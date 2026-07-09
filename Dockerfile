@@ -35,6 +35,7 @@ FROM debian:bookworm-slim
 # Install runtime dependencies
 RUN apt-get update && apt-get install -y \
     ca-certificates \
+    nftables \
     iptables \
     iproute2 \
     netcat-openbsd \
