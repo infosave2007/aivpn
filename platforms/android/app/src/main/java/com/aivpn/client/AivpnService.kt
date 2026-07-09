@@ -811,8 +811,11 @@ class AivpnService : VpnService() {
         // onTunnelReady is invoked from the Rust JNI thread; TileService callbacks
         // (qsTile access) must run on the main thread, same as statusCallback above.
         mainHandler.post { tileCallback?.invoke() }
+        // Only the ongoing foreground notification announces the connected
+        // state. A separate event notification here duplicated it verbatim —
+        // two identical "Connected to X" rows in the shade (and a re-fire on
+        // every auto-reconnect). The events channel still carries disconnect.
         updateNotification(getString(R.string.notification_connected, host))
-        postEventNotification(getString(R.string.notification_connected, host))
         Log.d(TAG, "Tunnel ready: host=$host")
     }
 
