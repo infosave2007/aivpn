@@ -542,9 +542,24 @@ impl NatForwarder {
         if out.status.success() {
             info!("nftables: aivpn table installed (NAT + forward + MSS clamp)");
         } else {
+            // stderr alone can be empty (e.g. nft killed by a seccomp SIGSYS in
+            // a container) — always include the exit status and stdout so the
+            // failure is diagnosable from the log.
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            let stdout = String::from_utf8_lossy(&out.stdout);
             warn!(
-                "nftables setup failed: {}",
-                String::from_utf8_lossy(&out.stderr)
+                "nftables setup failed (status: {}): {}{}",
+                out.status,
+                if stderr.trim().is_empty() {
+                    "<no stderr>"
+                } else {
+                    stderr.trim()
+                },
+                if stdout.trim().is_empty() {
+                    String::new()
+                } else {
+                    format!(" | stdout: {}", stdout.trim())
+                }
             );
         }
 
