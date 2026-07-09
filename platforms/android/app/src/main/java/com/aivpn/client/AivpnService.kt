@@ -841,35 +841,70 @@ class AivpnService : VpnService() {
                 if (!isUsableUnderlyingNetwork(caps)) return
 
                 val previous = currentUnderlyingNetwork
-                currentUnderlyingNetwork = network
+                if (previous == null || previous == network) {
+                    currentUnderlyingNetwork = network
+                    return
+                }
 
                 Log.d(TAG, "Underlying network available: $network (previous=$previous)")
 
+                // onAvailable fires for EVERY network matching the request, not
+                // just the default one: on dual-SIM devices the standby SIM's
+                // data network (and a re-validating Wi-Fi) periodically announce
+                // themselves while the network the tunnel is riding stays
+                // perfectly healthy. Blindly adopting each announcement made
+                // consecutive events alternate previous/next between two live
+                // networks — an endless restart ping-pong every 5-10 s that only
+                // a manual reconnect (which re-initialises
+                // currentUnderlyingNetwork) could break. A switch is real only
+                // when the network we ride is no longer usable, or when Wi-Fi
+                // appears while riding cellular (the one upgrade users expect).
+                val prevCaps = cm.getNetworkCapabilities(previous)
+                val prevAlive = prevCaps != null && isUsableUnderlyingNetwork(prevCaps)
+                val wifiUpgrade = prevAlive &&
+                    prevCaps!!.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) &&
+                    caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)
+                if (prevAlive && !wifiUpgrade) {
+                    Log.d(TAG, "Ignoring additional usable network $network — current $previous still healthy")
+                    return
+                }
+
+                if (!isRunning || !sessionEstablished) {
+                    currentUnderlyingNetwork = network
+                    return
+                }
+
                 // Seamless roaming with a protected UDP socket is not reliable across
-                // all Android vendors/radios. If the default network actually changed
+                // all Android vendors/radios. If the network we ride actually changed
                 // under an established session, restart immediately on the new path.
-                if (previous != null && previous != network && isRunning && sessionEstablished) {
-                    val now = SystemClock.elapsedRealtime()
-                    if (now < postConnectUntilMs) {
-                        // VPN just came up — Android reshuffles network IDs; ignore same-transport churn.
-                        // But if the transport type actually changed (e.g. WiFi → cellular), restart now
-                        // so the tunnel doesn't stay bound to the dead network until the RX watchdog fires.
-                        val prevCaps = cm.getNetworkCapabilities(previous)
-                        if (prevCaps != null && isTransportChange(prevCaps, caps)) {
-                            val now2 = SystemClock.elapsedRealtime()
-                            if (now2 - lastNetworkEventAtMs >= NETWORK_EVENT_DEBOUNCE_MS) {
-                                lastNetworkEventAtMs = now2
-                                Log.d(TAG, "Transport type changed within post-connect cooldown; restarting tunnel")
-                                networkTrigger = true
-                                AivpnJni.stopTunnel()
-                            }
+                val now = SystemClock.elapsedRealtime()
+                if (now < postConnectUntilMs) {
+                    // VPN just came up — Android reshuffles network IDs; ignore
+                    // same-transport churn and defer Wi-Fi upgrades until the
+                    // settle window ends. But if the previous network died AND
+                    // the transport type actually changed (e.g. WiFi → cellular),
+                    // restart now so the tunnel doesn't stay bound to the dead
+                    // network until the RX watchdog fires.
+                    if (wifiUpgrade) return
+                    if (prevCaps != null && isTransportChange(prevCaps, caps)) {
+                        if (now - lastNetworkEventAtMs >= NETWORK_EVENT_DEBOUNCE_MS) {
+                            lastNetworkEventAtMs = now
+                            currentUnderlyingNetwork = network
+                            Log.d(TAG, "Transport type changed within post-connect cooldown; restarting tunnel")
+                            networkTrigger = true
+                            AivpnJni.stopTunnel()
                         }
-                    } else if (now - lastNetworkEventAtMs >= NETWORK_EVENT_DEBOUNCE_MS) {
-                        lastNetworkEventAtMs = now
-                        Log.d(TAG, "Underlying network switched: $previous -> $network; restarting tunnel")
-                        networkTrigger = true
-                        AivpnJni.stopTunnel()
+                    } else {
+                        // Same-transport ID reshuffle of a dead old ID — adopt silently.
+                        currentUnderlyingNetwork = network
                     }
+                } else if (now - lastNetworkEventAtMs >= NETWORK_EVENT_DEBOUNCE_MS) {
+                    lastNetworkEventAtMs = now
+                    currentUnderlyingNetwork = network
+                    Log.d(TAG, "Underlying network switched: $previous -> $network " +
+                        "(${if (wifiUpgrade) "wifi upgrade" else "previous no longer usable"}); restarting tunnel")
+                    networkTrigger = true
+                    AivpnJni.stopTunnel()
                 }
             }
 
