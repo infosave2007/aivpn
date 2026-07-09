@@ -154,7 +154,7 @@ class VPNManager: ObservableObject {
     private var pathMonitor: NWPathMonitor?
     private let pathMonitorQueue = DispatchQueue(label: "com.aivpn.pathmonitor")
     private var lastPathStatus: NWPath.Status?
-    private var lastPathInterfaceTypes: Set<NWInterface.InterfaceType> = []
+    private var lastPathPrimaryInterfaceType: NWInterface.InterfaceType?
     private var networkChangeReconnectWorkItem: DispatchWorkItem?
 
     // Parameters from the most recent connect()/connectProxy() call, replayed by
@@ -1204,21 +1204,28 @@ class VPNManager: ObservableObject {
 
     private func handlePathUpdate(_ path: NWPath) {
         let previousStatus = lastPathStatus
-        let previousInterfaces = lastPathInterfaceTypes
-        let currentInterfaces = Set(path.availableInterfaces.map { $0.type })
+        let previousPrimary = lastPathPrimaryInterfaceType
+        // availableInterfaces is priority-ordered; the first entry is the one
+        // traffic actually rides. Comparing the whole SET restarted the tunnel
+        // whenever any SECONDARY interface appeared or vanished (iPhone hotspot
+        // plugged in, dock ethernet blip, Wi-Fi re-validating while Ethernet is
+        // primary) even though the ridden path never changed — the same
+        // reconnect ping-pong fixed on Android for standby-SIM announcements.
+        let currentPrimary = path.availableInterfaces.first?.type
 
         lastPathStatus = path.status
-        lastPathInterfaceTypes = currentInterfaces
+        lastPathPrimaryInterfaceType = currentPrimary
 
         // First callback only establishes the baseline — nothing has changed yet.
         guard let previousStatus = previousStatus else { return }
 
         // Network came back after being unreachable (e.g. wifi drop -> reconnect),
-        // or the set of available interfaces changed while still online (e.g.
+        // or the interface traffic rides changed while still online (e.g.
         // wifi -> cellular handover, or waking from sleep on a different network).
         let networkRestored = previousStatus != .satisfied && path.status == .satisfied
-        let interfaceSwitched = path.status == .satisfied && !previousInterfaces.isEmpty
-            && currentInterfaces != previousInterfaces
+        let interfaceSwitched = path.status == .satisfied
+            && previousPrimary != nil && currentPrimary != nil
+            && currentPrimary != previousPrimary
 
         guard networkRestored || interfaceSwitched else { return }
         guard isConnected, !isConnecting else { return }
