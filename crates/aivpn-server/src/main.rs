@@ -138,6 +138,12 @@ struct ServerFileConfig {
     tun_mtu: Option<MtuSetting>,
     #[serde(default)]
     pool: Option<PoolSyncConfig>,
+    /// Unix socket path for the management HTTP API (the aivpn-web panel
+    /// connects here). CLI `--management-socket` / `AIVPN_MANAGEMENT_SOCKET`
+    /// take precedence; this lets the socket be set from server.json too.
+    #[cfg(all(feature = "management-api", unix))]
+    #[serde(default)]
+    management_socket: Option<String>,
     #[serde(default)]
     site_to_site: Option<SiteToSiteConfig>,
     #[serde(default)]
@@ -398,7 +404,11 @@ async fn main() {
     #[cfg(all(feature = "management-api", unix))]
     let mgmt_db = client_db.clone();
     #[cfg(all(feature = "management-api", unix))]
-    let mgmt_socket = args.management_socket.clone();
+    let mgmt_socket = args.management_socket.clone().or_else(|| {
+        file_config
+            .as_ref()
+            .and_then(|c| c.management_socket.clone())
+    });
     #[cfg(all(feature = "management-api", unix))]
     let mgmt_pub_key = if server_private_key != [0u8; 32] {
         Some(crypto::KeyPair::from_private_key(server_private_key).public_key_bytes())
