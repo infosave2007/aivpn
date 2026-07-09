@@ -1133,7 +1133,9 @@ pub async fn run_tunnel_android(
     // initial interval above; the AdaptiveHint handler updates it live so a
     // server-hinted level change actually re-times keepalives without a reconnect
     // — parity with desktop client.rs's `keepalive_interval_ms` atomic.
-    let keepalive_ms = Arc::new(portable_atomic::AtomicU64::new(keepalive_interval.as_millis() as u64));
+    let keepalive_ms = Arc::new(portable_atomic::AtomicU64::new(
+        keepalive_interval.as_millis() as u64,
+    ));
     let mut transition_recv_keys: Option<SessionKeys> = Some(derive_session_keys(
         &dh,
         psk.as_ref(),
