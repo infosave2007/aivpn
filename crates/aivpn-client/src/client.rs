@@ -223,6 +223,35 @@ fn epoch_ms() -> u64 {
         .as_millis() as u64
 }
 
+/// Path A proactive carrier-change detection for the platforms that have NO
+/// native network-path monitor wired into this core: iOS (the NetworkExtension
+/// never forwards `defaultPath` changes into Rust), Windows and Linux (no
+/// NWPath equivalent). Android and macOS are deliberately excluded — they drive
+/// their own OS callbacks (`registerNetworkCallback` / `NWPathMonitor`) and
+/// adding a second trigger here would double-fire against already-tuned logic.
+///
+/// Returns the local source IP the kernel currently selects to reach `server`
+/// — i.e. the address of the PHYSICAL interface the tunnel's underlying UDP
+/// socket rides. A freshly `connect()`ed UDP socket only performs a route
+/// lookup and source-address selection; NO datagram leaves the host, so this is
+/// cheap and radio-silent (safe to call on a metered mobile link every few
+/// seconds). Because the kernel returns the source of the DEFAULT route to the
+/// server, a secondary interface that is not the default route never appears
+/// here: this cannot flap on standby-SIM / hotspot / dock-ethernet churn — the
+/// exact false-positive class fixed on Android (82aee70) and macOS (561daeb).
+#[cfg(any(target_os = "ios", target_os = "windows", target_os = "linux"))]
+fn probe_underlying_source_ip(server: SocketAddr) -> Option<std::net::IpAddr> {
+    let domain = if server.is_ipv4() {
+        socket2::Domain::IPV4
+    } else {
+        socket2::Domain::IPV6
+    };
+    let sock =
+        socket2::Socket::new(domain, socket2::Type::DGRAM, Some(socket2::Protocol::UDP)).ok()?;
+    sock.connect(&server.into()).ok()?;
+    sock.local_addr().ok()?.as_socket().map(|a| a.ip())
+}
+
 /// Collapse a per-session mask id to its base protocol-family preset id for
 /// §2 crowdsourced feedback. `bootstrap:{desc}:{base}:{slot}:{seed}` and
 /// `polymorphic:{base}:{hex}` both carry per-session/PSK-derived entropy that
@@ -1430,6 +1459,18 @@ impl AivpnClient {
         self.last_tx_ms.store(epoch_ms(), Ordering::Relaxed);
         // A4: rate-limit for the proactive warmup burst below.
         let mut last_warmup = std::time::Instant::now();
+        // Path A carrier-change baseline (iOS/Windows/Linux only — see
+        // probe_underlying_source_ip). `server_ep` is the connected socket's
+        // peer; `underlying_src_ip` is the physical source IP the kernel picks
+        // for it right now. Each watchdog tick re-probes and, on a persistent
+        // change (a real interface handover), forces a reconnect long before
+        // the passive RX-silence threshold would.
+        #[cfg(any(target_os = "ios", target_os = "windows", target_os = "linux"))]
+        let server_ep = self.udp_socket.as_ref().and_then(|s| s.peer_addr().ok());
+        #[cfg(any(target_os = "ios", target_os = "windows", target_os = "linux"))]
+        let mut underlying_src_ip = server_ep.and_then(probe_underlying_source_ip);
+        #[cfg(any(target_os = "ios", target_os = "windows", target_os = "linux"))]
+        let mut path_change_strikes: u8 = 0;
         // Set when the `join_res` select branch consumes upload_task's output,
         // so the teardown below knows it must not poll the handle again.
         let mut upload_joined = false;
@@ -1452,6 +1493,45 @@ impl AivpnClient {
                     // this 5 s tick bounds tag staleness at half a window.
                     #[cfg(target_os = "linux")]
                     self.kernel_push_tags(false);
+
+                    // Path A: proactive reconnect on a real carrier/interface
+                    // handover (iOS/Windows/Linux; Android and macOS use their
+                    // OS path callbacks). Only armed once the session is
+                    // ESTABLISHED (a ServerHello was processed) so a carrier
+                    // change DURING the initial handshake is left to the
+                    // first-contact timeout below. Requires TWO consecutive
+                    // disagreeing probes (~5-10 s) so a momentary route flap
+                    // mid-handover — or a transient dual-stack source flip —
+                    // does not reconnect prematurely.
+                    #[cfg(any(target_os = "ios", target_os = "windows", target_os = "linux"))]
+                    if self.ever_connected.load(Ordering::Relaxed) {
+                        if let (Some(server), Some(baseline)) = (server_ep, underlying_src_ip) {
+                            match probe_underlying_source_ip(server) {
+                                Some(now_ip) if now_ip != baseline => {
+                                    path_change_strikes = path_change_strikes.saturating_add(1);
+                                    if path_change_strikes >= 2 {
+                                        warn!(
+                                            "Underlying source address changed {} -> {} — \
+                                             carrier/interface handover, reconnecting",
+                                            baseline, now_ip
+                                        );
+                                        break Err(Error::Session(
+                                            "underlying interface changed".into(),
+                                        ));
+                                    }
+                                }
+                                // Back on the baseline path — clear a transient strike.
+                                Some(_) => path_change_strikes = 0,
+                                // No route right now (interface mid-handover): don't
+                                // count it as a change, wait for a definitive new IP.
+                                None => {}
+                            }
+                        } else if underlying_src_ip.is_none() {
+                            // Baseline was unavailable at loop start (probe failed
+                            // then). Establish it now so later ticks have a reference.
+                            underlying_src_ip = server_ep.and_then(probe_underlying_source_ip);
+                        }
+                    }
 
                     // A4 asymmetric silence detection. 45 s stays the ceiling
                     // for an idle uplink, but when we are actively SENDING
