@@ -919,9 +919,15 @@ class AivpnService : VpnService() {
             override fun onLost(network: Network) {
                 Log.d(TAG, "Underlying network lost: $network")
 
-                if (network == currentUnderlyingNetwork) {
-                    currentUnderlyingNetwork = findUsableUnderlyingNetwork(cm)
-                }
+                // Only the loss of the network the tunnel actually RIDES may
+                // trigger a restart. onLost also fires for secondary networks
+                // (standby SIM, a passing Wi-Fi) whose loss doesn't touch the
+                // carrier — reacting to those restarted the tunnel every time a
+                // secondary dropped: the same ping-pong the onAvailable guard
+                // fixed (82aee70), which onLost never got.
+                if (network != currentUnderlyingNetwork) return
+
+                currentUnderlyingNetwork = findUsableUnderlyingNetwork(cm)
 
                 val replacement = currentUnderlyingNetwork
                 val hasUsableDefault = replacement?.let { net ->
