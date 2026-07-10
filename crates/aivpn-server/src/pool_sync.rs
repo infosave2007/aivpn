@@ -373,10 +373,22 @@ impl PeerSyncer {
 
     async fn push_to_peer(&self, socket: &UdpSocket, link_idx: usize) -> Result<usize> {
         let link = &self.peer_links[link_idx];
-        let peer_addr: SocketAddr = link
-            .addr
-            .parse()
-            .map_err(|_| Error::Session(format!("pool_sync: invalid peer addr: {}", link.addr)))?;
+        // Fast path: a literal IP:port. Fall back to DNS resolution so a peer
+        // configured as `host:port` (which the docs explicitly recommend as the
+        // node_id form) actually pushes instead of failing to parse every tick.
+        let peer_addr: SocketAddr = match link.addr.parse() {
+            Ok(addr) => addr,
+            Err(_) => tokio::net::lookup_host(&link.addr)
+                .await
+                .ok()
+                .and_then(|mut addrs| addrs.next())
+                .ok_or_else(|| {
+                    Error::Session(format!(
+                        "pool_sync: cannot resolve peer addr: {}",
+                        link.addr
+                    ))
+                })?,
+        };
 
         // Include tombstones: revocations propagate as `deleted == true`
         // records, so a peer's stale live copy is overwritten via LWW merge.
