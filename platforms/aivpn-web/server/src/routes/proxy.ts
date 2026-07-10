@@ -191,6 +191,11 @@ proxy.all('/*', requireReadAccess(), async (c) => {
     'connection', 'keep-alive', 'transfer-encoding', 'te',
     'trailer', 'upgrade', 'proxy-authorization', 'proxy-authenticate',
     'host',
+    // Never forward the panel's own session credentials to the management
+    // daemon: the panel already authenticated the caller, and the refresh
+    // cookie (__Host-aivpn_rt, Path=/, 7-day) + access JWT would otherwise land
+    // in the daemon's request logs, widening the blast radius of a log leak.
+    'cookie', 'authorization',
   ])
   const forwardHeaders: Record<string, string> = {}
   // `c.req.raw.headers` is a Web `Headers` object, not a plain object —
