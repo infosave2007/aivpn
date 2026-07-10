@@ -290,9 +290,23 @@ static STOP_PENDING: AtomicBool = AtomicBool::new(false);
 /// Polled by JNI via getQualityScore().
 pub static ACTIVE_QUALITY_SCORE: AtomicU8 = AtomicU8::new(0);
 
-/// Suggested adaptive level from the last server AdaptiveHint (0–3). 0 = no hint yet.
-/// Polled by JNI via getAdaptiveLevelHint(); takes effect on next reconnect.
+/// Suggested adaptive level from the last server AdaptiveHint, stored as
+/// `level + 1` (1–4) so that 0 still means "no hint yet this session". The
+/// shift lets a server hint of Off(0) reach Kotlin as a real downgrade
+/// instead of being indistinguishable from "no hint" — before this, a level
+/// persisted in prefs could only ever ratchet UP (a session that improved
+/// back to Off never cleared the sticky FEC/Aggressive setting).
+/// Polled by JNI via getAdaptiveLevelHint() (which undoes the +1 shift);
+/// takes effect on next reconnect.
 pub static ACTIVE_ADAPTIVE_LEVEL: AtomicU8 = AtomicU8::new(0);
+
+/// Server-assigned VPN IPv4 from the ServerHello network config, as a
+/// big-endian u32 (0 = none received this session). When the pool re-homes a
+/// client onto a new vpn_ip, the IP embedded in the connection key goes
+/// stale and every uplink data packet is silently dropped by the server's
+/// anti-spoof check — the platform polls this via getAssignedVpnIp() and
+/// rebuilds the TUN with the server's address when it differs.
+pub static ASSIGNED_VPN_IP: AtomicU32 = AtomicU32::new(0);
 
 // §2 crowdsourced blocking feedback — process-global state polled by Kotlin
 // via the JNI getters in `lib.rs`, following the same reset-at-session-start
@@ -842,6 +856,9 @@ pub async fn run_tunnel_android(
     // Clear last session's quality so the diagnostics UI doesn't show a stale
     // score between reconnect and the first KeepaliveAck of the new session.
     ACTIVE_QUALITY_SCORE.store(0, Ordering::Relaxed);
+    // Clear last session's server-assigned VPN IP; this attempt's ServerHello
+    // will re-populate it (or leave it 0 for old servers).
+    ASSIGNED_VPN_IP.store(0, Ordering::Relaxed);
     ACTIVE_FEEDBACK_THRESHOLD.store(0, Ordering::Relaxed);
     ACTIVE_FEEDBACK_INTERVAL.store(0, Ordering::Relaxed);
     MASK_FEEDBACK_SENT.store(false, Ordering::Relaxed);
@@ -1120,6 +1137,12 @@ pub async fn run_tunnel_android(
             }
         }
     };
+    // Publish the server-assigned VPN IP for the platform's mismatch check
+    // (see the ASSIGNED_VPN_IP doc comment: a pool re-home leaves the
+    // key-embedded IP stale and the anti-spoof check kills all uplink data).
+    if let Some(cfg) = server_network_cfg.as_ref() {
+        ASSIGNED_VPN_IP.store(u32::from(cfg.client_ip), Ordering::Relaxed);
+    }
     let base_keepalive = server_network_cfg
         .as_ref()
         .and_then(|c| c.keepalive_secs)
@@ -1305,7 +1328,7 @@ pub async fn run_tunnel_android(
     let keepalive_sent_ms = Arc::new(AtomicU64::new(0));
     let mut quality_tracker = QualityTracker::new();
 
-    // Reset per-session hint so getAdaptiveLevelHint() returns 0 ("no hint yet") for this session.
+    // Reset per-session hint so getAdaptiveLevelHint() returns -1 ("no hint yet") for this session.
     ACTIVE_ADAPTIVE_LEVEL.store(0, Ordering::Relaxed);
     // Reset per-session recording feedback so a stale message from a previous
     // session is never surfaced to a new one.
@@ -1834,7 +1857,10 @@ pub async fn run_tunnel_android(
                                     }
                                 }
                                 ControlPayload::AdaptiveHint { level } => {
-                                    ACTIVE_ADAPTIVE_LEVEL.store(level.min(3), Ordering::Relaxed);
+                                    // +1 shift: 0 is reserved for "no hint yet", so a
+                                    // server hint of Off(0) still reaches the platform
+                                    // as a downgrade (see the static's doc comment).
+                                    ACTIVE_ADAPTIVE_LEVEL.store(level.min(3) + 1, Ordering::Relaxed);
                                     // Re-arm the running upload loop's keepalive interval to the
                                     // server-hinted level, mirroring desktop client.rs's
                                     // keepalive_with_nat_cap: take the level's own keepalive_secs()

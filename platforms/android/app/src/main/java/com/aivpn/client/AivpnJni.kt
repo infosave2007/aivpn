@@ -128,8 +128,20 @@ object AivpnJni {
     /** Connection quality score 0–100 from last KeepaliveAck RTT. 0 = no data yet. */
     external fun getQualityScore(): Int
 
-    /** Adaptive level hint from server (0–3). 0 = no hint received. Takes effect on next reconnect. */
+    /**
+     * Adaptive level hint from server: 0–3 (0 = server says adaptive Off — a real
+     * downgrade), or -1 when no hint has been received this session. Takes effect
+     * on next reconnect.
+     */
     external fun getAdaptiveLevelHint(): Int
+
+    /**
+     * VPN IPv4 the server assigned to this session in its ServerHello (dotted
+     * quad), or "" when the current session has not received one. Differs from
+     * the key-embedded IP after a pool re-home — the TUN must then be rebuilt
+     * with this address or the server's anti-spoof check drops all uplink data.
+     */
+    external fun getAssignedVpnIp(): String
 
     // ──────────── §2 crowdsourced blocking feedback getters ────────────
     //

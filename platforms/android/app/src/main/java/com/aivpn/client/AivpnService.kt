@@ -125,6 +125,9 @@ class AivpnService : VpnService() {
     private var vpnInterface: ParcelFileDescriptor? = null
     /** MTU the current [vpnInterface] was built with; 0 when no interface exists. */
     @Volatile private var currentTunMtu: Int = 0
+    // Address the live TUN was established with; a pool re-home changes the
+    // desired address and forces ensureVpnInterface() to rebuild (see there).
+    @Volatile private var currentTunAddress: String? = null
 
     // Coroutine lifecycle
     @Volatile private var serviceJob: Job? = null
@@ -372,7 +375,12 @@ class AivpnService : VpnService() {
         savedPsk         = pskBase64
         savedServerSigningKey = serverSigningKeyBase64
         savedMtlsCert    = mtlsCert
-        savedVpnIp       = vpnIp
+        // Prefer a server-assigned VPN IP remembered from an earlier session on
+        // this server (pool re-home): the key still embeds the stale colliding
+        // IP, so starting the TUN with it would earn an immediate anti-spoof
+        // drop until the poll loop re-adopts the override. Start correct instead.
+        savedVpnIp       = getSharedPreferences(PrefsKeys.PREFS_NAME, MODE_PRIVATE)
+            .getString(PrefsKeys.PREF_VPN_IP_OVERRIDE + serverAddr, null) ?: vpnIp
         savedServerVpnIp = serverVpnIp
         savedVpnPrefixLen = normalizedPrefixLen
         savedVpnMtu = normalizedMtu
@@ -381,6 +389,10 @@ class AivpnService : VpnService() {
         manualDisconnect = false
         isServiceActive = true
         uiState = UiState.CONNECTING
+        // A new connection attempt is starting: clear the stale "Отключено" event
+        // row (ID 2) from a previous disconnect so it can't linger beside the live
+        // foreground notification. Nothing else ever cancels it.
+        getSystemService(NotificationManager::class.java)?.cancel(NOTIFICATION_EVENT_ID)
         // Persist user intent: the VPN is wanted from now until an explicit manual
         // disconnect. onDestroy + VpnReconnectWorker use this to self-heal after a
         // system-initiated service stop.
@@ -685,12 +697,35 @@ class AivpnService : VpnService() {
                     val tcb = trafficCallback; tcb?.invoke(AivpnJni.getUploadBytes(), AivpnJni.getDownloadBytes())
                     // Apply server-suggested adaptive level silently (takes effect on next
                     // reconnect — ensureVpnInterface() rebuilds the TUN when the desired
-                    // MTU changed). Clamp to the valid 1..3 range so a rogue/buggy server
-                    // hint can never index UI level arrays out of bounds.
-                    val hint = AivpnJni.getAdaptiveLevelHint().coerceIn(0, 3)
-                    if (hint > 0 && hint != adaptiveLevel()) {
+                    // MTU changed). -1 = no hint this session; 0 is a REAL hint (server
+                    // says adaptive Off) and must be persisted like any other level —
+                    // ignoring it made the level ratchet-up-only, so one bad-RTT session
+                    // left FEC/Aggressive stuck in prefs forever. Clamp to 0..3 so a
+                    // rogue/buggy server hint can never index UI level arrays out of bounds.
+                    val hint = AivpnJni.getAdaptiveLevelHint()
+                    if (hint in 0..3 && hint != adaptiveLevel()) {
                         getSharedPreferences(PrefsKeys.PREFS_NAME, MODE_PRIVATE)
-                            .edit().putInt(PrefsKeys.ADAPTIVE_LEVEL, hint.coerceIn(1, 3)).apply()
+                            .edit().putInt(PrefsKeys.ADAPTIVE_LEVEL, hint).apply()
+                    }
+                    // Pool re-home healing: when the server's ServerHello assigns a
+                    // different VPN IP than the connection key embeds (the pool moved
+                    // this client to resolve an IP collision), every uplink data packet
+                    // is silently anti-spoof-dropped while keepalives still flow — the
+                    // session looks connected but passes no traffic. Adopt the server's
+                    // address, persist it per-server, and bounce the tunnel once so the
+                    // TUN is rebuilt with the working IP.
+                    val assigned = AivpnJni.getAssignedVpnIp()
+                    if (assigned.isNotEmpty() && assigned != savedVpnIp) {
+                        Log.w(TAG, "Server assigned VPN IP $assigned (key has $savedVpnIp) — adopting and rebuilding TUN")
+                        savedVpnIp = assigned
+                        savedServerAddr?.let { server ->
+                            getSharedPreferences(PrefsKeys.PREFS_NAME, MODE_PRIVATE)
+                                .edit()
+                                .putString(PrefsKeys.PREF_VPN_IP_OVERRIDE + server, assigned)
+                                .apply()
+                        }
+                        networkTrigger = true
+                        AivpnJni.stopTunnel()
                     }
                     // Forward any pending recording ack/complete/failed/status message to
                     // whoever is currently observing (MainActivity, if visible).
@@ -816,6 +851,12 @@ class AivpnService : VpnService() {
         // two identical "Connected to X" rows in the shade (and a re-fire on
         // every auto-reconnect). The events channel still carries disconnect.
         updateNotification(getString(R.string.notification_connected, host))
+        // The tunnel is actually up again: clear any lingering HIGH-importance
+        // "VPN stopped / traffic unprotected" alert (ID 3) from an earlier
+        // unexpected stop so a stale warning doesn't sit beside the live
+        // Connected notification. Done here (not at connect start) because the
+        // warning stays true until the session is genuinely re-established.
+        getSystemService(NotificationManager::class.java)?.cancel(NOTIFICATION_ALERT_ID)
         Log.d(TAG, "Tunnel ready: host=$host")
     }
 
@@ -1227,6 +1268,7 @@ class AivpnService : VpnService() {
         try { vpnInterface?.close() } catch (_: Exception) {}
         vpnInterface = null
         currentTunMtu = 0
+        currentTunAddress = null
     }
 
     /**
@@ -1362,21 +1404,24 @@ class AivpnService : VpnService() {
 
     private fun ensureVpnInterface() {
         val tunMtu = if (isAdaptiveEnabled()) ADAPTIVE_TUN_MTU else savedVpnMtu.coerceAtLeast(576)
-        if (vpnInterface != null) {
-            if (currentTunMtu == tunMtu) {
-                return
-            }
-            // The adaptive level changed the desired TUN MTU since this interface was
-            // built. setMtu only applies at establish() time, so rebuild the interface —
-            // this happens only at a reconnect boundary (no live session is using the fd)
-            // and mirrors the very first connect; the brief routing gap is the price of
-            // the MTU actually taking effect.
-            Log.i(TAG, "TUN MTU changed $currentTunMtu -> $tunMtu — recreating VPN interface")
-            closeTunnel()
-        }
-
         val tunAddress4 = savedVpnIp ?: "10.0.0.2"
         val tunPrefixLen = savedVpnPrefixLen.coerceIn(1, 30)
+        if (vpnInterface != null) {
+            if (currentTunMtu == tunMtu && currentTunAddress == tunAddress4) {
+                return
+            }
+            // The desired MTU or address changed since this interface was built —
+            // both only apply at establish() time, so rebuild. Address changes come
+            // from a pool re-home (server-assigned VPN IP differs from the key); MTU
+            // changes come from the adaptive level. This runs only at a reconnect
+            // boundary (no live session holds the fd) and mirrors the first connect;
+            // the brief routing gap is the price of the new value taking effect.
+            Log.i(
+                TAG,
+                "TUN params changed (mtu $currentTunMtu->$tunMtu addr $currentTunAddress->$tunAddress4) — recreating VPN interface",
+            )
+            closeTunnel()
+        }
 
         // Diagnostic: surface the EXACT address set on the TUN. A
         // VpnService.establish() "Cannot set address" failure is otherwise
@@ -1479,6 +1524,7 @@ class AivpnService : VpnService() {
             }
         }
         currentTunMtu = tunMtu
+        currentTunAddress = tunAddress4
     }
 
     /**

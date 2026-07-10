@@ -6,6 +6,13 @@ import android.content.SharedPreferences
 object PrefsKeys {
     const val ADAPTIVE_LEVEL = "adaptive_level"
     const val PREFS_NAME = "aivpn_prefs"
+    /**
+     * Prefix for the per-server VPN IP the server re-homed this client to (pool
+     * IP-collision resolution). Full key = this prefix + server address. When
+     * present it overrides the key-embedded IP so the rebuilt TUN uses the
+     * address the server's anti-spoof check actually expects.
+     */
+    const val PREF_VPN_IP_OVERRIDE = "vpn_ip_override_"
     /** Whether to auto-connect VPN on device boot. Stored via [BootPrefs] (device-protected). */
     const val PREF_AUTO_CONNECT = "auto_connect"
     /** Last active profile UUID, written on every explicit connect. Read by BootReceiver. */

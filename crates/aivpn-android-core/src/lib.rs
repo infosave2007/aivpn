@@ -16,8 +16,8 @@ use android_tunnel::{
     get_active_upload_bytes, run_tunnel_android, send_control_payload, stop_active_tunnel,
     take_recording_feedback_json, ACTIVE_ADAPTIVE_LEVEL, ACTIVE_FEEDBACK_INTERVAL,
     ACTIVE_FEEDBACK_THRESHOLD, ACTIVE_MASK_CATALOG_JSON, ACTIVE_QUALITY_SCORE,
-    ACTIVE_REGIONAL_HINTS_JSON, ATTEMPTED_MASK_FAMILY, EVER_CONNECTED, MASK_CATALOG_SEQ,
-    MASK_FEEDBACK_SENT, REGIONAL_HINTS_SEQ,
+    ACTIVE_REGIONAL_HINTS_JSON, ASSIGNED_VPN_IP, ATTEMPTED_MASK_FAMILY, EVER_CONNECTED,
+    MASK_CATALOG_SEQ, MASK_FEEDBACK_SENT, REGIONAL_HINTS_SEQ,
 };
 
 use std::sync::atomic::Ordering;
@@ -421,14 +421,38 @@ pub extern "system" fn Java_com_aivpn_client_AivpnJni_getDownloadBytes(
     get_active_download_bytes() as jlong
 }
 
-/// Returns the last adaptive level hint received from the server via AdaptiveHint (0–3).
-/// 0 means no hint has been received yet this session.
+/// Returns the last adaptive level hint received from the server via
+/// AdaptiveHint: 0–3 (0 = server says adaptive Off — a real downgrade), or
+/// -1 when no hint has been received yet this session. The static stores
+/// `level + 1` so 0 can keep meaning "no hint".
 #[no_mangle]
 pub extern "system" fn Java_com_aivpn_client_AivpnJni_getAdaptiveLevelHint(
     _env: JNIEnv,
     _class: JClass,
 ) -> jint {
-    ACTIVE_ADAPTIVE_LEVEL.load(Ordering::Relaxed) as jint
+    ACTIVE_ADAPTIVE_LEVEL.load(Ordering::Relaxed) as jint - 1
+}
+
+/// Returns the VPN IPv4 address the server assigned to this session in its
+/// ServerHello network config (dotted quad), or an empty string when the
+/// current session has not received one. When this differs from the IP
+/// embedded in the connection key, the server has re-homed the client (pool
+/// IP-conflict resolution) and the TUN must be rebuilt with this address —
+/// otherwise the server's anti-spoof check silently drops all uplink data.
+#[no_mangle]
+pub extern "system" fn Java_com_aivpn_client_AivpnJni_getAssignedVpnIp(
+    mut env: JNIEnv,
+    _class: JClass,
+) -> jstring {
+    let raw = ASSIGNED_VPN_IP.load(Ordering::Relaxed);
+    let s = if raw == 0 {
+        String::new()
+    } else {
+        std::net::Ipv4Addr::from(raw).to_string()
+    };
+    env.new_string(s)
+        .map(|j| j.into_raw())
+        .unwrap_or(std::ptr::null_mut())
 }
 
 // ──────────────────────────────────────────────────────────
