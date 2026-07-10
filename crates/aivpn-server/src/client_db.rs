@@ -583,7 +583,7 @@ impl ClientDatabase {
             .map_err(|e| Error::Session(format!("merge_from_json parse: {}", e)))?;
         let mut data = self.data.write();
         let mut merged = 0usize;
-        for inc in incoming {
+        for mut inc in incoming {
             if let Some(existing) = data.clients.iter_mut().find(|c| c.id == inc.id) {
                 // Only update if PSK matches (same logical client)
                 if existing.psk == inc.psk {
@@ -640,11 +640,31 @@ impl ClientDatabase {
                     .iter()
                     .any(|c| c.vpn_ip == inc.vpn_ip && c.id != inc.id && !c.deleted);
                 if ip_conflict {
-                    warn!(
-                        "merge_from_json: skipping client '{}' — vpn_ip {} already assigned to another client",
-                        inc.id, inc.vpn_ip
-                    );
-                    continue;
+                    // Each node allocates VPN IPs locally from the same base
+                    // (10.x.0.2…), so clients added INDEPENDENTLY on two pool
+                    // nodes get identical IPs. Silently dropping the incoming
+                    // one (the old behavior) left credentials un-synced forever.
+                    // Instead re-home it onto a free local IP: the credential
+                    // (id + PSK) still propagates, only the local routing IP
+                    // differs per node — which is fine, each node routes it
+                    // locally. The reassignment stays local (the existing-client
+                    // merge branch never overwrites vpn_ip), so it doesn't churn.
+                    match self.allocate_vpn_ip(&mut data).ok() {
+                        Some(free_ip) => {
+                            warn!(
+                                "merge_from_json: client '{}' vpn_ip {} conflicts locally — re-homed to {}",
+                                inc.id, inc.vpn_ip, free_ip
+                            );
+                            inc.vpn_ip = free_ip;
+                        }
+                        None => {
+                            warn!(
+                                "merge_from_json: skipping client '{}' — vpn_ip {} conflicts and no free IP to re-home",
+                                inc.id, inc.vpn_ip
+                            );
+                            continue;
+                        }
+                    }
                 }
                 data.clients.push(inc);
                 merged += 1;
