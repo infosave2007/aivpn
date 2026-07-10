@@ -656,7 +656,17 @@ impl AivpnClient {
         tokio::spawn(async move {
             for _ in 0..4u8 {
                 tokio::time::sleep(Duration::from_millis(100)).await;
-                let _ = tx.send(ControlPayload::Keepalive { send_ts: 0 }).await;
+                // Stamp the real send time: the server acks EVERY keepalive,
+                // and an ack with echo_ts=0 makes the RTT handler fall back to
+                // the last periodic keepalive's timestamp — each warmup ack
+                // then measured as 100..400 ms of fake RTT, poisoning the
+                // quality EWMA (and the server's adaptive hint) right at
+                // session start.
+                let _ = tx
+                    .send(ControlPayload::Keepalive {
+                        send_ts: epoch_ms(),
+                    })
+                    .await;
             }
         });
     }
