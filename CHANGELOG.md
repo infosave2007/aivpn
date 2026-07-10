@@ -1,12 +1,5 @@
 # Changelog
 
-## [1.0.1] - 2026-07-09
-
-### Fixed
-
-- **musl / embedded cross-compilation** — `AtomicU64` now comes from `portable_atomic` in the shared upload pipeline (`aivpn-common`) and the server mask store, instead of `std::sync::atomic::AtomicU64` (absent on 32-bit targets without native 64-bit atomics). The `recvmmsg` flags argument is cast portably (`as _`) for musl. Restores the `server-musl-*` and `client-musl-mipsel` release-asset builds.
-- **Windows release packaging** — `make windows` no longer deletes `aivpn-windows-gui.zip` after building the NSIS installer, so the release workflow publishes both the installer and the portable GUI zip.
-
 ## [1.0.0-RC1] - 2026-07-07
 
 > **Release candidate for 1.0.0.** The apps display this build as version **1.0.0** — “RC1” is only the release label. This entry consolidates everything since 0.9.2, including all work previously staged for a 0.10.0 release that was never shipped (a separate 0.10.0 release does not exist).
@@ -96,6 +89,8 @@
 
 ### Fixed
 
+- **musl / embedded cross-compilation** — `AtomicU64` now comes from `portable_atomic` in the shared upload pipeline (`aivpn-common`) and the server mask store, instead of `std::sync::atomic::AtomicU64` (absent on 32-bit targets without native 64-bit atomics). The `recvmmsg` flags argument is cast portably (`as _`) for musl. Restores the `server-musl-*` and `client-musl-mipsel` release-asset builds.
+- **Windows release packaging** — `make windows` no longer deletes `aivpn-windows-gui.zip` after building the NSIS installer, so the release workflow publishes both the installer and the portable GUI zip.
 - **A lost inline-rekey `KeyRotate` self-heals with zero reconnects (server + all clients).** In-flight PFS rekey previously sent `KeyRotate` exactly once; if that packet was lost, the server sat on new keys while the client kept the old ones — an irrecoverable desync ending in a ~35 s watchdog reconnect. The server now retransmits an unacknowledged `KeyRotate` on a short (~4 s, below the client's RX-silence watchdog) timer reusing the same rekey keypair, the rekey-ack wait is bounded so a dead upload task can't hang the receive loop, and uplink/downlink packet counters stay monotonic across the rekey (no nonce regression). Live-verified with injected packet loss: zero reconnects. Ported to desktop, iOS, and Android.
 - **Self-healing downlink MDH-length discovery (all clients)** — after a missed mask update, downlink packets framed at a different mask-derived-header length became undecodable and the session died; clients now track every MDH length ever seen for the session, the shared decoder tries all of them, and the active framing is re-discovered automatically.
 - **Pool/site/chain sync framing is mask-independent** — server-to-server sync packets were framed against the sending node's primary mask while the receiver derived the offset from *its own* primary mask; with embedded-tag masks (8 of 11 bundled) the AEAD never verified, so pool client databases silently never converged. Peer sync (pool sync, multi-site sync, chain forwarding) now uses a fixed cluster framing layout independent of any mask, plus a deterministic primary-mask choice; verified live on a two-node pool running embedded-tag masks.
@@ -315,6 +310,8 @@
 
 ### Исправлено
 
+- **Кросс-компиляция musl / embedded** — `AtomicU64` теперь берётся из `portable_atomic` в общем upload-конвейере (`aivpn-common`) и хранилище масок сервера вместо `std::sync::atomic::AtomicU64` (отсутствует на 32-битных целях без нативных 64-битных атомиков). Аргумент флагов `recvmmsg` приводится переносимо (`as _`) для musl. Восстанавливает сборки release-артефактов `server-musl-*` и `client-musl-mipsel`.
+- **Упаковка Windows-релиза** — `make windows` больше не удаляет `aivpn-windows-gui.zip` после сборки NSIS-инсталлятора, поэтому release-workflow публикует и инсталлятор, и переносимый zip GUI.
 - **Потерянный inline-rekey `KeyRotate` самовосстанавливается без реконнекта (сервер + все клиенты).** Ротация ключей PFS «в полёте» раньше отправляла `KeyRotate` ровно один раз; при потере этого пакета сервер оставался на новых ключах, а клиент — на старых: невосстановимый рассинхрон, заканчивавшийся реконнектом по watchdog через ~35 с. Сервер теперь ретранслирует неподтверждённый `KeyRotate` по короткому таймеру (~4 с, меньше клиентского watchdog RX-тишины) с той же rekey-ключевой парой, ожидание rekey-ack ограничено по времени (мёртвая upload-задача не может подвесить цикл приёма), а счётчики пакетов uplink/downlink остаются монотонными через rekey (нет регрессии nonce). Проверено вживую с инъекцией потери пакета: ноль реконнектов. Портировано на десктоп, iOS и Android.
 - **Самовосстанавливающееся определение длины MDH на downlink (все клиенты)** — после пропущенного обновления маски downlink-пакеты, оформленные с другой длиной mask-derived-header, становились нераскодируемыми и сессия умирала; клиенты теперь запоминают каждую длину MDH, когда-либо виденную в сессии, общий декодер пробует их все, и активный фрейминг переоткрывается автоматически.
 - **Фрейминг синхронизации pool/site/chain не зависит от маски** — межсерверные sync-пакеты оформлялись по первичной маске отправляющего узла, а получатель вычислял смещение по *своей* первичной маске; с масками со встроенным тегом (8 из 11 в бандле) AEAD никогда не сходился, и клиентские базы пула молча не синхронизировались. Пиринговая синхронизация (pool, мультисайт, chain-форвардинг) теперь использует фиксированную кластерную раскладку, независимую от любых масок, плюс детерминированный выбор первичной маски; проверено вживую на пуле из двух узлов с масками со встроенным тегом.
