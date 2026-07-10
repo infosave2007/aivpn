@@ -839,6 +839,9 @@ pub async fn run_tunnel_android(
     // per-session statics (`ACTIVE_ADAPTIVE_LEVEL`, recording feedback) are
     // reset.
     EVER_CONNECTED.store(false, Ordering::Relaxed);
+    // Clear last session's quality so the diagnostics UI doesn't show a stale
+    // score between reconnect and the first KeepaliveAck of the new session.
+    ACTIVE_QUALITY_SCORE.store(0, Ordering::Relaxed);
     ACTIVE_FEEDBACK_THRESHOLD.store(0, Ordering::Relaxed);
     ACTIVE_FEEDBACK_INTERVAL.store(0, Ordering::Relaxed);
     MASK_FEEDBACK_SENT.store(false, Ordering::Relaxed);
