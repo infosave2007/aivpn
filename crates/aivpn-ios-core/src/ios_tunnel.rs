@@ -284,6 +284,12 @@ static STOP_PENDING: AtomicBool = AtomicBool::new(false);
 static LAST_LOCAL_PORT: AtomicU16 = AtomicU16::new(0);
 pub static ACTIVE_QUALITY_SCORE: AtomicU8 = AtomicU8::new(0);
 pub static ACTIVE_ADAPTIVE_LEVEL: AtomicU8 = AtomicU8::new(0);
+/// Server-assigned VPN IPv4 from the ServerHello network config, as a
+/// big-endian u32 (0 = none received this session). After a pool re-home the
+/// connection-key IP goes stale and the server's anti-spoof check silently
+/// drops all uplink data — Swift polls this via aivpn_get_assigned_vpn_ip()
+/// and re-applies tunnel network settings with the server's address.
+pub static ASSIGNED_VPN_IP: AtomicU32 = AtomicU32::new(0);
 static ACTIVE_CONTROL_TX: Mutex<Option<mpsc::Sender<ControlPayload>>> = Mutex::new(None);
 
 // §2 crowdsourced blocking feedback — process-global state polled by Swift via
@@ -681,6 +687,9 @@ pub async fn run_tunnel_ios(
     // the very first poll and spuriously drive the recording UI.
     ACTIVE_QUALITY_SCORE.store(0, Ordering::Relaxed);
     ACTIVE_ADAPTIVE_LEVEL.store(0, Ordering::Relaxed);
+    // Clear last session's server-assigned VPN IP; this attempt's ServerHello
+    // will re-populate it (or leave it 0 for old servers).
+    ASSIGNED_VPN_IP.store(0, Ordering::Relaxed);
     RECORDING_FEEDBACK_SEQ.store(0, Ordering::Relaxed);
     *ACTIVE_RECORDING_FEEDBACK
         .lock()
@@ -918,6 +927,11 @@ pub async fn run_tunnel_ios(
         }
     };
 
+    // Publish the server-assigned VPN IP for Swift's re-home mismatch check
+    // (see the ASSIGNED_VPN_IP doc comment).
+    if let Some(cfg) = server_network_cfg.as_ref() {
+        ASSIGNED_VPN_IP.store(u32::from(cfg.client_ip), Ordering::Relaxed);
+    }
     // Server-derived base keepalive from the ServerHello network config
     // (mirrors android_tunnel.rs / desktop client.rs): the operator's
     // `keepalive_secs` must reach iOS too, not be silently discarded.

@@ -15,7 +15,7 @@ use ios_tunnel::{
     clear_pending_stop, get_active_download_bytes, get_active_upload_bytes, run_tunnel_ios,
     send_control_payload, stop_active_tunnel, OnReadyFn, RecordingFeedback, SendCtx,
     ACTIVE_ADAPTIVE_LEVEL, ACTIVE_FEEDBACK_INTERVAL, ACTIVE_FEEDBACK_THRESHOLD,
-    ACTIVE_QUALITY_SCORE, ACTIVE_RECORDING_FEEDBACK, ACTIVE_REGIONAL_HINTS_JSON,
+    ACTIVE_QUALITY_SCORE, ACTIVE_RECORDING_FEEDBACK, ACTIVE_REGIONAL_HINTS_JSON, ASSIGNED_VPN_IP,
     ATTEMPTED_MASK_FAMILY, EVER_CONNECTED, MASK_FEEDBACK_SENT, RECORDING_FEEDBACK_SEQ,
     REGIONAL_HINTS_SEQ,
 };
@@ -279,6 +279,18 @@ pub extern "C" fn aivpn_get_quality_score() -> libc::c_int {
 #[no_mangle]
 pub extern "C" fn aivpn_get_adaptive_level_hint() -> libc::c_int {
     ACTIVE_ADAPTIVE_LEVEL.load(Ordering::Relaxed) as libc::c_int
+}
+
+/// VPN IPv4 the server assigned to this session in its ServerHello network
+/// config, as a host-order u32 (e.g. 10.0.0.3 = 0x0A000003), or 0 when the
+/// current session has not received one. When it differs from the
+/// connection-key IP the server re-homed this client (pool IP-collision
+/// resolution) and the tunnel network settings must be re-applied with this
+/// address — otherwise the server's anti-spoof check silently drops all
+/// uplink data while keepalives keep flowing.
+#[no_mangle]
+pub extern "C" fn aivpn_get_assigned_vpn_ip() -> libc::c_uint {
+    ASSIGNED_VPN_IP.load(Ordering::Relaxed) as libc::c_uint
 }
 
 /// §2 crowdsourced blocking feedback — whether the most recently completed

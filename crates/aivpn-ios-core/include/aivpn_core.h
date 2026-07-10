@@ -113,6 +113,13 @@ int aivpn_get_quality_score(void);
 /// Most recent AdaptiveHint level received from the server (0–3).
 int aivpn_get_adaptive_level_hint(void);
 
+/// VPN IPv4 the server assigned to this session in its ServerHello network
+/// config, as a host-order u32 (10.0.0.3 = 0x0A000003), or 0 when none has
+/// been received this session. Differs from the connection-key IP after a
+/// pool re-home — re-apply tunnel network settings with this address or the
+/// server's anti-spoof check silently drops all uplink data.
+unsigned int aivpn_get_assigned_vpn_ip(void);
+
 /// Monotonically increasing counter, bumped each time new mask-recording
 /// feedback (RecordingAck/RecordingComplete/RecordingFailed/RecordingStatus)
 /// arrives from the server. Compare against the last-seen value to detect a

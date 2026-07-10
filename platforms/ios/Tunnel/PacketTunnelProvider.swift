@@ -60,6 +60,18 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     // Mask-recording feedback from the server (RecordingAck/RecordingComplete/
     // RecordingFailed/RecordingStatus), surfaced via the aivpn_get_recording_*
     // FFI getters in aivpn-ios-core and polled from the get_traffic handler.
+    // Pool re-home healing: the address the tunnel settings were applied with,
+    // the parameters needed to rebuild them, and the watcher that polls the
+    // Rust core for a server-assigned IP differing from the connection-key IP.
+    private var appliedVpnIP: String = ""
+    private var settingsServerHost: String = ""
+    private var settingsFullTunnel: Bool = false
+    private var settingsExcludedRoutes: [String] = []
+    private var settingsExcludedDomains: [String] = []
+    private var settingsAdaptiveLevel: Int = 0
+    private var settingsKillSwitch: Bool = false
+    private var rehomeWatch: DispatchSourceTimer?
+    private static let vpnIpOverridePrefix = "vpn_ip_override_"
     private var recordingMaskId: String = ""
     private var recordingFailureReason: String = ""
     private var lastSeenRecordingFeedbackSeq: Int64 = 0
@@ -206,7 +218,19 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             return
         }
 
-        let vpnIP    = key.vpnIP ?? "10.8.0.2"
+        // Prefer a server-assigned VPN IP remembered from an earlier session on
+        // this server (pool re-home): the key still embeds the stale colliding
+        // IP, and starting with it earns an immediate anti-spoof drop until the
+        // re-home watcher re-applies the settings. Start correct instead.
+        let keyVpnIP = key.vpnIP ?? "10.8.0.2"
+        let vpnIP    = appGroupDefaults?.string(forKey: Self.vpnIpOverridePrefix + key.serverHost) ?? keyVpnIP
+        appliedVpnIP           = vpnIP
+        settingsServerHost     = key.serverHost
+        settingsFullTunnel     = fullTunnel
+        settingsExcludedRoutes = excludedRoutes
+        settingsExcludedDomains = excludedDomains
+        settingsAdaptiveLevel  = adaptiveLevel
+        settingsKillSwitch     = killSwitch
         let settings = buildSettings(vpnIP: vpnIP, serverHost: key.serverHost,
                                      fullTunnel: fullTunnel,
                                      excludedRoutes: excludedRoutes,
@@ -237,6 +261,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                 completionHandler(self.makeError("tunnel stopped during startup"))
                 return
             }
+            self.startRehomeWatch()
 
             let host       = key.serverHost
             let port       = key.serverPort
@@ -448,6 +473,8 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         isStopped = true
         aivpn_stop_tunnel()
         bridgeQueue.sync {
+            rehomeWatch?.cancel()
+            rehomeWatch = nil
             if let source = outboundSource {
                 source.cancel() // cancel handler closes sp[0] and sets it to -1
                 outboundSource = nil
@@ -659,6 +686,47 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                 }
             }
         }
+    }
+
+    // MARK: - Pool re-home healing
+
+    /// Polls the core for a server-assigned VPN IP that differs from the
+    /// address the tunnel settings were applied with (the server re-homed this
+    /// client to resolve a pool IP collision). Without this the server's
+    /// anti-spoof check silently drops every uplink data packet while
+    /// keepalives keep flowing — "connected" with no traffic. Re-applying the
+    /// settings moves the utun to the working address without restarting the
+    /// session, and the address is remembered per-server so the next start is
+    /// correct from the first packet.
+    private func startRehomeWatch() {
+        rehomeWatch?.cancel()
+        let timer = DispatchSource.makeTimerSource(queue: bridgeQueue)
+        timer.schedule(deadline: .now() + 3, repeating: 3)
+        timer.setEventHandler { [weak self] in
+            guard let self = self, !self.isStopped else { return }
+            let raw = aivpn_get_assigned_vpn_ip()
+            guard raw != 0 else { return }
+            let ip = "\((raw >> 24) & 0xFF).\((raw >> 16) & 0xFF).\((raw >> 8) & 0xFF).\(raw & 0xFF)"
+            guard ip != self.appliedVpnIP else { return }
+            os_log(.info, "Server assigned VPN IP %{public}@ (settings had %{public}@) — re-applying network settings",
+                   ip, self.appliedVpnIP)
+            self.appliedVpnIP = ip
+            self.appGroupDefaults?.set(ip, forKey: Self.vpnIpOverridePrefix + self.settingsServerHost)
+            let settings = self.buildSettings(vpnIP: ip, serverHost: self.settingsServerHost,
+                                              fullTunnel: self.settingsFullTunnel,
+                                              excludedRoutes: self.settingsExcludedRoutes,
+                                              excludedDomains: self.settingsExcludedDomains,
+                                              adaptiveLevel: self.settingsAdaptiveLevel,
+                                              killSwitch: self.settingsKillSwitch)
+            self.setTunnelNetworkSettings(settings) { error in
+                if let error = error {
+                    os_log(.error, "Re-applying network settings failed: %{public}@",
+                           error.localizedDescription)
+                }
+            }
+        }
+        timer.resume()
+        rehomeWatch = timer
     }
 
     // MARK: - Network settings
