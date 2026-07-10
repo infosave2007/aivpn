@@ -1413,15 +1413,15 @@ impl App {
                         if key.is_empty() {
                             return Some("No profile selected".to_string());
                         }
+                        // Pass the key via env, not argv: argv is world-readable
+                        // via /proc/<pid>/cmdline, so `--connection-key <key>`
+                        // leaked the embedded PSK to any local user for the
+                        // duration of the bench. The client reads
+                        // AIVPN_CONNECTION_KEY when -k is absent (main.rs) and
+                        // scrubs it from its own env right after parsing.
                         let out = tokio::process::Command::new(&bin)
-                            .args([
-                                "--connection-key",
-                                &key,
-                                "bench",
-                                "--duration",
-                                "5",
-                                "--json",
-                            ])
+                            .env("AIVPN_CONNECTION_KEY", &key)
+                            .args(["bench", "--duration", "5", "--json"])
                             .output()
                             .await
                             .ok()?;
