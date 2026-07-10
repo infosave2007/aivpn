@@ -64,6 +64,9 @@ const MAX_STDIN_BYTES: usize = 64 * 1024;
 enum Verb {
     /// `ip addr replace <CIDR> dev <IFACE>`
     AddrReplaceDev,
+    /// `ip addr del <CIDR> dev <IFACE>` — removes the stale address after a
+    /// server-pushed network override moved the client to a new VPN IP
+    AddrDelDev,
     /// `ip route replace <CIDR> dev <IFACE>`
     RouteReplaceDev,
     /// `ip route replace <IP> via <GW> dev <IFACE>`
@@ -87,6 +90,7 @@ impl Verb {
     fn parse(s: &str) -> Option<Verb> {
         Some(match s {
             "addr_replace" => Verb::AddrReplaceDev,
+            "addr_del" => Verb::AddrDelDev,
             "route_replace_dev" => Verb::RouteReplaceDev,
             "route_replace_via_dev" => Verb::RouteReplaceViaDev,
             "route_replace_via_dev_onlink" => Verb::RouteReplaceViaDevOnlink,
@@ -104,6 +108,7 @@ impl Verb {
     fn field_count(self) -> usize {
         match self {
             Verb::AddrReplaceDev => 2,                   // CIDR, IFACE
+            Verb::AddrDelDev => 2,                       // CIDR, IFACE
             Verb::RouteReplaceDev => 2,                  // CIDR, IFACE
             Verb::RouteReplaceViaDev => 3,               // IP, GW, IFACE
             Verb::RouteReplaceViaDevOnlink => 3,         // IP, GW, IFACE
@@ -215,7 +220,7 @@ fn parse_line(line: &str, line_no: usize) -> Result<ParsedCommand, String> {
     }
 
     let argv = match verb {
-        Verb::AddrReplaceDev => {
+        Verb::AddrReplaceDev | Verb::AddrDelDev => {
             let (cidr, iface) = (rest[0], rest[1]);
             if !is_valid_cidr(cidr) {
                 return Err(format!("line {line_no}: invalid CIDR {cidr:?}"));
@@ -223,9 +228,14 @@ fn parse_line(line: &str, line_no: usize) -> Result<ParsedCommand, String> {
             if !is_valid_iface(iface) {
                 return Err(format!("line {line_no}: invalid interface {iface:?}"));
             }
+            let action = if verb == Verb::AddrDelDev {
+                "del"
+            } else {
+                "replace"
+            };
             vec![
                 "addr".to_string(),
-                "replace".to_string(),
+                action.to_string(),
                 cidr.to_string(),
                 "dev".to_string(),
                 iface.to_string(),

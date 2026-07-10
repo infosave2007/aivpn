@@ -5,7 +5,7 @@
 
 use std::io;
 use tokio::io::AsyncWriteExt;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use crate::kill_switch::KillSwitch;
 use aivpn_common::error::{Error, Result};
@@ -421,6 +421,18 @@ impl Tunnel {
         network_config: ClientNetworkConfig,
     ) -> Result<()> {
         network_config.validate()?;
+        // Remember the address the device carried BEFORE this override: on
+        // Linux `ip addr replace <new>` with a different IP ADDS it as a
+        // secondary address, the old one stays primary and keeps winning
+        // source selection — so the server's anti-spoof check would still see
+        // the stale IP and drop every data packet. The old CIDR must be
+        // deleted explicitly.
+        #[cfg(target_os = "linux")]
+        let stale_cidr = self
+            .config
+            .client_network_config()
+            .ok()
+            .map(|c| c.cidr_string());
         self.config.tun_addr = network_config.client_ip.to_string();
         self.config.server_vpn_ip = network_config.server_vpn_ip.to_string();
         self.config.tun_netmask = network_config.netmask_string();
@@ -445,12 +457,46 @@ impl Tunnel {
         }
 
         #[cfg(target_os = "linux")]
-        self.configure_linux()?;
+        {
+            self.configure_linux()?;
+            let new_cidr = self.config.client_network_config()?.cidr_string();
+            if let Some(stale) = stale_cidr.filter(|old| *old != new_cidr) {
+                self.remove_stale_linux_addr(&stale);
+            }
+        }
 
         #[cfg(target_os = "windows")]
         self.configure_windows()?;
 
         Ok(())
+    }
+
+    /// Delete a stale IPv4 address left on the TUN device after a
+    /// server-pushed network override changed the client IP (see
+    /// `apply_network_config`). Best-effort: the new address is already
+    /// installed, so a failure here only risks the kernel still preferring
+    /// the old source IP.
+    #[cfg(target_os = "linux")]
+    fn remove_stale_linux_addr(&self, stale_cidr: &str) {
+        let tun_name = &self.config.tun_name;
+        match Self::run_ip_batch_privileged(&[(
+            "addr_del",
+            &["addr", "del", stale_cidr, "dev", tun_name],
+        )]) {
+            Ok(results)
+                if results
+                    .iter()
+                    .any(|(name, s)| name == "addr_del" && s.success()) =>
+            {
+                info!("Removed stale tunnel address {}", stale_cidr);
+            }
+            Ok(_) => warn!(
+                "Could not remove stale tunnel address {} — outgoing packets may keep \
+                 the old source IP until reconnect",
+                stale_cidr
+            ),
+            Err(e) => warn!("Stale address cleanup failed: {}", e),
+        }
     }
 
     // ──────────────────── macOS ────────────────────
@@ -771,6 +817,9 @@ impl Tunnel {
             }
             ["addr", "replace", cidr, "dev", iface] => {
                 Some(format!("{name}\taddr_replace\t{cidr}\t{iface}"))
+            }
+            ["addr", "del", cidr, "dev", iface] => {
+                Some(format!("{name}\taddr_del\t{cidr}\t{iface}"))
             }
             ["route", "replace", cidr, "dev", iface] => {
                 Some(format!("{name}\troute_replace_dev\t{cidr}\t{iface}"))
