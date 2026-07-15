@@ -2032,6 +2032,15 @@ impl AivpnClient {
                 self.upload_at_last_data_rx = self.bytes_sent.load(Ordering::Relaxed);
                 self.data_stall_started = None;
                 self.data_stall_strikes = 0;
+                if !self.data_plane_proven {
+                    // FIX (Jul 15): remember the mask that just carried real DATA so
+                    // AUTO-mode reconnects reuse it instead of re-deriving (and
+                    // hopping) from the churning descriptor set.
+                    *crate::bootstrap_cache::LAST_GOOD_MASK
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner()) =
+                        Some(self.config.initial_mask.clone());
+                }
                 self.data_plane_proven = true;
                 debug!(
                     "Received {} bytes from server, wrote to TUN",

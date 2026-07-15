@@ -354,6 +354,46 @@ pub static MASK_FEEDBACK_SENT: AtomicBool = AtomicBool::new(false);
 /// right before `AivpnClient::new`; here it must cross the JNI boundary
 /// because mask selection happens inside this one-shot call.
 pub static ATTEMPTED_MASK_FAMILY: Mutex<Option<String>> = Mutex::new(None);
+/// Sticky last-known-good mask. Set on the first real DATA RX of a session and
+/// reused verbatim on every subsequent AUTO-mode reconnect (see
+/// `resolve_sticky_handshake_mask`). FIX (Jul 15): a data-plane stall drives
+/// the data watchdog to reconnect while the handshake keeps succeeding, so
+/// `HANDSHAKE_FAIL_STREAK` (which only counts never-connected handshakes) never
+/// trips — and the old resolver re-derived the mask from the churning
+/// bootstrap-descriptor set, hopping to a different mask each reconnect and
+/// never letting the data plane settle. Reusing the mask that last carried real
+/// data ends the hop (the client converges on a working mask, as a user does by
+/// manually pinning one). Process-global so it survives the platform reconnect
+/// loop; a stale entry (e.g. after a server switch) self-corrects because a mask
+/// that stops matching drives `HANDSHAKE_FAIL_STREAK` past the fallback
+/// threshold, which bypasses stickiness.
+pub static LAST_GOOD_MASK: Mutex<Option<MaskProfile>> = Mutex::new(None);
+
+/// AUTO-mode mask resolution with the sticky net: once a mask has carried real
+/// DATA this process (`LAST_GOOD_MASK`), reuse it instead of re-deriving from
+/// the (churning) descriptor set. Yields to an explicit user mask choice and to
+/// the handshake-fallback threshold (so a no-longer-matchable sticky mask can't
+/// wedge the client).
+fn resolve_sticky_handshake_mask(
+    preferred: Option<&str>,
+    descriptors: &[BootstrapDescriptor],
+    psk: Option<&[u8; 32]>,
+    fail_streak: u32,
+) -> MaskProfile {
+    let is_auto = preferred
+        .map(str::trim)
+        .map_or(true, |s| s.is_empty() || s == "auto");
+    if is_auto && fail_streak < HANDSHAKE_FALLBACK_THRESHOLD {
+        if let Some(m) = LAST_GOOD_MASK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+        {
+            return m;
+        }
+    }
+    resolve_handshake_mask_resilient(preferred, descriptors, psk, fail_streak)
+}
 /// §2 crowdsourced blocking feedback — most recent `RegionalMaskHints`
 /// received from the server this session, JSON-encoded
 /// (`{"country_code":"US","masks":[["webrtc_zoom_v3",0.87],...]}`) for the
@@ -1007,7 +1047,7 @@ pub async fn run_tunnel_android(
             handshake_fail_streak
         );
     }
-    let handshake_mask = resolve_handshake_mask_resilient(
+    let handshake_mask = resolve_sticky_handshake_mask(
         preferred_mask.as_deref(),
         &current_bootstrap_descriptors(),
         psk.as_ref(),
@@ -1360,7 +1400,7 @@ pub async fn run_tunnel_android(
     }
     let _ctrl_tx_guard = CtrlTxGuard;
 
-    let initial_mask = resolve_handshake_mask_resilient(
+    let initial_mask = resolve_sticky_handshake_mask(
         preferred_mask.as_deref(),
         &current_bootstrap_descriptors(),
         psk.as_ref(),
@@ -1630,7 +1670,15 @@ pub async fn run_tunnel_android(
                             session.upload_bytes.load(Ordering::Relaxed);
                         data_stall_started = None;
                         data_stall_strikes = 0;
-                        data_plane_proven = true;
+                        if !data_plane_proven {
+                            data_plane_proven = true;
+                            // FIX (Jul 15): this mask just carried real DATA — record it
+                            // as last-known-good so AUTO-mode reconnects reuse it instead
+                            // of re-deriving (and hopping) from the churning bootstrap-
+                            // descriptor set. See `resolve_sticky_handshake_mask`.
+                            *LAST_GOOD_MASK.lock().unwrap_or_else(|e| e.into_inner()) =
+                                Some(handshake_mask.clone());
+                        }
                         log::debug!("aivpn: wrote {} bytes to TUN (rx total={})",
                             decoded.payload.len(),
                             session.download_bytes.load(Ordering::Relaxed));

@@ -1012,6 +1012,26 @@ async fn main() {
         // In production secure mode (no_fallback), fail if no valid descriptors are available
         let initial_mask = bootstrap_cache::select_initial_mask(preshared_key.as_ref());
 
+        // FIX (Jul 15): sticky last-known-good mask. In AUTO mode (no explicit
+        // --preferred-mask / --polymorphic-base), once a mask has carried real
+        // data this process, reuse it across reconnects instead of re-deriving
+        // from the churning descriptor set — which otherwise hops masks on every
+        // data-watchdog reconnect and never lets the data plane settle. Yields to
+        // the handshake-fallback threshold (handled below) so a no-longer-
+        // matchable sticky mask cannot wedge the client. Mirrors the mobile cores.
+        let initial_mask = if args.preferred_mask.is_none()
+            && args.polymorphic_base.is_none()
+            && handshake_fail_streak < HANDSHAKE_FALLBACK_THRESHOLD
+        {
+            bootstrap_cache::LAST_GOOD_MASK
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+                .or(initial_mask)
+        } else {
+            initial_mask
+        };
+
         let initial_mask = if no_fallback {
             match initial_mask {
                 Some(mask) => mask,

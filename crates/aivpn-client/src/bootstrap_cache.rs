@@ -1,5 +1,6 @@
 use std::fs;
 use std::path::PathBuf;
+use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 
@@ -7,6 +8,14 @@ use aivpn_common::error::{Error, Result};
 use aivpn_common::mask::{
     current_unix_secs, derive_bootstrap_candidates, BootstrapDescriptor, MaskProfile,
 };
+
+/// Sticky last-known-good mask (client). Set on the first real DATA RX of a
+/// session and reused in AUTO mode across reconnects instead of re-deriving from
+/// the churning bootstrap-descriptor set. FIX (Jul 15): a data-plane stall makes
+/// the client reconnect while the handshake still succeeds, so the old resolver
+/// hopped masks each reconnect and never let the data plane settle. Mirrors the
+/// mobile cores' `LAST_GOOD_MASK`.
+pub static LAST_GOOD_MASK: Mutex<Option<MaskProfile>> = Mutex::new(None);
 
 const CACHE_FILE_NAME: &str = "bootstrap_descriptors.json";
 const MAX_CACHED_DESCRIPTORS: usize = 8;
