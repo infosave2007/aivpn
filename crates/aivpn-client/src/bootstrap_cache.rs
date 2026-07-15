@@ -1,6 +1,8 @@
 use std::fs;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
@@ -16,6 +18,35 @@ use aivpn_common::mask::{
 /// hopped masks each reconnect and never let the data plane settle. Mirrors the
 /// mobile cores' `LAST_GOOD_MASK`.
 pub static LAST_GOOD_MASK: Mutex<Option<MaskProfile>> = Mutex::new(None);
+
+/// Liveness half of the sticky-mask fix (client). Counts consecutive SHORT
+/// sessions that ended on the data watchdog while a sticky mask was in use, so a
+/// mask that keeps getting throttled is abandoned (LAST_GOOD_MASK cleared) and
+/// AUTO explores a different one, instead of looping on it forever.
+static DATA_STALL_STREAK: AtomicU32 = AtomicU32::new(0);
+/// A session that stayed up at least this long is a working mask; a later stall
+/// is a transient hiccup, so the streak resets and the mask stays sticky.
+const HEALTHY_SESSION_MIN: Duration = Duration::from_secs(45);
+/// Abandon the sticky mask after this many consecutive short data-stall sessions.
+const DATA_STALL_EXPLORE_THRESHOLD: u32 = 4;
+
+/// Call when a session ends on the data watchdog: a healthy-length session
+/// resets the stall streak; repeated short stalls clear the sticky mask so AUTO
+/// can explore alternatives.
+pub fn note_data_stall_and_maybe_explore(established: Instant) {
+    if established.elapsed() >= HEALTHY_SESSION_MIN {
+        DATA_STALL_STREAK.store(0, Ordering::Relaxed);
+        return;
+    }
+    let n = DATA_STALL_STREAK.fetch_add(1, Ordering::Relaxed) + 1;
+    if n >= DATA_STALL_EXPLORE_THRESHOLD {
+        *LAST_GOOD_MASK.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        DATA_STALL_STREAK.store(0, Ordering::Relaxed);
+        tracing::warn!(
+            "sticky mask produced {n} short data-stall sessions — clearing it so auto-mask can try a different mask"
+        );
+    }
+}
 
 const CACHE_FILE_NAME: &str = "bootstrap_descriptors.json";
 const MAX_CACHED_DESCRIPTORS: usize = 8;

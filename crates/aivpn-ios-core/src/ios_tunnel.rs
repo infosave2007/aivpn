@@ -352,6 +352,39 @@ pub static ATTEMPTED_MASK_FAMILY: Mutex<Option<String>> = Mutex::new(None);
 /// `HANDSHAKE_FAIL_STREAK` past the fallback threshold, which bypasses stickiness.
 pub static LAST_GOOD_MASK: Mutex<Option<MaskProfile>> = Mutex::new(None);
 
+/// Liveness half of the sticky-mask fix. Counts consecutive SHORT sessions that
+/// ended on the data watchdog while a sticky mask was in use. A mask that keeps
+/// getting throttled — it handshakes fine and carries a little data, then its
+/// data is quickly killed — must be abandoned, not reused forever, so after
+/// `DATA_STALL_EXPLORE_THRESHOLD` such sessions the sticky mask is cleared and
+/// AUTO resolution explores a different one.
+static DATA_STALL_STREAK: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// A session that carried data and stayed up at least this long is a working
+/// mask; a later stall is a transient hiccup, not throttling, so the streak
+/// resets and the mask stays sticky.
+const HEALTHY_SESSION_MIN: Duration = Duration::from_secs(45);
+/// Abandon the sticky mask after this many consecutive short data-stall sessions.
+const DATA_STALL_EXPLORE_THRESHOLD: u32 = 4;
+
+/// Called when a session ends on the data watchdog. A healthy-length session
+/// resets the stall streak (the sticky mask works); repeated short stalls clear
+/// the sticky mask so AUTO can explore alternatives.
+fn note_data_stall_and_maybe_explore(established: Instant) {
+    use std::sync::atomic::Ordering;
+    if established.elapsed() >= HEALTHY_SESSION_MIN {
+        DATA_STALL_STREAK.store(0, Ordering::Relaxed);
+        return;
+    }
+    let n = DATA_STALL_STREAK.fetch_add(1, Ordering::Relaxed) + 1;
+    if n >= DATA_STALL_EXPLORE_THRESHOLD {
+        *LAST_GOOD_MASK.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        DATA_STALL_STREAK.store(0, Ordering::Relaxed);
+        log::warn!(
+            "aivpn: sticky mask produced {n} short data-stall sessions — clearing it so auto-mask can try a different mask"
+        );
+    }
+}
+
 /// AUTO-mode mask resolution with the sticky net: once a mask has carried real
 /// DATA this process (`LAST_GOOD_MASK`), reuse it instead of re-deriving from
 /// the (churning) descriptor set. Yields to an explicit user mask choice and to
@@ -1045,6 +1078,9 @@ pub async fn run_tunnel_ios(
     // ratchet step). The platform polls this after `run_tunnel_ios` returns
     // to decide whether to attribute a failure to this attempt's mask family.
     EVER_CONNECTED.store(true, Ordering::Relaxed);
+    // Session start (post-handshake) — tells a working sticky mask (long healthy
+    // session) from a throttled one (repeated short data stalls).
+    let session_established = Instant::now();
     HANDSHAKE_FAIL_STREAK.store(0, Ordering::Relaxed);
 
     // Notify tunnel ready via C callback (after ClientCert so app UI opens after auth)
@@ -2011,6 +2047,9 @@ pub async fn run_tunnel_ios(
                 let stall_pending = verdict.is_some();
                 if let Some(reason) = data_stall_confirmed(&mut data_stall_strikes, verdict) {
                     tun_reader.abort(); upload_task.abort();
+                    // Liveness: a sticky mask that keeps stalling quickly gets
+                    // abandoned so AUTO can explore a different one.
+                    note_data_stall_and_maybe_explore(session_established);
                     return Err(Error::Session(format!(
                         "{}: {} bytes of uplink data unanswered for {:?} \
                          (no downlink data for {:?}) — reconnecting",

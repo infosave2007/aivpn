@@ -1187,6 +1187,10 @@ impl AivpnClient {
         // Send initial handshake packet with eph_pub to establish session
         self.send_init().await?;
 
+        // Session start (post-handshake) — tells a working sticky mask (long
+        // healthy session) from a throttled one (repeated short data stalls).
+        let session_established = std::time::Instant::now();
+
         info!("Starting client main loop");
         info!("Routing traffic through AIVPN tunnel...");
 
@@ -1617,6 +1621,11 @@ impl AivpnClient {
                                 data_up_since,
                                 stalled_for.unwrap_or_default(),
                                 self.last_data_rx.elapsed(),
+                            );
+                            // Liveness: a sticky mask that keeps stalling quickly
+                            // gets abandoned so AUTO can explore a different one.
+                            crate::bootstrap_cache::note_data_stall_and_maybe_explore(
+                                session_established,
                             );
                             break Err(Error::Session(format!("{reason} — reconnecting")));
                         }
