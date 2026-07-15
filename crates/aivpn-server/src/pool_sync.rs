@@ -263,6 +263,28 @@ impl PeerSyncer {
         // back to the current time bucket only when no persisted state
         // exists (first run) or it is stale/unreadable.
         let counter_state_path = db.file_path().with_file_name("pool_sync_counter.state");
+
+        // Best-effort cleanup of orphaned temp files. `write_counter_file` names
+        // its temp `pool_sync_counter.<pid>.tmp`; a process that is killed
+        // mid-persist (e.g. the crash-restart loops this survives) leaves its
+        // temp behind, and since the name is per-PID nothing ever reclaimed
+        // them — they accumulated unboundedly (hundreds observed in the field).
+        // Sweep any stale `pool_sync_counter.*.tmp` at startup. Safe: this runs
+        // before this process writes its own temp, and a co-located second
+        // instance's in-flight temp is only ever consumed by an atomic rename,
+        // so at worst one best-effort persist retries.
+        if let Some(dir) = counter_state_path.parent() {
+            if let Ok(entries) = std::fs::read_dir(dir) {
+                for entry in entries.flatten() {
+                    let name = entry.file_name();
+                    let name = name.to_string_lossy();
+                    if name.starts_with("pool_sync_counter.") && name.ends_with(".tmp") {
+                        let _ = std::fs::remove_file(entry.path());
+                    }
+                }
+            }
+        }
+
         let wall_clock_bucket = crypto::current_timestamp_ms() / 5_000;
         let resume_from = read_counter_file(&counter_state_path)
             .map(|c| c.saturating_add(1))
