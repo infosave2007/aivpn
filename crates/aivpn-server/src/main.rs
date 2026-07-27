@@ -1429,8 +1429,39 @@ fn parse_client_role(s: &str) -> Option<ClientRole> {
     }
 }
 
+/// Decode a `--device-pubkey` CLI value: standard (non-URL-safe) base64,
+/// matching the encoding `client_db.rs` uses for `device_pubkey` in
+/// clients.json (see `opt_base64_bytes`). Must decode to exactly 32 bytes.
+fn decode_device_pubkey_arg(b64: &str) -> std::result::Result<[u8; 32], String> {
+    use base64::Engine;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(b64.trim())
+        .map_err(|e| format!("--device-pubkey is not valid base64: {}", e))?;
+    if bytes.len() != 32 {
+        return Err(format!(
+            "--device-pubkey must decode to 32 bytes, got {}",
+            bytes.len()
+        ));
+    }
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&bytes);
+    Ok(out)
+}
+
 fn handle_add_client(db: &ClientDatabase, name: &str, args: &ServerArgs) {
-    match db.add_client(name) {
+    let device_pubkey = match args.device_pubkey.as_deref().map(decode_device_pubkey_arg) {
+        Some(Ok(pk)) => Some(pk),
+        Some(Err(e)) => {
+            eprintln!("❌ {}", e);
+            std::process::exit(1);
+        }
+        None => None,
+    };
+    let add_result = match device_pubkey {
+        Some(pk) => db.add_client_bound(name, pk),
+        None => db.add_client(name),
+    };
+    match add_result {
         Ok(client) => {
             let server_pub = load_server_public_key(args);
 
@@ -1492,7 +1523,23 @@ fn handle_add_client(db: &ClientDatabase, name: &str, args: &ServerArgs) {
 }
 
 fn handle_add_client_one_time(db: &ClientDatabase, name: &str, args: &ServerArgs) {
-    match db.add_client_one_time(name) {
+    let device_pubkey = match args.device_pubkey.as_deref().map(decode_device_pubkey_arg) {
+        Some(Ok(pk)) => Some(pk),
+        Some(Err(e)) => {
+            eprintln!("❌ {}", e);
+            std::process::exit(1);
+        }
+        None => None,
+    };
+    // With --device-pubkey, bind at creation instead of waiting for the
+    // first connect. one_time enforcement still applies afterward: a
+    // different device presenting the PSK will be rejected by
+    // enroll_device's mismatch check, same as a post-hoc bind would be.
+    let add_result = match device_pubkey {
+        Some(pk) => db.add_client_one_time_bound(name, pk),
+        None => db.add_client_one_time(name),
+    };
+    match add_result {
         Ok(client) => {
             let server_pub = load_server_public_key(args);
 
@@ -2573,7 +2620,36 @@ mod tests {
             bootstrap_output: None,
             shaping_level: None,
             role: None,
+            device_pubkey: None,
         }
+    }
+
+    #[test]
+    fn decode_device_pubkey_arg_accepts_valid_32_byte_base64() {
+        let raw = [0x42u8; 32];
+        let b64 = base64::engine::general_purpose::STANDARD.encode(raw);
+        assert_eq!(decode_device_pubkey_arg(&b64).unwrap(), raw);
+    }
+
+    #[test]
+    fn decode_device_pubkey_arg_trims_whitespace() {
+        let raw = [0x99u8; 32];
+        let b64 = base64::engine::general_purpose::STANDARD.encode(raw);
+        let padded = format!("  {}\n", b64);
+        assert_eq!(decode_device_pubkey_arg(&padded).unwrap(), raw);
+    }
+
+    #[test]
+    fn decode_device_pubkey_arg_rejects_wrong_length() {
+        let b64 = base64::engine::general_purpose::STANDARD.encode([0x11u8; 16]);
+        let err = decode_device_pubkey_arg(&b64).unwrap_err();
+        assert!(err.contains("32 bytes"), "unexpected error: {}", err);
+    }
+
+    #[test]
+    fn decode_device_pubkey_arg_rejects_invalid_base64() {
+        let err = decode_device_pubkey_arg("not!!valid==base64??").unwrap_err();
+        assert!(err.contains("base64"), "unexpected error: {}", err);
     }
 
     #[test]

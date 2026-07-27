@@ -55,6 +55,14 @@ qrcode = { version = "0.14", default-features = false, features = ["image"], opt
 image = { version = "0.25", default-features = false, features = ["png"], optional = true }
 anyhow = { version = "1", optional = true }
 
+# Pure-Rust SSH client for the in-app server installer (optional — only
+# pulled in by the `ssh-install` feature). Hoisted here (from aivpn-client)
+# so the mobile FFI cores (aivpn-android-core / aivpn-ios-core), which
+# depend only on aivpn-common, can also drive the installer. MUST NOT bloat
+# the default aivpn-common build or any dependent that doesn't opt in.
+russh = { version = "0.62", optional = true }
+russh-sftp = { version = "2.3", optional = true }
+
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
@@ -77,3 +85,10 @@ client-dpi-gate = ["dpi-gate", "client-upload"]
 # Local QR-code PNG rendering for `aivpn://...` connection keys (P2.R), shared
 # by every client implementation (desktop + mobile FFI).
 qr = ["dep:qrcode", "dep:image", "dep:anyhow"]
+# Wave C2b — pure-Rust SSH client + embedded installer bundle for the in-app
+# server installer (connect via password/private key, TOFU host-key verify,
+# sftp upload, streamed remote exec, high-level run_install orchestration).
+# OFF by default: pulls in `russh`/`russh-sftp`, which must NOT bloat the
+# default aivpn-common build or the mobile FFI cores (aivpn-android-core /
+# aivpn-ios-core), neither of which enables this feature.
+ssh-install = ["dep:russh", "dep:russh-sftp", "tokio"]

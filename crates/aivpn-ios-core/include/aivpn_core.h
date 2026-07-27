@@ -412,6 +412,165 @@ intptr_t aivpn_qr_png(
     size_t out_cap
 );
 
+// ─────────────────────────────────────────────────────────────────────────
+// Wave C2b-iOS — in-app SSH server installer (crates/aivpn-ios-core/src/
+// ssh_install_ffi/, wrapping aivpn_common::ssh_install; gated behind this
+// crate's `ssh-install` feature, DEFAULT-on so `make ios`'s plain
+// `cargo build -p aivpn-ios-core` picks it up with no extra flag).
+//
+// There is NO cancellation of an in-flight install (see
+// aivpn_ssh_install_start's doc comment below) — once started it runs to
+// completion on its own background thread regardless of polling/free calls.
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Probes host:port over SSH as `user` — no real authentication is attempted
+/// (auth is never reached; key exchange alone yields the host key) — and
+/// writes the server's OpenSSH-style `SHA256:<base64>` host-key fingerprint
+/// into out_buf. Show this to the user for out-of-band TOFU confirmation
+/// (e.g. against `ssh-keyscan`/a hosting control panel) BEFORE calling
+/// aivpn_ssh_install_start with it as the `fingerprint` field of that call's
+/// params_json.
+///
+/// Blocking: runs on a private current_thread Tokio runtime local to this
+/// call; does not touch any active tunnel session or its runtime.
+///
+/// Buffer contract shared with aivpn_mgmt_request/aivpn_qr_png: returns the
+/// number of bytes written when out_cap was large enough (always <=
+/// out_cap), or the needed length (out_buf left untouched, always >
+/// out_cap) otherwise — compare the return value against the out_cap you
+/// passed to tell the two cases apart, then retry with a bigger buffer.
+/// Returns -1 on any error: NULL host/user, non-UTF-8 input, DNS/TCP/SSH
+/// protocol failure, or local runtime creation failure.
+///
+/// @param host     NUL-terminated hostname or IP address.
+/// @param port     SSH port (usually 22).
+/// @param user     NUL-terminated SSH username (unused for the actual probe,
+///                 but part of the SSH handshake target).
+/// @param out_buf  Buffer to receive the NUL-free fingerprint string bytes.
+///                 May be NULL only if out_cap is 0.
+/// @param out_cap  Size of out_buf in bytes.
+intptr_t aivpn_ssh_probe_hostkey(
+    const char *host,
+    uint16_t port,
+    const char *user,
+    uint8_t *out_buf,
+    size_t out_cap
+);
+
+/// Copies the SHA256 (hex, 64 ASCII chars) of the embedded installer script
+/// into out_buf — show it to the user alongside aivpn_ssh_install_script's
+/// output so they can verify what will run on their VPS before confirming.
+/// Computed at compile time from the same script embedded in the binary;
+/// cannot fail other than a too-small/NULL buffer.
+///
+/// Buffer contract: same written-len-or-needed-len convention as
+/// aivpn_ssh_probe_hostkey.
+///
+/// @param out_buf  Buffer to receive the hex string bytes. May be NULL only
+///                 if out_cap is 0.
+/// @param out_cap  Size of out_buf in bytes.
+intptr_t aivpn_ssh_install_bundle_sha256(
+    uint8_t *out_buf,
+    size_t out_cap
+);
+
+/// Copies the embedded installer script's own text
+/// (deploy/install-server.sh, typically ~20 KB) into out_buf, for display
+/// before the user confirms an install.
+///
+/// Buffer contract: same written-len-or-needed-len convention as
+/// aivpn_ssh_probe_hostkey.
+///
+/// @param out_buf  Buffer to receive the script text bytes. May be NULL
+///                 only if out_cap is 0.
+/// @param out_cap  Size of out_buf in bytes.
+intptr_t aivpn_ssh_install_script(
+    uint8_t *out_buf,
+    size_t out_cap
+);
+
+/// Parses params_json and starts the SSH install on a dedicated background
+/// thread, returning immediately with an opaque job handle for
+/// aivpn_ssh_install_poll. JSON contract (mirrors
+/// aivpn_common::ssh_install::install_params_from_json):
+/// ```
+/// {
+///   "host": "1.2.3.4", "port": 22, "user": "root",
+///   "auth": {"type":"password","password":"..."}
+///         | {"type":"key_pem","pem":"...","passphrase":null}
+///         | {"type":"key_file","path":"/abs/path","passphrase":null},
+///   "fingerprint": "SHA256:...",
+///   "binary": {"type":"url","url":"..."}
+///           | {"type":"file","path":"..."}
+///           | {"type":"default"},
+///   "server_ip": null, "server_port": null,
+///   "mode": "systemd" | "docker",
+///   "device_pubkey_b64": null,
+///   "extra_args": []
+/// }
+/// ```
+/// `fingerprint` is required — TOFU confirmation (via
+/// aivpn_ssh_probe_hostkey) must already have happened out-of-band.
+/// `binary` defaults to "default", `mode` to "systemd", `extra_args` to [].
+///
+/// Every InstallEvent the install produces is queued as a single-line JSON
+/// string (aivpn_common::ssh_install::install_event_to_json's wire format:
+/// `{"type":"connected"|"uploading"|"line"|"marker"|"finished",...}`) for
+/// aivpn_ssh_install_poll to drain, in order. If the SSH session itself
+/// fails before producing its own "finished" event (connect/auth/host-key-
+/// mismatch/IO error — as opposed to the remote script merely exiting
+/// nonzero, which surfaces as a normal finished event with that exit code),
+/// two synthetic events are queued instead, in order:
+///   1. {"type":"line","line":"ERROR: <err>"}
+///   2. {"type":"finished","exit_code":-1,"connection_key":null}
+///
+/// @param params_json  NUL-terminated JSON object per the contract above.
+/// @return  Job handle (always >= 1) on success, or -1 if params_json is
+///          NULL, not valid UTF-8, or fails to parse.
+int64_t aivpn_ssh_install_start(const char *params_json);
+
+/// Pops the next queued InstallEvent (JSON-encoded, see
+/// aivpn_ssh_install_start) for `handle` into out_buf.
+///
+/// Buffer contract — peek-then-pop, a variant of the written-len-or-
+/// needed-len convention:
+///  - > 0:  an event was available and fit in out_cap; it has been POPPED
+///          from the queue and its JSON bytes (<= out_cap) were written
+///          into out_buf. Return value = bytes written.
+///  - an event is available but does NOT fit in out_cap: return value is
+///          the needed length (always > out_cap); the event is left in the
+///          queue (NOT popped) — retry with a buffer of at least that size
+///          to get the exact same event.
+///  - 0:    the queue is empty and the job is still running. Poll again
+///          later.
+///  - -2:   the queue is empty and the job has finished — no more events
+///          will ever arrive for this handle. Call aivpn_ssh_install_free
+///          and stop polling.
+///  - -1:   `handle` is not a currently registered job (never returned by
+///          aivpn_ssh_install_start, or already freed).
+///
+/// @param handle   Job handle from aivpn_ssh_install_start.
+/// @param out_buf  Buffer to receive the event's JSON bytes (NOT
+///                 NUL-terminated). May be NULL only if out_cap is 0.
+/// @param out_cap  Size of out_buf in bytes.
+intptr_t aivpn_ssh_install_poll(
+    int64_t handle,
+    uint8_t *out_buf,
+    size_t out_cap
+);
+
+/// Removes `handle` from the job registry so aivpn_ssh_install_poll no
+/// longer recognizes it. Does NOT cancel an in-flight install: if the
+/// background SSH thread is still running, it keeps producing events into
+/// the registry after this call — those become silent no-ops for `handle`
+/// (nothing leaks, nothing crashes); the SSH session and remote script run
+/// to completion with no observer.
+///
+/// @param handle  Job handle from aivpn_ssh_install_start.
+/// @return 0 if `handle` was found and removed, -1 if it was not
+///         registered (never issued, or already freed).
+int aivpn_ssh_install_free(int64_t handle);
+
 #ifdef __cplusplus
 }
 #endif

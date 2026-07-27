@@ -6,6 +6,8 @@
 #![allow(non_snake_case)]
 
 mod ios_tunnel;
+#[cfg(feature = "ssh-install")]
+mod ssh_install_ffi;
 
 use std::sync::atomic::Ordering;
 

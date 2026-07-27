@@ -8,6 +8,8 @@
 #![allow(non_snake_case)]
 
 mod android_tunnel;
+#[cfg(feature = "ssh-install")]
+mod ssh_job_registry;
 
 use aivpn_common::client_wire::DEFAULT_MDH_LEN;
 use aivpn_common::protocol::ControlPayload;
@@ -960,6 +962,289 @@ fn verify_bootstrap_descriptor_impl(
     }
 
     matches!(descriptor.verify_signature(&public_key), Ok(true))
+}
+
+// ──────────────────────────────────────────────────────────
+// SSH-install JNI bridge (C2b) — in-app aivpn-server installer over SSH.
+//
+// Gated behind the (default-on, see Cargo.toml) `ssh-install` feature, which
+// also gates `aivpn_common::ssh_install` itself. `sshInstallStart` returns
+// immediately with a job handle and drives the actual SSH work (connect,
+// TOFU-verified host key, sftp upload, streamed remote exec) on a dedicated
+// background `std::thread` — never on the calling JNI thread, since a real
+// install can run for minutes. `sshInstallPoll` drains that job's event
+// queue (see `ssh_job_registry`) from the caller's own polling loop/thread.
+//
+// There is no cancellation: `sshInstallFree` only forgets the handle on the
+// Rust side (so its queued events stop being retrievable and the small
+// per-handle allocation is reclaimed) — the background thread, if still
+// running, keeps driving the SSH session to completion regardless, same as
+// closing a file descriptor doesn't stop the write already in flight. A
+// caller that wants to react to "user cancelled" must do so on the platform
+// side (e.g. stop polling, show nothing further); the remote
+// `install-server.sh` run itself completes or fails on its own.
+// ──────────────────────────────────────────────────────────
+
+/// Connects to `host:port` as `user` with no real intent to authenticate,
+/// captures the SSH host key's `SHA256:...` fingerprint during key exchange,
+/// and returns it for the caller to show the user for TOFU confirmation
+/// before calling `sshInstallStart`. Blocks the calling thread (spins up a
+/// throwaway single-thread tokio runtime) — call off the UI thread.
+///
+/// Parameters (Kotlin):
+/// ```kotlin
+/// external fun sshProbeHostkey(host: String, port: Int, user: String): String?
+/// ```
+/// Returns the fingerprint, or `null` on any error (DNS/TCP/protocol
+/// failure, invalid port, bad UTF-8 in `host`/`user`). Never panics across
+/// the FFI boundary.
+#[cfg(feature = "ssh-install")]
+#[no_mangle]
+pub extern "system" fn Java_com_aivpn_client_AivpnJni_sshProbeHostkey<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    host: JString<'local>,
+    port: jint,
+    user: JString<'local>,
+) -> jstring {
+    let host_str = match env.get_string(&host) {
+        Ok(s) => String::from(s),
+        Err(_) => return std::ptr::null_mut(),
+    };
+    let user_str = match env.get_string(&user) {
+        Ok(s) => String::from(s),
+        Err(_) => return std::ptr::null_mut(),
+    };
+    if !(1..=65535).contains(&port) {
+        return std::ptr::null_mut();
+    }
+
+    let target = aivpn_common::ssh_install::SshTarget {
+        host: host_str,
+        port: port as u16,
+        user: user_str,
+    };
+
+    // catch_unwind so a future panic in the SSH/tokio path can never abort
+    // the whole app process across the FFI boundary (mirrors runTunnel/
+    // mgmtRequest above).
+    let fingerprint: Option<String> =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .ok()?;
+            rt.block_on(aivpn_common::ssh_install::probe_host_fingerprint(&target))
+                .ok()
+        }))
+        .unwrap_or(None);
+
+    match fingerprint {
+        Some(fp) => make_str(&mut env, &fp),
+        None => std::ptr::null_mut(),
+    }
+}
+
+/// Returns the SHA256 (hex) of the embedded `install-server.sh`, so the UI
+/// can show the user what will run before they confirm.
+///
+/// Parameters (Kotlin): `external fun sshInstallScriptSha256(): String`
+#[cfg(feature = "ssh-install")]
+#[no_mangle]
+pub extern "system" fn Java_com_aivpn_client_AivpnJni_sshInstallScriptSha256(
+    mut env: JNIEnv,
+    _class: JClass,
+) -> jstring {
+    make_str(
+        &mut env,
+        &aivpn_common::ssh_install::installer_script_sha256_hex(),
+    )
+}
+
+/// Returns the full text of the embedded `install-server.sh`.
+///
+/// Parameters (Kotlin): `external fun sshInstallScript(): String`
+#[cfg(feature = "ssh-install")]
+#[no_mangle]
+pub extern "system" fn Java_com_aivpn_client_AivpnJni_sshInstallScript(
+    mut env: JNIEnv,
+    _class: JClass,
+) -> jstring {
+    make_str(&mut env, aivpn_common::ssh_install::installer_script())
+}
+
+/// Parses `paramsJson` (the same wire contract `install_params_from_json`
+/// documents in aivpn-common — host/port/user/auth/fingerprint/binary/mode/
+/// etc.) and, if valid, spawns a background thread that runs the installer
+/// (`aivpn_common::ssh_install::run_install`) against it, returning
+/// immediately with a job handle to poll via `sshInstallPoll`.
+///
+/// Parameters (Kotlin):
+/// ```kotlin
+/// external fun sshInstallStart(paramsJson: String): Long
+/// ```
+/// Returns the job handle (>=1), or `-1` if `paramsJson` is malformed (bad
+/// UTF-8, invalid JSON, or fails aivpn-common's install-params validation) —
+/// in that case no job is created and there is nothing to poll or free.
+#[cfg(feature = "ssh-install")]
+#[no_mangle]
+pub extern "system" fn Java_com_aivpn_client_AivpnJni_sshInstallStart<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    params_json: JString<'local>,
+) -> jlong {
+    let json = match env.get_string(&params_json) {
+        Ok(s) => String::from(s),
+        Err(_) => return -1,
+    };
+    let params = match aivpn_common::ssh_install::install_params_from_json(&json) {
+        Ok(p) => p,
+        Err(_) => return -1,
+    };
+
+    let handle = ssh_job_registry::registry().create();
+    std::thread::spawn(move || run_ssh_install_job(handle, params));
+    handle
+}
+
+/// Drives a single `run_install` call to completion on the background
+/// thread spawned by `sshInstallStart`, translating each
+/// `aivpn_common::ssh_install::InstallEvent` into its JSON wire form (via
+/// `install_event_to_json`) and pushing it onto `handle`'s event queue as it
+/// happens, then marking the job done so `sshInstallPoll` can report
+/// `PollOutcome::Done`.
+///
+/// `run_install` itself already emits a `Finished` event (with the real
+/// exit code) through the `on_event` callback right before returning `Ok`,
+/// so the `Ok` arm below pushes nothing further. An `Err` return means
+/// `run_install` failed before/without emitting its own `Finished` (e.g. a
+/// connect/auth/host-key-mismatch failure) — that arm synthesizes the
+/// `{"type":"line","line":"ERROR: <err>"}` then
+/// `{"type":"finished","exit_code":-1,"connection_key":null}` pair so a
+/// poller never sees a job that silently stops emitting anything.
+///
+/// Wrapped in `catch_unwind` (this is a plain background thread, not itself
+/// crossing the JNI boundary, but an uncaught panic here would otherwise
+/// leave `handle` marked pending forever — a real job leak, since nothing
+/// else would ever call `mark_done`) — a panic degrades to the same
+/// synthetic error `Finished` event.
+#[cfg(feature = "ssh-install")]
+fn run_ssh_install_job(handle: i64, params: aivpn_common::ssh_install::InstallParams) {
+    use aivpn_common::ssh_install::{install_event_to_json, run_install, InstallEvent};
+
+    let registry = ssh_job_registry::registry();
+    let push_error_and_finish = |msg: String| {
+        registry.push_event(
+            handle,
+            install_event_to_json(&InstallEvent::Line(format!("ERROR: {msg}"))),
+        );
+        registry.push_event(
+            handle,
+            install_event_to_json(&InstallEvent::Finished {
+                exit_code: -1,
+                connection_key: None,
+            }),
+        );
+    };
+
+    let rt = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            push_error_and_finish(format!("failed to start install runtime: {e}"));
+            registry.mark_done(handle);
+            return;
+        }
+    };
+
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        rt.block_on(run_install(params, |ev| {
+            registry.push_event(handle, install_event_to_json(&ev));
+        }))
+    }));
+
+    match outcome {
+        Ok(Ok(_exit_code)) => {}
+        Ok(Err(e)) => push_error_and_finish(e.to_string()),
+        Err(_) => push_error_and_finish("internal error: installer panicked (caught)".to_string()),
+    }
+
+    registry.mark_done(handle);
+}
+
+/// Pops and returns the next queued event (single-line JSON, the same
+/// `install_event_to_json` shape `InstallEvent` documents) for `handle`, or
+/// reports pending/done via nullability.
+///
+/// Parameters (Kotlin):
+/// ```kotlin
+/// external fun sshInstallPoll(handle: Long): String?
+/// ```
+/// - An event is queued → that event's JSON string.
+/// - No event queued, job still running → `null` — poll again later.
+/// - No event queued, job finished → `""` — safe to call `sshInstallFree`.
+/// - `handle` unknown (bad value, or already freed) → `""` (same wire value
+///   as "finished" — nothing further will ever come from this handle).
+///
+/// JNI strings have no size limit worth worrying about here, so each event
+/// is popped and returned whole; there is no separate "peek" call.
+#[cfg(feature = "ssh-install")]
+#[no_mangle]
+pub extern "system" fn Java_com_aivpn_client_AivpnJni_sshInstallPoll(
+    mut env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+) -> jstring {
+    use ssh_job_registry::PollOutcome;
+
+    // catch_unwind so a panic in the registry lock can never abort the app
+    // process across the FFI boundary (mirrors getAttemptedMaskFamily above).
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        ssh_job_registry::registry().poll(handle)
+    }))
+    .unwrap_or(PollOutcome::NotFound);
+
+    match outcome {
+        PollOutcome::Event(json) => make_str(&mut env, &json),
+        PollOutcome::Pending => std::ptr::null_mut(),
+        PollOutcome::Done | PollOutcome::NotFound => make_str(&mut env, ""),
+    }
+}
+
+/// Forgets `handle` on the Rust side, freeing its queued-events storage.
+///
+/// Parameters (Kotlin):
+/// ```kotlin
+/// external fun sshInstallFree(handle: Long): Int
+/// ```
+/// Returns `0` if a job was actually removed, `-1` if `handle` was already
+/// unknown (double-free, or a handle that was never valid).
+///
+/// **No cancellation**: if the background install thread (spawned by
+/// `sshInstallStart`) is still running, freeing the handle does not stop
+/// it — it keeps driving the SSH session (connect/upload/remote exec) to
+/// completion on its own; only its output becomes unobservable (further
+/// `push_event`/`mark_done` calls against the now-missing handle are no-ops
+/// in `ssh_job_registry`). There is currently no SSH-level abort plumbed
+/// through from this JNI layer.
+#[cfg(feature = "ssh-install")]
+#[no_mangle]
+pub extern "system" fn Java_com_aivpn_client_AivpnJni_sshInstallFree(
+    _env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+) -> jint {
+    let freed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        ssh_job_registry::registry().free(handle)
+    }))
+    .unwrap_or(false);
+    if freed {
+        0
+    } else {
+        -1
+    }
 }
 
 // ──────────────────────────────────────────────────────────

@@ -71,6 +71,16 @@ pub struct ServerArgs {
     #[arg(long, value_name = "ROLE")]
     pub role: Option<String>,
 
+    /// Base64-encoded 32-byte X25519 device public key to bind at creation
+    /// time, used with `--add-client` (and `--add-client-one-time`). When
+    /// given, the new client is created device-bound immediately, so it can
+    /// be combined with `--role admin` (or `--role viewer`) to create a
+    /// fully elevated client in one shot — no separate enrollment step.
+    /// Same base64 alphabet/padding as `device_pubkey` in clients.json
+    /// (standard base64, not URL-safe).
+    #[arg(long, value_name = "BASE64")]
+    pub device_pubkey: Option<String>,
+
     /// Public IP of this server (embedded into connection keys).
     /// Required when using --add-client or --show-client to generate connection keys.
     #[arg(long, env = "AIVPN_SERVER_IP")]

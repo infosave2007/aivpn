@@ -25,6 +25,8 @@ pub mod proxy;
 pub mod record_cmd;
 pub mod secure_write;
 pub mod server_pool;
+#[cfg(feature = "ssh-install")]
+pub mod ssh_install_cmd;
 pub mod tunnel;
 
 pub use aivpn_common::mimicry::MimicryEngine;
@@ -32,5 +34,13 @@ pub use aivpn_common::mimicry::MimicryEngine;
 // cores) — re-exported here so existing `crate::qr::...` / `aivpn_client::qr`
 // callers keep working unchanged.
 pub use aivpn_common::qr;
+// Wave C2a/C2b: the SSH-install client (+ embedded installer bundle,
+// high-level orchestration) lives in aivpn-common (shared with the mobile
+// FFI cores) — re-exported here so `crate::ssh_install::...` /
+// `aivpn_client::ssh_install` callers keep working unchanged. Gated so the
+// default build (and the mobile FFI cores, which don't enable this feature)
+// never pull in `russh`/`russh-sftp`.
+#[cfg(feature = "ssh-install")]
+pub use aivpn_common::ssh_install;
 pub use client::AivpnClient;
 pub use tunnel::Tunnel;

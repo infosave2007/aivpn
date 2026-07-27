@@ -506,6 +506,26 @@ impl ClientDatabase {
 
     /// Add a new client, returns the generated config
     pub fn add_client(&self, name: &str) -> Result<ClientConfig> {
+        self.add_client_inner(name, None)
+    }
+
+    /// Add a new client already bound to `device_pubkey` at creation time.
+    ///
+    /// Unlike `add_client`, the returned (and persisted) record has
+    /// `device_pubkey: Some(..)` from the start, so it can be elevated to
+    /// `Viewer`/`Admin` via `update_client` immediately — no separate
+    /// `enroll_device` round trip needed. Used by the SSH installer
+    /// (Phase C) to create a device-bound admin client for the installing
+    /// app in one shot.
+    pub fn add_client_bound(&self, name: &str, device_pubkey: [u8; 32]) -> Result<ClientConfig> {
+        self.add_client_inner(name, Some(device_pubkey))
+    }
+
+    fn add_client_inner(
+        &self,
+        name: &str,
+        device_pubkey: Option<[u8; 32]>,
+    ) -> Result<ClientConfig> {
         let mut data = self.data.write();
 
         // Check name uniqueness (tombstones don't hold their name)
@@ -536,7 +556,7 @@ impl ClientDatabase {
             created_at: Utc::now(),
             stats: ClientStats::default(),
             qos: None,
-            device_pubkey: None,
+            device_pubkey,
             one_time: false,
             expires_at: None,
             updated_at: Some(Utc::now()),
@@ -555,6 +575,28 @@ impl ClientDatabase {
     /// Add a new one-time enrollment client — the first device to connect will be auto-bound.
     pub fn add_client_one_time(&self, name: &str) -> Result<ClientConfig> {
         let mut client = self.add_client(name)?;
+        {
+            let mut data = self.data.write();
+            if let Some(c) = data.clients.iter_mut().find(|c| c.id == client.id) {
+                c.one_time = true;
+                client.one_time = true;
+            }
+        }
+        self.save()?;
+        Ok(client)
+    }
+
+    /// Add a new one-time enrollment client already bound to `device_pubkey`
+    /// at creation time. Combines `add_client_bound` with the `one_time`
+    /// flag: since the device is already known, this mainly buys strict
+    /// per-device mismatch enforcement on re-enroll (same as a client that
+    /// was auto-bound via the classic one-time flow).
+    pub fn add_client_one_time_bound(
+        &self,
+        name: &str,
+        device_pubkey: [u8; 32],
+    ) -> Result<ClientConfig> {
+        let mut client = self.add_client_bound(name, device_pubkey)?;
         {
             let mut data = self.data.write();
             if let Some(c) = data.clients.iter_mut().find(|c| c.id == client.id) {
@@ -3113,6 +3155,97 @@ mod tests {
         )
         .unwrap();
         assert_eq!(db.find_by_id(&client.id).unwrap().role, ClientRole::Admin);
+    }
+
+    // --- Wave C1a: device-bound client creation -------------------------
+
+    #[test]
+    fn add_client_bound_sets_device_pubkey() {
+        let dir = tempfile::tempdir().unwrap();
+        let db =
+            ClientDatabase::load(&dir.path().join("clients.json"), test_network_config()).unwrap();
+        let pubkey = [0x44u8; 32];
+        let client = db.add_client_bound("installer-admin", pubkey).unwrap();
+        assert_eq!(client.device_pubkey, Some(pubkey));
+        assert_eq!(client.role, ClientRole::User);
+
+        // Persisted record must also carry the binding (not just the
+        // in-memory return value).
+        let reloaded = db.find_by_id(&client.id).unwrap();
+        assert_eq!(reloaded.device_pubkey, Some(pubkey));
+    }
+
+    #[test]
+    fn add_client_bound_can_be_elevated_to_admin_immediately() {
+        let dir = tempfile::tempdir().unwrap();
+        let db =
+            ClientDatabase::load(&dir.path().join("clients.json"), test_network_config()).unwrap();
+        let client = db
+            .add_client_bound("installer-admin", [0x55u8; 32])
+            .unwrap();
+
+        // Unlike an unbound client, elevation must succeed right away —
+        // no separate enroll_device() round trip needed.
+        db.update_client(
+            &client.id,
+            UpdateClientParams {
+                role: Some(ClientRole::Admin),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(db.find_by_id(&client.id).unwrap().role, ClientRole::Admin);
+    }
+
+    #[test]
+    fn add_client_still_creates_unbound_client_and_rejects_elevation() {
+        // Regression: plain add_client() must remain device-UNBOUND, and
+        // elevating it without a prior enroll_device() must still fail.
+        let dir = tempfile::tempdir().unwrap();
+        let db =
+            ClientDatabase::load(&dir.path().join("clients.json"), test_network_config()).unwrap();
+        let client = db.add_client("plain").unwrap();
+        assert!(client.device_pubkey.is_none());
+
+        let err = db
+            .update_client(
+                &client.id,
+                UpdateClientParams {
+                    role: Some(ClientRole::Admin),
+                    ..Default::default()
+                },
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("device binding"));
+    }
+
+    #[test]
+    fn add_client_bound_rejects_duplicate_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let db =
+            ClientDatabase::load(&dir.path().join("clients.json"), test_network_config()).unwrap();
+        db.add_client("dup").unwrap();
+        let err = db.add_client_bound("dup", [0x66u8; 32]).unwrap_err();
+        assert!(err.to_string().contains("already exists"));
+    }
+
+    #[test]
+    fn add_client_one_time_bound_sets_pubkey_and_one_time_flag() {
+        let dir = tempfile::tempdir().unwrap();
+        let db =
+            ClientDatabase::load(&dir.path().join("clients.json"), test_network_config()).unwrap();
+        let client = db
+            .add_client_one_time_bound("installer-admin", [0x77u8; 32])
+            .unwrap();
+        assert_eq!(client.device_pubkey, Some([0x77u8; 32]));
+        assert!(client.one_time);
+
+        // A different device presenting the PSK is still rejected.
+        let err = db.enroll_device(&client.id, &[0x88u8; 32]).unwrap_err();
+        assert!(err.to_string().contains("mismatch"));
+
+        // The actual bound device re-enrolling is fine (already matches).
+        assert_eq!(db.enroll_device(&client.id, &[0x77u8; 32]).unwrap(), false);
     }
 
     // --- Wave B2a: per-client exit_node config layer -------------------

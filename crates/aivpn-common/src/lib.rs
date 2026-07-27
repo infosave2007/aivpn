@@ -31,6 +31,9 @@ pub mod upload_pipeline;
 #[cfg(feature = "qr")]
 pub mod qr;
 
+#[cfg(feature = "ssh-install")]
+pub mod ssh_install;
+
 #[cfg(unix)]
 pub mod kernel_accel;
 

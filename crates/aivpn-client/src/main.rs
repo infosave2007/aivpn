@@ -243,6 +243,19 @@ pub enum ClientCommand {
         #[arg(long, default_value = "127.0.0.1:44301")]
         socket: String,
     },
+    /// Wave C2b-CLI: desktop bridge to the server SSH-installer
+    /// (`aivpn_common::ssh_install`, re-exported as `aivpn_client::ssh_install`).
+    /// Lets a GUI (or a human) drive a remote `aivpn-server` install over
+    /// SSH by spawning this subcommand as a subprocess and reading its
+    /// stdout — see `aivpn_client::ssh_install_cmd`'s module doc comment for
+    /// the exact streaming contract. Gated behind the `ssh-install` feature
+    /// so the default build never links `russh`/`russh-sftp`.
+    #[cfg(feature = "ssh-install")]
+    #[command(name = "ssh-install")]
+    SshInstall {
+        #[command(subcommand)]
+        action: aivpn_client::ssh_install_cmd::SshInstallAction,
+    },
 }
 
 #[derive(clap::ValueEnum, Clone, Copy, Debug)]
@@ -637,6 +650,11 @@ async fn main() {
                     }
                 }
                 return;
+            }
+            #[cfg(feature = "ssh-install")]
+            ClientCommand::SshInstall { action } => {
+                let code = aivpn_client::ssh_install_cmd::run(action).await;
+                std::process::exit(code);
             }
             ClientCommand::Record { action } => {
                 match action {

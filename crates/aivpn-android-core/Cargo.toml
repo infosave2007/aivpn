@@ -12,9 +12,15 @@ name = "aivpn_core"
 crate-type = ["cdylib"]
 
 [features]
-default = []
+default = ["ssh-install"]
 # R2 Phase D — client-side inline ML-DPI self-gate (OFF by default).
 client-dpi-gate = ["aivpn-common/client-dpi-gate"]
+# C2b — pure-Rust SSH client + embedded installer bundle for the in-app
+# server installer (JNI bridge in `lib.rs`/`ssh_job_registry.rs`). ON by
+# default: cargo-ndk's `-- build -p aivpn-android-core` (see
+# platforms/android/build-rust-android.sh) passes no --features flag, so the
+# in-app installer must ship in the default .so build to be usable at all.
+ssh-install = ["aivpn-common/ssh-install"]
 
 [dependencies]
 aivpn-common = { path = "../aivpn-common", version = "*", features = ["client-upload", "qr"] }

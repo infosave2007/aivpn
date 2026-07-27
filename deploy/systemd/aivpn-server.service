@@ -1,0 +1,67 @@
+# aivpn-server systemd unit (template)
+#
+# This file is a TEMPLATE: deploy/install-server.sh copies it to
+# /etc/systemd/system/aivpn-server.service and substitutes the
+# __AIVPN_*__ placeholders below with the paths/listen address chosen at
+# install time (see install_systemd_unit() in deploy/install-server.sh).
+# It is safe to install by hand too — just replace the placeholders
+# yourself first, e.g.:
+#
+#   sed -e 's#__AIVPN_LISTEN__#0.0.0.0:443#' \
+#       -e 's#__AIVPN_CONFIG__#/etc/aivpn/server.json#' \
+#       -e 's#__AIVPN_KEYFILE__#/etc/aivpn/server.key#' \
+#       -e 's#__AIVPN_CLIENTS_DB__#/etc/aivpn/clients.json#' \
+#       -e 's#__AIVPN_MASKDIR__#/var/lib/aivpn/masks#' \
+#       -e 's#__AIVPN_MGMT_SOCK__#/run/aivpn/api.sock#' \
+#       -e 's#__AIVPN_AUDITLOG__#/var/log/aivpn/audit.log#' \
+#       -e 's#__AIVPN_BINPATH__#/usr/local/bin/aivpn-server#' \
+#       deploy/systemd/aivpn-server.service > /etc/systemd/system/aivpn-server.service
+
+[Unit]
+Description=AIVPN Server (censorship-resistant VPN gateway)
+Documentation=https://github.com/infosave2007/aivpn
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=__AIVPN_BINPATH__
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+ExecStart=__AIVPN_BINPATH__ \
+  --config __AIVPN_CONFIG__ \
+  --key-file __AIVPN_KEYFILE__ \
+  --clients-db __AIVPN_CLIENTS_DB__ \
+  --mask-dir __AIVPN_MASKDIR__ \
+  --management-socket __AIVPN_MGMT_SOCK__ \
+  --audit-log __AIVPN_AUDITLOG__ \
+  --listen __AIVPN_LISTEN__
+ExecReload=/bin/kill -HUP $MAINPID
+
+# Runs as root: needs to open the TUN device, run NAT/nftables/iptables
+# rule management, and bind privileged ports (e.g. :443). Capabilities are
+# still declared explicitly for clarity/auditability even though root
+# already implies them, and DeviceAllow is required for the TUN device
+# to be reachable under a cgroup-v2 "closed" DevicePolicy regardless of
+# the running user.
+User=root
+Group=root
+AmbientCapabilities=CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_NET_ADMIN
+DeviceAllow=/dev/net/tun rw
+
+RuntimeDirectory=aivpn
+RuntimeDirectoryMode=0750
+StateDirectory=aivpn
+StateDirectoryMode=0750
+LogsDirectory=aivpn
+LogsDirectoryMode=0750
+
+Environment=RUST_LOG=info
+Restart=on-failure
+RestartSec=2
+LimitNOFILE=65536
+TimeoutStopSec=10
+
+[Install]
+WantedBy=multi-user.target
