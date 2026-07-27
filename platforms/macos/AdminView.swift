@@ -145,6 +145,108 @@ private func adminPatchClientBodyJSON(name: String?, enabled: Bool?,
     return (try? JSONSerialization.data(withJSONObject: dict)) ?? Data()
 }
 
+// MARK: - Exit-node picker (G-B1)
+//
+// Drives the Add/Edit exit-node control: a dropdown sourced from
+// `AdminStore.poolNodes` (`GET /api/v1/pool/nodes`, see PoolView.swift's
+// `AdminPoolNodeView`) plus a "(default / none)" entry (empty string — falls
+// back to the server's global `pool.exit_node`) and a "custom" entry that
+// keeps the original free-text host:port field available for an address not
+// in the pool list. `exitNode`/`editExitNode` (the `@State private var
+// String` already wired into create/save below) remains the single value
+// actually sent to the server; this enum only drives which control is shown
+// and, for `.node`, keeps that string in sync with the picker selection.
+private enum ExitNodeChoice: Hashable {
+    case globalDefault
+    case node(String)
+    case custom
+}
+
+/// Best-effort reconstruction of the picker selection that matches an
+/// existing `exit_node` value: an exact match against a known pool node's
+/// `address` selects that node (so editing a client the pool already knows
+/// about shows it as a dropdown pick, not a free-text blob); anything else
+/// (nil/empty, or an address outside the current pool snapshot — e.g. pool
+/// nodes haven't loaded yet, or the value was set by hand/by another
+/// client) falls back to `.globalDefault`/`.custom` respectively, which
+/// keeps the pre-existing free-text value visible and editable either way.
+private func exitNodeChoice(for value: String?, poolNodes: [AdminPoolNodeView]) -> ExitNodeChoice {
+    guard let value = value, !value.isEmpty else { return .globalDefault }
+    if poolNodes.contains(where: { $0.address == value }) {
+        return .node(value)
+    }
+    return .custom
+}
+
+/// G-B1: the exit-node control shared by `AdminAddClientSheet` and
+/// `AdminClientDetailSheet.editForm` — a dropdown sourced from `poolNodes`
+/// (`GET /api/v1/pool/nodes`) plus "(default / none)" and "custom" entries.
+/// `exitNode` is the value actually sent to the server; `choice` only drives
+/// which control is shown, kept in sync with `exitNode` via `onChange`
+/// (see `ExitNodeChoice`'s doc comment above).
+private struct ExitNodePickerView: View {
+    @Binding var exitNode: String
+    @Binding var choice: ExitNodeChoice
+    let poolNodes: [AdminPoolNodeView]
+    @EnvironmentObject var loc: LocalizationManager
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(loc.t("admin_exit_node"))
+                .font(.caption)
+                .foregroundColor(.secondary)
+            Picker("", selection: $choice) {
+                Text(loc.t("admin_exit_node_global")).tag(ExitNodeChoice.globalDefault)
+                ForEach(poolNodes.filter { $0.address != nil }) { node in
+                    Text("\(node.node_id) (\(node.address!))").tag(ExitNodeChoice.node(node.address!))
+                }
+                Text(loc.t("admin_exit_node_custom")).tag(ExitNodeChoice.custom)
+            }
+            .labelsHidden()
+            .onChange(of: choice) { newValue in
+                switch newValue {
+                case .globalDefault: exitNode = ""
+                case .node(let address): exitNode = address
+                case .custom: break
+                }
+            }
+            if choice == .custom {
+                TextField(loc.t("admin_exit_node_placeholder"), text: $exitNode)
+                    .textFieldStyle(.roundedBorder)
+            }
+            // B2b: per-client exit applies live; the global default only
+            // takes effect on the server's next restart.
+            Text(choice == .globalDefault
+                 ? loc.t("admin_exit_node_restart_hint")
+                 : loc.t("admin_exit_node_live_hint"))
+                .font(.system(size: 10))
+                .foregroundColor(.secondary)
+        }
+    }
+}
+
+/// P2: the in-tunnel admin-socket transport this window uses
+/// (`AdminApi.mgmtRequest` → aivpn-client's admin socket →
+/// `mgmt_service::dispatch`) never carries an error body — verified against
+/// `mgmt_service.rs::err_response`, which discards the `MgmtError`'s message
+/// and always returns an empty body for every non-2xx status (unlike the
+/// REST `management_api.rs` path other tooling uses, which does include
+/// `{"error": "..."}`). There is nothing in `platforms/macos` alone that can
+/// recover a body the server never sent, so the achievable improvement here
+/// is a status-specific localized reason instead of one generic string for
+/// every failure — still appending the raw status code for diagnostics.
+private func adminErrorMessage(status: UInt16?, loc: LocalizationManager) -> String {
+    let statusSuffix = status.map { " (\($0))" } ?? ""
+    switch status {
+    case 400: return loc.t("admin_error_bad_request") + statusSuffix
+    case 403: return loc.t("admin_error_forbidden") + statusSuffix
+    case 404: return loc.t("admin_error_not_found") + statusSuffix
+    case 409: return loc.t("admin_error_conflict") + statusSuffix
+    case .some(let s) where s >= 500: return loc.t("admin_error_server") + statusSuffix
+    default: return loc.t("admin_error_generic") + statusSuffix
+    }
+}
+
 // MARK: - Store
 
 /// Owns all client-management state for the Admin window and drives
@@ -162,6 +264,35 @@ final class AdminStore: ObservableObject {
     /// instead of blanking the whole window.
     @Published var channelUnavailable = false
 
+    // MARK: Role (G-A1: Viewer read-only admin UI)
+
+    /// Server-assigned role for the current session, refreshed alongside
+    /// `clients`/`status` every time the window (re)appears — mirrors
+    /// `ContentView`'s own `adminRole` cache but kept independent: this
+    /// window is a long-lived singleton that can stay open across a
+    /// reconnect, so it re-derives its own `canMutate` rather than trusting
+    /// a value threaded in once at construction time. `nil` = unknown/
+    /// unreachable, which `canMutate` below treats as "not Admin" — fails
+    /// closed to read-only, same as `ContentView.adminRole`'s doc comment.
+    @Published var role: UInt8? = nil
+
+    /// True only for a confirmed Admin (2). Viewer (1), User (0), and nil
+    /// (unknown/unreachable) are all read-only. Every mutating control in
+    /// this file (add/edit/revoke/reset-device/exit-node) must be gated on
+    /// this, not just on `role != nil` — a Viewer is a legitimate,
+    /// authenticated session, just not one the server lets mutate (its
+    /// curated `authorize()` restricts Viewer to GET; see AdminApi.swift's
+    /// `auditLog()` doc). Hiding the controls here is defense in depth /
+    /// UX, not the actual security boundary — the server 403s a Viewer's
+    /// mutation attempt regardless of what this app renders.
+    var canMutate: Bool { role == AdminApi.roleAdmin }
+
+    func refreshRole() {
+        run({ AdminApi.role() }) { [weak self] role in
+            self?.role = role
+        }
+    }
+
     // MARK: Pool topology (Wave B3-macOS)
 
     @Published var poolNodes: [AdminPoolNodeView] = []
@@ -171,6 +302,20 @@ final class AdminStore: ObservableObject {
     /// tracked separately so switching to the Pool tab doesn't blank an
     /// already-loaded Clients tab (and vice versa).
     @Published var poolChannelUnavailable = false
+
+    // MARK: Audit log (G-A2)
+
+    @Published var auditEntries: [AdminAuditEntryView] = []
+    @Published var auditVerified: Bool?
+    @Published var auditBrokenAt: Int?
+    @Published var auditLoading = false
+    /// Same "couldn't reach the daemon at all" meaning as `channelUnavailable`/
+    /// `poolChannelUnavailable`, tracked separately so switching tabs never
+    /// blanks an already-loaded pane. A 404 (audit log not configured on
+    /// this server) is NOT this — it's a real status handled inline by
+    /// `AdminAuditLogView` below.
+    @Published var auditChannelUnavailable = false
+    @Published var auditNotConfigured = false
 
     private func run<T>(_ work: @escaping () -> T, completion: @escaping (T) -> Void) {
         DispatchQueue.global(qos: .userInitiated).async {
@@ -338,6 +483,42 @@ final class AdminStore: ObservableObject {
         refreshPoolNodes()
         refreshPoolHealth()
     }
+
+    // MARK: Audit log (G-A2)
+
+    /// `GET /api/v1/audit-log?verify=1` via `AdminApi.auditLog()`. A `404`
+    /// (server has no `--audit-log-path` configured) is surfaced as
+    /// `auditNotConfigured`, distinct from `auditChannelUnavailable`
+    /// (couldn't reach the daemon at all) — both blank `auditEntries`, but
+    /// `AdminAuditLogView` shows a different message for each.
+    func refreshAuditLog() {
+        auditLoading = true
+        run({ AdminApi.auditLog() }) { [weak self] result in
+            guard let self = self else { return }
+            self.auditLoading = false
+            guard let (status, body) = result else {
+                self.auditChannelUnavailable = true
+                self.auditNotConfigured = false
+                self.auditEntries = []
+                self.auditVerified = nil
+                self.auditBrokenAt = nil
+                return
+            }
+            self.auditChannelUnavailable = false
+            guard status == 200,
+                  let decoded = try? JSONDecoder().decode(AdminAuditVerifyView.self, from: body) else {
+                self.auditNotConfigured = true
+                self.auditEntries = []
+                self.auditVerified = nil
+                self.auditBrokenAt = nil
+                return
+            }
+            self.auditNotConfigured = false
+            self.auditEntries = decoded.entries
+            self.auditVerified = decoded.verified
+            self.auditBrokenAt = decoded.broken_at
+        }
+    }
 }
 
 // MARK: - Window controller
@@ -392,11 +573,11 @@ extension Notification.Name {
 // MARK: - Root view
 
 /// Which pane `AdminRootView`'s segmented control shows — client CRUD
-/// (Phase A) or the read-only pool topology view (Wave B3-macOS).
-/// `Hashable` is required both by `Picker`'s `selection:` binding and by
-/// `.onChange(of:)` below.
+/// (Phase A), the read-only pool topology view (Wave B3-macOS), or the
+/// read-only audit log (G-A2). `Hashable` is required both by `Picker`'s
+/// `selection:` binding and by `.onChange(of:)` below.
 enum AdminTab: Hashable {
-    case clients, pool
+    case clients, pool, audit
 }
 
 struct AdminRootView: View {
@@ -424,7 +605,12 @@ struct AdminRootView: View {
                 .buttonStyle(.plain)
                 .help(loc.t("admin_refresh"))
 
-                if selectedTab == .clients {
+                // G-A1: add-client is a mutation — hidden for Viewer (and
+                // while the role is still unknown/unreachable, since
+                // `canMutate` fails closed to false). The server would 403
+                // it anyway; this just keeps a Viewer from seeing a control
+                // that can never succeed for them.
+                if selectedTab == .clients, store.canMutate {
                     Button(action: { showAddSheet = true }) {
                         Image(systemName: "plus")
                     }
@@ -434,35 +620,64 @@ struct AdminRootView: View {
             }
             .padding(16)
 
+            // G-A1: Viewer-mode banner — shown whenever the confirmed role
+            // is Viewer, so it's obvious the mutating controls elsewhere in
+            // this window are hidden on purpose, not missing/broken. Not
+            // shown for `role == nil` (unknown/unreachable — that state
+            // already gets its own `channelUnavailable` messaging per tab)
+            // or for Admin.
+            if store.role == AdminApi.roleViewer {
+                HStack(spacing: 6) {
+                    Image(systemName: "eye")
+                        .font(.caption)
+                    Text(loc.t("admin_viewer_mode_banner"))
+                        .font(.caption)
+                }
+                .foregroundColor(.secondary)
+                .padding(.horizontal, 16)
+                .padding(.bottom, 8)
+            }
+
             Picker("", selection: $selectedTab) {
                 Text(loc.t("admin_tab_clients")).tag(AdminTab.clients)
                 Text(loc.t("admin_tab_pool")).tag(AdminTab.pool)
+                Text(loc.t("admin_tab_audit")).tag(AdminTab.audit)
             }
             .pickerStyle(.segmented)
             .labelsHidden()
             .padding(.horizontal, 16)
             .padding(.bottom, 12)
             .onChange(of: selectedTab) { newValue in
-                if newValue == .pool { store.refreshPool() }
+                switch newValue {
+                case .pool: store.refreshPool()
+                case .audit: store.refreshAuditLog()
+                case .clients: break
+                }
             }
 
             Divider()
 
-            if selectedTab == .clients {
+            switch selectedTab {
+            case .clients:
                 content
-            } else {
+            case .pool:
                 AdminPoolView(store: store)
+            case .audit:
+                AdminAuditLogView(store: store)
             }
         }
         .frame(minWidth: 480, minHeight: 420)
         .onAppear {
+            store.refreshRole()
             store.refreshClients()
             store.refreshStatus()
         }
         .onReceive(NotificationCenter.default.publisher(for: .adminWindowDidShow)) { _ in
+            store.refreshRole()
             store.refreshClients()
             store.refreshStatus()
             if selectedTab == .pool { store.refreshPool() }
+            if selectedTab == .audit { store.refreshAuditLog() }
         }
         .sheet(isPresented: $showAddSheet) {
             AdminAddClientSheet(store: store, isPresented: $showAddSheet)
@@ -481,6 +696,8 @@ struct AdminRootView: View {
             store.refreshStatus()
         case .pool:
             store.refreshPool()
+        case .audit:
+            store.refreshAuditLog()
         }
     }
 
@@ -607,8 +824,14 @@ struct AdminAddClientSheet: View {
     @State private var expiresAt = Date().addingTimeInterval(86400 * 30)
     /// Wave B3-macOS: `host:port`, empty = use the server's global default
     /// (`pool.exit_node`). Applied via a follow-up `PATCH` after creation —
-    /// see `AdminStore.createClient`'s doc comment for why.
+    /// see `AdminStore.createClient`'s doc comment for why. G-B1: the value
+    /// actually sent — kept in sync with `exitNodeChoice` below (see that
+    /// enum's doc comment); a `.custom` pick leaves this as whatever the
+    /// user types.
     @State private var exitNode = ""
+    /// G-B1: drives which exit-node control is shown (dropdown vs. the
+    /// original free-text field).
+    @State private var exitNodeChoice: ExitNodeChoice = .globalDefault
     @State private var isCreating = false
     @State private var errorText: String?
 
@@ -630,13 +853,7 @@ struct AdminAddClientSheet: View {
                            displayedComponents: [.date, .hourAndMinute])
             }
 
-            VStack(alignment: .leading, spacing: 4) {
-                Text(loc.t("admin_exit_node"))
-                    .font(.caption)
-                    .foregroundColor(.secondary)
-                TextField(loc.t("admin_exit_node_placeholder"), text: $exitNode)
-                    .textFieldStyle(.roundedBorder)
-            }
+            exitNodePicker
 
             if let errorText = errorText {
                 Text(errorText)
@@ -656,6 +873,16 @@ struct AdminAddClientSheet: View {
         }
         .padding(20)
         .frame(width: 360)
+        .onAppear {
+            // Pool nodes may not have been fetched yet if the Pool tab was
+            // never visited this session — refresh so the dropdown has real
+            // entries instead of just "(default)"/"custom".
+            store.refreshPoolNodes()
+        }
+    }
+
+    private var exitNodePicker: some View {
+        ExitNodePickerView(exitNode: $exitNode, choice: $exitNodeChoice, poolNodes: store.poolNodes)
     }
 
     private func createTapped() {
@@ -669,7 +896,7 @@ struct AdminAddClientSheet: View {
             if success {
                 isPresented = false
             } else {
-                errorText = loc.t("admin_error_generic") + (status.map { " (\($0))" } ?? "")
+                errorText = adminErrorMessage(status: status, loc: loc)
             }
         }
     }
@@ -691,6 +918,9 @@ struct AdminClientDetailSheet: View {
     /// Wave B3-macOS: `host:port`, empty = clear (fall back to the global
     /// default). Pre-filled from `client.exit_node` in `.onAppear` below.
     @State private var editExitNode: String = ""
+    /// G-B1: drives which exit-node control `editForm` shows — see
+    /// `ExitNodePickerView`/`ExitNodeChoice`'s doc comments.
+    @State private var editExitNodeChoice: ExitNodeChoice = .globalDefault
     @State private var isSaving = false
 
     @State private var showRevokeConfirm = false
@@ -743,6 +973,12 @@ struct AdminClientDetailSheet: View {
                 editExpiresAt = Date().addingTimeInterval(86400 * 30)
             }
             editExitNode = client.exit_node ?? ""
+            // Best-effort match against whatever `store.poolNodes` already
+            // holds (may still be empty on first open — see the
+            // `refreshPoolNodes()` call right below, and `exitNodeChoice
+            // (for:poolNodes:)`'s doc comment for the fallback behavior).
+            editExitNodeChoice = exitNodeChoice(for: client.exit_node, poolNodes: store.poolNodes)
+            store.refreshPoolNodes()
         }
         .confirmationDialog(loc.t("admin_revoke_confirm_title"), isPresented: $showRevokeConfirm) {
             Button(loc.t("admin_revoke"), role: .destructive) { revokeTapped() }
@@ -791,9 +1027,15 @@ struct AdminClientDetailSheet: View {
             infoRow(icon: "arrow.triangle.branch",
                      text: "\(loc.t("admin_exit_node_current")): \(client.exit_node ?? loc.t("admin_exit_node_global"))")
 
-            Button(loc.t("admin_edit")) { isEditing = true }
-                .buttonStyle(.bordered)
-                .padding(.top, 4)
+            // G-A1: editing is a mutation — Viewer never sees the button
+            // that would open `editForm` (the server would 403 the PATCH
+            // regardless, but a Viewer shouldn't be led into a dead-end
+            // edit flow).
+            if store.canMutate {
+                Button(loc.t("admin_edit")) { isEditing = true }
+                    .buttonStyle(.bordered)
+                    .padding(.top, 4)
+            }
         }
     }
 
@@ -830,13 +1072,7 @@ struct AdminClientDetailSheet: View {
                 DatePicker(loc.t("admin_expires_at"), selection: $editExpiresAt,
                            displayedComponents: [.date, .hourAndMinute])
             }
-            VStack(alignment: .leading, spacing: 4) {
-                Text(loc.t("admin_exit_node"))
-                    .font(.caption)
-                    .foregroundColor(.secondary)
-                TextField(loc.t("admin_exit_node_placeholder"), text: $editExitNode)
-                    .textFieldStyle(.roundedBorder)
-            }
+            ExitNodePickerView(exitNode: $editExitNode, choice: $editExitNodeChoice, poolNodes: store.poolNodes)
             HStack {
                 Spacer()
                 Button(loc.t("admin_cancel")) { isEditing = false }
@@ -892,16 +1128,26 @@ struct AdminClientDetailSheet: View {
         }
     }
 
+    // G-A1: reset-device/revoke are mutations — hidden entirely for
+    // Viewer, not just disabled, so a Viewer never sees an action they
+    // could tap that the server would then 403. `actionsSection` itself
+    // becomes an empty `VStack` when `!store.canMutate`, which is fine —
+    // the surrounding `ScrollView`/`Divider`s already handle a missing
+    // section gracefully (same as when `client.expires_at`/`exit_node`
+    // are nil elsewhere in this sheet).
+    @ViewBuilder
     private var actionsSection: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Button(loc.t("admin_reset_device")) { showResetConfirm = true }
-                .buttonStyle(.bordered)
-                .disabled(isBusy)
+        if store.canMutate {
+            VStack(alignment: .leading, spacing: 8) {
+                Button(loc.t("admin_reset_device")) { showResetConfirm = true }
+                    .buttonStyle(.bordered)
+                    .disabled(isBusy)
 
-            Button(loc.t("admin_revoke")) { showRevokeConfirm = true }
-                .buttonStyle(.bordered)
-                .tint(.red)
-                .disabled(isBusy)
+                Button(loc.t("admin_revoke")) { showRevokeConfirm = true }
+                    .buttonStyle(.bordered)
+                    .tint(.red)
+                    .disabled(isBusy)
+            }
         }
     }
 
@@ -930,7 +1176,7 @@ struct AdminClientDetailSheet: View {
             if success {
                 dismiss()
             } else {
-                actionError = loc.t("admin_error_generic") + (status.map { " (\($0))" } ?? "")
+                actionError = adminErrorMessage(status: status, loc: loc)
             }
         }
     }
@@ -943,7 +1189,7 @@ struct AdminClientDetailSheet: View {
             if success {
                 dismiss()
             } else {
-                actionError = loc.t("admin_error_generic") + (status.map { " (\($0))" } ?? "")
+                actionError = adminErrorMessage(status: status, loc: loc)
             }
         }
     }
@@ -954,7 +1200,7 @@ struct AdminClientDetailSheet: View {
         store.resetDevice(id: client.id) { success, status in
             isBusy = false
             if !success {
-                actionError = loc.t("admin_error_generic") + (status.map { " (\($0))" } ?? "")
+                actionError = adminErrorMessage(status: status, loc: loc)
             }
         }
     }

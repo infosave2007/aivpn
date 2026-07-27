@@ -701,6 +701,30 @@ func connectionEvidenceFresh(maxAgeSeconds: TimeInterval = 10) -> Bool {
     return true
 }
 
+/// G-A4: scans `logContent` (most recent line first) for the client's
+/// machine-readable `"AIVPN-STATUS rejected <token>"` stdout line — printed
+/// exactly once, right before the client exits, by the `HandshakeReject`
+/// arm in crates/aivpn-client/src/client.rs (`handshake_reject_token()`
+/// there defines the token set: one_time_used/expired/disabled/
+/// unspecified). Returns the raw token (never the surrounding line) so the
+/// GUI (VPNManager.pollStatus) can localize it without depending on the
+/// client's English log wording — mirrors how the Linux/Windows GUIs parse
+/// the same line straight off the child process's stdout; this daemon
+/// instead redirects that stdout into `LOG_PATH` (see `startClient`), so
+/// `getStatus()` has to recover the line from the log file instead.
+func rejectToken(in logContent: String) -> String? {
+    let prefix = "AIVPN-STATUS rejected "
+    for line in logContent.components(separatedBy: "\n").reversed() {
+        let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.hasPrefix(prefix) {
+            let token = String(trimmed.dropFirst(prefix.count))
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            return token.isEmpty ? "unspecified" : token
+        }
+    }
+    return nil
+}
+
 /// Decides Connected/not from the MOST RECENT transition line in the log.
 /// A `contains` over the whole log latched Connected forever once any historic
 /// line matched — even while the client was midway through its in-process
@@ -733,6 +757,19 @@ func getStatus() -> HelperResponse {
         }
         // Check log for connection status
         if let logContent = try? String(contentsOfFile: LOG_PATH, encoding: .utf8) {
+            // G-A4: an authenticated terminal refusal takes priority over
+            // both the Connected-transition check and the generic
+            // error-line fallback below. The client always exits right
+            // after printing this line (see rejectToken's doc comment), so
+            // by the time this poll runs the process may already be gone —
+            // checking here (while the pid was still recognized alive a few
+            // lines up) catches it the SAME poll cycle instead of racing the
+            // "process exited" branch further down for one extra 2s tick.
+            if let token = rejectToken(in: logContent) {
+                return HelperResponse(status: "ok", message: "AIVPN-STATUS rejected \(token)",
+                                      connected: false, pid: Int(managedPID),
+                                      version: HELPER_VERSION)
+            }
             if lastLogTransitionIsConnected(logContent), connectionEvidenceFresh() {
                 isConnected = true
                 return HelperResponse(status: "ok", message: "Connected",
@@ -785,15 +822,24 @@ func getStatus() -> HelperResponse {
 
         var errorMsg = "Process exited"
         if let logContent = try? String(contentsOfFile: LOG_PATH, encoding: .utf8) {
-            let lines = logContent.components(separatedBy: "\n").filter { !$0.isEmpty }
-            if let last = lines.last {
-                let cleanLast = last.replacingOccurrences(
-                    of: "\u{001b}\\[[0-9;]*m", with: "", options: .regularExpression
-                )
-                // Level-token match only — a plain substring "error" would
-                // misreport ordinary INFO lines (URLs, counters) as failures.
-                if isErrorLogLine(cleanLast) {
-                    errorMsg = String(cleanLast.prefix(200))
+            // G-A4: same priority as the still-alive branch above — this is
+            // the path that normally wins the race (the client's own
+            // `terminal_rejected` break in main.rs exits the process right
+            // after printing the line, so by the next poll it's usually
+            // already reaped here rather than caught above).
+            if let token = rejectToken(in: logContent) {
+                errorMsg = "AIVPN-STATUS rejected \(token)"
+            } else {
+                let lines = logContent.components(separatedBy: "\n").filter { !$0.isEmpty }
+                if let last = lines.last {
+                    let cleanLast = last.replacingOccurrences(
+                        of: "\u{001b}\\[[0-9;]*m", with: "", options: .regularExpression
+                    )
+                    // Level-token match only — a plain substring "error" would
+                    // misreport ordinary INFO lines (URLs, counters) as failures.
+                    if isErrorLogLine(cleanLast) {
+                        errorMsg = String(cleanLast.prefix(200))
+                    }
                 }
             }
         }

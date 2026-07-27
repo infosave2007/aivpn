@@ -113,9 +113,10 @@ struct AdminPoolHealth: Codable {
     let subnet_mismatch: Bool
 }
 
-/// Mirrors `audit_log::AuditEntry`. `actor` has no `#[serde(rename_all)]`
-/// on `AuditActor`, so it serializes as the plain enum-variant string:
-/// "Cli" | "Api" | "System".
+/// Mirrors `audit_log::AuditEntry`. `AuditActor` IS `#[serde(rename_all =
+/// "snake_case")]` (verified in crates/aivpn-server/src/audit_log.rs), so
+/// `actor` serializes lowercase: "cli" | "api" | "system" — NOT the
+/// capitalized Rust variant names.
 struct AdminAuditEntry: Codable, Identifiable {
     let ts: String
     let actor: String
@@ -128,6 +129,25 @@ struct AdminAuditEntry: Codable, Identifiable {
     var id: String { hash.isEmpty ? "\(ts)-\(action)-\(target)" : hash }
 }
 
+/// Mirrors `mgmt_service::AuditVerifyView` (`GET .../audit-log?verify=1`'s
+/// response shape — `{ entries, verified, broken_at }`). `broken_at` is the
+/// tail-window index (0-based, oldest-first, matching `entries`) where
+/// `audit_log::verify_chain` detected a hash-chain break, or `nil` when the
+/// returned window verified clean; see that field's doc comment
+/// server-side for the tail-window caveat (it verifies only the returned
+/// window, not the whole on-disk log, when `limit` didn't cover it).
+struct AdminAuditLogResult: Codable {
+    let entries: [AdminAuditEntry]
+    let verified: Bool
+    let brokenAt: Int?
+
+    enum CodingKeys: String, CodingKey {
+        case entries
+        case verified
+        case brokenAt = "broken_at"
+    }
+}
+
 /// Mirrors the tunnel dispatch's `GET .../connection-key` body:
 /// `json_response(200, &serde_json::json!({ "connection_key": key }))`
 /// (unified with the REST handler's field name).
@@ -136,6 +156,32 @@ private struct AdminConnectionKeyResponse: Codable {
     enum CodingKeys: String, CodingKey {
         case key = "connection_key"
     }
+}
+
+// MARK: - Apply-with-rollback config models (Wave 2 / G-A3, mirror
+// mgmt_service.rs's `ApplyResponse` and management_api.rs's `MaskInfo`)
+
+/// Mirrors `management_api.rs::MaskInfo` (the `GET /api/v1/masks` REST
+/// response shape). `modified` is `Option<DateTime<Utc>>` server-side,
+/// kept as a raw RFC3339 `String?` here for the same reason
+/// `AdminClient`'s date fields are — a decode-strategy mismatch must never
+/// fail the whole list.
+struct AdminMaskInfo: Identifiable, Codable {
+    let id: String
+    let file: String
+    let size_bytes: UInt64
+    let modified: String?
+    let generated: Bool
+}
+
+/// Mirrors `mgmt_service::ApplyResponse` (`POST /api/v1/config/apply`'s
+/// response body). `token` must be handed to `AdminApi.confirmConfig`
+/// within the server's rollback window (`pending_config::
+/// PENDING_CONFIG_TIMEOUT` — 120s at time of writing) or the gateway's
+/// sweep task silently reverts the write.
+struct AdminApplyResponse: Codable {
+    let token: String
+    let applied: Bool
 }
 
 // MARK: - Errors
@@ -440,10 +486,96 @@ enum AdminApi {
         await getJSON("/api/v1/pool/links")
     }
 
-    /// `GET /api/v1/audit-log?limit=N` (server clamps to
-    /// `[1, MAX_AUDIT_LIMIT]`, defaults if unparsable).
-    static func auditLog(limit: Int = 100) async -> Result<[AdminAuditEntry], AdminApiError> {
-        await getJSON("/api/v1/audit-log?limit=\(limit)")
+    /// `GET /api/v1/audit-log?limit=N&verify=1` (server clamps `limit` to
+    /// `[1, MAX_AUDIT_LIMIT]`, defaults if unparsable; `verify=1` switches
+    /// the response shape from a plain array to `AuditVerifyView`, adding
+    /// hash-chain verification of the returned window — see
+    /// `AdminAuditLogResult`'s doc comment). Available to Viewer and Admin
+    /// alike — `authorize()` allows every GET route to Viewer role.
+    static func auditLog(limit: Int = 100) async -> Result<AdminAuditLogResult, AdminApiError> {
+        await getJSON("/api/v1/audit-log?limit=\(limit)&verify=1")
+    }
+
+    // MARK: Apply-with-rollback config (Wave 2 / G-A3 — mgmt_service.rs's
+    // "Apply-with-rollback for heavy config" section: `POST
+    // /api/v1/config/{apply,confirm}`, dispatched over the SAME curated
+    // tunnel allowlist as every other call here — `classify_route` maps
+    // `(POST, ["config","apply"])`/`(POST, ["config","confirm"])` to
+    // `Route::ConfigApply`/`Route::ConfigConfirm`, Admin-only.)
+
+    /// `POST /api/v1/config/apply` selecting `HeavySetting::ActiveMask` —
+    /// sets `client`'s per-client active-mask override to `mask` (writes
+    /// `<mask_dir>/.overrides/<client-id>.mask`), LIVE, no reconnect
+    /// needed. Mirrors `TunnelApplyRequest`'s "field presence, not a type
+    /// tag" convention server-side: this omits the `exit_node` key
+    /// entirely (never sends it, not even `null`) so the server resolves
+    /// `HeavySetting::ActiveMask` from `client`/`mask` instead of
+    /// `HeavySetting::ExitNode`. `client` MUST be a real, non-empty
+    /// client id or name — `resolve_heavy_setting` 400s on an empty
+    /// value (see that function's doc comment), there is no "server-wide"
+    /// sentinel. Returns a token that must reach `confirmConfig` within
+    /// the server's rollback window or the write auto-reverts.
+    static func applyActiveMask(client: String, mask: String) async -> Result<AdminApplyResponse, AdminApiError> {
+        let body = jsonBody(["client": client, "mask": mask])
+        return await sendJSON(method: 1, path: "/api/v1/config/apply", body: body)
+    }
+
+    /// `POST /api/v1/config/apply` selecting `HeavySetting::ExitNode` —
+    /// stages the server's GLOBAL default exit node (`pool.exit_node` in
+    /// `server.json`), or clears it when `addr == nil`. Presence of the
+    /// `exit_node` key (even as JSON `null`) is what selects this
+    /// `HeavySetting` variant server-side — see `TunnelApplyRequest`'s doc
+    /// comment. UNLIKE the per-client exit-node PATCH
+    /// (`AdminApi.patchClient(exitNode:)`), this does NOT take effect
+    /// live: `pool.exit_node` is only read at server startup, so the new
+    /// value applies after the next server restart (see
+    /// `HeavySetting::ExitNode`'s doc comment server-side). Returns a
+    /// token that must reach `confirmConfig` within the server's rollback
+    /// window or the write auto-reverts.
+    static func applyGlobalExitNode(_ addr: String?) async -> Result<AdminApplyResponse, AdminApiError> {
+        // `addr ?? NSNull()` does not type-check here (`String?` and
+        // `NSNull` don't unify under `??`) — build the dict explicitly,
+        // same pattern `patchClient`'s `exitNode: .clear` branch uses.
+        var dict: [String: Any] = [:]
+        if let addr {
+            dict["exit_node"] = addr
+        } else {
+            dict["exit_node"] = NSNull()
+        }
+        return await sendJSON(method: 1, path: "/api/v1/config/apply", body: jsonBody(dict))
+    }
+
+    /// `POST /api/v1/config/confirm` — makes a pending `applyActiveMask`/
+    /// `applyGlobalExitNode` write permanent instead of letting the
+    /// gateway's sweep task auto-revert it once the rollback window
+    /// elapses. 204 on success.
+    static func confirmConfig(token: String) async -> Result<Void, AdminApiError> {
+        await sendNoContent(method: 1, path: "/api/v1/config/confirm", body: jsonBody(["token": token]))
+    }
+
+    /// `GET /api/v1/masks` — lists mask profiles on disk (mirrors
+    /// `management_api.rs::list_masks`/`MaskInfo`).
+    ///
+    /// KNOWN GAP (verified by reading `mgmt_service.rs`'s
+    /// `classify_route`, not guessed): as of this writing, `classify_route`
+    /// has NO `Masks*` arm — only `Status`/`Clients*`/`AuditLog`/
+    /// `ConfigApply`/`ConfigConfirm`/`Pool*` are in the curated tunnel
+    /// allowlist `aivpn_mgmt_request` can reach. So this call currently
+    /// always returns `.failure(.http(status: 404))` over the tunnel,
+    /// for every role including Admin — `/api/v1/masks` is reachable only
+    /// from the REST/web-panel path (`management_api.rs`, a DIFFERENT
+    /// trust boundary iOS has no access to), not from this FFI. Kept as a
+    /// correctly-typed, forward-compatible wrapper (same shape the web
+    /// panel's `masks.list()` uses) for the day `classify_route` gains a
+    /// `Masks` arm; callers MUST treat a failure here as expected on
+    /// today's server and fall back to another mask-id source — see
+    /// `ServerSettingsView.swift`'s `serverSettingsLoadMaskChoices()`,
+    /// which falls back to the live session's `VPNManager.maskCatalog`
+    /// (the same `mask_id`/`generated` shape, sourced from the
+    /// `ControlPayload::MaskCatalog` this session already received over
+    /// the control channel) when this returns empty/failed.
+    static func listMasks() async -> Result<[AdminMaskInfo], AdminApiError> {
+        await getJSON("/api/v1/masks")
     }
 
     private static let iso8601 = ISO8601DateFormatter()

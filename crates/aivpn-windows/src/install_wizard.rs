@@ -271,6 +271,25 @@ fn gui_process_exit_line(exit_code: i32, msg: Option<&str>) -> InstallLine {
     }
 }
 
+/// G-C1: whether a just-parsed marker's `connection_key` should be
+/// auto-imported into the key store immediately, replacing the old design
+/// where the finished-install screen required a manual "Import profile"
+/// click. `true` only when all three hold: the marker actually carries a
+/// key (by construction only the terminal `done`/`client_done` marker ever
+/// does — see `parse_install_line_client_done_success_with_connection_key`
+/// below), its `status` is `"ok"` (defense-in-depth: never auto-add a key
+/// from an error-status line even in a hypothetical malformed marker that
+/// carries both), and nothing has been imported yet this run (so a
+/// duplicate/replayed marker — or the main loop observing the same
+/// `InstallLine` twice — can't add the same profile a second time).
+pub fn should_auto_import(
+    status: &str,
+    connection_key: &Option<String>,
+    already_imported: bool,
+) -> bool {
+    !already_imported && status == "ok" && connection_key.is_some()
+}
+
 // ── IO drivers — validated against a live/VM SSH server, not unit-tested ──
 
 #[cfg(windows)]
@@ -735,5 +754,33 @@ mod tests {
             }
             _ => panic!("expected Marker"),
         }
+    }
+
+    // --- should_auto_import (G-C1) --------------------------------------------
+
+    #[test]
+    fn should_auto_import_true_for_ok_marker_with_key_first_time() {
+        let key = Some("aivpn://server.example.com:51820?k=abc".to_string());
+        assert!(should_auto_import("ok", &key, false));
+    }
+
+    #[test]
+    fn should_auto_import_false_when_already_imported() {
+        let key = Some("aivpn://server.example.com:51820?k=abc".to_string());
+        assert!(!should_auto_import("ok", &key, true));
+    }
+
+    #[test]
+    fn should_auto_import_false_without_a_key() {
+        assert!(!should_auto_import("ok", &None, false));
+    }
+
+    #[test]
+    fn should_auto_import_false_for_non_ok_status_even_with_a_key() {
+        // Defense-in-depth: the CLI never actually attaches a key to a
+        // non-"ok" marker, but the gate must not trust that blindly.
+        let key = Some("aivpn://server.example.com:51820?k=abc".to_string());
+        assert!(!should_auto_import("error", &key, false));
+        assert!(!should_auto_import("info", &key, false));
     }
 }

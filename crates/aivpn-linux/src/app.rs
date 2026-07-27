@@ -6,7 +6,10 @@ use iced::{Alignment, Background, Border, Color, Element, Length, Subscription, 
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncBufReadExt, BufReader};
 
-use crate::admin::{self, ClientRecord, EditClientArgs, NewClientArgs, PoolHealth, PoolNode};
+use crate::admin::{
+    self, AuditLogView, ClientRecord, ConfigSetting, EditClientArgs, NewClientArgs, PoolHealth,
+    PoolNode,
+};
 use crate::install_wizard::{
     self, BinarySourceOpt, InstallAuth, InstallLine, InstallModeOpt, InstallTarget,
 };
@@ -20,6 +23,17 @@ use crate::vpn_manager::{
 use notify_rust;
 
 const MAX_LOG_LINES: usize = 200;
+
+/// G-A3: client-side estimate of the server's `PENDING_CONFIG_TIMEOUT`
+/// (`pending_config.rs`, ~120s) — the countdown shown next to the "Confirm"
+/// button in Server Settings. Deliberately approximate: this GUI never
+/// learns the server's real deadline over the wire (`config/apply`'s
+/// response carries only the token), so a `Confirm` sent right as this
+/// client-side timer hits 0 may still occasionally race an
+/// already-rolled-back server — surfaced as a normal `confirm_config`
+/// error, not a hang, since the server is the sole source of truth for the
+/// actual expiry.
+const SERVER_SETTINGS_CONFIRM_WINDOW_SECS: u32 = 120;
 
 fn strip_ansi(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
@@ -715,6 +729,10 @@ pub enum Message {
     AdminNewOneTimeToggled(bool),
     AdminNewExpiresChanged(String),
     AdminNewExitNodeChanged(String),
+    /// G-B1: pick_list convenience selector beside `AdminNewExitNodeChanged`'s
+    /// free-text field — `Default`/`Node(addr)` overwrite the field,
+    /// `Custom` is a no-op (see `ExitNodeSelection`).
+    AdminNewExitNodePicked(ExitNodeChoice),
     AdminAddClient,
     AdminAddClientResult(Result<ClientRecord, String>),
     AdminToggleEnabled(String, bool),
@@ -723,6 +741,9 @@ pub enum Message {
     AdminEditNameChanged(String),
     AdminEditExpiresChanged(String),
     AdminEditExitNodeChanged(String),
+    /// G-B1: same convenience selector as `AdminNewExitNodePicked`, for the
+    /// per-client edit row's exit-node field.
+    AdminEditExitNodePicked(ExitNodeChoice),
     AdminEditSave,
     AdminEditCancel,
     AdminEditResult(Result<ClientRecord, String>),
@@ -747,6 +768,27 @@ pub enum Message {
     PoolRefresh,
     PoolNodesLoaded(Result<Vec<PoolNode>, String>),
     PoolHealthLoaded(Result<PoolHealth, String>),
+    // ── G-A2: audit-log panel (Viewer + Admin, GET-only, hash-chain view) ──
+    ToggleAuditPanel,
+    AuditRefresh,
+    AuditLogLoaded(Result<AuditLogView, String>),
+    // ── G-A3: Server Settings (Admin-only apply-with-rollback) ──────────
+    ToggleServerSettingsPanel,
+    ServerSettingsMaskClientPicked(AdminClientChoice),
+    ServerSettingsMaskPicked(MaskChoice),
+    ServerSettingsApplyMask,
+    ServerSettingsExitNodeChanged(String),
+    /// G-B1-style convenience selector beside `ServerSettingsExitNodeChanged`'s
+    /// free-text field — `Default`/`Node(addr)` overwrite the field, `Custom`
+    /// is a no-op (see `ExitNodeSelection`).
+    ServerSettingsExitNodePicked(ExitNodeChoice),
+    ServerSettingsApplyExitNode,
+    ServerSettingsApplyResult(ServerSettingsPendingKind, Result<String, String>),
+    ServerSettingsConfirm,
+    ServerSettingsConfirmResult(Result<(), String>),
+    /// Once-a-second tick while `server_settings_pending.is_some()` — see
+    /// the conditional `Subscription` in `subscription()`.
+    ServerSettingsCountdownTick,
     // ── C3: "Install server via SSH" wizard ─────────────────────────────
     ToggleInstallWizard,
     InstallHostChanged(String),
@@ -1007,6 +1049,130 @@ impl std::fmt::Display for MaskChoice {
     }
 }
 
+/// G-B1: what picking a given `ExitNodeChoice` in the exit-node `pick_list`
+/// does to the free-text `admin_new_exit_node`/`admin_edit_exit_node` field
+/// it sits beside.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExitNodeSelection {
+    /// Clears the field — empty means "fall back to the pool's global
+    /// default" server-side (`exit_node: None`/`null`).
+    Default,
+    /// Fills the field with this pool node's `host:port` verbatim (from
+    /// `GET /api/v1/pool/nodes`'s `address`).
+    Node(String),
+    /// Leaves the field exactly as the user last typed it — the free-text
+    /// path (`text_input` beside the picker) is unchanged/unremoved by G-B1,
+    /// this is just the dropdown's "I'm typing something not in the list"
+    /// entry so it can still show *something* selected.
+    Custom,
+}
+
+/// One entry in the exit-node `pick_list` — mirrors `MaskChoice`'s
+/// id+display shape (`selection` drives the on-pick side effect above,
+/// `display` is what's rendered/what `PartialEq`-matches the currently
+/// selected row).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExitNodeChoice {
+    pub selection: ExitNodeSelection,
+    pub display: String,
+}
+
+impl std::fmt::Display for ExitNodeChoice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.display)
+    }
+}
+
+/// Builds the exit-node picker's option list: "(default)" first, then every
+/// pool node with a non-empty `address` (verified/unverified/offline all
+/// included — the picker doesn't second-guess reachability, same as the
+/// existing free-text path never did), then "Custom..." last.
+fn exit_node_choices(lang: &str, pool_nodes: &[PoolNode]) -> Vec<ExitNodeChoice> {
+    let mut choices = vec![ExitNodeChoice {
+        selection: ExitNodeSelection::Default,
+        display: t(lang, "(default)").to_string(),
+    }];
+    for n in pool_nodes {
+        if let Some(addr) = n.address.as_ref().filter(|a| !a.trim().is_empty()) {
+            choices.push(ExitNodeChoice {
+                selection: ExitNodeSelection::Node(addr.clone()),
+                display: addr.clone(),
+            });
+        }
+    }
+    choices.push(ExitNodeChoice {
+        selection: ExitNodeSelection::Custom,
+        display: t(lang, "Custom...").to_string(),
+    });
+    choices
+}
+
+/// Which `exit_node_choices()` entry currently matches `text` (the live
+/// content of the free-text field), so the picker highlights the right row
+/// instead of going blank the moment the user picks a preset. Falls back to
+/// the list's "Custom..." entry for anything that isn't empty and isn't a
+/// known pool-node address — i.e. manually-typed `host:port` values keep
+/// working exactly as before, just shown as "Custom..." in the dropdown.
+fn exit_node_selected(text: &str, choices: &[ExitNodeChoice]) -> Option<ExitNodeChoice> {
+    if text.is_empty() {
+        return choices
+            .iter()
+            .find(|c| c.selection == ExitNodeSelection::Default)
+            .cloned();
+    }
+    choices
+        .iter()
+        .find(|c| matches!(&c.selection, ExitNodeSelection::Node(addr) if addr == text))
+        .or_else(|| {
+            choices
+                .iter()
+                .find(|c| c.selection == ExitNodeSelection::Custom)
+        })
+        .cloned()
+}
+
+/// G-A3: which of the two `HeavySetting`s (`admin::ConfigSetting`) a
+/// `server_settings_pending` token belongs to — drives the pending banner's
+/// "applies live" vs "applies on restart" caption in
+/// `view_server_settings_section`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServerSettingsPendingKind {
+    ActiveMask,
+    ExitNode,
+}
+
+/// G-A3: one entry in the Server Settings "target client" `pick_list` for
+/// the active-mask-override setting — mirrors `MaskChoice`/`ExitNodeChoice`'s
+/// id+display shape.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdminClientChoice {
+    pub id: String,
+    pub display: String,
+}
+
+impl std::fmt::Display for AdminClientChoice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.display)
+    }
+}
+
+/// Builds the Server Settings client picker's option list from
+/// `self.admin_clients` (the same list `view_admin_section` already fetches
+/// on panel open — no separate network round trip here).
+fn admin_client_choices(clients: &[ClientRecord]) -> Vec<AdminClientChoice> {
+    clients
+        .iter()
+        .map(|c| AdminClientChoice {
+            id: c.id.clone(),
+            display: if c.name.is_empty() {
+                c.id.clone()
+            } else {
+                format!("{} ({})", c.name, c.id)
+            },
+        })
+        .collect()
+}
+
 #[derive(serde::Deserialize)]
 struct CatalogEntryRaw {
     mask_id: String,
@@ -1091,6 +1257,22 @@ fn mask_choices_from_catalog(lang: &str) -> Option<Vec<MaskChoice>> {
         return Some(choices);
     }
     None
+}
+
+/// G-A3: mask ids selectable in the Server Settings "active mask override"
+/// picker — reuses the same server-pushed catalog `mask_choices_from_catalog`
+/// already parses for the connect-time "preferred mask" picker, minus the
+/// `"auto"` sentinel entry (a client-side "let the client pick" value, not a
+/// real mask id — `config/apply`'s `HeavySetting::ActiveMask` validates
+/// against on-disk/preset masks only, see
+/// `mgmt_service.rs::resolve_heavy_setting`, and would 404 on it). Empty
+/// until a connection has received at least one catalog push.
+fn admin_mask_choices(lang: &str) -> Vec<MaskChoice> {
+    mask_choices_from_catalog(lang)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|m| m.id != "auto")
+        .collect()
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1198,6 +1380,13 @@ fn t<'a>(lang: &str, key: &'a str) -> &'a str {
         "revoked" => "отозван",
         "Last seen" => "Последняя активность",
         "never" => "никогда",
+        // G-A1: Viewer read-only badge
+        "View only" => "Только просмотр",
+        // G-A2: audit-log panel
+        "Audit Log" => "Журнал аудита",
+        "chain verified" => "цепочка подтверждена",
+        "chain BROKEN" => "ЦЕПОЧКА НАРУШЕНА",
+        "No audit entries" => "Нет записей аудита",
         // C3: SSH server install wizard
         "Install Server via SSH" => "Установка сервера по SSH",
         "Use SSH key instead of password" => "Использовать SSH-ключ вместо пароля",
@@ -1225,6 +1414,37 @@ fn t<'a>(lang: &str, key: &'a str) -> &'a str {
         "Install finished successfully" => "Установка успешно завершена",
         "Install failed" => "Установка не удалась",
         "Installing..." => "Установка...",
+        // G-C1: auto-import confirmation
+        "Imported profile" => "Профиль импортирован",
+        "ready to connect (admin access)" => "готов к подключению (права администратора)",
+        // G-B1: exit-node pick_list (pool.nodes source + custom host:port)
+        "(default)" => "(по умолчанию)",
+        "Custom..." => "Свой адрес...",
+        "Exit node" => "Узел выхода",
+        "applies live, no reconnect" => "применяется сразу, без переподключения",
+        "global default applies on restart" => "глобальный дефолт — при перезапуске",
+        // G-A3: Server Settings (Admin-only apply-with-rollback)
+        "Server Settings" => "Настройки сервера",
+        "Confirm" => "Подтвердить",
+        "Apply" => "Применить",
+        "Change applied - confirm within ~120s or it will be rolled back" => {
+            "Изменение применено — подтвердите в течение ~120с, иначе оно будет отменено"
+        }
+        "Change was not confirmed in time and was rolled back" => {
+            "Изменение не было подтверждено вовремя и было отменено"
+        }
+        "Time left" => "Осталось времени",
+        "Active mask override" => "Активная маска клиента",
+        "Select client..." => "Выберите клиента...",
+        "Select mask..." => "Выберите маску...",
+        "No clients loaded yet" => "Клиенты ещё не загружены",
+        "No mask catalog received yet (connect once first)" => {
+            "Каталог масок ещё не получен (сначала подключитесь один раз)"
+        }
+        "Global exit node (pool default)" => "Глобальный узел выхода (дефолт пула)",
+        "Takes effect only after the server process restarts" => {
+            "Вступает в силу только после перезапуска сервера"
+        }
         _ => key,
     }
 }
@@ -1307,6 +1527,59 @@ pub struct App {
     pool_health: Option<PoolHealth>,
     pool_loading: bool,
     pool_error: Option<String>,
+    // ── G-A2: audit-log panel (Viewer + Admin) ──────────────────────────
+    /// Panel disclosure toggle; same `admin_role >= 1` (Viewer or Admin)
+    /// gate as `admin_open`/`pool_open` — see `view_main`.
+    audit_open: bool,
+    audit_entries: Vec<admin::AuditEntry>,
+    /// Hash-chain verification result for `audit_entries` (from the
+    /// server's `verify=1` response), `None` until the first load.
+    audit_verified: Option<bool>,
+    /// Tail-window index (0-based, oldest-first) of the first broken link,
+    /// if `audit_verified == Some(false)`.
+    audit_broken_at: Option<usize>,
+    audit_loading: bool,
+    audit_error: Option<String>,
+    // ── G-A3: Server Settings (Admin-only apply-with-rollback) ──────────
+    /// Panel disclosure toggle. Unlike `admin_open`/`pool_open`/`audit_open`
+    /// (which any Viewer-or-Admin session can enter, `view_admin_section`
+    /// itself splitting mutate-vs-view), this panel has no read-only
+    /// rendering at all — `view_main` only calls
+    /// `view_server_settings_section` when `admin_role == Some(2)`.
+    server_settings_open: bool,
+    /// Target client (id) for the active-mask-override picker below.
+    /// `HeavySetting::ActiveMask` has no "apply to every client" form
+    /// server-side (see `ConfigSetting`'s doc comment in `admin.rs`) — this
+    /// is always one specific client, not a server-wide default.
+    server_settings_mask_client: Option<String>,
+    /// Mask id selected in the same picker (from `admin_mask_choices`).
+    server_settings_mask_id: Option<String>,
+    /// `host:port`, or empty for "(default)" i.e. clear — the pool's GLOBAL
+    /// default exit node (`pool.exit_node` in `server.json`). Unlike the
+    /// per-client override elsewhere in this panel, applying this only
+    /// takes effect after the server process restarts.
+    server_settings_exit_node: String,
+    /// Set while an apply/confirm call is in flight — disables both Apply
+    /// buttons and the Confirm button rather than allowing a second
+    /// concurrent request.
+    server_settings_busy: bool,
+    /// `Some((token, kind))` once `config/apply` has returned a token
+    /// awaiting `config/confirm` within the server's confirm window —
+    /// `None` once confirmed, rolled back, or never applied. Only one
+    /// pending change is tracked client-side at a time (both Apply buttons
+    /// are disabled while this is `Some`), even though the server itself
+    /// can track more than one concurrently by token.
+    server_settings_pending: Option<(String, ServerSettingsPendingKind)>,
+    /// Seconds remaining before the countdown assumes the server has
+    /// auto-rolled `server_settings_pending` back — ticked down once a
+    /// second by `Message::ServerSettingsCountdownTick` (see
+    /// `subscription`), reset to `SERVER_SETTINGS_CONFIRM_WINDOW_SECS` on
+    /// every successful apply.
+    server_settings_countdown: u32,
+    /// Set once the countdown above reaches 0 without a confirm — shown as
+    /// a "rolled back" banner until the next successful Apply.
+    server_settings_rolled_back: bool,
+    server_settings_error: Option<String>,
     // ── C3: "Install server via SSH" wizard ─────────────────────────────
     install_wizard_open: bool,
     install_host: String,
@@ -1358,6 +1631,12 @@ pub struct App {
     /// `ssh_install_cmd.rs`'s `Finished` event).
     install_connection_key: Option<String>,
     install_exit_code: Option<i32>,
+    /// G-C1: profile name once `install_connection_key` has been added to
+    /// `storage` automatically (see `import_installed_key`) — "install →
+    /// immediately connected as admin" without a mandatory manual click.
+    /// `None` until auto-import runs (or if it failed and the manual
+    /// "Import profile" retry button is still waiting to be pressed).
+    install_profile_imported: Option<String>,
 }
 
 impl App {
@@ -1428,6 +1707,21 @@ impl App {
                 pool_health: None,
                 pool_loading: false,
                 pool_error: None,
+                audit_open: false,
+                audit_entries: Vec::new(),
+                audit_verified: None,
+                audit_broken_at: None,
+                audit_loading: false,
+                audit_error: None,
+                server_settings_open: false,
+                server_settings_mask_client: None,
+                server_settings_mask_id: None,
+                server_settings_exit_node: String::new(),
+                server_settings_busy: false,
+                server_settings_pending: None,
+                server_settings_countdown: 0,
+                server_settings_rolled_back: false,
+                server_settings_error: None,
                 install_wizard_open: false,
                 install_host: String::new(),
                 install_port: String::new(),
@@ -1454,6 +1748,7 @@ impl App {
                 install_log: Vec::new(),
                 install_connection_key: None,
                 install_exit_code: None,
+                install_profile_imported: None,
             },
             Task::none(),
         )
@@ -1675,6 +1970,17 @@ impl App {
                     self.admin_qr = None;
                     self.admin_pending_revoke = None;
                     self.admin_edit_id = None;
+                    // G-A3: a pending apply/confirm token is meaningless
+                    // once the tunnel it rode in on is gone — confirming it
+                    // now would just fail (no daemon session to reach the
+                    // server through), and the server's own sweep will roll
+                    // it back on its own timeline regardless.
+                    self.server_settings_open = false;
+                    self.server_settings_busy = false;
+                    self.server_settings_pending = None;
+                    self.server_settings_countdown = 0;
+                    self.server_settings_rolled_back = false;
+                    self.server_settings_error = None;
                 } else if became_connected {
                     self.admin_role = None;
                     self.admin_clients.clear();
@@ -2083,33 +2389,79 @@ impl App {
             // ── Admin client-management panel ───────────────────────────
             Message::ToggleAdminPanel => {
                 self.admin_open = !self.admin_open;
+                // G-A1: the panel entry (and its client list) is open to
+                // both Viewer (1) and Admin (2) — the server's `authorize()`
+                // allows every curated GET route to a Viewer, so listing
+                // clients is a read they're entitled to; only the mutating
+                // controls inside `view_admin_section` stay Admin-only.
+                let mut tasks: Vec<Task<Message>> = Vec::new();
                 if self.admin_open
-                    && self.admin_role == Some(2)
+                    && self.admin_role.is_some_and(|r| r >= 1)
                     && self.admin_clients.is_empty()
                     && !self.admin_clients_loading
                 {
                     self.admin_clients_loading = true;
                     self.admin_error = None;
-                    return Task::perform(admin::list_clients(), Message::AdminClientsLoaded);
+                    tasks.push(Task::perform(
+                        admin::list_clients(),
+                        Message::AdminClientsLoaded,
+                    ));
                 }
+                // G-B1: the exit-node `pick_list` (Admin-only mutating
+                // control) is sourced from `GET /api/v1/pool/nodes` — load
+                // it here too so the picker has data the first time the
+                // add/edit form renders, without requiring the separate
+                // Pool Topology panel to have been opened first. Shares
+                // `pool_nodes`/`pool_loading` with that panel; whichever
+                // opens first populates it for both.
+                if self.admin_open
+                    && self.admin_role == Some(2)
+                    && self.pool_nodes.is_empty()
+                    && !self.pool_loading
+                {
+                    self.pool_loading = true;
+                    tasks.push(Task::perform(admin::pool_nodes(), Message::PoolNodesLoaded));
+                }
+                return Task::batch(tasks);
             }
             Message::AdminRoleLoaded(result) => match result {
                 Ok(role) => {
                     self.admin_role = Some(role);
-                    if role == 2
+                    let mut tasks: Vec<Task<Message>> = Vec::new();
+                    if role >= 1
                         && self.admin_open
                         && self.admin_clients.is_empty()
                         && !self.admin_clients_loading
                     {
                         self.admin_clients_loading = true;
-                        return Task::perform(admin::list_clients(), Message::AdminClientsLoaded);
+                        tasks.push(Task::perform(
+                            admin::list_clients(),
+                            Message::AdminClientsLoaded,
+                        ));
                     }
+                    // G-B1: role wasn't known yet when `ToggleAdminPanel`
+                    // ran (it's fetched fresh on every Connected — see the
+                    // field doc on `admin_role`), so cover the case where
+                    // the panel was already open before Admin confirmed.
+                    if role == 2
+                        && self.admin_open
+                        && self.pool_nodes.is_empty()
+                        && !self.pool_loading
+                    {
+                        self.pool_loading = true;
+                        tasks.push(Task::perform(admin::pool_nodes(), Message::PoolNodesLoaded));
+                    }
+                    return Task::batch(tasks);
                 }
                 Err(_) => {
-                    // Older client daemons (pre-defa271) or a User/Viewer
-                    // role simply have nothing to report here — not an
-                    // error worth surfacing; the panel entry point just
-                    // stays hidden (admin_role remains None).
+                    // Communication failure (older pre-defa271 client
+                    // daemon that doesn't support the `role` subcommand at
+                    // all, or no reply) — not an error worth surfacing; the
+                    // panel entry point just stays hidden (admin_role
+                    // remains None). A User/Viewer/Admin role on a current
+                    // daemon always gets a numeric reply here (0/1/2), so
+                    // this arm is NOT how User/Viewer gets hidden — that's
+                    // the `role >= 1` check above and in `view_main`.
                     self.admin_role = None;
                 }
             },
@@ -2132,6 +2484,11 @@ impl App {
             Message::AdminNewOneTimeToggled(b) => self.admin_new_one_time = b,
             Message::AdminNewExpiresChanged(s) => self.admin_new_expires = s,
             Message::AdminNewExitNodeChanged(s) => self.admin_new_exit_node = s,
+            Message::AdminNewExitNodePicked(choice) => match choice.selection {
+                ExitNodeSelection::Default => self.admin_new_exit_node.clear(),
+                ExitNodeSelection::Node(addr) => self.admin_new_exit_node = addr,
+                ExitNodeSelection::Custom => {}
+            },
             Message::AdminAddClient => {
                 let name = self.admin_new_name.trim().to_string();
                 if name.is_empty() || self.admin_busy_id.is_some() {
@@ -2199,6 +2556,11 @@ impl App {
             Message::AdminEditNameChanged(s) => self.admin_edit_name = s,
             Message::AdminEditExpiresChanged(s) => self.admin_edit_expires = s,
             Message::AdminEditExitNodeChanged(s) => self.admin_edit_exit_node = s,
+            Message::AdminEditExitNodePicked(choice) => match choice.selection {
+                ExitNodeSelection::Default => self.admin_edit_exit_node.clear(),
+                ExitNodeSelection::Node(addr) => self.admin_edit_exit_node = addr,
+                ExitNodeSelection::Custom => {}
+            },
             Message::AdminEditCancel => {
                 self.admin_edit_id = None;
                 self.admin_edit_name.clear();
@@ -2446,6 +2808,179 @@ impl App {
                 Err(e) => self.pool_error = Some(e),
             },
 
+            // ── G-A2: audit-log panel (Viewer + Admin, GET-only) ─────────
+            Message::ToggleAuditPanel => {
+                self.audit_open = !self.audit_open;
+                if self.audit_open && self.audit_entries.is_empty() && !self.audit_loading {
+                    self.audit_loading = true;
+                    self.audit_error = None;
+                    return Task::perform(admin::audit_log(), Message::AuditLogLoaded);
+                }
+            }
+            Message::AuditRefresh => {
+                self.audit_loading = true;
+                self.audit_error = None;
+                return Task::perform(admin::audit_log(), Message::AuditLogLoaded);
+            }
+            Message::AuditLogLoaded(result) => {
+                self.audit_loading = false;
+                match result {
+                    Ok(view) => {
+                        self.audit_entries = view.entries;
+                        self.audit_verified = Some(view.verified);
+                        self.audit_broken_at = view.broken_at;
+                        self.audit_error = None;
+                    }
+                    Err(e) => self.audit_error = Some(e),
+                }
+            }
+
+            // ── G-A3: Server Settings (Admin-only apply-with-rollback) ───
+            Message::ToggleServerSettingsPanel => {
+                self.server_settings_open = !self.server_settings_open;
+                let mut tasks: Vec<Task<Message>> = Vec::new();
+                // Self-sufficient regardless of whether the Client
+                // management / Pool topology panels above have been opened
+                // yet — both pickers below need this data, so fetch it on
+                // first open here too (both share the same fields, so
+                // whichever panel opens first just wins the race).
+                if self.server_settings_open && self.admin_role == Some(2) {
+                    if self.admin_clients.is_empty() && !self.admin_clients_loading {
+                        self.admin_clients_loading = true;
+                        self.admin_error = None;
+                        tasks.push(Task::perform(
+                            admin::list_clients(),
+                            Message::AdminClientsLoaded,
+                        ));
+                    }
+                    if self.pool_nodes.is_empty() && !self.pool_loading {
+                        self.pool_loading = true;
+                        tasks.push(Task::perform(admin::pool_nodes(), Message::PoolNodesLoaded));
+                    }
+                }
+                return Task::batch(tasks);
+            }
+            Message::ServerSettingsMaskClientPicked(choice) => {
+                self.server_settings_mask_client = Some(choice.id);
+            }
+            Message::ServerSettingsMaskPicked(choice) => {
+                self.server_settings_mask_id = Some(choice.id);
+            }
+            Message::ServerSettingsApplyMask => {
+                if !self.server_settings_busy && self.server_settings_pending.is_none() {
+                    if let (Some(client), Some(mask)) = (
+                        self.server_settings_mask_client.clone(),
+                        self.server_settings_mask_id.clone(),
+                    ) {
+                        self.server_settings_busy = true;
+                        self.server_settings_error = None;
+                        self.server_settings_rolled_back = false;
+                        return Task::perform(
+                            admin::apply_config(ConfigSetting::ActiveMask { client, mask }),
+                            |result| {
+                                Message::ServerSettingsApplyResult(
+                                    ServerSettingsPendingKind::ActiveMask,
+                                    result,
+                                )
+                            },
+                        );
+                    }
+                }
+            }
+            Message::ServerSettingsExitNodeChanged(s) => self.server_settings_exit_node = s,
+            Message::ServerSettingsExitNodePicked(choice) => match choice.selection {
+                ExitNodeSelection::Default => self.server_settings_exit_node.clear(),
+                ExitNodeSelection::Node(addr) => self.server_settings_exit_node = addr,
+                ExitNodeSelection::Custom => {}
+            },
+            Message::ServerSettingsApplyExitNode => {
+                if !self.server_settings_busy && self.server_settings_pending.is_none() {
+                    self.server_settings_busy = true;
+                    self.server_settings_error = None;
+                    self.server_settings_rolled_back = false;
+                    let trimmed = self.server_settings_exit_node.trim();
+                    let addr = if trimmed.is_empty() {
+                        None
+                    } else {
+                        Some(trimmed.to_string())
+                    };
+                    return Task::perform(
+                        admin::apply_config(ConfigSetting::ExitNode(addr)),
+                        |result| {
+                            Message::ServerSettingsApplyResult(
+                                ServerSettingsPendingKind::ExitNode,
+                                result,
+                            )
+                        },
+                    );
+                }
+            }
+            Message::ServerSettingsApplyResult(kind, result) => {
+                self.server_settings_busy = false;
+                match result {
+                    Ok(token) => {
+                        self.server_settings_pending = Some((token, kind));
+                        self.server_settings_countdown = SERVER_SETTINGS_CONFIRM_WINDOW_SECS;
+                        self.server_settings_rolled_back = false;
+                        self.server_settings_error = None;
+                    }
+                    Err(e) => self.server_settings_error = Some(e),
+                }
+            }
+            Message::ServerSettingsConfirm => {
+                if !self.server_settings_busy {
+                    if let Some((token, _)) = self.server_settings_pending.clone() {
+                        self.server_settings_busy = true;
+                        self.server_settings_error = None;
+                        return Task::perform(
+                            admin::confirm_config(token),
+                            Message::ServerSettingsConfirmResult,
+                        );
+                    }
+                }
+            }
+            Message::ServerSettingsConfirmResult(result) => {
+                self.server_settings_busy = false;
+                match result {
+                    Ok(()) => {
+                        self.server_settings_pending = None;
+                        self.server_settings_countdown = 0;
+                        self.server_settings_rolled_back = false;
+                        self.server_settings_error = None;
+                    }
+                    Err(e) => {
+                        // `confirm_config` (`mgmt_service.rs`) returns `404`
+                        // for BOTH an unknown token and one the sweep task
+                        // already rolled back past its deadline — the
+                        // client-side countdown is only an estimate (see
+                        // its field doc), so a 404 here is the authoritative
+                        // "there is nothing left to confirm" signal: clear
+                        // the pending state and show the rolled-back
+                        // banner. Any OTHER error (e.g. a transient "no
+                        // reply from daemon") leaves `server_settings_pending`
+                        // untouched so Confirm can be retried against the
+                        // same still-valid token instead of stranding the
+                        // user with a banner they can never dismiss.
+                        if e.starts_with("HTTP 404") {
+                            self.server_settings_pending = None;
+                            self.server_settings_countdown = 0;
+                            self.server_settings_rolled_back = true;
+                        }
+                        self.server_settings_error = Some(e);
+                    }
+                }
+            }
+            Message::ServerSettingsCountdownTick => {
+                if self.server_settings_pending.is_some() {
+                    self.server_settings_countdown =
+                        self.server_settings_countdown.saturating_sub(1);
+                    if self.server_settings_countdown == 0 {
+                        self.server_settings_pending = None;
+                        self.server_settings_rolled_back = true;
+                    }
+                }
+            }
+
             // ── C3: "Install server via SSH" wizard ─────────────────────
             Message::ToggleInstallWizard => {
                 self.install_wizard_open = !self.install_wizard_open;
@@ -2638,6 +3173,7 @@ impl App {
                 self.install_log.clear();
                 self.install_exit_code = None;
                 self.install_connection_key = None;
+                self.install_profile_imported = None;
                 self.install_target = Some(target);
             }
             Message::InstallWizardLine(line) => match line {
@@ -2663,7 +3199,14 @@ impl App {
                     }
                     self.install_log.push(line);
                     if let Some(ck) = connection_key {
-                        self.install_connection_key = Some(ck);
+                        self.install_connection_key = Some(ck.clone());
+                        // G-C1: auto-import — "install → immediately
+                        // connected as admin", no mandatory manual click.
+                        // Guarded so a re-delivered/duplicate marker line
+                        // can never add the same profile twice.
+                        if self.install_profile_imported.is_none() {
+                            self.import_installed_key(ck);
+                        }
                     }
                 }
             },
@@ -2703,30 +3246,45 @@ impl App {
                 self.install_log.clear();
                 self.install_connection_key = None;
                 self.install_exit_code = None;
+                self.install_profile_imported = None;
             }
+            // G-C1: retry path only — the happy path already ran this via
+            // `import_installed_key` the moment the `##AIVPN` marker carrying
+            // `connection_key` arrived (see `InstallWizardLine`). This button
+            // only still shows when that auto-import failed (`install_error`
+            // set, `install_profile_imported` still `None`).
             Message::InstallImportProfile => {
                 if let Some(key) = self.install_connection_key.clone() {
-                    let name = if self.install_host.trim().is_empty() {
-                        "Installed server".to_string()
-                    } else {
-                        self.install_host.trim().to_string()
-                    };
-                    match ConnectionKey::from_key_string(name, key) {
-                        Ok(conn_key) => {
-                            if let Err(e) = self.storage.add(conn_key) {
-                                self.install_error = Some(e);
-                            } else {
-                                self.install_error = None;
-                            }
-                        }
-                        Err(e) => self.install_error = Some(e),
-                    }
+                    self.import_installed_key(key);
                 }
             }
 
             Message::Noop => {}
         }
         Task::none()
+    }
+
+    /// G-C1: shared by the auto-import on the installer's final marker and
+    /// the manual "Import profile" retry button — decodes `key` and adds it
+    /// to `storage` under a name derived from the install target host,
+    /// recording success in `install_profile_imported` so the view can show
+    /// a confirmation instead of a "click to import" prompt.
+    fn import_installed_key(&mut self, key: String) {
+        let name = if self.install_host.trim().is_empty() {
+            "Installed server".to_string()
+        } else {
+            self.install_host.trim().to_string()
+        };
+        match ConnectionKey::from_key_string(name.clone(), key) {
+            Ok(conn_key) => match self.storage.add(conn_key) {
+                Ok(()) => {
+                    self.install_error = None;
+                    self.install_profile_imported = Some(name);
+                }
+                Err(e) => self.install_error = Some(e),
+            },
+            Err(e) => self.install_error = Some(e),
+        }
     }
 
     pub fn view(&self) -> Element<'_, Message> {
@@ -3424,22 +3982,50 @@ impl App {
             Space::with_height(0).into()
         };
 
-        // Admin client-management panel: gated on both a confirmed Admin
-        // role (fetched fresh on every Connected transition — see
-        // Message::StatusReceived) AND the panel being connected in the
-        // first place, so a stale role from a just-ended session can never
-        // show a panel that would immediately fail every call.
+        // Admin client-management panel: gated on the panel being connected
+        // in the first place (a stale role from a just-ended session can
+        // never show a panel that would immediately fail every call) AND a
+        // confirmed role of Viewer (1) or Admin (2), fetched fresh on every
+        // Connected transition (see Message::StatusReceived).
+        //
+        // G-A1: Viewer gets the SAME panel as Admin, not a separate
+        // read-only rendering — `view_admin_section` takes `can_mutate`
+        // (true only for Admin) and hides every mutating control
+        // (add/edit/enable-disable/reset-device/revoke) itself, leaving
+        // just the client list + "Key"/"Show QR" reads, both plain GETs the
+        // server's `authorize()` already permits a Viewer. A User (role 0,
+        // or no role loaded yet) still sees nothing at all.
         let admin_is_connected = matches!(self.status, VpnStatus::Connected { .. });
-        let admin_section: Element<Message> = if admin_is_connected && self.admin_role == Some(2) {
-            self.view_admin_section()
+        let admin_can_view = admin_is_connected && self.admin_role.is_some_and(|r| r >= 1);
+        let admin_can_mutate = admin_is_connected && self.admin_role == Some(2);
+        let admin_section: Element<Message> = if admin_can_view {
+            self.view_admin_section(admin_can_mutate)
         } else {
             Space::with_height(0).into()
         };
-        // Pool topology panel (B3): same connected+Admin gate as the
-        // client-management panel above — pool node/health data is just as
-        // sensitive as the client list.
-        let pool_section: Element<Message> = if admin_is_connected && self.admin_role == Some(2) {
+        // Pool topology panel (B3): same connected+Viewer-or-Admin gate as
+        // the client-management panel above — pool node/health data is a
+        // read like the client list, and this panel has no mutating
+        // controls of its own (Refresh is a GET reload).
+        let pool_section: Element<Message> = if admin_can_view {
             self.view_pool_section()
+        } else {
+            Space::with_height(0).into()
+        };
+        // G-A2: audit-log panel — same Viewer-or-Admin gate; the server's
+        // `audit-log` route is GET-only in the curated allowlist regardless
+        // of role, so there is nothing to mutate-gate here at all.
+        let audit_section: Element<Message> = if admin_can_view {
+            self.view_audit_section()
+        } else {
+            Space::with_height(0).into()
+        };
+        // G-A3: Server Settings panel — Admin-only (`admin_can_mutate`, NOT
+        // `admin_can_view`), unlike the three sections above: every control
+        // in this panel mutates server state (apply-with-rollback), so
+        // there is no Viewer-visible read-only rendering to fall back to.
+        let server_settings_section: Element<Message> = if admin_can_mutate {
+            self.view_server_settings_section()
         } else {
             Space::with_height(0).into()
         };
@@ -3503,6 +4089,10 @@ impl App {
                     Space::with_height(6),
                     pool_section,
                     Space::with_height(6),
+                    audit_section,
+                    Space::with_height(6),
+                    server_settings_section,
+                    Space::with_height(6),
                     install_wizard_section,
                     Space::with_height(6),
                     bootstrap_header,
@@ -3524,11 +4114,21 @@ impl App {
     }
 
     /// Admin client-management panel body. Only ever called from
-    /// `view_main` behind the `is_connected && admin_role == Some(2)` gate —
-    /// this method itself does not re-check the role, since it has no
-    /// meaningful "not authorized" rendering of its own (the caller simply
-    /// never invokes it).
-    fn view_admin_section(&self) -> Element<'_, Message> {
+    /// `view_main` behind the `is_connected && admin_role >= 1` (Viewer or
+    /// Admin) gate — this method itself does not re-check whether the role
+    /// qualifies for entry at all, since it has no meaningful "not
+    /// authorized" rendering of its own (the caller simply never invokes
+    /// it for a User/no-role session).
+    ///
+    /// G-A1: `can_mutate` (`true` only for a confirmed Admin, `false` for
+    /// Viewer) gates every mutating control inside — the add-client form
+    /// and each client's Edit/Enable-Disable/Reset-device/Revoke buttons.
+    /// "Key"/"Show QR" stay available to both roles: both are plain GETs
+    /// the server's `authorize()` already permits a Viewer
+    /// (`connection-key` is a curated GET route; QR generation never goes
+    /// through the mgmt API at all — it's the client daemon's own admin
+    /// socket, unrelated to the server-assigned role).
+    fn view_admin_section(&self, can_mutate: bool) -> Element<'_, Message> {
         let lang = self.settings.lang.as_str();
         let is_dark = self.settings.dark_mode;
         let muted = if is_dark {
@@ -3547,6 +4147,11 @@ impl App {
             button(text(toggle_label))
                 .on_press(Message::ToggleAdminPanel)
                 .style(button::text),
+            if !can_mutate {
+                text(t(lang, "View only")).size(11).color(muted).into()
+            } else {
+                Element::from(Space::with_width(0))
+            },
             Space::with_width(Length::Fill),
             if self.admin_open {
                 button(t(lang, "Refresh"))
@@ -3557,6 +4162,7 @@ impl App {
                 Element::from(Space::with_width(0))
             },
         ]
+        .spacing(8)
         .align_y(Alignment::Center);
 
         if !self.admin_open {
@@ -3569,33 +4175,64 @@ impl App {
             body = body.push(text(err).size(12).color(danger));
         }
 
-        // ── Add-client form ─────────────────────────────────────────────
-        let adding = self.admin_busy_id.as_deref() == Some("");
-        let add_row = row![
-            text_input(t(lang, "Name"), &self.admin_new_name)
-                .on_input(Message::AdminNewNameChanged)
-                .width(Length::FillPortion(2)),
-            checkbox(t(lang, "One-time"), self.admin_new_one_time)
-                .on_toggle(Message::AdminNewOneTimeToggled),
-            text_input("expires (RFC3339, optional)", &self.admin_new_expires)
-                .on_input(Message::AdminNewExpiresChanged)
-                .width(Length::FillPortion(2)),
-            text_input(t(lang, "Exit node (optional)"), &self.admin_new_exit_node)
-                .on_input(Message::AdminNewExitNodeChanged)
-                .width(Length::FillPortion(2)),
-            button(text(if adding {
-                t(lang, "Adding...")
-            } else {
-                t(lang, "+ Add")
-            }))
-            .on_press_maybe(
-                (!adding && !self.admin_new_name.trim().is_empty())
-                    .then_some(Message::AdminAddClient)
-            ),
-        ]
-        .spacing(6)
-        .align_y(Alignment::Center);
-        body = body.push(add_row);
+        // G-B1: exit-node picker option list — "(default)" + every
+        // `GET /api/v1/pool/nodes` address + "Custom..." — shared by the
+        // add-client and per-client-edit forms below. Sourced from
+        // `self.pool_nodes`, fetched on `ToggleAdminPanel`/`AdminRoleLoaded`
+        // (same field the Pool Topology panel uses, loaded at most once).
+        let exit_choices = exit_node_choices(lang, &self.pool_nodes);
+        // Caption shared by both forms' exit-node control — per-client
+        // overrides are applied by the running daemon live (no reconnect);
+        // clearing back to "(default)" only takes effect for the pool's
+        // *global* default on the daemon's next restart.
+        let exit_node_hint = || {
+            text(format!(
+                "{}: {} / {}",
+                t(lang, "Exit node"),
+                t(lang, "applies live, no reconnect"),
+                t(lang, "global default applies on restart"),
+            ))
+            .size(10)
+            .color(muted)
+        };
+
+        // ── Add-client form (Admin only — a mutating control) ────────────
+        if can_mutate {
+            let adding = self.admin_busy_id.as_deref() == Some("");
+            let selected = exit_node_selected(&self.admin_new_exit_node, &exit_choices);
+            let add_row = row![
+                text_input(t(lang, "Name"), &self.admin_new_name)
+                    .on_input(Message::AdminNewNameChanged)
+                    .width(Length::FillPortion(2)),
+                checkbox(t(lang, "One-time"), self.admin_new_one_time)
+                    .on_toggle(Message::AdminNewOneTimeToggled),
+                text_input("expires (RFC3339, optional)", &self.admin_new_expires)
+                    .on_input(Message::AdminNewExpiresChanged)
+                    .width(Length::FillPortion(2)),
+                pick_list(
+                    exit_choices.clone(),
+                    selected,
+                    Message::AdminNewExitNodePicked,
+                )
+                .width(120),
+                text_input(t(lang, "Exit node (optional)"), &self.admin_new_exit_node)
+                    .on_input(Message::AdminNewExitNodeChanged)
+                    .width(Length::FillPortion(2)),
+                button(text(if adding {
+                    t(lang, "Adding...")
+                } else {
+                    t(lang, "+ Add")
+                }))
+                .on_press_maybe(
+                    (!adding && !self.admin_new_name.trim().is_empty())
+                        .then_some(Message::AdminAddClient)
+                ),
+            ]
+            .spacing(6)
+            .align_y(Alignment::Center);
+            body = body.push(add_row);
+            body = body.push(exit_node_hint());
+        }
 
         // ── Client list ──────────────────────────────────────────────────
         if self.admin_clients_loading {
@@ -3634,7 +4271,13 @@ impl App {
 
             let mut card = column![title_row].spacing(4);
 
-            if self.admin_pending_revoke.as_deref() == Some(c.id.as_str()) {
+            // G-A1: `pending_revoke`/`edit_id` can only ever be set via the
+            // Revoke/Edit buttons in the `can_mutate` branch below, so a
+            // Viewer session can never actually be sitting in either of
+            // these two states — the `can_mutate &&` here is defense in
+            // depth (e.g. a role downgrade landing mid-interaction), not
+            // the primary gate.
+            if can_mutate && self.admin_pending_revoke.as_deref() == Some(c.id.as_str()) {
                 card = card.push(
                     row![
                         text(t(lang, "Confirm revoke?")).size(12).color(danger),
@@ -3648,7 +4291,8 @@ impl App {
                     .spacing(6)
                     .align_y(Alignment::Center),
                 );
-            } else if self.admin_edit_id.as_deref() == Some(c.id.as_str()) {
+            } else if can_mutate && self.admin_edit_id.as_deref() == Some(c.id.as_str()) {
+                let edit_selected = exit_node_selected(&self.admin_edit_exit_node, &exit_choices);
                 card = card.push(
                     row![
                         text_input(t(lang, "Name"), &self.admin_edit_name)
@@ -3657,6 +4301,12 @@ impl App {
                         text_input("expires (RFC3339)", &self.admin_edit_expires)
                             .on_input(Message::AdminEditExpiresChanged)
                             .width(Length::FillPortion(2)),
+                        pick_list(
+                            exit_choices.clone(),
+                            edit_selected,
+                            Message::AdminEditExitNodePicked,
+                        )
+                        .width(120),
                         text_input("host:port", &self.admin_edit_exit_node)
                             .on_input(Message::AdminEditExitNodeChanged)
                             .width(Length::FillPortion(2)),
@@ -3669,7 +4319,8 @@ impl App {
                     .spacing(6)
                     .align_y(Alignment::Center),
                 );
-            } else {
+                card = card.push(exit_node_hint());
+            } else if can_mutate {
                 card = card.push(
                     row![
                         button(t(lang, "Key"))
@@ -3695,6 +4346,16 @@ impl App {
                             )
                             .style(button::danger),
                     ]
+                    .spacing(4)
+                    .align_y(Alignment::Center),
+                );
+            } else {
+                // Viewer: only the read-only "Key" affordance (a plain GET
+                // the server allows a Viewer) — every mutating control is
+                // omitted entirely rather than disabled.
+                card = card.push(
+                    row![button(t(lang, "Key"))
+                        .on_press_maybe((!busy).then_some(Message::AdminShowKey(c.id.clone())))]
                     .spacing(4)
                     .align_y(Alignment::Center),
                 );
@@ -3910,6 +4571,331 @@ impl App {
         column![header, body].spacing(6).into()
     }
 
+    /// G-A3: "Server Settings" panel body — Admin-only apply-with-rollback
+    /// for the two `HeavySetting`s `POST /api/v1/config/apply` supports
+    /// (`mgmt_service.rs::HeavySetting`): a per-client active-mask override
+    /// (applies live) and the pool's global default exit node (applies only
+    /// after a server restart). Only ever called from `view_main` behind
+    /// `is_connected && admin_role == Some(2)` — unlike
+    /// `view_admin_section`/`view_pool_section`/`view_audit_section` there
+    /// is no Viewer-visible read-only rendering here at all, since every
+    /// control in this panel mutates server state.
+    ///
+    /// NOTE on scope: the original brief for this panel assumed a "global
+    /// active mask" setting and a `GET /api/v1/masks` catalog endpoint
+    /// reachable over the admin tunnel. Neither exists: `classify_route`
+    /// (`mgmt_service.rs`) has no masks route at all (the tunnel
+    /// deliberately never exposes several `management_api.rs` REST routes,
+    /// masks among them), and `HeavySetting::ActiveMask` rejects an empty
+    /// `client` with `400` — it is a per-client override, not a global
+    /// default, verified directly against `resolve_heavy_setting`. So the
+    /// mask picker below targets one client (from `self.admin_clients`,
+    /// already fetched for the client-management panel) and its choices
+    /// come from the local server-pushed mask catalog
+    /// (`admin_mask_choices`/`mask_choices_from_catalog`) rather than a
+    /// network call.
+    fn view_server_settings_section(&self) -> Element<'_, Message> {
+        let lang = self.settings.lang.as_str();
+        let is_dark = self.settings.dark_mode;
+        let muted = if is_dark {
+            Color::from_rgb(0.62, 0.64, 0.70)
+        } else {
+            Color::from_rgb(0.43, 0.45, 0.50)
+        };
+        let danger = Color::from_rgb(0.95, 0.28, 0.18);
+
+        let toggle_label = if self.server_settings_open {
+            format!("[-] {}", t(lang, "Server Settings"))
+        } else {
+            format!("[+] {}", t(lang, "Server Settings"))
+        };
+        let header = row![button(text(toggle_label))
+            .on_press(Message::ToggleServerSettingsPanel)
+            .style(button::text)];
+
+        if !self.server_settings_open {
+            return column![header].into();
+        }
+
+        let mut body = column![].spacing(8);
+
+        if let Some(err) = &self.server_settings_error {
+            body = body.push(text(err).size(12).color(danger));
+        }
+        if self.server_settings_rolled_back {
+            body = body.push(
+                text(t(
+                    lang,
+                    "Change was not confirmed in time and was rolled back",
+                ))
+                .size(12)
+                .color(danger),
+            );
+        }
+
+        // ── Pending apply / confirm banner — shared by both settings
+        // below, since only one apply is tracked client-side at a time.
+        if let Some((_, kind)) = &self.server_settings_pending {
+            let scope_hint = match kind {
+                ServerSettingsPendingKind::ActiveMask => t(lang, "applies live, no reconnect"),
+                ServerSettingsPendingKind::ExitNode => t(lang, "global default applies on restart"),
+            };
+            body = body.push(
+                container(
+                    column![
+                        text(format!(
+                            "{} ({})",
+                            t(
+                                lang,
+                                "Change applied - confirm within ~120s or it will be rolled back"
+                            ),
+                            scope_hint,
+                        ))
+                        .size(12),
+                        row![
+                            text(format!(
+                                "{}: {}s",
+                                t(lang, "Time left"),
+                                self.server_settings_countdown
+                            ))
+                            .size(12)
+                            .color(muted),
+                            button(t(lang, "Confirm")).on_press_maybe(
+                                (!self.server_settings_busy)
+                                    .then_some(Message::ServerSettingsConfirm)
+                            ),
+                        ]
+                        .spacing(10)
+                        .align_y(Alignment::Center),
+                    ]
+                    .spacing(4),
+                )
+                .padding(8)
+                .width(Length::Fill)
+                .style(move |_: &Theme| container::Style {
+                    background: Some(Background::Color(if is_dark {
+                        Color::from_rgba(0.85, 0.65, 0.10, 0.15)
+                    } else {
+                        Color::from_rgba(0.95, 0.75, 0.10, 0.20)
+                    })),
+                    border: Border {
+                        radius: 6.0.into(),
+                        width: 1.0,
+                        color: Color::from_rgba(0.85, 0.65, 0.10, 0.5),
+                    },
+                    ..Default::default()
+                }),
+            );
+        }
+
+        let pending_active = self.server_settings_pending.is_some();
+
+        // ── Active mask override (per-client, live) ─────────────────────
+        body = body.push(horizontal_rule(1));
+        body = body.push(text(t(lang, "Active mask override")).size(13));
+        let client_choices = admin_client_choices(&self.admin_clients);
+        let selected_client = self
+            .server_settings_mask_client
+            .as_ref()
+            .and_then(|id| client_choices.iter().find(|c| &c.id == id).cloned());
+        let mask_choices = admin_mask_choices(lang);
+        let selected_mask = self
+            .server_settings_mask_id
+            .as_ref()
+            .and_then(|id| mask_choices.iter().find(|m| &m.id == id).cloned());
+        body = body.push(
+            row![
+                pick_list(
+                    client_choices.clone(),
+                    selected_client,
+                    Message::ServerSettingsMaskClientPicked,
+                )
+                .placeholder(t(lang, "Select client..."))
+                .width(Length::FillPortion(2)),
+                pick_list(
+                    mask_choices.clone(),
+                    selected_mask,
+                    Message::ServerSettingsMaskPicked,
+                )
+                .placeholder(t(lang, "Select mask..."))
+                .width(Length::FillPortion(2)),
+                button(t(lang, "Apply")).on_press_maybe(
+                    (!self.server_settings_busy
+                        && !pending_active
+                        && self.server_settings_mask_client.is_some()
+                        && self.server_settings_mask_id.is_some())
+                    .then_some(Message::ServerSettingsApplyMask)
+                ),
+            ]
+            .spacing(6)
+            .align_y(Alignment::Center),
+        );
+        if client_choices.is_empty() {
+            body = body.push(text(t(lang, "No clients loaded yet")).size(11).color(muted));
+        }
+        if mask_choices.is_empty() {
+            body = body.push(
+                text(t(lang, "No mask catalog received yet (connect once first)"))
+                    .size(11)
+                    .color(muted),
+            );
+        }
+
+        // ── Global exit node (pool default, restart required) ───────────
+        body = body.push(horizontal_rule(1));
+        body = body.push(text(t(lang, "Global exit node (pool default)")).size(13));
+        let exit_choices = exit_node_choices(lang, &self.pool_nodes);
+        let exit_selected = exit_node_selected(&self.server_settings_exit_node, &exit_choices);
+        body = body.push(
+            row![
+                pick_list(
+                    exit_choices.clone(),
+                    exit_selected,
+                    Message::ServerSettingsExitNodePicked,
+                )
+                .width(140),
+                text_input("host:port", &self.server_settings_exit_node)
+                    .on_input(Message::ServerSettingsExitNodeChanged)
+                    .width(Length::FillPortion(2)),
+                button(t(lang, "Apply")).on_press_maybe(
+                    (!self.server_settings_busy && !pending_active)
+                        .then_some(Message::ServerSettingsApplyExitNode)
+                ),
+            ]
+            .spacing(6)
+            .align_y(Alignment::Center),
+        );
+        body = body.push(
+            text(t(
+                lang,
+                "Takes effect only after the server process restarts",
+            ))
+            .size(10)
+            .color(muted),
+        );
+
+        column![header, body].spacing(6).into()
+    }
+
+    /// G-A2: audit-log panel body — hash-chain-verified tail of the
+    /// server's append-only admin audit log (`GET /api/v1/audit-log?verify=1`).
+    /// Same gating discipline as `view_pool_section`: only ever called from
+    /// `view_main` behind `is_connected && admin_role >= 1` (Viewer or
+    /// Admin) — GET-only in the server's curated allowlist regardless of
+    /// role, so unlike `view_admin_section` there is no `can_mutate` split
+    /// here at all, nothing in this panel ever mutates anything.
+    fn view_audit_section(&self) -> Element<'_, Message> {
+        let lang = self.settings.lang.as_str();
+        let is_dark = self.settings.dark_mode;
+        let muted = if is_dark {
+            Color::from_rgb(0.62, 0.64, 0.70)
+        } else {
+            Color::from_rgb(0.43, 0.45, 0.50)
+        };
+        let danger = Color::from_rgb(0.95, 0.28, 0.18);
+        let good = Color::from_rgb(0.20, 0.70, 0.35);
+
+        let toggle_label = if self.audit_open {
+            format!("[-] {}", t(lang, "Audit Log"))
+        } else {
+            format!("[+] {}", t(lang, "Audit Log"))
+        };
+        let header = row![
+            button(text(toggle_label))
+                .on_press(Message::ToggleAuditPanel)
+                .style(button::text),
+            Space::with_width(Length::Fill),
+            if self.audit_open {
+                button(t(lang, "Refresh"))
+                    .on_press(Message::AuditRefresh)
+                    .style(button::text)
+                    .into()
+            } else {
+                Element::from(Space::with_width(0))
+            },
+        ]
+        .align_y(Alignment::Center);
+
+        if !self.audit_open {
+            return column![header].into();
+        }
+
+        let mut body = column![].spacing(6);
+
+        if let Some(err) = &self.audit_error {
+            body = body.push(text(err).size(12).color(danger));
+        }
+
+        if let Some(verified) = self.audit_verified {
+            let chain_badge = if verified {
+                text(t(lang, "chain verified")).size(12).color(good)
+            } else {
+                text(format!(
+                    "{} ({})",
+                    t(lang, "chain BROKEN"),
+                    self.audit_broken_at
+                        .map(|i| i.to_string())
+                        .unwrap_or_else(|| "?".to_string())
+                ))
+                .size(12)
+                .color(danger)
+            };
+            body = body.push(chain_badge);
+        }
+
+        if self.audit_loading {
+            body = body.push(text(t(lang, "Loading...")).size(12).color(muted));
+        } else if self.audit_entries.is_empty() {
+            body = body.push(text(t(lang, "No audit entries")).size(12).color(muted));
+        }
+
+        // Oldest-first from the server; show newest-first so the most
+        // recent action is always the first row without scrolling.
+        for e in self.audit_entries.iter().rev() {
+            let entry_row = row![
+                text(e.ts.clone())
+                    .size(11)
+                    .color(muted)
+                    .width(Length::FillPortion(2)),
+                text(format!("[{}]", e.actor)).size(11).color(muted),
+                text(e.action.clone())
+                    .size(12)
+                    .width(Length::FillPortion(2)),
+                text(e.target.clone())
+                    .size(11)
+                    .color(muted)
+                    .width(Length::FillPortion(2)),
+                text(e.result.clone())
+                    .size(11)
+                    .color(if e.result == "ok" { good } else { danger }),
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center);
+
+            body = body.push(container(entry_row).padding(6).width(Length::Fill).style(
+                move |_: &Theme| container::Style {
+                    background: Some(Background::Color(if is_dark {
+                        Color::from_rgb(0.24, 0.25, 0.30)
+                    } else {
+                        Color::from_rgb(0.95, 0.95, 0.97)
+                    })),
+                    border: Border {
+                        radius: 6.0.into(),
+                        width: 1.0,
+                        color: if is_dark {
+                            Color::from_rgba(1.0, 1.0, 1.0, 0.08)
+                        } else {
+                            Color::from_rgba(0.0, 0.0, 0.0, 0.06)
+                        },
+                    },
+                    ..Default::default()
+                },
+            ));
+        }
+
+        column![header, body].spacing(6).into()
+    }
+
     /// C3: "Install server via SSH" wizard body — Target → TOFU → Installing
     /// steps, computed from state rather than an explicit step enum (each
     /// step's fields double as the "am I on this step" flags: no
@@ -3980,12 +4966,42 @@ impl App {
                     .on_press(Message::InstallReset)
                     .style(button::secondary)]
                 .spacing(6);
-                if self.install_connection_key.is_some() {
+                // G-C1: auto-import already ran the instant the marker with
+                // `connection_key` arrived (see `import_installed_key`), so
+                // this button is only ever shown as a retry when that failed
+                // (`install_error` set, `install_profile_imported` still
+                // `None`) — the happy path needs no manual click at all.
+                if self.install_connection_key.is_some() && self.install_profile_imported.is_none()
+                {
                     actions = actions.push(
                         button(t(lang, "Import profile")).on_press(Message::InstallImportProfile),
                     );
                 }
                 body = body.push(actions);
+                if let Some(name) = &self.install_profile_imported {
+                    body = body.push(
+                        text(format!(
+                            "{} \"{}\" — {}",
+                            t(lang, "Imported profile"),
+                            name,
+                            t(lang, "ready to connect (admin access)")
+                        ))
+                        .size(12)
+                        .color(ok_color),
+                    );
+                    if let Some(key) = &self.install_connection_key {
+                        body = body.push(
+                            scrollable(text(key).size(11))
+                                .width(Length::Fill)
+                                .height(50),
+                        );
+                        body = body.push(
+                            row![button(t(lang, "Copy"))
+                                .on_press(Message::AdminCopyKey(key.clone()))]
+                            .spacing(6),
+                        );
+                    }
+                }
             } else {
                 body = body.push(text(t(lang, "Installing...")).size(12).color(muted));
             }
@@ -4591,6 +5607,23 @@ impl App {
             Subscription::none()
         };
 
+        // G-A3: once-a-second countdown tick while a Server Settings apply
+        // is pending confirmation — only included in the batch while
+        // `server_settings_pending.is_some()`, so it starts/stops itself as
+        // that flips (same conditional-inclusion pattern as `recording_sub`
+        // above) rather than needing its own explicit start/stop messages.
+        let server_settings_countdown_sub = if self.server_settings_pending.is_some() {
+            let stream = iced::stream::channel(4, |mut sender| async move {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    let _ = sender.try_send(Message::ServerSettingsCountdownTick);
+                }
+            });
+            Subscription::run_with_id("server_settings_countdown", stream)
+        } else {
+            Subscription::none()
+        };
+
         Subscription::batch(vec![
             worker_sub,
             stats_sub,
@@ -4598,6 +5631,7 @@ impl App {
             close_sub,
             recording_sub,
             install_sub,
+            server_settings_countdown_sub,
         ])
     }
 

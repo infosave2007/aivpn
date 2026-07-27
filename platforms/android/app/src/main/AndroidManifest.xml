@@ -61,6 +61,18 @@
             android:exported="false"
             android:parentActivityName=".AdminActivity" />
 
+        <!-- In-app admin: audit-log view (G-A2, Admin/Viewer role gated, read-only) -->
+        <activity
+            android:name=".AuditLogActivity"
+            android:exported="false"
+            android:parentActivityName=".AdminActivity" />
+
+        <!-- In-app admin: server settings apply-with-rollback (G-A3, Admin-only) -->
+        <activity
+            android:name=".ServerSettingsActivity"
+            android:exported="false"
+            android:parentActivityName=".AdminActivity" />
+
         <!-- C3: SSH server-install wizard (always reachable — no tunnel/role required) -->
         <activity
             android:name=".InstallServerActivity"

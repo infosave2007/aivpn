@@ -58,9 +58,9 @@ struct ContentView: View {
     // P3.3-macOS: cached server-assigned role, refreshed (off main thread —
     // AdminApi.role() blocks on a socket round trip up to 10s) whenever the
     // tunnel connects. nil = unknown/unreachable/not connected; the admin
-    // section only ever shows for an explicit AdminApi.roleAdmin match, so
-    // "unknown" and "not admin" both fail closed to "hidden", never a
-    // false-positive reveal.
+    // section only ever shows for role >= AdminApi.roleViewer (G-A1: Viewer
+    // included, read-only), so "unknown" and "User (0)" both fail closed to
+    // "hidden", never a false-positive reveal.
     @State private var adminRole: UInt8? = nil
     @State private var benchRunning: Bool = false
     @State private var benchResult: BenchDisplayResult? = nil
@@ -308,7 +308,7 @@ struct ContentView: View {
 
             // Install a server via SSH — the basic "spin up my first server"
             // scenario, so unlike "Manage clients"/AdminWindowController
-            // above (gated on vpn.isConnected && adminRole == roleAdmin,
+            // below (gated on vpn.isConnected && adminRole >= roleViewer,
             // which by definition can never be true before any server
             // exists) this entry point is ALWAYS available: no connection,
             // no admin role required. Only the install flow itself needs
@@ -815,21 +815,61 @@ struct ContentView: View {
                 Divider()
             }
 
-            // Admin: client-management console (P3.3-macOS). Only ever shown
-            // when the server-assigned role cached from the last Capabilities
-            // control message is Admin (2) — never assignable from this app,
-            // the server decides. Opens its own window (AdminWindowController)
-            // rather than an inline section: the popover is a fixed 360×440
-            // and a client list + add-client form + QR/save-panel flow needs
-            // real room, the same way "Manage…"/"Preferences…" in other
-            // menu-bar apps opens a separate window instead of growing the
-            // popover indefinitely.
-            if vpn.isConnected, adminRole == AdminApi.roleAdmin {
+            // Admin: client-management console (P3.3-macOS). Shown for any
+            // server-assigned role above User — Viewer (1) as well as
+            // Admin (2) — cached from the last Capabilities control
+            // message; never assignable from this app, the server decides.
+            // G-A1: Viewer gets the same entry point but the window itself
+            // (AdminWindowController/AdminRootView in AdminView.swift)
+            // independently re-derives `AdminStore.canMutate` from its own
+            // `AdminApi.role()` call and hides every mutating control when
+            // it isn't Admin — this button's label/icon just previews that
+            // mode up front so a Viewer isn't surprised. Opens its own
+            // window rather than an inline section: the popover is a fixed
+            // 360×440 and a client list + add-client form + QR/save-panel
+            // flow needs real room, the same way "Manage…"/"Preferences…"
+            // in other menu-bar apps opens a separate window instead of
+            // growing the popover indefinitely.
+            if vpn.isConnected, let adminRole = adminRole, adminRole >= AdminApi.roleViewer {
                 Button(action: { AdminWindowController.shared.show() }) {
                     HStack {
-                        Image(systemName: "person.2.badge.gearshape")
+                        Image(systemName: adminRole == AdminApi.roleAdmin
+                              ? "person.2.badge.gearshape" : "eye")
                             .font(.caption)
-                        Text(loc.t("admin_panel_button"))
+                        Text(adminRole == AdminApi.roleAdmin
+                             ? loc.t("admin_panel_button") : loc.t("admin_panel_button_viewer"))
+                            .font(.caption)
+                        Spacer()
+                        Image(systemName: "chevron.right")
+                            .font(.caption2)
+                            .foregroundColor(.secondary)
+                    }
+                }
+                .buttonStyle(.plain)
+                .padding(.horizontal, 16)
+                .padding(.vertical, 8)
+
+                Divider()
+            }
+
+            // G-A3: Server Settings (apply-with-rollback: active mask +
+            // global default exit node) — Admin ONLY, unlike the client-
+            // management console above which Viewer can also open in
+            // read-only mode. There is no read-only story for this window
+            // (every control on it is a mutation), so it is simply absent
+            // for Viewer/User rather than opened-and-then-blocked; the
+            // window itself (ServerSettingsRootView in ServerSettingsView.
+            // swift) independently re-derives `ServerSettingsStore.isAdmin`
+            // from its own `AdminApi.role()` call and shows an admin-only
+            // message if the role isn't (or is no longer) Admin by the time
+            // it's opened — same defense-in-depth convention as the button
+            // above.
+            if vpn.isConnected, let adminRole = adminRole, adminRole == AdminApi.roleAdmin {
+                Button(action: { ServerSettingsWindowController.shared.show() }) {
+                    HStack {
+                        Image(systemName: "slider.horizontal.3")
+                            .font(.caption)
+                        Text(loc.t("server_settings_button"))
                             .font(.caption)
                         Spacer()
                         Image(systemName: "chevron.right")

@@ -28,6 +28,8 @@ SWIFT_SOURCES=(
     "$SCRIPT_DIR/AdminApi.swift"
     "$SCRIPT_DIR/AdminView.swift"
     "$SCRIPT_DIR/PoolView.swift"
+    "$SCRIPT_DIR/AuditLogView.swift"
+    "$SCRIPT_DIR/ServerSettingsView.swift"
     "$SCRIPT_DIR/SshInstaller.swift"
     "$SCRIPT_DIR/InstallServerView.swift"
 )

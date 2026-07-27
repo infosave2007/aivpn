@@ -1126,6 +1126,13 @@ enum Route {
     PoolHealth,
     /// Wave B1: `GET /api/v1/pool/links`.
     PoolLinks,
+    /// G-A3: `GET /api/v1/masks` — list available mask profiles so the
+    /// native in-app "Server Settings" apply-with-rollback picker has the
+    /// same data source as the web panel. Read-only listing of the mask
+    /// directory (filenames + sizes + `generated` flag), no secrets — the
+    /// REST handler is `management_api.rs::list_masks`; this arm mirrors its
+    /// shape over the curated tunnel so Viewer+Admin can enumerate masks.
+    MasksList,
 }
 
 /// Parse `?limit=N` out of a raw query string, clamped to
@@ -1199,6 +1206,7 @@ fn classify_route(method: u8, path: &str) -> Option<Route> {
         (METHOD_GET, ["pool", "nodes"]) => Some(Route::PoolNodes),
         (METHOD_GET, ["pool", "health"]) => Some(Route::PoolHealth),
         (METHOD_GET, ["pool", "links"]) => Some(Route::PoolLinks),
+        (METHOD_GET, ["masks"]) => Some(Route::MasksList),
         _ => None,
     }
 }
@@ -1489,7 +1497,62 @@ pub fn dispatch(ctx: &MgmtCtx, method: u8, path: &str, body: &[u8]) -> (u16, Vec
             let links = ctx.pool.as_ref().map(|p| &p.links).unwrap_or(&empty.links);
             json_response(200, links)
         }
+        Route::MasksList => json_response(200, &list_mask_files(ctx.mask_dir)),
     }
+}
+
+/// List the mask profiles in `mask_dir` for the tunnel `GET /api/v1/masks`
+/// arm — mirrors the shape of `management_api.rs::list_masks`'s `MaskInfo`
+/// (`id`/`file`/`size_bytes`/`modified`/`generated`) so the native and web
+/// mask pickers consume identical JSON. Read-only; any unreadable directory
+/// or entry degrades to an empty/partial list rather than erroring.
+fn list_mask_files(mask_dir: &std::path::Path) -> Vec<serde_json::Value> {
+    let mut entries = Vec::new();
+    let Ok(dir) = std::fs::read_dir(mask_dir) else {
+        return entries;
+    };
+    for entry in dir.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let meta = entry.metadata().ok();
+        let size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+        // RFC3339 string to byte-match the REST handler's
+        // `Option<DateTime<Utc>>` serialization (clients decode `modified`
+        // as an optional string; a bare number would fail strict decoders).
+        let modified = meta
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .and_then(|d| DateTime::<Utc>::from_timestamp(d.as_secs() as i64, 0))
+            .map(|dt| dt.to_rfc3339());
+        let file = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("")
+            .to_string();
+        let id = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_string();
+        // Cheaply read just the `generated` flag from the profile JSON so
+        // the picker can mark auto-generated masks — mirrors the REST handler.
+        let generated = std::fs::read(&path)
+            .ok()
+            .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+            .and_then(|v| v.get("generated").and_then(|g| g.as_bool()))
+            .unwrap_or(false);
+        entries.push(serde_json::json!({
+            "id": id,
+            "file": file,
+            "size_bytes": size,
+            "modified": modified,
+            "generated": generated,
+        }));
+    }
+    entries.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
+    entries
 }
 
 #[cfg(test)]
@@ -2893,5 +2956,43 @@ mod tests {
             assert!(!authorize(role, METHOD_PATCH, "/api/v1/pool/health"));
             assert!(!authorize(role, METHOD_DELETE, "/api/v1/pool/links"));
         }
+    }
+
+    /// G-A3: `GET /api/v1/masks` classifies and is a read-only route —
+    /// Viewer+Admin may GET (falls out of "Viewer = GET only"), User denied,
+    /// and no mutating method exists over the tunnel.
+    #[test]
+    fn authorize_masks_list_is_read_only_route() {
+        assert!(matches!(
+            classify_route(METHOD_GET, "/api/v1/masks"),
+            Some(Route::MasksList)
+        ));
+        assert!(authorize(ROLE_VIEWER, METHOD_GET, "/api/v1/masks"));
+        assert!(authorize(ROLE_ADMIN, METHOD_GET, "/api/v1/masks"));
+        assert!(!authorize(ROLE_USER, METHOD_GET, "/api/v1/masks"));
+        for role in [ROLE_USER, ROLE_VIEWER, ROLE_ADMIN] {
+            assert!(!authorize(role, METHOD_POST, "/api/v1/masks"));
+            assert!(!authorize(role, METHOD_DELETE, "/api/v1/masks"));
+        }
+    }
+
+    /// `list_mask_files` lists `*.json` profiles with the REST `MaskInfo`
+    /// shape (id/file/size_bytes/modified/generated), reads the `generated`
+    /// flag, sorts by id, and ignores non-JSON entries.
+    #[test]
+    fn list_mask_files_shapes_and_filters_entries() {
+        let dir = std::env::temp_dir().join(format!("aivpn-mask-test-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        std::fs::write(dir.join("zeta.json"), br#"{"generated":true}"#).unwrap();
+        std::fs::write(dir.join("alpha.json"), br#"{"foo":1}"#).unwrap();
+        std::fs::write(dir.join("notes.txt"), b"ignore me").unwrap();
+        let masks = list_mask_files(&dir);
+        assert_eq!(masks.len(), 2, "only *.json counted");
+        assert_eq!(masks[0]["id"].as_str(), Some("alpha"), "sorted by id");
+        assert_eq!(masks[0]["file"].as_str(), Some("alpha.json"));
+        assert_eq!(masks[0]["generated"].as_bool(), Some(false));
+        assert_eq!(masks[1]["id"].as_str(), Some("zeta"));
+        assert_eq!(masks[1]["generated"].as_bool(), Some(true));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

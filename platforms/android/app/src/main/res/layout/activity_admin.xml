@@ -31,6 +31,7 @@
                 app:tint="@color/text_primary" />
 
             <TextView
+                android:id="@+id/textTitle"
                 android:layout_width="0dp"
                 android:layout_height="wrap_content"
                 android:layout_weight="1"
@@ -47,6 +48,27 @@
                 android:src="@android:drawable/ic_menu_mapmode"
                 android:background="?attr/selectableItemBackgroundBorderless"
                 android:contentDescription="@string/pool_title"
+                android:scaleType="centerInside"
+                app:tint="@color/text_primary" />
+
+            <ImageButton
+                android:id="@+id/btnAudit"
+                android:layout_width="40dp"
+                android:layout_height="40dp"
+                android:src="@android:drawable/ic_menu_recent_history"
+                android:background="?attr/selectableItemBackgroundBorderless"
+                android:contentDescription="@string/audit_title"
+                android:scaleType="centerInside"
+                app:tint="@color/text_primary" />
+
+            <!-- Admin-only (G-A3): visibility toggled in AdminActivity#onCreate, mirrors fabAdd -->
+            <ImageButton
+                android:id="@+id/btnSettings"
+                android:layout_width="40dp"
+                android:layout_height="40dp"
+                android:src="@android:drawable/ic_menu_manage"
+                android:background="?attr/selectableItemBackgroundBorderless"
+                android:contentDescription="@string/server_settings_title"
                 android:scaleType="centerInside"
                 app:tint="@color/text_primary" />
 

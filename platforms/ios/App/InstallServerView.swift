@@ -217,6 +217,19 @@ struct InstallServerView: View {
     // MARK: Install
     @StateObject private var runner = SshInstallRunner()
     @State private var showImportSheet = false
+    // G-C1: auto-import — the connection key is imported into the Keychain
+    // the moment the `finished` marker reports one, no manual "Import"
+    // click required (the wizard is admin-only, see the header comment, so
+    // this key is always an admin-capable client — "install → immediately
+    // connected as admin" per the design). `autoImported` latches so a
+    // stray re-render / extra `finishedExitCode` change never double-adds
+    // the same key. `importedKeyId` is the Keychain id of the resulting
+    // record (either the just-created one, or a pre-existing one that
+    // happened to have the exact same key value already — see
+    // `autoImportIfNeeded()`), used so the confirmation sheet can rename
+    // it without re-doing the import.
+    @State private var autoImported = false
+    @State private var importedKeyId: String?
 
     var body: some View {
         NavigationStack {
@@ -243,6 +256,7 @@ struct InstallServerView: View {
                 runner.start(paramsJson: buildParamsJson(), loc: loc)
             }
         }
+        .onChange(of: runner.finishedExitCode) { _ in autoImportIfNeeded() }
         .sheet(isPresented: $showScriptSheet) {
             scriptSheet
                 .environmentObject(loc)
@@ -250,16 +264,65 @@ struct InstallServerView: View {
         .sheet(isPresented: $showImportSheet) {
             InstallImportKeySheet(
                 connectionKey: runner.finishedConnectionKey ?? "",
-                suggestedName: host,
-                onImported: {
-                    showImportSheet = false
-                    dismiss()
-                },
-                onCancel: { showImportSheet = false }
+                keyId: importedKeyId,
+                suggestedName: autoImportName(),
+                onDone: { showImportSheet = false }
             )
             .environmentObject(vpn)
             .environmentObject(loc)
         }
+    }
+
+    // MARK: - G-C1: auto-import
+
+    /// Runs once the installer's `finished` marker lands successfully with a
+    /// connection key — see the `autoImported`/`importedKeyId` doc comment
+    /// above for why this replaces the old "tap Import to add the key"
+    /// step. Mirrors `InstallImportKeySheet`'s OLD `save()` validation
+    /// exactly (format check via `ConnectionKey.isValidKeyString`, then
+    /// `vpn.addKey`), just triggered automatically instead of from a button
+    /// tap.
+    @MainActor
+    private func autoImportIfNeeded() {
+        guard !autoImported else { return }
+        guard runner.finishedExitCode == 0,
+              let key = runner.finishedConnectionKey, !key.isEmpty else { return }
+        autoImported = true
+
+        guard ConnectionKey.isValidKeyString(key) else {
+            // Malformed key from the remote script — nothing to import;
+            // the confirmation sheet still opens (via `showImportSheet`
+            // below) so the raw text is visible/copyable even though
+            // `importedKeyId` stays nil (see InstallImportKeySheet's
+            // "not imported" branch).
+            showImportSheet = true
+            return
+        }
+
+        if vpn.addKey(name: autoImportName(), keyValue: key) {
+            // `VPNManager.addKey` always selects the key it just created
+            // (see that function's body) — reading it straight back via
+            // `selectedKeyId` is the ONLY way to get its Keychain id, since
+            // `addKey` itself returns a plain `Bool`, not the record.
+            importedKeyId = vpn.selectedKeyId
+        } else {
+            // `addKey` only fails on an exact keyValue duplicate (same
+            // server key already saved from a prior install/import) — find
+            // that existing record instead of treating this as an error,
+            // so the confirmation sheet still has something to rename.
+            let norm = key.trimmingCharacters(in: .whitespacesAndNewlines)
+                .replacingOccurrences(of: "aivpn://", with: "")
+            importedKeyId = vpn.keys.first(where: { $0.keyValue == norm })?.id
+        }
+        showImportSheet = true
+    }
+
+    /// `host` at the time the install finished — same default the old
+    /// manual-import sheet suggested, still overridable in the sheet's own
+    /// name field before/after the fact via rename.
+    private func autoImportName() -> String {
+        let trimmed = host.trimmingCharacters(in: .whitespaces)
+        return trimmed.isEmpty ? "aivpn" : trimmed
     }
 
     // MARK: - Step 1: Target
@@ -607,7 +670,24 @@ struct InstallServerView: View {
                             .foregroundColor(.red)
                     }
                     if let key = runner.finishedConnectionKey, !key.isEmpty {
-                        Button(loc.t("install_import_button")) { showImportSheet = true }
+                        // G-C1: the key is already imported by this point —
+                        // `autoImportIfNeeded()` ran the moment
+                        // `finishedExitCode`/`finishedConnectionKey` landed
+                        // (see the `.onChange(of: runner.finishedExitCode)`
+                        // modifier above) and already popped the
+                        // confirmation sheet once. This button is only a
+                        // way to reopen that sheet (view the key again /
+                        // rename it) — it is never the thing that performs
+                        // the import.
+                        if autoImported {
+                            Label(
+                                importedKeyId != nil ? loc.t("install_import_done") : loc.t("install_auto_import_failed"),
+                                systemImage: importedKeyId != nil ? "checkmark.circle.fill" : "exclamationmark.triangle.fill"
+                            )
+                            .font(.caption)
+                            .foregroundColor(importedKeyId != nil ? .green : .orange)
+                        }
+                        Button(loc.t("install_view_key_button")) { showImportSheet = true }
                             .buttonStyle(.borderedProminent)
                     } else {
                         Text(loc.t("install_no_key_hint"))
@@ -706,33 +786,42 @@ struct InstallServerView: View {
     }
 }
 
-// MARK: - Import connection key sheet
+// MARK: - Import confirmation sheet (G-C1)
 
-/// Minimal "add key" flow reusing `VPNManager.addKey`/`ConnectionKey`'s own
-/// validation — functionally equivalent to ContentView.swift's private
-/// `KeyEditSheet` (same validation, same save path), but a separate type
-/// here because `KeyEditSheet` is file-private to ContentView.swift and
-/// this wizard lives in its own file.
+/// Post-auto-import confirmation/rename sheet. UNLIKE the pre-G-C1 version
+/// of this type, it does NOT perform the import itself anymore — by the
+/// time this is presented, `InstallServerView.autoImportIfNeeded()` has
+/// already called `vpn.addKey` (see that function's doc comment). This
+/// view's only two jobs are: show the operator what just got imported
+/// (name + raw key, same fields the old manual sheet showed), and let them
+/// rename it — `keyId` is that already-created record's Keychain id (`nil`
+/// only in the edge case where auto-import itself failed on a malformed
+/// key, e.g. `install-server.sh` echoed something `ConnectionKey
+/// .isValidKeyString` rejects; the raw text stays visible/copyable either
+/// way, same "never lose the ability to view/rename" requirement the
+/// button that reopens this sheet from `installStep` relies on).
 private struct InstallImportKeySheet: View {
     /// Already in `aivpn://<base64url-json>` form — see
     /// `mgmt_service::connection_key` server-side, which formats it that
     /// way before install-server.sh ever echoes it back in the `finished`
-    /// marker — so this is NOT re-prefixed before validation/saving.
+    /// marker.
     let connectionKey: String
+    /// Keychain id of the already-imported record, or `nil` if
+    /// `autoImportIfNeeded()` couldn't import it (malformed key).
+    let keyId: String?
     let suggestedName: String
-    let onImported: () -> Void
-    let onCancel: () -> Void
+    let onDone: () -> Void
 
     @EnvironmentObject private var vpn: VPNManager
     @EnvironmentObject private var loc: LocalizationManager
     @State private var name: String
     @State private var error: String?
 
-    init(connectionKey: String, suggestedName: String, onImported: @escaping () -> Void, onCancel: @escaping () -> Void) {
+    init(connectionKey: String, keyId: String?, suggestedName: String, onDone: @escaping () -> Void) {
         self.connectionKey = connectionKey
+        self.keyId = keyId
         self.suggestedName = suggestedName
-        self.onImported = onImported
-        self.onCancel = onCancel
+        self.onDone = onDone
         _name = State(initialValue: suggestedName)
     }
 
@@ -740,8 +829,18 @@ private struct InstallImportKeySheet: View {
         NavigationStack {
             Form {
                 Section {
+                    if keyId != nil {
+                        Label(loc.t("install_import_done"), systemImage: "checkmark.circle.fill")
+                            .foregroundColor(.green)
+                    } else {
+                        Label(loc.t("install_auto_import_failed"), systemImage: "exclamationmark.triangle.fill")
+                            .foregroundColor(.orange)
+                    }
+                }
+                Section {
                     TextField(loc.t("key_name"), text: $name)
                         .autocorrectionDisabled()
+                        .disabled(keyId == nil)
                 }
                 Section {
                     Text(connectionKey)
@@ -756,26 +855,38 @@ private struct InstallImportKeySheet: View {
             .navigationTitle(loc.t("install_import_title"))
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                ToolbarItem(placement: .cancellationAction) {
-                    Button(loc.t("cancel")) { onCancel() }
-                }
                 ToolbarItem(placement: .confirmationAction) {
-                    Button(loc.t("admin_save")) { save() }
-                        .disabled(name.trimmingCharacters(in: .whitespaces).isEmpty)
+                    Button(loc.t("done")) { save() }
+                        .disabled(keyId != nil && name.trimmingCharacters(in: .whitespaces).isEmpty)
                 }
             }
         }
     }
 
+    /// Renames the already-imported record if `name` was edited — the
+    /// import itself already happened before this view ever appeared (see
+    /// the type doc comment), so there is no "add" path here anymore, only
+    /// an optional rename. Preserves `mtlsCert`/`serverSigningKey` from the
+    /// current record (both `nil` in practice, since `autoImportIfNeeded()`
+    /// calls `vpn.addKey` without them) rather than passing `nil`
+    /// unconditionally, so this can never silently clobber fields on a
+    /// pre-existing record it happened to reuse (the "duplicate keyValue"
+    /// branch of `autoImportIfNeeded()`).
     private func save() {
-        guard ConnectionKey.isValidKeyString(connectionKey) else {
-            error = loc.t("error_invalid_key")
+        guard let keyId, let current = vpn.keys.first(where: { $0.id == keyId }) else {
+            onDone()
             return
         }
-        guard vpn.addKey(name: name.trimmingCharacters(in: .whitespaces), keyValue: connectionKey) else {
+        let trimmed = name.trimmingCharacters(in: .whitespaces)
+        guard !trimmed.isEmpty, trimmed != current.name else {
+            onDone()
+            return
+        }
+        guard vpn.updateKey(id: keyId, name: trimmed, keyValue: current.keyValue,
+                             mtlsCert: current.mtlsCert, serverSigningKey: current.serverSigningKey) else {
             error = loc.t("duplicate_key")
             return
         }
-        onImported()
+        onDone()
     }
 }

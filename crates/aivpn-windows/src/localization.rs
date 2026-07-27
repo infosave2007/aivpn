@@ -467,8 +467,8 @@ pub fn t(lang: Lang, key: &str) -> &'static str {
         (Lang::Ru, "admin_expiry_hint") => "Срок действия (RFC3339, необязательно)",
         (Lang::En, "admin_enabled") => "Enabled",
         (Lang::Ru, "admin_enabled") => "Включён",
-        (Lang::En, "admin_status_audit") => "Server status & audit log",
-        (Lang::Ru, "admin_status_audit") => "Статус сервера и журнал аудита",
+        (Lang::En, "admin_status_header") => "Server status",
+        (Lang::Ru, "admin_status_header") => "Статус сервера",
         (Lang::En, "admin_status_clients") => "Clients enabled/total",
         (Lang::Ru, "admin_status_clients") => "Клиентов включено/всего",
         (Lang::En, "admin_status_kernel") => "Kernel module",
@@ -492,12 +492,38 @@ pub fn t(lang: Lang, key: &str) -> &'static str {
             "Это необратимо. Ключ клиента перестанет работать немедленно."
         }
 
+        // G-A1: Viewer read-only admin-panel badge
+        (Lang::En, "admin_view_only") => "View only",
+        (Lang::Ru, "admin_view_only") => "Только просмотр",
+
+        // G-A2: audit-log panel (Viewer + Admin, GET-only)
+        (Lang::En, "admin_audit_panel") => "Audit log",
+        (Lang::Ru, "admin_audit_panel") => "Журнал аудита",
+        (Lang::En, "admin_audit_no_entries") => "No audit entries",
+        (Lang::Ru, "admin_audit_no_entries") => "Нет записей аудита",
+        (Lang::En, "admin_audit_chain_verified") => "chain verified",
+        (Lang::Ru, "admin_audit_chain_verified") => "цепочка подтверждена",
+        (Lang::En, "admin_audit_chain_broken") => "chain BROKEN",
+        (Lang::Ru, "admin_audit_chain_broken") => "ЦЕПОЧКА НАРУШЕНА",
+
         // Per-client exit node (B3) — Admin edit, shown to Viewer read-only
         (Lang::En, "admin_exit_node") => "Exit node",
         (Lang::Ru, "admin_exit_node") => "Узел выхода",
         (Lang::En, "admin_exit_node_hint") => "Exit node (optional, host:port — empty = global default)",
         (Lang::Ru, "admin_exit_node_hint") => {
             "Узел выхода (необязательно, host:port — пусто = глобальный по умолчанию)"
+        }
+
+        // G-B1: exit-node picker (ComboBox sourced from GET /pool/nodes)
+        (Lang::En, "admin_exit_node_default") => "(default)",
+        (Lang::Ru, "admin_exit_node_default") => "(по умолчанию)",
+        (Lang::En, "admin_exit_node_custom") => "Custom…",
+        (Lang::Ru, "admin_exit_node_custom") => "Другой…",
+        (Lang::En, "admin_exit_node_live_hint") => {
+            "Per-client exit node applies live, no reconnect needed. The global default (set on the server) only takes effect after a restart."
+        }
+        (Lang::Ru, "admin_exit_node_live_hint") => {
+            "Персональный узел выхода клиента применяется вживую, без переподключения. Глобальный узел по умолчанию (на сервере) вступает в силу только после рестарта."
         }
 
         // Pool topology view (B3) — Viewer + Admin
@@ -528,6 +554,51 @@ pub fn t(lang: Lang, key: &str) -> &'static str {
         }
         (Lang::Ru, "admin_pool_subnet_mismatch") => {
             "⚠ Несовпадение подсети: пир не согласен с VPN-подсетью"
+        }
+
+        // G-A3: Server Settings (Admin only) — apply-with-rollback for the
+        // active mask (per-client) and the global default exit node.
+        (Lang::En, "admin_settings_panel") => "Server Settings",
+        (Lang::Ru, "admin_settings_panel") => "Настройки сервера",
+        (Lang::En, "admin_settings_mask_section") => "Active mask",
+        (Lang::Ru, "admin_settings_mask_section") => "Активная маска",
+        (Lang::En, "admin_settings_mask_client_label") => "Client",
+        (Lang::Ru, "admin_settings_mask_client_label") => "Клиент",
+        (Lang::En, "admin_settings_mask_no_clients") => {
+            "No clients loaded — refresh the client list above first"
+        }
+        (Lang::Ru, "admin_settings_mask_no_clients") => {
+            "Клиенты не загружены — сначала обновите список клиентов выше"
+        }
+        (Lang::En, "admin_settings_mask_id_label") => "Mask ID",
+        (Lang::Ru, "admin_settings_mask_id_label") => "ID маски",
+        (Lang::En, "admin_settings_mask_id_hint") => "e.g. webrtc_zoom_v3",
+        (Lang::Ru, "admin_settings_mask_id_hint") => "напр. webrtc_zoom_v3",
+        (Lang::En, "admin_settings_exit_section") => "Global exit node (pool default)",
+        (Lang::Ru, "admin_settings_exit_section") => "Глобальный узел выхода (по умолчанию)",
+        (Lang::En, "admin_settings_exit_restart_hint") => {
+            "Applies after the server process restarts — not live."
+        }
+        (Lang::Ru, "admin_settings_exit_restart_hint") => {
+            "Применяется после рестарта процесса сервера — не вживую."
+        }
+        (Lang::En, "admin_settings_exit_none") => "(none)",
+        (Lang::Ru, "admin_settings_exit_none") => "(нет)",
+        (Lang::En, "admin_settings_apply") => "Apply",
+        (Lang::Ru, "admin_settings_apply") => "Применить",
+        (Lang::En, "admin_settings_confirm") => "Confirm",
+        (Lang::Ru, "admin_settings_confirm") => "Подтвердить",
+        (Lang::En, "admin_settings_pending_banner") => {
+            "Confirm within the time shown or this change is rolled back automatically"
+        }
+        (Lang::Ru, "admin_settings_pending_banner") => {
+            "Подтвердите за отведённое время, иначе изменение будет автоматически откачено"
+        }
+        (Lang::En, "admin_settings_rolled_back") => {
+            "Not confirmed in time — the change was rolled back."
+        }
+        (Lang::Ru, "admin_settings_rolled_back") => {
+            "Не подтверждено вовремя — изменение откачено."
         }
 
         // C3: SSH server-install wizard — entry point + form + progress
@@ -577,8 +648,15 @@ pub fn t(lang: Lang, key: &str) -> &'static str {
         (Lang::Ru, "ssh_install_done_error") => "Установка завершилась с ошибкой — см. журнал выше.",
         (Lang::En, "ssh_import_profile_btn") => "Import profile",
         (Lang::Ru, "ssh_import_profile_btn") => "Импортировать профиль",
-        (Lang::En, "ssh_import_profile_done") => "Profile imported.",
-        (Lang::Ru, "ssh_import_profile_done") => "Профиль импортирован.",
+        (Lang::En, "ssh_import_profile_done") => "Profile imported automatically.",
+        (Lang::Ru, "ssh_import_profile_done") => "Профиль импортирован автоматически.",
+        // G-C1: shown only if the automatic import itself failed (retry path)
+        (Lang::En, "ssh_import_profile_retry_hint") => {
+            "Automatic import failed — you can retry it manually:"
+        }
+        (Lang::Ru, "ssh_import_profile_retry_hint") => {
+            "Автоматический импорт не удался — можно повторить вручную:"
+        }
         (Lang::En, "ssh_wizard_close_btn") => "Close",
         (Lang::Ru, "ssh_wizard_close_btn") => "Закрыть",
         (Lang::En, "ssh_script_title") => "install-server.sh",

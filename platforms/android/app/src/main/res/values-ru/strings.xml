@@ -217,7 +217,7 @@
 
     <!-- In-app admin: client management (P3.1) -->
     <string name="admin_menu_title">Управление клиентами</string>
-    <string name="desc_admin_menu">Добавление, отзыв и управление подключёнными клиентами (админ)</string>
+    <string name="desc_admin_menu">Просмотр клиентов, пула и журнала аудита — добавление/изменение/отзыв только для Admin</string>
     <string name="admin_title">Управление клиентами</string>
     <string name="admin_refresh">Обновить</string>
     <string name="admin_not_connected">Нет подключения — подключитесь к VPN, чтобы управлять клиентами</string>
@@ -248,7 +248,11 @@
     <string name="admin_error_generic">Ошибка запроса (%d)</string>
     <string name="admin_error_with_reason">Ошибка запроса (%1$d): %2$s</string>
     <string name="admin_hint_exit_node">Выходной узел (необязательно, host:port — пусто = глобальный по умолчанию)</string>
+    <string name="admin_hint_exit_node_live">Персональный выходной узел применяется вживую, без переподключения. Глобальный по умолчанию — только после перезапуска сервера.</string>
+    <string name="admin_exit_option_default">(по умолчанию)</string>
+    <string name="admin_exit_option_custom">Свой вариант…</string>
     <string name="admin_exit_node_prefix">Выход: %s</string>
+    <string name="admin_title_viewer">Управление клиентами (Viewer, только просмотр)</string>
 
     <!-- Топология пула (Wave B3) -->
     <string name="pool_title">Топология пула</string>
@@ -268,6 +272,29 @@
     <string name="pool_node_disconnected">Отключён</string>
     <string name="pool_node_last_seen">Последний раз виден: %s</string>
     <string name="pool_node_never">никогда</string>
+
+    <!-- Настройки сервера с откатом (Wave 2 / G-A3): только Admin -->
+    <string name="server_settings_title">Настройки сервера</string>
+    <string name="server_settings_mask_title">Активная маска</string>
+    <string name="server_settings_mask_caption">Применяется вживую, немедленно — перезапуск сервера не требуется. Подтвердите в течение окна ниже, иначе изменение будет автоматически откачено.</string>
+    <string name="server_settings_mask_id_hint">Введите id маски</string>
+    <string name="server_settings_mask_none_loaded">Список масок пока недоступен — подключитесь к VPN и откройте этот экран заново, либо введите id маски вручную.</string>
+    <string name="server_settings_exit_title">Глобальный выходной узел по умолчанию (пул)</string>
+    <string name="server_settings_exit_caption">Применяется только после ПЕРЕЗАПУСКА сервера — не вживую. Это резервный вариант для любого клиента без собственного персонального выходного узла.</string>
+    <string name="server_settings_exit_hint">host:port — пусто = нет</string>
+    <string name="server_settings_apply">Применить</string>
+    <string name="server_settings_confirm">Подтвердить</string>
+    <string name="server_settings_pending_banner">Подтвердите в течение %d с, иначе изменение будет автоматически откачено</string>
+    <string name="server_settings_confirmed">Подтверждено — изменение теперь постоянное</string>
+    <string name="server_settings_reverted">Не подтверждено вовремя — сервер уже откатил это изменение</string>
+
+    <!-- Журнал аудита (G-A2): цепочка хешей подписанных действий админа, Viewer + Admin -->
+    <string name="audit_title">Журнал аудита</string>
+    <string name="audit_no_entries">Записей аудита пока нет</string>
+    <string name="audit_chain_verified">Цепочка подтверждена</string>
+    <string name="audit_chain_broken">Цепочка повреждена на записи №%d</string>
+    <string name="audit_entry_target_prefix">Цель: %s</string>
+    <string name="audit_entry_actor_prefix">%1$s · %2$s</string>
 
     <!-- Мастер установки сервера по SSH (C3) -->
     <string name="install_menu_title">Установить сервер</string>
@@ -326,6 +353,7 @@
     <string name="install_log_uploading">Загрузка %s…</string>
     <string name="install_log_finished">Завершено, код выхода %d</string>
     <string name="install_profile_imported">Профиль импортирован</string>
+    <string name="install_profile_auto_imported">Профиль импортирован автоматически:</string>
     <string name="install_marker_port_busy">Целевой порт уже занят другим процессом</string>
     <string name="install_marker_no_masks">Нет доступных профилей маскировки для установки</string>
     <string name="install_marker_template_missing">В пакете установки отсутствует шаблон конфигурации сервера</string>

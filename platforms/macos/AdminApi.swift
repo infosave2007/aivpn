@@ -224,4 +224,86 @@ enum AdminApi {
     static func poolHealth() -> (status: UInt16, body: Data)? {
         mgmtRequest(method: 0 /* GET */, path: "/api/v1/pool/health")
     }
+
+    // MARK: - Audit log (G-A2)
+
+    /// `GET /api/v1/audit-log?verify=1&limit={limit}` — thin wrapper over
+    /// `mgmtRequest`, same raw `(status, body)` contract. Always requests
+    /// hash-chain verification (`verify=1`): the view always wants the
+    /// `verified`/`broken_at` badge, so the response always decodes as the
+    /// server's `AuditVerifyView` shape (`{entries, verified, broken_at}`),
+    /// never the bare `Vec<AuditEntry>` array `GET /api/v1/audit-log`
+    /// (without `?verify=1`) returns — see
+    /// `crates/aivpn-server/src/mgmt_service.rs::dispatch`'s `Route::AuditLog`
+    /// arm. The `?query` rides inside `path` itself: the admin-socket wire
+    /// protocol only splits on `:` (see the module doc above and
+    /// `crates/aivpn-client/src/record_cmd.rs::parse_admin_line`'s
+    /// `splitn(3, ':')`), so a `?`-bearing path round-trips unmodified —
+    /// the server's own `classify_route` is what splits `path` from
+    /// `query` on `?` (`mgmt_service.rs`). Available to Viewer (1) and
+    /// Admin (2): `authorize()` server-side allows every curated GET route,
+    /// including `audit-log`, at Viewer.
+    static func auditLog(limit: Int = 200) -> (status: UInt16, body: Data)? {
+        mgmtRequest(method: 0 /* GET */, path: "/api/v1/audit-log?verify=1&limit=\(limit)")
+    }
+
+    // MARK: - Server settings apply-with-rollback (G-A3)
+
+    /// `GET /api/v1/masks` — thin wrapper over `mgmtRequest`, same raw
+    /// `(status, body)` contract as `poolNodes()`/`auditLog()` above.
+    ///
+    /// KNOWN GAP, verified directly against
+    /// `crates/aivpn-server/src/mgmt_service.rs`: unlike `clients`/`status`/
+    /// `audit-log`/`config/apply`/`config/confirm`/`pool/*`, `["masks"]` has
+    /// NO arm in that file's `classify_route()` match — the masks catalog
+    /// is currently a REST-only route (`management_api.rs::list_masks`,
+    /// mounted at the same `/api/v1/masks` path but only reachable over the
+    /// web-panel's Unix-socket REST API, not the in-tunnel admin-socket
+    /// `mgmt:` command this file speaks). Calling this today therefore
+    /// always fails closed — `classify_route` returns `None`, so
+    /// `authorize()` denies it before `dispatch()` is ever reached,
+    /// regardless of caller role — surfacing here as a non-200 `status`
+    /// (or, if the gateway declines to reply to an unauthorized request at
+    /// all, as `mgmtRequest` returning `nil`, the same as any other
+    /// unreachable-daemon case). This wrapper is written against the wire
+    /// shape the server-side task (extending `classify_route`/`dispatch`
+    /// with a `Route::Masks` arm reusing `management_api::MaskInfo`) is
+    /// expected to land as a natural follow-up — once that lands, this
+    /// starts working with no client-side change. Callers (`ServerSettingsStore.
+    /// refreshMasks()`) MUST treat any non-200 as "catalog unavailable" and
+    /// fall back to manual mask-id entry, never as a hard error — see that
+    /// method's doc comment.
+    static func listMasks() -> (status: UInt16, body: Data)? {
+        mgmtRequest(method: 0 /* GET */, path: "/api/v1/masks")
+    }
+
+    /// `POST /api/v1/config/apply` — thin wrapper over `mgmtRequest`. Body
+    /// is caller-built JSON: `{"client":"","mask":"<id>"}` selects the
+    /// active-mask `HeavySetting` (live, no restart); `{"exit_node":
+    /// "<host:port>"|null}` selects the global default exit-node
+    /// `HeavySetting` (persisted to `server.json`'s `pool.exit_node`, takes
+    /// effect on the server's NEXT RESTART only — see
+    /// `HeavySetting::ExitNode`'s doc comment in mgmt_service.rs). A `200`
+    /// reply decodes as `{"token":"...","applied":true}`
+    /// (`mgmt_service::ApplyResponse`) — the caller must POST that `token`
+    /// back to `confirmConfig(token:)` within `PENDING_CONFIG_TIMEOUT`
+    /// (120s, `crates/aivpn-server/src/pending_config.rs`) or the server's
+    /// own background sweep auto-rolls the change back.
+    static func applyConfig(body: Data) -> (status: UInt16, body: Data)? {
+        mgmtRequest(method: 1 /* POST */, path: "/api/v1/config/apply", body: body)
+    }
+
+    /// `POST /api/v1/config/confirm` — thin wrapper over `mgmtRequest`.
+    /// Body is `{"token":"<token from applyConfig>"}`
+    /// (`mgmt_service::TunnelConfirmRequest`). `204` on success (change is
+    /// now permanent, nothing left to roll back); a non-2xx status
+    /// (typically `404` — unknown or already-expired-and-swept token, see
+    /// `PendingConfigManager::confirm`'s doc comment) means the token no
+    /// longer names a live pending change — the caller should treat that
+    /// the same as an expiry (the server has, or will shortly, roll back on
+    /// its own sweep).
+    static func confirmConfig(token: String) -> (status: UInt16, body: Data)? {
+        let body = (try? JSONSerialization.data(withJSONObject: ["token": token])) ?? Data()
+        return mgmtRequest(method: 1 /* POST */, path: "/api/v1/config/confirm", body: body)
+    }
 }

@@ -125,9 +125,21 @@ final class InstallServerStore: ObservableObject {
     @Published var connectionKey: String?
     @Published var lastMarker: SshInstaller.Marker?
 
-    // Import
+    // Import (G-C1: automatic — see the `client_done` marker handler in
+    // `startInstall` below)
     @Published var importedProfileName: String = ""
     @Published var didImport: Bool = false
+    /// `VPNManager.shared.selectedKeyId` right after a successful auto-import
+    /// — needed so the rename control in `resultView` can target the right
+    /// keychain entry via `VPNManager.updateKeyName(id:newName:)`.
+    @Published var importedKeyId: String?
+    /// True only when auto-import ran and `VPNManager.addKey` returned
+    /// false — `KeychainStorage.addKey` refuses a connection key whose
+    /// value exactly duplicates an already-stored one (see
+    /// ConnectionKey.swift). Surfaces `install_import_failed` so the key
+    /// isn't silently lost; the raw connection key stays visible/
+    /// selectable in `resultView` either way.
+    @Published var importFailed: Bool = false
 
     var canProbe: Bool {
         !host.trimmingCharacters(in: .whitespaces).isEmpty
@@ -148,6 +160,8 @@ final class InstallServerStore: ObservableObject {
         lastMarker = nil
         didImport = false
         importedProfileName = ""
+        importedKeyId = nil
+        importFailed = false
     }
 
     func probe() {
@@ -193,6 +207,10 @@ final class InstallServerStore: ObservableObject {
         exitCode = nil
         connectionKey = nil
         lastMarker = nil
+        didImport = false
+        importedProfileName = ""
+        importedKeyId = nil
+        importFailed = false
 
         let auth: SshInstaller.Auth
         switch authMode {
@@ -230,6 +248,32 @@ final class InstallServerStore: ObservableObject {
                     self.lastMarker = marker
                     if marker.step == "client_done", let key = marker.connection_key {
                         self.connectionKey = key
+                        // G-C1: import the profile the moment the key
+                        // arrives — no mandatory manual "Import Profile"
+                        // click. Same `VPNManager.addKey` path the old
+                        // button used (adds to KeychainStorage + selects
+                        // it), just called here instead of gated behind a
+                        // tap. `onLine` (SshInstaller.runInstall's doc
+                        // comment) always dispatches on the main thread, so
+                        // touching `@Published` state and `VPNManager.shared`
+                        // here is safe. Guarded by `didImport` so a
+                        // (theoretical) duplicate `client_done` line can't
+                        // double-import.
+                        if !self.didImport {
+                            let profileName = self.host
+                            if VPNManager.shared.addKey(name: profileName, keyValue: key) {
+                                self.didImport = true
+                                self.importFailed = false
+                                self.importedProfileName = profileName
+                                self.importedKeyId = VPNManager.shared.selectedKeyId
+                            } else {
+                                // Duplicate key value (KeychainStorage.addKey
+                                // returns nil) — surfaced in resultView via
+                                // `install_import_failed`; the key text
+                                // itself stays visible/copyable regardless.
+                                self.importFailed = true
+                            }
+                        }
                     }
                 }
             }
@@ -404,6 +448,17 @@ struct InstallServerRootView: View {
         }
     }
 
+    /// G-C1: renames the already auto-imported profile in place via
+    /// `VPNManager.updateKeyName` — keeps the "view/rename the key" ability
+    /// the old manual-import flow had, without requiring the import itself
+    /// to be manual.
+    private func renameTapped() {
+        guard let id = store.importedKeyId else { return }
+        let name = store.importedProfileName.trimmingCharacters(in: .whitespaces)
+        guard !name.isEmpty else { return }
+        vpn.updateKeyName(id: id, newName: name)
+    }
+
     // MARK: Step 2 — TOFU
 
     private var tofuStep: some View {
@@ -516,23 +571,54 @@ struct InstallServerRootView: View {
             }
 
             if ok, let key = store.connectionKey {
+                // G-C1: the profile was already imported automatically by
+                // `startInstall`'s `client_done` marker handler — no
+                // mandatory manual click. The rename control (and, in the
+                // rare duplicate-key failure case, the original manual
+                // import button) stay available so the user never loses
+                // the ability to see/rename/retry.
                 VStack(alignment: .leading, spacing: 8) {
                     Text(key)
                         .font(.system(size: 10, design: .monospaced))
                         .textSelection(.enabled)
                         .lineLimit(3)
                         .truncationMode(.middle)
-                    TextField(loc.t("install_profile_name"), text: $store.importedProfileName)
-                        .textFieldStyle(.roundedBorder)
+
                     if store.didImport {
-                        Text(loc.t("install_imported"))
-                            .font(.caption)
-                            .foregroundColor(.green)
+                        HStack(spacing: 4) {
+                            Image(systemName: "checkmark.circle.fill")
+                                .foregroundColor(.green)
+                            Text(loc.t("install_imported"))
+                                .font(.caption)
+                                .foregroundColor(.green)
+                        }
+                        HStack {
+                            TextField(loc.t("install_profile_name"), text: $store.importedProfileName)
+                                .textFieldStyle(.roundedBorder)
+                            Button(loc.t("install_rename")) { renameTapped() }
+                                .disabled(store.importedProfileName.trimmingCharacters(in: .whitespaces).isEmpty
+                                          || store.importedKeyId == nil)
+                        }
                     } else {
+                        // Auto-import only fails on an exact duplicate key
+                        // value (KeychainStorage.addKey — see
+                        // InstallServerStore.importFailed's doc comment);
+                        // this manual fallback is what the "Import Profile"
+                        // button used to be unconditionally.
+                        if store.importFailed {
+                            Text(loc.t("install_import_failed"))
+                                .font(.caption)
+                                .foregroundColor(.orange)
+                        }
+                        TextField(loc.t("install_profile_name"), text: $store.importedProfileName)
+                            .textFieldStyle(.roundedBorder)
                         Button(loc.t("install_import_profile")) {
                             let name = store.importedProfileName.trimmingCharacters(in: .whitespaces)
-                            _ = vpn.addKey(name: name.isEmpty ? store.host : name, keyValue: key)
-                            store.didImport = true
+                            if vpn.addKey(name: name.isEmpty ? store.host : name, keyValue: key) {
+                                store.didImport = true
+                                store.importFailed = false
+                                store.importedKeyId = vpn.selectedKeyId
+                            }
                         }
                         .buttonStyle(.borderedProminent)
                     }

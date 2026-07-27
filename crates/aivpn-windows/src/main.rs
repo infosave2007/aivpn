@@ -549,6 +549,15 @@ use vpn_manager::{
 #[cfg(windows)]
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// G-A3: mirrors the server's `pending_config::PENDING_CONFIG_TIMEOUT`
+/// (~120s) — duplicated client-side purely for the UI's own countdown
+/// display. This clock is cosmetic-only: the server's own sweep task is
+/// what actually rolls a change back, on its own clock, regardless of
+/// what this local countdown shows (a client/server clock skew or a
+/// delayed frame only affects when the LOCAL banner disappears).
+#[cfg(windows)]
+const ADMIN_SETTINGS_CONFIRM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
 #[cfg(windows)]
 struct AivpnApp {
     settings: AppSettings,
@@ -595,14 +604,20 @@ struct AivpnApp {
     connect_requested: std::sync::Arc<std::sync::atomic::AtomicBool>,
     tray_thread_shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
 
-    // ── Admin panel (P3.4) — in-tunnel client management, Admin role only ──
+    // ── Admin panel (P3.4) — in-tunnel client management ────────────────
     admin_tx: std::sync::mpsc::Sender<AdminResponse>,
     admin_rx: std::sync::mpsc::Receiver<AdminResponse>,
     /// Server-assigned role cached for the CURRENT session (0/1/2). `None`
     /// until the `role` query answers; the panel only ever shows once this
-    /// is `Some(1)` (Viewer — pool topology, read-only) or `Some(2)`
-    /// (Admin — pool topology + full client management) — fails closed
-    /// (never shown) on a query error or plain `User` role.
+    /// is `Some(1)` (Viewer) or `Some(2)` (Admin) — fails closed (never
+    /// shown) on a query error or plain `User` role.
+    ///
+    /// G-A1: Viewer and Admin now reach the SAME panel — every subsection
+    /// (clients/pool/audit) is visible to both; `draw_admin_clients_section`
+    /// takes a `can_mutate` flag (`admin_role == Some(2)`) that hides every
+    /// mutating control (add/edit/enable-disable/reset-device/revoke) for
+    /// a Viewer, leaving only reads the server's `authorize()` already
+    /// permits that role (every curated route is GET-only for Viewer).
     admin_role: Option<u8>,
     admin_clients_loaded: bool,
     admin_clients: Vec<admin::AdminClient>,
@@ -613,7 +628,17 @@ struct AivpnApp {
     /// double-clicked into two concurrent operations on the same client.
     admin_busy_ids: std::collections::HashSet<String>,
     admin_status: Option<admin::AdminStatus>,
+    // ── G-A2: audit-log panel (Viewer + Admin, GET-only) ────────────────
+    admin_audit_loaded: bool,
     admin_audit: Vec<admin::AuditEntry>,
+    /// Hash-chain verification result for `admin_audit` (from the server's
+    /// `?verify=1` response) — `None` until the first load, or if the
+    /// server answered with the plain bare-array shape (see
+    /// `admin::parse_audit_log`'s doc comment).
+    admin_audit_verified: Option<bool>,
+    /// Tail-window index (0-based, oldest-first) of the first broken link,
+    /// present only when `admin_audit_verified == Some(false)`.
+    admin_audit_broken_at: Option<usize>,
     admin_audit_loading: bool,
     admin_audit_error: Option<String>,
 
@@ -623,6 +648,12 @@ struct AivpnApp {
     admin_add_expiry: String,
     /// B3: `host:port`, empty = use the server's global default.
     admin_add_exit_node: String,
+    /// G-B1: `true` once the user has explicitly picked "custom" in the
+    /// exit-node `ComboBox` — keeps the free-text box shown even if the
+    /// typed value happens to match "(default)" or a known pool-node
+    /// address (`admin::classify_exit_node` would otherwise reclassify it
+    /// away from Custom on the very next frame).
+    admin_add_exit_custom_mode: bool,
     admin_add_error: Option<String>,
     admin_add_busy: bool,
 
@@ -632,6 +663,9 @@ struct AivpnApp {
     admin_edit_expiry: String,
     /// B3: `host:port`, empty = clear the per-client override.
     admin_edit_exit_node: String,
+    /// G-B1: same rationale as `admin_add_exit_custom_mode`, for the edit
+    /// form.
+    admin_edit_exit_custom_mode: bool,
     admin_edit_error: Option<String>,
     admin_edit_busy: bool,
 
@@ -660,6 +694,41 @@ struct AivpnApp {
     // Revoke confirmation modal
     admin_revoke_id: Option<String>,
     admin_revoke_name: String,
+
+    // ── G-A3: Server Settings (Admin only) — apply-with-rollback ────────
+    // for the active mask (per-client) and the global default exit node.
+    // Both share the SAME apply -> pending-token -> confirm/timeout flow,
+    // but are tracked in independent field sets (mirrors the server's
+    // `PendingConfigManager`, which keys entries by target file, so a mask
+    // apply and an exit-node apply can both be pending at once without
+    // colliding).
+    /// Free-text client id/name the "Active mask" apply targets — picked
+    /// via a `ComboBox` over the already-loaded `admin_clients` list, not
+    /// re-fetched here.
+    admin_settings_mask_client: String,
+    admin_settings_mask_id: String,
+    admin_settings_mask_busy: bool,
+    admin_settings_mask_error: Option<String>,
+    admin_settings_mask_token: Option<String>,
+    admin_settings_mask_deadline: Option<Instant>,
+    admin_settings_mask_confirm_busy: bool,
+    /// Set for one "apply" cycle when the pending token's deadline passed
+    /// locally without a confirm — cleared the next time this setting's
+    /// Apply is clicked. Purely informational: the server's own sweep
+    /// task already performed the real rollback by the time this fires.
+    admin_settings_mask_rolled_back: bool,
+
+    /// `host:port`, empty = clear the global default (`None`).
+    admin_settings_exit_node: String,
+    /// Same rationale as `admin_add_exit_custom_mode` — G-B1's picker
+    /// convention reused here via `Self::draw_exit_node_picker`.
+    admin_settings_exit_custom_mode: bool,
+    admin_settings_exit_busy: bool,
+    admin_settings_exit_error: Option<String>,
+    admin_settings_exit_token: Option<String>,
+    admin_settings_exit_deadline: Option<Instant>,
+    admin_settings_exit_confirm_busy: bool,
+    admin_settings_exit_rolled_back: bool,
 
     // ── SSH server-install wizard (C3) — shells out to `aivpn-client
     // ssh-install {script,probe,run}`, see `install_wizard.rs`'s module
@@ -766,7 +835,10 @@ impl AivpnApp {
             admin_clients_error: None,
             admin_busy_ids: std::collections::HashSet::new(),
             admin_status: None,
+            admin_audit_loaded: false,
             admin_audit: Vec::new(),
+            admin_audit_verified: None,
+            admin_audit_broken_at: None,
             admin_audit_loading: false,
             admin_audit_error: None,
             admin_show_add: false,
@@ -774,6 +846,7 @@ impl AivpnApp {
             admin_add_one_time: false,
             admin_add_expiry: String::new(),
             admin_add_exit_node: String::new(),
+            admin_add_exit_custom_mode: false,
             admin_add_error: None,
             admin_add_busy: false,
             admin_edit_id: None,
@@ -781,6 +854,7 @@ impl AivpnApp {
             admin_edit_enabled: true,
             admin_edit_expiry: String::new(),
             admin_edit_exit_node: String::new(),
+            admin_edit_exit_custom_mode: false,
             admin_edit_error: None,
             admin_edit_busy: false,
             admin_pool_loaded: false,
@@ -801,6 +875,22 @@ impl AivpnApp {
             admin_qr_saved_msg: None,
             admin_revoke_id: None,
             admin_revoke_name: String::new(),
+            admin_settings_mask_client: String::new(),
+            admin_settings_mask_id: String::new(),
+            admin_settings_mask_busy: false,
+            admin_settings_mask_error: None,
+            admin_settings_mask_token: None,
+            admin_settings_mask_deadline: None,
+            admin_settings_mask_confirm_busy: false,
+            admin_settings_mask_rolled_back: false,
+            admin_settings_exit_node: String::new(),
+            admin_settings_exit_custom_mode: false,
+            admin_settings_exit_busy: false,
+            admin_settings_exit_error: None,
+            admin_settings_exit_token: None,
+            admin_settings_exit_deadline: None,
+            admin_settings_exit_confirm_busy: false,
+            admin_settings_exit_rolled_back: false,
             ssh_wizard_open: false,
             ssh_wizard_stage: SshWizardStage::Form,
             ssh_host: String::new(),
@@ -1045,6 +1135,26 @@ impl AivpnApp {
             self.last_conn_state = cur;
         }
         self.poll_admin();
+        // G-A3: local auto-rollback countdown — purely cosmetic (see
+        // `ADMIN_SETTINGS_CONFIRM_TIMEOUT`'s doc comment); runs AFTER
+        // `poll_admin` drains this frame's responses so a `ConfigConfirmed`
+        // that arrived in the same frame the deadline passed already
+        // cleared the deadline field and wins the race (a genuine confirm
+        // success is always more authoritative than this local clock).
+        if let Some(deadline) = self.admin_settings_mask_deadline {
+            if Instant::now() >= deadline {
+                self.admin_settings_mask_token = None;
+                self.admin_settings_mask_deadline = None;
+                self.admin_settings_mask_rolled_back = true;
+            }
+        }
+        if let Some(deadline) = self.admin_settings_exit_deadline {
+            if Instant::now() >= deadline {
+                self.admin_settings_exit_token = None;
+                self.admin_settings_exit_deadline = None;
+                self.admin_settings_exit_rolled_back = true;
+            }
+        }
         self.poll_ssh_install();
         if let Some(at) = self.error_at {
             if at.elapsed().as_secs() > 8 {
@@ -1070,7 +1180,11 @@ impl AivpnApp {
                 AdminResponse::Role(r) => match r {
                     Ok(role) => {
                         self.admin_role = Some(role);
-                        if role == 2 && !self.admin_clients_loaded {
+                        // G-A1: the client list is a plain GET the server's
+                        // `authorize()` already permits a Viewer — only the
+                        // mutating controls inside `draw_admin_clients_
+                        // section` stay Admin-only, gated by `can_mutate`.
+                        if role >= 1 && !self.admin_clients_loaded {
                             self.admin_clients_loaded = true;
                             self.refresh_admin_clients();
                         }
@@ -1079,6 +1193,12 @@ impl AivpnApp {
                         if role >= 1 && !self.admin_pool_loaded {
                             self.admin_pool_loaded = true;
                             self.refresh_admin_pool();
+                        }
+                        // G-A2: audit log is likewise Viewer(1)+Admin(2)
+                        // GET-only readable.
+                        if role >= 1 && !self.admin_audit_loaded {
+                            self.admin_audit_loaded = true;
+                            self.refresh_admin_audit();
                         }
                     }
                     Err(_) => {
@@ -1175,8 +1295,10 @@ impl AivpnApp {
                 AdminResponse::AuditLog(r) => {
                     self.admin_audit_loading = false;
                     match r {
-                        Ok(list) => {
-                            self.admin_audit = list;
+                        Ok(view) => {
+                            self.admin_audit = view.entries;
+                            self.admin_audit_verified = view.verified;
+                            self.admin_audit_broken_at = view.broken_at;
                             self.admin_audit_error = None;
                         }
                         Err(e) => self.admin_audit_error = Some(e),
@@ -1199,6 +1321,71 @@ impl AivpnApp {
                     // pool-unreachable condition from the paired call.
                     if let Ok(h) = r {
                         self.admin_pool_health = Some(h);
+                    }
+                }
+                AdminResponse::ConfigApplied { setting, result } => {
+                    match setting {
+                        admin::ConfigSetting::ActiveMask => self.admin_settings_mask_busy = false,
+                        admin::ConfigSetting::ExitNode => self.admin_settings_exit_busy = false,
+                    }
+                    match result {
+                        Ok(applied) => {
+                            let deadline = Some(Instant::now() + ADMIN_SETTINGS_CONFIRM_TIMEOUT);
+                            match setting {
+                                admin::ConfigSetting::ActiveMask => {
+                                    self.admin_settings_mask_token = Some(applied.token);
+                                    self.admin_settings_mask_deadline = deadline;
+                                    self.admin_settings_mask_error = None;
+                                    self.admin_settings_mask_rolled_back = false;
+                                }
+                                admin::ConfigSetting::ExitNode => {
+                                    self.admin_settings_exit_token = Some(applied.token);
+                                    self.admin_settings_exit_deadline = deadline;
+                                    self.admin_settings_exit_error = None;
+                                    self.admin_settings_exit_rolled_back = false;
+                                }
+                            }
+                        }
+                        Err(e) => match setting {
+                            admin::ConfigSetting::ActiveMask => {
+                                self.admin_settings_mask_error = Some(e)
+                            }
+                            admin::ConfigSetting::ExitNode => {
+                                self.admin_settings_exit_error = Some(e)
+                            }
+                        },
+                    }
+                }
+                AdminResponse::ConfigConfirmed { setting, result } => {
+                    match setting {
+                        admin::ConfigSetting::ActiveMask => {
+                            self.admin_settings_mask_confirm_busy = false
+                        }
+                        admin::ConfigSetting::ExitNode => {
+                            self.admin_settings_exit_confirm_busy = false
+                        }
+                    }
+                    match result {
+                        Ok(()) => match setting {
+                            admin::ConfigSetting::ActiveMask => {
+                                self.admin_settings_mask_token = None;
+                                self.admin_settings_mask_deadline = None;
+                                self.admin_settings_mask_rolled_back = false;
+                            }
+                            admin::ConfigSetting::ExitNode => {
+                                self.admin_settings_exit_token = None;
+                                self.admin_settings_exit_deadline = None;
+                                self.admin_settings_exit_rolled_back = false;
+                            }
+                        },
+                        // Deliberately leaves token/deadline intact on a
+                        // confirm error: it might be transient (the token
+                        // itself may still be valid server-side), so the
+                        // user gets another shot at Confirm before the
+                        // LOCAL countdown (see `tick()`) times it out on
+                        // its own. Only that local timeout — not a failed
+                        // confirm call — ever sets `*_rolled_back`.
+                        Err(e) => self.show_error(e),
                     }
                 }
             }
@@ -1226,6 +1413,13 @@ impl AivpnApp {
         // `tx.send` starts failing (it already handles that — see
         // `spawn_install`'s doc comment) instead of polluting a later run.
         let mut rx_disconnected = false;
+        // G-C1: set inside the `rx`-borrowing loop below, acted on after it
+        // ends — `import_ssh_install_key` takes `&mut self`, which the
+        // borrow checker can't reconcile with the outstanding `&self.
+        // ssh_install_rx` borrow `rx` holds for the loop's duration (unlike
+        // the direct field writes below, a `&mut self` method call is
+        // opaque to it and would conflict).
+        let mut auto_import_key = false;
         if let Some(rx) = &self.ssh_install_rx {
             loop {
                 match rx.try_recv() {
@@ -1239,6 +1433,19 @@ impl AivpnApp {
                         {
                             if let Some(key) = connection_key {
                                 self.ssh_install_connection_key = Some(key.clone());
+                                // G-C1: auto-import the moment the terminal
+                                // success marker's key shows up — no more
+                                // waiting on a manual "Import profile"
+                                // click. `should_auto_import` also guards
+                                // against double-importing if this marker
+                                // is somehow observed twice in one run.
+                                if install_wizard::should_auto_import(
+                                    status,
+                                    connection_key,
+                                    self.ssh_import_done,
+                                ) {
+                                    auto_import_key = true;
+                                }
                             }
                             // `gui_process` is spawn_install's own synthetic
                             // marker, always sent exactly once when the
@@ -1262,6 +1469,11 @@ impl AivpnApp {
                     }
                 }
             }
+        }
+        // G-C1: now that `rx`'s borrow of `self.ssh_install_rx` has ended,
+        // it's safe to call the `&mut self` import path.
+        if auto_import_key {
+            self.import_ssh_install_key();
         }
         if rx_disconnected {
             self.ssh_install_rx = None;
@@ -1532,6 +1744,18 @@ impl AivpnApp {
         );
     }
 
+    /// G-A2: refresh the audit-log panel — Viewer(1)+Admin(2), same as
+    /// `refresh_admin_pool`.
+    fn refresh_admin_audit(&mut self) {
+        self.admin_audit_loading = true;
+        self.admin_audit_error = None;
+        admin::spawn(
+            self.vpn.client_binary.clone(),
+            AdminRequest::AuditLog,
+            self.admin_tx.clone(),
+        );
+    }
+
     /// Clear every admin-panel field back to its pre-session default.
     /// Called when the session leaves the Connected state — the panel
     /// (and its cached role/clients/dialogs) belongs to that one session
@@ -1544,17 +1768,22 @@ impl AivpnApp {
         self.admin_clients_error = None;
         self.admin_busy_ids.clear();
         self.admin_status = None;
+        self.admin_audit_loaded = false;
         self.admin_audit.clear();
+        self.admin_audit_verified = None;
+        self.admin_audit_broken_at = None;
         self.admin_audit_loading = false;
         self.admin_audit_error = None;
         self.admin_show_add = false;
         self.admin_add_error = None;
         self.admin_add_busy = false;
         self.admin_add_exit_node.clear();
+        self.admin_add_exit_custom_mode = false;
         self.admin_edit_id = None;
         self.admin_edit_error = None;
         self.admin_edit_busy = false;
         self.admin_edit_exit_node.clear();
+        self.admin_edit_exit_custom_mode = false;
         self.admin_pool_loaded = false;
         self.admin_pool_nodes.clear();
         self.admin_pool_nodes_loading = false;
@@ -1571,6 +1800,22 @@ impl AivpnApp {
         self.admin_qr_error = None;
         self.admin_qr_saved_msg = None;
         self.admin_revoke_id = None;
+        self.admin_settings_mask_client.clear();
+        self.admin_settings_mask_id.clear();
+        self.admin_settings_mask_busy = false;
+        self.admin_settings_mask_error = None;
+        self.admin_settings_mask_token = None;
+        self.admin_settings_mask_deadline = None;
+        self.admin_settings_mask_confirm_busy = false;
+        self.admin_settings_mask_rolled_back = false;
+        self.admin_settings_exit_node.clear();
+        self.admin_settings_exit_custom_mode = false;
+        self.admin_settings_exit_busy = false;
+        self.admin_settings_exit_error = None;
+        self.admin_settings_exit_token = None;
+        self.admin_settings_exit_deadline = None;
+        self.admin_settings_exit_confirm_busy = false;
+        self.admin_settings_exit_rolled_back = false;
     }
 
     /// Save the currently-displayed connection key to a `.txt` file next to
@@ -1618,16 +1863,90 @@ impl AivpnApp {
         }
     }
 
-    /// Client-list + add/edit forms + pool topology — drawn inline inside
-    /// the main scroll area (see call site in `update()`), following the
-    /// same pattern as the Recording/Diagnostics sections above it. Called
-    /// for both `admin_role == Some(1)` (Viewer — pool topology only) and
-    /// `Some(2)` (Admin — everything); client management (list/add/edit/
-    /// revoke/reset-device/status/audit) is gated internally on `is_admin`
-    /// so a Viewer session never even builds those widgets.
-    fn draw_admin_panel(&mut self, ui: &mut eframe::egui::Ui, lang: Lang) {
+    /// G-B1: exit-node picker shared by the add/edit forms — a `ComboBox`
+    /// listing "(default)", every known pool-node address
+    /// (`admin::exit_node_addresses`), and "custom", instead of a bare
+    /// free-text field. `value` is the form's existing `host:port` string
+    /// (unchanged wire representation — still empty for default, still
+    /// free text for a manual entry), `custom_mode` is the form's
+    /// `admin_*_exit_custom_mode` flag (see its doc comment for why the
+    /// UI needs it in addition to `admin::classify_exit_node`). No `&self`
+    /// param: called as `Self::draw_exit_node_picker(...)` from both forms
+    /// so the caller can pass either the add- or edit-form's fields
+    /// without a disjoint-field-borrow conflict against `self`.
+    fn draw_exit_node_picker(
+        ui: &mut eframe::egui::Ui,
+        lang: Lang,
+        id_salt: &str,
+        value: &mut String,
+        custom_mode: &mut bool,
+        known_addresses: &[String],
+    ) {
         use eframe::egui;
 
+        let choice = if *custom_mode {
+            admin::ExitNodeChoice::Custom
+        } else {
+            admin::classify_exit_node(value, known_addresses)
+        };
+        let default_label = t(lang, "admin_exit_node_default");
+        let custom_label = t(lang, "admin_exit_node_custom");
+        let selected_text = match &choice {
+            admin::ExitNodeChoice::Default => default_label.to_string(),
+            admin::ExitNodeChoice::Node(addr) => addr.clone(),
+            admin::ExitNodeChoice::Custom => custom_label.to_string(),
+        };
+
+        egui::ComboBox::from_id_salt(id_salt)
+            .selected_text(selected_text)
+            .width(230.0)
+            .show_ui(ui, |ui| {
+                if ui
+                    .selectable_label(choice == admin::ExitNodeChoice::Default, default_label)
+                    .clicked()
+                {
+                    value.clear();
+                    *custom_mode = false;
+                }
+                for addr in known_addresses {
+                    let is_selected =
+                        matches!(&choice, admin::ExitNodeChoice::Node(a) if a == addr);
+                    if ui.selectable_label(is_selected, addr).clicked() {
+                        *value = addr.clone();
+                        *custom_mode = false;
+                    }
+                }
+                if ui
+                    .selectable_label(choice == admin::ExitNodeChoice::Custom, custom_label)
+                    .clicked()
+                {
+                    *custom_mode = true;
+                }
+            })
+            .response
+            .on_hover_text(t(lang, "admin_exit_node_live_hint"));
+
+        if matches!(choice, admin::ExitNodeChoice::Custom) {
+            ui.add(
+                egui::TextEdit::singleline(value)
+                    .desired_width(f32::INFINITY)
+                    .hint_text("exit.example.com:51820"),
+            );
+        }
+    }
+
+    /// Client-list + add/edit forms + pool topology + audit log — drawn
+    /// inline inside the main scroll area (see call site in `update()`),
+    /// following the same pattern as the Recording/Diagnostics sections
+    /// above it. Only ever called for `admin_role == Some(1)` (Viewer) or
+    /// `Some(2)` (Admin) — see the call site's `matches!` guard — so every
+    /// subsection below is reachable by both roles; `can_mutate`
+    /// (`is_admin`) is threaded down to `draw_admin_clients_section` to
+    /// hide the mutating controls (add/edit/enable-disable/reset-device/
+    /// revoke) for a Viewer, leaving read-only access to clients/pool/audit
+    /// (G-A1) — the same GET-only allowlist the server's `authorize()`
+    /// already grants that role.
+    fn draw_admin_panel(&mut self, ui: &mut eframe::egui::Ui, lang: Lang) {
         let is_admin = self.admin_role == Some(2);
 
         // GAP-G2/G1: the SSH-install wizard's entry point moved to the main
@@ -1635,34 +1954,63 @@ impl AivpnApp {
         // `update()`'s header area); the migration wizard was removed
         // entirely (web-only per GAP-G1). Nothing wizard-related belongs
         // here anymore.
-        if is_admin {
-            self.draw_admin_clients_section(ui, lang);
-        }
+        self.draw_admin_clients_section(ui, lang, is_admin);
 
         // ── Pool topology (B3) — Viewer + Admin ─────────────────────────
         self.draw_admin_pool_section(ui, lang);
+
+        // ── Audit log (G-A2) — Viewer + Admin, GET-only ──────────────────
+        self.draw_audit_panel(ui, lang);
+
+        // ── Server Settings (G-A3) — Admin ONLY, unlike every section ────
+        // above: this mutates server-wide/per-client heavy config, so it
+        // gets no Viewer read-only rendering at all (contrast
+        // `draw_admin_clients_section`'s `can_mutate` split, which still
+        // shows a Viewer the client list itself, just without the mutating
+        // controls).
+        if is_admin {
+            self.draw_admin_server_settings_section(ui, lang);
+        }
     }
 
-    /// Client list + add/edit forms + status/audit — Admin role only. Split
-    /// out of `draw_admin_panel` so the Viewer-visible pool section above
-    /// stays reachable without building any of this UI for a non-Admin
-    /// session.
-    fn draw_admin_clients_section(&mut self, ui: &mut eframe::egui::Ui, lang: Lang) {
+    /// Client list + add/edit forms + server status — visible to both
+    /// Viewer and Admin (G-A1); `can_mutate` (`true` only for a confirmed
+    /// Admin) gates every mutating control inside — the "+ add" button,
+    /// the add/edit forms, and each row's Edit/Reset-device/Revoke
+    /// buttons. "Key / QR" stays available to both: it's a plain GET the
+    /// server's `authorize()` already permits a Viewer (`connection-key`
+    /// is a curated GET route; QR rendering never touches the mgmt API at
+    /// all — it's the client daemon's own admin-socket protocol,
+    /// independent of the server-assigned role).
+    fn draw_admin_clients_section(
+        &mut self,
+        ui: &mut eframe::egui::Ui,
+        lang: Lang,
+        can_mutate: bool,
+    ) {
         use eframe::egui;
 
         ui.horizontal(|ui| {
             ui.label(egui::RichText::new(t(lang, "admin_panel")).strong());
+            if !can_mutate {
+                ui.label(
+                    egui::RichText::new(t(lang, "admin_view_only"))
+                        .size(11.0)
+                        .weak(),
+                );
+            }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.small_button(t(lang, "admin_refresh")).clicked() {
                     self.refresh_admin_clients();
                 }
-                if ui.small_button("  +  ").clicked() {
+                if can_mutate && ui.small_button("  +  ").clicked() {
                     self.admin_show_add = true;
                     self.admin_edit_id = None;
                     self.admin_add_name.clear();
                     self.admin_add_one_time = false;
                     self.admin_add_expiry.clear();
                     self.admin_add_exit_node.clear();
+                    self.admin_add_exit_custom_mode = false;
                     self.admin_add_error = None;
                 }
             });
@@ -1759,42 +2107,49 @@ impl AivpnApp {
                                         self.admin_tx.clone(),
                                     );
                                 }
-                                if ui
-                                    .add_enabled(!busy, egui::Button::new(t(lang, "edit")))
-                                    .clicked()
-                                {
-                                    self.admin_show_add = false;
-                                    self.admin_edit_id = Some(c.id.clone());
-                                    self.admin_edit_name = c.name.clone();
-                                    self.admin_edit_enabled = c.enabled;
-                                    self.admin_edit_expiry =
-                                        c.expires_at.clone().unwrap_or_default();
-                                    self.admin_edit_exit_node =
-                                        c.exit_node.clone().unwrap_or_default();
-                                    self.admin_edit_error = None;
-                                }
-                                if ui
-                                    .add_enabled(
-                                        !busy,
-                                        egui::Button::new(t(lang, "admin_reset_device")),
+                                // G-A1: Edit/Reset-device/Revoke all mutate
+                                // server state — hidden entirely for a
+                                // Viewer rather than shown-disabled, same
+                                // treatment as the "+ add" button above.
+                                if can_mutate {
+                                    if ui
+                                        .add_enabled(!busy, egui::Button::new(t(lang, "edit")))
+                                        .clicked()
+                                    {
+                                        self.admin_show_add = false;
+                                        self.admin_edit_id = Some(c.id.clone());
+                                        self.admin_edit_name = c.name.clone();
+                                        self.admin_edit_enabled = c.enabled;
+                                        self.admin_edit_expiry =
+                                            c.expires_at.clone().unwrap_or_default();
+                                        self.admin_edit_exit_node =
+                                            c.exit_node.clone().unwrap_or_default();
+                                        self.admin_edit_exit_custom_mode = false;
+                                        self.admin_edit_error = None;
+                                    }
+                                    if ui
+                                        .add_enabled(
+                                            !busy,
+                                            egui::Button::new(t(lang, "admin_reset_device")),
+                                        )
+                                        .clicked()
+                                    {
+                                        self.admin_busy_ids.insert(c.id.clone());
+                                        admin::spawn(
+                                            self.vpn.client_binary.clone(),
+                                            AdminRequest::ResetDevice { id: c.id.clone() },
+                                            self.admin_tx.clone(),
+                                        );
+                                    }
+                                    let revoke_btn = egui::Button::new(
+                                        egui::RichText::new(t(lang, "admin_revoke"))
+                                            .color(egui::Color32::WHITE),
                                     )
-                                    .clicked()
-                                {
-                                    self.admin_busy_ids.insert(c.id.clone());
-                                    admin::spawn(
-                                        self.vpn.client_binary.clone(),
-                                        AdminRequest::ResetDevice { id: c.id.clone() },
-                                        self.admin_tx.clone(),
-                                    );
-                                }
-                                let revoke_btn = egui::Button::new(
-                                    egui::RichText::new(t(lang, "admin_revoke"))
-                                        .color(egui::Color32::WHITE),
-                                )
-                                .fill(egui::Color32::from_rgb(0xC6, 0x28, 0x28));
-                                if ui.add_enabled(!busy, revoke_btn).clicked() {
-                                    self.admin_revoke_id = Some(c.id.clone());
-                                    self.admin_revoke_name = c.name.clone();
+                                    .fill(egui::Color32::from_rgb(0xC6, 0x28, 0x28));
+                                    if ui.add_enabled(!busy, revoke_btn).clicked() {
+                                        self.admin_revoke_id = Some(c.id.clone());
+                                        self.admin_revoke_name = c.name.clone();
+                                    }
                                 }
                             });
                         });
@@ -1802,8 +2157,8 @@ impl AivpnApp {
                 });
         });
 
-        // ── Add-client form ─────────────────────────────────────────────
-        if self.admin_show_add {
+        // ── Add-client form (Admin only — a mutating control) ────────────
+        if can_mutate && self.admin_show_add {
             ui.add_space(4.0);
             ui.label(egui::RichText::new(t(lang, "admin_add_client")).strong());
             ui.add(
@@ -1818,11 +2173,14 @@ impl AivpnApp {
                     .desired_width(f32::INFINITY)
                     .hint_text("2026-08-01T00:00:00Z"),
             );
-            ui.label(t(lang, "admin_exit_node_hint"));
-            ui.add(
-                egui::TextEdit::singleline(&mut self.admin_add_exit_node)
-                    .desired_width(f32::INFINITY)
-                    .hint_text("exit.example.com:51820"),
+            ui.label(t(lang, "admin_exit_node"));
+            Self::draw_exit_node_picker(
+                ui,
+                lang,
+                "admin_add_exit_node_combo",
+                &mut self.admin_add_exit_node,
+                &mut self.admin_add_exit_custom_mode,
+                &admin::exit_node_addresses(&self.admin_pool_nodes),
             );
             if let Some(err) = &self.admin_add_error {
                 ui.colored_label(egui::Color32::from_rgb(0xEF, 0x53, 0x50), err);
@@ -1857,78 +2215,83 @@ impl AivpnApp {
             });
         }
 
-        // ── Edit-client form ────────────────────────────────────────────
-        if let Some(id) = self.admin_edit_id.clone() {
-            ui.add_space(4.0);
-            ui.label(
-                egui::RichText::new(format!("{}: {}", t(lang, "edit"), self.admin_edit_name))
-                    .strong(),
-            );
-            ui.add(
-                egui::TextEdit::singleline(&mut self.admin_edit_name)
-                    .desired_width(f32::INFINITY)
-                    .hint_text(t(lang, "key_name")),
-            );
-            ui.checkbox(&mut self.admin_edit_enabled, t(lang, "admin_enabled"));
-            ui.label(t(lang, "admin_expiry_hint"));
-            ui.add(
-                egui::TextEdit::singleline(&mut self.admin_edit_expiry)
-                    .desired_width(f32::INFINITY)
-                    .hint_text("2026-08-01T00:00:00Z"),
-            );
-            ui.label(t(lang, "admin_exit_node_hint"));
-            ui.add(
-                egui::TextEdit::singleline(&mut self.admin_edit_exit_node)
-                    .desired_width(f32::INFINITY)
-                    .hint_text("exit.example.com:51820"),
-            );
-            if let Some(err) = &self.admin_edit_error {
-                ui.colored_label(egui::Color32::from_rgb(0xEF, 0x53, 0x50), err);
+        // ── Edit-client form (Admin only). `can_mutate &&` here is
+        // defense-in-depth, not the primary gate — `admin_edit_id` can only
+        // ever be set via the Edit button above, which is itself hidden
+        // for a Viewer (e.g. guards against a role downgrade landing
+        // mid-interaction).
+        if can_mutate {
+            if let Some(id) = self.admin_edit_id.clone() {
+                ui.add_space(4.0);
+                ui.label(
+                    egui::RichText::new(format!("{}: {}", t(lang, "edit"), self.admin_edit_name))
+                        .strong(),
+                );
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.admin_edit_name)
+                        .desired_width(f32::INFINITY)
+                        .hint_text(t(lang, "key_name")),
+                );
+                ui.checkbox(&mut self.admin_edit_enabled, t(lang, "admin_enabled"));
+                ui.label(t(lang, "admin_expiry_hint"));
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.admin_edit_expiry)
+                        .desired_width(f32::INFINITY)
+                        .hint_text("2026-08-01T00:00:00Z"),
+                );
+                ui.label(t(lang, "admin_exit_node"));
+                Self::draw_exit_node_picker(
+                    ui,
+                    lang,
+                    "admin_edit_exit_node_combo",
+                    &mut self.admin_edit_exit_node,
+                    &mut self.admin_edit_exit_custom_mode,
+                    &admin::exit_node_addresses(&self.admin_pool_nodes),
+                );
+                if let Some(err) = &self.admin_edit_error {
+                    ui.colored_label(egui::Color32::from_rgb(0xEF, 0x53, 0x50), err);
+                }
+                ui.horizontal(|ui| {
+                    let can_save = !self.admin_edit_name.trim().is_empty() && !self.admin_edit_busy;
+                    if ui
+                        .add_enabled(can_save, egui::Button::new(t(lang, "save")))
+                        .clicked()
+                    {
+                        self.admin_edit_busy = true;
+                        self.admin_edit_error = None;
+                        let form = admin::EditClientForm {
+                            id: id.clone(),
+                            name: self.admin_edit_name.trim().to_string(),
+                            enabled: self.admin_edit_enabled,
+                            expires_at: self.admin_edit_expiry.trim().to_string(),
+                            exit_node: self.admin_edit_exit_node.trim().to_string(),
+                        };
+                        admin::spawn(
+                            self.vpn.client_binary.clone(),
+                            AdminRequest::EditClient(form),
+                            self.admin_tx.clone(),
+                        );
+                    }
+                    if ui
+                        .add_enabled(!self.admin_edit_busy, egui::Button::new(t(lang, "cancel")))
+                        .clicked()
+                    {
+                        self.admin_edit_id = None;
+                        self.admin_edit_error = None;
+                    }
+                });
             }
-            ui.horizontal(|ui| {
-                let can_save = !self.admin_edit_name.trim().is_empty() && !self.admin_edit_busy;
-                if ui
-                    .add_enabled(can_save, egui::Button::new(t(lang, "save")))
-                    .clicked()
-                {
-                    self.admin_edit_busy = true;
-                    self.admin_edit_error = None;
-                    let form = admin::EditClientForm {
-                        id: id.clone(),
-                        name: self.admin_edit_name.trim().to_string(),
-                        enabled: self.admin_edit_enabled,
-                        expires_at: self.admin_edit_expiry.trim().to_string(),
-                        exit_node: self.admin_edit_exit_node.trim().to_string(),
-                    };
-                    admin::spawn(
-                        self.vpn.client_binary.clone(),
-                        AdminRequest::EditClient(form),
-                        self.admin_tx.clone(),
-                    );
-                }
-                if ui
-                    .add_enabled(!self.admin_edit_busy, egui::Button::new(t(lang, "cancel")))
-                    .clicked()
-                {
-                    self.admin_edit_id = None;
-                    self.admin_edit_error = None;
-                }
-            });
         }
 
-        // ── Server status + audit log (read-only) ───────────────────────
-        egui::CollapsingHeader::new(t(lang, "admin_status_audit")).show(ui, |ui| {
+        // ── Server status (read-only) — Viewer + Admin ───────────────────
+        // A plain GET (`GET /api/v1/status`), same as the client list
+        // above; nothing here mutates, so it's shown to both roles
+        // unconditionally (no `can_mutate` check needed).
+        egui::CollapsingHeader::new(t(lang, "admin_status_header")).show(ui, |ui| {
             if ui.button(t(lang, "admin_refresh")).clicked() {
                 admin::spawn(
                     self.vpn.client_binary.clone(),
                     AdminRequest::Status,
-                    self.admin_tx.clone(),
-                );
-                self.admin_audit_loading = true;
-                self.admin_audit_error = None;
-                admin::spawn(
-                    self.vpn.client_binary.clone(),
-                    AdminRequest::AuditLog,
                     self.admin_tx.clone(),
                 );
             }
@@ -1942,28 +2305,89 @@ impl AivpnApp {
                     if s.kernel_module { "✓" } else { "✗" }
                 ));
             }
-            if self.admin_audit_loading {
-                ui.weak(t(lang, "admin_loading"));
-            }
-            if let Some(err) = &self.admin_audit_error {
-                ui.colored_label(egui::Color32::from_rgb(0xEF, 0x53, 0x50), err);
-            }
-            egui::ScrollArea::vertical()
-                .id_salt("admin_audit")
-                .max_height(120.0)
-                .show(ui, |ui| {
-                    for e in &self.admin_audit {
-                        ui.label(
-                            egui::RichText::new(format!(
-                                "[{}] {} {} {} — {}",
-                                e.ts, e.actor, e.action, e.target, e.result
-                            ))
-                            .size(10.0)
-                            .weak(),
-                        );
+        });
+    }
+
+    /// G-A2: audit-log panel — hash-chain-verified tail of the server's
+    /// append-only admin audit log (`GET /api/v1/audit-log?verify=1`,
+    /// `mgmt_service::audit_verify`). Only ever called from
+    /// `draw_admin_panel`, itself gated on `admin_role == Some(1)` (Viewer)
+    /// or `Some(2)` (Admin) — GET-only in the server's curated allowlist
+    /// regardless of role, so unlike `draw_admin_clients_section` there is
+    /// no `can_mutate` split here at all: nothing in this panel ever
+    /// mutates anything.
+    fn draw_audit_panel(&mut self, ui: &mut eframe::egui::Ui, lang: Lang) {
+        use eframe::egui;
+
+        egui::CollapsingHeader::new(t(lang, "admin_audit_panel"))
+            .default_open(false)
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    if ui.small_button(t(lang, "admin_refresh")).clicked() {
+                        self.refresh_admin_audit();
                     }
                 });
-        });
+
+                if self.admin_audit_loading {
+                    ui.weak(t(lang, "admin_loading"));
+                }
+                if let Some(err) = &self.admin_audit_error {
+                    ui.colored_label(egui::Color32::from_rgb(0xEF, 0x53, 0x50), err);
+                }
+
+                // Hash-chain verification badge — `None` (no info, e.g. an
+                // older server that ignored `?verify=1`) renders nothing
+                // rather than defaulting to either color.
+                match self.admin_audit_verified {
+                    Some(true) => {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(0x4C, 0xAF, 0x50),
+                            t(lang, "admin_audit_chain_verified"),
+                        );
+                    }
+                    Some(false) => {
+                        let idx = self
+                            .admin_audit_broken_at
+                            .map(|i| i.to_string())
+                            .unwrap_or_else(|| "?".to_string());
+                        ui.colored_label(
+                            egui::Color32::from_rgb(0xEF, 0x53, 0x50),
+                            format!("{} ({idx})", t(lang, "admin_audit_chain_broken")),
+                        );
+                    }
+                    None => {}
+                }
+
+                if self.admin_audit.is_empty() && !self.admin_audit_loading {
+                    ui.weak(t(lang, "admin_audit_no_entries"));
+                }
+
+                let frame = egui::Frame::group(ui.style())
+                    .inner_margin(egui::Margin::same(4i8))
+                    .corner_radius(egui::CornerRadius::same(4));
+                frame.show(ui, |ui| {
+                    ui.set_min_width(ui.available_width());
+                    egui::ScrollArea::vertical()
+                        .id_salt("admin_audit")
+                        .max_height(180.0)
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            // Oldest-first from the server; show newest-first
+                            // so the most recent action is always visible
+                            // without scrolling.
+                            for e in self.admin_audit.iter().rev() {
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "[{}] {} {} {} — {}",
+                                        e.ts, e.actor, e.action, e.target, e.result
+                                    ))
+                                    .size(10.0)
+                                    .weak(),
+                                );
+                            }
+                        });
+                });
+            });
     }
 
     /// Pool topology view (B3) — node list + health summary, read-only.
@@ -2072,6 +2496,272 @@ impl AivpnApp {
                         });
                 });
             });
+    }
+
+    /// G-A3: Server Settings — Admin-only apply-with-rollback for the
+    /// active mask (per client — see `admin.rs`'s module-doc note on why
+    /// there is no server-WIDE default mask here) and the global default
+    /// exit node. Only ever called for `is_admin` (see `draw_admin_panel`'s
+    /// call site) — unlike every other admin subsection, there is no
+    /// Viewer-visible read-only rendering at all.
+    fn draw_admin_server_settings_section(&mut self, ui: &mut eframe::egui::Ui, lang: Lang) {
+        use eframe::egui;
+
+        egui::CollapsingHeader::new(t(lang, "admin_settings_panel"))
+            .default_open(false)
+            .show(ui, |ui| {
+                // ── Active mask (per client) ─────────────────────────────
+                ui.label(egui::RichText::new(t(lang, "admin_settings_mask_section")).strong());
+                if self.admin_clients.is_empty() {
+                    ui.weak(t(lang, "admin_settings_mask_no_clients"));
+                } else {
+                    ui.horizontal(|ui| {
+                        ui.label(t(lang, "admin_settings_mask_client_label"));
+                        let selected_label = self
+                            .admin_clients
+                            .iter()
+                            .find(|c| c.id == self.admin_settings_mask_client)
+                            .map(|c| c.name.clone())
+                            .unwrap_or_default();
+                        egui::ComboBox::from_id_salt("admin_settings_mask_client_combo")
+                            .selected_text(selected_label)
+                            .show_ui(ui, |ui| {
+                                for c in &self.admin_clients {
+                                    let is_selected = self.admin_settings_mask_client == c.id;
+                                    if ui.selectable_label(is_selected, &c.name).clicked() {
+                                        self.admin_settings_mask_client = c.id.clone();
+                                    }
+                                }
+                            });
+                    });
+                    ui.label(t(lang, "admin_settings_mask_id_label"));
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.admin_settings_mask_id)
+                            .desired_width(f32::INFINITY)
+                            .hint_text(t(lang, "admin_settings_mask_id_hint")),
+                    );
+                    if let Some(err) = &self.admin_settings_mask_error {
+                        ui.colored_label(egui::Color32::from_rgb(0xEF, 0x53, 0x50), err);
+                    }
+                    if self.admin_settings_mask_rolled_back {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(0xFF, 0xA7, 0x26),
+                            t(lang, "admin_settings_rolled_back"),
+                        );
+                    }
+                    if let Some(token) = self.admin_settings_mask_token.clone() {
+                        let confirm_clicked = Self::draw_pending_config_banner(
+                            ui,
+                            lang,
+                            self.admin_settings_mask_deadline,
+                            self.admin_settings_mask_confirm_busy,
+                        );
+                        if confirm_clicked {
+                            self.admin_settings_mask_confirm_busy = true;
+                            admin::spawn(
+                                self.vpn.client_binary.clone(),
+                                AdminRequest::ConfirmConfig {
+                                    setting: admin::ConfigSetting::ActiveMask,
+                                    token,
+                                },
+                                self.admin_tx.clone(),
+                            );
+                        }
+                    } else {
+                        let can_apply = !self.admin_settings_mask_client.is_empty()
+                            && admin::mask_id_looks_valid(self.admin_settings_mask_id.trim())
+                            && !self.admin_settings_mask_busy;
+                        if ui
+                            .add_enabled(
+                                can_apply,
+                                egui::Button::new(t(lang, "admin_settings_apply")),
+                            )
+                            .clicked()
+                        {
+                            self.admin_settings_mask_busy = true;
+                            self.admin_settings_mask_error = None;
+                            self.admin_settings_mask_rolled_back = false;
+                            admin::spawn(
+                                self.vpn.client_binary.clone(),
+                                AdminRequest::ApplyActiveMask {
+                                    client_id: self.admin_settings_mask_client.clone(),
+                                    mask: self.admin_settings_mask_id.trim().to_string(),
+                                },
+                                self.admin_tx.clone(),
+                            );
+                        }
+                    }
+                }
+
+                ui.separator();
+
+                // ── Global default exit node (pool.exit_node) ────────────
+                ui.label(egui::RichText::new(t(lang, "admin_settings_exit_section")).strong());
+                ui.label(
+                    egui::RichText::new(t(lang, "admin_settings_exit_restart_hint"))
+                        .size(10.0)
+                        .weak(),
+                );
+                Self::draw_global_exit_node_picker(
+                    ui,
+                    lang,
+                    &mut self.admin_settings_exit_node,
+                    &mut self.admin_settings_exit_custom_mode,
+                    &admin::exit_node_addresses(&self.admin_pool_nodes),
+                );
+                if let Some(err) = &self.admin_settings_exit_error {
+                    ui.colored_label(egui::Color32::from_rgb(0xEF, 0x53, 0x50), err);
+                }
+                if self.admin_settings_exit_rolled_back {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(0xFF, 0xA7, 0x26),
+                        t(lang, "admin_settings_rolled_back"),
+                    );
+                }
+                if let Some(token) = self.admin_settings_exit_token.clone() {
+                    let confirm_clicked = Self::draw_pending_config_banner(
+                        ui,
+                        lang,
+                        self.admin_settings_exit_deadline,
+                        self.admin_settings_exit_confirm_busy,
+                    );
+                    if confirm_clicked {
+                        self.admin_settings_exit_confirm_busy = true;
+                        admin::spawn(
+                            self.vpn.client_binary.clone(),
+                            AdminRequest::ConfirmConfig {
+                                setting: admin::ConfigSetting::ExitNode,
+                                token,
+                            },
+                            self.admin_tx.clone(),
+                        );
+                    }
+                } else if ui
+                    .add_enabled(
+                        !self.admin_settings_exit_busy,
+                        egui::Button::new(t(lang, "admin_settings_apply")),
+                    )
+                    .clicked()
+                {
+                    self.admin_settings_exit_busy = true;
+                    self.admin_settings_exit_error = None;
+                    self.admin_settings_exit_rolled_back = false;
+                    let trimmed = self.admin_settings_exit_node.trim();
+                    let addr = if trimmed.is_empty() {
+                        None
+                    } else {
+                        Some(trimmed.to_string())
+                    };
+                    admin::spawn(
+                        self.vpn.client_binary.clone(),
+                        AdminRequest::ApplyExitNode { addr },
+                        self.admin_tx.clone(),
+                    );
+                }
+            });
+    }
+
+    /// G-A3: shared "pending confirmation" banner — the countdown text plus
+    /// the Confirm button, used identically by both the active-mask and
+    /// exit-node blocks in `draw_admin_server_settings_section`. Returns
+    /// `true` if Confirm was clicked this frame; no `&self`/`&mut self`
+    /// param (same rationale as `draw_exit_node_picker`) so it can be
+    /// called from either block without a disjoint-field-borrow conflict —
+    /// the caller does the actual `admin::spawn` since which busy flag to
+    /// set and which `ConfigSetting` to send differs per call site.
+    fn draw_pending_config_banner(
+        ui: &mut eframe::egui::Ui,
+        lang: Lang,
+        deadline: Option<Instant>,
+        confirm_busy: bool,
+    ) -> bool {
+        use eframe::egui;
+
+        // Frame-time based, not a separate timer: `update()` already runs
+        // continuously while a session is Connected (egui repaints on
+        // every VPN status poll), so this recomputes fresh each draw.
+        let secs_left = deadline
+            .map(|d| d.saturating_duration_since(Instant::now()).as_secs())
+            .unwrap_or(0);
+        ui.colored_label(
+            egui::Color32::from_rgb(0xFF, 0xA7, 0x26),
+            format!(
+                "{} ({secs_left}s)",
+                t(lang, "admin_settings_pending_banner")
+            ),
+        );
+        ui.add_enabled(
+            !confirm_busy,
+            egui::Button::new(t(lang, "admin_settings_confirm")),
+        )
+        .clicked()
+    }
+
+    /// G-A3: exit-node picker for the GLOBAL default (`pool.exit_node`) —
+    /// same `ComboBox`-over-known-pool-addresses-plus-custom shape as
+    /// `draw_exit_node_picker`, but with its own "no override" label
+    /// ("(none)" rather than "(default)" — there IS no higher-level
+    /// default to fall back to for this one, clearing it disables global
+    /// exit routing entirely) and no live-apply hover hint (the restart
+    /// caveat is already shown as a persistent label above the picker in
+    /// `draw_admin_server_settings_section`, unlike the per-client picker
+    /// which has no equivalent always-visible caption).
+    fn draw_global_exit_node_picker(
+        ui: &mut eframe::egui::Ui,
+        lang: Lang,
+        value: &mut String,
+        custom_mode: &mut bool,
+        known_addresses: &[String],
+    ) {
+        use eframe::egui;
+
+        let choice = if *custom_mode {
+            admin::ExitNodeChoice::Custom
+        } else {
+            admin::classify_exit_node(value, known_addresses)
+        };
+        let none_label = t(lang, "admin_settings_exit_none");
+        let custom_label = t(lang, "admin_exit_node_custom");
+        let selected_text = match &choice {
+            admin::ExitNodeChoice::Default => none_label.to_string(),
+            admin::ExitNodeChoice::Node(addr) => addr.clone(),
+            admin::ExitNodeChoice::Custom => custom_label.to_string(),
+        };
+
+        egui::ComboBox::from_id_salt("admin_settings_exit_node_combo")
+            .selected_text(selected_text)
+            .width(230.0)
+            .show_ui(ui, |ui| {
+                if ui
+                    .selectable_label(choice == admin::ExitNodeChoice::Default, none_label)
+                    .clicked()
+                {
+                    value.clear();
+                    *custom_mode = false;
+                }
+                for addr in known_addresses {
+                    let is_selected =
+                        matches!(&choice, admin::ExitNodeChoice::Node(a) if a == addr);
+                    if ui.selectable_label(is_selected, addr).clicked() {
+                        *value = addr.clone();
+                        *custom_mode = false;
+                    }
+                }
+                if ui
+                    .selectable_label(choice == admin::ExitNodeChoice::Custom, custom_label)
+                    .clicked()
+                {
+                    *custom_mode = true;
+                }
+            });
+
+        if matches!(choice, admin::ExitNodeChoice::Custom) {
+            ui.add(
+                egui::TextEdit::singleline(value)
+                    .desired_width(f32::INFINITY)
+                    .hint_text("exit.example.com:51820"),
+            );
+        }
     }
 
     /// Connection-key / QR viewer window and the revoke-confirmation modal —
@@ -2473,16 +3163,42 @@ impl AivpnApp {
                     t(lang, "ssh_install_done_error"),
                 );
             }
-            if self.ssh_install_connection_key.is_some() {
-                ui.horizontal(|ui| {
-                    if !self.ssh_import_done {
-                        if ui.button(t(lang, "ssh_import_profile_btn")).clicked() {
-                            self.import_ssh_install_key();
-                        }
-                    } else {
-                        ui.label(t(lang, "ssh_import_profile_done"));
+            // G-C1: the profile is now imported automatically the moment
+            // the terminal marker's key arrives (`poll_ssh_install`) —
+            // no manual click required. This just confirms it happened
+            // and shows the key, mirroring the admin panel's read-only
+            // key viewer (`admin_key_value` above). `!ssh_import_done`
+            // only remains reachable if the auto-import itself failed
+            // (e.g. `KeyStorage::add_key` rejected it) — that path keeps
+            // the old manual button as a retry rather than stranding the
+            // key with no way to add it.
+            if let Some(key) = self.ssh_install_connection_key.clone() {
+                ui.separator();
+                if self.ssh_import_done {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(0x4C, 0xAF, 0x50),
+                        t(lang, "ssh_import_profile_done"),
+                    );
+                    let mut display_key = key.clone();
+                    ui.add(
+                        egui::TextEdit::multiline(&mut display_key)
+                            .desired_width(360.0)
+                            .desired_rows(3)
+                            .font(egui::TextStyle::Monospace)
+                            .interactive(false),
+                    );
+                    if ui.button(t(lang, "copy")).clicked() {
+                        ui.ctx().copy_text(key);
                     }
-                });
+                } else {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(0xEF, 0x53, 0x50),
+                        t(lang, "ssh_import_profile_retry_hint"),
+                    );
+                    if ui.button(t(lang, "ssh_import_profile_btn")).clicked() {
+                        self.import_ssh_install_key();
+                    }
+                }
             }
             if ui.button(t(lang, "ssh_wizard_close_btn")).clicked() {
                 self.close_ssh_wizard();
@@ -3238,8 +3954,8 @@ impl eframe::App for AivpnApp {
                         ui.separator();
                     }
 
-                    // ── Admin panel (P3.4) — Viewer(1) sees pool topology only, ─────
-                    // ── Admin(2) sees pool topology + full client management ────────
+                    // ── Admin panel (P3.4) — Viewer(1) and Admin(2) both get ────────
+                    // ── clients/pool/audit (G-A1/G-A2); Viewer read-only ─────────────
                     if is_connected && matches!(self.admin_role, Some(1) | Some(2)) {
                         self.draw_admin_panel(ui, lang);
                         ui.separator();

@@ -4,9 +4,20 @@ import UIKit
 // In-app admin screen (P3.2-iOS): client list + add/edit/QR-share/revoke,
 // backed by AdminApi.swift's wrapper around the in-tunnel management API
 // (aivpn_mgmt_request / aivpn_qr_png, see crates/aivpn-ios-core). Presented
-// from ContentView.swift as a sheet, gated on AdminApi.role() == 2 (Admin) —
-// there is no role-editing UI here: role assignment is not exposed over the
-// tunnel (see AdminApi.patchClient's doc comment).
+// from ContentView.swift as a sheet, gated on AdminApi.role() >= 1
+// (Viewer or Admin) — there is no role-editing UI here: role assignment is
+// not exposed over the tunnel (see AdminApi.patchClient's doc comment).
+//
+// G-A1 (Viewer read-only widening): the server authorizes every curated
+// route's GET to Viewer role but rejects any mutation with 403 (see
+// mgmt_service.rs's `authorize` doc comment) — this screen mirrors that on
+// the client side via `canMutate` (`AdminApi.role() == 2`) so a Viewer
+// never sees a control that would just bounce off a 403: the "add client"
+// toolbar button, the swipe-to-revoke action, and the entire edit /
+// reset-device / revoke sections of the detail sheet are hidden, not
+// merely disabled, for Viewer. Read-only surfaces (client list, detail
+// info, connection-key display/QR/share, pool topology, audit log) stay
+// available to both roles.
 
 // MARK: - Small formatting helpers (file-scoped, mirror ContentView.swift's
 // private helpers of the same shape but kept separate since those are
@@ -40,6 +51,94 @@ private func adminDisplayDate(_ s: String) -> String {
     return df.string(from: date)
 }
 
+// MARK: - Exit-node picker (G-B1)
+//
+// Backs the free-text `exit_node` field (Wave B2a) with a `Picker` sourced
+// from `GET /api/v1/pool/nodes` (`AdminApi.poolNodes()`), while preserving
+// the original manual host:port entry as a "Custom…" option — neither
+// `AdminAddClientView` nor `AdminClientDetailView` loses the ability to
+// type an arbitrary address, they just gain a faster path for the common
+// case of picking a known pool node.
+
+/// Mirrors the three things the `exit_node` string field (`""` | a known
+/// pool-node address | an arbitrary address) can resolve to for picker
+/// display. `Hashable` is synthesized (Swift auto-derives it for enums
+/// whose associated values are themselves `Hashable`, per SE-0185), which
+/// is all `Picker`'s `selection:` binding needs for its tags below.
+private enum AdminExitNodeChoice: Hashable {
+    case globalDefault
+    case node(String)
+    case custom
+}
+
+/// Best-effort: pool sync being unconfigured on this node, or the call
+/// failing outright, just yields an empty address list — the picker still
+/// works fine via "(default)" and "custom" either way, mirroring
+/// `AdminApi.poolNodes()`'s own "always 200 empty array when pool sync
+/// isn't configured" contract (see that call's doc comment). Deduplicated
+/// and sorted so re-appearances of the same peer (e.g. one entry with a
+/// bound `node_id` and one address-only entry that both resolve to the
+/// same `address`) don't produce duplicate Picker rows.
+private func adminLoadPoolNodeAddresses() async -> [String] {
+    guard case .success(let nodes) = await AdminApi.poolNodes() else { return [] }
+    let addrs = nodes.compactMap { $0.address?.trimmingCharacters(in: .whitespaces) }
+        .filter { !$0.isEmpty }
+    return Array(Set(addrs)).sorted()
+}
+
+/// Shared row group (a `Picker` + a conditional manual `TextField`) for the
+/// `exit_node` field, used identically by `AdminAddClientView`'s "add" form
+/// and `AdminClientDetailView`'s "edit" form. `exitNode` is the SAME
+/// `@State` the rest of each view's save logic already reads/trims/sends —
+/// this never introduces a second source of truth for the field's value,
+/// it only changes how that one binding gets edited: picking a pool node
+/// writes its address straight into `exitNode`; picking "Custom…" leaves
+/// whatever text is already there (clearing it only when it was a
+/// just-deselected pool-node address, so a fresh custom entry starts
+/// blank instead of pre-filled with the last-picked node); picking
+/// "Global (default)" clears it, same as the old empty-TextField meant.
+@ViewBuilder
+private func adminExitNodePickerRows(
+    exitNode: Binding<String>,
+    poolNodeAddresses: [String],
+    loc: LocalizationManager
+) -> some View {
+    let choice = Binding<AdminExitNodeChoice>(
+        get: {
+            let trimmed = exitNode.wrappedValue.trimmingCharacters(in: .whitespaces)
+            if trimmed.isEmpty { return .globalDefault }
+            if poolNodeAddresses.contains(trimmed) { return .node(trimmed) }
+            return .custom
+        },
+        set: { newChoice in
+            switch newChoice {
+            case .globalDefault:
+                exitNode.wrappedValue = ""
+            case .node(let addr):
+                exitNode.wrappedValue = addr
+            case .custom:
+                let trimmed = exitNode.wrappedValue.trimmingCharacters(in: .whitespaces)
+                if poolNodeAddresses.contains(trimmed) {
+                    exitNode.wrappedValue = ""
+                }
+            }
+        }
+    )
+    Picker(loc.t("admin_exit_node"), selection: choice) {
+        Text(loc.t("admin_exit_node_global")).tag(AdminExitNodeChoice.globalDefault)
+        ForEach(poolNodeAddresses, id: \.self) { addr in
+            Text(addr).tag(AdminExitNodeChoice.node(addr))
+        }
+        Text(loc.t("admin_exit_node_custom")).tag(AdminExitNodeChoice.custom)
+    }
+    if choice.wrappedValue == .custom {
+        TextField(loc.t("admin_exit_node"), text: exitNode)
+            .autocorrectionDisabled()
+            .autocapitalization(.none)
+            .keyboardType(.asciiCapable)
+    }
+}
+
 // MARK: - Main admin screen
 
 struct AdminView: View {
@@ -54,6 +153,14 @@ struct AdminView: View {
     @State private var revokeTarget: AdminClient?
     @State private var showRevokeConfirm = false
     @State private var showPool = false
+    @State private var showAuditLog = false
+    @State private var showServerSettings = false
+
+    /// `true` only for the Admin role (2) — Viewer (1) reaches this screen
+    /// (see the header comment's G-A1 note) but every mutating control is
+    /// gated on this. Cheap: `AdminApi.role()` reads a process-global
+    /// atomic, safe to call from `body` on every re-render.
+    private var canMutate: Bool { AdminApi.role() == 2 }
 
     var body: some View {
         NavigationStack {
@@ -71,8 +178,10 @@ struct AdminView: View {
                                 .foregroundColor(.red)
                                 .multilineTextAlignment(.center)
                         }
-                        Button(loc.t("admin_add_client")) { showAddClient = true }
-                            .buttonStyle(.bordered)
+                        if canMutate {
+                            Button(loc.t("admin_add_client")) { showAddClient = true }
+                                .buttonStyle(.bordered)
+                        }
                     }
                     .padding()
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -94,11 +203,13 @@ struct AdminView: View {
                                 }
                                 .buttonStyle(.plain)
                                 .swipeActions(edge: .trailing) {
-                                    Button(role: .destructive) {
-                                        revokeTarget = client
-                                        showRevokeConfirm = true
-                                    } label: {
-                                        Label(loc.t("admin_revoke"), systemImage: "xmark.shield")
+                                    if canMutate {
+                                        Button(role: .destructive) {
+                                            revokeTarget = client
+                                            showRevokeConfirm = true
+                                        } label: {
+                                            Label(loc.t("admin_revoke"), systemImage: "xmark.shield")
+                                        }
                                     }
                                 }
                             }
@@ -111,12 +222,22 @@ struct AdminView: View {
             .navigationTitle(loc.t("admin_title"))
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                ToolbarItem(placement: .navigationBarLeading) {
-                    Button {
-                        showAddClient = true
-                    } label: {
-                        Image(systemName: "plus.circle.fill")
+                if canMutate {
+                    ToolbarItem(placement: .navigationBarLeading) {
+                        Button {
+                            showAddClient = true
+                        } label: {
+                            Image(systemName: "plus.circle.fill")
+                        }
                     }
+                }
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Button {
+                        showAuditLog = true
+                    } label: {
+                        Image(systemName: "list.bullet.rectangle")
+                    }
+                    .accessibilityLabel(Text(loc.t("audit_title")))
                 }
                 ToolbarItem(placement: .navigationBarTrailing) {
                     Button {
@@ -126,6 +247,20 @@ struct AdminView: View {
                     }
                     .accessibilityLabel(Text(loc.t("pool_title")))
                 }
+                // G-A3: apply-with-rollback server settings — Admin only,
+                // same gate as the "add client" button above, since every
+                // control on that screen mutates (see
+                // ServerSettingsView.swift's header comment).
+                if canMutate {
+                    ToolbarItem(placement: .navigationBarTrailing) {
+                        Button {
+                            showServerSettings = true
+                        } label: {
+                            Image(systemName: "gearshape")
+                        }
+                        .accessibilityLabel(Text(loc.t("server_settings_title")))
+                    }
+                }
                 ToolbarItem(placement: .confirmationAction) {
                     Button(loc.t("done")) { dismiss() }
                 }
@@ -134,6 +269,12 @@ struct AdminView: View {
         .task { await loadClients() }
         .sheet(isPresented: $showPool) {
             PoolView().environmentObject(loc)
+        }
+        .sheet(isPresented: $showAuditLog) {
+            AuditLogView().environmentObject(loc)
+        }
+        .sheet(isPresented: $showServerSettings) {
+            ServerSettingsView().environmentObject(loc)
         }
         .sheet(isPresented: $showAddClient) {
             AdminAddClientView { newClient, warning in
@@ -279,6 +420,7 @@ private struct AdminAddClientView: View {
     @State private var hasExpiry: Bool = false
     @State private var expiresAt: Date = Date().addingTimeInterval(86400 * 30)
     @State private var exitNode: String = ""
+    @State private var poolNodeAddresses: [String] = []
     @State private var isSaving = false
     @State private var errorMessage: String?
 
@@ -302,10 +444,7 @@ private struct AdminAddClientView: View {
                     }
                 }
                 Section(footer: Text(loc.t("admin_exit_node_hint"))) {
-                    TextField(loc.t("admin_exit_node"), text: $exitNode)
-                        .autocorrectionDisabled()
-                        .autocapitalization(.none)
-                        .keyboardType(.asciiCapable)
+                    adminExitNodePickerRows(exitNode: $exitNode, poolNodeAddresses: poolNodeAddresses, loc: loc)
                 }
                 if let errorMessage {
                     Section {
@@ -332,6 +471,7 @@ private struct AdminAddClientView: View {
                     }
                 }
             }
+            .task { poolNodeAddresses = await adminLoadPoolNodeAddresses() }
         }
     }
 
@@ -398,6 +538,7 @@ private struct AdminClientDetailView: View {
     @State private var editedHasExpiry: Bool = false
     @State private var editedExpiresAt: Date = Date().addingTimeInterval(86400 * 30)
     @State private var editedExitNode: String = ""
+    @State private var poolNodeAddresses: [String] = []
     @State private var isSavingEdit = false
 
     @State private var connectionKey: String?
@@ -412,41 +553,46 @@ private struct AdminClientDetailView: View {
     @State private var isRevoking = false
     @State private var actionError: String?
 
+    /// `true` only for the Admin role — see `AdminView.canMutate`'s doc
+    /// comment; this view is presented from both `AdminView`'s client list
+    /// (Viewer+Admin) and its own edit/reset/revoke actions are 403'd
+    /// server-side for Viewer, so they're hidden here too.
+    private var canMutate: Bool { AdminApi.role() == 2 }
+
     var body: some View {
         NavigationStack {
             Form {
-                Section(header: Text(loc.t("admin_edit_section"))) {
-                    TextField(loc.t("admin_client_name"), text: $editedName)
-                        .autocorrectionDisabled()
-                    Toggle(loc.t("admin_enabled"), isOn: $editedEnabled)
-                    Toggle(loc.t("admin_one_time"), isOn: $editedOneTime)
-                    Toggle(loc.t("admin_has_expiry"), isOn: $editedHasExpiry.animation())
-                    if editedHasExpiry {
-                        DatePicker(
-                            loc.t("admin_expires_at"),
-                            selection: $editedExpiresAt,
-                            displayedComponents: [.date, .hourAndMinute]
-                        )
-                    }
-                    TextField(loc.t("admin_exit_node"), text: $editedExitNode)
-                        .autocorrectionDisabled()
-                        .autocapitalization(.none)
-                        .keyboardType(.asciiCapable)
-                    Text(loc.t("admin_exit_node_hint"))
-                        .font(.caption2)
-                        .foregroundColor(.secondary)
-                    Button {
-                        Task { await saveEdits() }
-                    } label: {
-                        if isSavingEdit {
-                            ProgressView()
-                        } else {
-                            Text(loc.t("admin_save"))
+                if canMutate {
+                    Section(header: Text(loc.t("admin_edit_section"))) {
+                        TextField(loc.t("admin_client_name"), text: $editedName)
+                            .autocorrectionDisabled()
+                        Toggle(loc.t("admin_enabled"), isOn: $editedEnabled)
+                        Toggle(loc.t("admin_one_time"), isOn: $editedOneTime)
+                        Toggle(loc.t("admin_has_expiry"), isOn: $editedHasExpiry.animation())
+                        if editedHasExpiry {
+                            DatePicker(
+                                loc.t("admin_expires_at"),
+                                selection: $editedExpiresAt,
+                                displayedComponents: [.date, .hourAndMinute]
+                            )
                         }
-                    }
-                    .disabled(isSavingEdit || editedName.trimmingCharacters(in: .whitespaces).isEmpty)
-                    if let actionError {
-                        Text(actionError).font(.caption).foregroundColor(.red)
+                        adminExitNodePickerRows(exitNode: $editedExitNode, poolNodeAddresses: poolNodeAddresses, loc: loc)
+                        Text(loc.t("admin_exit_node_hint"))
+                            .font(.caption2)
+                            .foregroundColor(.secondary)
+                        Button {
+                            Task { await saveEdits() }
+                        } label: {
+                            if isSavingEdit {
+                                ProgressView()
+                            } else {
+                                Text(loc.t("admin_save"))
+                            }
+                        }
+                        .disabled(isSavingEdit || editedName.trimmingCharacters(in: .whitespaces).isEmpty)
+                        if let actionError {
+                            Text(actionError).font(.caption).foregroundColor(.red)
+                        }
                     }
                 }
 
@@ -499,35 +645,37 @@ private struct AdminClientDetailView: View {
                     }
                 }
 
-                Section {
-                    Button {
-                        Task { await resetDevice() }
-                    } label: {
-                        if isResettingDevice {
-                            ProgressView()
-                        } else {
-                            Label(loc.t("admin_reset_device"), systemImage: "arrow.counterclockwise")
+                if canMutate {
+                    Section {
+                        Button {
+                            Task { await resetDevice() }
+                        } label: {
+                            if isResettingDevice {
+                                ProgressView()
+                            } else {
+                                Label(loc.t("admin_reset_device"), systemImage: "arrow.counterclockwise")
+                            }
                         }
+                        .disabled(isResettingDevice)
+                        if let resetMessage {
+                            Text(resetMessage).font(.caption).foregroundColor(.secondary)
+                        }
+                    } footer: {
+                        Text(loc.t("admin_reset_device_hint"))
                     }
-                    .disabled(isResettingDevice)
-                    if let resetMessage {
-                        Text(resetMessage).font(.caption).foregroundColor(.secondary)
-                    }
-                } footer: {
-                    Text(loc.t("admin_reset_device_hint"))
-                }
 
-                Section {
-                    Button(role: .destructive) {
-                        showRevokeConfirm = true
-                    } label: {
-                        if isRevoking {
-                            ProgressView()
-                        } else {
-                            Label(loc.t("admin_revoke"), systemImage: "xmark.shield")
+                    Section {
+                        Button(role: .destructive) {
+                            showRevokeConfirm = true
+                        } label: {
+                            if isRevoking {
+                                ProgressView()
+                            } else {
+                                Label(loc.t("admin_revoke"), systemImage: "xmark.shield")
+                            }
                         }
+                        .disabled(isRevoking)
                     }
-                    .disabled(isRevoking)
                 }
             }
             .navigationTitle(client.name)
@@ -538,6 +686,11 @@ private struct AdminClientDetailView: View {
                 }
             }
             .onAppear { resetEditedFields() }
+            // Viewer (role 1) can open this sheet too (read-only info), but
+            // the exit-node picker this feeds is inside the `if canMutate`
+            // edit section above — skip the extra `/pool/nodes` round trip
+            // for a role that will never see it.
+            .task { if canMutate { poolNodeAddresses = await adminLoadPoolNodeAddresses() } }
             .confirmationDialog(
                 loc.t("admin_revoke_confirm_title"),
                 isPresented: $showRevokeConfirm,

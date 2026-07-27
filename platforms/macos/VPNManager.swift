@@ -1118,6 +1118,37 @@ class VPNManager: ObservableObject {
             let connected = response.connected ?? false
             let message = response.message
 
+            // G-A4: authenticated terminal handshake refusal — the helper's
+            // getStatus() surfaces this as a well-known
+            // "AIVPN-STATUS rejected <token>" message (see rejectToken() in
+            // aivpn-helper/main.swift, itself scanning for the exact line
+            // client.rs's HandshakeReject arm prints — see
+            // handshake_reject_token there). Checked before the connected/
+            // failure branching below so it fires whether the poll still
+            // sees the pid alive (still-connecting window) or already
+            // reports "Process exited" (the client's own terminal_rejected
+            // reconnect-loop break in main.rs usually wins that race).
+            // Mirrors the Linux GUI's parse_status_line "rejected" arm,
+            // just localized here instead of hardcoded English.
+            if message.hasPrefix("AIVPN-STATUS rejected ") {
+                let token = String(message.dropFirst("AIVPN-STATUS rejected ".count))
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                self.isConnecting = false
+                self.isConnected = false
+                self.lastError = LocalizationManager.shared.rejectReasonText(token: token)
+                self.stopStatusPolling()
+                self.trafficTimer?.invalidate()
+                self.trafficTimer = nil
+                self.serverAdaptiveLevel = 0
+                self.postConnectionNotification(connected: false)
+                // The client already exited on its own (terminal_rejected
+                // stops main.rs's reconnect loop before it ever retries) —
+                // this just reaps any leftover helper-side pid/state so a
+                // stale entry can't linger; a no-op if it's already gone.
+                self.sendToHelper(HelperRequest(action: "disconnect", key: nil, fullTunnel: nil, binaryPath: nil, service: nil, mtlsCertPath: nil, excludeRoutes: nil, adaptiveLevel: nil, dnsProxy: nil, killSwitch: nil)) { _ in }
+                return
+            }
+
             if connected && !self.isConnected {
                 // Transition: connecting → connected
                 self.isConnecting = false

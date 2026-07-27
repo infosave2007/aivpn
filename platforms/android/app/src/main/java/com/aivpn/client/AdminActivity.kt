@@ -10,10 +10,13 @@ import android.os.Bundle
 import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
+import android.widget.AdapterView
+import android.widget.ArrayAdapter
 import android.widget.CheckBox
 import android.widget.EditText
 import android.widget.ImageView
 import android.widget.LinearLayout
+import android.widget.Spinner
 import android.widget.TextView
 import android.widget.Toast
 import androidx.appcompat.app.AlertDialog
@@ -35,26 +38,39 @@ import org.json.JSONObject
  *
  * Visibility of the entry point in [MainActivity] and the role check here
  * are both driven by [AivpnJni.getRole]: 2=Admin gets full read/write,
- * 1=Viewer gets a read-only list (no add/edit/reset/revoke), 0=User never
- * sees this screen at all. Role assignment itself is server-side only and
- * is intentionally not exposed anywhere in this screen.
+ * 1=Viewer gets a read-only list PLUS the non-mutating connection-key/QR
+ * view (server-side `authorize()` allows any GET route, including
+ * `connection-key`, to Viewer — only the mutating routes add/edit/
+ * reset-device/revoke are Admin-only), 0=User never sees this screen at
+ * all. Role assignment itself is server-side only and is intentionally not
+ * exposed anywhere in this screen.
  */
 class AdminActivity : AppCompatActivity() {
 
     private lateinit var binding: ActivityAdminBinding
     private lateinit var adapter: ClientAdapter
     private val clients = mutableListOf<JSONObject>()
-    private var isAdmin = false
+
+    /** Role == 2 (Admin): full read/write, all mutating actions enabled. */
+    private var canMutate = false
+
+    /** Role == 1 (Viewer): read-only — list, connection-key/QR, pool, audit log. */
+    private var isViewer = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         binding = ActivityAdminBinding.inflate(layoutInflater)
         setContentView(binding.root)
 
-        isAdmin = try {
-            AivpnJni.isAvailable && AivpnJni.getRole() == ROLE_ADMIN
+        val role = try {
+            if (AivpnJni.isAvailable) AivpnJni.getRole() else -1
         } catch (_: Throwable) {
-            false
+            -1
+        }
+        canMutate = role == ROLE_ADMIN
+        isViewer = role == ROLE_VIEWER
+        if (isViewer) {
+            binding.textTitle.text = getString(R.string.admin_title_viewer)
         }
 
         adapter = ClientAdapter()
@@ -66,7 +82,16 @@ class AdminActivity : AppCompatActivity() {
         binding.btnPool.setOnClickListener {
             startActivity(Intent(this, PoolActivity::class.java))
         }
-        binding.fabAdd.visibility = if (isAdmin) View.VISIBLE else View.GONE
+        binding.btnAudit.setOnClickListener {
+            startActivity(Intent(this, AuditLogActivity::class.java))
+        }
+        // G-A3: apply-with-rollback server settings — Admin-only, same gate as fabAdd/edit/
+        // reset/revoke (ServerSettingsActivity itself re-checks the role defensively too).
+        binding.btnSettings.visibility = if (canMutate) View.VISIBLE else View.GONE
+        binding.btnSettings.setOnClickListener {
+            startActivity(Intent(this, ServerSettingsActivity::class.java))
+        }
+        binding.fabAdd.visibility = if (canMutate) View.VISIBLE else View.GONE
         binding.fabAdd.setOnClickListener { showAddDialog() }
 
         loadClients()
@@ -114,8 +139,22 @@ class AdminActivity : AppCompatActivity() {
 
     // ──────────── Add ────────────
 
+    /**
+     * Wave 3 G-B1: fetches the pool-node picker options first (async, over the
+     * mgmt tunnel — see [fetchExitNodeOptions]), then builds/shows the dialog
+     * from a plain (non-suspend) method so the dialog body below can keep
+     * using unqualified `this`/`getString`/`getColor` exactly as before —
+     * see [showAddDialogWithOptions].
+     */
     private fun showAddDialog() {
-        if (!isAdmin) return
+        if (!canMutate) return
+        lifecycleScope.launch {
+            val exitOptions = fetchExitNodeOptions()
+            showAddDialogWithOptions(exitOptions)
+        }
+    }
+
+    private fun showAddDialogWithOptions(exitOptions: List<ExitNodeOption>) {
         val dialogCtx = android.view.ContextThemeWrapper(this, R.style.Theme_AIVPN_Dialog)
         val layout = LinearLayout(dialogCtx).apply {
             orientation = LinearLayout.VERTICAL
@@ -139,23 +178,11 @@ class AdminActivity : AppCompatActivity() {
             setSingleLine(true)
             textSize = 13f
         }
-        val exitNodeLabel = TextView(dialogCtx).apply {
-            text = getString(R.string.admin_hint_exit_node)
-            textSize = 12f
-            setTextColor(getColor(R.color.text_secondary))
-            setPadding(0, 8.dp, 0, 2.dp)
-        }
-        val exitNodeInput = EditText(dialogCtx).apply {
-            hint = "203.0.113.5:51820"
-            setSingleLine(true)
-            textSize = 13f
-        }
         layout.addView(nameInput)
         layout.addView(oneTimeCheck)
         layout.addView(expiryLabel)
         layout.addView(expiryInput)
-        layout.addView(exitNodeLabel)
-        layout.addView(exitNodeInput)
+        val exitNodeInput = addExitNodePicker(dialogCtx, layout, exitOptions, "")
 
         AlertDialog.Builder(this)
             .setTitle(getString(R.string.admin_dialog_add_title))
@@ -191,11 +218,18 @@ class AdminActivity : AppCompatActivity() {
 
     // ──────────── Edit ────────────
 
+    /** See [showAddDialog]'s doc comment — same fetch-then-build split. */
     private fun showEditDialog(client: JSONObject) {
-        if (!isAdmin) return
+        if (!canMutate) return
         val id = client.optString("id", client.optString("client_id", ""))
         if (id.isEmpty()) return
+        lifecycleScope.launch {
+            val exitOptions = fetchExitNodeOptions()
+            showEditDialogWithOptions(client, id, exitOptions)
+        }
+    }
 
+    private fun showEditDialogWithOptions(client: JSONObject, id: String, exitOptions: List<ExitNodeOption>) {
         val dialogCtx = android.view.ContextThemeWrapper(this, R.style.Theme_AIVPN_Dialog)
         val layout = LinearLayout(dialogCtx).apply {
             orientation = LinearLayout.VERTICAL
@@ -226,27 +260,14 @@ class AdminActivity : AppCompatActivity() {
             setSingleLine(true)
             textSize = 13f
         }
-        val exitNodeLabel = TextView(dialogCtx).apply {
-            text = getString(R.string.admin_hint_exit_node)
-            textSize = 12f
-            setTextColor(getColor(R.color.text_secondary))
-            setPadding(0, 8.dp, 0, 2.dp)
-        }
         // Empty = fall back to the server's global default (pool.exit_node).
         val originalExitNode = if (client.isNull("exit_node")) "" else client.optString("exit_node", "")
-        val exitNodeInput = EditText(dialogCtx).apply {
-            hint = "203.0.113.5:51820"
-            setText(originalExitNode)
-            setSingleLine(true)
-            textSize = 13f
-        }
         layout.addView(nameInput)
         layout.addView(enabledCheck)
         layout.addView(oneTimeCheck)
         layout.addView(expiryLabel)
         layout.addView(expiryInput)
-        layout.addView(exitNodeLabel)
-        layout.addView(exitNodeInput)
+        val exitNodeInput = addExitNodePicker(dialogCtx, layout, exitOptions, originalExitNode)
 
         AlertDialog.Builder(this)
             .setTitle(getString(R.string.admin_dialog_edit_title))
@@ -274,6 +295,135 @@ class AdminActivity : AppCompatActivity() {
             }
             .setNegativeButton(getString(R.string.btn_cancel), null)
             .show()
+    }
+
+    // ──────────── Exit-node picker (Wave 3 G-B1) ────────────
+
+    /** One `GET /api/v1/pool/nodes` entry usable as an exit-node value — see [fetchExitNodeOptions]. */
+    private data class ExitNodeOption(val nodeId: String, val address: String)
+
+    /**
+     * Node addresses for the exit-node Spinner, from `GET /api/v1/pool/nodes`
+     * (same endpoint [PoolActivity] reads read-only). Revoked nodes and nodes
+     * with no address (this registry knows about them but hasn't dialed them
+     * — see server-side `PoolNodeInfo::address`'s doc comment) are filtered
+     * out: neither is a usable exit-node value. Returns an empty list (never
+     * throws) on any failure — the picker still works with just
+     * "(default)" + "Custom…" in that case (e.g. pool sync not configured on
+     * this node), same as the plain free-text field behaved before this wave.
+     */
+    private suspend fun fetchExitNodeOptions(): List<ExitNodeOption> {
+        val result = AdminApi.poolNodes()
+        if (!result.ok) return emptyList()
+        val arr = result.bodyArray() ?: return emptyList()
+        val out = mutableListOf<ExitNodeOption>()
+        for (i in 0 until arr.length()) {
+            val n = arr.optJSONObject(i) ?: continue
+            if (n.optBoolean("revoked", false)) continue
+            val address = if (n.isNull("address")) "" else n.optString("address", "")
+            if (address.isBlank()) continue
+            out.add(ExitNodeOption(nodeId = n.optString("node_id", address), address = address))
+        }
+        return out
+    }
+
+    /**
+     * Builds the exit-node label + live/restart caption + Spinner + (conditionally
+     * shown) manual host:port [EditText], appends them to [layout], and returns the
+     * [EditText] — the single source of truth the Add/Edit submit handlers already
+     * read via `.text.toString().trim()`, unchanged from before this wave.
+     *
+     * The Spinner's items are "(default)" (position 0 — clears/omits the override,
+     * client falls back to the node's global `pool.exit_node`), then one entry per
+     * [options], then "Custom…" (last position — leaves the [EditText] free-typed).
+     * Selecting a preset node COPIES its address into the [EditText] and disables
+     * it; selecting "(default)" clears+hides it. Selecting "Custom…" only flips
+     * visibility/enabled and never clears the text — Android's Spinner always fires
+     * `onItemSelected` once on first layout even with no user interaction, and this
+     * makes that first, non-user-driven fire idempotent instead of clobbering a
+     * pre-filled custom value ([originalExitNode] on the edit dialog).
+     *
+     * @param originalExitNode current value ("" = none set); used only to choose the
+     *   initial Spinner position. Pass "" from the add dialog (no current value yet).
+     */
+    private fun addExitNodePicker(
+        dialogCtx: android.content.Context,
+        layout: LinearLayout,
+        options: List<ExitNodeOption>,
+        originalExitNode: String,
+    ): EditText {
+        val exitNodeLabel = TextView(dialogCtx).apply {
+            text = getString(R.string.admin_hint_exit_node)
+            textSize = 12f
+            setTextColor(getColor(R.color.text_secondary))
+            setPadding(0, 8.dp, 0, 2.dp)
+        }
+        val exitNodeCaption = TextView(dialogCtx).apply {
+            text = getString(R.string.admin_hint_exit_node_live)
+            textSize = 11f
+            setTextColor(getColor(R.color.text_secondary))
+            setPadding(0, 0, 0, 4.dp)
+        }
+        val exitNodeInput = EditText(dialogCtx).apply {
+            hint = "203.0.113.5:51820"
+            setText(originalExitNode)
+            setSingleLine(true)
+            textSize = 13f
+        }
+
+        val labels = mutableListOf(getString(R.string.admin_exit_option_default))
+        labels.addAll(options.map { "${it.nodeId} (${it.address})" })
+        labels.add(getString(R.string.admin_exit_option_custom))
+        val customIndex = labels.size - 1
+        val initialIndex = when {
+            originalExitNode.isEmpty() -> 0
+            else -> {
+                val match = options.indexOfFirst { it.address == originalExitNode }
+                if (match >= 0) match + 1 else customIndex
+            }
+        }
+        // Pre-apply the state matching initialIndex before the listener is attached
+        // (belt-and-suspenders alongside the listener's own idempotent handling above).
+        when (initialIndex) {
+            0 -> { exitNodeInput.visibility = View.GONE; exitNodeInput.isEnabled = false }
+            customIndex -> { exitNodeInput.visibility = View.VISIBLE; exitNodeInput.isEnabled = true }
+            else -> { exitNodeInput.visibility = View.VISIBLE; exitNodeInput.isEnabled = false }
+        }
+
+        val spinner = Spinner(dialogCtx).apply {
+            adapter = ArrayAdapter(dialogCtx, android.R.layout.simple_spinner_item, labels).apply {
+                setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
+            }
+            setSelection(initialIndex)
+        }
+        spinner.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
+            override fun onItemSelected(parent: AdapterView<*>?, view: View?, position: Int, id: Long) {
+                when (position) {
+                    0 -> {
+                        exitNodeInput.setText("")
+                        exitNodeInput.visibility = View.GONE
+                        exitNodeInput.isEnabled = false
+                    }
+                    customIndex -> {
+                        exitNodeInput.visibility = View.VISIBLE
+                        exitNodeInput.isEnabled = true
+                    }
+                    else -> {
+                        val opt = options[position - 1]
+                        exitNodeInput.setText(opt.address)
+                        exitNodeInput.visibility = View.VISIBLE
+                        exitNodeInput.isEnabled = false
+                    }
+                }
+            }
+            override fun onNothingSelected(parent: AdapterView<*>?) {}
+        }
+
+        layout.addView(exitNodeLabel)
+        layout.addView(exitNodeCaption)
+        layout.addView(spinner)
+        layout.addView(exitNodeInput)
+        return exitNodeInput
     }
 
     // ──────────── Connection key / QR ────────────
@@ -353,7 +503,7 @@ class AdminActivity : AppCompatActivity() {
     // ──────────── Reset device ────────────
 
     private fun confirmReset(id: String, name: String) {
-        if (!isAdmin) return
+        if (!canMutate) return
         AlertDialog.Builder(this)
             .setTitle(getString(R.string.admin_reset_confirm_title))
             .setMessage(getString(R.string.admin_reset_confirm_msg, name))
@@ -370,7 +520,7 @@ class AdminActivity : AppCompatActivity() {
     // ──────────── Revoke ────────────
 
     private fun confirmRevoke(id: String, name: String) {
-        if (!isAdmin) return
+        if (!canMutate) return
         AlertDialog.Builder(this)
             .setTitle(getString(R.string.admin_revoke_confirm_title))
             .setMessage(getString(R.string.admin_revoke_confirm_msg, name))
@@ -476,22 +626,34 @@ class AdminActivity : AppCompatActivity() {
                 holder.rowActions.visibility = View.GONE
                 return
             }
-
-            // Viewer (role==1): read-only list, no key/edit/reset/revoke actions.
-            if (!isAdmin) {
-                holder.rowActions.visibility = View.GONE
-                return
-            }
             holder.rowActions.visibility = View.VISIBLE
 
+            // "Key" (connection-key/QR) is a GET request — non-mutating —
+            // so it stays available to Viewer, unlike the rest of the row.
+            holder.btnKey.visibility = View.VISIBLE
             holder.btnKey.setOnClickListener { showKeyDialog(id, name) }
-            holder.btnEdit.setOnClickListener { showEditDialog(c) }
-            holder.btnReset.setOnClickListener { confirmReset(id, name) }
-            holder.btnRevoke.setOnClickListener { confirmRevoke(id, name) }
+
+            // Edit/reset-device/revoke are mutating (PATCH/POST/DELETE) and
+            // 403 server-side for Viewer — hide rather than let the user
+            // tap into a guaranteed-failing request.
+            val mutateVisibility = if (canMutate) View.VISIBLE else View.GONE
+            holder.btnEdit.visibility = mutateVisibility
+            holder.btnReset.visibility = mutateVisibility
+            holder.btnRevoke.visibility = mutateVisibility
+            if (canMutate) {
+                holder.btnEdit.setOnClickListener { showEditDialog(c) }
+                holder.btnReset.setOnClickListener { confirmReset(id, name) }
+                holder.btnRevoke.setOnClickListener { confirmRevoke(id, name) }
+            } else {
+                holder.btnEdit.setOnClickListener(null)
+                holder.btnReset.setOnClickListener(null)
+                holder.btnRevoke.setOnClickListener(null)
+            }
         }
     }
 
     companion object {
         private const val ROLE_ADMIN = 2
+        private const val ROLE_VIEWER = 1
     }
 }

@@ -244,10 +244,11 @@ class LocalizationManager: ObservableObject {
         // MARK: Per-client exit node (Wave B2a/B3-iOS)
         "admin_exit_node":        ["en": "Exit node (optional)", "ru": "Узел выхода (необязательно)"],
         "admin_exit_node_hint": [
-            "en": "host:port — leave empty to use the server's global exit node.",
-            "ru": "host:port — оставьте пустым, чтобы использовать глобальный узел выхода сервера.",
+            "en": "Applies live for this client, no reconnect needed. \"Global (default)\" defers to the server's pool.exit_node setting — that global value itself only takes effect after a server restart.",
+            "ru": "Применяется сразу для этого клиента, без переподключения. Вариант «Глобальный (по умолчанию)» использует настройку pool.exit_node сервера — само это значение вступает в силу только после перезапуска сервера.",
         ],
         "admin_exit_node_global": ["en": "Global (default)", "ru": "Глобальный (по умолчанию)"],
+        "admin_exit_node_custom": ["en": "Custom…", "ru": "Свой вариант…"],
 
         // MARK: Pool topology view (Wave B1/B3-iOS)
         "pool_title":              ["en": "Pool Topology", "ru": "Топология пула"],
@@ -272,6 +273,48 @@ class LocalizationManager: ObservableObject {
         ],
         "pool_partition_conflict": ["en": "Partition conflict", "ru": "Конфликт партиции"],
         "pool_subnet_mismatch":    ["en": "Subnet mismatch", "ru": "Несовпадение подсети"],
+
+        // MARK: Server settings apply-with-rollback (Wave 2 / G-A3,
+        // ServerSettingsView.swift)
+        "server_settings_title":         ["en": "Server Settings", "ru": "Настройки сервера"],
+        "server_settings_admin_only": [
+            "en": "Admin role required",
+            "ru": "Требуется роль администратора",
+        ],
+        "server_settings_mask_section":  ["en": "Active Mask (per client, live)", "ru": "Активная маска (для клиента, вживую)"],
+        "server_settings_mask_hint": [
+            "en": "Sets this client's active-mask override immediately, no reconnect needed.",
+            "ru": "Сразу задаёт клиенту переопределение активной маски, без переподключения.",
+        ],
+        "server_settings_select_client": ["en": "Client", "ru": "Клиент"],
+        "server_settings_select_mask":   ["en": "Mask", "ru": "Маска"],
+        "server_settings_no_clients":    ["en": "No clients available", "ru": "Нет доступных клиентов"],
+        "server_settings_no_masks":      ["en": "No masks available", "ru": "Нет доступных масок"],
+        "mask_generated_suffix":         ["en": "(auto)", "ru": "(авто)"],
+        "server_settings_exit_section":  ["en": "Global Default Exit (Pool)", "ru": "Глобальный узел выхода по умолчанию (пул)"],
+        "server_settings_exit_hint": [
+            "en": "Sets pool.exit_node in server.json — applies only after the server RESTARTS, unlike a per-client exit-node override.",
+            "ru": "Задаёт pool.exit_node в server.json — применяется только после ПЕРЕЗАПУСКА сервера, в отличие от переопределения для отдельного клиента.",
+        ],
+        "server_settings_exit_none":     ["en": "(none)", "ru": "(нет)"],
+        "server_settings_apply":         ["en": "Apply", "ru": "Применить"],
+        "server_settings_confirm":       ["en": "Confirm", "ru": "Подтвердить"],
+        "server_settings_pending_prefix": ["en": "Confirm within", "ru": "Подтвердите в течение"],
+        "server_settings_pending_suffix": ["en": "s or it reverts", "ru": " с, иначе будет отменено"],
+        "server_settings_confirmed":     ["en": "Confirmed", "ru": "Подтверждено"],
+        "server_settings_reverted":      ["en": "Not confirmed in time — reverted", "ru": "Не подтверждено вовремя — изменение отменено"],
+
+        // MARK: Audit log view (G-A2, AuditLogView.swift)
+        "audit_title":            ["en": "Audit Log", "ru": "Журнал аудита"],
+        "audit_no_entries":       ["en": "No audit entries yet", "ru": "Записей аудита пока нет"],
+        "audit_chain_verified":   ["en": "Hash chain verified", "ru": "Цепочка хэшей подтверждена"],
+        "audit_chain_broken":     ["en": "Hash chain BROKEN", "ru": "Цепочка хэшей НАРУШЕНА"],
+        "audit_broken_at":        ["en": "Break detected at entry", "ru": "Разрыв обнаружен на записи"],
+        "audit_actor":            ["en": "Actor", "ru": "Инициатор"],
+        "audit_actor_cli":        ["en": "CLI", "ru": "CLI"],
+        "audit_actor_api":        ["en": "API", "ru": "API"],
+        "audit_actor_system":     ["en": "System", "ru": "Система"],
+        "audit_result":           ["en": "Result", "ru": "Результат"],
 
         // MARK: SSH server-install wizard (C3-iOS, InstallServerView.swift)
         "install_wizard_title":       ["en": "Install Server via SSH", "ru": "Установка сервера по SSH"],
@@ -325,7 +368,12 @@ class LocalizationManager: ObservableObject {
         "install_running":            ["en": "Installing…", "ru": "Выполняется установка…"],
         "install_success":            ["en": "Installation completed successfully", "ru": "Установка успешно завершена"],
         "install_failed":             ["en": "Installation failed", "ru": "Установка завершилась с ошибкой"],
-        "install_import_button":      ["en": "Import Connection Key", "ru": "Импортировать ключ подключения"],
+        "install_view_key_button":    ["en": "View Imported Key", "ru": "Показать импортированный ключ"],
+        "install_import_done":        ["en": "Connection key imported and selected", "ru": "Ключ подключения импортирован и выбран"],
+        "install_auto_import_failed": [
+            "en": "The key was received but couldn't be imported automatically (invalid format). Copy it below and add it manually via the + button.",
+            "ru": "Ключ получен, но не удалось импортировать его автоматически (некорректный формат). Скопируйте его ниже и добавьте вручную кнопкой «+».",
+        ],
         "install_import_title":       ["en": "Import Key", "ru": "Импорт ключа"],
         "install_no_key_hint": [
             "en": "No connection key was auto-created (enable Device binding above before installing to get one automatically). Create an admin client manually — via the server CLI, web panel, or another device — then add its key here with the + button.",

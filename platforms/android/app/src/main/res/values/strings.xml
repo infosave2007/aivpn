@@ -217,7 +217,7 @@
 
     <!-- In-app admin: client management (P3.1) -->
     <string name="admin_menu_title">Client management</string>
-    <string name="desc_admin_menu">Add, revoke, and manage connected clients (admin)</string>
+    <string name="desc_admin_menu">View clients, pool, and audit log — add/edit/revoke for Admin only</string>
     <string name="admin_title">Client Management</string>
     <string name="admin_refresh">Refresh</string>
     <string name="admin_not_connected">Not connected — connect to the VPN to manage clients</string>
@@ -248,7 +248,11 @@
     <string name="admin_error_generic">Request failed (%d)</string>
     <string name="admin_error_with_reason">Request failed (%1$d): %2$s</string>
     <string name="admin_hint_exit_node">Exit node (optional, host:port — empty = global default)</string>
+    <string name="admin_hint_exit_node_live">Per-client exit applies live, without reconnecting. The global default only applies after a server restart.</string>
+    <string name="admin_exit_option_default">(default)</string>
+    <string name="admin_exit_option_custom">Custom…</string>
     <string name="admin_exit_node_prefix">Exit: %s</string>
+    <string name="admin_title_viewer">Client Management (Viewer, read-only)</string>
 
     <!-- Pool topology (Wave B3) -->
     <string name="pool_title">Pool topology</string>
@@ -268,6 +272,29 @@
     <string name="pool_node_disconnected">Disconnected</string>
     <string name="pool_node_last_seen">Last seen: %s</string>
     <string name="pool_node_never">never</string>
+
+    <!-- Server settings apply-with-rollback (Wave 2 / G-A3): Admin-only -->
+    <string name="server_settings_title">Server settings</string>
+    <string name="server_settings_mask_title">Active mask</string>
+    <string name="server_settings_mask_caption">Applies live, immediately — no server restart needed. Confirm within the window below or it reverts automatically.</string>
+    <string name="server_settings_mask_id_hint">Enter mask id</string>
+    <string name="server_settings_mask_none_loaded">No mask list available yet — connect to the VPN and reopen this screen, or enter a mask id manually.</string>
+    <string name="server_settings_exit_title">Global default exit (pool)</string>
+    <string name="server_settings_exit_caption">Applies after a server RESTART — not live. This is the fallback used by any client without its own per-client exit-node override.</string>
+    <string name="server_settings_exit_hint">host:port — empty = none</string>
+    <string name="server_settings_apply">Apply</string>
+    <string name="server_settings_confirm">Confirm</string>
+    <string name="server_settings_pending_banner">Confirm within %ds or this change reverts automatically</string>
+    <string name="server_settings_confirmed">Confirmed — change is now permanent</string>
+    <string name="server_settings_reverted">Not confirmed in time — the server already reverted this change</string>
+
+    <!-- Audit log (G-A2): hash-chain-verified admin action log, Viewer + Admin -->
+    <string name="audit_title">Audit Log</string>
+    <string name="audit_no_entries">No audit entries</string>
+    <string name="audit_chain_verified">Chain verified</string>
+    <string name="audit_chain_broken">Chain integrity BROKEN at entry #%d</string>
+    <string name="audit_entry_target_prefix">Target: %s</string>
+    <string name="audit_entry_actor_prefix">%1$s · %2$s</string>
 
     <!-- SSH server-install wizard (C3) -->
     <string name="install_menu_title">Install server</string>
@@ -326,6 +353,7 @@
     <string name="install_log_uploading">Uploading %s…</string>
     <string name="install_log_finished">Finished, exit code %d</string>
     <string name="install_profile_imported">Profile imported</string>
+    <string name="install_profile_auto_imported">Profile imported automatically:</string>
     <string name="install_marker_port_busy">Target port is already in use by another process</string>
     <string name="install_marker_no_masks">No mask profiles available to install</string>
     <string name="install_marker_template_missing">Server config template is missing from the install bundle</string>

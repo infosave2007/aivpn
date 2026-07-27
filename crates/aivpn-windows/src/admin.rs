@@ -43,12 +43,26 @@ const ADMIN_SOCKET_ADDR: &str = "127.0.0.1:44301";
 
 pub const PATH_CLIENTS: &str = "/api/v1/clients";
 pub const PATH_STATUS: &str = "/api/v1/status";
-pub const PATH_AUDIT_LOG: &str = "/api/v1/audit-log";
+/// G-A2: `?verify=1` requests hash-chain verification alongside the tail —
+/// the server always answers with the `{entries, verified, broken_at}`
+/// shape (`AuditVerifyView`, `mgmt_service.rs`) when this query param is
+/// present, rather than the bare-array shape it uses without it. Viewer(1)
+/// and Admin(2) both reach this route — `authorize()` treats every curated
+/// route as GET-only-or-full depending on role, and `audit-log` only ever
+/// has a GET method to begin with.
+pub const PATH_AUDIT_LOG: &str = "/api/v1/audit-log?verify=1";
 /// B3: `GET /api/v1/pool/nodes` — read-only pool topology, Viewer+Admin
 /// (`mgmt_service.rs`'s `authorize`: role 1 is GET-only, role 2 is full).
 pub const PATH_POOL_NODES: &str = "/api/v1/pool/nodes";
 /// B3: `GET /api/v1/pool/health` — aggregate pool-sync health summary.
 pub const PATH_POOL_HEALTH: &str = "/api/v1/pool/health";
+/// G-A3: `POST /api/v1/config/apply` — apply-with-rollback for a
+/// [`HeavySetting`]-class change (server's `mgmt_service.rs`). Admin-only
+/// (`authorize()`: role 2 required for any non-GET curated route).
+pub const PATH_CONFIG_APPLY: &str = "/api/v1/config/apply";
+/// G-A3: `POST /api/v1/config/confirm` — makes a pending apply permanent,
+/// cancelling its auto-rollback.
+pub const PATH_CONFIG_CONFIRM: &str = "/api/v1/config/confirm";
 
 pub fn path_client(id: &str) -> String {
     format!("/api/v1/clients/{id}")
@@ -200,18 +214,56 @@ impl AuditEntry {
     }
 }
 
-fn parse_audit_log(body: &[u8]) -> Result<Vec<AuditEntry>, String> {
+/// G-A2: `GET /api/v1/audit-log?verify=1` response — mirrors
+/// `mgmt_service::AuditVerifyView` verbatim (`{entries, verified,
+/// broken_at}`). `verified`/`broken_at` report the hash-chain check over
+/// the returned (possibly tail-windowed) `entries` — see that struct's doc
+/// comment on the server for the tail-window caveat.
+#[derive(Debug, Clone, Default)]
+pub struct AuditLogView {
+    pub entries: Vec<AuditEntry>,
+    /// `None` only for the defensive bare-array fallback below (no
+    /// verification info available at all) — never conflated with
+    /// `Some(false)` ("verified and broken"), so the UI can distinguish
+    /// "unknown" from "BROKEN" rather than defaulting an unknown state to
+    /// a scary red badge.
+    pub verified: Option<bool>,
+    /// Tail-window index (0-based, oldest-first, matching `entries`) of the
+    /// first broken link, present only when `verified == Some(false)`.
+    pub broken_at: Option<usize>,
+}
+
+fn parse_audit_log(body: &[u8]) -> Result<AuditLogView, String> {
     let v: serde_json::Value =
         serde_json::from_slice(body).map_err(|e| format!("Bad JSON from server: {e}"))?;
-    // Bare array is the default (no `?verify=1`) shape; also accept
-    // `{ "entries": [...], ... }` in case a future server version changes
-    // the default response shape to match the verified one.
-    let arr = v
-        .as_array()
-        .cloned()
-        .or_else(|| v.get("entries").and_then(|e| e.as_array()).cloned())
-        .ok_or_else(|| "Expected a JSON array of audit entries".to_string())?;
-    Ok(arr.iter().filter_map(AuditEntry::from_value).collect())
+    // `PATH_AUDIT_LOG` always sends `?verify=1`, so the server always
+    // answers with the `{entries, verified, broken_at}` object shape — but
+    // still accept a bare array defensively (an older server that doesn't
+    // recognize `verify` yet, or an intermediary that stripped the query),
+    // reporting no verification result in that case rather than failing
+    // the whole panel.
+    if let Some(arr) = v.as_array() {
+        return Ok(AuditLogView {
+            entries: arr.iter().filter_map(AuditEntry::from_value).collect(),
+            verified: None,
+            broken_at: None,
+        });
+    }
+    let entries = v
+        .get("entries")
+        .and_then(|e| e.as_array())
+        .ok_or_else(|| "Expected a JSON array of audit entries".to_string())?
+        .iter()
+        .filter_map(AuditEntry::from_value)
+        .collect();
+    Ok(AuditLogView {
+        entries,
+        verified: v.get("verified").and_then(|x| x.as_bool()),
+        broken_at: v
+            .get("broken_at")
+            .and_then(|x| x.as_u64())
+            .map(|x| x as usize),
+    })
 }
 
 #[derive(Debug, Clone, Default)]
@@ -281,6 +333,70 @@ fn parse_pool_nodes(body: &[u8]) -> Result<Vec<PoolNode>, String> {
     Ok(arr.iter().filter_map(PoolNode::from_value).collect())
 }
 
+// ── G-B1: exit-node picker (pool-node dropdown) ─────────────────────────
+//
+// The add/edit forms used to be a bare free-text `host:port` field. G-B1
+// replaces it with an egui `ComboBox` sourced from the pool's own node
+// addresses (`GET /api/v1/pool/nodes`, already fetched for the pool
+// topology section above) plus two synthetic entries: "(default)" — clears
+// the override so the client falls back to the server's global
+// `pool.exit_node` — and "custom" — keeps the field free-text for an
+// address that isn't (yet) a pool member. Both helpers below are pure/
+// host-clean so they're unit-testable on Linux even though the `ComboBox`
+// itself only ever draws under `cfg(windows)`.
+
+/// Distinct, non-empty candidate addresses to list in the dropdown, in
+/// server order (`Vec` preserves first-seen order; a `HashSet` would not).
+/// Revoked nodes are excluded — routing a client's exit traffic through a
+/// pool member the operator just revoked would be actively wrong, not just
+/// stale.
+pub fn exit_node_addresses(nodes: &[PoolNode]) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for n in nodes {
+        if n.revoked {
+            continue;
+        }
+        let Some(addr) = n.address.as_deref().map(str::trim) else {
+            continue;
+        };
+        if addr.is_empty() {
+            continue;
+        }
+        if seen.insert(addr.to_string()) {
+            out.push(addr.to_string());
+        }
+    }
+    out
+}
+
+/// Which dropdown entry the form's current free-text value corresponds to.
+/// Purely a function of the text + the known address list — the caller
+/// (egui code) additionally tracks an explicit "user picked custom" flag so
+/// switching to Custom in the UI doesn't immediately snap back to Default/
+/// a Node entry just because the text happens to match one (see
+/// `draw_admin_clients_section`'s `admin_add_exit_custom_mode` field).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExitNodeChoice {
+    /// Empty field — no override, server's global default applies.
+    Default,
+    /// Field matches one of `exit_node_addresses`'s entries exactly.
+    Node(String),
+    /// Non-empty field that isn't a known pool-node address.
+    Custom,
+}
+
+pub fn classify_exit_node(current: &str, known_addresses: &[String]) -> ExitNodeChoice {
+    let trimmed = current.trim();
+    if trimmed.is_empty() {
+        return ExitNodeChoice::Default;
+    }
+    if known_addresses.iter().any(|a| a == trimmed) {
+        return ExitNodeChoice::Node(trimmed.to_string());
+    }
+    ExitNodeChoice::Custom
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct PoolHealth {
     pub transport: String,
@@ -320,6 +436,116 @@ fn parse_pool_health(body: &[u8]) -> Result<PoolHealth, String> {
             .and_then(|x| x.as_bool())
             .unwrap_or(false),
     })
+}
+
+// ── G-A3: Server Settings — apply-with-rollback (active mask + global ──────
+// exit node) ─────────────────────────────────────────────────────────────
+//
+// Two of the server's `HeavySetting` variants (`mgmt_service.rs`) are
+// exposed here, both through the SAME `POST /api/v1/config/apply` ->
+// `POST /api/v1/config/confirm` flow:
+//
+// - `HeavySetting::ActiveMask { client, mask }` — sets ONE client's active-
+//   mask override (`resolve_heavy_setting`'s `ActiveMask` arm requires a
+//   non-empty, resolvable `client` — this is a PER-CLIENT setting, not a
+//   server-wide default, despite the client being free to pass an empty
+//   string on the wire; an empty `client` always 400s server-side with
+//   "fields 'client' and 'mask' are required"). The panel therefore always
+//   sends a real client id, picked from the already-loaded admin client
+//   list.
+// - `HeavySetting::ExitNode { addr }` — sets (`Some`) or clears (`None`)
+//   the server's GLOBAL default exit node (`pool.exit_node`); unlike the
+//   per-client `exit_node` override on `EditClientForm`, this only takes
+//   effect after the server process restarts (see that variant's doc
+//   comment in `mgmt_service.rs`).
+//
+// NOTE ON THE MISSING MASK PICKER: there is deliberately no `ListMasks`
+// request here. `GET /api/v1/masks` (`management_api.rs::list_masks`) is a
+// plain REST route with no equivalent in the tunnel's curated `Route`
+// enum/`classify_route` table (`mgmt_service.rs`) — every call this crate
+// makes rides `aivpn-client mgmt`, which only ever reaches the tunnel, so
+// there is no way to fetch the mask list from here. The mask id is
+// therefore free text, validated client-side by `mask_id_looks_valid`
+// (UX only — the server remains the authority) against the same
+// character class `resolve_heavy_setting`'s `ActiveMask` arm enforces.
+
+/// Which `HeavySetting` an apply/confirm round-trip is for — lets the UI
+/// route a response to the right form's busy/error/pending-token state
+/// without a second channel per setting. Both settings can have an
+/// independently pending (unconfirmed) token at once — the server's
+/// `PendingConfigManager` keys entries by `target_path`, and
+/// `ActiveMask`/`ExitNode` write different files, so they never collide.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigSetting {
+    ActiveMask,
+    ExitNode,
+}
+
+/// Result of a successful `POST /api/v1/config/apply` — mirrors the
+/// server's `ApplyResponse` (`mgmt_service.rs`) `{"token","applied"}`
+/// verbatim. The caller must present `token` to `POST /api/v1/config/
+/// confirm` within the server's `PENDING_CONFIG_TIMEOUT` (~120s, not
+/// itself sent over the wire) or the server's sweep task rolls the change
+/// back automatically.
+#[derive(Debug, Clone)]
+pub struct ApplyResult {
+    pub token: String,
+    pub applied: bool,
+}
+
+fn parse_apply_response(body: &[u8]) -> Result<ApplyResult, String> {
+    let v: serde_json::Value =
+        serde_json::from_slice(body).map_err(|e| format!("Bad JSON from server: {e}"))?;
+    let token = v
+        .get("token")
+        .and_then(|x| x.as_str())
+        .ok_or_else(|| "Server response did not include a token".to_string())?
+        .to_string();
+    let applied = v.get("applied").and_then(|x| x.as_bool()).unwrap_or(false);
+    Ok(ApplyResult { token, applied })
+}
+
+/// Body for `POST /api/v1/config/apply` selecting `HeavySetting::
+/// ActiveMask { client, mask }`. Deliberately omits the `exit_node` key
+/// entirely (rather than sending it as `null`) — the tunnel's
+/// `TunnelApplyRequest::exit_node` uses the same absent/null/value
+/// tri-state as `EditClientForm`'s PATCH body (`deserialize_opt_opt`), and
+/// its mere PRESENCE (even `null`) is what selects `HeavySetting::
+/// ExitNode` on the server (`management_api.rs::apply_config`: `if let
+/// Some(exit_node) = body.exit_node { ExitNode } else { ActiveMask }`) —
+/// so this body must never contain that key at all.
+pub fn build_apply_mask_body(client_id: &str, mask_id: &str) -> Vec<u8> {
+    serde_json::json!({ "client": client_id, "mask": mask_id })
+        .to_string()
+        .into_bytes()
+}
+
+/// Body for `POST /api/v1/config/apply` selecting `HeavySetting::ExitNode
+/// { addr }`. Always includes the `exit_node` key (see
+/// `build_apply_mask_body`'s doc comment) — `null` clears the global
+/// default, a string sets it.
+pub fn build_apply_exit_node_body(addr: Option<&str>) -> Vec<u8> {
+    let json = serde_json::json!({ "exit_node": addr });
+    json.to_string().into_bytes()
+}
+
+/// Body for `POST /api/v1/config/confirm`.
+pub fn build_confirm_body(token: &str) -> Vec<u8> {
+    serde_json::json!({ "token": token })
+        .to_string()
+        .into_bytes()
+}
+
+/// Client-side mirror of `resolve_heavy_setting`'s `ActiveMask` arm's mask-
+/// name character class (`mgmt_service.rs`: alphanumeric, `-`, `_`) — used
+/// only to disable the Apply button before round-tripping to the server
+/// for a predictable 400. Not security-relevant; the server re-validates
+/// unconditionally.
+pub fn mask_id_looks_valid(id: &str) -> bool {
+    !id.is_empty()
+        && id
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
 }
 
 // ── Add/Edit form payloads ─────────────────────────────────────────────────
@@ -380,6 +606,24 @@ pub enum AdminRequest {
     PoolNodes,
     /// B3: `GET /api/v1/pool/health` — Viewer+Admin.
     PoolHealth,
+    /// G-A3: `POST /api/v1/config/apply` selecting `HeavySetting::
+    /// ActiveMask` — Admin only.
+    ApplyActiveMask {
+        client_id: String,
+        mask: String,
+    },
+    /// G-A3: `POST /api/v1/config/apply` selecting `HeavySetting::
+    /// ExitNode` — Admin only.
+    ApplyExitNode {
+        addr: Option<String>,
+    },
+    /// G-A3: `POST /api/v1/config/confirm` — Admin only. `setting` is
+    /// carried through unchanged so the matching `AdminResponse` can route
+    /// back to the right form.
+    ConfirmConfig {
+        setting: ConfigSetting,
+        token: String,
+    },
 }
 
 pub enum AdminResponse {
@@ -410,11 +654,23 @@ pub enum AdminResponse {
         result: Result<Vec<u8>, String>,
     },
     Status(Result<AdminStatus, String>),
-    AuditLog(Result<Vec<AuditEntry>, String>),
+    /// G-A2: response to `AdminRequest::AuditLog`.
+    AuditLog(Result<AuditLogView, String>),
     /// B3: response to `AdminRequest::PoolNodes`.
     PoolNodes(Result<Vec<PoolNode>, String>),
     /// B3: response to `AdminRequest::PoolHealth`.
     PoolHealth(Result<PoolHealth, String>),
+    /// G-A3: response to `AdminRequest::ApplyActiveMask` /
+    /// `AdminRequest::ApplyExitNode`.
+    ConfigApplied {
+        setting: ConfigSetting,
+        result: Result<ApplyResult, String>,
+    },
+    /// G-A3: response to `AdminRequest::ConfirmConfig`.
+    ConfigConfirmed {
+        setting: ConfigSetting,
+        result: Result<(), String>,
+    },
 }
 
 /// Run one admin operation on a background thread and send exactly one
@@ -455,6 +711,18 @@ pub fn spawn(client_binary: PathBuf, req: AdminRequest, tx: Sender<AdminResponse
             AdminRequest::AuditLog => AdminResponse::AuditLog(get_audit_log(&client_binary)),
             AdminRequest::PoolNodes => AdminResponse::PoolNodes(list_pool_nodes(&client_binary)),
             AdminRequest::PoolHealth => AdminResponse::PoolHealth(get_pool_health(&client_binary)),
+            AdminRequest::ApplyActiveMask { client_id, mask } => AdminResponse::ConfigApplied {
+                setting: ConfigSetting::ActiveMask,
+                result: apply_active_mask(&client_binary, &client_id, &mask),
+            },
+            AdminRequest::ApplyExitNode { addr } => AdminResponse::ConfigApplied {
+                setting: ConfigSetting::ExitNode,
+                result: apply_exit_node(&client_binary, addr.as_deref()),
+            },
+            AdminRequest::ConfirmConfig { setting, token } => AdminResponse::ConfigConfirmed {
+                setting,
+                result: confirm_pending_config(&client_binary, &token),
+            },
         };
         let _ = tx.send(resp);
     });
@@ -642,6 +910,35 @@ fn get_pool_health(client_binary: &Path) -> Result<PoolHealth, String> {
     parse_pool_health(&body)
 }
 
+/// G-A3: `POST /api/v1/config/apply` selecting `HeavySetting::ActiveMask`.
+fn apply_active_mask(
+    client_binary: &Path,
+    client_id: &str,
+    mask_id: &str,
+) -> Result<ApplyResult, String> {
+    let body = build_apply_mask_body(client_id, mask_id);
+    let (status, resp_body) = mgmt_call(client_binary, "POST", PATH_CONFIG_APPLY, &body)?;
+    check_status(status, &resp_body)?;
+    parse_apply_response(&resp_body)
+}
+
+/// G-A3: `POST /api/v1/config/apply` selecting `HeavySetting::ExitNode`.
+fn apply_exit_node(client_binary: &Path, addr: Option<&str>) -> Result<ApplyResult, String> {
+    let body = build_apply_exit_node_body(addr);
+    let (status, resp_body) = mgmt_call(client_binary, "POST", PATH_CONFIG_APPLY, &body)?;
+    check_status(status, &resp_body)?;
+    parse_apply_response(&resp_body)
+}
+
+/// G-A3: `POST /api/v1/config/confirm` — the server answers `204 No
+/// Content` on success, so `check_status` (which never requires a
+/// non-empty body) is the whole implementation.
+fn confirm_pending_config(client_binary: &Path, token: &str) -> Result<(), String> {
+    let body = build_confirm_body(token);
+    let (status, resp_body) = mgmt_call(client_binary, "POST", PATH_CONFIG_CONFIRM, &body)?;
+    check_status(status, &resp_body)
+}
+
 fn connection_key(client_binary: &Path, id: &str) -> Result<String, String> {
     let (status, body) = mgmt_call(client_binary, "GET", &path_connection_key(id), &[])?;
     check_status(status, &body)?;
@@ -664,7 +961,7 @@ fn get_status(client_binary: &Path) -> Result<AdminStatus, String> {
     parse_status(&body)
 }
 
-fn get_audit_log(client_binary: &Path) -> Result<Vec<AuditEntry>, String> {
+fn get_audit_log(client_binary: &Path) -> Result<AuditLogView, String> {
     let (status, body) = mgmt_call(client_binary, "GET", PATH_AUDIT_LOG, &[])?;
     check_status(status, &body)?;
     parse_audit_log(&body)
@@ -749,4 +1046,270 @@ fn qr_png_for(text: &str) -> Result<Vec<u8>, String> {
     base64::engine::general_purpose::STANDARD
         .decode(reply.trim())
         .map_err(|e| format!("Failed to decode QR image: {e}"))
+}
+
+// ── Tests ────────────────────────────────────────────────────────────────
+//
+// Only host-clean, allocation-free-of-Windows-only-things logic is covered
+// here (JSON parsing) — same split as `install_wizard.rs`'s test module:
+// this crate has no `#[cfg(windows)]` gate on `mod admin;` itself, so these
+// run on every host, including the Linux dev/CI machine this was written
+// on (see `mgmt_call`'s `#[cfg(windows)]`-gated `CREATE_NO_WINDOW` bits,
+// which these tests never exercise).
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── G-A2: parse_audit_log / AuditLogView ────────────────────────────
+
+    #[test]
+    fn parse_audit_log_verified_object_shape() {
+        let body = br#"{
+            "entries": [
+                {"ts": "2026-07-24T00:00:00Z", "actor": "admin", "action": "add_client", "target": "c1", "result": "ok"},
+                {"ts": "2026-07-24T00:01:00Z", "actor": "admin", "action": "revoke", "target": "c2", "result": "ok"}
+            ],
+            "verified": true,
+            "broken_at": null
+        }"#;
+        let view = parse_audit_log(body).expect("parse ok");
+        assert_eq!(view.entries.len(), 2);
+        assert_eq!(view.entries[0].action, "add_client");
+        assert_eq!(view.entries[1].target, "c2");
+        assert_eq!(view.verified, Some(true));
+        assert_eq!(view.broken_at, None);
+    }
+
+    #[test]
+    fn parse_audit_log_broken_chain_reports_index() {
+        let body = br#"{
+            "entries": [
+                {"ts": "t0", "actor": "admin", "action": "a", "target": "x", "result": "ok"}
+            ],
+            "verified": false,
+            "broken_at": 3
+        }"#;
+        let view = parse_audit_log(body).expect("parse ok");
+        assert_eq!(view.verified, Some(false));
+        assert_eq!(view.broken_at, Some(3));
+    }
+
+    #[test]
+    fn parse_audit_log_bare_array_fallback_has_no_verification_info() {
+        // Defensive fallback for an older server / an intermediary that
+        // stripped `?verify=1` — must not be misread as "verified: false"
+        // (which would render as a scary BROKEN badge for a server that
+        // simply never answered the question).
+        let body = br#"[
+            {"ts": "t0", "actor": "cli", "action": "add_client", "target": "c1", "result": "ok"}
+        ]"#;
+        let view = parse_audit_log(body).expect("parse ok");
+        assert_eq!(view.entries.len(), 1);
+        assert_eq!(view.verified, None);
+        assert_eq!(view.broken_at, None);
+    }
+
+    #[test]
+    fn parse_audit_log_missing_entries_field_is_error() {
+        let body = br#"{"verified": true}"#;
+        assert!(parse_audit_log(body).is_err());
+    }
+
+    #[test]
+    fn parse_audit_log_malformed_json_is_error() {
+        let body = b"not json";
+        assert!(parse_audit_log(body).is_err());
+    }
+
+    #[test]
+    fn parse_audit_log_skips_entries_missing_required_fields() {
+        // `AuditEntry::from_value` has no required fields (every field
+        // falls back to a default), so a malformed entry never gets
+        // dropped for missing fields — only a non-object array element
+        // would fail `filter_map`. Verifies the tolerant-parsing
+        // convention this crate uses throughout (`AdminClient`, `PoolNode`)
+        // also applies to `AuditEntry`.
+        let body = br#"{"entries": [{}], "verified": true, "broken_at": null}"#;
+        let view = parse_audit_log(body).expect("parse ok");
+        assert_eq!(view.entries.len(), 1);
+        assert_eq!(view.entries[0].ts, "");
+        assert_eq!(view.entries[0].action, "");
+    }
+
+    #[test]
+    fn path_audit_log_requests_verification() {
+        assert!(PATH_AUDIT_LOG.contains("verify=1"));
+    }
+
+    // ── G-B1: exit_node_addresses / classify_exit_node ──────────────────
+
+    fn node(node_id: &str, address: Option<&str>, revoked: bool) -> PoolNode {
+        PoolNode {
+            node_id: node_id.to_string(),
+            address: address.map(str::to_string),
+            verified: true,
+            revoked,
+            connected: true,
+            last_seen_unix: None,
+        }
+    }
+
+    #[test]
+    fn exit_node_addresses_dedups_preserving_order() {
+        let nodes = vec![
+            node("n1", Some("a.example.com:51820"), false),
+            node("n2", Some("b.example.com:51820"), false),
+            node("n3", Some("a.example.com:51820"), false),
+        ];
+        assert_eq!(
+            exit_node_addresses(&nodes),
+            vec![
+                "a.example.com:51820".to_string(),
+                "b.example.com:51820".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn exit_node_addresses_excludes_revoked_and_empty() {
+        let nodes = vec![
+            node("n1", Some("a.example.com:51820"), true),
+            node("n2", None, false),
+            node("n3", Some(""), false),
+            node("n4", Some("  "), false),
+            node("n5", Some("d.example.com:51820"), false),
+        ];
+        assert_eq!(
+            exit_node_addresses(&nodes),
+            vec!["d.example.com:51820".to_string()]
+        );
+    }
+
+    #[test]
+    fn exit_node_addresses_trims_whitespace() {
+        let nodes = vec![node("n1", Some("  a.example.com:51820  "), false)];
+        assert_eq!(
+            exit_node_addresses(&nodes),
+            vec!["a.example.com:51820".to_string()]
+        );
+    }
+
+    #[test]
+    fn classify_exit_node_empty_is_default() {
+        let known = vec!["a.example.com:51820".to_string()];
+        assert_eq!(classify_exit_node("", &known), ExitNodeChoice::Default);
+        assert_eq!(classify_exit_node("   ", &known), ExitNodeChoice::Default);
+    }
+
+    #[test]
+    fn classify_exit_node_known_address_is_node() {
+        let known = vec!["a.example.com:51820".to_string()];
+        assert_eq!(
+            classify_exit_node("a.example.com:51820", &known),
+            ExitNodeChoice::Node("a.example.com:51820".to_string())
+        );
+        // Untrimmed input still matches a known trimmed address.
+        assert_eq!(
+            classify_exit_node("  a.example.com:51820  ", &known),
+            ExitNodeChoice::Node("a.example.com:51820".to_string())
+        );
+    }
+
+    #[test]
+    fn classify_exit_node_unknown_address_is_custom() {
+        let known = vec!["a.example.com:51820".to_string()];
+        assert_eq!(
+            classify_exit_node("z.example.com:9999", &known),
+            ExitNodeChoice::Custom
+        );
+    }
+
+    // ── G-A3: Server Settings apply-with-rollback ────────────────────────
+
+    #[test]
+    fn build_apply_mask_body_has_client_and_mask_no_exit_node_key() {
+        let body = build_apply_mask_body("client-123", "webrtc_zoom_v3");
+        let v: serde_json::Value = serde_json::from_slice(&body).expect("valid json");
+        assert_eq!(v.get("client").and_then(|x| x.as_str()), Some("client-123"));
+        assert_eq!(
+            v.get("mask").and_then(|x| x.as_str()),
+            Some("webrtc_zoom_v3")
+        );
+        // Presence of `exit_node` (even null) would select the WRONG
+        // `HeavySetting` on the server — must be entirely absent, not just
+        // null.
+        assert!(v.get("exit_node").is_none());
+    }
+
+    #[test]
+    fn build_apply_exit_node_body_sets_address() {
+        let body = build_apply_exit_node_body(Some("exit.example.com:51820"));
+        let v: serde_json::Value = serde_json::from_slice(&body).expect("valid json");
+        assert_eq!(
+            v.get("exit_node").and_then(|x| x.as_str()),
+            Some("exit.example.com:51820")
+        );
+    }
+
+    #[test]
+    fn build_apply_exit_node_body_none_sends_explicit_null() {
+        let body = build_apply_exit_node_body(None);
+        let v: serde_json::Value = serde_json::from_slice(&body).expect("valid json");
+        // The key must be PRESENT (selects HeavySetting::ExitNode) but
+        // null (clears the global default) — not simply absent.
+        assert!(v.get("exit_node").is_some());
+        assert!(v.get("exit_node").unwrap().is_null());
+    }
+
+    #[test]
+    fn build_confirm_body_has_token() {
+        let body = build_confirm_body("abc123");
+        let v: serde_json::Value = serde_json::from_slice(&body).expect("valid json");
+        assert_eq!(v.get("token").and_then(|x| x.as_str()), Some("abc123"));
+    }
+
+    #[test]
+    fn parse_apply_response_ok() {
+        let body = br#"{"token": "deadbeef", "applied": true}"#;
+        let r = parse_apply_response(body).expect("parse ok");
+        assert_eq!(r.token, "deadbeef");
+        assert!(r.applied);
+    }
+
+    #[test]
+    fn parse_apply_response_missing_token_is_error() {
+        let body = br#"{"applied": true}"#;
+        assert!(parse_apply_response(body).is_err());
+    }
+
+    #[test]
+    fn parse_apply_response_missing_applied_defaults_false() {
+        // Tolerant-parsing convention matches AdminClient/PoolNode/etc. —
+        // a missing/renamed field degrades rather than failing the whole
+        // response, even though the real server always sends `applied`.
+        let body = br#"{"token": "t"}"#;
+        let r = parse_apply_response(body).expect("parse ok");
+        assert!(!r.applied);
+    }
+
+    #[test]
+    fn parse_apply_response_malformed_json_is_error() {
+        assert!(parse_apply_response(b"not json").is_err());
+    }
+
+    #[test]
+    fn mask_id_looks_valid_accepts_alnum_dash_underscore() {
+        assert!(mask_id_looks_valid("webrtc_zoom_v3"));
+        assert!(mask_id_looks_valid("quic-https-v2"));
+        assert!(mask_id_looks_valid("Abc123"));
+    }
+
+    #[test]
+    fn mask_id_looks_valid_rejects_empty_and_bad_chars() {
+        assert!(!mask_id_looks_valid(""));
+        assert!(!mask_id_looks_valid("has space"));
+        assert!(!mask_id_looks_valid("has/slash"));
+        assert!(!mask_id_looks_valid("has.dot"));
+    }
 }

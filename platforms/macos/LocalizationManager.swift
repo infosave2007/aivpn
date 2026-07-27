@@ -708,6 +708,115 @@ class LocalizationManager: ObservableObject {
             "en": "Global default",
             "ru": "Глобальный по умолчанию"
         ],
+        // G-B1: exit-node picker additions — dropdown sourced from
+        // `GET /api/v1/pool/nodes` (AdminStore.poolNodes), with an explicit
+        // "custom" escape hatch that keeps the original free-text host:port
+        // entry available.
+        "admin_exit_node_custom": [
+            "en": "Custom (enter host:port)…",
+            "ru": "Другой (ввести host:port)…"
+        ],
+        "admin_exit_node_live_hint": [
+            "en": "Per-client exit node applies live — no reconnect needed.",
+            "ru": "Узел выхода для клиента применяется вживую — переподключение не требуется."
+        ],
+        "admin_exit_node_restart_hint": [
+            "en": "Global default exit node applies on the server's next restart.",
+            "ru": "Глобальный узел выхода по умолчанию применяется после перезапуска сервера."
+        ],
+
+        // MARK: - Admin: error detail (P2 — status-specific wording where the
+        // in-tunnel admin socket gives no error body to show; see
+        // `adminErrorMessage` in AdminView.swift for why).
+        "admin_error_bad_request": [
+            "en": "Request rejected — invalid input.",
+            "ru": "Запрос отклонён — некорректные данные."
+        ],
+        "admin_error_forbidden": [
+            "en": "Forbidden — your role does not allow this action.",
+            "ru": "Доступ запрещён — ваша роль не позволяет это действие."
+        ],
+        "admin_error_not_found": [
+            "en": "Not found — this client may have already been removed.",
+            "ru": "Не найдено — возможно, этот клиент уже удалён."
+        ],
+        "admin_error_conflict": [
+            "en": "Conflict — the server's state changed; refresh and retry.",
+            "ru": "Конфликт — состояние на сервере изменилось; обновите и повторите."
+        ],
+        "admin_error_server": [
+            "en": "Server error — try again shortly.",
+            "ru": "Ошибка сервера — попробуйте немного позже."
+        ],
+
+        // MARK: - Reject reason (G-A4) — localized text for the client's
+        // machine-readable "AIVPN-STATUS rejected <token>" stdout line (see
+        // handshake_reject_token() in crates/aivpn-client/src/client.rs).
+        // Keys match the tokens verbatim (reject_reason_<token>).
+        "reject_reason_one_time_used": [
+            "en": "This one-time key was already used.",
+            "ru": "Этот одноразовый ключ уже был использован."
+        ],
+        "reject_reason_expired": [
+            "en": "This client's key has expired.",
+            "ru": "Срок действия ключа этого клиента истёк."
+        ],
+        "reject_reason_disabled": [
+            "en": "This client has been disabled by the server administrator.",
+            "ru": "Этот клиент отключён администратором сервера."
+        ],
+        "reject_reason_unspecified": [
+            "en": "The server refused this connection.",
+            "ru": "Сервер отклонил это подключение."
+        ],
+
+        // MARK: - Admin: Viewer read-only mode (G-A1)
+        "admin_panel_button_viewer": [
+            "en": "View clients",
+            "ru": "Просмотр клиентов"
+        ],
+        "admin_viewer_mode_banner": [
+            "en": "Viewer mode — read-only, no changes allowed",
+            "ru": "Режим просмотра — только чтение, изменения запрещены"
+        ],
+
+        // MARK: - Admin: audit log (G-A2)
+        "admin_tab_audit": [
+            "en": "Audit Log",
+            "ru": "Журнал аудита"
+        ],
+        "audit_not_configured_title": [
+            "en": "Audit log unavailable",
+            "ru": "Журнал аудита недоступен"
+        ],
+        "audit_not_configured_message": [
+            "en": "This server has no audit log configured, or the request failed.",
+            "ru": "На этом сервере не настроен журнал аудита, либо запрос завершился с ошибкой."
+        ],
+        "audit_no_entries": [
+            "en": "No audit entries yet.",
+            "ru": "Записей аудита пока нет."
+        ],
+        "audit_chain_verified": [
+            "en": "Chain verified",
+            "ru": "Цепочка подтверждена"
+        ],
+        "audit_chain_broken": [
+            "en": "Chain BROKEN",
+            "ru": "Цепочка НАРУШЕНА"
+        ],
+        "audit_chain_broken_here": [
+            "en": "Hash-chain verification broke at this entry",
+            "ru": "Проверка цепочки хешей нарушена на этой записи"
+        ],
+        "audit_result_ok": [
+            "en": "OK",
+            "ru": "OK"
+        ],
+        "audit_result_failed": [
+            "en": "Failed",
+            "ru": "Ошибка"
+        ],
 
         // MARK: - Entry buttons (Wave C3-macOS)
         "install_wizard_button": [
@@ -885,8 +994,21 @@ class LocalizationManager: ObservableObject {
             "ru": "Импортировать профиль"
         ],
         "install_imported": [
-            "en": "Profile imported.",
-            "ru": "Профиль импортирован."
+            "en": "Profile imported — connected as admin.",
+            "ru": "Профиль импортирован — подключение как администратор."
+        ],
+        // G-C1: the key is now imported automatically as soon as the
+        // client_done marker arrives (see InstallServerStore.startInstall's
+        // marker handler) — these support the rename affordance the
+        // "Import profile" button used to gate, kept so the user can still
+        // see/rename the profile without a mandatory manual click.
+        "install_rename": [
+            "en": "Rename",
+            "ru": "Переименовать"
+        ],
+        "install_import_failed": [
+            "en": "Automatic import failed — add this key manually from the main window.",
+            "ru": "Не удалось импортировать ключ автоматически — добавьте его вручную в главном окне."
         ],
         "install_no_connection_key": [
             "en": "No connection key was returned over this channel (device binding was likely off) — check the admin panel or server logs to fetch one manually.",
@@ -1049,6 +1171,72 @@ class LocalizationManager: ObservableObject {
             "en": "failed to start process",
             "ru": "не удалось запустить процесс"
         ],
+
+        // MARK: - Server settings (G-A3: apply-with-rollback)
+        "server_settings_title": [
+            "en": "Server Settings",
+            "ru": "Настройки сервера"
+        ],
+        "server_settings_button": [
+            "en": "Server settings…",
+            "ru": "Настройки сервера…"
+        ],
+        "server_settings_admin_only": [
+            "en": "Admin access required to view server settings.",
+            "ru": "Для просмотра настроек сервера требуются права администратора."
+        ],
+        "server_settings_mask_section_title": [
+            "en": "Active mask",
+            "ru": "Активная маска"
+        ],
+        "server_settings_mask_catalog_unavailable": [
+            "en": "Mask catalog unavailable — enter a mask ID manually.",
+            "ru": "Каталог масок недоступен — введите ID маски вручную."
+        ],
+        "server_settings_mask_id_placeholder": [
+            "en": "Mask ID",
+            "ru": "ID маски"
+        ],
+        "server_settings_mask_auto": [
+            "en": "auto",
+            "ru": "авто"
+        ],
+        "server_settings_apply": [
+            "en": "Apply",
+            "ru": "Применить"
+        ],
+        "server_settings_applying": [
+            "en": "Applying…",
+            "ru": "Применение…"
+        ],
+        "server_settings_confirm": [
+            "en": "Confirm",
+            "ru": "Подтвердить"
+        ],
+        "server_settings_confirming": [
+            "en": "Confirming…",
+            "ru": "Подтверждение…"
+        ],
+        "server_settings_confirm_countdown": [
+            "en": "Confirm within %d s or it reverts",
+            "ru": "Подтвердите в течение %d с, иначе откат"
+        ],
+        "server_settings_reverted": [
+            "en": "Reverted — the change was not confirmed in time.",
+            "ru": "Откат — изменение не было подтверждено вовремя."
+        ],
+        "server_settings_exit_section_title": [
+            "en": "Global default exit (pool)",
+            "ru": "Глобальный узел выхода по умолчанию (пул)"
+        ],
+        "server_settings_exit_restart_note": [
+            "en": "Applies after server RESTART.",
+            "ru": "Применяется после ПЕРЕЗАПУСКА сервера."
+        ],
+        "server_settings_exit_none": [
+            "en": "(none)",
+            "ru": "(нет)"
+        ],
     ]
 
     init() {
@@ -1061,6 +1249,23 @@ class LocalizationManager: ObservableObject {
     func t(_ key: String) -> String {
         guard let dict = strings[key] else { return key }
         return dict[language] ?? dict["en"] ?? key
+    }
+
+    /// G-A4: maps a `handshake_reject_token()` value (crates/aivpn-client/
+    /// src/client.rs) — carried verbatim through the helper's
+    /// "AIVPN-STATUS rejected <token>" status message (see
+    /// `rejectToken(in:)` in aivpn-helper/main.swift and the `pollStatus()`
+    /// parser in VPNManager.swift) — to a localized user-facing string.
+    /// An unrecognized token (e.g. a future server adds a reason this build
+    /// doesn't know about) falls back to the generic "unspecified" wording
+    /// rather than leaking the raw ASCII token to the UI.
+    func rejectReasonText(token: String) -> String {
+        switch token {
+        case "one_time_used": return t("reject_reason_one_time_used")
+        case "expired": return t("reject_reason_expired")
+        case "disabled": return t("reject_reason_disabled")
+        default: return t("reject_reason_unspecified")
+        }
     }
 
     func toggleLanguage() {

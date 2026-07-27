@@ -4,11 +4,11 @@ import SwiftUI
 // aggregate health, and per-peer sync links, backed by AdminApi.swift's
 // poolNodes()/poolHealth()/poolLinks() wrappers around
 // `GET /api/v1/pool/{nodes,health,links}` (crates/aivpn-server/src/
-// mgmt_service.rs). Presented as a sheet from AdminView, which is already
-// gated on AdminApi.role() == 2 (Admin) — see AdminView.swift's header
-// comment; there is no separate role check here since the pool routes
-// themselves are Viewer+ authorized server-side but this screen only ever
-// opens from the already-Admin-gated AdminView.
+// mgmt_service.rs). Presented as a sheet from AdminView, which (G-A1) is
+// gated on AdminApi.role() >= 1 (Viewer or Admin) — there is no separate
+// role check here because every control on this screen is a plain GET
+// (`authorize()` allows those to Viewer server-side too) and there is
+// nothing here to mutate.
 
 private func poolFormatUnix(_ unix: Int64) -> String {
     let date = Date(timeIntervalSince1970: TimeInterval(unix))

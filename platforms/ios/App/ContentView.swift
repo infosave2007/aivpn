@@ -375,17 +375,19 @@ struct ContentView: View {
                         Image(systemName: "network")
                     }
                 }
-                // In-app admin (P3.2): only the server-assigned Admin role
-                // (2) may reach the client-management screen — Viewer/User
-                // never see the button at all. `vpn.isConnected` gates
-                // AdminApi.role() being meaningful (it caches the last
-                // Capabilities push, reset to User at the start of each
-                // session) and also re-evaluates this every second while
-                // connected via VPNManager's durationTimer-driven
-                // @Published updates, so the button appears shortly after
-                // the post-handshake Capabilities message arrives without
-                // any extra polling here.
-                if vpn.isConnected && AdminApi.role() == 2 {
+                // In-app admin (P3.2, widened G-A1): Viewer (1) and Admin
+                // (2) roles both reach the admin screen — User (0) never
+                // sees the button at all. Viewer gets read-only access
+                // (AdminView/AdminClientDetailView hide every mutating
+                // control behind `canMutate`); Admin is unchanged.
+                // `vpn.isConnected` gates AdminApi.role() being meaningful
+                // (it caches the last Capabilities push, reset to User at
+                // the start of each session) and also re-evaluates this
+                // every second while connected via VPNManager's
+                // durationTimer-driven @Published updates, so the button
+                // appears shortly after the post-handshake Capabilities
+                // message arrives without any extra polling here.
+                if vpn.isConnected && AdminApi.role() >= 1 {
                     ToolbarItem(placement: .navigationBarTrailing) {
                         Button { showAdmin = true } label: {
                             Image(systemName: "person.badge.key.fill")

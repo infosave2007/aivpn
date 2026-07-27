@@ -236,6 +236,48 @@ pub async fn pool_health() -> Result<PoolHealth, String> {
     parse_json(&body)
 }
 
+/// One entry of the append-only admin audit log
+/// (`aivpn-server::audit_log::AuditEntry`), as returned by
+/// `GET /api/v1/audit-log?verify=1`. Field names match verbatim (same
+/// tolerant-parsing rationale as `ClientRecord`/`PoolNode` above) — `actor`
+/// stays a plain `String` (server-side `AuditActor` serializes as
+/// `"cli"`/`"api"`/`"system"` via `#[serde(rename_all = "snake_case")]`)
+/// rather than mirroring the enum, since this is a display-only view.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AuditEntry {
+    #[serde(default)]
+    pub ts: String,
+    #[serde(default)]
+    pub actor: String,
+    #[serde(default)]
+    pub action: String,
+    #[serde(default)]
+    pub target: String,
+    #[serde(default)]
+    pub result: String,
+}
+
+/// `GET /api/v1/audit-log?verify=1` response — matches
+/// `mgmt_service::AuditVerifyView` verbatim. `verified`/`broken_at` report
+/// the hash-chain check over the returned (tail-windowed) entries.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AuditLogView {
+    #[serde(default)]
+    pub entries: Vec<AuditEntry>,
+    #[serde(default)]
+    pub verified: bool,
+    #[serde(default)]
+    pub broken_at: Option<usize>,
+}
+
+/// Fetch the audit log tail with hash-chain verification. Available to
+/// both Viewer (1) and Admin (2) roles server-side — `authorize()` allows
+/// every curated GET route, and `audit-log` is one of them.
+pub async fn audit_log() -> Result<AuditLogView, String> {
+    let (_, body) = mgmt_call(MgmtMethod::Get, "/api/v1/audit-log?verify=1", None).await?;
+    parse_json(&body)
+}
+
 pub async fn get_role() -> Result<u8, String> {
     let bin = find_client_binary()?;
     let out = tokio::process::Command::new(&bin)
@@ -366,6 +408,78 @@ pub async fn connection_key(id: &str) -> Result<String, String> {
     .await?;
     let resp: ConnectionKeyResponse = parse_json(&body)?;
     Ok(resp.connection_key)
+}
+
+/// G-A3: which `HeavySetting` (`mgmt_service.rs`) a `POST /api/v1/config/apply`
+/// call selects — mirrors the server's `TunnelApplyRequest`: presence of the
+/// `exit_node` key (even as JSON `null`, to clear it) selects the pool's
+/// global default exit node; its absence selects the per-client active-mask
+/// override via `client`/`mask`.
+///
+/// IMPORTANT: unlike a per-client `exit_node` override, `ActiveMask` has NO
+/// "apply to every client"/global form server-side —
+/// `mgmt_service::resolve_heavy_setting` rejects an empty `client` with
+/// `400 Bad Request` and otherwise resolves it by name-or-id against the
+/// live client database. So `ActiveMask` here always names one specific
+/// client, not a server-wide default (the panel's client picker in `app.rs`
+/// is not cosmetic — it is required for the call to succeed at all).
+#[derive(Debug, Clone)]
+pub enum ConfigSetting {
+    /// Set `client` (name or id)'s active-mask override to `mask` — applied
+    /// live, no reconnect needed (`management_api.rs::set_active_mask`'s
+    /// same on-disk override file).
+    ActiveMask { client: String, mask: String },
+    /// Set (`Some(addr)`) or clear (`None`) the pool's global default exit
+    /// node (`pool.exit_node` in `server.json`). Persisted immediately but
+    /// only takes effect after the server process restarts — see
+    /// `HeavySetting::ExitNode`'s doc comment server-side.
+    ExitNode(Option<String>),
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ApplyConfigResponse {
+    token: String,
+    /// Echoed back by the server (always `true` on a `200` — a failed apply
+    /// never reaches here at all, `mgmt_call` already turned a non-2xx
+    /// status into an `Err`) — kept only for wire-shape completeness, not
+    /// read anywhere.
+    #[allow(dead_code)]
+    applied: bool,
+}
+
+/// `POST /api/v1/config/apply` — Admin-only (role 2; a Viewer's `mgmt_call`
+/// would get `403` from the server's `authorize()` before this even runs).
+/// Returns the confirm token the caller must round-trip to
+/// [`confirm_config`] within the server's `PENDING_CONFIG_TIMEOUT` (~120s)
+/// or the change is automatically rolled back by the gateway's sweep task.
+pub async fn apply_config(setting: ConfigSetting) -> Result<String, String> {
+    let obj = match setting {
+        ConfigSetting::ActiveMask { client, mask } => serde_json::json!({
+            "client": client,
+            "mask": mask,
+        }),
+        // `exit_node` must be PRESENT (even as JSON `null`) to select the
+        // `HeavySetting::ExitNode` branch server-side — `json!` serializes
+        // `Option::None` as `Value::Null`, never omits the key, so this is
+        // correct for both "set" and "clear".
+        ConfigSetting::ExitNode(addr) => serde_json::json!({ "exit_node": addr }),
+    };
+    let body = serde_json::to_vec(&obj).map_err(|e| e.to_string())?;
+    let (_, resp) = mgmt_call(MgmtMethod::Post, "/api/v1/config/apply", Some(body)).await?;
+    let parsed: ApplyConfigResponse = parse_json(&resp)?;
+    Ok(parsed.token)
+}
+
+/// `POST /api/v1/config/confirm` — Admin-only. Confirms a still-pending
+/// token from [`apply_config`] before the server's confirm window elapses.
+/// `204 No Content` on success (nothing to parse; `mgmt_call` already turns
+/// a non-2xx status, e.g. an expired/unknown token, into an `Err`).
+pub async fn confirm_config(token: String) -> Result<(), String> {
+    let body =
+        serde_json::to_vec(&serde_json::json!({ "token": token })).map_err(|e| e.to_string())?;
+    mgmt_call(MgmtMethod::Post, "/api/v1/config/confirm", Some(body))
+        .await
+        .map(|_| ())
 }
 
 // ── Raw admin-socket transport (QR only — no CLI subcommand exists) ────────

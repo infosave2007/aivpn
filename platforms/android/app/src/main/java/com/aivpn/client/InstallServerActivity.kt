@@ -110,6 +110,15 @@ class InstallServerActivity : AppCompatActivity() {
     private var finishedExitCode: Int? = null
     private var finishedConnectionKey: String? = null
 
+    /**
+     * Wave 3 G-C1: set once [autoImportProfile] has added the freshly-installed
+     * server's key as a profile — flips the success step from a manual
+     * "Import profile" button to a confirmation showing the imported key, so no
+     * click is required to finish onboarding. Stays `false` (falling back to the
+     * old manual button) if auto-import couldn't run, e.g. a malformed key.
+     */
+    private var profileAutoImported = false
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         binding = ActivityInstallServerBinding.inflate(layoutInflater)
@@ -629,9 +638,31 @@ class InstallServerActivity : AppCompatActivity() {
                     setTypeface(typeface, android.graphics.Typeface.BOLD)
                     setPadding(0, 0, 0, 8.dp)
                 })
-                val importBtn = android.widget.Button(ctx).apply { text = getString(R.string.install_import_profile) }
-                importBtn.setOnClickListener { importProfile(key) }
-                layout.addView(importBtn)
+                if (profileAutoImported) {
+                    // Wave 3 G-C1: already imported by autoImportProfile() the moment the
+                    // "finished" marker arrived — show a confirmation + the key instead of
+                    // making the user click an "Import profile" button for something
+                    // that's already done.
+                    layout.addView(TextView(ctx).apply {
+                        text = getString(R.string.install_profile_auto_imported)
+                        setTextColor(getColor(R.color.text_secondary))
+                        setPadding(0, 0, 0, 4.dp)
+                    })
+                    layout.addView(TextView(ctx).apply {
+                        text = key
+                        textSize = 11f
+                        typeface = android.graphics.Typeface.MONOSPACE
+                        setTextColor(getColor(R.color.text_secondary))
+                        setTextIsSelectable(true)
+                        setPadding(0, 0, 0, 8.dp)
+                    })
+                } else {
+                    // Auto-import didn't run (e.g. the key failed to parse) — fall back to
+                    // the old manual path rather than silently dropping the key.
+                    val importBtn = android.widget.Button(ctx).apply { text = getString(R.string.install_import_profile) }
+                    importBtn.setOnClickListener { importProfile(key) }
+                    layout.addView(importBtn)
+                }
             } else {
                 layout.addView(TextView(ctx).apply {
                     text = getString(R.string.install_failed, code)
@@ -762,7 +793,11 @@ class InstallServerActivity : AppCompatActivity() {
                 installFinished = true
                 finishedExitCode = obj.optInt("exit_code", -1)
                 val key = if (obj.isNull("connection_key")) null else obj.optString("connection_key")
-                if (!key.isNullOrBlank()) finishedConnectionKey = key
+                if (!key.isNullOrBlank()) {
+                    finishedConnectionKey = key
+                    // Wave 3 G-C1: import immediately — no manual click required.
+                    autoImportProfile(key)
+                }
                 appendLog(getString(R.string.install_log_finished, finishedExitCode))
                 renderStep()
             }
@@ -886,5 +921,34 @@ class InstallServerActivity : AppCompatActivity() {
         SecureStorage.saveActiveProfileId(this, profile.id)
         Toast.makeText(this, getString(R.string.install_profile_imported), Toast.LENGTH_SHORT).show()
         finish()
+    }
+
+    /**
+     * Wave 3 G-C1: called from [handleInstallEvent]'s `"finished"` branch the moment
+     * the install script's final marker reports a `connection_key` — adds it as a
+     * profile right away instead of requiring the user to tap "Import profile"
+     * manually. Mirrors [importProfile]'s profile-creation logic exactly, but does
+     * NOT call `finish()`: the success step stays up (see [buildInstallStep]) so the
+     * user still sees a confirmation and the key before leaving, they just don't have
+     * to click anything to get there.
+     *
+     * No-ops (leaving [profileAutoImported] `false`, so [buildInstallStep] falls back
+     * to the old manual button) if [connectionKey] fails to parse — the same
+     * defensive check [importProfile] does, kept here so a malformed key from the
+     * server never gets silently saved as an unusable profile.
+     */
+    private fun autoImportProfile(connectionKey: String) {
+        if (profileAutoImported) return
+        if (ConnectionKeyParser.parse(connectionKey) == null) return
+        val profiles = SecureStorage.loadProfiles(this).toMutableList()
+        val profile = SecureStorage.ConnectionProfile(
+            id = UUID.randomUUID().toString(),
+            name = host.ifBlank { getString(R.string.install_title) },
+            key = connectionKey,
+        )
+        profiles.add(profile)
+        SecureStorage.saveProfiles(this, profiles)
+        SecureStorage.saveActiveProfileId(this, profile.id)
+        profileAutoImported = true
     }
 }

@@ -112,7 +112,14 @@ object AdminApi {
 
     suspend fun status(): MgmtResult = request(METHOD_GET, "/api/v1/status")
 
-    suspend fun auditLog(): MgmtResult = request(METHOD_GET, "/api/v1/audit-log")
+    /**
+     * `?verify=1` requests the hash-chain-verified shape
+     * (`{"entries":[...],"verified":bool,"broken_at":usize|null}`, mirrors
+     * server-side `mgmt_service::AuditVerifyView`) instead of the bare
+     * entries array — see [AuditLogActivity]. GET-only, so allowed for
+     * Viewer and Admin alike (same as [poolNodes]/[poolHealth]).
+     */
+    suspend fun auditLog(): MgmtResult = request(METHOD_GET, "/api/v1/audit-log?verify=1")
 
     // ──────────── Pool topology (Wave B3) ────────────
     // Read-only, available to both Viewer and Admin roles — see PoolActivity.
@@ -122,6 +129,83 @@ object AdminApi {
     suspend fun poolHealth(): MgmtResult = request(METHOD_GET, "/api/v1/pool/health")
 
     suspend fun poolLinks(): MgmtResult = request(METHOD_GET, "/api/v1/pool/links")
+
+    // ──────────── Server settings apply-with-rollback (G-A3) ────────────
+    //
+    // Both actions below go through the SAME server-side "commit confirmed"
+    // flow (mgmt_service::apply_heavy / confirm_config, pending_config.rs):
+    // apply writes the new value immediately and returns a one-time token;
+    // unless confirmConfig(token) is called within
+    // pending_config::PENDING_CONFIG_TIMEOUT (~120s) of the apply, the
+    // server's own background sweep rolls the change back automatically.
+    // See [ServerSettingsActivity] for the shared apply→countdown→confirm UI.
+
+    /**
+     * `POST /api/v1/config/apply` with `{"client":"","mask":"<mask_id>"}` —
+     * sets the server's ACTIVE mask override, which takes effect immediately
+     * (no server restart) for new/reconnecting sessions. `client` is always
+     * sent empty here: an empty client id selects the server-wide override,
+     * as opposed to a specific client's override (not exposed by this admin
+     * screen — this mirrors the same `HeavySetting::ActiveMask` request
+     * shape `management_api.rs`'s REST `ApplyConfigRequest` uses, just with
+     * `client` fixed to `""`).
+     */
+    suspend fun applyActiveMask(maskId: String): MgmtResult {
+        val json = JSONObject().apply {
+            put("client", "")
+            put("mask", maskId)
+        }
+        return request(METHOD_POST, "/api/v1/config/apply", json.toString().toByteArray(Charsets.UTF_8))
+    }
+
+    /**
+     * `POST /api/v1/config/apply` with `{"exit_node": addr|null}` — sets the
+     * server's GLOBAL default exit node (`pool.exit_node` in `server.json`).
+     * Unlike a per-client override ([patchClient]'s `exitNode`, which is
+     * live), this global default only takes effect after the server process
+     * restarts — see `server_settings_exit_caption`.
+     *
+     * @param addr `host:port`, or `null` to clear the global default. Always
+     *   sends the `exit_node` key (even when `null`) — the server's
+     *   `TunnelApplyRequest::exit_node` uses KEY PRESENCE (not the value) to
+     *   pick this branch over [applyActiveMask]'s `client`/`mask` shape.
+     */
+    suspend fun applyGlobalExitNode(addr: String?): MgmtResult {
+        val json = JSONObject().apply {
+            put("exit_node", if (addr.isNullOrBlank()) JSONObject.NULL else addr)
+        }
+        return request(METHOD_POST, "/api/v1/config/apply", json.toString().toByteArray(Charsets.UTF_8))
+    }
+
+    /**
+     * `POST /api/v1/config/confirm` — confirms a pending change from
+     * [applyActiveMask] / [applyGlobalExitNode] before its confirm window
+     * expires, making it permanent. A non-`ok` result (404/409: unknown or
+     * already-expired-and-swept token) means the window already closed and
+     * the server already rolled the change back on its own — the caller
+     * should treat that the same as a timeout, not retry.
+     */
+    suspend fun confirmConfig(token: String): MgmtResult {
+        val json = JSONObject().apply { put("token", token) }
+        return request(METHOD_POST, "/api/v1/config/confirm", json.toString().toByteArray(Charsets.UTF_8))
+    }
+
+    /**
+     * `GET /api/v1/masks` — lists mask profiles on disk as
+     * `[{"id","file","size_bytes","modified","generated"},...]`
+     * (`management_api.rs`'s `MaskInfo`).
+     *
+     * CAVEAT verified against `mgmt_service.rs::classify_route`: this route
+     * is NOT in the tunnel's curated allowlist (only `management_api.rs`'s
+     * REST/Unix-socket surface exposes it) — over [AivpnJni.mgmtRequest] this
+     * call currently always 404s. Kept here as a correct, forward-compatible
+     * wrapper of the documented contract (a future server-side allowlist
+     * addition needs no Android change to start working); until then,
+     * [ServerSettingsActivity] falls back to the mask list the server
+     * already pushes to every session — [AivpnJni.getMaskCatalogJson] — the
+     * same source [MainActivity]'s mask picker uses.
+     */
+    suspend fun listMasks(): MgmtResult = request(METHOD_GET, "/api/v1/masks")
 
     private fun encode(id: String): String =
         java.net.URLEncoder.encode(id, "UTF-8")
