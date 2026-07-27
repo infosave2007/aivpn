@@ -23,7 +23,7 @@ client-dpi-gate = ["aivpn-common/client-dpi-gate"]
 ssh-install = ["aivpn-common/ssh-install"]
 
 [dependencies]
-aivpn-common = { path = "../aivpn-common", version = "*", features = ["client-upload", "qr"] }
+aivpn-common = { path = "../aivpn-common", version = "*", features = ["client-upload", "qr", "mobile-tunnel"] }
 
 jni       = "0.21"
 libc      = "0.2"

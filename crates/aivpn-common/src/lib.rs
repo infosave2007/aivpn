@@ -28,6 +28,9 @@ pub mod mimicry;
 #[cfg(feature = "client-upload")]
 pub mod upload_pipeline;
 
+#[cfg(feature = "mobile-tunnel")]
+pub mod mobile_tunnel;
+
 #[cfg(feature = "qr")]
 pub mod qr;
 

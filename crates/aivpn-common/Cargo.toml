@@ -41,6 +41,11 @@ portable-atomic = "1"
 # Async (optional — needed for upload_pipeline)
 tokio = { workspace = true, optional = true }
 
+# Logging (optional — only pulled in by the shared mobile tunnel core, which
+# was hoisted from the mobile FFI crates where `log` is the established
+# facade; the rest of aivpn-common uses `tracing`).
+log = { version = "0.4", optional = true }
+
 # Concurrency — optional, only pulled in by the inline ML-DPI gate (dpi-gate).
 dashmap = { workspace = true, optional = true }
 
@@ -76,6 +81,10 @@ tokio = { workspace = true, features = ["test-util"] }
 [features]
 default = []
 client-upload = ["tokio"]
+# Shared mobile VPN tunnel core (state/encryptor/io) hoisted from
+# aivpn-ios-core / aivpn-android-core. Unix-only in practice (libc, eventfd /
+# pipe stop signal); only the mobile FFI crates enable it.
+mobile-tunnel = ["client-upload", "dep:log"]
 # Inline ML-DPI "reads-as-tunnel" GBDT gate (R2 Phase D). Pure: dashmap + std,
 # no async. Shared by the server (`neural` feature) and the client self-gate.
 dpi-gate = ["dep:dashmap"]
