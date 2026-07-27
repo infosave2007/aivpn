@@ -28,7 +28,9 @@ use tokio_stream::StreamExt as _;
 use tower::util::ServiceExt;
 
 use crate::audit_log::{AuditActor, AuditLogger};
-use crate::client_db::{ClientDatabase, ClientStats, UpdateClientParams};
+use crate::client_db::{ClientDatabase, ClientRole};
+use crate::mgmt_service::{self, ClientView as ClientResponse, HeavySetting, MgmtCtx, MgmtError};
+use crate::pending_config::PendingConfigManager;
 
 // ── Config passed by main ────────────────────────────────────────────────────
 
@@ -80,6 +82,15 @@ pub struct ServeConfig {
     /// socket without running aivpn-server itself as that uid. `None` (the
     /// default) keeps the existing owner-only 0600 socket.
     pub socket_group: Option<u32>,
+    /// P1.5: the shared apply-with-rollback tracker for
+    /// `POST /api/v1/config/apply` / `/config/confirm`. Must be the SAME
+    /// `Arc<PendingConfigManager>` handed to `GatewayConfig` (via
+    /// `AivpnServer::pending_config()`, mirroring how `bootstrap_descriptors`
+    /// is shared) — otherwise a REST-initiated apply would never be swept
+    /// by the gateway's rollback timer. `None` disables both routes (they
+    /// 500 — see `mgmt_service::apply_heavy`'s doc comment), which only
+    /// happens if a caller builds `ServeConfig` without wiring this up.
+    pub pending_config: Option<std::sync::Arc<PendingConfigManager>>,
 }
 
 // ── Shared handler state ─────────────────────────────────────────────────────
@@ -102,40 +113,50 @@ struct ApiState {
     mask_verify_mode: aivpn_common::mask::MaskVerifyMode,
     #[cfg(feature = "metrics")]
     metrics: Option<Arc<crate::metrics::MetricsCollector>>,
+    pending_config: Option<Arc<PendingConfigManager>>,
 }
 
-// ── Wire types ───────────────────────────────────────────────────────────────
-
-#[derive(Serialize)]
-struct ClientResponse {
-    id: String,
-    name: String,
-    vpn_ip: String,
-    enabled: bool,
-    one_time: bool,
-    device_bound: bool,
-    created_at: DateTime<Utc>,
-    stats: ClientStats,
-    qos: Option<crate::qos::ClientQos>,
-    expires_at: Option<DateTime<Utc>>,
-}
-
-impl From<crate::client_db::ClientConfig> for ClientResponse {
-    fn from(c: crate::client_db::ClientConfig) -> Self {
-        Self {
-            device_bound: c.device_pubkey.is_some(),
-            id: c.id,
-            name: c.name,
-            vpn_ip: c.vpn_ip.to_string(),
-            enabled: c.enabled,
-            one_time: c.one_time,
-            created_at: c.created_at,
-            stats: c.stats,
-            qos: c.qos,
-            expires_at: c.expires_at,
+impl ApiState {
+    /// Build the shared `mgmt_service` context from this (already-owned,
+    /// per-request) state. Borrows from `self`, so callers that need to
+    /// cross an `.await`/`spawn_blocking` boundary should `move` the whole
+    /// `ApiState` into the blocking closure first and call this from
+    /// inside it (see the handlers below) rather than trying to smuggle a
+    /// borrowed `MgmtCtx` across the boundary itself.
+    fn mgmt_ctx(&self) -> MgmtCtx<'_> {
+        MgmtCtx {
+            db: &self.db,
+            server_pub_key: self.server_pub_key,
+            server_addr: self.server_addr.clone(),
+            server_signing_pubkey: self.server_signing_pubkey,
+            mask_operator_pubkey: self.mask_operator_pubkey,
+            audit: self.audit_log.as_ref(),
+            mask_dir: &self.mask_dir,
+            config_path: self.config_path.as_deref(),
+            audit_log_path: self.audit_log_path.as_deref(),
+            pending_config: self.pending_config.as_deref(),
         }
     }
 }
+
+/// Map a `MgmtError` from `add_client`/`connection_key`-style operations
+/// where the pre-refactor handler had exactly two outcomes: a specific
+/// `BadRequest` (400, name validation) and everything else as `Conflict`
+/// (409). Kept as a named helper (rather than inlined per handler) since
+/// two handlers (`add_client`) share this exact mapping.
+fn conflict_or_bad_request(e: &MgmtError) -> StatusCode {
+    match e {
+        MgmtError::BadRequest(_) => StatusCode::BAD_REQUEST,
+        MgmtError::NotFound => StatusCode::NOT_FOUND,
+        _ => StatusCode::CONFLICT,
+    }
+}
+
+// ── Wire types ───────────────────────────────────────────────────────────────
+//
+// `ClientResponse` is a type alias for `mgmt_service::ClientView` (the
+// PSK-stripped shape shared with the in-tunnel mgmt path) — same fields,
+// same order, so the JSON this API has always returned is unchanged.
 
 #[derive(Deserialize)]
 struct AddClientRequest {
@@ -143,6 +164,13 @@ struct AddClientRequest {
     #[serde(default)]
     one_time: bool,
     expires_at: Option<DateTime<Utc>>,
+    /// Elevate the newly created client's role. Setting `viewer`/`admin`
+    /// requires the client to already be device-bound (fresh clients never
+    /// are), so this normally fails with 409 — provision via one-time
+    /// enroll, then elevate the role afterwards with `PATCH`. Kept for
+    /// completeness / already-bound re-adds.
+    #[serde(default)]
+    role: ClientRole,
 }
 
 #[derive(Deserialize)]
@@ -156,6 +184,8 @@ struct PatchClientRequest {
     /// Pass `null` to clear expiry; omit to leave unchanged.
     #[serde(default, deserialize_with = "deserialize_opt_opt")]
     expires_at: Option<Option<DateTime<Utc>>>,
+    /// Role assignment (web/CLI-only path; the tunnel path is P1.2).
+    role: Option<ClientRole>,
 }
 
 /// Deserialises a field that can be absent (don't touch), null (clear), or a value (set).
@@ -203,9 +233,22 @@ struct KernelResponse {
 struct AuditLogQuery {
     #[serde(default = "default_audit_limit")]
     limit: usize,
+    /// `?verify=1` (also accepts `true`/`yes`) requests hash-chain
+    /// verification of the returned window (P1.4). Kept as `Option<String>`
+    /// rather than `bool` because `serde_urlencoded` (axum's `Query`
+    /// extractor) only accepts the literal strings `"true"`/`"false"` for a
+    /// native bool field — `?verify=1` would fail to deserialize and 400
+    /// the whole request instead of just defaulting to "no verify".
+    #[serde(default)]
+    verify: Option<String>,
 }
 fn default_audit_limit() -> usize {
     200
+}
+
+/// `AuditLogQuery::verify` truthy check, shared by the one call site below.
+fn wants_audit_verify(q: &AuditLogQuery) -> bool {
+    matches!(q.verify.as_deref(), Some("1") | Some("true") | Some("yes"))
 }
 
 #[derive(Serialize)]
@@ -234,23 +277,19 @@ fn audit(state: &ApiState, action: &str, target: &str, result: &str) {
 // ── Handlers ─────────────────────────────────────────────────────────────────
 
 async fn get_status(State(state): State<ApiState>) -> impl IntoResponse {
-    let clients = state.db.list_clients();
+    let started_at = state.started_at;
+    let v = mgmt_service::status(&state.mgmt_ctx());
     Json(StatusResponse {
         version: env!("CARGO_PKG_VERSION"),
-        uptime_secs: state.started_at.elapsed().as_secs(),
-        clients_total: clients.len(),
-        clients_enabled: clients.iter().filter(|c| c.enabled).count(),
-        kernel_module: kernel_loaded(),
+        uptime_secs: started_at.elapsed().as_secs(),
+        clients_total: v.clients_total,
+        clients_enabled: v.clients_enabled,
+        kernel_module: v.kernel_module,
     })
 }
 
 async fn list_clients(State(state): State<ApiState>) -> impl IntoResponse {
-    let clients: Vec<ClientResponse> = state
-        .db
-        .list_clients()
-        .into_iter()
-        .map(Into::into)
-        .collect();
+    let clients: Vec<ClientResponse> = mgmt_service::list_clients(&state.mgmt_ctx());
     Json(clients)
 }
 
@@ -258,45 +297,19 @@ async fn add_client(
     State(state): State<ApiState>,
     Json(body): Json<AddClientRequest>,
 ) -> impl IntoResponse {
-    if body.name.is_empty() || body.name.len() > 64 {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "name must be 1–64 characters"})),
-        )
-            .into_response();
-    }
-    let db = state.db.clone();
-    let name = body.name.clone();
-    let one_time = body.one_time;
-    let expires_at = body.expires_at;
-    let result = tokio::task::spawn_blocking(move || {
-        let client = if one_time {
-            db.add_client_one_time(&name)?
-        } else {
-            db.add_client(&name)?
-        };
-        if expires_at.is_some() {
-            db.update_client(
-                &client.id,
-                UpdateClientParams {
-                    expires_at: Some(expires_at),
-                    ..Default::default()
-                },
-            )
-        } else {
-            Ok(client)
-        }
-    })
-    .await;
+    let args = mgmt_service::AddClientArgs {
+        name: body.name.clone(),
+        one_time: body.one_time,
+        expires_at: body.expires_at,
+        role: body.role,
+        qos: None,
+    };
+    let result =
+        tokio::task::spawn_blocking(move || mgmt_service::add_client(&state.mgmt_ctx(), args))
+            .await;
     match result {
-        Ok(Ok(c)) => {
-            audit(&state, "ClientAdd", &format!("{} ({})", c.name, c.id), "ok");
-            (StatusCode::CREATED, Json(ClientResponse::from(c))).into_response()
-        }
-        Ok(Err(e)) => {
-            audit(&state, "ClientAdd", &body.name, &format!("failed: {}", e));
-            (StatusCode::CONFLICT, err(e)).into_response()
-        }
+        Ok(Ok(c)) => (StatusCode::CREATED, Json(c)).into_response(),
+        Ok(Err(e)) => (conflict_or_bad_request(&e), err(e)).into_response(),
         Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, err("internal error")).into_response(),
     }
 }
@@ -317,40 +330,30 @@ async fn patch_client(
     Path(id): Path<String>,
     Json(body): Json<PatchClientRequest>,
 ) -> impl IntoResponse {
-    if let Some(ref name) = body.name {
-        if name.is_empty() || name.len() > 64 {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": "name must be 1–64 characters"})),
-            )
-                .into_response();
-        }
-    }
-    let db = state.db.clone();
-    let params = UpdateClientParams {
+    let args = mgmt_service::UpdateClientArgs {
         name: body.name,
         enabled: body.enabled,
         one_time: body.one_time,
         qos: body.qos,
         expires_at: body.expires_at,
+        role: body.role,
     };
-    let id_for_log = id.clone();
-    match tokio::task::spawn_blocking(move || db.update_client(&id, params)).await {
-        Ok(Ok(c)) => {
-            audit(&state, "ClientPatch", &id_for_log, "ok");
-            Json(ClientResponse::from(c)).into_response()
-        }
+    let result = tokio::task::spawn_blocking(move || {
+        mgmt_service::update_client(&state.mgmt_ctx(), &id, args)
+    })
+    .await;
+    match result {
+        Ok(Ok(c)) => Json(c).into_response(),
         Ok(Err(e)) => {
-            audit(
-                &state,
-                "ClientPatch",
-                &id_for_log,
-                &format!("failed: {}", e),
-            );
-            let status = if e.to_string().contains("not found") {
-                StatusCode::NOT_FOUND
-            } else {
-                StatusCode::CONFLICT
+            // `Forbidden` (role change without a bound device) is mapped to
+            // the same `409 Conflict` every other non-not-found
+            // `update_client` failure got before this refactor — preserves
+            // the REST API's exact pre-refactor status codes; the P1.2
+            // tunnel dispatch maps `Forbidden` to its own 403 instead.
+            let status = match e {
+                MgmtError::NotFound => StatusCode::NOT_FOUND,
+                MgmtError::BadRequest(_) => StatusCode::BAD_REQUEST,
+                _ => StatusCode::CONFLICT,
             };
             (status, err(e)).into_response()
         }
@@ -359,43 +362,49 @@ async fn patch_client(
 }
 
 async fn remove_client(State(state): State<ApiState>, Path(id): Path<String>) -> impl IntoResponse {
-    let db = state.db.clone();
-    let id_for_log = id.clone();
-    match tokio::task::spawn_blocking(move || db.remove_client(&id)).await {
-        Ok(Ok(())) => {
-            audit(&state, "ClientRemove", &id_for_log, "ok");
-            StatusCode::NO_CONTENT.into_response()
-        }
-        Ok(Err(e)) => {
-            audit(
-                &state,
-                "ClientRemove",
-                &id_for_log,
-                &format!("failed: {}", e),
-            );
-            (StatusCode::NOT_FOUND, err(e)).into_response()
-        }
+    let result =
+        tokio::task::spawn_blocking(move || mgmt_service::remove_client(&state.mgmt_ctx(), &id))
+            .await;
+    match result {
+        Ok(Ok(())) => StatusCode::NO_CONTENT.into_response(),
+        Ok(Err(e)) => (StatusCode::NOT_FOUND, err(e)).into_response(),
         Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, err("internal error")).into_response(),
     }
 }
 
 async fn reset_device(State(state): State<ApiState>, Path(id): Path<String>) -> impl IntoResponse {
-    let db = state.db.clone();
-    let id_for_log = id.clone();
-    match tokio::task::spawn_blocking(move || db.reset_device_binding(&id)).await {
-        Ok(Ok(())) => {
-            audit(&state, "DeviceReset", &id_for_log, "ok");
-            Json(serde_json::json!({ "ok": true })).into_response()
-        }
-        Ok(Err(e)) => {
-            audit(
-                &state,
-                "DeviceReset",
-                &id_for_log,
-                &format!("failed: {}", e),
-            );
-            (StatusCode::NOT_FOUND, err(e)).into_response()
-        }
+    let result =
+        tokio::task::spawn_blocking(move || mgmt_service::reset_device(&state.mgmt_ctx(), &id))
+            .await;
+    match result {
+        Ok(Ok(())) => Json(serde_json::json!({ "ok": true })).into_response(),
+        Ok(Err(e)) => (StatusCode::NOT_FOUND, err(e)).into_response(),
+        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, err("internal error")).into_response(),
+    }
+}
+
+/// P1.3 admin revoke — `POST /api/v1/clients/:id/revoke`. Tombstones via
+/// `mgmt_service::revoke` (audited as `"ClientRevoke"`, distinct from the
+/// plain `DELETE`'s `"ClientRemove"`).
+///
+/// **Disconnect timing note:** unlike the in-tunnel `MgmtRequest` revoke
+/// path (`gateway.rs`), this REST handler does NOT immediately
+/// force-disconnect a live session for the client — `ApiState` carries no
+/// `Gateway`/`SessionManager`/`PoolDialer` handle (the REST management API
+/// is constructed independently of the gateway in `main.rs`). A live
+/// session is instead torn down by the gateway's existing periodic
+/// revocation sweep (~5s cadence), which now also sends
+/// `Shutdown{reason:4}` before dropping the session (P1.3), and peers
+/// converge on the tombstone via the next scheduled pool anti-entropy
+/// beacon rather than an immediate priority one. See `mgmt_service::revoke`'s
+/// doc comment for the full split of responsibility between this REST path
+/// and the in-tunnel path.
+async fn revoke_client(State(state): State<ApiState>, Path(id): Path<String>) -> impl IntoResponse {
+    let result =
+        tokio::task::spawn_blocking(move || mgmt_service::revoke(&state.mgmt_ctx(), &id)).await;
+    match result {
+        Ok(Ok(())) => StatusCode::NO_CONTENT.into_response(),
+        Ok(Err(e)) => (StatusCode::NOT_FOUND, err(e)).into_response(),
         Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, err("internal error")).into_response(),
     }
 }
@@ -412,61 +421,18 @@ async fn get_connection_key(
     State(state): State<ApiState>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    let (pub_key, server_addr) = match (&state.server_pub_key, &state.server_addr) {
-        (Some(k), Some(a)) => (k, a.as_str()),
-        _ => {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                err("--server-ip or --key-file not configured; cannot build connection key"),
-            )
-                .into_response()
+    match mgmt_service::connection_key(&state.mgmt_ctx(), &id) {
+        Ok(key) => Json(serde_json::json!({ "connection_key": key })).into_response(),
+        Err(MgmtError::Unavailable(msg)) => {
+            (StatusCode::SERVICE_UNAVAILABLE, err(msg)).into_response()
         }
-    };
-    let client = match state.db.find_by_id(&id) {
-        Some(c) => c,
-        None => {
-            return (
-                StatusCode::NOT_FOUND,
-                err(format!("Client '{}' not found", id)),
-            )
-                .into_response()
-        }
-    };
-    let client_net_cfg = match state.db.network_config().client_config(client.vpn_ip) {
-        Ok(cfg) => cfg,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, err(e)).into_response(),
-    };
-    use base64::Engine;
-    let psk_b64 = base64::engine::general_purpose::STANDARD.encode(&client.psk);
-    let pub_b64 = base64::engine::general_purpose::STANDARD.encode(pub_key);
-    let mut json = serde_json::json!({
-        "s": server_addr, "k": pub_b64, "p": psk_b64,
-        "i": client_net_cfg.client_ip, "n": client_net_cfg,
-    });
-    // Parity with the CLI's `build_connection_key`: embed the server's
-    // ed25519 signing pubkey (`sk`) and the operator mask-verifying pubkey
-    // (`mop`) so panel-provisioned clients can verify signed server messages
-    // and pushed masks out of the box, exactly like CLI-provisioned ones.
-    if let Some(sk) = &state.server_signing_pubkey {
-        json["sk"] =
-            serde_json::Value::String(base64::engine::general_purpose::STANDARD.encode(sk));
+        Err(MgmtError::NotFound) => (
+            StatusCode::NOT_FOUND,
+            err(format!("Client '{}' not found", id)),
+        )
+            .into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, err(e)).into_response(),
     }
-    if let Some(mop) = &state.mask_operator_pubkey {
-        json["mop"] =
-            serde_json::Value::String(base64::engine::general_purpose::STANDARD.encode(mop));
-    }
-    let json_str = match serde_json::to_string(&json) {
-        Ok(s) => s,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                err(format!("connection key serialization error: {}", e)),
-            )
-                .into_response()
-        }
-    };
-    let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(json_str.as_bytes());
-    Json(serde_json::json!({ "connection_key": format!("aivpn://{}", encoded) })).into_response()
 }
 
 // ── Config ───────────────────────────────────────────────────────────────────
@@ -852,6 +818,93 @@ async fn set_active_mask(
     }
 }
 
+// ── P1.5: apply-with-rollback for heavy config ─────────────────────────────
+//
+// See `mgmt_service.rs`'s "Apply-with-rollback for heavy config" section
+// for the full design + v1 scope boundary. These two handlers are the REST
+// (Unix-socket) counterpart of the in-tunnel `POST /api/v1/config/apply` /
+// `/config/confirm` routes (`mgmt_service::dispatch`'s `ConfigApply`/
+// `ConfigConfirm` arms) — both delegate to the SAME `mgmt_service::
+// apply_heavy`/`confirm_config` functions and the SAME shared
+// `PendingConfigManager` (`ApiState::pending_config`), so an apply started
+// from the web panel can be confirmed from the tunnel (or vice versa) and
+// is swept by the same gateway rollback timer either way.
+
+#[derive(Deserialize)]
+struct ApplyConfigRequest {
+    client: String,
+    mask: String,
+}
+
+#[derive(Serialize)]
+struct ApplyConfigResponse {
+    token: String,
+    applied: bool,
+}
+
+async fn apply_config(
+    State(state): State<ApiState>,
+    Json(body): Json<ApplyConfigRequest>,
+) -> impl IntoResponse {
+    let result = tokio::task::spawn_blocking(move || {
+        let ctx = state.mgmt_ctx();
+        mgmt_service::apply_heavy(
+            &ctx,
+            HeavySetting::ActiveMask {
+                client: body.client,
+                mask: body.mask,
+            },
+            Instant::now(),
+        )
+    })
+    .await;
+    match result {
+        Ok(Ok(resp)) => Json(ApplyConfigResponse {
+            token: resp.token,
+            applied: resp.applied,
+        })
+        .into_response(),
+        Ok(Err(e)) => mgmt_error_response(&e),
+        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, err("internal error")).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct ConfirmConfigRequest {
+    token: String,
+}
+
+async fn confirm_config(
+    State(state): State<ApiState>,
+    Json(body): Json<ConfirmConfigRequest>,
+) -> impl IntoResponse {
+    let result = tokio::task::spawn_blocking(move || {
+        mgmt_service::confirm_config(&state.mgmt_ctx(), &body.token)
+    })
+    .await;
+    match result {
+        Ok(Ok(())) => StatusCode::NO_CONTENT.into_response(),
+        Ok(Err(e)) => mgmt_error_response(&e),
+        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, err("internal error")).into_response(),
+    }
+}
+
+/// Map a `MgmtError` to a REST status + body for the apply/confirm
+/// handlers — a superset of `conflict_or_bad_request` (also needs
+/// `Forbidden`/`Unavailable`/`Internal`, which `apply_heavy`/
+/// `confirm_config` can both return).
+fn mgmt_error_response(e: &MgmtError) -> axum::response::Response {
+    let status = match e {
+        MgmtError::NotFound => StatusCode::NOT_FOUND,
+        MgmtError::Conflict(_) => StatusCode::CONFLICT,
+        MgmtError::BadRequest(_) => StatusCode::BAD_REQUEST,
+        MgmtError::Forbidden => StatusCode::FORBIDDEN,
+        MgmtError::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
+        MgmtError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    (status, err(e.to_string())).into_response()
+}
+
 // ── Backup ───────────────────────────────────────────────────────────────────
 
 async fn export_backup(State(state): State<ApiState>) -> impl IntoResponse {
@@ -1033,49 +1086,30 @@ async fn get_audit_log(
     State(state): State<ApiState>,
     Query(q): Query<AuditLogQuery>,
 ) -> impl IntoResponse {
-    let log_path = match &state.audit_log_path {
-        Some(p) => p.clone(),
-        None => return (StatusCode::NOT_FOUND, err("audit log not configured")).into_response(),
-    };
     let limit = q.limit.min(1000);
-    let result = tokio::task::spawn_blocking(
-        move || -> Result<Vec<crate::audit_log::AuditEntry>, std::io::Error> {
-            use std::io::{Read as _, Seek, SeekFrom};
-            // Bounded tail read: the log grows without rotation guarantees,
-            // so never buffer the whole file — read at most enough bytes from
-            // the end to cover `limit` entries (~1 KiB/entry is generous; the
-            // typical entry is ~150 bytes), capped at 4 MiB.
-            let mut file = std::fs::File::open(&log_path)?;
-            let file_len = file.metadata()?.len();
-            let max_bytes = (limit as u64)
-                .saturating_mul(1024)
-                .clamp(64 * 1024, 4 * 1024 * 1024);
-            let start = file_len.saturating_sub(max_bytes);
-            file.seek(SeekFrom::Start(start))?;
-            let mut buf = Vec::with_capacity((file_len - start) as usize);
-            file.read_to_end(&mut buf)?;
-            let text = String::from_utf8_lossy(&buf);
-            let mut lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
-            // If we started mid-file, the first line is almost certainly a
-            // truncated entry — drop it (it would fail to parse anyway).
-            if start > 0 && !lines.is_empty() {
-                lines.remove(0);
-            }
-            let entries: Vec<crate::audit_log::AuditEntry> = lines
-                .iter()
-                .rev()
-                .take(limit)
-                .rev()
-                .filter_map(|l| serde_json::from_str(l).ok())
-                .collect();
-            Ok(entries)
-        },
-    )
-    .await;
+
+    // `?verify=1` returns `{ entries, verified, broken_at }` (P1.4); the
+    // default (no `verify` param) KEEPS the pre-existing plain-array shape
+    // for backward compat with any existing caller of this endpoint.
+    if wants_audit_verify(&q) {
+        let result = tokio::task::spawn_blocking(move || {
+            mgmt_service::audit_verify(&state.mgmt_ctx(), limit)
+        })
+        .await;
+        return match result {
+            Ok(Ok(view)) => Json(view).into_response(),
+            Ok(Err(e)) => (StatusCode::NOT_FOUND, err(e)).into_response(),
+            Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, err("internal error")).into_response(),
+        };
+    }
+
+    let result =
+        tokio::task::spawn_blocking(move || mgmt_service::audit_tail(&state.mgmt_ctx(), limit))
+            .await;
 
     match result {
         Ok(Ok(entries)) => Json(entries).into_response(),
-        Ok(Err(e)) => (StatusCode::NOT_FOUND, err(format!("audit log: {}", e))).into_response(),
+        Ok(Err(e)) => (StatusCode::NOT_FOUND, err(e)).into_response(),
         Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, err("internal error")).into_response(),
     }
 }
@@ -1229,7 +1263,10 @@ fn router(state: ApiState) -> Router {
             get(get_connection_key),
         )
         .route("/api/v1/clients/:id/reset-device", post(reset_device))
+        .route("/api/v1/clients/:id/revoke", post(revoke_client))
         .route("/api/v1/config", get(get_config).put(put_config))
+        .route("/api/v1/config/apply", post(apply_config))
+        .route("/api/v1/config/confirm", post(confirm_config))
         .route("/api/v1/masks", get(list_masks).post(upload_mask))
         .route("/api/v1/masks/:name", axum::routing::delete(delete_mask))
         .route("/api/v1/masks/active", post(set_active_mask))
@@ -1397,6 +1434,7 @@ pub async fn serve(cfg: ServeConfig) {
         mask_verify_mode: cfg.mask_verify_mode,
         #[cfg(feature = "metrics")]
         metrics: cfg.metrics,
+        pending_config: cfg.pending_config,
     };
     let app = router(state);
 

@@ -270,6 +270,14 @@ pub struct Session {
     /// Starts at 0 so the catalog is sent once shortly after connect.
     pub mask_catalog_version_sent: u64,
 
+    /// True once a `ControlPayload::Capabilities` announcement (this
+    /// session's server-assigned role) has been pushed to the client.
+    /// Mirrors `mask_catalog_version_sent`'s send-once gate, but a plain
+    /// bool suffices — role doesn't change mid-session the way the mask
+    /// catalog does; a role change takes effect on the client's next
+    /// reconnect, when a fresh `Session` (and a fresh `false`) is created.
+    pub capabilities_sent: bool,
+
     /// Signature of the session state last pushed to the kernel accelerator
     /// (c2s key + wire offsets). 0 = never installed. When the live state
     /// diverges (mask switch, key rotation) the kernel session is re-installed
@@ -443,6 +451,7 @@ impl Session {
             fec_xor_len: 0,
             fec_pending_seq: 0,
             mask_catalog_version_sent: 0,
+            capabilities_sent: false,
             kernel_install_sig: 0,
             kernel_dl_window: 0,
             tag_window_tw: 0,

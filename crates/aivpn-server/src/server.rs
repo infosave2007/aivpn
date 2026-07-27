@@ -62,6 +62,15 @@ pub struct ServerArgs {
     #[arg(long, value_name = "NAME_OR_ID")]
     pub reset_device: Option<String>,
 
+    /// Management role to assign a client created with `--add-client`
+    /// (one of: user, viewer, admin; default: user). Elevating to
+    /// `viewer`/`admin` requires the client to already be device-bound,
+    /// so this only applies to already-bound clients re-added by name —
+    /// for a fresh client, add it first and elevate the role afterwards
+    /// once its device has enrolled.
+    #[arg(long, value_name = "ROLE")]
+    pub role: Option<String>,
+
     /// Public IP of this server (embedded into connection keys).
     /// Required when using --add-client or --show-client to generate connection keys.
     #[arg(long, env = "AIVPN_SERVER_IP")]
@@ -308,6 +317,16 @@ impl AivpnServer {
         self.gateway.bootstrap_descriptors()
     }
 
+    /// Return a shared handle to the P1.5 apply-with-rollback tracker, kept
+    /// swept by the gateway's periodic cleanup task — for the management
+    /// API's `POST /api/v1/config/apply` / `/config/confirm` handlers to
+    /// share the SAME `PendingConfigManager` the tunnel path uses. Mirrors
+    /// `bootstrap_descriptors()`: must be called before `run()` consumes
+    /// the gateway.
+    pub fn pending_config(&self) -> Arc<crate::pending_config::PendingConfigManager> {
+        self.gateway.pending_config()
+    }
+
     /// Set multi-hop chain forwarder.  Must be called before `run()`.
     pub fn set_chain_forwarder(&mut self, cf: Arc<crate::chain_forwarder::ChainForwarder>) {
         self.gateway.set_chain_forwarder(cf);
@@ -322,6 +341,14 @@ impl AivpnServer {
         exit_addr: String,
     ) {
         self.gateway.set_masked_exit(dialer, exit_addr);
+    }
+
+    /// P1.3 (priority pool beacon): install a `PoolDialer` handle for the
+    /// admin-revoke immediate beacon, independent of whether this node
+    /// dials an exit. See `Gateway::set_pool_dialer`. Must be called
+    /// before `run()`.
+    pub fn set_pool_dialer(&mut self, dialer: Arc<crate::pool_dialer::PoolDialer>) {
+        self.gateway.set_pool_dialer(dialer);
     }
 
     /// PHASE 4 (reverse chain-forward): hand out a clone of the sender an

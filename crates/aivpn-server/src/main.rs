@@ -3,10 +3,10 @@
 use aivpn_common::crypto;
 use aivpn_common::event_log::{EventBus, EventSinkConfig};
 use aivpn_common::mask::{IATDistType, MaskProfile, SizeDistType};
-use aivpn_common::network_config::{netmask_to_prefix_len, ClientNetworkConfig, VpnNetworkConfig};
+use aivpn_common::network_config::{netmask_to_prefix_len, VpnNetworkConfig};
 use aivpn_server::audit_log::AuditLogger;
 use aivpn_server::backup::{export_server, import_server, ExportOptions};
-use aivpn_server::client_db::UpdateClientParams;
+use aivpn_server::client_db::{ClientRole, UpdateClientParams};
 #[cfg(feature = "dns")]
 use aivpn_server::dns_proxy::DnsProxyConfig;
 use aivpn_server::gateway::GatewayConfig;
@@ -339,7 +339,11 @@ async fn main() {
     } else {
         None
     };
-    #[cfg(all(feature = "management-api", unix))]
+    // Not feature/unix-gated (unlike the rest of the `mgmt_*` locals below):
+    // both are also consumed by `GatewayConfig::mgmt_server_addr` /
+    // `GatewayConfig::audit_log_path` further down, which feed the in-tunnel
+    // `MgmtRequest` dispatch path (`mgmt_service` is unconditional — only
+    // the Unix-socket REST `management_api` is behind the feature gate).
     let mgmt_server_addr = args.server_ip.as_ref().map(|ip| {
         if ip.parse::<SocketAddr>().is_ok() {
             ip.clone()
@@ -357,7 +361,6 @@ async fn main() {
     let mgmt_clients_db_path = Some(std::path::PathBuf::from(&args.clients_db));
     #[cfg(all(feature = "management-api", unix))]
     let mgmt_mask_dir = resolve_mask_dir(&args, file_config.as_ref());
-    #[cfg(all(feature = "management-api", unix))]
     let mgmt_audit_log_path = Some(std::path::PathBuf::from(&args.audit_log));
     #[cfg(all(feature = "management-api", unix))]
     let mgmt_mask_operator_pubkey = resolve_mask_operator_pubkey(&args, file_config.as_ref());
@@ -523,6 +526,12 @@ async fn main() {
         // `None`, matching the gateway's pre-existing byte-for-byte behavior.
         pool_server_keypair: pool_masked_sync_key.map(|k| crypto::pool_server_keypair(&k)),
         pool_client_psk: pool_masked_sync_key.map(|k| crypto::pool_client_psk(&k)),
+        // P1.2b: same values threaded into the REST API's `ServeConfig`
+        // below (`server_addr`/`audit_log_path`) — cloned here since that
+        // `#[cfg(all(feature = "management-api", unix))]` block still moves
+        // its own copies out of `mgmt_server_addr`/`mgmt_audit_log_path`.
+        mgmt_server_addr: mgmt_server_addr.clone(),
+        audit_log_path: mgmt_audit_log_path.clone(),
     };
 
     // Create and run server
@@ -536,6 +545,10 @@ async fn main() {
             #[cfg(all(feature = "management-api", unix))]
             {
                 let bootstrap_descriptors = Some(server.bootstrap_descriptors());
+                // P1.5: share the SAME PendingConfigManager the gateway's
+                // cleanup task sweeps — see `AivpnServer::pending_config`'s
+                // doc comment.
+                let mgmt_pending_config = Some(server.pending_config());
                 #[cfg(feature = "metrics")]
                 let mgmt_metrics = Some(server.metrics());
                 if mgmt_socket.is_some() {
@@ -560,6 +573,7 @@ async fn main() {
                                 #[cfg(feature = "metrics")]
                                 metrics: mgmt_metrics,
                                 socket_group: mgmt_socket_group,
+                                pending_config: mgmt_pending_config,
                             },
                         )
                         .await;
@@ -721,6 +735,16 @@ async fn main() {
                         // the site-to-site selection below relies on this,
                         // not on the config-only `transport_is_masked()`.
                         masked_dialer_active = true;
+
+                        // P1.3 (priority pool beacon): give the gateway a
+                        // `PoolDialer` handle regardless of whether this
+                        // node also dials an exit — `set_masked_exit` below
+                        // only wires it for the exit-dialing case. Lets the
+                        // admin "revoke" mgmt route trigger an immediate
+                        // beacon via `Gateway::trigger_priority_pool_beacon`
+                        // on every masked pool-sync node, not just exit
+                        // nodes.
+                        server.set_pool_dialer(dialer.clone());
 
                         // PHASE 3: wire the masked exit route BEFORE handing
                         // the dialer's Arc off to `start` (which consumes
@@ -1248,43 +1272,47 @@ fn handle_sign_mask_dir(dir: &str, args: &ServerArgs) {
 }
 
 /// Build a connection key: aivpn://BASE64({"s":"host:port","k":"...","p":"...","i":"...","n":{...}})
+///
+/// Thin CLI wrapper: resolves CLI/config-file-based inputs (normalized
+/// server address via `build_connection_server_addr`, the server's ed25519
+/// signing pubkey, the operator mask-verifying pubkey, the mask dir) and
+/// delegates the actual `aivpn://` JSON encoding to the single shared
+/// implementation, `aivpn_server::mgmt_service::connection_key` — the same
+/// function the REST API's `GET .../connection-key` handler calls. This
+/// used to duplicate that handler's JSON-building logic independently;
+/// now there is exactly one implementation.
 fn build_connection_key(
+    db: &ClientDatabase,
     args: &ServerArgs,
+    client_id: &str,
     server_ip: &str,
-    server_pub_b64: &str,
-    psk_b64: &str,
-    client_network_config: ClientNetworkConfig,
-) -> String {
+    server_pub_key: [u8; 32],
+) -> std::result::Result<String, aivpn_server::mgmt_service::MgmtError> {
     use base64::Engine;
     let server_addr = build_connection_server_addr(args, server_ip);
-    let mut json = serde_json::json!({
-        "s": server_addr,
-        "k": server_pub_b64,
-        "p": psk_b64,
-        "i": client_network_config.client_ip,
-        "n": client_network_config,
+    let config_path = resolve_config_path(args);
+    let file_config = load_server_file_config(config_path.as_deref());
+    let server_signing_pubkey = load_server_signing_public_key(args).and_then(|b64| {
+        base64::engine::general_purpose::STANDARD
+            .decode(b64)
+            .ok()
+            .and_then(|v| <[u8; 32]>::try_from(v).ok())
     });
-    // Embed the server's ed25519 signing (verifying) public key so the client can
-    // authenticate bootstrap descriptors / ServerHello / MaskUpdate out of the box
-    // (previously verification was unreachable without a manual --server-signing-key).
-    if let Some(sk) = load_server_signing_public_key(args) {
-        json["sk"] = serde_json::Value::String(sk);
-    }
-    // R2 Phase B: embed the operator mask-verifying public key (`mop`) so
-    // clients can verify the embedded MaskProfile.signature of pushed masks
-    // out of the box (default client mode is `warn` — log-only).
-    {
-        use base64::Engine as _;
-        let config_path = resolve_config_path(args);
-        let file_config = load_server_file_config(config_path.as_deref());
-        if let Some(mop) = resolve_mask_operator_pubkey(args, file_config.as_ref()) {
-            json["mop"] =
-                serde_json::Value::String(base64::engine::general_purpose::STANDARD.encode(mop));
-        }
-    }
-    let json_bytes = serde_json::to_string(&json).unwrap();
-    let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(json_bytes.as_bytes());
-    format!("aivpn://{}", encoded)
+    let mask_operator_pubkey = resolve_mask_operator_pubkey(args, file_config.as_ref());
+    let mask_dir = resolve_mask_dir(args, file_config.as_ref());
+    let ctx = aivpn_server::mgmt_service::MgmtCtx {
+        db,
+        server_pub_key: Some(server_pub_key),
+        server_addr: Some(server_addr),
+        server_signing_pubkey,
+        mask_operator_pubkey,
+        audit: None,
+        mask_dir: &mask_dir,
+        config_path: config_path.as_deref().map(std::path::Path::new),
+        audit_log_path: None,
+        pending_config: None,
+    };
+    aivpn_server::mgmt_service::connection_key(&ctx, client_id)
 }
 
 fn build_connection_server_addr(args: &ServerArgs, server_ip: &str) -> String {
@@ -1304,32 +1332,62 @@ fn build_connection_server_addr(args: &ServerArgs, server_ip: &str) -> String {
     format!("{}:{}", server_ip, port)
 }
 
+/// Parses the `--role` CLI value (`user`/`viewer`/`admin`, case-insensitive).
+/// Returns `None` for anything else so the caller can warn and skip.
+fn parse_client_role(s: &str) -> Option<ClientRole> {
+    match s.to_ascii_lowercase().as_str() {
+        "user" => Some(ClientRole::User),
+        "viewer" => Some(ClientRole::Viewer),
+        "admin" => Some(ClientRole::Admin),
+        _ => None,
+    }
+}
+
 fn handle_add_client(db: &ClientDatabase, name: &str, args: &ServerArgs) {
     match db.add_client(name) {
         Ok(client) => {
-            use base64::Engine;
-            let psk_b64 = base64::engine::general_purpose::STANDARD.encode(&client.psk);
             let server_pub = load_server_public_key(args);
-            let client_network_config = db.network_config().client_config(client.vpn_ip).unwrap();
 
             println!("✅ Client '{}' created!", name);
             println!("   ID:     {}", client.id);
             println!("   VPN IP: {}", client.vpn_ip);
             println!();
 
+            if let Some(ref role_str) = args.role {
+                match parse_client_role(role_str) {
+                    Some(role) if role != ClientRole::User => {
+                        match db.update_client(
+                            &client.id,
+                            UpdateClientParams {
+                                role: Some(role),
+                                ..Default::default()
+                            },
+                        ) {
+                            Ok(_) => println!("   Role:   {:?}", role),
+                            Err(e) => eprintln!(
+                                "⚠  Could not set role to {:?} (client has no bound device yet): {}",
+                                role, e
+                            ),
+                        }
+                    }
+                    Some(_) => {}
+                    None => eprintln!(
+                        "⚠  Invalid --role '{}' (expected user|viewer|admin), leaving role as 'user'",
+                        role_str
+                    ),
+                }
+            }
+
             if let (Some(pub_key), Some(ref server_ip)) = (server_pub, &args.server_ip) {
-                let pub_b64 = base64::engine::general_purpose::STANDARD.encode(&pub_key);
-                let conn_key = build_connection_key(
-                    args,
-                    server_ip,
-                    &pub_b64,
-                    &psk_b64,
-                    client_network_config,
-                );
-                println!("══ Connection Key (paste into app) ══");
-                println!();
-                println!("{}", conn_key);
-                println!();
+                match build_connection_key(db, args, &client.id, server_ip, pub_key) {
+                    Ok(conn_key) => {
+                        println!("══ Connection Key (paste into app) ══");
+                        println!();
+                        println!("{}", conn_key);
+                        println!();
+                    }
+                    Err(e) => eprintln!("⚠  Could not generate connection key: {}", e),
+                }
             } else {
                 if server_pub.is_none() {
                     eprintln!("⚠  --key-file not provided, cannot generate connection key");
@@ -1350,10 +1408,7 @@ fn handle_add_client(db: &ClientDatabase, name: &str, args: &ServerArgs) {
 fn handle_add_client_one_time(db: &ClientDatabase, name: &str, args: &ServerArgs) {
     match db.add_client_one_time(name) {
         Ok(client) => {
-            use base64::Engine;
-            let psk_b64 = base64::engine::general_purpose::STANDARD.encode(&client.psk);
             let server_pub = load_server_public_key(args);
-            let client_network_config = db.network_config().client_config(client.vpn_ip).unwrap();
 
             println!("✅ One-time enrollment client '{}' created!", name);
             println!("   ID:     {}", client.id);
@@ -1362,18 +1417,15 @@ fn handle_add_client_one_time(db: &ClientDatabase, name: &str, args: &ServerArgs
             println!();
 
             if let (Some(pub_key), Some(ref server_ip)) = (server_pub, &args.server_ip) {
-                let pub_b64 = base64::engine::general_purpose::STANDARD.encode(&pub_key);
-                let conn_key = build_connection_key(
-                    args,
-                    server_ip,
-                    &pub_b64,
-                    &psk_b64,
-                    client_network_config,
-                );
-                println!("══ Connection Key (single-use — share with one device only) ══");
-                println!();
-                println!("{}", conn_key);
-                println!();
+                match build_connection_key(db, args, &client.id, server_ip, pub_key) {
+                    Ok(conn_key) => {
+                        println!("══ Connection Key (single-use — share with one device only) ══");
+                        println!();
+                        println!("{}", conn_key);
+                        println!();
+                    }
+                    Err(e) => eprintln!("⚠  Could not generate connection key: {}", e),
+                }
             } else {
                 if server_pub.is_none() {
                     eprintln!("⚠  --key-file not provided, cannot generate connection key");
@@ -1520,10 +1572,7 @@ fn handle_show_client(db: &ClientDatabase, id: &str, args: &ServerArgs) {
 
     match client {
         Some(client) => {
-            use base64::Engine;
-            let psk_b64 = base64::engine::general_purpose::STANDARD.encode(&client.psk);
             let server_pub = load_server_public_key(args);
-            let client_network_config = db.network_config().client_config(client.vpn_ip);
 
             println!("Client: {} ({})", client.name, client.id);
             println!("  VPN IP:      {}", client.vpn_ip);
@@ -1548,24 +1597,16 @@ fn handle_show_client(db: &ClientDatabase, id: &str, args: &ServerArgs) {
             );
 
             if let (Some(pub_key), Some(ref server_ip)) = (server_pub, &args.server_ip) {
-                match client_network_config {
-                    Ok(client_network_config) => {
-                        let pub_b64 = base64::engine::general_purpose::STANDARD.encode(&pub_key);
-                        let conn_key = build_connection_key(
-                            args,
-                            server_ip,
-                            &pub_b64,
-                            &psk_b64,
-                            client_network_config,
-                        );
+                match build_connection_key(db, args, &client.id, server_ip, pub_key) {
+                    Ok(conn_key) => {
                         println!();
                         println!("══ Connection Key ══");
                         println!();
                         println!("{}", conn_key);
                         println!();
                     }
-                    Err(err) => {
-                        eprintln!("⚠  Cannot generate connection key for this client under the current VPN subnet: {}", err);
+                    Err(e) => {
+                        eprintln!("⚠  Cannot generate connection key for this client: {}", e);
                         eprintln!("   Client VPN IP: {}", client.vpn_ip);
                         eprintln!(
                             "   Current server subnet: {}",
@@ -2445,6 +2486,7 @@ mod tests {
             export_bootstrap_descriptor: false,
             bootstrap_output: None,
             shaping_level: None,
+            role: None,
         }
     }
 
@@ -2469,21 +2511,19 @@ mod tests {
     #[test]
     fn build_connection_key_embeds_normalized_server_addr() {
         let args = test_args("0.0.0.0:443");
-        let key = build_connection_key(
-            &args,
-            "203.0.113.10:8443",
-            "server-key",
-            "psk",
-            ClientNetworkConfig {
-                client_ip: Ipv4Addr::new(10, 0, 0, 2),
-                server_vpn_ip: Ipv4Addr::new(10, 0, 0, 1),
-                prefix_len: 24,
-                mtu: 1346,
-                mdh_len: 20,
-                keepalive_secs: None,
-                ipv6_address: None,
-            },
-        );
+        let dir = tempfile::tempdir().unwrap();
+        let network_config = VpnNetworkConfig {
+            server_vpn_ip: Ipv4Addr::new(10, 0, 0, 1),
+            prefix_len: 24,
+            mtu: 1346,
+            keepalive_secs: None,
+            ..Default::default()
+        };
+        let db = ClientDatabase::load(&dir.path().join("clients.json"), network_config).unwrap();
+        let client = db.add_client("alice").unwrap();
+
+        let key = build_connection_key(&db, &args, &client.id, "203.0.113.10:8443", [7u8; 32])
+            .expect("build_connection_key should succeed for a freshly created client");
         let payload = key.strip_prefix("aivpn://").unwrap();
         let json_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .decode(payload)

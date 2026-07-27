@@ -51,11 +51,12 @@ use serde::{Deserialize, Deserializer};
 
 use crate::audit_log::{AuditActor, AuditLogger};
 use crate::batch_io::PacketBatchIo as _;
-use crate::client_db::ClientDatabase;
+use crate::client_db::{ClientDatabase, ClientRole};
 use crate::ebpf_observer::EbpfObserver;
 use crate::mask_gen::generate_and_store_mask;
 use crate::mask_store::MaskStore;
 use crate::metrics::MetricsCollector;
+use crate::mgmt_service;
 use crate::nat::NatForwarder;
 use crate::neural::{NeuralConfig, NeuralResonanceModule, ResonanceStatus};
 use crate::qos::QosEnforcer;
@@ -251,6 +252,22 @@ pub struct GatewayConfig {
     /// `pool_server_keypair`. Both must be `Some` for masked pool-client
     /// handshakes to be recognized.
     pub pool_client_psk: Option<[u8; 32]>,
+    /// P1.2b: the public `host:port` a client should dial to reach this
+    /// server, used to build the `aivpn://` connection key returned by the
+    /// in-tunnel `MgmtRequest` `GET .../connection-key` route
+    /// (`mgmt_service::MgmtCtx::server_addr`). Mirrors the REST API's
+    /// `management_api::ServeConfig::server_addr` — same value, computed
+    /// the same way in `main.rs` from `--server-ip` (falling back to the
+    /// listen port). `None` (e.g. `--server-ip` not configured) makes that
+    /// route return `503 Unavailable`, matching the REST path's behavior.
+    pub mgmt_server_addr: Option<String>,
+    /// P1.2b: on-disk path to the append-only audit-log JSONL file, read by
+    /// the in-tunnel `MgmtRequest` `GET /api/v1/audit-log` route
+    /// (`mgmt_service::MgmtCtx::audit_log_path`). Mirrors the REST API's
+    /// `management_api::ServeConfig::audit_log_path` — same value, computed
+    /// the same way in `main.rs` from `--audit-log`. `None` makes that route
+    /// return `404 NotFound`, matching the REST path's behavior.
+    pub audit_log_path: Option<std::path::PathBuf>,
 }
 
 /// Default §2 `report_failure_threshold`. Kept in sync with the client's
@@ -300,6 +317,8 @@ impl Default for GatewayConfig {
             mask_verify_mode: aivpn_common::mask::MaskVerifyMode::default(),
             pool_server_keypair: None,
             pool_client_psk: None,
+            mgmt_server_addr: None,
+            audit_log_path: None,
         }
     }
 }
@@ -671,6 +690,23 @@ fn try_claim_mask_feedback_slot(
     try_claim_slot(throttle, session_id, now, mask_feedback_throttled)
 }
 
+/// Per-session `MgmtRequest` throttle predicate (P1.2) — same shape as
+/// `mask_feedback_throttled`, gating the `mgmt_service::dispatch` path
+/// (DB IO + JSON encoding) instead of the mask-feedback scan+reply path.
+fn mgmt_throttled(last_processed: Option<Instant>, now: Instant) -> bool {
+    throttled(last_processed, now, MGMT_THROTTLE)
+}
+
+/// `MgmtRequest`-specific wrapper around `try_claim_slot` (P1.2) — see that
+/// function's doc comment for the atomicity guarantee.
+fn try_claim_mgmt_slot(
+    throttle: &DashMap<[u8; 16], Instant>,
+    session_id: [u8; 16],
+    now: Instant,
+) -> bool {
+    try_claim_slot(throttle, session_id, now, mgmt_throttled)
+}
+
 /// PHASE 4 (reverse chain-forward / exit downlink gap): how long an exit
 /// node remembers which masked pool-peer session an origin client's uplink
 /// `ChainForward` most recently arrived on (see `Gateway::chain_reverse_routes`
@@ -981,6 +1017,15 @@ pub struct Gateway {
     /// `MASK_FEEDBACK_THROTTLE` and the `MaskFeedback` arm in
     /// `handle_control_message`.
     mask_feedback_throttle: Arc<DashMap<[u8; 16], Instant>>,
+    /// P1.2 (in-tunnel management channel): per-session throttle on the
+    /// `MgmtRequest` dispatch path (`mgmt_service::dispatch`, which does
+    /// DB reads/writes and JSON encoding). Same shape and atomicity
+    /// guarantee as `mask_feedback_throttle` — `session_id -> Instant` of
+    /// the last time this session's `MgmtRequest` was actually served (a
+    /// throttled request never reaches `dispatch`, it gets an immediate
+    /// `429` `MgmtResponse` instead). See `MGMT_THROTTLE` and the
+    /// `MgmtRequest` arm in `handle_control_message`.
+    mgmt_request_throttle: Arc<DashMap<[u8; 16], Instant>>,
     /// FORK-B pool-sync: mirrors `GatewayConfig::pool_server_keypair`. `None`
     /// disables all masked-pool-peer handshake recognition.
     pool_server_keypair: Option<aivpn_common::crypto::KeyPair>,
@@ -997,6 +1042,17 @@ pub struct Gateway {
     /// exhaustive struct literal and threading this through it is a
     /// separate, out-of-scope task.
     require_node_enrollment: bool,
+    /// P1.5 (apply-with-rollback): shared tracker for in-flight
+    /// "commit-confirmed" heavy config changes. Read from
+    /// `dispatch_mgmt_request`'s `MgmtCtx` (both `apply_heavy` and
+    /// `confirm_config` operate on it) and swept every cleanup tick in
+    /// `run()`, which restores `target_path` from `rollback_value()` for
+    /// every entry `tick()` returns. Also handed out via
+    /// `pending_config()`/`AivpnServer::pending_config()` so
+    /// `management_api.rs`'s REST `ServeConfig` shares the SAME instance —
+    /// a REST-initiated apply must be swept by this SAME timer (see
+    /// `mgmt_service::MgmtCtx::pending_config`'s doc comment).
+    pending_config: Arc<crate::pending_config::PendingConfigManager>,
 }
 
 /// Per-session `MaskPreference` throttle window. `handle_control_message`'s
@@ -1049,6 +1105,14 @@ const MASK_PREFERENCE_THROTTLE: Duration = Duration::from_secs(2);
 /// legitimate usage nothing while bounding a spammer to at most one
 /// scan+reply pair per session per window.
 const MASK_FEEDBACK_THROTTLE: Duration = Duration::from_secs(5);
+
+/// P1.2: per-session floor on `MgmtRequest` dispatch. 200ms is generous for
+/// any legitimate admin/viewer UI interaction (list/patch/connection-key
+/// calls are human-paced, not a polling loop) while bounding a compromised
+/// or buggy client to at most 5 `mgmt_service::dispatch` calls/sec — each of
+/// which does DB IO and JSON encoding, unlike the cheap packet-classify path
+/// most other throttles guard.
+const MGMT_THROTTLE: Duration = Duration::from_millis(200);
 
 const BOOTSTRAP_ROTATION_SECS: u64 = 24 * 3600;
 /// Global cap (packets/sec, shared across ALL source IPs) on how often the
@@ -1175,6 +1239,196 @@ pub fn build_bootstrap_descriptors(
 const BOOTSTRAP_EPOCH_WINDOW: [i64; 4] = [-2, -1, 0, 1];
 
 impl Gateway {
+    /// Resolve a session's server-assigned management role:
+    /// `client_id -> client_db.find_by_id -> ClientConfig::role`, defaulting
+    /// to `ClientRole::User` when the session has no `client_id` yet
+    /// (pre-enrollment), no `client_db` is configured, or the client record
+    /// can no longer be found (e.g. it was just revoked). Deliberately
+    /// re-resolved on every call rather than cached on `Session` — a live
+    /// revoke or role downgrade must take effect on the client's very next
+    /// `MgmtRequest`/`Capabilities` push, not just after it reconnects.
+    /// Used by both the `Capabilities` announcement and the `MgmtRequest`
+    /// authorization gate (see the `Keepalive` and `MgmtRequest` arms in
+    /// `handle_control_message`).
+    fn session_role(&self, session: &Arc<parking_lot::Mutex<Session>>) -> ClientRole {
+        let client_id = session.lock().client_id.clone();
+        client_id
+            .and_then(|cid| self.client_db.as_ref().and_then(|db| db.find_by_id(&cid)))
+            .map(|c| c.role)
+            .unwrap_or_default()
+    }
+
+    /// `MgmtRequest`-specific wrapper around `try_claim_slot` (P1.2) — see
+    /// that function's doc comment for the atomicity guarantee. Bounds
+    /// `mgmt_service::dispatch` (DB IO + JSON encoding) to at most once per
+    /// session per `MGMT_THROTTLE`; a call that doesn't claim a slot must
+    /// reply with an immediate `429` `MgmtResponse` instead of dispatching.
+    fn try_claim_mgmt_slot(&self, session_id: [u8; 16], now: Instant) -> bool {
+        try_claim_mgmt_slot(&self.mgmt_request_throttle, session_id, now)
+    }
+
+    /// Build the `mgmt_service::MgmtCtx` inputs this `Gateway` actually
+    /// holds and run `mgmt_service::dispatch` on a blocking thread — it
+    /// does synchronous `ClientDatabase` file IO
+    /// (`add_client`/`update_client`/`remove_client` all end in
+    /// `ClientDatabase::save()`, a blocking `std::fs::write`), so unlike
+    /// the cheap in-memory `find_by_id`/`list_clients` reads used
+    /// elsewhere in this file, it must never run directly on a tokio
+    /// reactor thread.
+    ///
+    /// `server_pub_key` and `server_signing_pubkey` ARE fully populated —
+    /// both are pure functions of `server_private_key`, which is already
+    /// on `GatewayConfig` (see `main.rs`'s `mgmt_pub_key`/
+    /// `mgmt_signing_pubkey`, computed the exact same way for the REST
+    /// API's `ServeConfig`). `server_addr` (the public `host:port` a
+    /// client should dial) and `audit_log_path` (the on-disk path
+    /// `audit_tail` reads) are sourced from `GatewayConfig::mgmt_server_addr`
+    /// / `GatewayConfig::audit_log_path` (P1.2b) — `main.rs` populates both
+    /// with the exact same values it computes for `management_api::
+    /// ServeConfig::server_addr` / `::audit_log_path`. All curated routes
+    /// (status/list/add/get/patch/delete/reset-device/connection-key/
+    /// audit-log) are fully functional over the tunnel.
+    async fn dispatch_mgmt_request(
+        &self,
+        method: u8,
+        path: String,
+        body: Vec<u8>,
+    ) -> (u16, Vec<u8>) {
+        let Some(db) = self.client_db.clone() else {
+            return (503, Vec::new());
+        };
+        let mask_dir = self.config.mask_dir.clone();
+        let mask_operator_pubkey = self.config.mask_operator_pubkey;
+        let audit_log = self.audit_log.clone();
+        let server_private_key = self.config.server_private_key;
+        let server_addr = self.config.mgmt_server_addr.clone();
+        let audit_log_path = self.config.audit_log_path.clone();
+        let pending_config = self.pending_config.clone();
+
+        let result = tokio::task::spawn_blocking(move || {
+            let (server_pub_key, server_signing_pubkey) = if server_private_key != [0u8; 32] {
+                (
+                    Some(crypto::KeyPair::from_private_key(server_private_key).public_key_bytes()),
+                    Some(
+                        derive_server_signing_key(&server_private_key)
+                            .verifying_key()
+                            .to_bytes(),
+                    ),
+                )
+            } else {
+                (None, None)
+            };
+            let ctx = mgmt_service::MgmtCtx {
+                db: &db,
+                server_pub_key,
+                server_addr,
+                server_signing_pubkey,
+                mask_operator_pubkey,
+                audit: Some(&audit_log),
+                mask_dir: &mask_dir,
+                config_path: None,
+                audit_log_path: audit_log_path.as_deref(),
+                pending_config: Some(&pending_config),
+            };
+            mgmt_service::dispatch(&ctx, method, &path, &body)
+        })
+        .await;
+
+        match result {
+            Ok(r) => r,
+            Err(e) => {
+                error!("mgmt_service::dispatch panicked: {}", e);
+                (500, Vec::new())
+            }
+        }
+    }
+
+    /// P1.3 (admin revoke): force-disconnect any live session(s) for
+    /// `client_id` on THIS node — sends `ControlPayload::Shutdown{reason:
+    /// 4 /* revoked */}` to each, then immediately `remove_session`s it.
+    /// Called synchronously from the in-tunnel `MgmtRequest` revoke arm
+    /// (see `handle_control_message`'s `MgmtRequest` match) right after a
+    /// successful `mgmt_service::revoke`, so a connected client is dropped
+    /// in the SAME round-trip as the admin's revoke request — unlike the
+    /// REST revoke path (`management_api.rs`), whose `ApiState` holds no
+    /// `Gateway`/`SessionManager` handle and so falls back to the periodic
+    /// revocation sweep in `run()` (which now also sends this same
+    /// `Shutdown{reason:4}`, just up to ~5s later). See
+    /// `mgmt_service::revoke`'s doc comment for the full split.
+    ///
+    /// Reason code 4 = revoked, alongside the pre-existing
+    /// 1=one-time-used/2=expired/3=disabled `Shutdown` reasons already sent
+    /// elsewhere in this file.
+    ///
+    /// A client should hold at most one live session per node in normal
+    /// operation (`SessionManager::cleanup_old_sessions_for_client_id`
+    /// already evicts stale duplicates on every fresh handshake), but this
+    /// collects and drops every matching session defensively rather than
+    /// assuming exactly one.
+    async fn force_disconnect_client(&self, client_id: &str) {
+        let Some(socket) = self.udp_socket.as_ref() else {
+            return;
+        };
+        let mdh = self.mask_catalog.packet_mdh_bytes();
+        let targets: Vec<([u8; 16], Arc<parking_lot::Mutex<Session>>)> = self
+            .session_manager
+            .iter_sessions()
+            .filter_map(|entry| {
+                let session = entry.value().clone();
+                let is_target = session.lock().client_id.as_deref() == Some(client_id);
+                is_target.then(|| (*entry.key(), session))
+            })
+            .collect();
+
+        for (session_id, session) in targets {
+            let shutdown = ControlPayload::Shutdown { reason: 4 };
+            if let Err(e) = Self::send_control_message_via(socket, &mdh, &shutdown, &session).await
+            {
+                debug!(
+                    "force_disconnect_client: Shutdown send failed for revoked client {}: {}",
+                    client_id, e
+                );
+            }
+            self.session_manager.remove_session(&session_id);
+            warn!(
+                "Force-disconnected session {:02x}{:02x}{:02x}{:02x} — client {} revoked",
+                session_id[0], session_id[1], session_id[2], session_id[3], client_id
+            );
+        }
+    }
+
+    /// P1.3 (priority pool beacon): if a masked `PoolDialer` handle is
+    /// installed on this node (`set_masked_exit`/`set_pool_dialer` — see
+    /// those setters' doc comments) and a `ClientDatabase` is configured,
+    /// push an immediate `PoolStateDigest` beacon to every currently
+    /// connected pool peer via `PoolDialer::broadcast` — the SAME send
+    /// path `pool_dialer.rs`'s scheduled anti-entropy tick uses, just
+    /// triggered right now instead of waiting up to `pool.sync_beacon_secs`
+    /// for the next tick. A revoke already bumps the tombstoned client's
+    /// `updated_at` (see `ClientDatabase::remove_client`), so a peer that
+    /// receives this beacon and diffs its `state_digest` against its own
+    /// will pull the fresh tombstone on its next anti-entropy round either
+    /// way — this just gets that round started immediately instead of on
+    /// the peer's own schedule.
+    ///
+    /// No-op (and no error) when no `PoolDialer` is installed — the common
+    /// case for a single-node deployment, or a node still on the legacy
+    /// mask-independent `PeerSyncer` transport, which has no equivalent
+    /// "beacon now" hook and keeps propagating tombstones on its existing
+    /// periodic push schedule (out of scope here — see the design's Phase-
+    /// out-of-legacy-transport plan).
+    fn trigger_priority_pool_beacon(&self) {
+        let (Some(dialer), Some(db)) = (self.pool_dialer.as_ref(), self.client_db.as_ref()) else {
+            return;
+        };
+        let digest = db.state_digest();
+        let peers_notified = dialer.broadcast(ControlPayload::PoolStateDigest { digest });
+        debug!(
+            "Priority pool beacon (post-revoke) sent to {} connected peer(s)",
+            peers_notified
+        );
+    }
+
     fn can_start_recording(&self, client_id: Option<&str>) -> bool {
         let Some(client_id) = client_id else {
             return false;
@@ -1476,6 +1730,7 @@ impl Gateway {
             mask_feedback: Arc::new(crate::mask_feedback::MaskFeedbackStore::new()),
             mask_preference_throttle: Arc::new(DashMap::new()),
             mask_feedback_throttle: Arc::new(DashMap::new()),
+            mgmt_request_throttle: Arc::new(DashMap::new()),
             pool_server_keypair: config.pool_server_keypair,
             pool_client_psk: config.pool_client_psk,
             // BUG D1 fix: NOT sourced from `GatewayConfig` — `main.rs`
@@ -1492,7 +1747,18 @@ impl Gateway {
             // `GatewayConfig { .. }` literal in `main.rs`) and read it here
             // instead of the literal `false`.
             require_node_enrollment: false,
+            pending_config: Arc::new(crate::pending_config::PendingConfigManager::new()),
         })
+    }
+
+    /// Shared handle to the apply-with-rollback tracker (P1.5), so
+    /// `management_api.rs`'s REST `ServeConfig` and `dispatch_mgmt_request`
+    /// operate on the SAME `PendingConfigManager` the cleanup task in
+    /// `run()` sweeps — mirrors `bootstrap_descriptors()`'s sharing pattern.
+    /// Must be called before `run()` consumes the gateway (see
+    /// `AivpnServer::pending_config()`, `server.rs`).
+    pub fn pending_config(&self) -> Arc<crate::pending_config::PendingConfigManager> {
+        self.pending_config.clone()
     }
 
     /// Set (or replace) the multi-hop chain forwarder after server construction.
@@ -1517,6 +1783,22 @@ impl Gateway {
     ) {
         self.pool_dialer = Some(dialer);
         self.masked_exit_addr = Some(exit_addr);
+    }
+
+    /// P1.3 (priority pool beacon): install a handle to this node's masked
+    /// `PoolDialer` even when no `exit_node` is configured. `set_masked_exit`
+    /// above only wires `self.pool_dialer` for the exit-dialing case; a
+    /// plain pool-sync-only masked-transport node never got a `pool_dialer`
+    /// handle on `Gateway` before this, so the admin "revoke" mgmt route's
+    /// immediate priority beacon (`trigger_priority_pool_beacon`) had
+    /// nothing to call `broadcast` on. `main.rs` calls this unconditionally
+    /// whenever the masked `PoolDialer` actually started, right alongside
+    /// (and independent of) the `exit_node`-only `set_masked_exit` call —
+    /// calling both with the same `Arc` (when this node ALSO dials an
+    /// exit) is harmless, the second call just re-sets the same pointer.
+    /// Must be called before `run()`.
+    pub fn set_pool_dialer(&mut self, dialer: Arc<crate::pool_dialer::PoolDialer>) {
+        self.pool_dialer = Some(dialer);
     }
 
     /// PHASE 4 (per-node identity): install the pool-node identity registry so
@@ -1839,7 +2121,9 @@ impl Gateway {
             let handshake_locks_cleanup = self.handshake_locks.clone();
             let mask_preference_throttle_cleanup = self.mask_preference_throttle.clone();
             let mask_feedback_throttle_cleanup = self.mask_feedback_throttle.clone();
+            let mgmt_request_throttle_cleanup = self.mgmt_request_throttle.clone();
             let mask_catalog_cleanup = self.mask_catalog.clone();
+            let pending_config_cleanup = self.pending_config.clone();
             tokio::spawn(async move {
                 loop {
                     tokio::time::sleep(Duration::from_secs(5)).await;
@@ -1889,6 +2173,8 @@ impl Gateway {
                     // Same pruning for the FIX F MaskFeedback throttle map.
                     mask_feedback_throttle_cleanup
                         .retain(|_, v| v.elapsed() < MASK_FEEDBACK_THROTTLE);
+                    // Same pruning for the P1.2 MgmtRequest throttle map.
+                    mgmt_request_throttle_cleanup.retain(|_, v| v.elapsed() < MGMT_THROTTLE);
                     // H1: give masks that tripped the neural/DPI/anomaly
                     // detectors a second chance after COMPROMISED_TTL rather
                     // than excluding them from rotation forever.
@@ -1904,6 +2190,23 @@ impl Gateway {
                     // client is now missing, disabled, or expired.
                     let mut revoked: Vec<[u8; 16]> = Vec::new();
                     if let Some(ref db) = client_db_cleanup {
+                        // P1.3: keep the session handle alongside its id so
+                        // the loop below can send `Shutdown{reason:4}`
+                        // before dropping it — this is the REST-revoke /
+                        // disable / expiry fallback path (the in-tunnel
+                        // admin revoke instead calls
+                        // `Gateway::force_disconnect_client` synchronously,
+                        // see that method's doc comment for the split).
+                        // Previously this sweep just called
+                        // `sessions.remove_session` silently, so a client
+                        // revoked/disabled via the REST API (which has no
+                        // `Gateway` handle to force-disconnect immediately)
+                        // saw its connection die with no explanation until
+                        // this fix.
+                        let mut revoked_sessions: Vec<(
+                            [u8; 16],
+                            Arc<parking_lot::Mutex<Session>>,
+                        )> = Vec::new();
                         for entry in sessions.iter_sessions() {
                             let (sid, cid) = {
                                 let s = entry.value().lock();
@@ -1919,14 +2222,29 @@ impl Gateway {
                                     .unwrap_or(false);
                                 if !live {
                                     revoked.push(sid);
+                                    revoked_sessions.push((sid, entry.value().clone()));
                                 }
                             }
                         }
-                        for sid in &revoked {
+                        for (sid, session) in &revoked_sessions {
                             warn!(
                                 "Dropping active session {:02x}{:02x}{:02x}{:02x} — client revoked/disabled/expired",
                                 sid[0], sid[1], sid[2], sid[3]
                             );
+                            let shutdown = ControlPayload::Shutdown { reason: 4 };
+                            if let Err(e) = Self::send_control_message_via(
+                                socket.as_ref(),
+                                &mdh,
+                                &shutdown,
+                                session,
+                            )
+                            .await
+                            {
+                                debug!(
+                                    "revocation sweep: Shutdown send failed for session {:02x}{:02x}{:02x}{:02x}: {}",
+                                    sid[0], sid[1], sid[2], sid[3], e
+                                );
+                            }
                             sessions.remove_session(sid);
                         }
                     }
@@ -1955,6 +2273,44 @@ impl Gateway {
                                 &socket, &sessions, &store, &mdh, outcome, None,
                             )
                             .await;
+                        }
+                    }
+
+                    // P1.5 (apply-with-rollback): sweep every heavy config
+                    // change whose confirm deadline passed without a
+                    // `confirm_config` call — from EITHER transport (the
+                    // tunnel's `MgmtRequest` or the REST `/config/apply`
+                    // handler, both of which register into this SAME
+                    // shared `PendingConfigManager`; see that field's doc
+                    // comment on `Gateway`). Restore each entry's
+                    // `target_path` to its `rollback_value()` — `Some(bytes)`
+                    // writes the prior content back, `None` means the file
+                    // didn't exist before the change, so it's removed.
+                    for entry in pending_config_cleanup.tick(Instant::now()) {
+                        let path = entry.target_path().to_path_buf();
+                        let restore_result = match entry.rollback_value() {
+                            Some(prior_bytes) => std::fs::write(&path, prior_bytes),
+                            None => match std::fs::remove_file(&path) {
+                                Ok(()) => Ok(()),
+                                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                                Err(e) => Err(e),
+                            },
+                        };
+                        match restore_result {
+                            Ok(()) => {
+                                warn!(
+                                    "Pending config auto-rolled-back (unconfirmed within window): {}",
+                                    entry.descriptor()
+                                );
+                            }
+                            Err(e) => {
+                                error!(
+                                    "Pending config rollback FAILED for '{}' (path {}): {}",
+                                    entry.descriptor(),
+                                    path.display(),
+                                    e
+                                );
+                            }
                         }
                     }
                 }
@@ -4838,6 +5194,24 @@ impl Gateway {
                         Err(e) => debug!("MaskCatalog send failed: {}", e),
                     }
                 }
+                // P1.2: announce this session's server-assigned management
+                // role once, so the client knows whether to surface
+                // admin/viewer management UI. Gated exactly like the
+                // MaskCatalog push above — post-ratchet Keepalive only
+                // (guarded at the top of this arm), send-once via
+                // `capabilities_sent`, self-healing if the send is lost
+                // (retried on the next Keepalive).
+                if !session.lock().capabilities_sent {
+                    let role = self.session_role(session);
+                    let caps = ControlPayload::Capabilities {
+                        role: role.as_u8(),
+                        features: 0,
+                    };
+                    match self.send_control_message(&caps, session).await {
+                        Ok(()) => session.lock().capabilities_sent = true,
+                        Err(e) => debug!("Capabilities send failed: {}", e),
+                    }
+                }
             }
             ControlPayload::TelemetryRequest { metric_flags: _ } => {
                 debug!("Telemetry request from {}", hash_addr(&client_addr));
@@ -5924,6 +6298,96 @@ impl Gateway {
                     hash_addr(&client_addr)
                 );
             }
+            ControlPayload::Capabilities { .. } => {
+                // Server→client only; a client should never send this. Ignore.
+                debug!(
+                    "Unexpected Capabilities from client {} ignored",
+                    hash_addr(&client_addr)
+                );
+            }
+            ControlPayload::MgmtResponse { .. } => {
+                // Server→client only; a client should never send this. Ignore.
+                debug!(
+                    "Unexpected MgmtResponse from client {} ignored",
+                    hash_addr(&client_addr)
+                );
+            }
+            ControlPayload::MgmtRequest {
+                req_id,
+                method,
+                path,
+                body,
+            } => {
+                // P1.2: real in-tunnel management dispatch. Every branch
+                // below replies with SOME `MgmtResponse` — a caller
+                // waiting on `req_id` must never hang, whether the
+                // outcome is throttled/denied/dispatched.
+                let session_id = session.lock().session_id;
+                if !self.try_claim_mgmt_slot(session_id, Instant::now()) {
+                    let resp = ControlPayload::MgmtResponse {
+                        req_id,
+                        status: 429,
+                        body: Vec::new(),
+                    };
+                    if let Err(e) = self.send_control_message(&resp, session).await {
+                        debug!("MgmtResponse (429 throttled) send failed: {}", e);
+                    }
+                    return Ok(());
+                }
+
+                // Role resolved server-side from the session's `client_id`
+                // — NEVER anything the request itself claims. See
+                // `session_role`'s doc comment for why this is re-resolved
+                // per request rather than cached.
+                let role = self.session_role(session);
+                if !mgmt_service::authorize(role.as_u8(), method, &path) {
+                    debug!(
+                        "MgmtRequest from {} denied: role={:?} method={} path={}",
+                        hash_addr(&client_addr),
+                        role,
+                        method,
+                        path
+                    );
+                    let resp = ControlPayload::MgmtResponse {
+                        req_id,
+                        status: 403,
+                        body: Vec::new(),
+                    };
+                    if let Err(e) = self.send_control_message(&resp, session).await {
+                        debug!("MgmtResponse (403 denied) send failed: {}", e);
+                    }
+                    return Ok(());
+                }
+
+                // P1.3: identify a revoke BEFORE dispatching — `path` is
+                // moved into `dispatch_mgmt_request` below, and
+                // `mgmt_service::revoke_target` needs the original
+                // (method, path) pair to recognize the route regardless of
+                // outcome.
+                let revoke_id = mgmt_service::revoke_target(method, &path);
+
+                let (status, resp_body) = self.dispatch_mgmt_request(method, path, body).await;
+
+                // P1.3: on a successful admin revoke (204), immediately
+                // force-disconnect any live session for that client on
+                // this node and kick a priority pool beacon so peers
+                // converge on the tombstone without waiting for their next
+                // scheduled anti-entropy tick. See `force_disconnect_client`
+                // / `trigger_priority_pool_beacon`'s doc comments.
+                if let Some(client_id) = revoke_id.filter(|_| status == 204) {
+                    self.force_disconnect_client(&client_id).await;
+                    self.trigger_priority_pool_beacon();
+                }
+
+                let resp = ControlPayload::MgmtResponse {
+                    req_id,
+                    status,
+                    body: resp_body,
+                };
+                if let Err(e) = self.send_control_message(&resp, session).await {
+                    debug!("MgmtResponse send failed: {}", e);
+                }
+            }
         }
 
         Ok(())
@@ -6353,18 +6817,22 @@ mod tests {
     use super::route_sync_must_be_dropped_unverified;
     use super::try_claim_mask_feedback_slot;
     use super::try_claim_mask_preference_slot;
+    use super::try_claim_mgmt_slot;
     use super::verify_device_enrollment_proof;
     use super::Gateway;
     use super::GatewayConfig;
     use super::MaskCatalog;
+    use super::Session;
     use super::CHAIN_REVERSE_ROUTE_TTL;
     use super::CHAIN_REVERSE_SWEEP_EVERY;
     use super::MASK_FEEDBACK_THROTTLE;
     use super::MASK_PREFERENCE_THROTTLE;
+    use super::MGMT_THROTTLE;
     use aivpn_common::crypto::TAG_SIZE;
     use aivpn_common::mask::preset_masks::webrtc_zoom_v3;
     use dashmap::DashMap;
-    use std::net::Ipv4Addr;
+    use std::net::{Ipv4Addr, SocketAddr};
+    use std::sync::Arc;
     use std::time::{Duration, Instant};
 
     /// The handshake candidate scan must derive descriptors for a WINDOW of
@@ -7622,5 +8090,157 @@ mod tests {
                                                                // A raw encrypted wire prefix (random high bytes, first nibble != 4)
                                                                // must yield nothing — this is the exact regression the fix prevents.
         assert!(inner_l7_prefix(&[0x9f, 0x3c, 0xa1, 0x00, 0xde, 0xad, 0xbe, 0xef]).is_empty());
+    }
+
+    // ========================================================================
+    // P1.2: MgmtRequest rate-limit + session role resolution
+    // ========================================================================
+
+    /// Same shape as `mask_feedback_throttle_blocks_within_window` — the
+    /// `MgmtRequest` throttle predicate must behave identically.
+    #[test]
+    fn mgmt_throttle_blocks_within_window() {
+        use super::mgmt_throttled;
+        let now = Instant::now();
+        assert!(!mgmt_throttled(None, now));
+        assert!(mgmt_throttled(Some(now), now));
+
+        let later = now + Duration::from_millis(50);
+        assert!(mgmt_throttled(Some(now), later));
+
+        let after_window = now + MGMT_THROTTLE + Duration::from_millis(1);
+        assert!(!mgmt_throttled(Some(now), after_window));
+    }
+
+    /// `try_claim_mgmt_slot` must give the same atomic check-and-claim
+    /// guarantee as `try_claim_mask_feedback_slot`: first claim for a fresh
+    /// session succeeds, a second claim for the SAME session within the
+    /// window is throttled (this is what makes a burst of `MgmtRequest`
+    /// packets from a single session collapse to one dispatched call plus
+    /// N `429` replies), and a claim after the window elapses succeeds
+    /// again.
+    #[test]
+    fn try_claim_mgmt_slot_is_atomic_check_and_claim() {
+        let throttle: DashMap<[u8; 16], Instant> = DashMap::new();
+        let session_id = [11u8; 16];
+        let t0 = Instant::now();
+
+        assert!(
+            try_claim_mgmt_slot(&throttle, session_id, t0),
+            "first claim for a fresh session must succeed"
+        );
+        assert!(
+            !try_claim_mgmt_slot(&throttle, session_id, t0),
+            "second claim within the window must be throttled (429)"
+        );
+
+        let t1 = t0 + MGMT_THROTTLE + Duration::from_millis(1);
+        assert!(
+            try_claim_mgmt_slot(&throttle, session_id, t1),
+            "claim after the window has elapsed must succeed again"
+        );
+    }
+
+    /// Two different sessions must never share a throttle slot — a burst
+    /// on session A must not 429 a legitimate `MgmtRequest` from session B.
+    #[test]
+    fn mgmt_throttle_is_scoped_per_session() {
+        let throttle: DashMap<[u8; 16], Instant> = DashMap::new();
+        let session_a = [21u8; 16];
+        let session_b = [22u8; 16];
+        let now = Instant::now();
+
+        assert!(try_claim_mgmt_slot(&throttle, session_a, now));
+        assert!(try_claim_mgmt_slot(&throttle, session_b, now));
+        assert!(!try_claim_mgmt_slot(&throttle, session_a, now));
+        assert!(!try_claim_mgmt_slot(&throttle, session_b, now));
+    }
+
+    /// Build a bare, unratcheted `Session` wrapped the way the gateway
+    /// stores it (`Arc<parking_lot::Mutex<Session>>`), for tests that only
+    /// need `client_id` and don't drive the handshake state machine.
+    fn make_bare_session(client_id: Option<String>) -> Arc<parking_lot::Mutex<Session>> {
+        let keys = aivpn_common::crypto::SessionKeys {
+            session_key: [1u8; 32],
+            session_key_s2c: [1u8; 32],
+            tag_secret: [1u8; 32],
+            prng_seed: [1u8; 32],
+        };
+        let addr: SocketAddr = "203.0.113.9:41000".parse().unwrap();
+        let mut s = Session::new([9u8; 16], addr, keys, [0u8; 32]);
+        s.client_id = client_id;
+        Arc::new(parking_lot::Mutex::new(s))
+    }
+
+    /// `Gateway::session_role` (used by both the `Capabilities` push and
+    /// the `MgmtRequest` authorization gate) must resolve
+    /// `client_id -> client_db.find_by_id -> ClientConfig::role`, and must
+    /// default to `ClientRole::User` — never trust anything the client
+    /// itself could claim — when the session has no `client_id` at all.
+    #[test]
+    fn session_role_resolves_from_client_db_and_defaults_to_user_without_client_id() {
+        use crate::client_db::{ClientDatabase, ClientRole, UpdateClientParams};
+        use std::sync::Arc as StdArc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let network = aivpn_common::network_config::VpnNetworkConfig {
+            server_vpn_ip: Ipv4Addr::new(10, 66, 0, 1),
+            prefix_len: 24,
+            mtu: 1400,
+            ..Default::default()
+        };
+        let db =
+            StdArc::new(ClientDatabase::load(&dir.path().join("clients.json"), network).unwrap());
+        let client = db.add_client("role-test").unwrap();
+        db.enroll_device(&client.id, &[3u8; 32]).unwrap();
+        db.update_client(
+            &client.id,
+            UpdateClientParams {
+                role: Some(ClientRole::Admin),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let mut config = make_test_gateway_config("session-role");
+        config.client_db = Some(db.clone());
+        let gateway = Gateway::new(config).expect("gateway constructs");
+
+        let bound_session = make_bare_session(Some(client.id.clone()));
+        assert_eq!(gateway.session_role(&bound_session), ClientRole::Admin);
+
+        let unbound_session = make_bare_session(None);
+        assert_eq!(
+            gateway.session_role(&unbound_session),
+            ClientRole::User,
+            "a session with no client_id must default to User, never inherit a stale role"
+        );
+
+        let unknown_client_session = make_bare_session(Some("does-not-exist".to_string()));
+        assert_eq!(
+            gateway.session_role(&unknown_client_session),
+            ClientRole::User,
+            "a client_id that can no longer be found (e.g. just revoked) must default to User"
+        );
+    }
+
+    /// `authorize`/`dispatch` are unit-tested exhaustively in
+    /// `mgmt_service`; this covers the one piece of glue that lives in
+    /// `gateway.rs` — `ClientRole::as_u8` feeding straight into
+    /// `mgmt_service::authorize` the way the `MgmtRequest` arm in
+    /// `handle_control_message` does.
+    #[test]
+    fn client_role_as_u8_matches_mgmt_service_authorize_expectations() {
+        use crate::client_db::ClientRole;
+        use crate::mgmt_service::authorize;
+
+        assert_eq!(ClientRole::User.as_u8(), 0);
+        assert_eq!(ClientRole::Viewer.as_u8(), 1);
+        assert_eq!(ClientRole::Admin.as_u8(), 2);
+
+        assert!(!authorize(ClientRole::User.as_u8(), 0, "/api/v1/clients"));
+        assert!(authorize(ClientRole::Viewer.as_u8(), 0, "/api/v1/clients"));
+        assert!(!authorize(ClientRole::Viewer.as_u8(), 1, "/api/v1/clients"));
+        assert!(authorize(ClientRole::Admin.as_u8(), 1, "/api/v1/clients"));
     }
 }

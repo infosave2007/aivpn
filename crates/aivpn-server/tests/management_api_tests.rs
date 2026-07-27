@@ -94,6 +94,7 @@ async fn spawn_server_with_key(
             #[cfg(feature = "metrics")]
             metrics: None,
             socket_group: None,
+            pending_config: None,
         })
         .await;
     });
@@ -371,6 +372,65 @@ async fn test_delete_nonexistent_client_returns_404() {
         &mut sender,
         Method::DELETE,
         "/api/v1/clients/no-such-id",
+        None,
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(
+        body["error"].is_string(),
+        "error field expected: {:?}",
+        body
+    );
+}
+
+/// P1.3: POST /api/v1/clients/:id/revoke tombstones the client and returns
+/// 204 No Content — same wire status as DELETE, but a distinct route/audit
+/// action (`ClientRevoke` vs `ClientRemove`, see `mgmt_service::revoke`'s
+/// doc comment).
+#[tokio::test]
+async fn test_revoke_client_returns_204_and_tombstones() {
+    let (_dir, db) = make_temp_db("revoke_client");
+    let sock = unique_socket_path();
+    spawn_server(db, sock.clone()).await;
+
+    let mut sender = connect(&sock).await;
+    let (_, created) = send(
+        &mut sender,
+        Method::POST,
+        "/api/v1/clients",
+        Some(r#"{"name":"nadia"}"#),
+    )
+    .await;
+    let id = created["id"].as_str().unwrap().to_string();
+
+    let mut sender2 = connect(&sock).await;
+    let path = format!("/api/v1/clients/{}/revoke", id);
+    let (status, _) = send(&mut sender2, Method::POST, &path, None).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "revoke must return 204");
+
+    let mut sender3 = connect(&sock).await;
+    let get_path = format!("/api/v1/clients/{}", id);
+    let (status2, _) = send(&mut sender3, Method::GET, &get_path, None).await;
+    assert_eq!(
+        status2,
+        StatusCode::NOT_FOUND,
+        "revoked client must return 404"
+    );
+}
+
+/// POST /api/v1/clients/:id/revoke for a non-existent ID returns 404.
+#[tokio::test]
+async fn test_revoke_nonexistent_client_returns_404() {
+    let (_dir, db) = make_temp_db("revoke_404");
+    let sock = unique_socket_path();
+    spawn_server(db, sock.clone()).await;
+
+    let mut sender = connect(&sock).await;
+    let (status, body) = send(
+        &mut sender,
+        Method::POST,
+        "/api/v1/clients/no-such-id/revoke",
         None,
     )
     .await;

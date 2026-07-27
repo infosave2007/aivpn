@@ -15,6 +15,47 @@ use tracing::{error, info, warn};
 use aivpn_common::error::{Error, Result};
 use aivpn_common::network_config::VpnNetworkConfig;
 
+/// A client's server-side management role: gates what an in-tunnel
+/// `MgmtRequest` (or the REST API acting on its behalf) is allowed to do.
+/// `User` (the default) has no management access at all; `Viewer` may only
+/// read curated status/list/audit endpoints; `Admin` may perform the full
+/// curated allowlist (client CRUD, connection-key issuance, revoke, etc).
+/// Ranked so callers can gate with a single `at_least` comparison instead of
+/// matching every variant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ClientRole {
+    #[default]
+    User,
+    Viewer,
+    Admin,
+}
+
+impl ClientRole {
+    /// True if `self` is at least as privileged as `req`.
+    pub fn at_least(self, req: ClientRole) -> bool {
+        self.rank() >= req.rank()
+    }
+
+    fn rank(self) -> u8 {
+        match self {
+            ClientRole::User => 0,
+            ClientRole::Viewer => 1,
+            ClientRole::Admin => 2,
+        }
+    }
+
+    /// Wire representation used by `ControlPayload::Capabilities` and the
+    /// in-tunnel `MgmtRequest` authorization gate — `rank()` is private
+    /// (an internal ordering detail), this is the public, stable u8 the
+    /// protocol and `mgmt_service::authorize` are allowed to depend on.
+    /// User=0, Viewer=1, Admin=2 (same values as `rank()` today, but the
+    /// two are allowed to diverge — this is the contract, `rank()` is not).
+    pub fn as_u8(self) -> u8 {
+        self.rank()
+    }
+}
+
 /// Client configuration and credentials
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClientConfig {
@@ -63,10 +104,23 @@ pub struct ClientConfig {
     /// clients are invisible to all lookup/list paths.
     #[serde(default, skip_serializing_if = "is_false")]
     pub deleted: bool,
+    /// Server-side management role granted to this client (0.11.0+, optional
+    /// for backward compat — absent/older records default to `User`, i.e. no
+    /// management access). Elevating to `Viewer`/`Admin` requires the client
+    /// to already be device-bound (see `update_client`'s enforcement) — role
+    /// is authenticated by the device's static key during the handshake, so
+    /// a role on a non-device-bound (PSK-only) client could never actually be
+    /// proven to belong to the connecting peer.
+    #[serde(default, skip_serializing_if = "is_role_user")]
+    pub role: ClientRole,
 }
 
 fn is_false(b: &bool) -> bool {
     !*b
+}
+
+fn is_role_user(r: &ClientRole) -> bool {
+    *r == ClientRole::User
 }
 
 /// Encode an `Option<DateTime<Utc>>` as 8 little-endian bytes for
@@ -132,6 +186,11 @@ fn write_record_canonical_fields(hasher: &mut blake3::Hasher, c: &ClientConfig) 
     let qos_json = serde_json::to_vec(&c.qos).unwrap_or_default();
     hasher.update(&(qos_json.len() as u32).to_le_bytes());
     hasher.update(&qos_json);
+
+    // role (fixed 1 byte — a management-relevant field like enabled/deleted,
+    // must converge in the digest so a pool node can't silently retain a
+    // stale role after another node elevates/demotes a client)
+    hasher.update(&[c.role.rank()]);
 }
 
 /// Deterministic bucket assignment for a client `id`: the first 8 bytes of
@@ -199,6 +258,11 @@ pub struct UpdateClientParams {
     pub qos: Option<Option<crate::qos::ClientQos>>,
     /// None = leave unchanged; Some(None) = clear; Some(Some(dt)) = set expiry
     pub expires_at: Option<Option<DateTime<Utc>>>,
+    /// None = leave unchanged. Setting `Viewer`/`Admin` requires the client
+    /// to already be (or be simultaneously, via `device_pubkey` — not
+    /// exposed here, see `update_client`) device-bound; enforced atomically
+    /// in `update_client`.
+    pub role: Option<ClientRole>,
 }
 
 /// Per-client traffic statistics
@@ -381,6 +445,7 @@ impl ClientDatabase {
             expires_at: None,
             updated_at: Some(Utc::now()),
             deleted: false,
+            role: ClientRole::User,
         };
 
         data.clients.push(client.clone());
@@ -816,6 +881,11 @@ impl ClientDatabase {
                     existing.expires_at = inc.expires_at;
                     existing.device_pubkey = inc.device_pubkey;
                     existing.one_time = inc.one_time;
+                    // `role` is management-relevant exactly like the fields
+                    // above (an admin elevation/demotion done on one pool
+                    // node must converge everywhere) — same `incoming_wins`
+                    // LWW/tombstone-sticky gate, no separate policy.
+                    existing.role = inc.role;
                     merged += 1;
                 }
             } else if inc.deleted {
@@ -1131,6 +1201,18 @@ impl ClientDatabase {
             .iter_mut()
             .find(|c| c.id == client_id && !c.deleted)
             .ok_or_else(|| Error::Session(format!("Client '{}' not found", client_id)))?;
+        // Elevating to Viewer/Admin requires the client to already be
+        // device-bound: role is only ever authenticated via the connecting
+        // device's static key during the handshake, so granting it to a
+        // PSK-only (not-yet-bound) client would be a privilege that can
+        // never actually be proven to belong to whoever shows up with the
+        // PSK. Checked against the CURRENT `device_pubkey` — this call never
+        // sets one, so there is no ordering trick to bypass it.
+        if let Some(role) = params.role {
+            if role != ClientRole::User && client.device_pubkey.is_none() {
+                return Err(Error::Session("role requires device binding".into()));
+            }
+        }
         if let Some(name) = params.name {
             client.name = name;
         }
@@ -1145,6 +1227,9 @@ impl ClientDatabase {
         }
         if let Some(expires_at) = params.expires_at {
             client.expires_at = expires_at;
+        }
+        if let Some(role) = params.role {
+            client.role = role;
         }
         client.updated_at = Some(Utc::now());
         let updated = client.clone();
@@ -2113,6 +2198,7 @@ mod tests {
             expires_at: None,
             updated_at: Some(Utc::now()),
             deleted: false,
+            role: ClientRole::User,
         };
         let merged = daemon
             .merge_from_json(&serde_json::to_string(&vec![peer_client]).unwrap())
@@ -2177,6 +2263,7 @@ mod tests {
             expires_at: None,
             updated_at: Some(Utc::now()),
             deleted: false,
+            role: ClientRole::User,
         };
 
         let merged = db
@@ -2224,5 +2311,174 @@ mod tests {
         // accidental early-return) would fail this test even though it has
         // no other externally observable effect.
         ClientDatabase::warn_duplicate_live_names(&all_live);
+    }
+
+    // --- P0.1: ClientRole ---------------------------------------------
+
+    #[test]
+    fn client_role_defaults_to_user_and_roundtrips() {
+        let json = r#"{"id":"a","name":"n","psk":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=","vpn_ip":"10.0.0.2","enabled":true,"created_at":"2026-01-01T00:00:00Z","stats":{"bytes_in":0,"bytes_out":0,"total_connections":0}}"#;
+        let c: ClientConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(c.role, ClientRole::User);
+        let c2 = ClientConfig {
+            role: ClientRole::Admin,
+            ..c.clone()
+        };
+        let s = serde_json::to_string(&c2).unwrap();
+        let back: ClientConfig = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.role, ClientRole::Admin);
+    }
+
+    /// Pool-sync convergence: an Admin elevation made on one node (with a
+    /// newer `updated_at`) must propagate to a peer node via
+    /// `merge_from_json`, exactly like `enabled`/`expires_at`/etc.
+    #[test]
+    fn merge_from_json_converges_role_elevation_last_writer_wins() {
+        let dir_a = tempfile::tempdir().unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+        let db_a = ClientDatabase::load(&dir_a.path().join("clients.json"), test_network_config())
+            .unwrap();
+        let db_b = ClientDatabase::load(&dir_b.path().join("clients.json"), test_network_config())
+            .unwrap();
+
+        // Same logical client on both "nodes" (shared id/psk), starting as
+        // a plain User but already device-bound so the elevation below is
+        // legal.
+        let client = db_a.add_client("shared").unwrap();
+        db_a.enroll_device(&client.id, &[0x11; 32]).unwrap();
+        db_b.merge_from_json(&db_a.export_json().unwrap()).unwrap();
+        assert_eq!(db_b.find_by_id(&client.id).unwrap().role, ClientRole::User);
+
+        // Elevate to Admin on node A — `update_client` stamps a fresh
+        // `updated_at`, guaranteeing it's strictly newer than B's copy.
+        db_a.update_client(
+            &client.id,
+            UpdateClientParams {
+                role: Some(ClientRole::Admin),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        // Merge A's state into B: the elevation must converge.
+        let merged = db_b.merge_from_json(&db_a.export_json().unwrap()).unwrap();
+        assert_eq!(merged, 1, "the role elevation must merge");
+        assert_eq!(
+            db_b.find_by_id(&client.id).unwrap().role,
+            ClientRole::Admin,
+            "role must converge pool-wide via merge_from_json"
+        );
+    }
+
+    /// A tombstoned (revoked) client must not have its role "come back" via
+    /// a merge from a peer that still holds an older, live copy — the
+    /// sticky-tombstone policy that already protects `enabled`/`deleted`
+    /// must equally protect `role`.
+    #[test]
+    fn merge_from_json_tombstone_does_not_resurrect_role() {
+        let dir = tempfile::tempdir().unwrap();
+        let db =
+            ClientDatabase::load(&dir.path().join("clients.json"), test_network_config()).unwrap();
+
+        let client = db.add_client("revoked-admin").unwrap();
+        db.enroll_device(&client.id, &[0x22; 32]).unwrap();
+        db.update_client(
+            &client.id,
+            UpdateClientParams {
+                role: Some(ClientRole::Admin),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        // Revoke locally (tombstone). remove_client bumps updated_at.
+        db.remove_client(&client.id).unwrap();
+        assert!(
+            db.find_by_id(&client.id).is_none(),
+            "tombstoned clients are invisible to lookups"
+        );
+
+        // A peer's OLDER live copy (still role=Admin, not yet aware of the
+        // revocation) arrives — it must not resurrect the client or its role.
+        let stale_peer_copy = ClientConfig {
+            id: client.id.clone(),
+            name: client.name.clone(),
+            psk: client.psk,
+            vpn_ip: client.vpn_ip,
+            enabled: true,
+            created_at: client.created_at,
+            stats: ClientStats::default(),
+            qos: None,
+            device_pubkey: Some([0x22; 32]),
+            one_time: false,
+            expires_at: None,
+            updated_at: Some(client.created_at), // older than the tombstone's updated_at
+            deleted: false,
+            role: ClientRole::Admin,
+        };
+        let merged = db
+            .merge_from_json(&serde_json::to_string(&vec![stale_peer_copy]).unwrap())
+            .unwrap();
+        assert_eq!(
+            merged, 0,
+            "an older live peer record must not beat a tombstone"
+        );
+        assert!(
+            db.find_by_id(&client.id).is_none(),
+            "the client must remain revoked (invisible) after the merge"
+        );
+        let raw = db
+            .list_clients_including_deleted()
+            .into_iter()
+            .find(|c| c.id == client.id)
+            .unwrap();
+        assert!(raw.deleted, "the tombstone itself must survive");
+        assert_eq!(
+            raw.role,
+            ClientRole::Admin,
+            "the tombstone keeps whatever role it already had locally — it was not overwritten \
+             by the stale peer, and it was certainly not silently un-revoked"
+        );
+    }
+
+    #[test]
+    fn update_client_rejects_elevated_role_without_device_binding() {
+        let dir = tempfile::tempdir().unwrap();
+        let db =
+            ClientDatabase::load(&dir.path().join("clients.json"), test_network_config()).unwrap();
+        let client = db.add_client("no-device").unwrap();
+        assert!(client.device_pubkey.is_none());
+
+        for role in [ClientRole::Viewer, ClientRole::Admin] {
+            let err = db
+                .update_client(
+                    &client.id,
+                    UpdateClientParams {
+                        role: Some(role),
+                        ..Default::default()
+                    },
+                )
+                .unwrap_err();
+            assert!(
+                err.to_string().contains("device binding"),
+                "unexpected error for {:?}: {}",
+                role,
+                err
+            );
+        }
+        // Role must remain unchanged (User) after the rejected attempts.
+        assert_eq!(db.find_by_id(&client.id).unwrap().role, ClientRole::User);
+
+        // Once device-bound, elevation succeeds.
+        db.enroll_device(&client.id, &[0x33; 32]).unwrap();
+        db.update_client(
+            &client.id,
+            UpdateClientParams {
+                role: Some(ClientRole::Admin),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(db.find_by_id(&client.id).unwrap().role, ClientRole::Admin);
     }
 }

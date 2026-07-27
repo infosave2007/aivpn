@@ -119,6 +119,18 @@ pub enum ControlSubtype {
     /// key so a peer can bind/pin `node_id` to `node_pub` instead of trusting
     /// a self-asserted `node_id` string (0x23)
     NodeEnrollment = 0x23,
+    /// Server → client, sent once per session (typically piggybacked after
+    /// ratchet completion / on the Keepalive path): announces the connecting
+    /// client's server-assigned role and a reserved feature-flag bitmask so
+    /// the client UI can gate admin/viewer management affordances (0x24)
+    Capabilities = 0x24,
+    /// Client → server: an in-tunnel management API call (Phase A in-app
+    /// admin). Proxies a curated REST-shaped request (method/path/body) into
+    /// the server's `mgmt_service` layer, correlated by `req_id` (0x25)
+    MgmtRequest = 0x25,
+    /// Server → client: the response to a `MgmtRequest`, correlated by the
+    /// same `req_id` (0x26)
+    MgmtResponse = 0x26,
 }
 
 impl ControlSubtype {
@@ -159,6 +171,9 @@ impl ControlSubtype {
             0x21 => Some(Self::PoolStateDigest),
             0x22 => Some(Self::PoolBucketDigests),
             0x23 => Some(Self::NodeEnrollment),
+            0x24 => Some(Self::Capabilities),
+            0x25 => Some(Self::MgmtRequest),
+            0x26 => Some(Self::MgmtResponse),
             _ => None,
         }
     }
@@ -312,7 +327,7 @@ impl AivpnPacket {
 }
 
 /// Control message payload
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ControlPayload {
     KeyRotate {
         new_eph_pub: [u8; 32],
@@ -529,6 +544,34 @@ pub enum ControlPayload {
     /// "(авто)". Capped at 64 entries on encode.
     MaskCatalog {
         masks: Vec<(String, String, bool)>,
+    },
+    /// Server → client, sent once per session: the connecting client's
+    /// server-assigned role (see `aivpn_server::client_db::ClientRole::rank`
+    /// — 0=User, 1=Viewer, 2=Admin) and a reserved feature-flag bitmask
+    /// (currently unused, always 0) for future capability negotiation.
+    Capabilities {
+        role: u8,
+        features: u32,
+    },
+    /// Client → server: an in-tunnel management API call (Phase A in-app
+    /// admin). `method`: 0=GET, 1=POST, 2=PATCH, 3=DELETE, 4=PUT. `path` is
+    /// a curated REST-shaped path (e.g. "/api/v1/clients"), capped at 512
+    /// bytes on encode. `body` is an optional JSON payload, capped at
+    /// 262144 bytes (256 KiB) on encode. `req_id` correlates the eventual
+    /// `MgmtResponse`.
+    MgmtRequest {
+        req_id: u32,
+        method: u8,
+        path: String,
+        body: Vec<u8>,
+    },
+    /// Server → client: the response to a `MgmtRequest`, correlated by the
+    /// same `req_id`. `status` mirrors an HTTP status code (200, 403, 404,
+    /// 429, ...). `body` is capped at 262144 bytes (256 KiB) on encode.
+    MgmtResponse {
+        req_id: u32,
+        status: u16,
+        body: Vec<u8>,
     },
 }
 
@@ -817,6 +860,46 @@ impl ControlPayload {
                     buf.extend_from_slice(label_bytes);
                     buf.push(if *generated { 1 } else { 0 });
                 }
+            }
+            Self::Capabilities { role, features } => {
+                buf.push(ControlSubtype::Capabilities as u8);
+                buf.push(*role);
+                buf.extend_from_slice(&features.to_le_bytes());
+            }
+            Self::MgmtRequest {
+                req_id,
+                method,
+                path,
+                body,
+            } => {
+                let path_bytes = path.as_bytes();
+                if path_bytes.len() > 512 {
+                    return Err(Error::InvalidPacket("MgmtRequest path too long"));
+                }
+                if body.len() > 262_144 {
+                    return Err(Error::InvalidPacket("MgmtRequest body too long"));
+                }
+                buf.push(ControlSubtype::MgmtRequest as u8);
+                buf.extend_from_slice(&req_id.to_le_bytes());
+                buf.push(*method);
+                buf.extend_from_slice(&(path_bytes.len() as u16).to_le_bytes());
+                buf.extend_from_slice(path_bytes);
+                buf.extend_from_slice(&(body.len() as u32).to_le_bytes());
+                buf.extend_from_slice(body);
+            }
+            Self::MgmtResponse {
+                req_id,
+                status,
+                body,
+            } => {
+                if body.len() > 262_144 {
+                    return Err(Error::InvalidPacket("MgmtResponse body too long"));
+                }
+                buf.push(ControlSubtype::MgmtResponse as u8);
+                buf.extend_from_slice(&req_id.to_le_bytes());
+                buf.extend_from_slice(&status.to_le_bytes());
+                buf.extend_from_slice(&(body.len() as u32).to_le_bytes());
+                buf.extend_from_slice(body);
             }
         }
 
@@ -1376,6 +1459,67 @@ impl ControlPayload {
                 }
                 Ok(Self::MaskCatalog { masks })
             }
+            ControlSubtype::Capabilities => {
+                if data.len() < 6 {
+                    return Err(Error::InvalidPacket("Capabilities too short"));
+                }
+                let role = data[1];
+                let features = u32::from_le_bytes([data[2], data[3], data[4], data[5]]);
+                Ok(Self::Capabilities { role, features })
+            }
+            ControlSubtype::MgmtRequest => {
+                if data.len() < 8 {
+                    return Err(Error::InvalidPacket("MgmtRequest too short"));
+                }
+                let req_id = u32::from_le_bytes([data[1], data[2], data[3], data[4]]);
+                let method = data[5];
+                let path_len = u16::from_le_bytes([data[6], data[7]]) as usize;
+                if data.len().saturating_sub(8) < path_len {
+                    return Err(Error::InvalidPacket("MgmtRequest path truncated"));
+                }
+                let path_start = 8;
+                let path_end = path_start + path_len;
+                let path = String::from_utf8_lossy(&data[path_start..path_end]).to_string();
+                if data.len().saturating_sub(path_end) < 4 {
+                    return Err(Error::InvalidPacket("MgmtRequest missing body length"));
+                }
+                let body_len = u32::from_le_bytes([
+                    data[path_end],
+                    data[path_end + 1],
+                    data[path_end + 2],
+                    data[path_end + 3],
+                ]) as usize;
+                let body_start = path_end + 4;
+                // Overflow-safe on 32-bit targets (see PoolSync above).
+                if data.len().saturating_sub(body_start) < body_len {
+                    return Err(Error::InvalidPacket("MgmtRequest body truncated"));
+                }
+                let body = data[body_start..body_start + body_len].to_vec();
+                Ok(Self::MgmtRequest {
+                    req_id,
+                    method,
+                    path,
+                    body,
+                })
+            }
+            ControlSubtype::MgmtResponse => {
+                if data.len() < 11 {
+                    return Err(Error::InvalidPacket("MgmtResponse too short"));
+                }
+                let req_id = u32::from_le_bytes([data[1], data[2], data[3], data[4]]);
+                let status = u16::from_le_bytes([data[5], data[6]]);
+                let body_len = u32::from_le_bytes([data[7], data[8], data[9], data[10]]) as usize;
+                // Overflow-safe on 32-bit targets (see PoolSync above).
+                if data.len().saturating_sub(11) < body_len {
+                    return Err(Error::InvalidPacket("MgmtResponse body truncated"));
+                }
+                let body = data[11..11 + body_len].to_vec();
+                Ok(Self::MgmtResponse {
+                    req_id,
+                    status,
+                    body,
+                })
+            }
         }
     }
 }
@@ -1492,6 +1636,9 @@ mod tests {
             (0x21, ControlSubtype::PoolStateDigest),
             (0x22, ControlSubtype::PoolBucketDigests),
             (0x23, ControlSubtype::NodeEnrollment),
+            (0x24, ControlSubtype::Capabilities),
+            (0x25, ControlSubtype::MgmtRequest),
+            (0x26, ControlSubtype::MgmtResponse),
         ];
         for (byte, expected) in pairs {
             assert_eq!(
@@ -1502,7 +1649,7 @@ mod tests {
             );
         }
         assert_eq!(ControlSubtype::from_u8(0x00), None);
-        assert_eq!(ControlSubtype::from_u8(0x24), None);
+        assert_eq!(ControlSubtype::from_u8(0x27), None);
     }
 
     // -----------------------------------------------------------------------
@@ -2633,5 +2780,112 @@ mod tests {
                 );
             }
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Capabilities / MgmtRequest / MgmtResponse (P0.2)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn mgmt_and_caps_roundtrip() {
+        let caps = ControlPayload::Capabilities {
+            role: 2,
+            features: 0,
+        };
+        assert_eq!(
+            ControlPayload::decode(&caps.encode().unwrap()).unwrap(),
+            caps
+        );
+
+        let req = ControlPayload::MgmtRequest {
+            req_id: 7,
+            method: 2,
+            path: "/api/v1/clients".into(),
+            body: vec![1, 2, 3],
+        };
+        assert_eq!(ControlPayload::decode(&req.encode().unwrap()).unwrap(), req);
+
+        let resp = ControlPayload::MgmtResponse {
+            req_id: 7,
+            status: 201,
+            body: b"{}".to_vec(),
+        };
+        assert_eq!(
+            ControlPayload::decode(&resp.encode().unwrap()).unwrap(),
+            resp
+        );
+    }
+
+    #[test]
+    fn mgmt_response_large_body_roundtrips_intact() {
+        let body = vec![0xABu8; 40 * 1024];
+        let resp = ControlPayload::MgmtResponse {
+            req_id: 42,
+            status: 200,
+            body: body.clone(),
+        };
+        let encoded = resp.encode().unwrap();
+        let decoded = ControlPayload::decode(&encoded).unwrap();
+        match decoded {
+            ControlPayload::MgmtResponse {
+                req_id,
+                status,
+                body: decoded_body,
+            } => {
+                assert_eq!(req_id, 42);
+                assert_eq!(status, 200);
+                assert_eq!(decoded_body, body);
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mgmt_request_rejects_oversized_path_and_body_on_encode() {
+        let too_long_path = ControlPayload::MgmtRequest {
+            req_id: 1,
+            method: 0,
+            path: "a".repeat(513),
+            body: vec![],
+        };
+        assert!(too_long_path.encode().is_err());
+
+        let too_long_body = ControlPayload::MgmtRequest {
+            req_id: 1,
+            method: 0,
+            path: "/x".into(),
+            body: vec![0u8; 262_145],
+        };
+        assert!(too_long_body.encode().is_err());
+    }
+
+    #[test]
+    fn mgmt_request_truncated_bytes_return_error_not_panic() {
+        // Well-formed header claiming a path/body that the buffer doesn't
+        // actually contain must be rejected, never panic on an out-of-bounds
+        // slice.
+        let full = ControlPayload::MgmtRequest {
+            req_id: 9,
+            method: 1,
+            path: "/api/v1/status".into(),
+            body: vec![9, 9, 9, 9],
+        }
+        .encode()
+        .unwrap();
+
+        // Truncate at every prefix length and assert decode never panics and
+        // always returns Err for a genuinely incomplete buffer.
+        for cut in 1..full.len() {
+            let truncated = &full[..cut];
+            let result = std::panic::catch_unwind(|| ControlPayload::decode(truncated));
+            assert!(result.is_ok(), "decode panicked at cut={cut}");
+            assert!(
+                result.unwrap().is_err(),
+                "expected Err for truncated MgmtRequest at cut={cut}"
+            );
+        }
+
+        // Also assert a minimal too-short buffer (just the subtype byte).
+        assert!(ControlPayload::decode(&[0x25u8]).is_err());
     }
 }
