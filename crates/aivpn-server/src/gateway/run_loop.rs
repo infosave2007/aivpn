@@ -6,6 +6,26 @@
 
 use super::*;
 
+// Cadences and entry TTLs for the periodic background loops spawned by `run`
+// below. Named here so each interval's intent is visible at a glance — several
+// share a numeric value (the two 5-minute sweeps) yet are independent knobs.
+/// How often the recording store is flushed to disk.
+const RECORDING_FLUSH_INTERVAL: Duration = Duration::from_secs(5);
+/// Age past which a stale per-IP rate-limit entry is pruned.
+const RATE_LIMIT_ENTRY_TTL: Duration = Duration::from_secs(30);
+/// Age past which a stale per-IP handshake-cooldown entry is pruned.
+const HANDSHAKE_COOLDOWN_ENTRY_TTL: Duration = Duration::from_secs(60);
+/// Interval of the mask-feedback / metrics / session sweep.
+const BACKGROUND_SWEEP_INTERVAL: Duration = Duration::from_secs(300);
+/// Fast tick driving rekey retransmits (kept well below the rekey window).
+const REKEY_RETRANSMIT_TICK: Duration = Duration::from_secs(2);
+/// Interval of the client-DB traffic-stats flush.
+const CLIENT_DB_STATS_FLUSH_INTERVAL: Duration = Duration::from_secs(300);
+/// Interval of the client-DB reload / exit-route-cache invalidation check.
+const CLIENT_DB_RELOAD_INTERVAL: Duration = Duration::from_secs(10);
+/// Interval of the bootstrap-epoch rotation check (epochs advance hourly).
+const BOOTSTRAP_EPOCH_CHECK_INTERVAL: Duration = Duration::from_secs(3600);
+
 impl super::Gateway {
     /// Start the gateway
     pub async fn run(mut self) -> Result<()> {
@@ -271,7 +291,7 @@ impl super::Gateway {
             let server_config_path_cleanup = self.config.server_config_path.clone();
             tokio::spawn(async move {
                 loop {
-                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    tokio::time::sleep(RECORDING_FLUSH_INTERVAL).await;
                     if let Some(ref rec) = recorder {
                         let store = rec.store();
                         for outcome in rec.take_ready_or_stale(
@@ -303,9 +323,9 @@ impl super::Gateway {
                     // elsewhere so it grows without bound under sustained churn.
                     // Entries whose Arc strong_count == 1 have no active waiters
                     // and are safe to remove.
-                    rate_limits_cleanup.retain(|_, v| v.1.elapsed() < Duration::from_secs(30));
+                    rate_limits_cleanup.retain(|_, v| v.1.elapsed() < RATE_LIMIT_ENTRY_TTL);
                     handshake_cooldowns_cleanup
-                        .retain(|_, v| v.1.elapsed() < Duration::from_secs(60));
+                        .retain(|_, v| v.1.elapsed() < HANDSHAKE_COOLDOWN_ENTRY_TTL);
                     handshake_locks_cleanup.retain(|_, v| std::sync::Arc::strong_count(v) > 1);
                     // Prune expired MaskPreference throttle entries so this
                     // DashMap doesn't grow unbounded across session churn —
@@ -517,7 +537,7 @@ impl super::Gateway {
             let sessions_sweep = self.session_manager.clone();
             tokio::spawn(async move {
                 loop {
-                    tokio::time::sleep(Duration::from_secs(300)).await;
+                    tokio::time::sleep(BACKGROUND_SWEEP_INTERVAL).await;
                     let now_hour = current_unix_secs() / 3600;
                     let removed = mask_feedback
                         .sweep_stale(now_hour, crate::mask_feedback::DEFAULT_RETENTION_HOURS);
@@ -568,7 +588,7 @@ impl super::Gateway {
                 // — riding the 30 s tick cost a reconnect per lost packet.
                 let mut tick: u32 = 0;
                 loop {
-                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    tokio::time::sleep(REKEY_RETRANSMIT_TICK).await;
                     tick = tick.wrapping_add(1);
                     let mut due = sessions.rekey_retransmits_due();
                     if tick % 15 == 0 {
@@ -611,7 +631,7 @@ impl super::Gateway {
             let db = db.clone();
             tokio::spawn(async move {
                 loop {
-                    tokio::time::sleep(Duration::from_secs(300)).await;
+                    tokio::time::sleep(CLIENT_DB_STATS_FLUSH_INTERVAL).await;
                     db.flush_stats();
                 }
             });
@@ -629,7 +649,7 @@ impl super::Gateway {
             let exit_route_cache = self.exit_route_cache.clone();
             tokio::spawn(async move {
                 loop {
-                    tokio::time::sleep(Duration::from_secs(10)).await;
+                    tokio::time::sleep(CLIENT_DB_RELOAD_INTERVAL).await;
                     if db.reload_if_changed() {
                         exit_route_cache.clear();
                     }
@@ -653,7 +673,7 @@ impl super::Gateway {
             tokio::spawn(async move {
                 let signing_key = derive_server_signing_key(&server_private_key);
                 loop {
-                    tokio::time::sleep(Duration::from_secs(3600)).await;
+                    tokio::time::sleep(BOOTSTRAP_EPOCH_CHECK_INTERVAL).await;
                     let epoch = bootstrap_epoch(current_unix_secs());
                     if epoch == last_epoch {
                         continue;
