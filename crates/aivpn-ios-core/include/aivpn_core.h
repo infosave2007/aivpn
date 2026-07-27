@@ -67,6 +67,18 @@ typedef void (*aivpn_ready_callback_t)(const char *host, void *ctx);
 ///                       in the Swift App Group layer). A truly-first-ever
 ///                       connect with no persisted descriptor still uses the
 ///                       preset.
+/// @param mask_operator_pubkey  Optional 32-byte ed25519 verifying key used to
+///                       check the embedded operator signature on mask
+///                       artifacts pushed via MaskUpdate (R2 Phase B), or NULL
+///                       to leave it unconfigured (mirrors desktop's
+///                       --mask-operator-pubkey / config-file / connection-key
+///                       "mop" field precedence — the Swift layer resolves
+///                       which source wins before this call).
+/// @param mask_verify_mode  Optional NUL-terminated verification mode string
+///                       ("off"|"warn"|"enforce", case-insensitive), or
+///                       NULL/empty/unrecognized for the default ("warn" —
+///                       same default desktop uses with no override
+///                       configured). Never fails the call on a bad string.
 /// @return 0 on a clean rekey-triggered exit, -1 on error.
 int aivpn_run_tunnel(
     int tun_fd,
@@ -88,7 +100,9 @@ int aivpn_run_tunnel(
     const char *country_code,
     const char *prior_outcomes_json,
     const char *preferred_mask,
-    const char *cached_descriptors_json
+    const char *cached_descriptors_json,
+    const uint8_t *mask_operator_pubkey,
+    const char *mask_verify_mode
 );
 
 /// Close the active UDP socket so the tunnel loop exits immediately.
@@ -209,6 +223,13 @@ unsigned int aivpn_get_handshake_fail_streak(void);
 /// aivpn_get_attempted_mask_family() (mirrors desktop main.rs's
 /// client.ever_connected() check in the reconnect loop).
 int aivpn_ever_connected(void);
+
+/// Whether the server sent CertRejected (mTLS certificate rejected) during the
+/// most recently completed aivpn_run_tunnel call. 0 = not rejected (or no
+/// mTLS cert was configured). Poll alongside get_traffic and, when 1, prompt
+/// the user to re-provision their mTLS cert instead of retrying forever in
+/// silence.
+int aivpn_cert_was_rejected(void);
 
 /// §2 crowdsourced blocking feedback — whether a MaskFeedback control message
 /// was actually sent during the most recently completed aivpn_run_tunnel call

@@ -6,6 +6,7 @@ use aivpn_common::mask::{IATDistType, MaskProfile, SizeDistType};
 use aivpn_common::network_config::{netmask_to_prefix_len, ClientNetworkConfig, VpnNetworkConfig};
 use aivpn_server::audit_log::AuditLogger;
 use aivpn_server::backup::{export_server, import_server, ExportOptions};
+use aivpn_server::client_db::UpdateClientParams;
 #[cfg(feature = "dns")]
 use aivpn_server::dns_proxy::DnsProxyConfig;
 use aivpn_server::gateway::GatewayConfig;
@@ -204,6 +205,22 @@ async fn main() {
     }
     if let Some(ref name_or_id) = args.set_client_qos.clone() {
         handle_set_client_qos(&client_db, name_or_id, &args);
+        return;
+    }
+    if let Some(ref name_or_id) = args.enable_client.clone() {
+        handle_set_client_enabled(&client_db, name_or_id, true);
+        return;
+    }
+    if let Some(ref name_or_id) = args.disable_client.clone() {
+        handle_set_client_enabled(&client_db, name_or_id, false);
+        return;
+    }
+    if let Some(ref name_or_id) = args.set_client_name.clone() {
+        handle_set_client_name(&client_db, name_or_id, &args);
+        return;
+    }
+    if let Some(ref name_or_id) = args.set_client_expiry.clone() {
+        handle_set_client_expiry(&client_db, name_or_id, &args);
         return;
     }
     if let Some(ref name_or_id) = args.set_mask.clone() {
@@ -1172,13 +1189,42 @@ fn format_bytes(bytes: u64) -> String {
     }
 }
 
+/// Loads and parses `server.json` at startup. Deliberately LENIENT about
+/// unknown top-level keys: a config that survived one or more upgrades
+/// commonly carries a field a past release removed (e.g. `max_sessions`,
+/// `default_mask`), and refusing to boot over that is a deployment-breaking
+/// regression, not a useful guard — unlike `PUT /api/v1/config`'s validator
+/// in `management_api.rs`, which stays strict because a body submitted there
+/// is a live, operator-authored write where a stray key is almost certainly a
+/// typo. See `server_config.rs`'s module doc for the full rationale.
+///
+/// Known fields are still fully type-checked (a wrong-typed value is still a
+/// hard parse error, same as before) — only *unrecognized keys* are
+/// tolerated, and only after warning about them so the operator can clean up
+/// the file.
 fn load_server_file_config(path: Option<&str>) -> Option<ServerFileConfig> {
     let path = path?;
     let content = std::fs::read_to_string(path).unwrap_or_else(|e| {
         eprintln!("Failed to read config file '{}': {}", path, e);
         std::process::exit(1);
     });
-    Some(serde_json::from_str(&content).unwrap_or_else(|e| {
+    let value: serde_json::Value = serde_json::from_str(&content).unwrap_or_else(|e| {
+        eprintln!("Failed to parse config file '{}': {}", path, e);
+        std::process::exit(1);
+    });
+    let unknown = aivpn_server::server_config::unknown_top_level_keys(&value);
+    if !unknown.is_empty() {
+        // `tracing_subscriber` isn't initialized yet this early in `main`
+        // (it's set up after config load), so a `tracing::warn!` here would
+        // silently vanish. `eprintln!` is guaranteed visible, matching the
+        // other startup-time diagnostics in this function.
+        eprintln!(
+            "Warning: config file '{}' has unknown top-level key(s), ignoring: {}",
+            path,
+            unknown.join(", ")
+        );
+    }
+    Some(serde_json::from_value(value).unwrap_or_else(|e| {
         eprintln!("Failed to parse config file '{}': {}", path, e);
         std::process::exit(1);
     }))
@@ -1474,8 +1520,14 @@ fn handle_import(archive_path: &str, dry_run: bool, args: &ServerArgs) {
         .and_then(|p| std::path::Path::new(p).parent())
         .unwrap_or(std::path::Path::new("/etc/aivpn"));
     match import_server(std::path::Path::new(archive_path), target_dir, dry_run) {
-        Ok(()) => {
-            if dry_run {
+        Ok(summary) => {
+            if summary.dry_run {
+                println!("DRY RUN — no files will be written.");
+                println!("Backup created:  {}", summary.created_at);
+                println!("Backup version:  {}", summary.aivpn_version);
+                println!("Components:      {:?}", summary.components);
+                println!("Restore target:  {:?}", target_dir);
+                println!("Signed:          {}", summary.signed);
                 println!("✅ Dry-run complete. No files written.");
             } else {
                 println!("✅ Import complete.");
@@ -1505,8 +1557,15 @@ fn handle_set_client_qos(db: &ClientDatabase, name_or_id: &str, args: &ServerArg
     let bw_down = args.bw_down.as_deref().and_then(parse_bandwidth);
     let dscp = args.dscp.as_deref().and_then(dscp_by_name);
 
-    if bw_up.is_none() && bw_down.is_none() && dscp.is_none() && args.dscp.is_none() {
-        eprintln!("⚠  No QoS parameters specified. Use --bw-up, --bw-down, and/or --dscp.");
+    if bw_up.is_none()
+        && bw_down.is_none()
+        && dscp.is_none()
+        && args.dscp.is_none()
+        && args.priority.is_none()
+    {
+        eprintln!(
+            "⚠  No QoS parameters specified. Use --bw-up, --bw-down, --dscp, and/or --priority."
+        );
         std::process::exit(1);
     }
 
@@ -1514,7 +1573,7 @@ fn handle_set_client_qos(db: &ClientDatabase, name_or_id: &str, args: &ServerArg
         bandwidth_limit_up: bw_up,
         bandwidth_limit_down: bw_down,
         dscp_class: dscp,
-        priority: None,
+        priority: args.priority,
     };
 
     match db.set_client_qos(&client.id, qos) {
@@ -1529,9 +1588,136 @@ fn handle_set_client_qos(db: &ClientDatabase, name_or_id: &str, args: &ServerArg
             if let Some(d) = args.dscp.as_deref() {
                 println!("   DSCP class:     {}", d);
             }
+            if let Some(p) = args.priority {
+                println!("   Priority:       {}", p);
+            }
         }
         Err(e) => {
             eprintln!("❌ Failed to set QoS: {}", e);
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Resolve a client by name or ID, or print an error and exit(1).
+/// Mirrors the lookup style used by `handle_set_client_qos`.
+fn resolve_client_or_exit(
+    db: &ClientDatabase,
+    name_or_id: &str,
+) -> aivpn_server::client_db::ClientConfig {
+    db.list_clients()
+        .into_iter()
+        .find(|c| c.id == name_or_id || c.name == name_or_id)
+        .unwrap_or_else(|| {
+            eprintln!("❌ Client '{}' not found", name_or_id);
+            std::process::exit(1);
+        })
+}
+
+/// `--enable-client` / `--disable-client`: flip a client's `enabled` flag
+/// through the same `ClientDatabase::update_client` path the management API's
+/// PATCH /api/v1/clients/:id handler uses.
+fn handle_set_client_enabled(db: &ClientDatabase, name_or_id: &str, enabled: bool) {
+    let client = resolve_client_or_exit(db, name_or_id);
+    match db.update_client(
+        &client.id,
+        UpdateClientParams {
+            enabled: Some(enabled),
+            ..Default::default()
+        },
+    ) {
+        Ok(_) => println!(
+            "✅ Client '{}' ({}) {}",
+            client.name,
+            client.id,
+            if enabled { "enabled" } else { "disabled" }
+        ),
+        Err(e) => {
+            eprintln!("❌ Failed to update client: {}", e);
+            std::process::exit(1);
+        }
+    }
+}
+
+/// `--set-client-name` (with `--new-name`): rename an existing client through
+/// the same `ClientDatabase::update_client` path the management API uses.
+fn handle_set_client_name(db: &ClientDatabase, name_or_id: &str, args: &ServerArgs) {
+    let new_name = match args.new_name.as_deref() {
+        Some(n) if !n.trim().is_empty() => n,
+        _ => {
+            eprintln!("❌ --new-name is required with --set-client-name");
+            std::process::exit(1);
+        }
+    };
+    let client = resolve_client_or_exit(db, name_or_id);
+    match db.update_client(
+        &client.id,
+        UpdateClientParams {
+            name: Some(new_name.to_string()),
+            ..Default::default()
+        },
+    ) {
+        Ok(updated) => println!(
+            "✅ Client renamed: '{}' → '{}' ({})",
+            client.name, updated.name, updated.id
+        ),
+        Err(e) => {
+            eprintln!("❌ Failed to rename client: {}", e);
+            std::process::exit(1);
+        }
+    }
+}
+
+/// `--set-client-expiry` (with `--expiry`): set or clear an existing client's
+/// expiry through the same `ClientDatabase::update_client` path the
+/// management API uses. An empty `--expiry` value clears the expiry.
+fn handle_set_client_expiry(db: &ClientDatabase, name_or_id: &str, args: &ServerArgs) {
+    let expiry = match args.expiry.as_deref() {
+        Some(e) => e,
+        None => {
+            eprintln!(
+                "❌ --expiry is required with --set-client-expiry \
+                 (pass an empty string to clear an existing expiry)"
+            );
+            std::process::exit(1);
+        }
+    };
+    let expires_at = if expiry.trim().is_empty() {
+        None
+    } else {
+        match chrono::DateTime::parse_from_rfc3339(expiry) {
+            Ok(dt) => Some(dt.with_timezone(&chrono::Utc)),
+            Err(e) => {
+                eprintln!(
+                    "❌ Invalid --expiry '{}': {} (expected RFC3339, e.g. 2026-12-31T00:00:00Z)",
+                    expiry, e
+                );
+                std::process::exit(1);
+            }
+        }
+    };
+    let client = resolve_client_or_exit(db, name_or_id);
+    match db.update_client(
+        &client.id,
+        UpdateClientParams {
+            expires_at: Some(expires_at),
+            ..Default::default()
+        },
+    ) {
+        Ok(_) => {
+            if let Some(dt) = expires_at {
+                println!(
+                    "✅ Expiry set for '{}' ({}): {}",
+                    client.name,
+                    client.id,
+                    dt.to_rfc3339()
+                );
+            } else {
+                println!("✅ Expiry cleared for '{}' ({})", client.name, client.id);
+            }
+        }
+        Err(e) => {
+            eprintln!("❌ Failed to set expiry: {}", e);
             std::process::exit(1);
         }
     }
@@ -1823,6 +2009,13 @@ mod tests {
             bw_up: None,
             bw_down: None,
             dscp: None,
+            priority: None,
+            enable_client: None,
+            disable_client: None,
+            set_client_name: None,
+            new_name: None,
+            set_client_expiry: None,
+            expiry: None,
             audit_log: "/dev/null".to_string(),
             gen_ca: false,
             issue_cert: None,

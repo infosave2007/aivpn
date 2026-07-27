@@ -965,6 +965,16 @@ impl eframe::App for AivpnApp {
         let bytes_rx = self.vpn.stats().bytes_received;
         let bytes_tx = self.vpn.stats().bytes_sent;
         let quality = self.vpn.stats().quality_score;
+        // HIGH #2 (client parity): the live, possibly server-re-homed VPN IP
+        // from traffic.stats (`ip:` key) takes priority over the connection
+        // key's static, one-time-parsed IP — falls back to the latter only
+        // before the client's first stats write of the session arrives.
+        let vpn_ip_display: Option<String> = self.vpn.stats().vpn_ip.clone().or_else(|| {
+            self.keys
+                .selected_key()
+                .map(|k| k.vpn_ip.clone())
+                .filter(|s| !s.is_empty())
+        });
         // Uptime comes from the client's session epoch (`since:` in the stats
         // file, wall-clock now − since): on a silent in-child reconnect the
         // epoch changes and the stopwatch resets together with the per-session
@@ -1125,6 +1135,21 @@ impl eframe::App for AivpnApp {
                                 ui.label(
                                     egui::RichText::new(format!("→ {name}")).size(11.0).weak(),
                                 );
+                            }
+                            // HIGH #2 (client parity): show the assigned VPN
+                            // IP once connected, live-updated across a pool
+                            // re-home (see vpn_ip_display above).
+                            if is_connected {
+                                if let Some(ip) = &vpn_ip_display {
+                                    ui.label(
+                                        egui::RichText::new(format!(
+                                            "{}: {ip}",
+                                            t(lang, "vpn_ip_label")
+                                        ))
+                                        .size(11.0)
+                                        .weak(),
+                                    );
+                                }
                             }
                             // Warn when disconnected and no key is available/selected
                             if !is_connected && !is_busy {

@@ -357,6 +357,12 @@ pub fn t(lang: Lang, key: &str) -> &'static str {
             "Туннель активен, трафика нет. Проверьте aivpn-client.exe и сервер."
         }
 
+        // Assigned VPN IP (HIGH #2, client parity): live value from the
+        // client's traffic.stats `ip:` field, updated on a server pool
+        // re-home — not the connection key's static one-time-parsed IP.
+        (Lang::En, "vpn_ip_label") => "IP",
+        (Lang::Ru, "vpn_ip_label") => "IP",
+
         // Tray connect/disconnect
         (Lang::En, "tray_connect") => "Connect",
         (Lang::Ru, "tray_connect") => "Подключить",

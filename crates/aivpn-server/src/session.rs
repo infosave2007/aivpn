@@ -673,7 +673,16 @@ impl Session {
             self.pending_bytes_in = 0;
             self.pending_bytes_out = 0;
             self.is_ratcheted = true;
-            self.server_eph_pub = None;
+            // Keep `server_eph_pub` (a PUBLIC key) — the client sends its
+            // transcript-bound `DeviceEnrollment` proof immediately AFTER the
+            // ratchet, and the server must still hold this ratchet's
+            // `server_eph_pub` to recompute the expected proof (see
+            // `verify_device_enrollment_proof`). PFS only requires erasing the
+            // PRIVATE ephemeral (the `server_eph_kp` secret, already dropped
+            // after DH2 in `create_session`); retaining the public half leaks
+            // nothing. Nulling it here made the server reject every enrollment
+            // with Shutdown reason 3, killing the session right after the
+            // handshake — the whole data plane went dead.
             self.server_hello_signature = None;
         }
     }

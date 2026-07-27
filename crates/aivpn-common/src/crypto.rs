@@ -54,6 +54,13 @@ const HKDF_PRNG_SEED_CONTEXT: &str = "aivpn-prng-seed-v1";
 const PEER_DIR_C2S_CONTEXT: &str = "aivpn-peer-dir-c2s-v1";
 const PEER_DIR_S2C_CONTEXT: &str = "aivpn-peer-dir-s2c-v1";
 
+/// Domain-separation context for the device-enrollment proof-of-possession
+/// (see [`device_enrollment_proof`]). Distinct from every session-key
+/// context above so a proof can never be confused with, or substituted for,
+/// a session key even though both are derived via BLAKE3 `derive_key` from
+/// DH-shaped input.
+const DEVICE_ENROLLMENT_PROOF_CONTEXT: &str = "aivpn-device-enrollment-v2";
+
 /// Session keys derived from key exchange
 #[derive(Clone, Zeroize, ZeroizeOnDrop)]
 pub struct SessionKeys {
@@ -184,6 +191,32 @@ pub fn derive_session_keys(
         tag_secret: tag_secret_hash[..32].try_into().unwrap(),
         prng_seed: prng_seed_hash[..32].try_into().unwrap(),
     }
+}
+
+/// Compute the session-bound device-enrollment proof-of-possession.
+///
+/// `dh_shared` = X25519(static_priv, peer_static_pub) — the same value on
+/// both ends since X25519 is symmetric. The proof additionally binds this
+/// session's ephemeral handshake transcript, `server_eph_pub || client_eph_pub`
+/// (in that fixed order — both sides MUST hash them in this order, see
+/// `ControlPayload::DeviceEnrollment`'s doc comment for the canonical wire
+/// meaning), via BLAKE3 `derive_key` under a dedicated domain string. This
+/// makes the resulting 32 bytes a single-session value: an observer who
+/// captures one valid `dh_proof` off the wire, a log, or a coredump cannot
+/// replay it in a *different* session, because that session's ephemeral pair
+/// differs and the derived output changes with it. An attacker who has not
+/// recovered `static_priv` still cannot forge a valid proof for any session,
+/// since `dh_shared` remains the secret input either way.
+pub fn device_enrollment_proof(
+    dh_shared: &[u8; 32],
+    server_eph_pub: &[u8; 32],
+    client_eph_pub: &[u8; 32],
+) -> [u8; 32] {
+    let mut material = Vec::with_capacity(96);
+    material.extend_from_slice(dh_shared);
+    material.extend_from_slice(server_eph_pub);
+    material.extend_from_slice(client_eph_pub);
+    blake3::derive_key(DEVICE_ENROLLMENT_PROOF_CONTEXT, &material)
 }
 
 /// Derive one directional sub-key of a peer pair.
@@ -588,6 +621,79 @@ mod tests {
         assert_eq!(keys1.session_key, keys2.session_key);
         assert_eq!(keys1.tag_secret, keys2.tag_secret);
         assert_eq!(keys1.prng_seed, keys2.prng_seed);
+    }
+
+    #[test]
+    fn device_enrollment_proof_is_deterministic_for_same_transcript() {
+        let dh_shared = [0x11u8; 32];
+        let server_eph = [0x22u8; 32];
+        let client_eph = [0x33u8; 32];
+
+        let proof1 = device_enrollment_proof(&dh_shared, &server_eph, &client_eph);
+        let proof2 = device_enrollment_proof(&dh_shared, &server_eph, &client_eph);
+        assert_eq!(
+            proof1, proof2,
+            "same (dh_shared, transcript) must reproduce the same proof"
+        );
+    }
+
+    #[test]
+    fn device_enrollment_proof_rejects_cross_session_replay() {
+        // A proof correctly built for session A's ephemeral transcript must
+        // NOT verify against session B's transcript, even with the identical
+        // static-key DH secret — this is the whole point of the hardening:
+        // an observed proof cannot be replayed into a different session.
+        let dh_shared = [0x44u8; 32];
+        let server_a = [0x55u8; 32];
+        let client_a = [0x66u8; 32];
+        let server_b = [0x77u8; 32];
+        let client_b = [0x88u8; 32];
+
+        let proof_for_a = device_enrollment_proof(&dh_shared, &server_a, &client_a);
+        let proof_for_b = device_enrollment_proof(&dh_shared, &server_b, &client_b);
+        assert_ne!(
+            proof_for_a, proof_for_b,
+            "proofs for different session transcripts must differ"
+        );
+
+        // Recomputing what session B expects must not match A's proof.
+        let expected_for_b = device_enrollment_proof(&dh_shared, &server_b, &client_b);
+        assert_ne!(
+            proof_for_a, expected_for_b,
+            "replaying session A's proof into session B must fail verification"
+        );
+    }
+
+    #[test]
+    fn device_enrollment_proof_transcript_order_matters() {
+        // server_eph_pub || client_eph_pub must NOT equal
+        // client_eph_pub || server_eph_pub — verifies both ends really need
+        // to agree on byte order, not just on the pair of values.
+        let dh_shared = [0x99u8; 32];
+        let a = [0xAAu8; 32];
+        let b = [0xBBu8; 32];
+        let forward = device_enrollment_proof(&dh_shared, &a, &b);
+        let reversed = device_enrollment_proof(&dh_shared, &b, &a);
+        assert_ne!(
+            forward, reversed,
+            "transcript byte order must be significant"
+        );
+    }
+
+    #[test]
+    fn device_enrollment_proof_differs_from_legacy_raw_dh() {
+        // The legacy (pre-hardening) scheme sent the bare DH result as the
+        // proof. The new scheme must not collapse back to that value, or a
+        // captured legacy proof would trivially double as a valid new-scheme
+        // proof for an attacker-chosen transcript.
+        let dh_shared = [0xCCu8; 32];
+        let server_eph = [0xDDu8; 32];
+        let client_eph = [0xEEu8; 32];
+        let proof = device_enrollment_proof(&dh_shared, &server_eph, &client_eph);
+        assert_ne!(
+            proof, dh_shared,
+            "transcript-bound proof must not equal the raw legacy DH value"
+        );
     }
 
     #[test]

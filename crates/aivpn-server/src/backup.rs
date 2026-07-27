@@ -329,8 +329,28 @@ fn validate_component(rel: &str, bytes: &[u8]) -> Result<()> {
     }
 }
 
-/// Import from a backup archive. `dry_run = true` prints diff without writing.
-pub fn import_server(archive_path: &Path, target_dir: &Path, dry_run: bool) -> Result<()> {
+/// Summary of what an import did (or, for a dry run, would do) — returned to
+/// both the CLI (`--import --dry-run`) and the management API
+/// (`POST /backup/import?dry_run=true`) so both surfaces can preview a
+/// restore without writing files.
+#[derive(Debug, Clone, Serialize)]
+pub struct ImportSummary {
+    pub aivpn_version: String,
+    pub created_at: String,
+    pub components: Vec<String>,
+    /// Whether the manifest carried a verified integrity signature.
+    pub signed: bool,
+    /// True if this summary describes a dry run (no files written).
+    pub dry_run: bool,
+}
+
+/// Import from a backup archive. `dry_run = true` validates the archive and
+/// returns the summary of what would be restored, without writing any files.
+pub fn import_server(
+    archive_path: &Path,
+    target_dir: &Path,
+    dry_run: bool,
+) -> Result<ImportSummary> {
     // Pass 1: read the manifest AND every allowlisted, schema-valid
     // component into memory. Nothing is written to `target_dir` until every
     // file in the archive has been checked — a truncated or partially
@@ -446,13 +466,13 @@ pub fn import_server(archive_path: &Path, target_dir: &Path, dry_run: bool) -> R
     }
 
     if dry_run {
-        println!("DRY RUN — no files will be written.");
-        println!("Backup created:  {}", manifest.created_at);
-        println!("Backup version:  {}", manifest.aivpn_version);
-        println!("Components:      {:?}", manifest.components);
-        println!("Restore target:  {:?}", target_dir);
-        println!("Signed:          {}", manifest.mac.is_some());
-        return Ok(());
+        return Ok(ImportSummary {
+            aivpn_version: manifest.aivpn_version.clone(),
+            created_at: manifest.created_at.clone(),
+            components: manifest.components.clone(),
+            signed: manifest.mac.is_some(),
+            dry_run: true,
+        });
     }
 
     std::fs::create_dir_all(target_dir)
@@ -486,7 +506,13 @@ pub fn import_server(archive_path: &Path, target_dir: &Path, dry_run: bool) -> R
     }
 
     info!("Import complete from {:?}", archive_path);
-    Ok(())
+    Ok(ImportSummary {
+        aivpn_version: manifest.aivpn_version.clone(),
+        created_at: manifest.created_at.clone(),
+        components: manifest.components.clone(),
+        signed: manifest.mac.is_some(),
+        dry_run: false,
+    })
 }
 
 fn semver_major(v: &str) -> u64 {

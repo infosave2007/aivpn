@@ -65,6 +65,11 @@ class VPNManager: ObservableObject {
     @Published var recordingCapabilityKnown: Bool = false
     @Published var lastRecordingResult: RecordingResultSummary?
     @Published var liveQuality: Int = 0
+    /// Protocol parity #3: set when the server rejects our mTLS certificate
+    /// (CertRejected) — polled from get_traffic. A rejected cert makes the
+    /// tunnel retry forever with no other visible signal, so this drives a
+    /// one-time local notification prompting the user to re-provision.
+    @Published var certRejected: Bool = false
     /// Server-pushed mask catalog (polled from the tunnel via get_traffic).
     /// Drives the dynamic mask Picker + its "(авто)" marker.
     @Published var maskCatalog: [MaskCatalogEntry] = []
@@ -256,6 +261,7 @@ class VPNManager: ObservableObject {
                 recordingCapabilityKnown = false
                 liveQuality = 0
                 serverAdaptiveLevel = 0
+                certRejected = false
             }
         @unknown default:
             break
@@ -278,6 +284,7 @@ class VPNManager: ObservableObject {
         canRecordMasks = false
         recordingCapabilityKnown = false
         lastRecordingResult = nil
+        certRejected = false
 
         let proto = NETunnelProviderProtocol()
         proto.providerBundleIdentifier = bundleId
@@ -337,6 +344,15 @@ class VPNManager: ObservableObject {
             .trimmingCharacters(in: .whitespacesAndNewlines), !signingKey.isEmpty {
             providerConfig["server_signing_key"] = signingKey
         }
+        // R2 Phase B: operator's ed25519 mask-verifying public key — provisioned
+        // per connection key (the "mop" field), threaded the same way as
+        // server_signing_key above so PacketTunnelProvider can pass it to
+        // verify_mask_artifact via aivpn_run_tunnel. Omitted = verification
+        // stays unconfigured (mirrors desktop with no --mask-operator-pubkey).
+        if let maskOpKey = key.maskOperatorPubkey?
+            .trimmingCharacters(in: .whitespacesAndNewlines), !maskOpKey.isEmpty {
+            providerConfig["mask_operator_pubkey"] = maskOpKey
+        }
 
         let certHandoffToken: String?
         if let cert = key.mtlsCert, !cert.isEmpty {
@@ -371,6 +387,19 @@ class VPNManager: ObservableObject {
         manager.protocolConfiguration = proto
         manager.localizedDescription = "AIVPN"
         manager.isEnabled = true
+        // Client parity #5: without an on-demand rule, iOS never relaunches the
+        // tunnel after the extension is jetsam-killed or the device reboots —
+        // the user must reopen the app and tap Connect again, unlike every
+        // other platform's autostart/self-heal path. NEOnDemandRuleConnect()
+        // with the default (.any) interfaceTypeMatch asks the system to bring
+        // the tunnel up whenever a network is available. Disabled again in
+        // disconnect() below so an intentional user disconnect is never
+        // immediately fought by the system reconnecting it (the same "respect
+        // user intent" gate that toggling isOnDemandEnabled false achieves —
+        // isEnabled/isOnDemandEnabled persist in the saved profile, so this
+        // must be re-enabled on every connect(), not just the first one).
+        manager.isOnDemandEnabled = true
+        manager.onDemandRules = [NEOnDemandRuleConnect()]
 
         manager.saveToPreferences { [weak self] error in
             guard let self = self else { return }
@@ -406,6 +435,18 @@ class VPNManager: ObservableObject {
     }
 
     func disconnect() {
+        // Client parity #5: disable on-demand before stopping so the system
+        // doesn't immediately fight this intentional disconnect by bringing
+        // the tunnel back up on the next network-change evaluation —
+        // NEOnDemandRuleConnect() only applies while isOnDemandEnabled is
+        // true, and that flag persists in the saved profile independent of
+        // the stop below. Best-effort or not, stopTunnel() still fires
+        // synchronously right after — a user disconnect must never be
+        // silently delayed behind a preferences save.
+        if let manager = manager, manager.isOnDemandEnabled {
+            manager.isOnDemandEnabled = false
+            manager.saveToPreferences { _ in }
+        }
         (manager?.connection as? NETunnelProviderSession)?.stopTunnel()
     }
 
@@ -495,6 +536,12 @@ class VPNManager: ObservableObject {
             if let canRec = r["can_record"] as? Bool {
                 self.canRecordMasks = canRec
                 self.recordingCapabilityKnown = true
+            }
+            if let rejected = r["cert_rejected"] as? Bool, rejected, !self.certRejected {
+                self.certRejected = true
+                self.postNotification(
+                    title: LocalizationManager.shared.t("cert_rejected_title"),
+                    body: LocalizationManager.shared.t("cert_rejected_body"))
             }
             if let stateStr = r["recording_state"] as? String {
                 // Don't let the tunnel's "idle" overwrite terminal states the user

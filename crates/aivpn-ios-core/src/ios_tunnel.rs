@@ -29,7 +29,7 @@ use aivpn_common::client_wire::{
     build_inner_packet, build_shaped_mdh_packet, decode_downlink_any_mdh_len,
     obfuscate_client_eph_pub, process_server_hello_with_mdh_len, RecvWindow, DEFAULT_MDH_LEN,
 };
-use aivpn_common::crypto::{derive_session_keys, KeyPair, SessionKeys};
+use aivpn_common::crypto::{derive_session_keys, device_enrollment_proof, KeyPair, SessionKeys};
 use aivpn_common::error::{Error, Result};
 use aivpn_common::mask::{
     current_unix_secs, decode_bootstrap_descriptor, resolve_handshake_mask_resilient,
@@ -336,6 +336,14 @@ static ACTIVE_CONTROL_TX: Mutex<Option<mpsc::Sender<ControlPayload>>> = Mutex::n
 /// the platform layer attributes such attempts as a failure for the base
 /// mask family it requested (see `PacketTunnelProvider.swift`).
 pub static EVER_CONNECTED: AtomicBool = AtomicBool::new(false);
+/// Set when the server sends `CertRejected` (mTLS certificate rejected) this
+/// session — desktop only logs this (client.rs), leaving the mobile clients
+/// with no way to tell the platform layer "stop retrying, re-provision your
+/// cert". Swift polls this via `aivpn_cert_was_rejected()` (see lib.rs) and
+/// surfaces it to the UI. Reset at the start of every `run_tunnel_ios` call
+/// so a stale rejection from a previous attempt is never misreported for a
+/// fresh one.
+pub static CERT_REJECTED: AtomicBool = AtomicBool::new(false);
 /// Consecutive attempts that died on a handshake TIMEOUT without ever
 /// connecting, carried across `run_tunnel_ios` calls (the tunnel extension
 /// process stays alive across the Swift reconnect loop). At
@@ -758,6 +766,17 @@ pub async fn run_tunnel_ios(
     // `bootstrap_cache::select_initial_mask`). A truly-first-ever connect (no
     // persisted descriptor yet) still uses the preset — acceptable residual.
     cached_descriptors_json: Option<String>,
+    // R2 Phase B: operator's ed25519 mask-verifying public key (mirrors
+    // desktop's `ClientConfig::mask_operator_pubkey`, sourced from the same
+    // connection-key `mop` field via `ConnectionKey.maskOperatorPubkey` on the
+    // Swift side). `None` when not configured — `verify_mask_artifact` then
+    // resolves to `NoOperatorKey`/accept under `Warn`, exactly like desktop
+    // with no `--mask-operator-pubkey` set.
+    mask_operator_pubkey: Option<[u8; 32]>,
+    // R2 Phase B: config-gated enforcement level for the check above (mirrors
+    // desktop's `ClientConfig::mask_verify_mode`). Defaults to `Warn` when the
+    // platform layer passes no override, matching desktop's own default.
+    mask_verify_mode: aivpn_common::mask::MaskVerifyMode,
 ) -> Result<()> {
     let session = Arc::new(SessionRuntime::new());
     let _guard = activate_session(session.clone())?;
@@ -821,6 +840,7 @@ pub async fn run_tunnel_ios(
     // §2 crowdsourced blocking feedback — reset per-session state so a prior
     // attempt's outcome/FeedbackConfig is never misattributed to this one.
     EVER_CONNECTED.store(false, Ordering::Relaxed);
+    CERT_REJECTED.store(false, Ordering::Relaxed);
     ACTIVE_FEEDBACK_THRESHOLD.store(0, Ordering::Relaxed);
     ACTIVE_FEEDBACK_INTERVAL.store(0, Ordering::Relaxed);
     MASK_FEEDBACK_SENT.store(false, Ordering::Relaxed);
@@ -958,7 +978,17 @@ pub async fn run_tunnel_ios(
     // read, so a lost response self-heals in-band. Function-local, so a
     // reconnect (fresh run_tunnel_ios call) resets it.
     let mut rekey_response_eph: Option<[u8; 32]> = None;
-    let keepalive = ControlPayload::Keepalive { send_ts: 0 }.encode()?;
+    // Real send timestamp (mirrors desktop client.rs's warmup-burst fix):
+    // send_ts=0 made every early RTT sample the server could compute from
+    // this packet meaningless. Encoded once and resent verbatim on each
+    // handshake retry below, so the timestamp is accurate for the first send
+    // and slightly stale on a retry — still strictly better than always 0,
+    // and no client-side quality tracking reads it during the handshake wait
+    // anyway (the reply here is a ServerHello, not a KeepaliveAck).
+    let keepalive = ControlPayload::Keepalive {
+        send_ts: aivpn_common::crypto::current_timestamp_ms(),
+    }
+    .encode()?;
     {
         let obf_pub = obfuscate_client_eph_pub(&keypair, &server_key);
         let inner = build_inner_packet(InnerType::Control, send_seq, &keepalive);
@@ -979,7 +1009,7 @@ pub async fn run_tunnel_ios(
     let deadline = Instant::now() + HANDSHAKE_TIMEOUT;
     let mut retry_count: u32 = 0;
     let mut recv_win = RecvWindow::new();
-    let server_network_cfg = loop {
+    let (server_network_cfg, server_eph_pub) = loop {
         let now = Instant::now();
         if now >= deadline {
             // Feed the resilience net: a timeout here is the signature of an
@@ -1018,7 +1048,7 @@ pub async fn run_tunnel_ios(
                     mdh_len,
                     server_signing_key.as_ref(),
                 ) {
-                    Ok(cfg) => break cfg,
+                    Ok((cfg, server_eph_pub)) => break (cfg, server_eph_pub),
                     Err(e) => {
                         log::debug!("aivpn: non-ServerHello datagram during handshake — ignoring: {e}");
                     }
@@ -1056,6 +1086,15 @@ pub async fn run_tunnel_ios(
     if let Some(cfg) = server_network_cfg.as_ref() {
         ASSIGNED_VPN_IP.store(u32::from(cfg.client_ip), Ordering::Relaxed);
     }
+    // The server_eph_pub this session ratcheted against, so a mid-session
+    // ServerHello resend (see the ServerHello arm in the main receive loop
+    // below) can tell a genuine ratchet event from the server's own
+    // reliability retransmit apart — gateway.rs resends ServerHello,
+    // reusing the SAME server_eph_pub, whenever it sees a Keepalive from a
+    // session it still considers un-ratcheted (its measure for a lost
+    // post-ratchet confirmation packet). Mirrors desktop client.rs's
+    // `ratcheted_server_eph_pub` field.
+    let mut ratcheted_server_eph_pub: Option<[u8; 32]> = Some(server_eph_pub);
     // Server-derived base keepalive from the ServerHello network config
     // (mirrors android_tunnel.rs / desktop client.rs): the operator's
     // `keepalive_secs` must reach iOS too, not be silently discarded.
@@ -1109,7 +1148,10 @@ pub async fn run_tunnel_ios(
     // Early keepalive: prevent CGNAT outbound mapping expiry between last
     // handshake packet and the first upload pipeline tick.
     {
-        let ka = ControlPayload::Keepalive { send_ts: 0 }.encode()?;
+        let ka = ControlPayload::Keepalive {
+            send_ts: aivpn_common::crypto::current_timestamp_ms(),
+        }
+        .encode()?;
         let inner = build_inner_packet(InnerType::Control, send_seq, &ka);
         if let Ok(pkt) = build_shaped_mdh_packet(
             &keys,
@@ -1160,7 +1202,15 @@ pub async fn run_tunnel_ios(
                 return Err(Error::Session("Tunnel stop requested".into()));
             }
             _ = tokio::time::sleep(Duration::from_millis(100)) => {
-                if let Ok(ka) = (ControlPayload::Keepalive { send_ts: 0 }).encode() {
+                // Real send time (mirrors desktop client.rs's spawn_warmup_burst
+                // fix): the server acks EVERY keepalive, and an echo_ts=0 reply
+                // made the RTT handler fall back to the last periodic keepalive's
+                // timestamp, poisoning the quality EWMA with 100..400 ms of fake
+                // RTT right at session start.
+                if let Ok(ka) = (ControlPayload::Keepalive {
+                    send_ts: aivpn_common::crypto::current_timestamp_ms(),
+                })
+                .encode() {
                     let inner = build_inner_packet(InnerType::Control, send_seq, &ka);
                     if let Ok(pkt) = build_shaped_mdh_packet(&keys, &mut send_counter, &inner, None, mdh_len, &handshake_mask) {
                         send_seq = send_seq.wrapping_add(1);
@@ -1172,9 +1222,15 @@ pub async fn run_tunnel_ios(
     }
 
     // Device enrollment: send static key proof after ratchet (PFS-protected).
+    // dh_proof is bound to THIS session's ephemeral transcript
+    // (server_eph_pub || client_eph_pub, matching the server's
+    // verify_device_enrollment_proof) so it cannot be replayed into a
+    // different session.
     if let Some(priv_bytes) = static_privkey {
         let static_kp = KeyPair::from_private_key(priv_bytes);
-        if let Ok(dh_proof) = static_kp.compute_shared(&server_key) {
+        if let Ok(dh_shared) = static_kp.compute_shared(&server_key) {
+            let client_eph_pub = keypair.public_key_bytes();
+            let dh_proof = device_enrollment_proof(&dh_shared, &server_eph_pub, &client_eph_pub);
             let enrollment = ControlPayload::DeviceEnrollment {
                 static_pub: static_kp.public_key_bytes(),
                 dh_proof,
@@ -1937,12 +1993,11 @@ pub async fn run_tunnel_ios(
                                         continue;
                                     }
                                     if let Some(mask) = aivpn_common::mimicry::decode_mask_update(&mask_data) {
-                                        // R2 Phase B: shared artifact verification hook. The
-                                        // operator pubkey is not yet plumbed through the C FFI
-                                        // config surface, so this runs as (None, warn) — a
-                                        // silent no-op today. Once the pubkey/mode params are
-                                        // added to the FFI, only these two arguments change and
-                                        // iOS inherits the same semantics as desktop.
+                                        // R2 Phase B: shared artifact verification hook, now
+                                        // fed the real operator pubkey/mode plumbed through the
+                                        // C FFI (`mask_operator_pubkey`/`mask_verify_mode`
+                                        // params above) — iOS inherits the same semantics as
+                                        // desktop's `handle_server_control` MaskUpdate arm.
                                         //
                                         // Derived variants (`polymorphic:`/`bootstrap:` mask_id
                                         // prefix) are exempt from the artifact check ONLY when
@@ -1957,11 +2012,13 @@ pub async fn run_tunnel_ios(
                                         let artifact_ok = (mask.is_derived_variant() && transport_verified) || {
                                             let verdict = aivpn_common::mask::verify_mask_artifact(
                                                 &mask,
-                                                None,
-                                                aivpn_common::mask::MaskVerifyMode::Warn,
+                                                mask_operator_pubkey.as_ref(),
+                                                mask_verify_mode,
                                             );
                                             if !verdict.accept {
-                                                log::warn!("aivpn: MaskUpdate '{}' rejected: {:?}", mask.mask_id, verdict.detail);
+                                                log::warn!("aivpn: MaskUpdate '{}' rejected (mask_verify_mode={:?}): {:?}", mask.mask_id, mask_verify_mode, verdict.detail);
+                                            } else if verdict.is_failure() && mask_operator_pubkey.is_some() {
+                                                log::warn!("aivpn: MaskUpdate '{}' failed operator signature verification ({:?}) — accepted because mask_verify_mode=warn", mask.mask_id, verdict.detail);
                                             }
                                             verdict.accept
                                         };
@@ -1984,8 +2041,112 @@ pub async fn run_tunnel_ios(
                                         log::warn!("aivpn: MaskUpdate decode failed — ignoring");
                                     }
                                 }
+                                aivpn_common::protocol::ControlPayload::ServerHello {
+                                    server_eph_pub: resent_eph_pub,
+                                    signature,
+                                    network_config,
+                                } => {
+                                    // The server resends ServerHello (reusing the SAME
+                                    // server_eph_pub) whenever it sees a Keepalive from a
+                                    // session it still considers un-ratcheted — its own
+                                    // reliability measure for a lost post-ratchet confirmation
+                                    // packet (gateway.rs's `!session.is_ratcheted` Keepalive
+                                    // handler). Previously ServerHello had no arm here and fell
+                                    // through to the wildcard below: the client (already
+                                    // ratcheted from the pre-loop wait) never proved its ratchet
+                                    // to the server, which kept resending until the session
+                                    // either self-healed by luck or the RX-silence watchdog
+                                    // forced a full reconnect. Mirrors desktop client.rs's
+                                    // mid-session ServerHello handling.
+                                    if let Some(signing_key) = server_signing_key.as_ref() {
+                                        use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+                                        let sig_ok = match VerifyingKey::from_bytes(signing_key) {
+                                            Ok(vk) => {
+                                                let mut msg = Vec::with_capacity(64);
+                                                msg.extend_from_slice(&resent_eph_pub);
+                                                msg.extend_from_slice(&keypair.public_key_bytes());
+                                                let sig = Signature::from_bytes(&signature);
+                                                vk.verify(&msg, &sig).is_ok()
+                                            }
+                                            Err(_) => false,
+                                        };
+                                        if !sig_ok {
+                                            log::warn!("aivpn: mid-session ServerHello rejected: ed25519 signature invalid — possible MITM attack");
+                                            continue;
+                                        }
+                                    }
+
+                                    // Dedup against the eph_pub this session already ratcheted
+                                    // for: the server always resends the SAME eph_pub (it never
+                                    // creates a new ratchet event this way), so this is expected
+                                    // to be a duplicate — skip the crypto and just re-confirm.
+                                    let is_duplicate = ratcheted_server_eph_pub == Some(resent_eph_pub);
+                                    if is_duplicate {
+                                        log::debug!("aivpn: duplicate mid-session ServerHello for already-ratcheted eph_pub — re-confirming without re-ratcheting");
+                                    } else {
+                                        // Defensive parity with desktop's own dedup check: a
+                                        // server that ever behaves differently (new eph_pub) must
+                                        // not silently desync the client. Route the new keys
+                                        // through the same key_rotate_slot handoff the inline
+                                        // KeyRotate rekey above uses, so the upload task adopts
+                                        // them too — not just this receive loop's local `keys`.
+                                        match keypair.compute_shared(&resent_eph_pub) {
+                                            Ok(dh2) => {
+                                                log::info!("aivpn: mid-session ServerHello with a NEW server_eph_pub — completing PFS ratchet");
+                                                let current_key = keys.session_key;
+                                                let ratcheted = derive_session_keys(
+                                                    &dh2,
+                                                    Some(&current_key),
+                                                    &keypair.public_key_bytes(),
+                                                );
+                                                // Keep decoding old-key downlink for a grace
+                                                // window in case in-flight packets under the
+                                                // previous keys are still arriving (mirrors the
+                                                // inline-rekey transition window above).
+                                                tr_keys = Some(keys.clone());
+                                                tr_deadline = Some(Instant::now() + REKEY_TRANSITION_GRACE);
+                                                tr_hard = Some(Instant::now() + REKEY_TRANSITION_HARD_CAP);
+                                                tr_win = recv_win.clone();
+                                                keys = ratcheted;
+                                                recv_win.reset();
+                                                *key_rotate_slot.lock().unwrap_or_else(|e| e.into_inner()) =
+                                                    Some(keys.clone());
+                                                ratcheted_server_eph_pub = Some(resent_eph_pub);
+                                            }
+                                            Err(e) => {
+                                                log::warn!("aivpn: mid-session ServerHello DH failed: {e} — ignoring");
+                                                continue;
+                                            }
+                                        }
+                                    }
+
+                                    // Re-apply network config (VPN IP / keepalive) exactly like
+                                    // the pre-loop handler — the server may push an updated
+                                    // pool-assigned IP or keepalive interval on this resend too.
+                                    if let Some(cfg) = network_config.as_ref() {
+                                        ASSIGNED_VPN_IP.store(u32::from(cfg.client_ip), Ordering::Relaxed);
+                                        if let Some(ka) = cfg.keepalive_secs.filter(|&s| s > 0) {
+                                            let requested = Duration::from_secs(ka as u64);
+                                            let capped = requested.min(KEEPALIVE_NAT_CAP);
+                                            keepalive_ms.store(capped.as_millis() as u64, Ordering::Relaxed);
+                                        }
+                                    }
+
+                                    // Prod the server with fresh confirmation traffic under the
+                                    // (now) ratcheted keys so it observes the ratchet and stops
+                                    // retrying — mirrors desktop's ClientCert/DeviceEnrollment
+                                    // resend after every ServerHello (dup or not).
+                                    let _ = ctrl_tx_recv_loop.try_send(ControlPayload::Keepalive {
+                                        send_ts: aivpn_common::crypto::current_timestamp_ms(),
+                                    });
+                                }
                                 aivpn_common::protocol::ControlPayload::CertRejected {} => {
                                     log::warn!("aivpn: mTLS certificate rejected by server — re-provision your mTLS cert");
+                                    // Surface to Swift (aivpn_cert_was_rejected()) so the UI can
+                                    // prompt for re-provisioning instead of retrying forever in
+                                    // silence — desktop only logs this; mobile has no console the
+                                    // user will ever see.
+                                    CERT_REJECTED.store(true, Ordering::Relaxed);
                                 }
                                 aivpn_common::protocol::ControlPayload::RecordingAck { session_id, status } => {
                                     log::info!("aivpn: RecordingAck status={}", status);

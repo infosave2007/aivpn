@@ -2,13 +2,16 @@
   import { page } from '$app/stores';
   import { goto } from '$app/navigation';
   import { createQuery, createMutation, useQueryClient } from '@tanstack/svelte-query';
-  import { clients as clientsApi } from '$lib/api';
+  import { clients as clientsApi, masks as masksApi } from '$lib/api';
   import type { Client, ClientQos } from '$lib/api';
   import QrModal from '$lib/components/QrModal.svelte';
   import ConnectionKeyModal from '$lib/components/ConnectionKeyModal.svelte';
   import { ArrowLeft, Key, QrCode } from 'lucide-svelte';
 
-  const id = $derived($page.params.id);
+  // Route params are always populated when this component is mounted (the
+  // [id] segment matched); the `string | undefined` from the index-signature
+  // typing is a tsconfig strictness artifact, not a real possibility here.
+  const id = $derived($page.params.id as string);
   const qc = useQueryClient();
 
   const query = createQuery({
@@ -80,6 +83,27 @@
   const resetMut = createMutation({
     mutationFn: () => clientsApi.resetDevice(id),
     onSuccess: () => { toast = 'Device reset'; toastError = false; setTimeout(() => { toast = ''; }, 3000); },
+  });
+
+  // Per-client active-mask override (server: POST /api/v1/masks/active,
+  // CLI: --set-mask). Writes a <mask_dir>/.overrides/<client-id>.mask file —
+  // there is no GET endpoint to read the current override back, so the
+  // dropdown is write-only (select + apply), same as the CLI.
+  const masksQuery = createQuery({ queryKey: ['masks'], queryFn: () => masksApi.list() });
+  let selectedMask = $state('');
+
+  const setMaskMut = createMutation({
+    mutationFn: (mask: string) => masksApi.setActive(id, mask),
+    onSuccess: (res) => {
+      toast = `Active mask set to "${res.mask}"`;
+      toastError = false;
+      setTimeout(() => { toast = ''; }, 3000);
+    },
+    onError: (e: Error) => {
+      toast = e.message;
+      toastError = true;
+      setTimeout(() => { toast = ''; }, 4000);
+    },
   });
 
   let qrOpen = $state(false);
@@ -231,6 +255,29 @@
         >
           <QrCode size={16} />
           QR Code
+        </button>
+      </div>
+    </div>
+
+    <div class="bg-white dark:bg-gray-800 rounded-xl p-6 border border-gray-200 dark:border-gray-700 space-y-3">
+      <h2 class="text-base font-semibold text-gray-900 dark:text-white">Active Mask Override</h2>
+      <p class="text-sm text-gray-500 dark:text-gray-400">Force this client's traffic-mimicry mask, overriding its normal selection.</p>
+      <div class="flex gap-3">
+        <select
+          bind:value={selectedMask}
+          class="flex-1 px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-white text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500"
+        >
+          <option value="" disabled selected>Select mask…</option>
+          {#each ($masksQuery.data ?? []) as mask (mask.id)}
+            <option value={mask.id}>{mask.id}{mask.generated ? ' (auto)' : ''}</option>
+          {/each}
+        </select>
+        <button
+          onclick={() => { if (selectedMask) $setMaskMut.mutate(selectedMask); }}
+          disabled={!selectedMask || $setMaskMut.isPending}
+          class="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 disabled:opacity-50 text-white rounded-lg text-sm font-medium"
+        >
+          {$setMaskMut.isPending ? 'Applying…' : 'Apply'}
         </button>
       </div>
     </div>

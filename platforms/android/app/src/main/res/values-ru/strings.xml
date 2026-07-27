@@ -8,6 +8,7 @@
     <string name="status_reconnecting">Повторное подключение…</string>
     <string name="status_error">Ошибка: %s</string>
     <string name="status_native_lib_unavailable">Ошибка: нативная библиотека недоступна — переустановите приложение</string>
+    <string name="status_cert_rejected">Сервер отклонил сертификат — требуется повторное предоставление</string>
     <string name="btn_connect">Подключить</string>
     <string name="btn_disconnect">Отключить</string>
     <string name="hint_server">Адрес сервера</string>

@@ -163,6 +163,7 @@ class AivpnService : VpnService() {
     @Volatile private var savedServerKey: String?  = null
     @Volatile private var savedPsk: String?        = null
     @Volatile private var savedServerSigningKey: String? = null
+    @Volatile private var savedMaskOperatorPubkey: String? = null
     @Volatile private var savedMtlsCert: ByteArray? = null
     @Volatile private var savedVpnIp: String?      = null
     /** Prefs key the current profile's VPN-IP override is stored under (see [vpnIpOverrideKey]). */
@@ -356,6 +357,7 @@ class AivpnService : VpnService() {
         dnsServers: List<String> = emptyList(),
         preferredMask: String? = null,
         serverSigningKeyBase64: String? = null,
+        maskOperatorPubkeyBase64: String? = null,
     ) {
         Log.d(TAG, "startVpn: server=$serverAddr mask=${preferredMask ?: "auto"}")
 
@@ -405,6 +407,7 @@ class AivpnService : VpnService() {
             savedDnsServers == dnsServers &&
             savedMaskProfile == normalizedMask &&
             savedServerSigningKey == serverSigningKeyBase64 &&
+            savedMaskOperatorPubkey == maskOperatorPubkeyBase64 &&
             (savedMtlsCert == null && mtlsCert == null ||
              savedMtlsCert != null && mtlsCert != null && savedMtlsCert.contentEquals(mtlsCert))
         val startupInFlight = restartJob?.isActive == true
@@ -420,6 +423,7 @@ class AivpnService : VpnService() {
         savedServerKey   = serverKeyBase64
         savedPsk         = pskBase64
         savedServerSigningKey = serverSigningKeyBase64
+        savedMaskOperatorPubkey = maskOperatorPubkeyBase64
         savedMtlsCert    = mtlsCert
         // Prefer a server-assigned VPN IP remembered from an earlier session on
         // this server (pool re-home): the key still embeds the stale colliding
@@ -705,6 +709,7 @@ class AivpnService : VpnService() {
         val snapServerKey = savedServerKey
         val snapPsk = savedPsk
         val snapServerSigningKey = savedServerSigningKey
+        val snapMaskOperatorPubkey = savedMaskOperatorPubkey
         val snapMtlsCert = savedMtlsCert
 
         val (host, port) = parseServerAddr(
@@ -739,6 +744,21 @@ class AivpnService : VpnService() {
             }
             if (decoded != null && decoded.size == 32) decoded else null
         }
+        val maskOperatorPubkey: ByteArray? = snapMaskOperatorPubkey?.let {
+            val decoded = try {
+                android.util.Base64.decode(it, android.util.Base64.DEFAULT)
+            } catch (e: IllegalArgumentException) {
+                Log.w(TAG, "Mask operator pubkey is not valid base64 — ignoring")
+                null
+            }
+            if (decoded != null && decoded.size == 32) decoded else null
+        }
+        // R2 Phase B: Android has no CLI/config-file surface for mask verify mode
+        // yet, so always request the same default desktop uses absent an explicit
+        // --mask-verify-mode override (warn: log+accept on a bad/missing operator
+        // signature, never silently block a connection). A future settings toggle
+        // only needs to change this one constant.
+        val maskVerifyMode = 1 // 0=off, 1=warn, 2=enforce
 
         ensureVpnInterface()
         val activeTun = vpnInterface ?: throw Exception("VPN interface is not available")
@@ -813,6 +833,15 @@ class AivpnService : VpnService() {
                         if (rcb != null) rcb.invoke(feedback)
                         else pendingRecordingFeedback = feedback
                     }
+                    // The server rejected our mTLS client certificate — it will never
+                    // accept this one, so surface it now instead of letting the tunnel
+                    // sit "connected" while silently retrying forever. Reuses the
+                    // generic status callback (same one MainActivity observes for
+                    // connect/disconnect text) so the UI can prompt re-provisioning.
+                    if (AivpnJni.certRejected()) {
+                        Log.w(TAG, "Server rejected mTLS certificate — re-provisioning required")
+                        postStatusCallback(isEstablished, getString(R.string.status_cert_rejected))
+                    }
                 }
             }
             try {
@@ -858,6 +887,7 @@ class AivpnService : VpnService() {
                     AivpnJni.runTunnel(
                         this@AivpnService, tunFd, host, port, serverKey, psk, snapMtlsCert,
                         adaptiveLevel(), deviceKey, initialMaskArg, serverSigningKey,
+                        maskOperatorPubkey, maskVerifyMode,
                         polymorphicBase, effShareFeedback, effReceiveHints, countryCode(),
                         priorOutcomesArg, cachedDescriptorsArg,
                     )
@@ -1353,6 +1383,7 @@ class AivpnService : VpnService() {
         savedServerKey = null
         savedPsk = null
         savedServerSigningKey = null
+        savedMaskOperatorPubkey = null
         savedMtlsCert = null
         isRunning = false
         isEstablished = false
@@ -1871,6 +1902,7 @@ class AivpnService : VpnService() {
             vpnMtu          = parsed.mtu,
             mtlsCert        = mtlsCert,
             serverSigningKeyBase64 = parsed.serverSigningKey,
+            maskOperatorPubkeyBase64 = parsed.maskOperatorPubkey,
             dnsServers      = profile.dnsServers ?: emptyList(),
             preferredMask   = profile.maskProfile,
         )

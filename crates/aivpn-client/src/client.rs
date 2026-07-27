@@ -467,6 +467,15 @@ pub struct AivpnClient {
     // Traffic counters
     bytes_sent: Arc<AtomicU64>,
     bytes_received: Arc<AtomicU64>,
+    /// Client's currently-effective VPN IP (the `client_ip` half of the last
+    /// applied `ClientNetworkConfig`). Seeded from the static key's `i` field
+    /// at construction and updated live by `apply_server_network_override` on
+    /// every server-confirmed network change, including a pool re-home that
+    /// assigns a different IP than the key's. Shared with the stats-writer
+    /// task (below) so file-based GUIs (Windows, whose child stdout is piped
+    /// to `Stdio::null()`) can observe the re-home the same way Linux's
+    /// stdout `AIVPN-STATUS` line does.
+    current_vpn_ip: Arc<Mutex<String>>,
     // Pre-allocated buffers for zero-copy I/O (OPTIMIZATION)
     _send_buf: Vec<u8>,
     _recv_buf: Vec<u8>,
@@ -568,6 +577,7 @@ impl AivpnClient {
         let recv_mdh_len = packet_mdh_len_for_mask(&config.initial_mask);
         let bytes_sent = Arc::new(AtomicU64::new(0));
         let bytes_received = Arc::new(AtomicU64::new(0));
+        let initial_vpn_ip = config.tun_config.tun_addr.clone();
 
         let static_keypair = load_or_generate_static_keypair();
         let initial_adaptive_level = config.initial_adaptive_level;
@@ -625,6 +635,7 @@ impl AivpnClient {
             recv_mdh_candidates: vec![recv_mdh_len],
             bytes_sent: bytes_sent.clone(),
             bytes_received: bytes_received.clone(),
+            current_vpn_ip: Arc::new(Mutex::new(initial_vpn_ip)),
             // Pre-allocate buffers to MAX_PACKET_SIZE to avoid reallocations
             _send_buf: Vec::with_capacity(MAX_PACKET_SIZE),
             _recv_buf: Vec::with_capacity(MAX_PACKET_SIZE),
@@ -944,8 +955,28 @@ impl AivpnClient {
                 .apply_network_config(network_config.clone())
                 .await?;
         }
+        // Ipv4Addr is Copy — capture before `network_config` moves into
+        // `from_network_config` below.
+        let new_client_ip = network_config.client_ip;
         self.config.tun_config =
             TunnelConfig::from_network_config(tun_name, network_config, full_tunnel);
+
+        // HIGH #2 (client parity): this override just applied a genuinely
+        // different network config — either the first server confirmation of
+        // this session, or a pool re-home to a different server-assigned VPN
+        // IP than the one derived from the static key. Publish the new IP on
+        // both channels the GUIs consume: the shared value read by the
+        // stats-writer task's traffic.stats `ip:` field (Windows pipes the
+        // child's stdout to Stdio::null(), so it can only observe this via
+        // the stats file), and the "AIVPN-STATUS connected <ip>" stdout line
+        // the Linux GUI already parses (previously never emitted — it only
+        // had an unreachable doc comment describing this exact protocol).
+        *self
+            .current_vpn_ip
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = new_client_ip.to_string();
+        println!("AIVPN-STATUS connected {}", new_client_ip);
+
         Ok(())
     }
 
@@ -1380,6 +1411,7 @@ impl AivpnClient {
         let stats_shutdown = shutdown.clone();
         let stats_bytes_sent = self.bytes_sent.clone();
         let stats_bytes_received = self.bytes_received.clone();
+        let stats_current_vpn_ip = self.current_vpn_ip.clone();
         let stats_task = tokio::spawn(async move {
             // Determine platform-appropriate stats paths
             #[cfg(target_os = "windows")]
@@ -1415,7 +1447,14 @@ impl AivpnClient {
             // process can write. Uses spawn_blocking (mirroring what
             // tokio::fs::write already does internally) since the hardened
             // write is a handful of sync syscalls, not the tokio async-fs API.
-            let initial = format!("sent:0,received:0,since:{}", session_since_ms);
+            let initial_ip = stats_current_vpn_ip
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            let initial = format!(
+                "sent:0,received:0,since:{},ip:{}",
+                session_since_ms, initial_ip
+            );
             for path in &stats_paths {
                 let p = path.clone();
                 let data = initial.clone();
@@ -1434,9 +1473,18 @@ impl AivpnClient {
                 }
                 let sent = stats_bytes_sent.load(Ordering::Relaxed);
                 let received = stats_bytes_received.load(Ordering::Relaxed);
+                // Re-read on every tick (not just once at task start): a pool
+                // re-home updates `current_vpn_ip` live via
+                // `apply_server_network_override` while this task keeps
+                // running, so the stats file must reflect the change within
+                // one tick for file-polling GUIs (Windows) to pick it up.
+                let ip = stats_current_vpn_ip
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone();
                 let stats = format!(
-                    "sent:{},received:{},since:{}",
-                    sent, received, session_since_ms
+                    "sent:{},received:{},since:{},ip:{}",
+                    sent, received, session_since_ms, ip
                 );
                 for path in &stats_paths {
                     let p = path.clone();
@@ -2672,9 +2720,20 @@ impl AivpnClient {
 
                 // Device enrollment: prove static key ownership to server.
                 // Sent after ratchet so it is protected by PFS session keys.
+                // dh_proof is bound to THIS session's ephemeral transcript
+                // (server_eph_pub || client_eph_pub, matching the server's
+                // verify_device_enrollment_proof) so it cannot be replayed
+                // into a different session — see
+                // crypto::device_enrollment_proof for the scheme.
                 if let Some(ref skp) = self.static_keypair {
                     match skp.compute_shared(&self.config.server_public_key) {
-                        Ok(dh_proof) => {
+                        Ok(dh_shared) => {
+                            let client_eph_pub = self.keypair.public_key_bytes();
+                            let dh_proof = crypto::device_enrollment_proof(
+                                &dh_shared,
+                                &server_eph_pub,
+                                &client_eph_pub,
+                            );
                             let enrollment = ControlPayload::DeviceEnrollment {
                                 static_pub: skp.public_key_bytes(),
                                 dh_proof,

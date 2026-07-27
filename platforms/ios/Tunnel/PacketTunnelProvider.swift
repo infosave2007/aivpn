@@ -209,6 +209,30 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             return
         }
 
+        // R2 Phase B: operator's ed25519 mask-verifying public key (base64, 32
+        // bytes) for MaskUpdate artifact signature checks — sourced from the
+        // connection key's "mop" field via ConnectionKey.maskOperatorPubkey
+        // (App target), threaded through providerConfiguration exactly like
+        // server_signing_key above. Same fail-closed-on-malformed rule.
+        let maskOperatorPubkeyB64 = (cfg["mask_operator_pubkey"] as? String ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let maskOperatorPubkey: [UInt8]?
+        if maskOperatorPubkeyB64.isEmpty {
+            maskOperatorPubkey = nil
+        } else if let data = Data(base64Encoded: maskOperatorPubkeyB64), data.count == 32 {
+            maskOperatorPubkey = Array(data)
+        } else {
+            completionHandler(makeError("invalid mask operator public key (expected base64-encoded 32 bytes)"))
+            return
+        }
+        // R2 Phase B: verification mode ("off"|"warn"|"enforce"). No UI sets
+        // this today — an unset/absent value falls through to the Rust side's
+        // own default ("warn"), matching desktop's default with no
+        // --mask-verify-mode/config override. Left as a providerConfiguration
+        // string (like preferred_mask) so a future settings screen is a
+        // one-line addition rather than a new FFI parameter.
+        let maskVerifyMode = cfg["mask_verify_mode"] as? String ?? ""
+
         // Create socketpair: sp[0] = Swift side, sp[1] = Rust side
         var fds: [Int32] = [-1, -1]
         guard socketpair(AF_UNIX, SOCK_DGRAM, 0, &fds) == 0 else {
@@ -443,6 +467,8 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                                                 // unsetenv above enforces.
                                                 withOptionalCString(polymorphicActive ? nil : mask) { maskPtr in
                                                 withOptionalCString(cachedDescriptorsJson) { cachedDescPtr in
+                                                withOptional(maskOperatorPubkey) { mopPtr in
+                                                withOptionalCString(maskVerifyMode) { mvmPtr in
                                                 _ = aivpn_run_tunnel(rustFd, host, Int32(port),
                                                                      sKeyPtr.baseAddress!, pskPtr,
                                                                      certPtr, certCount,
@@ -456,7 +482,11 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                                                                      countryPtr,
                                                                      priorPtr,
                                                                      maskPtr,
-                                                                     cachedDescPtr)
+                                                                     cachedDescPtr,
+                                                                     mopPtr,
+                                                                     mvmPtr)
+                                                }
+                                                }
                                                 }
                                                 }
                                             }
@@ -647,6 +677,10 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                 // Server-pushed mask catalog (JSON array string, "" until received)
                 // so the app's Picker can render a live list + "(авто)" marker.
                 "mask_catalog":    readCString(capacity: 8192) { aivpn_get_mask_catalog_json($0, $1) } ?? "",
+                // Protocol parity #3: surfaces a server-side mTLS CertRejected
+                // this session so VPNManager can prompt the user to
+                // re-provision instead of the tunnel silently retrying forever.
+                "cert_rejected":   aivpn_cert_was_rejected() != 0,
             ]
             completionHandler?(serialize(resp))
 
@@ -963,6 +997,32 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             // each domain to its current IP(s) and adding those as excludedRoutes, which is
             // a much larger, ongoing-resolution feature outside this fix's scope.
             settings.dnsSettings = dns
+        }
+
+        // H1: IPv6 leak guard (full-tunnel only). The Rust data path only ever
+        // handles IPv4 — the TUN reader in ios_tunnel.rs drops any packet whose
+        // version nibble isn't 4 — so without ANY NEIPv6Settings a dual-stack
+        // network lets IPv6 traffic exit around the tunnel on the physical
+        // interface while the user believes they are fully tunneled. Every
+        // other platform already defends this: the macOS helper installs a
+        // system `route -inet6 -net ::/0 -blackhole` (aivpn-helper/main.swift),
+        // and Android assigns a private ULA + captures the default v6 route
+        // into the VPN interface (AivpnService.kt) — the same shape used here.
+        // A private, non-dialable ULA address is required because
+        // NEIPv6Settings(addresses:networkPrefixLengths:) takes non-optional
+        // arrays (Apple docs), so at least one address must be supplied even
+        // though nothing ever legitimately reaches it: capturing the default
+        // route (::/0) into the tunnel interface is what matters — the Rust
+        // core silently discards every packet that arrives here, which is
+        // functionally the same "blackhole" outcome as the system route used
+        // on macOS. Split-tunnel mode intentionally leaves IPv6 untouched (no
+        // ipv6Settings assigned) — the user opted out of full capture there,
+        // so v6 must not be restricted beyond that either, mirroring how the
+        // IPv4 branch above only routes the VPN subnet in split-tunnel mode.
+        if fullTunnel {
+            let ipv6 = NEIPv6Settings(addresses: ["fd00::2"], networkPrefixLengths: [NSNumber(value: 64)])
+            ipv6.includedRoutes = [NEIPv6Route.default()]
+            settings.ipv6Settings = ipv6
         }
         return settings
     }

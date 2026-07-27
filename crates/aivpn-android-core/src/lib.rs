@@ -16,8 +16,8 @@ use android_tunnel::{
     get_active_upload_bytes, run_tunnel_android, send_control_payload, stop_active_tunnel,
     take_recording_feedback_json, ACTIVE_ADAPTIVE_LEVEL, ACTIVE_FEEDBACK_INTERVAL,
     ACTIVE_FEEDBACK_THRESHOLD, ACTIVE_MASK_CATALOG_JSON, ACTIVE_QUALITY_SCORE,
-    ACTIVE_REGIONAL_HINTS_JSON, ASSIGNED_VPN_IP, ATTEMPTED_MASK_FAMILY, EVER_CONNECTED,
-    MASK_CATALOG_SEQ, MASK_FEEDBACK_SENT, REGIONAL_HINTS_SEQ,
+    ACTIVE_REGIONAL_HINTS_JSON, ASSIGNED_VPN_IP, ATTEMPTED_MASK_FAMILY, CERT_REJECTED,
+    EVER_CONNECTED, MASK_CATALOG_SEQ, MASK_FEEDBACK_SENT, REGIONAL_HINTS_SEQ,
 };
 
 use std::sync::atomic::Ordering;
@@ -44,6 +44,15 @@ use jni::JNIEnv;
 ///     serverSigningKey: ByteArray?, // 32 bytes ed25519 verifying key, or null to skip
 ///                                   // ServerHello signature verification (opt-in,
 ///                                   // matching desktop's --server-signing-key)
+///     maskOperatorPubkey: ByteArray?, // 32 bytes ed25519 verifying key for
+///                                   // artifact-level MaskUpdate signature
+///                                   // verification (the "mop" connection-key
+///                                   // field), or null to skip — matching
+///                                   // desktop's --mask-operator-pubkey
+///     maskVerifyMode: Int,          // 0=off, 1=warn, 2=enforce; matches desktop's
+///                                   // --mask-verify-mode (any other value is
+///                                   // treated as warn, the same default desktop
+///                                   // uses absent an explicit override)
 ///     polymorphicBase: String?,     // §3 base mask id to request a per-session
 ///                                   // polymorphic variant of, or null to disable
 ///     shareMaskFeedback: Boolean,   // §2 opt-in: report mask success/fail outcomes
@@ -70,10 +79,12 @@ pub extern "system" fn Java_com_aivpn_client_AivpnJni_runTunnel<'local>(
     static_privkey_obj: JObject<'local>, // nullable JByteArray — device binding key
     mask_name_obj: JObject<'local>,      // nullable JString — preferred mask profile name
     server_signing_key_obj: JObject<'local>, // nullable JByteArray — ed25519 verifying key
-    polymorphic_base_obj: JObject<'local>, // nullable JString — §3 polymorphic base mask id
-    share_mask_feedback: jni::sys::jboolean, // §2 opt-in: report mask outcomes
-    receive_mask_hints: jni::sys::jboolean, // §2 opt-in: accept server region hints
-    country_code_obj: JObject<'local>,   // nullable JString — 2-letter ISO-3166-1 code
+    mask_operator_pubkey_obj: JObject<'local>, // nullable JByteArray — mask-operator ed25519 verifying key ("mop")
+    mask_verify_mode_int: jint,                // 0=off, 1=warn (default), 2=enforce
+    polymorphic_base_obj: JObject<'local>,     // nullable JString — §3 polymorphic base mask id
+    share_mask_feedback: jni::sys::jboolean,   // §2 opt-in: report mask outcomes
+    receive_mask_hints: jni::sys::jboolean,    // §2 opt-in: accept server region hints
+    country_code_obj: JObject<'local>,         // nullable JString — 2-letter ISO-3166-1 code
     prior_outcomes_json_obj: JObject<'local>, // nullable JString — §2 prior unreported outcomes (JSON)
     cached_descriptors_json_obj: JObject<'local>, // nullable JString — app-persisted signed bootstrap descriptors (JSON array)
 ) -> jstring {
@@ -210,6 +221,51 @@ pub extern "system" fn Java_com_aivpn_client_AivpnJni_runTunnel<'local>(
         }
     };
 
+    // R2 Phase B: operator mask-verifying public key ("mop" connection-key
+    // field) — same 32-byte-optional-byte-array shape as server_signing_key
+    // above, but feeds `verify_mask_artifact` instead of ServerHello/transport
+    // signature checks (see android_tunnel.rs's `mask_operator_pubkey` doc).
+    let mask_operator_pubkey: Option<[u8; 32]> = if mask_operator_pubkey_obj.is_null() {
+        None
+    } else {
+        match env.is_instance_of(&mask_operator_pubkey_obj, "[B") {
+            Ok(true) => {}
+            Ok(false) => {
+                return make_str(
+                    &mut env,
+                    "mask_operator_pubkey must be a byte array (byte[])",
+                )
+            }
+            Err(e) => {
+                return make_str(
+                    &mut env,
+                    &format!("mask_operator_pubkey type check failed: {e}"),
+                )
+            }
+        }
+        let arr: JByteArray<'local> =
+            unsafe { JByteArray::from_raw(mask_operator_pubkey_obj.as_raw()) };
+        match env.convert_byte_array(&arr) {
+            Ok(b) if b.len() == 32 => {
+                let mut out = [0u8; 32];
+                out.copy_from_slice(&b);
+                Some(out)
+            }
+            Ok(b) => {
+                return make_str(
+                    &mut env,
+                    &format!("mask_operator_pubkey must be 32 bytes, got {}", b.len()),
+                )
+            }
+            Err(e) => return make_str(&mut env, &format!("bad mask_operator_pubkey: {e}")),
+        }
+    };
+    let mask_verify_mode: aivpn_common::mask::MaskVerifyMode = match mask_verify_mode_int {
+        0 => aivpn_common::mask::MaskVerifyMode::Off,
+        2 => aivpn_common::mask::MaskVerifyMode::Enforce,
+        _ => aivpn_common::mask::MaskVerifyMode::Warn,
+    };
+
     let preferred_mask: Option<String> = if mask_name_obj.is_null() {
         None
     } else {
@@ -344,6 +400,8 @@ pub extern "system" fn Java_com_aivpn_client_AivpnJni_runTunnel<'local>(
             static_privkey,
             preferred_mask,
             server_signing_key,
+            mask_operator_pubkey,
+            mask_verify_mode,
             polymorphic_base,
             share_mask_feedback,
             receive_mask_hints,
@@ -454,6 +512,21 @@ pub extern "system" fn Java_com_aivpn_client_AivpnJni_getAssignedVpnIp(
     // empty string (after clearing the pending exception) instead of handing
     // a null jstring to a Kotlin `external fun` declared non-null String.
     make_str(&mut env, &s)
+}
+
+/// Returns `true` (and atomically clears the flag) if the server sent
+/// `CertRejected` (mTLS client certificate rejected) at any point since the
+/// last call — poll this live during a session (like `getAssignedVpnIp`), not
+/// just after `runTunnel` returns, since the server keeps the tunnel up while
+/// rejecting the cert rather than tearing it down. A `true` result means the
+/// current certificate will never be accepted by this server; the caller
+/// should prompt the user to re-provision instead of waiting for a timeout.
+#[no_mangle]
+pub extern "system" fn Java_com_aivpn_client_AivpnJni_certRejected(
+    _env: JNIEnv,
+    _class: JClass,
+) -> jni::sys::jboolean {
+    CERT_REJECTED.swap(false, Ordering::Relaxed) as jni::sys::jboolean
 }
 
 // ──────────────────────────────────────────────────────────

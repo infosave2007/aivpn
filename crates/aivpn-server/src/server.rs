@@ -126,6 +126,37 @@ pub struct ServerArgs {
     #[arg(long, value_name = "CLASS")]
     pub dscp: Option<String>,
 
+    /// Priority hint for --set-client-qos: 0 = default, 1 = high, 2 = low.
+    #[arg(long, value_name = "0-N")]
+    pub priority: Option<u8>,
+
+    // ── Per-client management (enable/disable/rename/expiry) ───────────────────
+    /// Enable an existing client (by name or ID).
+    #[arg(long, value_name = "NAME_OR_ID")]
+    pub enable_client: Option<String>,
+
+    /// Disable an existing client (by name or ID). Disabled clients are
+    /// rejected at handshake but keep their record (unlike --remove-client).
+    #[arg(long, value_name = "NAME_OR_ID")]
+    pub disable_client: Option<String>,
+
+    /// Rename an existing client (by name or ID). Use with --new-name.
+    #[arg(long, value_name = "NAME_OR_ID")]
+    pub set_client_name: Option<String>,
+
+    /// New name to apply with --set-client-name.
+    #[arg(long, value_name = "NAME")]
+    pub new_name: Option<String>,
+
+    /// Set or clear an existing client's expiry (by name or ID). Use with --expiry.
+    #[arg(long, value_name = "NAME_OR_ID")]
+    pub set_client_expiry: Option<String>,
+
+    /// Expiry timestamp in RFC3339 (e.g. 2026-12-31T00:00:00Z) for --set-client-expiry.
+    /// Pass an empty string to clear an existing expiry.
+    #[arg(long, value_name = "RFC3339-OR-EMPTY")]
+    pub expiry: Option<String>,
+
     // ── Audit Log ──────────────────────────────────────────────────────────────
     /// Path to the append-only admin audit log (JSONL format).
     #[arg(

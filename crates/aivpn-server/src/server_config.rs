@@ -7,9 +7,26 @@
 //! real schema and either rejected valid configs or accepted configs that
 //! bricked the next start (`load_server_file_config` exits on parse failure).
 //!
-//! `deny_unknown_fields` makes typo'd top-level keys a hard parse error in
-//! both places, so the API rejects them with a clear message instead of the
-//! server silently ignoring (or fatally rejecting) them later.
+//! Unknown-top-level-key handling is intentionally **asymmetric** between the
+//! two call sites, because they represent different trust levels:
+//!
+//! - **Startup load** (`main.rs::load_server_file_config`) is **lenient**: an
+//!   on-disk `server.json` surviving an upgrade commonly carries a field a
+//!   past release removed (e.g. `max_sessions`, `default_mask`). Refusing to
+//!   boot over a stale key is a deployment-breaking regression, not a
+//!   security win, so the loader parses known fields and only *warns* about
+//!   the rest.
+//! - **`PUT /api/v1/config`** stays **strict**: a body submitted through the
+//!   API (typically the web panel) is a live, operator-authored write, so an
+//!   unrecognized key is almost certainly a typo. The handler rejects it with
+//!   `400` via an explicit key-name check (see `unknown_top_level_keys`)
+//!   instead of relying on `#[serde(deny_unknown_fields)]`, since serde has
+//!   no way to make that attribute apply to only one of the two call sites on
+//!   the same struct.
+//!
+//! Both paths still type-check every known field the normal way — a
+//! wrong-typed value (`"listen_addr": 443`) is a hard parse error in both
+//! places, same as before.
 
 use std::net::Ipv4Addr;
 
@@ -94,10 +111,18 @@ pub struct PolymorphicFileConfig {
 }
 
 /// Top-level `server.json` schema. This is THE schema: the management API's
-/// `PUT /api/v1/config` accepts a body iff it deserializes into this struct,
-/// which is also exactly what the server parses at startup.
+/// `PUT /api/v1/config` accepts a body iff it deserializes into this struct
+/// AND has no unrecognized top-level keys (checked separately via
+/// `unknown_top_level_keys`, see the module doc), which is also exactly what
+/// the server parses at startup (minus the unknown-key rejection — startup
+/// only warns, see `main.rs::load_server_file_config`).
+///
+/// No `#[serde(deny_unknown_fields)]` here on purpose: it would make startup
+/// hard-fail on any stale/removed key left over in an on-disk config from a
+/// previous release, which is a deployment-breaking regression, not a useful
+/// guard. Unknown-key rejection is applied explicitly, and only on the API
+/// write path, via `unknown_top_level_keys`.
 #[derive(Debug, Clone, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct ServerFileConfig {
     pub listen_addr: Option<String>,
     pub tun_name: Option<String>,
@@ -177,6 +202,57 @@ pub struct ServerFileConfig {
     pub mask_verify_mode: Option<String>,
 }
 
+/// Every top-level key `ServerFileConfig` currently understands. Kept next to
+/// the struct (not derived — serde/Rust have no cheap reflection for this) so
+/// a field addition is one glance away from updating this list too; the
+/// `known_keys_cover_shipped_example` test below catches drift against the
+/// shipped example the moment it's missed, the same way the old ad-hoc
+/// allowlist silently didn't.
+pub const CONFIG_KNOWN_KEYS: &[&str] = &[
+    "listen_addr",
+    "tun_name",
+    "tun_addr",
+    "tun_netmask",
+    "network_config",
+    "mask_dir",
+    "bootstrap_mask_files",
+    "session_timeout_secs",
+    "idle_timeout_secs",
+    "tun_mtu",
+    "pool",
+    "management_socket",
+    "site_to_site",
+    "mtls",
+    "dns",
+    "allow_peer_routing",
+    "downlink_shaping",
+    "neural_enabled",
+    "neural",
+    "bootstrap_publish",
+    "feedback",
+    "polymorphic",
+    "mask_signing_key",
+    "mask_operator_pubkey",
+    "mask_verify_mode",
+];
+
+/// Top-level keys of `value` that aren't in `CONFIG_KNOWN_KEYS`, sorted. Empty
+/// (never an error) for a non-object `value` — structural validation of the
+/// body is the caller's job. Used by the startup loader to warn, and by
+/// `PUT /api/v1/config` to reject.
+pub fn unknown_top_level_keys(value: &serde_json::Value) -> Vec<String> {
+    let Some(obj) = value.as_object() else {
+        return Vec::new();
+    };
+    let mut unknown: Vec<String> = obj
+        .keys()
+        .filter(|k| !CONFIG_KNOWN_KEYS.contains(&k.as_str()))
+        .cloned()
+        .collect();
+    unknown.sort();
+    unknown
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -202,17 +278,51 @@ mod tests {
         assert!(cfg.polymorphic.is_some());
     }
 
-    /// Typo'd top-level keys must be a parse error (deny_unknown_fields), so
-    /// the API rejects them instead of the server silently ignoring them.
+    /// Guards `CONFIG_KNOWN_KEYS` against drift the same way the old ad-hoc
+    /// allowlist drifted: every top-level key the shipped example actually
+    /// uses must be recognized, or `PUT /api/v1/config` would 400 the stock
+    /// config the moment a field is added to the struct but not the list.
     #[test]
-    fn unknown_top_level_key_is_rejected() {
-        let err = serde_json::from_str::<ServerFileConfig>(r#"{ "listen_adr": "0.0.0.0:443" }"#)
-            .unwrap_err();
-        assert!(err.to_string().contains("listen_adr"), "{err}");
+    fn known_keys_cover_shipped_example() {
+        let value: serde_json::Value = serde_json::from_str(EXAMPLE).unwrap();
+        let unknown = unknown_top_level_keys(&value);
+        assert!(
+            unknown.is_empty(),
+            "server.json.example has keys missing from CONFIG_KNOWN_KEYS: {unknown:?}"
+        );
     }
 
-    /// Wrong-typed values must be a parse error — a valid-key/wrong-type body
-    /// previously passed the key-name allowlist and bricked the next start.
+    /// Startup-style lenient parse (no `deny_unknown_fields`): an unknown
+    /// top-level key — e.g. a field a past release removed, left behind in an
+    /// on-disk config after an upgrade — must NOT be a parse error. This is
+    /// the regression this schema previously reintroduced: the server used to
+    /// exit at startup on any stale key.
+    #[test]
+    fn lenient_parse_accepts_unknown_top_level_key() {
+        let cfg: ServerFileConfig = serde_json::from_str(
+            r#"{ "listen_addr": "127.0.0.1:1", "max_sessions": 500, "default_mask": "webrtc_zoom_v3" }"#,
+        )
+        .expect("unknown top-level keys must not fail the lenient (startup) parse");
+        assert_eq!(cfg.listen_addr.as_deref(), Some("127.0.0.1:1"));
+    }
+
+    /// API-style strict validation: `unknown_top_level_keys` (used by
+    /// `PUT /api/v1/config`) must flag a typo'd/unknown key so the handler can
+    /// reject it with 400 — the point of the original fix this schema is
+    /// meant to preserve, just moved out of `deny_unknown_fields`.
+    #[test]
+    fn unknown_top_level_key_is_rejected_by_strict_key_check() {
+        let value: serde_json::Value =
+            serde_json::from_str(r#"{ "listen_adr": "0.0.0.0:443" }"#).unwrap();
+        let unknown = unknown_top_level_keys(&value);
+        assert_eq!(unknown, vec!["listen_adr".to_string()]);
+    }
+
+    /// Wrong-typed values must be a parse error on both paths — a
+    /// valid-key/wrong-type body previously passed the key-name allowlist and
+    /// bricked the next start. This still holds without `deny_unknown_fields`
+    /// since it's ordinary per-field type checking, unaffected by unknown-key
+    /// handling.
     #[test]
     fn wrong_typed_field_is_rejected() {
         assert!(serde_json::from_str::<ServerFileConfig>(r#"{ "listen_addr": 443 }"#).is_err());

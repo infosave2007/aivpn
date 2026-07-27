@@ -387,7 +387,16 @@ pub enum ControlPayload {
     CertRejected {},
     /// Device enrollment — client proves ownership of its static X25519 keypair.
     /// Sent by client after ServerHello using ratcheted session keys.
-    /// `dh_proof` = X25519(static_priv, server_static_pub) — proves private key possession.
+    ///
+    /// `dh_proof` = `device_enrollment_proof(dh_shared, server_eph_pub, client_eph_pub)`
+    /// (see `aivpn_common::crypto::device_enrollment_proof`), where
+    /// `dh_shared = X25519(static_priv, server_static_pub)` proves private-key
+    /// possession, and `server_eph_pub || client_eph_pub` (THIS FIXED ORDER on
+    /// both ends) is the ephemeral pair this session's PFS handshake used —
+    /// binding the proof to the session so a captured `dh_proof` cannot be
+    /// replayed into a different session. The server verifies ONLY this
+    /// transcript-bound value — see `verify_device_enrollment_proof` in
+    /// `aivpn-server/src/gateway.rs`.
     DeviceEnrollment {
         static_pub: [u8; 32],
         dh_proof: [u8; 32],

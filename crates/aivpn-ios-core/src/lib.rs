@@ -79,6 +79,18 @@ pub unsafe extern "C" fn aivpn_run_tunnel(
     // descriptor mask instead of a public preset. Mirrors Android's
     // `cachedDescriptorsJson`; persistence lives in the Swift App Group layer.
     cached_descriptors_json: *const libc::c_char,
+    // R2 Phase B: operator's ed25519 mask-verifying public key (32 bytes), or
+    // NULL to leave mask artifact verification unconfigured (mirrors
+    // desktop's --mask-operator-pubkey / config-file / connection-key `mop`
+    // field precedence — the Swift layer resolves which one wins before this
+    // call). NULL means `verify_mask_artifact` sees `NoOperatorKey`, matching
+    // desktop's own behavior with no operator key configured.
+    mask_operator_pubkey: *const u8,
+    // R2 Phase B: NUL-terminated verification mode string ("off"|"warn"|
+    // "enforce", case-insensitive), or NULL/empty/unrecognized for the
+    // default ("warn" — mirrors `MaskVerifyMode::default()`, the same
+    // default desktop uses with no --mask-verify-mode/config override).
+    mask_verify_mode: *const libc::c_char,
 ) -> libc::c_int {
     if server_host.is_null() || server_key.is_null() {
         return -1;
@@ -202,6 +214,32 @@ pub unsafe extern "C" fn aivpn_run_tunnel(
             .map(str::to_owned)
     };
 
+    // R2 Phase B: mirrors server_signing_key_opt above — 32 raw bytes, no
+    // encoding to worry about.
+    let mask_operator_pubkey_opt: Option<[u8; 32]> = if mask_operator_pubkey.is_null() {
+        None
+    } else {
+        // SAFETY: mask_operator_pubkey points to 32 bytes passed by Swift.
+        let mut arr = [0u8; 32];
+        unsafe { arr.copy_from_slice(std::slice::from_raw_parts(mask_operator_pubkey, 32)) };
+        Some(arr)
+    };
+
+    // R2 Phase B: parse the mode string the same way desktop's
+    // `MaskVerifyMode::from_str` does (off|warn|enforce, case-insensitive);
+    // NULL/empty/unrecognized all collapse to the default (`Warn`) rather
+    // than erroring — this FFI boundary must never fail closed on a typo.
+    let mask_verify_mode_val: aivpn_common::mask::MaskVerifyMode = if mask_verify_mode.is_null() {
+        aivpn_common::mask::MaskVerifyMode::default()
+    } else {
+        // SAFETY: mask_verify_mode is a NUL-terminated C string from Swift.
+        unsafe { std::ffi::CStr::from_ptr(mask_verify_mode) }
+            .to_str()
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or_default()
+    };
+
     let rt = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -233,6 +271,8 @@ pub unsafe extern "C" fn aivpn_run_tunnel(
             prior_outcomes_json_opt,
             preferred_mask_opt,
             cached_descriptors_json_opt,
+            mask_operator_pubkey_opt,
+            mask_verify_mode_val,
         ))
     }));
     match outcome {
@@ -336,6 +376,18 @@ pub extern "C" fn aivpn_get_handshake_fail_streak() -> libc::c_uint {
 #[no_mangle]
 pub extern "C" fn aivpn_ever_connected() -> libc::c_int {
     EVER_CONNECTED.load(Ordering::Relaxed) as libc::c_int
+}
+
+/// Whether the server sent `CertRejected` (mTLS certificate rejected) during
+/// the most recently completed `aivpn_run_tunnel` call. `0` = not rejected
+/// (or no mTLS cert was configured). The platform should poll this alongside
+/// `get_traffic` and, when `1`, prompt the user to re-provision their mTLS
+/// cert instead of silently retrying forever — desktop only logs this
+/// server-pushed signal (client.rs); mobile has no console the user will
+/// ever see it in.
+#[no_mangle]
+pub extern "C" fn aivpn_cert_was_rejected() -> libc::c_int {
+    crate::ios_tunnel::CERT_REJECTED.load(Ordering::Relaxed) as libc::c_int
 }
 
 /// §2 crowdsourced blocking feedback — whether a `MaskFeedback` control

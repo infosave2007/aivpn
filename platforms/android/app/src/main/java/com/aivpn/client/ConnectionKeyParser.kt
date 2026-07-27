@@ -14,6 +14,11 @@ data class ParsedConnectionKey(
     /** Base64 (standard) ed25519 server signing/verifying key, or null. Enables
      * signature verification of ServerHello / MaskUpdate / bootstrap descriptors. */
     val serverSigningKey: String? = null,
+    /** Base64 (standard) ed25519 mask-operator verifying key ("mop" field), or null.
+     * Enables artifact-level signature verification of MaskUpdate profiles — distinct
+     * from [serverSigningKey], which authenticates the transport push, not the mask
+     * artifact itself. Mirrors desktop's `--mask-operator-pubkey` / `mop` sourcing. */
+    val maskOperatorPubkey: String? = null,
 )
 
 object ConnectionKeyParser {
@@ -35,6 +40,7 @@ object ConnectionKeyParser {
             val serverKey = json.getString("k")
             val psk = json.optString("p").takeUnless { it.isNullOrBlank() }
             val serverSigningKey = json.optString("sk").takeUnless { it.isNullOrBlank() }
+            val maskOperatorPubkey = json.optString("mop").takeUnless { it.isNullOrBlank() }
             val networkConfig = json.optJSONObject("n")
             val vpnIp = networkConfig?.optString("client_ip")?.takeUnless { it.isNullOrBlank() }
                 ?: json.optString("i").takeUnless { it.isNullOrBlank() } ?: return null
@@ -58,7 +64,10 @@ object ConnectionKeyParser {
                 return null
             }
 
-            ParsedConnectionKey(server, serverKey, psk, vpnIp, serverVpnIp, prefixLen, mtu, serverSigningKey)
+            ParsedConnectionKey(
+                server, serverKey, psk, vpnIp, serverVpnIp, prefixLen, mtu,
+                serverSigningKey, maskOperatorPubkey,
+            )
         } catch (_: Exception) {
             null
         }

@@ -1767,18 +1767,45 @@ impl App {
                 t(lang, "Connecting...").to_string(),
                 Color::from_rgb(1.0, 0.70, 0.15),
             ),
-            VpnStatus::Connected { vpn_ip } => (
-                Color::from_rgb(0.25, 0.84, 0.36),
-                format!(
-                    "{}  {vpn_ip}",
-                    if lang == "ru" {
-                        "Подключено"
+            VpnStatus::Connected { vpn_ip } => {
+                // MEDIUM-HIGH #3 (client parity): elapsed connection time,
+                // derived the same way Windows (vpn_manager.rs
+                // session_since_ms) and macOS (VPNManager) do — wall-clock
+                // now minus the client's session epoch — instead of never
+                // showing uptime at all. `connected_since` is already parsed
+                // by `read_traffic_stats()`/`parse_traffic_stats()` from the
+                // stats file's `since:` key; previously only consulted here
+                // to detect a silent in-process reconnect, never displayed.
+                let uptime_str = self.stats.connected_since.map(|since_ms| {
+                    let now_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(since_ms);
+                    let secs = now_ms.saturating_sub(since_ms) / 1000;
+                    let h = secs / 3600;
+                    let m = (secs % 3600) / 60;
+                    let s = secs % 60;
+                    if h > 0 {
+                        format!("{h}:{m:02}:{s:02}")
                     } else {
-                        "Connected"
+                        format!("{m}:{s:02}")
                     }
-                ),
-                Color::from_rgb(0.25, 0.84, 0.36),
-            ),
+                });
+                let label = if lang == "ru" {
+                    "Подключено"
+                } else {
+                    "Connected"
+                };
+                let status_str = match &uptime_str {
+                    Some(u) => format!("{label}  {vpn_ip}  {u}"),
+                    None => format!("{label}  {vpn_ip}"),
+                };
+                (
+                    Color::from_rgb(0.25, 0.84, 0.36),
+                    status_str,
+                    Color::from_rgb(0.25, 0.84, 0.36),
+                )
+            }
             VpnStatus::Error(e) => (
                 Color::from_rgb(0.95, 0.28, 0.18),
                 format!(

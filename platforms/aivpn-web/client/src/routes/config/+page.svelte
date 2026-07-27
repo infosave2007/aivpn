@@ -26,8 +26,14 @@
   // Complex sub-objects editable as raw JSON. bootstrap_publish is a valid
   // server key (management_api.rs CONFIG_KNOWN_KEYS) with no dedicated form
   // section — without it here it was impossible to edit AND (before the
-  // merge-based apply below) got silently destroyed on every Apply.
-  const ADVANCED_KEYS = ['network_config', 'site_to_site', 'mtls', 'dns', 'bootstrap_publish'];
+  // merge-based apply below) got silently destroyed on every Apply. Same
+  // reasoning applies to neural_enabled/neural/feedback/polymorphic/
+  // downlink_shaping (ServerFileConfig, server_config.rs) — valid keys with
+  // no form control, previously rejected by the advanced-JSON whitelist.
+  const ADVANCED_KEYS = [
+    'network_config', 'site_to_site', 'mtls', 'dns', 'bootstrap_publish',
+    'neural_enabled', 'neural', 'feedback', 'polymorphic', 'downlink_shaping',
+  ];
 
   // Simple field values
   let fv = $state<Record<string, string | number | boolean>>({});
@@ -35,9 +41,11 @@
   // Pool section
   let poolEnabled = $state(false);
   let poolPeers = $state('');
+  let poolNodeId = $state('');
   let poolSyncKey = $state('');
   let showSyncKey = $state(false); // sync_key is a shared secret — masked by default
   let poolExitNode = $state('');
+  let poolExitNodeEnabled = $state(false);
 
   // Bootstrap mask files
   let bootstrapMasks = $state('');
@@ -62,12 +70,17 @@
       for (const f of FIELDS) {
         if (cfg[f.key] !== undefined) fv[f.key] = cfg[f.key] as string | number | boolean;
       }
-      const pool = cfg['pool'] as { peers?: string[]; sync_key?: string; exit_node?: string } | undefined;
+      const pool = cfg['pool'] as {
+        peers?: string[]; sync_key?: string; exit_node?: string;
+        node_id?: string; exit_node_enabled?: boolean;
+      } | undefined;
       if (pool) {
         poolEnabled = true;
         poolPeers = (pool.peers ?? []).join('\n');
+        poolNodeId = pool.node_id ?? '';
         poolSyncKey = pool.sync_key ?? '';
         poolExitNode = pool.exit_node ?? '';
+        poolExitNodeEnabled = pool.exit_node_enabled ?? false;
       }
       const bm = cfg['bootstrap_mask_files'];
       if (Array.isArray(bm)) bootstrapMasks = bm.join('\n');
@@ -93,9 +106,20 @@
     }
     if (poolEnabled) {
       const peers = poolPeers.split('\n').map(s => s.trim()).filter(Boolean);
-      const pool: Record<string, unknown> = { peers };
+      // Merge over the fetched base pool object (not a wholesale replace) so
+      // any pool field this form doesn't manage — e.g. the deprecated
+      // sync_port, or a key added server-side after this UI shipped — still
+      // round-trips instead of being silently deleted on every Apply (the
+      // same class of bug as the bootstrap_publish wipe).
+      const basePool = (base['pool'] as Record<string, unknown> | undefined) ?? {};
+      const pool: Record<string, unknown> = { ...basePool, peers };
+      if (poolNodeId.trim()) pool['node_id'] = poolNodeId.trim();
+      else delete pool['node_id'];
       if (poolSyncKey.trim()) pool['sync_key'] = poolSyncKey.trim();
+      else delete pool['sync_key'];
       if (poolExitNode.trim()) pool['exit_node'] = poolExitNode.trim();
+      else delete pool['exit_node'];
+      pool['exit_node_enabled'] = poolExitNodeEnabled;
       out['pool'] = pool;
     } else {
       delete out['pool'];
@@ -265,6 +289,19 @@
         </div>
         <div>
           <div class="flex items-center gap-1.5 mb-1">
+            <label class="text-xs font-medium text-gray-600 dark:text-gray-400" for="pool-node-id">Node ID</label>
+            <div class="relative" data-tip>
+              <button type="button" onclick={() => tip('pool-node-id')} class="text-gray-400 hover:text-indigo-500"><Info size={12} /></button>
+              {#if openTip === 'pool-node-id'}
+                <div class="absolute left-0 top-5 z-20 w-64 bg-gray-900 text-white text-xs rounded-lg px-3 py-2 shadow-xl">This node's own identifier as the OTHER nodes reference it in their peers lists (recommended: this node's public host:vpn_port). Required — pool sync is disabled while this is empty.</div>
+              {/if}
+            </div>
+          </div>
+          <input id="pool-node-id" type="text" bind:value={poolNodeId} placeholder="node1.example.com:443"
+            class="w-full px-3 py-1.5 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-white text-sm font-mono focus:outline-none focus:ring-2 focus:ring-indigo-500" />
+        </div>
+        <div>
+          <div class="flex items-center gap-1.5 mb-1">
             <label class="text-xs font-medium text-gray-600 dark:text-gray-400" for="pool-sync-key">Sync Key (base64)</label>
             <div class="relative" data-tip>
               <button type="button" onclick={() => tip('pool-sync-key')} class="text-gray-400 hover:text-indigo-500"><Info size={12} /></button>
@@ -298,6 +335,16 @@
           <input id="pool-exit-node" type="text" bind:value={poolExitNode} placeholder="exit.example.com:443"
             class="w-full px-3 py-1.5 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-white text-sm font-mono focus:outline-none focus:ring-2 focus:ring-indigo-500" />
         </div>
+        <div class="flex items-center gap-2">
+          <input type="checkbox" id="pool-exit-node-enabled" bind:checked={poolExitNodeEnabled} class="rounded text-indigo-600" />
+          <label class="text-xs font-medium text-gray-600 dark:text-gray-400 flex-1 cursor-pointer" for="pool-exit-node-enabled">This node acts as the exit point</label>
+          <div class="relative" data-tip>
+            <button type="button" onclick={() => tip('pool-exit-node-enabled')} class="text-gray-400 hover:text-indigo-500"><Info size={12} /></button>
+            {#if openTip === 'pool-exit-node-enabled'}
+              <div class="absolute right-0 top-5 z-20 w-64 bg-gray-900 text-white text-xs rounded-lg px-3 py-2 shadow-xl">Guards multi-hop routing. When off (default), incoming ChainForward relay requests from other nodes are rejected, preventing this node from being used as an open relay.</div>
+            {/if}
+          </div>
+        </div>
       </div>
     {/if}
   </div>
@@ -322,7 +369,7 @@
   <div class="bg-white dark:bg-gray-800 rounded-xl border border-gray-200 dark:border-gray-700 overflow-hidden">
     <button type="button" onclick={() => { showAdvanced = !showAdvanced; }}
       class="w-full flex items-center justify-between px-4 py-3 text-sm font-medium text-gray-600 dark:text-gray-400 hover:bg-gray-50 dark:hover:bg-gray-700/50 transition-colors">
-      <span>Advanced — raw JSON (<code class="font-mono text-xs">network_config</code>, <code class="font-mono text-xs">dns</code>, <code class="font-mono text-xs">site_to_site</code>, <code class="font-mono text-xs">mtls</code>, <code class="font-mono text-xs">bootstrap_publish</code>)</span>
+      <span>Advanced — raw JSON (<code class="font-mono text-xs">network_config</code>, <code class="font-mono text-xs">dns</code>, <code class="font-mono text-xs">site_to_site</code>, <code class="font-mono text-xs">mtls</code>, <code class="font-mono text-xs">bootstrap_publish</code>, <code class="font-mono text-xs">neural_enabled</code>, <code class="font-mono text-xs">neural</code>, <code class="font-mono text-xs">feedback</code>, <code class="font-mono text-xs">polymorphic</code>, <code class="font-mono text-xs">downlink_shaping</code>)</span>
       <span>{showAdvanced ? '▲' : '▼'}</span>
     </button>
     {#if showAdvanced}

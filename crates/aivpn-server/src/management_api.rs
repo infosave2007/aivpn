@@ -502,12 +502,39 @@ async fn put_config(
         )
             .into_response();
     }
+    // Unknown-key validation: a PUT body is a live, operator-authored write
+    // (typically from the web panel), so a top-level key that isn't part of
+    // the schema is almost certainly a typo — reject it here with a clear
+    // 400. This is intentionally STRICTER than the startup loader in
+    // `main.rs` (`load_server_file_config`), which tolerates unknown keys
+    // (with a warning) so a config left over from an older release doesn't
+    // brick the next boot; see `server_config.rs`'s module doc for the
+    // rationale split. `ServerFileConfig` itself no longer carries
+    // `#[serde(deny_unknown_fields)]` — serde can't apply that per call site
+    // on one struct — so the check is explicit here via
+    // `unknown_top_level_keys`.
+    let unknown_keys = crate::server_config::unknown_top_level_keys(&body);
+    if !unknown_keys.is_empty() {
+        let msg = format!("unknown config key(s): {}", unknown_keys.join(", "));
+        audit(
+            &state,
+            "ConfigPut",
+            &path.display().to_string(),
+            &format!("rejected: {}", msg),
+        );
+        return (
+            StatusCode::BAD_REQUEST,
+            err(format!("invalid config: {}", msg)),
+        )
+            .into_response();
+    }
     // Type-level validation: the body must deserialize into the SAME
-    // `ServerFileConfig` the server parses at startup (deny_unknown_fields
-    // catches typo'd keys). A key-name allowlist used to live here; it
-    // drifted out of sync with the real schema and either 400'd valid
-    // configs or accepted wrong-typed values that bricked the next server
-    // start (`load_server_file_config` exits on parse failure).
+    // `ServerFileConfig` the server parses at startup. A key-name allowlist
+    // used to live here; it drifted out of sync with the real schema and
+    // either 400'd valid configs or accepted wrong-typed values that bricked
+    // the next server start (`load_server_file_config` exits on parse
+    // failure). The allowlist is back (`CONFIG_KNOWN_KEYS`, checked above),
+    // but guarded by a test that catches drift against the shipped example.
     if let Err(e) = serde_json::from_value::<crate::server_config::ServerFileConfig>(body.clone()) {
         audit(
             &state,
@@ -896,7 +923,20 @@ async fn export_bootstrap(State(state): State<ApiState>) -> impl IntoResponse {
     }
 }
 
-async fn import_backup(State(state): State<ApiState>, body: Bytes) -> impl IntoResponse {
+/// Query params for `POST /backup/import`. `dry_run=true` validates the
+/// archive and returns the would-apply summary without writing any files —
+/// the API/web equivalent of the CLI's `--import --dry-run`.
+#[derive(Deserialize)]
+struct ImportBackupQuery {
+    #[serde(default)]
+    dry_run: bool,
+}
+
+async fn import_backup(
+    State(state): State<ApiState>,
+    Query(q): Query<ImportBackupQuery>,
+    body: Bytes,
+) -> impl IntoResponse {
     use crate::backup::import_server;
     const MAX_BACKUP_SIZE: usize = 50 * 1024 * 1024; // 50 MB
     if body.len() > MAX_BACKUP_SIZE {
@@ -917,34 +957,50 @@ async fn import_backup(State(state): State<ApiState>, body: Bytes) -> impl IntoR
         }
     };
 
-    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-        // server-sec HIGH5: unpredictable name + created 0600 up front (the
-        // uploaded archive contains plaintext PSKs until it is fully
-        // validated and either imported or discarded) instead of a
-        // predictable timestamp path with default perms.
-        let mut suffix = [0u8; 16];
-        rand::rngs::OsRng.fill_bytes(&mut suffix);
-        let tmp = std::env::temp_dir().join(format!("aivpn-import-{}.tar.gz", hex::encode(suffix)));
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(&tmp)?;
-        }
-        std::fs::write(&tmp, &body)?;
-        let r = import_server(&tmp, &target_dir, false);
-        let _ = std::fs::remove_file(&tmp);
-        Ok(r?)
-    })
-    .await;
+    let dry_run = q.dry_run;
+    let result =
+        tokio::task::spawn_blocking(move || -> anyhow::Result<crate::backup::ImportSummary> {
+            // server-sec HIGH5: unpredictable name + created 0600 up front (the
+            // uploaded archive contains plaintext PSKs until it is fully
+            // validated and either imported or discarded) instead of a
+            // predictable timestamp path with default perms.
+            let mut suffix = [0u8; 16];
+            rand::rngs::OsRng.fill_bytes(&mut suffix);
+            let tmp =
+                std::env::temp_dir().join(format!("aivpn-import-{}.tar.gz", hex::encode(suffix)));
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(&tmp)?;
+            }
+            std::fs::write(&tmp, &body)?;
+            let r = import_server(&tmp, &target_dir, dry_run);
+            let _ = std::fs::remove_file(&tmp);
+            Ok(r?)
+        })
+        .await;
 
     match result {
-        Ok(Ok(())) => {
-            audit(&state, "BackupImport", "server backup", "ok");
-            Json(serde_json::json!({ "ok": true })).into_response()
+        Ok(Ok(summary)) => {
+            audit(
+                &state,
+                "BackupImport",
+                "server backup",
+                if summary.dry_run { "dry-run ok" } else { "ok" },
+            );
+            Json(serde_json::json!({
+                "ok": true,
+                "dry_run": summary.dry_run,
+                "aivpn_version": summary.aivpn_version,
+                "created_at": summary.created_at,
+                "components": summary.components,
+                "signed": summary.signed,
+            }))
+            .into_response()
         }
         Ok(Err(e)) => {
             audit(

@@ -24,6 +24,13 @@ pub struct TrafficStats {
     pub bytes_received: u64,
     pub quality_score: u8,
     pub server_adaptive_level: u8,
+    /// Client's currently-effective VPN IP, from the `ip:` key the client's
+    /// stats writer adds to traffic.stats. Unlike the connection key's own
+    /// (static, one-time-parsed) `vpn_ip`, this reflects a server-assigned IP
+    /// after a pool re-home. `None` before the first stats write with an
+    /// `ip:` field arrives, or if that field failed to parse as an IPv4
+    /// address (e.g. a torn read of the non-atomic stats write).
+    pub vpn_ip: Option<String>,
 }
 
 // ── Recording ───────────────────────────────────────────────────────────────
@@ -468,6 +475,7 @@ impl VpnManager {
                 // from briefly showing Connected before the TUN device is up.
                 self.stats.bytes_sent = 0;
                 self.stats.bytes_received = 0;
+                self.stats.vpn_ip = None;
                 self.session_since_ms = None;
                 // Request initial recording status
                 self.request_recording_status_refresh();
@@ -670,6 +678,7 @@ impl VpnManager {
         self.state = ConnectionState::Disconnected;
         self.stats.bytes_sent = 0;
         self.stats.bytes_received = 0;
+        self.stats.vpn_ip = None;
         self.session_since_ms = None;
         self.connected_since = None;
         self.last_error = None;
@@ -758,6 +767,7 @@ impl VpnManager {
                     self.connected_since = None;
                     self.stats.bytes_sent = 0;
                     self.stats.bytes_received = 0;
+                    self.stats.vpn_ip = None;
                     self.session_since_ms = None;
                     return;
                 }
@@ -785,6 +795,7 @@ impl VpnManager {
                     // next session's display.
                     self.stats.bytes_sent = 0;
                     self.stats.bytes_received = 0;
+                    self.stats.vpn_ip = None;
                     self.session_since_ms = None;
                     return;
                 }
@@ -1037,7 +1048,17 @@ impl VpnManager {
 
         for path in &paths {
             if let Ok(content) = std::fs::read_to_string(path) {
-                if let Some((sent, recv, since)) = Self::parse_stats(&content) {
+                if let Some((sent, recv, since, ip)) = Self::parse_stats(&content) {
+                    // Plausibility gate (torn-read hardening, mirrors the
+                    // `since` gate below): only accept an `ip` that parses as
+                    // IPv4 — a partial/interleaved read of the non-atomic
+                    // stats write could otherwise surface truncated garbage.
+                    // Never clear a previously-good value on a bad read; the
+                    // 4 explicit reset sites (connect/disconnect/exit) own
+                    // clearing it back to None.
+                    if let Some(ip) = ip.filter(|s| s.parse::<std::net::Ipv4Addr>().is_ok()) {
+                        self.stats.vpn_ip = Some(ip);
+                    }
                     // Plausibility gate (MEDIUM-2, torn-read hardening): the
                     // client's stats write is not atomic, so a partial read
                     // can yield a truncated/garbage `since` that would fake a
@@ -1115,14 +1136,19 @@ impl VpnManager {
         (0, 0)
     }
 
-    fn parse_stats(content: &str) -> Option<(u64, u64, Option<u64>)> {
-        // Format: "sent:12345,received:67890[,since:<unix-ms>]" — `since` is
-        // the session epoch, absent in pre-session zero-writes and in files
-        // from old client binaries.
+    fn parse_stats(content: &str) -> Option<(u64, u64, Option<u64>, Option<String>)> {
+        // Format: "sent:12345,received:67890[,since:<unix-ms>][,ip:<vpn-ip>]"
+        // — `since` is the session epoch, absent in pre-session zero-writes
+        // and in files from old client binaries. `ip` is the client's
+        // currently-effective VPN IP (HIGH #2, client parity): absent in the
+        // same cases as `since`, and re-written on every tick so a pool
+        // re-home to a different server-assigned IP shows up here even
+        // though the GUI's own child stdout is piped to Stdio::null().
         let content = content.trim();
         let mut sent = None;
         let mut recv = None;
         let mut since = None;
+        let mut ip = None;
 
         for part in content.split(',') {
             let mut kv = part.splitn(2, ':');
@@ -1130,12 +1156,13 @@ impl VpnManager {
                 (Some("sent"), Some(v)) => sent = v.trim().parse().ok(),
                 (Some("received"), Some(v)) => recv = v.trim().parse().ok(),
                 (Some("since"), Some(v)) => since = v.trim().parse().ok(),
+                (Some("ip"), Some(v)) => ip = Some(v.trim().to_string()),
                 _ => {}
             }
         }
 
         match (sent, recv) {
-            (Some(s), Some(r)) => Some((s, r, since)),
+            (Some(s), Some(r)) => Some((s, r, since, ip)),
             _ => None,
         }
     }

@@ -7,6 +7,24 @@ import SwiftUI
 // UserDefaults (group.com.aivpn.client) and are NOT cryptographically verified.
 // Any process in the same App Group can modify these lists. Do not rely on this
 // storage for security-sensitive routing decisions.
+//
+// DOMAIN EXCLUSION IS NOT ENFORCED ON iOS (client-parity #4). `excludedDomains`
+// below is threaded all the way to PacketTunnelProvider.swift's
+// providerConfiguration (VPNManager.connect() -> "excluded_domains") and
+// stored in `settingsExcludedDomains`, but `buildSettings()` never applies it:
+// NEDNSSettings has no `matchExcludedDomains` — confirmed by a real Xcode
+// compile error when this was previously attempted, not a guess (see
+// PacketTunnelProvider.swift's buildSettings doc comment). Implementing this
+// properly would mean resolving each domain to its current IP(s) and adding
+// those as route-level `excludedRoutes` (like Android's AivpnService does),
+// which requires DNS resolution on the tunnel-setup path inside a
+// resource-budgeted Network Extension — a much larger, ongoing-resolution
+// feature this fix intentionally does not take on without the ability to
+// build/test it on-device. `addDomain`/`removeDomain` below are consequently
+// NOT wired to any SwiftUI control today (only the CIDR route section renders
+// in `SplitTunnelView.body`) — do not add a UI entry point for them without
+// first implementing the resolved-route enforcement above, or the control
+// would silently do nothing again.
 class SplitTunnelManager: ObservableObject {
     static let shared = SplitTunnelManager()
 

@@ -320,6 +320,16 @@ export const masks = {
   async delete(name: string): Promise<void> {
     await apiFetch(`/api/v1/masks/${encodeURIComponent(name)}`, { method: 'DELETE' });
   },
+  /** POST /api/v1/masks/active (management_api.rs set_active_mask / CLI --set-mask
+   *  equivalent). `client` accepts either the client's id or its name — the
+   *  server resolves by name first, falling back to id. Writes a per-client
+   *  override file; the mask must already exist on disk or be a built-in preset. */
+  async setActive(client: string, mask: string): Promise<{ ok: boolean; client: string; mask: string }> {
+    return apiJson('/api/v1/masks/active', {
+      method: 'POST',
+      body: JSON.stringify({ client, mask }),
+    });
+  },
 };
 
 export const auditLog = {

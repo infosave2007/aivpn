@@ -68,6 +68,19 @@ object AivpnJni {
         staticPrivkey: ByteArray?,
         maskProfile: String?,
         serverSigningKey: ByteArray?,
+        /**
+         * R2 Phase B: 32-byte ed25519 verifying key for artifact-level MaskUpdate
+         * signature verification (the "mop" connection-key field, mirrors desktop's
+         * `--mask-operator-pubkey`), or null to skip. Distinct from [serverSigningKey]:
+         * that authenticates "pushed by my server" (transport); this authenticates
+         * "gated + signed by the operator" (artifact).
+         */
+        maskOperatorPubkey: ByteArray?,
+        /**
+         * Matching verification strictness: 0=off, 1=warn, 2=enforce (mirrors desktop's
+         * `--mask-verify-mode`). Any other value is treated as warn.
+         */
+        maskVerifyMode: Int,
         /** §3 Polymorphic masks: base mask id to request a per-session unique variant of, or null. */
         polymorphicBase: String?,
         /** §2 crowdsourced blocking feedback (opt-in): report mask success/fail outcomes. */
@@ -142,6 +155,16 @@ object AivpnJni {
      * with this address or the server's anti-spoof check drops all uplink data.
      */
     external fun getAssignedVpnIp(): String
+
+    /**
+     * Returns `true` (and atomically clears the flag) if the server sent CertRejected
+     * (mTLS client certificate rejected) at any point since the last call. Poll this
+     * live during a session, like [getAssignedVpnIp] — the server keeps the tunnel up
+     * while rejecting the cert rather than tearing it down, so waiting for [runTunnel]
+     * to return would never observe it. A `true` result means the current certificate
+     * will never be accepted by this server; prompt the user to re-provision.
+     */
+    external fun certRejected(): Boolean
 
     // ──────────── §2 crowdsourced blocking feedback getters ────────────
     //
