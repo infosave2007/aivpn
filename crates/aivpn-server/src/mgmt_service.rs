@@ -999,7 +999,14 @@ pub fn apply_heavy(
             return Err(MgmtError::Internal(format!("mkdir failed: {}", e)));
         }
     }
-    let tmp = resolved.target_path.with_extension("tmp");
+    // Unique (random-suffixed) temp name: two concurrent applies targeting
+    // the same file (REST and tunnel are independent transports) must not
+    // share one `<file>.tmp` — interleaved write/rename of a shared name
+    // can rename the OTHER writer's half-written content into place.
+    // Mirrors `backup.rs`'s randomized temp-file pattern.
+    let tmp = resolved
+        .target_path
+        .with_extension(format!("tmp.{}", generate_token()));
     if let Err(e) = std::fs::write(&tmp, &resolved.new_content) {
         audit(
             ctx,
@@ -1010,6 +1017,8 @@ pub fn apply_heavy(
         return Err(MgmtError::Internal(format!("write failed: {}", e)));
     }
     if let Err(e) = std::fs::rename(&tmp, &resolved.target_path) {
+        // Best-effort: don't leave the orphaned temp file behind.
+        let _ = std::fs::remove_file(&tmp);
         audit(
             ctx,
             "ConfigApply",

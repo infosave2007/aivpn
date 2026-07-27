@@ -1217,16 +1217,25 @@ impl AivpnApp {
                         Err(e) => self.admin_clients_error = Some(e),
                     }
                 }
-                AdminResponse::ClientSaved(r) => {
-                    let editing = self.admin_edit_id.is_some();
-                    self.admin_add_busy = false;
-                    self.admin_edit_busy = false;
-                    match r {
+                // `editing` comes from the ORIGINATING request, not from
+                // "is the edit form open right now" — see the variant's doc
+                // comment in admin.rs (BUG FIX: overlapping add/edit used to
+                // misroute errors and close the wrong form).
+                AdminResponse::ClientSaved { editing, result } => {
+                    if editing {
+                        self.admin_edit_busy = false;
+                    } else {
+                        self.admin_add_busy = false;
+                    }
+                    match result {
                         Ok(_) => {
-                            self.admin_show_add = false;
-                            self.admin_edit_id = None;
-                            self.admin_add_error = None;
-                            self.admin_edit_error = None;
+                            if editing {
+                                self.admin_edit_id = None;
+                                self.admin_edit_error = None;
+                            } else {
+                                self.admin_show_add = false;
+                                self.admin_add_error = None;
+                            }
                             self.refresh_admin_clients();
                         }
                         Err(e) => {
@@ -1263,8 +1272,14 @@ impl AivpnApp {
                     }
                 }
                 AdminResponse::ConnectionKey { id, result } => {
-                    self.admin_key_loading = false;
+                    // Only touch UI state if this answers the client the
+                    // viewer window CURRENTLY shows — a stale response for a
+                    // previously-viewed client must not clear the loading
+                    // spinner of the request still in flight for the current
+                    // one (BUG FIX, review: `loading = false` used to run
+                    // before this id check).
                     if self.admin_key_id.as_deref() == Some(id.as_str()) {
+                        self.admin_key_loading = false;
                         match result {
                             Ok(key) => {
                                 self.admin_key_value = Some(key);
@@ -1275,8 +1290,9 @@ impl AivpnApp {
                     }
                 }
                 AdminResponse::Qr { id, result } => {
-                    self.admin_qr_loading = false;
+                    // Same stale-response guard as ConnectionKey above.
                     if self.admin_key_id.as_deref() == Some(id.as_str()) {
+                        self.admin_qr_loading = false;
                         match result {
                             Ok(png) => {
                                 self.admin_qr_png = Some(png);

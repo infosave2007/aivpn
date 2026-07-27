@@ -33,6 +33,14 @@ pub fn png_for_scaled(text: &str, module_px: u32) -> anyhow::Result<Vec<u8>> {
     if module_px == 0 {
         anyhow::bail!("qr: module_px must be non-zero");
     }
+    // Upper bound: a large QR code is ~180 modules per side incl. quiet
+    // zone; 256 px/module already yields a ~46k×46k image. Anything bigger
+    // risks `(modules + quiet) * module_px` overflowing u32 inside the
+    // qrcode/image crates (panic in debug, bogus giant allocation in
+    // release) — reject instead.
+    if module_px > 256 {
+        anyhow::bail!("qr: module_px too large (max 256)");
+    }
 
     let code = QrCode::new(text.as_bytes())
         .map_err(|e| anyhow::anyhow!("qr: failed to encode connection key: {e:?}"))?;
@@ -102,6 +110,15 @@ mod tests {
     fn png_for_zero_module_px_errors_gracefully() {
         let result = png_for_scaled("aivpn://x", 0);
         assert!(result.is_err(), "module_px=0 must error, not panic");
+    }
+
+    #[test]
+    fn png_for_huge_module_px_errors_gracefully() {
+        // Would overflow `(modules + quiet) * module_px` in u32 inside the
+        // qrcode/image crates — must be rejected up front, not panic or
+        // attempt a multi-GB allocation.
+        let result = png_for_scaled("aivpn://x", u32::MAX);
+        assert!(result.is_err(), "huge module_px must error, not panic");
     }
 
     #[test]

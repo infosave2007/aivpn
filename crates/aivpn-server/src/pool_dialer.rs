@@ -203,6 +203,38 @@ pub struct PoolDialer {
     /// but in practice it exists so tests can assert "`add_peer` didn't
     /// double-spawn" without needing to observe a real live connection.
     spawn_count: Arc<AtomicUsize>,
+    /// Wave 2 (dial-teardown): the subset of `dialed_peers` that were added
+    /// via [`Self::add_peer`] — i.e. a RUNTIME exit dial spawned for a
+    /// client or global `exit_node`, never a startup-configured `pool.peers`
+    /// sync peer or startup `pool.exit_node` (both dialed only from
+    /// `self.peers` inside [`Self::start`], which never inserts here). This
+    /// is the ONLY set [`Self::remove_peer`] is allowed to act on — see its
+    /// doc comment for the safety guarantee this provides: even a caller
+    /// bug that asks to remove a real pool-sync peer is refused, because
+    /// that peer was never inserted into this set in the first place.
+    runtime_exit_peers: Arc<parking_lot::Mutex<HashSet<String>>>,
+    /// Wave 2 (dial-teardown): per-peer stop signal, one entry per address
+    /// currently tracked in `dialed_peers` (startup OR runtime), created by
+    /// [`Self::spawn_dial_loop`] right before it spawns that peer's
+    /// `dial_loop` task and removed by [`Self::remove_peer`] when torn
+    /// down. Distinct from the single shared `shutdown` flag (process-wide,
+    /// checked by every peer): flipping ONE entry here stops only that one
+    /// peer's `dial_loop` — both its reconnect backoff wait AND, via
+    /// `watch_combined_stop`, any session currently in progress — without
+    /// affecting any other peer.
+    peer_stop_flags: Arc<parking_lot::Mutex<HashMap<String, Arc<AtomicBool>>>>,
+    /// Serializes the multi-lock membership transitions of
+    /// [`Self::spawn_dial_loop`] (add) and [`Self::remove_peer`] (remove).
+    /// Each of those touches several independent Mutexes (`dialed_peers`,
+    /// `runtime_exit_peers`, `peer_stop_flags`, `peer_senders`,
+    /// `pool_status`) in sequence — without this outer lock, an
+    /// `add_peer(X)` interleaving into the middle of a `remove_peer(X)`
+    /// could (a) see `dialed_peers` still occupied and silently no-op (the
+    /// add is lost until the next mutation-driven scan), or (b) register
+    /// its fresh session just in time for the tail of `remove_peer` to
+    /// wipe the new `peer_senders` entry. Always the OUTERMOST lock; the
+    /// inner Mutexes are never held while acquiring it.
+    topology_lock: parking_lot::Mutex<()>,
 }
 
 impl PoolDialer {
@@ -306,6 +338,9 @@ impl PoolDialer {
             dialed_peers: Arc::new(parking_lot::Mutex::new(HashSet::new())),
             shutdown: Arc::new(parking_lot::Mutex::new(None)),
             spawn_count: Arc::new(AtomicUsize::new(0)),
+            runtime_exit_peers: Arc::new(parking_lot::Mutex::new(HashSet::new())),
+            peer_stop_flags: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            topology_lock: parking_lot::Mutex::new(()),
         }))
     }
 
@@ -366,6 +401,20 @@ impl PoolDialer {
     #[cfg(test)]
     pub(crate) fn test_mark_started(&self, shutdown: Arc<AtomicBool>) {
         *self.shutdown.lock() = Some(shutdown);
+    }
+
+    /// Wave 2 test-only: simulate a STARTUP (`is_runtime_exit: false`)
+    /// dial — i.e. what `start()` does for each entry in `self.peers` —
+    /// for tests OUTSIDE this module (`gateway.rs`'s dial-teardown tests)
+    /// that need a "protected pool-sync peer" fixture without calling the
+    /// real `start()` (which would additionally try to dial every OTHER
+    /// configured peer for real). The private `spawn_dial_loop` itself
+    /// can't be called from outside this module, hence this thin
+    /// `pub(crate)` wrapper — mirrors this module's own teardown tests,
+    /// which call `spawn_dial_loop` directly since they ARE inside it.
+    #[cfg(test)]
+    pub(crate) fn test_spawn_startup_peer(self: &Arc<Self>, addr: &str) -> bool {
+        self.spawn_dial_loop(addr.to_string(), false)
     }
 
     /// Wave B2c test-only: `true` iff `peer` is currently tracked in
@@ -434,7 +483,13 @@ impl PoolDialer {
             self.peers.len()
         );
         for peer in self.peers.clone() {
-            self.spawn_dial_loop(peer);
+            // `is_runtime_exit: false` — these are the startup-configured
+            // dial set (`pool.peers` sync peers, plus a startup
+            // `pool.exit_node` if `main.rs` merged one in — see
+            // `main.rs`'s wiring site). NEVER tracked in
+            // `runtime_exit_peers`, so `remove_peer` can never tear any of
+            // them down. See Wave 2 (dial-teardown)'s doc comments.
+            self.spawn_dial_loop(peer, false);
         }
     }
 
@@ -450,7 +505,16 @@ impl PoolDialer {
     /// task, so — rather than spawn a task with no way to ever be told to
     /// stop — this rolls back the `dialed_peers` insert and no-ops, letting
     /// a legitimate later `start()`/`add_peer` call spawn it for real).
-    fn spawn_dial_loop(self: &Arc<Self>, peer: String) -> bool {
+    ///
+    /// `is_runtime_exit` (Wave 2, dial-teardown): `true` only from
+    /// [`Self::add_peer`] — inserts `peer` into `runtime_exit_peers`,
+    /// making it eligible for [`Self::remove_peer`]. `false` from
+    /// `start()`'s startup-configured dial set, which must NEVER become
+    /// eligible for removal.
+    fn spawn_dial_loop(self: &Arc<Self>, peer: String, is_runtime_exit: bool) -> bool {
+        // See `topology_lock`'s doc comment — serializes this whole
+        // membership transition against a concurrent `remove_peer`.
+        let _topo = self.topology_lock.lock();
         {
             let mut dialed = self.dialed_peers.lock();
             if !dialed.insert(peer.clone()) {
@@ -474,10 +538,18 @@ impl PoolDialer {
             }
         };
 
+        let peer_stop = Arc::new(AtomicBool::new(false));
+        self.peer_stop_flags
+            .lock()
+            .insert(peer.clone(), peer_stop.clone());
+        if is_runtime_exit {
+            self.runtime_exit_peers.lock().insert(peer.clone());
+        }
+
         self.spawn_count.fetch_add(1, Ordering::Relaxed);
         let me = self.clone();
         tokio::spawn(async move {
-            me.dial_loop(peer, shutdown).await;
+            me.dial_loop(peer, shutdown, peer_stop).await;
         });
         true
     }
@@ -499,13 +571,14 @@ impl PoolDialer {
     ///   idempotency gate);
     /// - the dialer has not been [`Self::start`]ed yet.
     ///
-    /// Scope note (Wave B2c): this only ADDS dial sessions. Teardown of an
-    /// unused runtime-added session (e.g. after an admin later clears that
-    /// client's `exit_node` and no other client references it) is
-    /// intentionally NOT implemented here — an idling unused dial session
-    /// is acceptable for this wave; pruning it is a future optimization.
-    /// Making the global default (`masked_exit_addr`) itself hot-swappable
-    /// is a separate follow-up, also out of scope here.
+    /// Scope note (Wave B2c, updated by Wave 2): this only ADDS dial
+    /// sessions — every address it spawns is tracked in `runtime_exit_peers`
+    /// (`is_runtime_exit: true`), making it eligible for later teardown via
+    /// [`Self::remove_peer`] (see `gateway.rs`'s `teardown_unused_exit_dials`,
+    /// which prunes any such address no client/global `exit_node`
+    /// references any more). Making the global default (`masked_exit_addr`)
+    /// itself hot-swappable is handled by `gateway.rs`'s
+    /// `apply_global_exit_update`, which calls back into this method.
     pub fn add_peer(self: &Arc<Self>, addr: impl Into<String>) {
         let addr = addr.into();
         let addr = addr.trim();
@@ -519,12 +592,84 @@ impl PoolDialer {
             );
             return;
         }
-        if self.spawn_dial_loop(addr.to_string()) {
+        if self.spawn_dial_loop(addr.to_string(), true) {
             info!(
                 "pool_dialer: runtime add_peer — now dialing new peer {} (live without restart)",
                 addr
             );
         }
+    }
+
+    /// Wave 2 (dial-teardown): tear down a RUNTIME-added exit dial —
+    /// signals its `dial_loop` task to stop (both mid-session, via the
+    /// `watch_combined_stop` race in `dial_loop`, and mid-backoff) and
+    /// immediately removes it from `peer_senders`/`dialed_peers` so it
+    /// stops being reachable via `send_to_peer`/`has_live_session` and
+    /// stops counting as "already dialed" for a future `add_peer`/
+    /// `dialed_peer_addrs` check, without waiting for the (now-orphaned)
+    /// task to actually finish unwinding.
+    ///
+    /// ⚠️ SAFETY GUARANTEE (critical): only ever acts on an address
+    /// currently tracked in `runtime_exit_peers` — i.e. one this dialer
+    /// itself spawned via [`Self::add_peer`] (`is_runtime_exit: true`).
+    /// `runtime_exit_peers.lock().remove(addr)` is both the membership
+    /// check AND the removal, done atomically under one lock acquisition,
+    /// so there is no window where a caller could race this against a
+    /// concurrent `add_peer` and observe a stale "yes, it's runtime" result.
+    /// A STARTUP-configured `pool.peers` sync peer or startup
+    /// `pool.exit_node` (dialed only via `start()`, which passes
+    /// `is_runtime_exit: false` and so never inserts here) is NEVER in
+    /// `runtime_exit_peers` — this method is a guaranteed no-op (returns
+    /// `false`) for any such address, regardless of what the caller passes.
+    /// Tearing one of those down would break pool-sync convergence with
+    /// that peer, which must never happen from this path.
+    ///
+    /// Returns `true` iff `addr` was actually a tracked runtime-exit peer
+    /// (and so was torn down); `false` for a blank address or one this
+    /// dialer never runtime-added (including a startup peer).
+    pub fn remove_peer(&self, addr: &str) -> bool {
+        let addr = addr.trim();
+        if addr.is_empty() {
+            return false;
+        }
+        // See `topology_lock`'s doc comment — serializes this whole
+        // membership transition against a concurrent `add_peer`.
+        let _topo = self.topology_lock.lock();
+        if !self.runtime_exit_peers.lock().remove(addr) {
+            return false;
+        }
+        if let Some(stop) = self.peer_stop_flags.lock().remove(addr) {
+            stop.store(true, Ordering::Relaxed);
+        }
+        self.dialed_peers.lock().remove(addr);
+        self.peer_senders.lock().remove(addr);
+        if let Some(entry) = self.pool_status.lock().get_mut(addr) {
+            entry.connected = false;
+        }
+        info!(
+            "pool_dialer: remove_peer({}) — runtime exit dial torn down",
+            addr
+        );
+        true
+    }
+
+    /// Wave 2 (dial-teardown): snapshot of every peer address currently
+    /// tracked as a RUNTIME exit dial (added via [`Self::add_peer`] for a
+    /// client or global `exit_node` — see `runtime_exit_peers`'s doc
+    /// comment), at the moment of the call. Used by `gateway.rs`'s
+    /// `teardown_unused_exit_dials` to compute which of them are no longer
+    /// referenced by any client/global `exit_node` and should be
+    /// [`Self::remove_peer`]d. NEVER includes a startup-configured
+    /// `pool.peers`/`pool.exit_node` dial.
+    pub fn runtime_exit_peer_addrs(&self) -> Vec<String> {
+        self.runtime_exit_peers.lock().iter().cloned().collect()
+    }
+
+    /// Wave 2 test-only: `true` iff `addr` is currently tracked in
+    /// `runtime_exit_peers`.
+    #[cfg(test)]
+    pub(crate) fn is_runtime_exit_peer(&self, addr: &str) -> bool {
+        self.runtime_exit_peers.lock().contains(addr)
     }
 
     /// Wave B2c: every peer address currently tracked in `dialed_peers` —
@@ -538,15 +683,45 @@ impl PoolDialer {
     }
 
     /// Reconnect loop for a single peer: dial, run anti-entropy until the
-    /// session ends, back off, repeat — until `shutdown` is set.
-    async fn dial_loop(self: Arc<Self>, peer: String, shutdown: Arc<AtomicBool>) {
+    /// session ends, back off, repeat — until `shutdown` (process-wide) or
+    /// `peer_stop` (Wave 2, this ONE peer's own teardown signal — see
+    /// [`Self::remove_peer`]) is set.
+    ///
+    /// A live session is not just skipped on the next reconnect check —
+    /// `peer_stop` also interrupts a session ALREADY in progress: each
+    /// attempt races `run_one_session` against `watch_combined_stop`
+    /// (which sets a per-attempt `combined` flag the instant either
+    /// `shutdown` or `peer_stop` fires) instead of an external
+    /// `tokio::select!` over `run_one_session` itself — cancelling
+    /// `run_one_session`'s future directly would drop it mid-flight and
+    /// skip its own cleanup (`driver.abort()` for the `anti_entropy` task,
+    /// `peer_senders`/`pool_status` bookkeeping). Routing the stop signal
+    /// THROUGH the flag `AivpnClient::run` already polls means
+    /// `run_one_session` always returns normally and that cleanup always
+    /// runs.
+    async fn dial_loop(
+        self: Arc<Self>,
+        peer: String,
+        shutdown: Arc<AtomicBool>,
+        peer_stop: Arc<AtomicBool>,
+    ) {
         let mut backoff = INITIAL_BACKOFF;
 
-        while !shutdown.load(Ordering::Relaxed) {
+        while !shutdown.load(Ordering::Relaxed) && !peer_stop.load(Ordering::Relaxed) {
             let started = std::time::Instant::now();
             info!("pool_dialer: connecting to peer {}", peer);
 
-            match self.run_one_session(&peer, shutdown.clone()).await {
+            let combined = Arc::new(AtomicBool::new(false));
+            let watcher = tokio::spawn(watch_combined_stop(
+                shutdown.clone(),
+                peer_stop.clone(),
+                combined.clone(),
+            ));
+
+            let session_result = self.run_one_session(&peer, combined.clone()).await;
+            watcher.abort();
+
+            match session_result {
                 Ok(()) => {
                     debug!("pool_dialer: session with {} ended cleanly", peer);
                 }
@@ -555,7 +730,7 @@ impl PoolDialer {
                 }
             }
 
-            if shutdown.load(Ordering::Relaxed) {
+            if shutdown.load(Ordering::Relaxed) || peer_stop.load(Ordering::Relaxed) {
                 break;
             }
 
@@ -567,7 +742,22 @@ impl PoolDialer {
             }
 
             debug!("pool_dialer: reconnecting to {} in {:?}", peer, backoff);
-            tokio::time::sleep(backoff).await;
+            // Wave 2: poll `peer_stop` in short slices instead of one flat
+            // sleep, so `remove_peer` during the backoff wait (not just
+            // during a live session) is picked up promptly rather than only
+            // after the full (up to `MAX_BACKOFF`) delay elapses. `shutdown`
+            // deliberately keeps its pre-existing (loop-top-only) check here
+            // — unchanged behavior for process-wide shutdown, which is out
+            // of this wave's scope.
+            let mut remaining = backoff;
+            while remaining > Duration::ZERO {
+                if peer_stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                let step = remaining.min(Duration::from_millis(200));
+                tokio::time::sleep(step).await;
+                remaining = remaining.saturating_sub(step);
+            }
             backoff = (backoff * 2).min(MAX_BACKOFF);
         }
     }
@@ -628,6 +818,9 @@ impl PoolDialer {
 
         // Registry: make this peer's control sender reachable via
         // `send_to_peer`/`broadcast` for the lifetime of this session.
+        // `per_session_ctrl` is kept for the guarded cleanup at the end of
+        // this function (identity check via `Sender::same_channel`).
+        let per_session_ctrl = ctrl.clone();
         self.peer_senders
             .lock()
             .insert(peer.to_string(), ctrl.clone());
@@ -714,17 +907,63 @@ impl PoolDialer {
         // reconnect (via `dial_loop`) inserts a fresh entry the next time
         // `run_one_session` succeeds, so this never leaves a stale sender
         // behind for `send_to_peer`/`broadcast` to find.
-        self.peer_senders.lock().remove(peer);
+        //
+        // Guarded remove: only remove the entry if it is still THIS
+        // session's sender. A stale session winding down (remove_peer →
+        // immediate add_peer of the same address, e.g. the admin
+        // re-assigning the same exit) races with the NEW session's insert
+        // above — an unconditional remove here would delete the live new
+        // session's sender, leaving `has_live_session`/`send_to_peer` dark
+        // for that peer until its next reconnect (potentially hours).
+        let removed_own_sender = {
+            let mut senders = self.peer_senders.lock();
+            match senders.get(peer) {
+                Some(tx) if tx.same_channel(&per_session_ctrl) => {
+                    senders.remove(peer);
+                    true
+                }
+                _ => false,
+            }
+        };
 
         // Wave B1: mirror the disconnect into the retained status too —
         // `converged`/`last_converged_unix` are left untouched (they record
         // the last time convergence WAS observed, which stays meaningful
-        // across a disconnect/reconnect).
-        if let Some(entry) = self.pool_status.lock().get_mut(peer) {
-            entry.connected = false;
+        // across a disconnect/reconnect). Same guard as above: a stale
+        // session must not mark a live replacement session disconnected.
+        if removed_own_sender {
+            if let Some(entry) = self.pool_status.lock().get_mut(peer) {
+                entry.connected = false;
+            }
         }
 
         run_result
+    }
+}
+
+/// Wave 2 (dial-teardown): background watcher for one `dial_loop` attempt —
+/// polls the shared process-wide `shutdown` flag and this peer's own
+/// `peer_stop` flag (see [`PoolDialer::remove_peer`]) on a short interval
+/// and, the instant either fires, sets `combined` once and returns.
+/// `combined` is what actually gets handed to `run_one_session`/
+/// `AivpnClient::run` — which only ever polls ONE `Arc<AtomicBool>` — so a
+/// per-peer teardown reaches a session already in progress through the
+/// EXACT SAME graceful-shutdown path `AivpnClient::run` already implements
+/// for process-wide `shutdown`, rather than needing a second one built for
+/// this wave. `dial_loop` aborts this task right after `run_one_session`
+/// returns, so it never outlives the session it was watching for.
+async fn watch_combined_stop(
+    shutdown: Arc<AtomicBool>,
+    peer_stop: Arc<AtomicBool>,
+    combined: Arc<AtomicBool>,
+) {
+    const POLL_INTERVAL: Duration = Duration::from_millis(150);
+    loop {
+        if shutdown.load(Ordering::Relaxed) || peer_stop.load(Ordering::Relaxed) {
+            combined.store(true, Ordering::Relaxed);
+            return;
+        }
+        tokio::time::sleep(POLL_INTERVAL).await;
     }
 }
 
@@ -1114,8 +1353,8 @@ async fn anti_entropy(
                     Some(ControlPayload::PartitionAnnounce {
                         subnet_cidr: peer_cidr,
                         partition_index: peer_index,
-                        partition_size: _peer_partition_size,
-                        num_partitions: _peer_num_partitions,
+                        partition_size: peer_partition_size,
+                        num_partitions: peer_num_partitions,
                         explicit: peer_explicit,
                     }) => {
                         // Wave B-IP.2: this is the gateway's reply to the
@@ -1128,11 +1367,20 @@ async fn anti_entropy(
                         let local_cidr = db.network_config().cidr_string();
                         let local_partition =
                             db.partition_info().map(|p| (p.partition_index, p.explicit));
+                        // Decode the UNPARTITIONED sentinel {index:0, size:0,
+                        // num_partitions:1} back to `None` — see
+                        // `decode_peer_partition`'s doc comment.
+                        let peer_partition = crate::pool_partition::decode_peer_partition(
+                            peer_index,
+                            peer_partition_size,
+                            peer_num_partitions,
+                            peer_explicit,
+                        );
                         let check = crate::pool_partition::check_partition(
                             &local_cidr,
                             local_partition,
                             &peer_cidr,
-                            Some((peer_index, peer_explicit)),
+                            peer_partition,
                         );
                         if last_partition_check != Some(check) {
                             crate::pool_partition::log_partition_check(
@@ -1682,6 +1930,123 @@ mod tests {
         assert_eq!(
             addrs,
             vec!["peer-a:443".to_string(), "peer-b:443".to_string()]
+        );
+    }
+
+    // ── Wave 2: dial-teardown ────────────────────────────────────────────
+
+    /// `remove_peer` must remove ONLY the targeted runtime-exit peer —
+    /// a sibling runtime peer must stay fully intact (dialed, and still
+    /// reachable via `has_live_session`/`send_to_peer` if it had a live
+    /// session).
+    #[tokio::test]
+    async fn remove_peer_removes_only_the_target_runtime_peer() {
+        let cfg = base_pool_config();
+        let dialer = PoolDialer::new(test_db(), &cfg, vec![], None, None).unwrap();
+        dialer.test_mark_started(Arc::new(AtomicBool::new(false)));
+
+        dialer.add_peer("runtime-a:51820");
+        dialer.add_peer("runtime-b:51820");
+        let _rx_b = dialer.test_register_live_session("runtime-b:51820");
+        assert!(dialer.is_dialed_peer("runtime-a:51820"));
+        assert!(dialer.is_dialed_peer("runtime-b:51820"));
+
+        let removed = dialer.remove_peer("runtime-a:51820");
+
+        assert!(removed, "a tracked runtime-exit peer must be removable");
+        assert!(
+            !dialer.is_dialed_peer("runtime-a:51820"),
+            "the targeted peer must no longer be tracked as dialed"
+        );
+        assert!(
+            !dialer.is_runtime_exit_peer("runtime-a:51820"),
+            "the targeted peer must no longer be tracked as a runtime exit"
+        );
+        assert!(
+            dialer.is_dialed_peer("runtime-b:51820"),
+            "a sibling runtime peer must be untouched"
+        );
+        assert!(
+            dialer.has_live_session("runtime-b:51820"),
+            "a sibling peer's live session must survive an unrelated remove_peer"
+        );
+    }
+
+    /// ⚠️ CRITICAL safety guarantee: `remove_peer` must REFUSE to act on a
+    /// peer this dialer did not itself add via `add_peer` — i.e. a
+    /// startup-configured `pool.peers` sync peer (or a startup
+    /// `pool.exit_node`, indistinguishably merged into the same set by
+    /// `main.rs` before `PoolDialer::new` — see that wiring site). Tearing
+    /// one of those down would break pool-sync convergence with that peer.
+    #[tokio::test]
+    async fn remove_peer_refuses_a_non_runtime_pool_sync_peer() {
+        let cfg = base_pool_config();
+        let dialer = PoolDialer::new(test_db(), &cfg, vec![], None, None).unwrap();
+        dialer.test_mark_started(Arc::new(AtomicBool::new(false)));
+
+        // Simulate a startup-configured dial (what `start()` does for every
+        // entry in `self.peers`) WITHOUT calling the real `start()` — same
+        // rationale `test_mark_started`'s own doc comment gives for why
+        // tests avoid it (a real `start()` would additionally try to dial
+        // every OTHER configured peer for real).
+        assert!(dialer.spawn_dial_loop("pool-sync-peer:443".to_string(), false));
+        assert!(dialer.is_dialed_peer("pool-sync-peer:443"));
+        assert!(
+            !dialer.is_runtime_exit_peer("pool-sync-peer:443"),
+            "a startup (is_runtime_exit: false) dial must never be tracked as runtime"
+        );
+
+        let removed = dialer.remove_peer("pool-sync-peer:443");
+
+        assert!(
+            !removed,
+            "remove_peer must refuse a peer never added via add_peer"
+        );
+        assert!(
+            dialer.is_dialed_peer("pool-sync-peer:443"),
+            "a refused remove_peer must leave the pool-sync peer's dial fully intact"
+        );
+    }
+
+    /// A blank/whitespace-only address, and an address that was never
+    /// dialed at all, must both be safe no-ops.
+    #[tokio::test]
+    async fn remove_peer_is_noop_for_blank_or_unknown_address() {
+        let cfg = base_pool_config();
+        let dialer = PoolDialer::new(test_db(), &cfg, vec![], None, None).unwrap();
+        dialer.test_mark_started(Arc::new(AtomicBool::new(false)));
+
+        assert!(!dialer.remove_peer("   "));
+        assert!(!dialer.remove_peer("never-added:443"));
+    }
+
+    /// `runtime_exit_peer_addrs` must track exactly the `add_peer`-added
+    /// set — growing on `add_peer`, shrinking on a successful
+    /// `remove_peer`, and never including a startup-configured peer.
+    #[tokio::test]
+    async fn runtime_exit_peer_addrs_reflects_add_and_remove() {
+        let cfg = base_pool_config();
+        let dialer = PoolDialer::new(test_db(), &cfg, vec![], None, None).unwrap();
+        dialer.test_mark_started(Arc::new(AtomicBool::new(false)));
+
+        // A startup-style dial (not via `add_peer`) must never appear here.
+        dialer.spawn_dial_loop("startup-peer:443".to_string(), false);
+
+        dialer.add_peer("exit-x:51820");
+        dialer.add_peer("exit-y:51820");
+        let mut addrs = dialer.runtime_exit_peer_addrs();
+        addrs.sort();
+        assert_eq!(
+            addrs,
+            vec!["exit-x:51820".to_string(), "exit-y:51820".to_string()],
+            "runtime_exit_peer_addrs must contain exactly the add_peer-added set"
+        );
+
+        dialer.remove_peer("exit-x:51820");
+        assert_eq!(
+            dialer.runtime_exit_peer_addrs(),
+            vec!["exit-y:51820".to_string()],
+            "a removed peer must drop out of runtime_exit_peer_addrs"
         );
     }
 }

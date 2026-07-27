@@ -13,6 +13,7 @@
 //! `tokio::process::Command` + `BufReader::lines()` pattern the VPN-connect
 //! worker subscription in `app.rs::subscription` already uses.
 
+use iced::futures::SinkExt;
 use iced::Subscription;
 use tokio::io::{AsyncBufReadExt, BufReader};
 
@@ -511,22 +512,45 @@ pub fn install_subscription(target: InstallTarget) -> Subscription<Message> {
         let mut out = BufReader::new(stdout).lines();
         let mut err = BufReader::new(stderr).lines();
 
+        // Drain BOTH streams to their own EOF — never break on the first one
+        // to finish. `ssh-install run`'s final `##AIVPN {"step":"done",...}`
+        // marker (which carries the `aivpn://` connection key the wizard
+        // auto-imports) is on STDOUT; a bare `_ => break` on the stderr arm
+        // would tear the loop down the instant stderr closed (e.g. an install
+        // that emits nothing on stderr) and silently drop that still-pending
+        // stdout marker. The per-branch `if !*_done` guards stop a finished
+        // stream's `next_line()` from being polled again (it would busy-return
+        // `Ok(None)`), and the loop exits only once both have hit EOF.
+        let mut out_done = false;
+        let mut err_done = false;
+        // Lines are `send().await`ed (not `try_send`): a fast-scrolling
+        // install (e.g. apt output) can easily outpace the event loop and
+        // fill the 64-slot channel, and a dropped `##AIVPN` marker line
+        // would lose the `connection_key` the wizard auto-imports.
         loop {
             tokio::select! {
-                line = out.next_line() => match line {
+                line = out.next_line(), if !out_done => match line {
                     Ok(Some(l)) => {
-                        let _ = sender.try_send(Message::InstallWizardLine(parse_install_line(&l)));
+                        let _ = sender
+                            .send(Message::InstallWizardLine(parse_install_line(&l)))
+                            .await;
                     }
-                    _ => break,
+                    _ => out_done = true,
                 },
-                line = err.next_line() => match line {
+                line = err.next_line(), if !err_done => match line {
                     Ok(Some(l)) => {
-                        let _ = sender.try_send(Message::InstallWizardLine(InstallLine::Raw(
-                            format!("[err] {l}"),
-                        )));
+                        let _ = sender
+                            .send(Message::InstallWizardLine(InstallLine::Raw(
+                                format!("[err] {l}"),
+                            )))
+                            .await;
                     }
-                    _ => break,
+                    _ => err_done = true,
                 },
+                else => break,
+            }
+            if out_done && err_done {
+                break;
             }
         }
 
@@ -534,7 +558,10 @@ pub fn install_subscription(target: InstallTarget) -> Subscription<Message> {
             Ok(status) => status.code().unwrap_or(-1),
             Err(_) => -1,
         };
-        let _ = sender.try_send(Message::InstallWizardFinished(code));
+        // send().await, not try_send: dropping this terminal message on a
+        // full channel would leave `install_running` true forever (UI stuck
+        // on "Installing..." with no subprocess left).
+        let _ = sender.send(Message::InstallWizardFinished(code)).await;
     });
     Subscription::run_with_id("aivpn_install_wizard", stream)
 }

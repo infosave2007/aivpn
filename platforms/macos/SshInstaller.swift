@@ -135,6 +135,14 @@ enum SshInstaller {
         do {
             try task.run()
         } catch {
+            // Unblock the two drain threads: with no child holding the write
+            // ends, EOF only arrives after we close our own copies — without
+            // this, both readDataToEndOfFile calls (and their GCD threads +
+            // pipe fds) leak forever on every failed spawn. Same reasoning as
+            // `VPNManager.runBundledClientCommand`'s catch path.
+            outPipe.fileHandleForWriting.closeFile()
+            errPipe.fileHandleForWriting.closeFile()
+            _ = group.wait(timeout: .now() + 1)
             return (-1, "", error.localizedDescription)
         }
 

@@ -155,13 +155,7 @@ pub async fn mgmt_call(
     let out = out?;
 
     let stderr = String::from_utf8_lossy(&out.stderr);
-    let status: u16 = stderr
-        .lines()
-        .next()
-        .unwrap_or("0")
-        .trim()
-        .parse()
-        .unwrap_or(0);
+    let status = parse_mgmt_status(&stderr);
     if status == 0 {
         let msg = stderr.trim();
         return Err(if msg.is_empty() {
@@ -175,6 +169,22 @@ pub async fn mgmt_call(
         return Err(format!("HTTP {status}: {}", body_txt.trim()));
     }
     Ok((status, out.stdout))
+}
+
+/// Extract the HTTP status `aivpn-client mgmt` prints to stderr
+/// (`eprintln!("{status}")` in its `main.rs`, the LAST thing it writes
+/// there). The client initializes a stderr-writing tracing subscriber
+/// before dispatching the subcommand, so stderr may carry log lines BEFORE
+/// the status line (e.g. with `RUST_LOG` set in the desktop session) —
+/// scanning for the last purely-numeric line instead of blindly taking the
+/// first line keeps the parse robust to that. 0 = no parseable status
+/// (treated as "no reply" by the caller).
+fn parse_mgmt_status(stderr: &str) -> u16 {
+    stderr
+        .lines()
+        .rev()
+        .find_map(|l| l.trim().parse().ok())
+        .unwrap_or(0)
 }
 
 fn parse_json<T: for<'de> Deserialize<'de>>(body: &[u8]) -> Result<T, String> {
@@ -535,4 +545,34 @@ pub async fn qr_png(text: String) -> Result<Vec<u8>, String> {
     })
     .await
     .map_err(|e| format!("Task join error: {e}"))?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_mgmt_status;
+
+    #[test]
+    fn parse_mgmt_status_plain() {
+        assert_eq!(parse_mgmt_status("200\n"), 200);
+        assert_eq!(parse_mgmt_status("404"), 404);
+    }
+
+    #[test]
+    fn parse_mgmt_status_ignores_leading_log_lines() {
+        // tracing writes to stderr before the status eprintln — the status
+        // is the LAST numeric line, not necessarily the first line.
+        let stderr = "2026-07-24T10:00:00Z  WARN aivpn_client: something noisy\n204\n";
+        assert_eq!(parse_mgmt_status(stderr), 204);
+    }
+
+    #[test]
+    fn parse_mgmt_status_no_numeric_line_is_zero() {
+        assert_eq!(
+            parse_mgmt_status(
+                "No reply from daemon at 127.0.0.1:44301 (is aivpn-client running?)\n"
+            ),
+            0
+        );
+        assert_eq!(parse_mgmt_status(""), 0);
+    }
 }

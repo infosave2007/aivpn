@@ -380,20 +380,28 @@ async fn main() {
     let _log_guard = {
         let args: Vec<String> = std::env::args().collect();
         // Only write to the persistent log file for the main VPN connection mode.
-        // Subcommands (record, kill-switch, bench) are short-lived one-off CLI
-        // invocations that must not truncate the VPN connection log. Must match
-        // the real `ClientCommand` variants exactly: `Record`("record"),
+        // Subcommands (record, kill-switch, bench, mgmt, role, ssh-install) are
+        // short-lived one-off CLI invocations that must not truncate the VPN
+        // connection log. Must match the real `ClientCommand` variants exactly:
+        // `Record`("record"),
         // `KillSwitch`("kill-switch" — clap's `#[command(name = "kill-switch")]`),
-        // `Bench`("bench"). There is no top-level "status"/"key" subcommand, so
+        // `Bench`("bench"), `Mgmt`("mgmt"), `Role`("role"),
+        // `SshInstall`("ssh-install"). The P2.3-desktop bridge commands matter
+        // most here: the Windows GUI shells out `aivpn-client.exe mgmt ...`
+        // repeatedly WHILE the VPN daemon is running — before they were listed,
+        // every such call fell into the main-mode branch below and truncated
+        // %LOCALAPPDATA%\AIVPN\client.log mid-session. There is no top-level "status"/"key" subcommand, so
         // those never matched anything; "kill-switch" was missing entirely,
         // which meant e.g. `aivpn-client.exe kill-switch clear` — a genuine
         // one-off admin action — fell through to the main-mode branch below and
         // truncated %LOCALAPPDATA%\AIVPN\client.log, destroying diagnostic
         // history from the last real VPN session.
-        let is_subcommand = args
-            .iter()
-            .skip(1)
-            .any(|a| matches!(a.as_str(), "record" | "kill-switch" | "bench"));
+        let is_subcommand = args.iter().skip(1).any(|a| {
+            matches!(
+                a.as_str(),
+                "record" | "kill-switch" | "bench" | "mgmt" | "role" | "ssh-install"
+            )
+        });
 
         let log_path = if is_subcommand {
             None
@@ -457,7 +465,17 @@ async fn main() {
                 .with_ansi(false)
                 .init();
         } else {
-            tracing_subscriber::fmt().with_env_filter(filter).init();
+            // No log file (every subcommand — `log_path` is `None` for
+            // `is_subcommand` above — and the daemon when `%LOCALAPPDATA%`
+            // is unset): write to STDERR, never STDOUT. `mgmt`/`role`/
+            // `ssh-install` print their machine-readable reply (mgmt JSON
+            // body, role integer, `##AIVPN` markers) on STDOUT, and the
+            // egui GUI parses it; a default-`info` tracing line on STDOUT
+            // would corrupt that. Mirrors the non-Windows branch below.
+            tracing_subscriber::fmt()
+                .with_env_filter(filter)
+                .with_writer(std::io::stderr)
+                .init();
         }
         log_path // keep in scope so the subscriber lives for the whole process
     };

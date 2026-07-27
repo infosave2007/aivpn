@@ -101,6 +101,38 @@
                         android:paddingTop="2dp"
                         android:paddingBottom="8dp" />
 
+                    <!-- The active mask is strictly per-client server-side
+                         (.overrides/{client}.mask) — an empty client id is
+                         rejected with 400, so a client MUST be picked. -->
+                    <TextView
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:text="@string/server_settings_mask_client_label"
+                        android:textSize="12sp"
+                        android:textColor="@color/text_secondary" />
+
+                    <Spinner
+                        android:id="@+id/spinnerMaskClient"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content" />
+
+                    <TextView
+                        android:id="@+id/textMaskClientEmpty"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:text="@string/server_settings_mask_no_clients"
+                        android:textSize="12sp"
+                        android:textColor="@color/text_secondary"
+                        android:visibility="gone" />
+
+                    <TextView
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:text="@string/server_settings_mask_label"
+                        android:textSize="12sp"
+                        android:textColor="@color/text_secondary"
+                        android:paddingTop="8dp" />
+
                     <Spinner
                         android:id="@+id/spinnerMask"
                         android:layout_width="match_parent"

@@ -277,6 +277,9 @@
     <string name="server_settings_title">Настройки сервера</string>
     <string name="server_settings_mask_title">Активная маска</string>
     <string name="server_settings_mask_caption">Применяется вживую, немедленно — перезапуск сервера не требуется. Подтвердите в течение окна ниже, иначе изменение будет автоматически откачено.</string>
+    <string name="server_settings_mask_client_label">Клиент (переопределение маски — per-client)</string>
+    <string name="server_settings_mask_label">Маска</string>
+    <string name="server_settings_mask_no_clients">Список клиентов недоступен — подключитесь к VPN и нажмите обновить.</string>
     <string name="server_settings_mask_id_hint">Введите id маски</string>
     <string name="server_settings_mask_none_loaded">Список масок пока недоступен — подключитесь к VPN и откройте этот экран заново, либо введите id маски вручную.</string>
     <string name="server_settings_exit_title">Глобальный выходной узел по умолчанию (пул)</string>

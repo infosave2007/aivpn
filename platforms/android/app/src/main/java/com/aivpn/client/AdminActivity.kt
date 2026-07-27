@@ -254,9 +254,14 @@ class AdminActivity : AppCompatActivity() {
             setTextColor(getColor(R.color.text_secondary))
             setPadding(0, 8.dp, 0, 2.dp)
         }
+        // isNull guard: the server always serializes `expires_at` (null when
+        // unset), and Android org.json's optString turns JSON null into the
+        // literal string "null" — which would then round-trip into the PATCH
+        // body and fail the server's DateTime parse (400 for the whole edit).
+        val originalExpiry = if (client.isNull("expires_at")) "" else client.optString("expires_at", "")
         val expiryInput = EditText(dialogCtx).apply {
             hint = "2026-12-31T00:00:00Z"
-            setText(client.optString("expires_at", ""))
+            setText(originalExpiry)
             setSingleLine(true)
             textSize = 13f
         }
@@ -278,15 +283,18 @@ class AdminActivity : AppCompatActivity() {
                 val exitNodeText = exitNodeInput.text.toString().trim()
                 // Cleared field that previously had a value -> explicit
                 // null (fall back to global default); non-empty -> set;
-                // empty and never had a value -> omit (no-op).
+                // empty and never had a value -> omit (no-op). Same
+                // double-Option convention for expiry below.
                 val clearExitNode = exitNodeText.isEmpty() && originalExitNode.isNotEmpty()
+                val clearExpiry = expiry.isEmpty() && originalExpiry.isNotEmpty()
                 lifecycleScope.launch {
                     val result = AdminApi.patchClient(
                         id = id,
                         name = name.ifEmpty { null },
                         enabled = enabledCheck.isChecked,
                         oneTime = oneTimeCheck.isChecked,
-                        expiresAt = expiry,
+                        expiresAt = expiry.ifEmpty { null },
+                        clearExpiresAt = clearExpiry,
                         exitNode = exitNodeText.ifEmpty { null },
                         clearExitNode = clearExitNode,
                     )
@@ -584,7 +592,9 @@ class AdminActivity : AppCompatActivity() {
             val name = c.optString("name", id)
             val enabled = c.optBoolean("enabled", true)
             val oneTime = c.optBoolean("one_time", false)
-            val expiresAt = c.optString("expires_at", "")
+            // isNull guard — see showEditDialogWithOptions: JSON null would
+            // otherwise render as the literal subtitle text "null".
+            val expiresAt = if (c.isNull("expires_at")) "" else c.optString("expires_at", "")
             val roleStr = c.optString("role", "")
             val rejectReason = c.optString("reject_reason", c.optString("last_reject_reason", ""))
 

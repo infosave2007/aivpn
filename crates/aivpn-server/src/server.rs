@@ -346,6 +346,14 @@ impl AivpnServer {
         self.gateway.exit_route_cache()
     }
 
+    /// P1 REST parity fix: shared handle to the gateway's live
+    /// `masked_exit_addr` cell, for `main.rs`'s REST `ServeConfig` — see
+    /// `Gateway::masked_exit_addr`'s doc comment. Mirrors
+    /// `exit_route_cache()`'s existing sharing pattern.
+    pub fn masked_exit_addr(&self) -> Arc<parking_lot::RwLock<Option<String>>> {
+        self.gateway.masked_exit_addr()
+    }
+
     /// Set multi-hop chain forwarder.  Must be called before `run()`.
     pub fn set_chain_forwarder(&mut self, cf: Arc<crate::chain_forwarder::ChainForwarder>) {
         self.gateway.set_chain_forwarder(cf);

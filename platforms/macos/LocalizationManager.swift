@@ -1189,6 +1189,14 @@ class LocalizationManager: ObservableObject {
             "en": "Active mask",
             "ru": "Активная маска"
         ],
+        "server_settings_select_client": [
+            "en": "Client",
+            "ru": "Клиент"
+        ],
+        "server_settings_no_clients": [
+            "en": "No clients available",
+            "ru": "Нет доступных клиентов"
+        ],
         "server_settings_mask_catalog_unavailable": [
             "en": "Mask catalog unavailable — enter a mask ID manually.",
             "ru": "Каталог масок недоступен — введите ID маски вручную."

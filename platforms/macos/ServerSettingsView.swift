@@ -60,13 +60,18 @@ struct PendingApply {
 // `JSONEncoder`'s `Optional` handling can't express directly — `NSNull()`
 // gives precise control over that.
 
-/// `{"client":"","mask":"<id>"}` — selects `HeavySetting::ActiveMask` on the
-/// server (`client` empty is intentional here: this is the server's GLOBAL
-/// active-mask control, not a per-client override — mirrors the same empty-
-/// `client` convention the design note in mgmt_service.rs's `TunnelApplyRequest`
-/// doc comment describes for this call shape).
-private func adminApplyMaskBodyJSON(mask: String) -> Data {
-    (try? JSONSerialization.data(withJSONObject: ["client": "", "mask": mask])) ?? Data()
+/// `{"client":"<id>","mask":"<id>"}` — selects `HeavySetting::ActiveMask` on
+/// the server: a PER-CLIENT active-mask override (writes
+/// `<mask_dir>/.overrides/<client-id>.mask`). `client` MUST be a real,
+/// non-empty client id or name: `resolve_heavy_setting` in mgmt_service.rs
+/// 400s on an empty value ("fields 'client' and 'mask' are required") —
+/// there is no "server-wide" sentinel. A prior version of this builder sent
+/// `client: ""` believing it selected a global override; every Apply
+/// therefore failed with 400 against a real server. Mirrors the iOS
+/// `AdminApi.applyActiveMask(client:mask:)` contract, which documents the
+/// same server-side requirement.
+private func adminApplyMaskBodyJSON(client: String, mask: String) -> Data {
+    (try? JSONSerialization.data(withJSONObject: ["client": client, "mask": mask])) ?? Data()
 }
 
 /// `{"exit_node": "<host:port>"}` or `{"exit_node": null}` — the `exit_node`
@@ -164,6 +169,23 @@ final class ServerSettingsStore: ObservableObject {
         }
     }
 
+    // MARK: Clients (target for the per-client active-mask override)
+    //
+    // `POST /api/v1/config/apply {"client":…,"mask":…}` requires a real
+    // client id (see `adminApplyMaskBodyJSON`'s doc comment) — this list
+    // feeds the client picker in `ActiveMaskSection`. Same wire shape/decode
+    // as `AdminStore.refreshClients()` (AdminView.swift).
+
+    @Published var clients: [AdminClientView] = []
+
+    func refreshClients() {
+        run({ AdminApi.mgmtRequest(method: 0 /* GET */, path: "/api/v1/clients") }) { [weak self] result in
+            guard let (status, body) = result, status == 200,
+                  let decoded = try? JSONDecoder().decode([AdminClientView].self, from: body) else { return }
+            self?.clients = decoded
+        }
+    }
+
     // MARK: Pool nodes (source for the global-exit-node picker)
 
     @Published var poolNodes: [AdminPoolNodeView] = []
@@ -189,15 +211,15 @@ final class ServerSettingsStore: ObservableObject {
     @Published var maskErrorStatus: UInt16? = nil
     /// Set true the instant the local countdown reaches zero without a
     /// confirm — mirrors the server auto-rolling the change back on its own
-    /// sweep. Cleared on the next successful `applyMask(_:)`.
+    /// sweep. Cleared on the next successful `applyMask(client:maskId:)`.
     @Published var maskReverted = false
     private var maskTimer: Timer?
 
-    func applyMask(_ maskId: String) {
+    func applyMask(client: String, maskId: String) {
         maskApplying = true
         maskErrorStatus = nil
         maskReverted = false
-        let body = adminApplyMaskBodyJSON(mask: maskId)
+        let body = adminApplyMaskBodyJSON(client: client, mask: maskId)
         run({ AdminApi.applyConfig(body: body) }) { [weak self] result in
             guard let self = self else { return }
             self.maskApplying = false
@@ -462,6 +484,7 @@ struct ServerSettingsRootView: View {
         store.refreshRole()
         store.refreshMasks()
         store.refreshPoolNodes()
+        store.refreshClients()
     }
 
     private var header: some View {
@@ -519,15 +542,20 @@ private struct ApplyConfirmBanner: View {
 
 // MARK: - Active mask section
 
-/// «Active mask»: `Picker` sourced from `GET /api/v1/masks` (falls back to
-/// free-text entry while `store.masksUnavailable` — see that property's doc
-/// comment) → Apply → `POST /api/v1/config/apply {"client":"","mask":id}` →
+/// «Active mask»: client `Picker` (sourced from `GET /api/v1/clients` —
+/// the server's `HeavySetting::ActiveMask` is a PER-CLIENT override and
+/// 400s without a real client id, see `adminApplyMaskBodyJSON`) + mask
+/// `Picker` sourced from `GET /api/v1/masks` (falls back to free-text entry
+/// while `store.masksUnavailable` — see that property's doc comment) →
+/// Apply → `POST /api/v1/config/apply {"client":id,"mask":id}` →
 /// confirm-within-~120s banner (live change — no restart needed, unlike the
-/// global exit node below).
+/// global exit node below). Same client+mask picker pairing as the iOS
+/// `ServerSettingsView`'s active-mask section.
 private struct ActiveMaskSection: View {
     @ObservedObject var store: ServerSettingsStore
     @EnvironmentObject var loc: LocalizationManager
 
+    @State private var selectedClientId: String = ""
     @State private var selectedMaskId: String = ""
     @State private var manualMaskId: String = ""
 
@@ -535,6 +563,32 @@ private struct ActiveMaskSection: View {
         VStack(alignment: .leading, spacing: 10) {
             Text(loc.t("server_settings_mask_section_title"))
                 .font(.headline)
+
+            if store.clients.isEmpty {
+                Text(loc.t("server_settings_no_clients"))
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            } else {
+                Picker(loc.t("server_settings_select_client"), selection: $selectedClientId) {
+                    ForEach(store.clients) { client in
+                        Text(client.name).tag(client.id)
+                    }
+                }
+                .onAppear {
+                    if selectedClientId.isEmpty, let first = store.clients.first {
+                        selectedClientId = first.id
+                    }
+                }
+                // The list loads asynchronously after the window opens (and
+                // can change across refreshes) — keep the selection valid:
+                // adopt the first client once the list arrives, and drop a
+                // selection whose client no longer exists.
+                .onChange(of: store.clients) { newValue in
+                    if !newValue.contains(where: { $0.id == selectedClientId }) {
+                        selectedClientId = newValue.first?.id ?? ""
+                    }
+                }
+            }
 
             if store.masksLoading {
                 ProgressView()
@@ -576,10 +630,10 @@ private struct ActiveMaskSection: View {
                     Spacer()
                     Button(store.maskApplying ? loc.t("server_settings_applying") : loc.t("server_settings_apply")) {
                         let id = effectiveMaskId
-                        guard !id.isEmpty else { return }
-                        store.applyMask(id)
+                        guard !id.isEmpty, !selectedClientId.isEmpty else { return }
+                        store.applyMask(client: selectedClientId, maskId: id)
                     }
-                    .disabled(store.maskApplying || effectiveMaskId.isEmpty)
+                    .disabled(store.maskApplying || effectiveMaskId.isEmpty || selectedClientId.isEmpty)
                 }
             }
 

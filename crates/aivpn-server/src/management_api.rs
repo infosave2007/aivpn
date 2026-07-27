@@ -144,6 +144,18 @@ pub struct ServeConfig {
     /// `pool_dialer_slot`/`pool_registry_slot` above.
     pub exit_route_cache:
         Option<std::sync::Arc<dashmap::DashMap<std::net::Ipv4Addr, Option<String>>>>,
+    /// P1 REST parity fix: the SAME `masked_exit_addr` cell the gateway's
+    /// in-tunnel `dispatch_mgmt_request` hot-swaps after every mgmt request
+    /// (via `Gateway::masked_exit_addr()`/`AivpnServer::masked_exit_addr()`,
+    /// mirroring `exit_route_cache` above) — without this, a `pool.exit_node`
+    /// change confirmed over THIS (REST/Unix-socket) transport would persist
+    /// to `server.json` (see `HeavySetting::ExitNode`) but never take effect
+    /// on the live gateway's routing until a restart or a tunnel-side mgmt
+    /// request happened to touch it. `None` only for a `ServeConfig` built
+    /// without a live gateway to share with (e.g. a unit test) —
+    /// `confirm_config` simply skips the live-swap in that case, same
+    /// degrade-gracefully pattern as `pool_dialer_slot`/`exit_route_cache`.
+    pub masked_exit_addr: Option<std::sync::Arc<parking_lot::RwLock<Option<String>>>>,
 }
 
 // ── Shared handler state ─────────────────────────────────────────────────────
@@ -172,6 +184,7 @@ struct ApiState {
         Option<Arc<parking_lot::Mutex<Option<Arc<crate::node_registry::NodeRegistry>>>>>,
     pool_dialer_slot: Option<Arc<parking_lot::Mutex<Option<Arc<crate::pool_dialer::PoolDialer>>>>>,
     exit_route_cache: Option<Arc<dashmap::DashMap<std::net::Ipv4Addr, Option<String>>>>,
+    masked_exit_addr: Option<Arc<parking_lot::RwLock<Option<String>>>>,
 }
 
 impl ApiState {
@@ -458,6 +471,7 @@ async fn patch_client(
     let touches_exit_node = body.exit_node.is_some();
     let exit_route_cache = state.exit_route_cache.clone();
     let pool_dialer_slot = state.pool_dialer_slot.clone();
+    let masked_exit_addr = state.masked_exit_addr.clone();
     let db_for_dial = state.db.clone();
     let args = mgmt_service::UpdateClientArgs {
         name: body.name,
@@ -482,12 +496,29 @@ async fn patch_client(
         if let Some(slot) = &pool_dialer_slot {
             let dialer = slot.lock().clone();
             if let Some(dialer) = dialer {
+                let clients = db_for_dial.list_clients();
                 let already: std::collections::HashSet<String> =
                     dialer.dialed_peer_addrs().into_iter().collect();
-                for addr in
-                    crate::gateway::exits_needing_dial(&db_for_dial.list_clients(), &already)
-                {
+                for addr in crate::gateway::exits_needing_dial(&clients, &already) {
                     dialer.add_peer(addr);
+                }
+                // Wave 2 symmetry with the in-tunnel path (`Gateway::
+                // dispatch_mgmt_request` → `apply_global_exit_and_teardown`):
+                // changing a client's exit from A to B over REST must also
+                // PRUNE the now-unreferenced runtime dial to A, not only add
+                // B — otherwise every re-pointed exit leaks an idle dial
+                // task until some in-tunnel mgmt call happens to sweep it.
+                // (Deliberately NOT the full `apply_global_exit_and_teardown`
+                // here: that would re-read `server.json` and could take an
+                // applied-but-unconfirmed global `exit_node` live, which the
+                // REST path only does on an explicit confirm — see
+                // `confirm_config`.)
+                if let Some(masked_exit_addr) = &masked_exit_addr {
+                    crate::gateway::teardown_unused_exit_dials_for(
+                        masked_exit_addr,
+                        Some(&dialer),
+                        &clients,
+                    );
                 }
             }
         }
@@ -993,8 +1024,12 @@ struct ApplyConfigRequest {
     mask: Option<String>,
     /// Wave B2a: global default exit node (`host:port`), or `null` to
     /// disable it. See `HeavySetting::ExitNode`'s doc comment — this
-    /// persists to `server.json` with rollback but does NOT live-apply
-    /// (takes effect on restart).
+    /// persists to `server.json` with rollback. P1 REST parity fix: once
+    /// confirmed via `POST /api/v1/config/confirm`, it now ALSO takes
+    /// effect live on this node's own routing, without a restart — see
+    /// `confirm_config`'s call to `gateway::apply_global_exit_and_teardown`,
+    /// which mirrors the in-tunnel path's existing live-swap
+    /// (`Gateway::dispatch_mgmt_request`).
     #[serde(default, deserialize_with = "deserialize_opt_opt")]
     exit_node: Option<Option<String>>,
 }
@@ -1042,10 +1077,45 @@ async fn confirm_config(
     State(state): State<ApiState>,
     Json(body): Json<ConfirmConfigRequest>,
 ) -> impl IntoResponse {
+    // P1 REST parity fix: this REST/Unix-socket transport shares the SAME
+    // live `ClientDatabase` AND (via `masked_exit_addr`/`pool_dialer_slot`
+    // below) the SAME `masked_exit_addr` cell / `PoolDialer` as the gateway
+    // (see `ServeConfig::masked_exit_addr`'s doc comment) — but nothing on
+    // this path used to re-apply a confirmed `pool.exit_node` change to
+    // that live state, unlike the in-tunnel path
+    // (`Gateway::dispatch_mgmt_request`), which re-reads and hot-swaps it
+    // after EVERY mgmt request. Capture what's needed BEFORE `state` is
+    // moved into the blocking closure below.
+    let masked_exit_addr = state.masked_exit_addr.clone();
+    let pool_dialer_slot = state.pool_dialer_slot.clone();
+    let server_config_path = state.config_path.clone();
+    let db_for_exit = state.db.clone();
     let result = tokio::task::spawn_blocking(move || {
         mgmt_service::confirm_config(&state.mgmt_ctx(), &body.token)
     })
     .await;
+    if matches!(result, Ok(Ok(()))) {
+        // Only a CONFIRMED change (never a merely-applied, still-pending
+        // one) goes live here — an applied-but-unconfirmed `ExitNode`
+        // change already sits on disk with a rollback token
+        // (`apply_heavy`/`PendingConfigManager`), and going live before
+        // confirmation would leave this node's live routing pointed at a
+        // value the gateway's own sweep task could still revert out from
+        // under it. Mirrors the tunnel path's own re-read, just gated on
+        // this specific request having confirmed successfully rather than
+        // running unconditionally after every mgmt call.
+        if let Some(masked_exit_addr) = &masked_exit_addr {
+            let dialer = pool_dialer_slot
+                .as_ref()
+                .and_then(|slot| slot.lock().clone());
+            crate::gateway::apply_global_exit_and_teardown(
+                masked_exit_addr,
+                dialer.as_ref(),
+                server_config_path.as_deref(),
+                &db_for_exit,
+            );
+        }
+    }
     match result {
         Ok(Ok(())) => StatusCode::NO_CONTENT.into_response(),
         Ok(Err(e)) => mgmt_error_response(&e),
@@ -1606,6 +1676,7 @@ pub async fn serve(cfg: ServeConfig) {
         pool_registry_slot: cfg.pool_registry_slot,
         pool_dialer_slot: cfg.pool_dialer_slot,
         exit_route_cache: cfg.exit_route_cache,
+        masked_exit_addr: cfg.masked_exit_addr,
     };
     let app = router(state);
 

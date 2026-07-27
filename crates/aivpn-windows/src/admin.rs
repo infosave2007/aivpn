@@ -630,8 +630,18 @@ pub enum AdminResponse {
     Role(Result<u8, String>),
     Clients(Result<Vec<AdminClient>, String>),
     /// Result of both `AddClient` and `EditClient` — the server returns the
-    /// same `ClientView` shape for both.
-    ClientSaved(Result<AdminClient, String>),
+    /// same `ClientView` shape for both. `editing` records WHICH request
+    /// this answers (`true` = `EditClient`), so the UI routes the result to
+    /// the right form even if the user opened the other form while the
+    /// (up to ~5s per call) request was still in flight — the UI's own
+    /// "is the edit form open right now" state is not a reliable proxy for
+    /// that (BUG FIX, review: an Add error used to land in the Edit form's
+    /// error slot, and an Add success used to close a just-opened Edit
+    /// form, whenever the two overlapped).
+    ClientSaved {
+        editing: bool,
+        result: Result<AdminClient, String>,
+    },
     ClientDeleted {
         id: String,
         result: Result<(), String>,
@@ -681,12 +691,14 @@ pub fn spawn(client_binary: PathBuf, req: AdminRequest, tx: Sender<AdminResponse
         let resp = match req {
             AdminRequest::Role => AdminResponse::Role(run_role(&client_binary)),
             AdminRequest::ListClients => AdminResponse::Clients(list_clients(&client_binary)),
-            AdminRequest::AddClient(form) => {
-                AdminResponse::ClientSaved(add_client(&client_binary, &form))
-            }
-            AdminRequest::EditClient(form) => {
-                AdminResponse::ClientSaved(edit_client(&client_binary, &form))
-            }
+            AdminRequest::AddClient(form) => AdminResponse::ClientSaved {
+                editing: false,
+                result: add_client(&client_binary, &form),
+            },
+            AdminRequest::EditClient(form) => AdminResponse::ClientSaved {
+                editing: true,
+                result: edit_client(&client_binary, &form),
+            },
             AdminRequest::DeleteClient { id } => {
                 let result = mgmt_status_only(&client_binary, "DELETE", &path_client(&id));
                 AdminResponse::ClientDeleted { id, result }

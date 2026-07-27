@@ -278,9 +278,11 @@ enum AdminApi {
     }
 
     /// `POST /api/v1/config/apply` — thin wrapper over `mgmtRequest`. Body
-    /// is caller-built JSON: `{"client":"","mask":"<id>"}` selects the
-    /// active-mask `HeavySetting` (live, no restart); `{"exit_node":
-    /// "<host:port>"|null}` selects the global default exit-node
+    /// is caller-built JSON: `{"client":"<id>","mask":"<id>"}` selects the
+    /// per-client active-mask `HeavySetting` (live, no restart; `client`
+    /// must be a real, non-empty client id/name — `resolve_heavy_setting`
+    /// 400s on an empty value, there is no server-wide sentinel);
+    /// `{"exit_node": "<host:port>"|null}` selects the global default exit-node
     /// `HeavySetting` (persisted to `server.json`'s `pool.exit_node`, takes
     /// effect on the server's NEXT RESTART only — see
     /// `HeavySetting::ExitNode`'s doc comment in mgmt_service.rs). A `200`

@@ -46,6 +46,7 @@ private enum TunnelMessageType: String {
     case startRecord  = "record_start"
     case stopRecord   = "record_stop"
     case getRecordStatus = "record_status"
+    case mgmtRequest  = "mgmt_request"
 }
 
 // MARK: - VPNManager
@@ -83,6 +84,14 @@ class VPNManager: ObservableObject {
     /// Server-pushed mask catalog (polled from the tunnel via get_traffic).
     /// Drives the dynamic mask Picker + its "(авто)" marker.
     @Published var maskCatalog: [MaskCatalogEntry] = []
+    /// Phase A in-app admin: server-assigned role for this session
+    /// (0=User, 1=Viewer, 2=Admin), polled from the TUNNEL EXTENSION
+    /// process via get_traffic. The extension is a separate process with
+    /// its own copy of the statically-linked Rust core — the app process's
+    /// own `aivpn_get_role()` is a different global that never leaves 0 —
+    /// so this polled value is the ONLY correct role source in the app
+    /// (see AdminApi.role()). Reset to 0 (User) on connect and disconnect.
+    @Published var adminRole: UInt8 = 0
     @Published var serverAdaptiveLevel: Int = 0
     @Published var preferredMask: String = UserDefaults.standard.string(forKey: "preferredMask") ?? "auto" {
         didSet { UserDefaults.standard.set(preferredMask, forKey: "preferredMask") }
@@ -274,6 +283,7 @@ class VPNManager: ObservableObject {
                 certRejected = false
                 handshakeRejected = false
                 handshakeRejectReason = 0
+                adminRole = 0
             }
         @unknown default:
             break
@@ -297,6 +307,7 @@ class VPNManager: ObservableObject {
         recordingCapabilityKnown = false
         lastRecordingResult = nil
         certRejected = false
+        adminRole = 0
 
         let proto = NETunnelProviderProtocol()
         proto.providerBundleIdentifier = bundleId
@@ -540,6 +551,7 @@ class VPNManager: ObservableObject {
             }
             if let q = r["quality_score"] as? Int { self.liveQuality = q }
             if let al = r["adaptive_level"] as? Int { self.serverAdaptiveLevel = al }
+            if let role = r["role"] as? Int { self.adminRole = UInt8(clamping: role) }
             if let catJson = r["mask_catalog"] as? String, !catJson.isEmpty,
                let data = catJson.data(using: .utf8),
                let items = try? JSONDecoder().decode([MaskCatalogEntry].self, from: data) {
@@ -658,6 +670,39 @@ class VPNManager: ObservableObject {
                 body: reason)
         default:
             recordingState = .idle
+        }
+    }
+
+    // MARK: - In-tunnel management API (Phase A in-app admin)
+
+    /// Routes one curated management call to the TUNNEL EXTENSION process,
+    /// where the live control channel and `aivpn_mgmt_request`'s
+    /// process-global session state actually live (the app process's own
+    /// copy of the core has no session — calling the FFI here would always
+    /// return -1). See PacketTunnelProvider's "mgmt_request" handler.
+    ///
+    /// Main-thread only (same rule as every other `sendMessage` caller);
+    /// `completion` is delivered on the main queue. `nil` = transport
+    /// failure: not connected, IPC failed, or the extension reported
+    /// `aivpn_mgmt_request` returned -1 (no session / channel closed /
+    /// 10s timeout).
+    func mgmtRequest(method: UInt8, path: String, body: Data,
+                     completion: @escaping ((status: UInt16, body: Data)?) -> Void) {
+        let payload: [String: Any] = [
+            "method": Int(method),
+            "path": path,
+            "body_b64": body.base64EncodedString(),
+        ]
+        sendMessage(type: .mgmtRequest, body: payload) { response in
+            guard let r = response,
+                  let status = r["status"] as? Int,
+                  let bodyB64 = r["body_b64"] as? String,
+                  let respBody = Data(base64Encoded: bodyB64) else {
+                // Includes the tunnel's explicit {"error": "transport"} reply.
+                completion(nil)
+                return
+            }
+            completion((status: UInt16(clamping: status), body: respBody))
         }
     }
 

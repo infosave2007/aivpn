@@ -73,10 +73,15 @@
             android:exported="false"
             android:parentActivityName=".AdminActivity" />
 
-        <!-- C3: SSH server-install wizard (always reachable — no tunnel/role required) -->
+        <!-- C3: SSH server-install wizard (always reachable — no tunnel/role required).
+             configChanges (same set as MainActivity): a rotation mid-install would
+             otherwise destroy the Activity — cancelling the poll loop and freeing the
+             Rust-side event queue (sshInstallFree) — leaving a still-running install
+             permanently unobservable and dropping all typed wizard state. -->
         <activity
             android:name=".InstallServerActivity"
             android:exported="false"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboard|keyboardHidden"
             android:parentActivityName=".MainActivity" />
 
         <service

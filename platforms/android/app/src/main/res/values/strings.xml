@@ -277,6 +277,9 @@
     <string name="server_settings_title">Server settings</string>
     <string name="server_settings_mask_title">Active mask</string>
     <string name="server_settings_mask_caption">Applies live, immediately — no server restart needed. Confirm within the window below or it reverts automatically.</string>
+    <string name="server_settings_mask_client_label">Client (the mask override is per-client)</string>
+    <string name="server_settings_mask_label">Mask</string>
+    <string name="server_settings_mask_no_clients">Client list unavailable — connect to the VPN and tap refresh.</string>
     <string name="server_settings_mask_id_hint">Enter mask id</string>
     <string name="server_settings_mask_none_loaded">No mask list available yet — connect to the VPN and reopen this screen, or enter a mask id manually.</string>
     <string name="server_settings_exit_title">Global default exit (pool)</string>

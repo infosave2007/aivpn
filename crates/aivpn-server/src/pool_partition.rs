@@ -41,6 +41,29 @@ pub enum PartitionCheck {
     SubnetMismatch,
 }
 
+/// Decode a peer's announced `PartitionAnnounce` numeric fields back into
+/// the `Option<(partition_index, explicit)>` shape [`check_partition`]
+/// expects. An UNPARTITIONED node announces the self-describing sentinel
+/// `{partition_index: 0, partition_size: 0, num_partitions: 1}` (rather
+/// than skipping the announce) — that must decode to `None`, not to a
+/// literal `Some((0, _))`: a genuinely partitioned receiver holding index 0
+/// would otherwise flag a spurious `IndexConflict` against every
+/// unpartitioned peer, exactly the false alarm `check_partition`'s
+/// "one side unpartitioned never conflicts" contract rules out. A real
+/// partition always has `partition_size >= 1`.
+pub fn decode_peer_partition(
+    partition_index: u32,
+    partition_size: u32,
+    num_partitions: u32,
+    explicit: bool,
+) -> Option<(u32, bool)> {
+    if partition_size == 0 && num_partitions <= 1 {
+        None
+    } else {
+        Some((partition_index, explicit))
+    }
+}
+
 /// Compare this node's own `(subnet_cidr, Option<(partition_index,
 /// explicit)>)` against a peer's announced values. Subnet mismatch is
 /// checked first and wins outright (an index comparison across two
@@ -196,6 +219,33 @@ mod tests {
     #[test]
     fn both_sides_unpartitioned_same_subnet_is_ok() {
         let check = check_partition("10.0.0.0/24", None, "10.0.0.0/24", None);
+        assert_eq!(check, PartitionCheck::Ok);
+    }
+
+    #[test]
+    fn decode_peer_partition_maps_unpartitioned_sentinel_to_none() {
+        // The exact sentinel both announce senders emit for "no partition
+        // configured": {index: 0, size: 0, num_partitions: 1}.
+        assert_eq!(decode_peer_partition(0, 0, 1, false), None);
+        // explicit flag is irrelevant for the sentinel shape.
+        assert_eq!(decode_peer_partition(0, 0, 1, true), None);
+        // num_partitions: 0 (degenerate) with size 0 is also "no partition".
+        assert_eq!(decode_peer_partition(0, 0, 0, false), None);
+    }
+
+    #[test]
+    fn decode_peer_partition_keeps_real_partitions() {
+        assert_eq!(decode_peer_partition(0, 50, 4, false), Some((0, false)));
+        assert_eq!(decode_peer_partition(3, 50, 4, true), Some((3, true)));
+    }
+
+    #[test]
+    fn partitioned_index_zero_vs_unpartitioned_sentinel_is_ok_not_conflict() {
+        // Regression: node A partitioned with index 0, node B unpartitioned
+        // (announcing the sentinel). Decoding the sentinel as a literal
+        // Some((0, _)) used to raise a spurious IndexConflict here.
+        let peer = decode_peer_partition(0, 0, 1, false);
+        let check = check_partition("10.0.0.0/24", Some((0, true)), "10.0.0.0/24", peer);
         assert_eq!(check, PartitionCheck::Ok);
     }
 }

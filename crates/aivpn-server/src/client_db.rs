@@ -986,16 +986,31 @@ impl ClientDatabase {
                         (Some(_), None) => true,
                         (None, _) => false,
                     };
+                    // Same-liveness timestamp tie (both None — legacy
+                    // records — or the same millisecond): break it
+                    // DETERMINISTICALLY by canonical content hash, so both
+                    // nodes independently pick the SAME winner. The old
+                    // "incoming always wins when both are untimestamped"
+                    // rule made two legacy records with divergent content
+                    // swap places on EVERY anti-entropy round (A adopts B's
+                    // copy while B adopts A's) — digests never converged and
+                    // both nodes re-saved to disk each beacon, forever. An
+                    // equal-`Some` tie previously just diverged silently
+                    // (neither side ever won), keeping the bucket exchange
+                    // hot as well. Records whose canonical content is equal
+                    // hash identically → no winner needed (vpn_ip is
+                    // deliberately outside the canonical fields; divergence
+                    // there is allowed by design).
+                    let tie_break_wins = || {
+                        inc.updated_at == existing.updated_at
+                            && Self::record_canonical_hash(&inc)
+                                < Self::record_canonical_hash(existing)
+                    };
                     let incoming_wins = match (existing.deleted, inc.deleted) {
                         (true, false) => false,
                         (false, true) => true,
-                        (true, true) => strictly_newer,
-                        // Between two untimestamped live records the legacy
-                        // overwrite behavior is kept.
-                        (false, false) => {
-                            strictly_newer
-                                || (inc.updated_at.is_none() && existing.updated_at.is_none())
-                        }
+                        (true, true) => strictly_newer || tie_break_wins(),
+                        (false, false) => strictly_newer || tie_break_wins(),
                     };
                     if !incoming_wins {
                         continue;
@@ -1069,6 +1084,33 @@ impl ClientDatabase {
                 // never drops a client). The winner's vpn_ip is never
                 // touched by this branch on either node — that is what keeps
                 // its already-issued connection key valid (no churn).
+                // Hardening: an incoming record must never squat on THIS
+                // node's own server VPN IP. A peer with a DIFFERENT
+                // `server_vpn_ip` in the same subnet can legitimately
+                // allocate that address for one of its clients (its own
+                // allocator only filters ITS server IP) — but locally,
+                // `find_by_vpn_ip(server_ip)` suddenly resolving to a client
+                // corrupts routing lookups. Re-home it here exactly like a
+                // client-vs-client collision below (divergent per-node
+                // vpn_ip is allowed by design — `state_digest` excludes it).
+                if inc.vpn_ip == self.network_config().server_vpn_ip {
+                    match self.deterministic_reassign_offset(&inc.id, &data) {
+                        Some(new_ip) => {
+                            warn!(
+                                "merge_from_json: client '{}' vpn_ip {} collides with this node's server VPN IP — re-homed to {}",
+                                inc.id, inc.vpn_ip, new_ip
+                            );
+                            inc.vpn_ip = new_ip;
+                        }
+                        None => {
+                            warn!(
+                                "merge_from_json: skipping client '{}' — vpn_ip {} collides with this node's server VPN IP and no free IP to re-home",
+                                inc.id, inc.vpn_ip
+                            );
+                            continue;
+                        }
+                    }
+                }
                 if let Some(conflict_idx) = data
                     .clients
                     .iter()
@@ -2146,6 +2188,96 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// LWW tie-break: two LEGACY records (same id+psk, `updated_at: None`
+    /// on both sides) with divergent content must converge to the SAME
+    /// deterministic winner on both nodes, and stay stable afterwards.
+    /// The old rule ("incoming always wins when both are untimestamped")
+    /// made the two nodes SWAP contents on every anti-entropy round —
+    /// digests never converged and both sides re-saved forever.
+    #[test]
+    fn merge_from_json_untimestamped_tie_breaks_deterministically() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_a = ClientDatabase::load(&dir.path().join("a.json"), test_network_config()).unwrap();
+        let db_b = ClientDatabase::load(&dir.path().join("b.json"), test_network_config()).unwrap();
+
+        // Same logical client (id + psk), no timestamps, divergent names —
+        // seeded into each db via the merge insert path so BOTH copies stay
+        // untimestamped (add_client would stamp updated_at).
+        let template = {
+            let seed_dir = tempfile::tempdir().unwrap();
+            let seed_db =
+                ClientDatabase::load(&seed_dir.path().join("s.json"), test_network_config())
+                    .unwrap();
+            let mut c = seed_db.add_client("seed").unwrap();
+            c.updated_at = None;
+            c
+        };
+        let mut variant_a = template.clone();
+        variant_a.name = "as-seen-on-node-a".to_string();
+        let mut variant_b = template.clone();
+        variant_b.name = "as-seen-on-node-b".to_string();
+
+        db_a.merge_from_json(&serde_json::to_string(&vec![variant_a.clone()]).unwrap())
+            .unwrap();
+        db_b.merge_from_json(&serde_json::to_string(&vec![variant_b.clone()]).unwrap())
+            .unwrap();
+
+        // One full bidirectional anti-entropy round: each side receives the
+        // OTHER side's copy.
+        db_a.merge_from_json(&serde_json::to_string(&vec![variant_b.clone()]).unwrap())
+            .unwrap();
+        db_b.merge_from_json(&serde_json::to_string(&vec![variant_a.clone()]).unwrap())
+            .unwrap();
+
+        let name_a = db_a.find_by_id(&template.id).unwrap().name;
+        let name_b = db_b.find_by_id(&template.id).unwrap().name;
+        assert_eq!(
+            name_a, name_b,
+            "both nodes must independently converge on the SAME winner"
+        );
+
+        // Second round with the SAME inputs must change nothing (stability —
+        // this is what rules out the old A↔B content swap every round).
+        let merged_a2 = db_a
+            .merge_from_json(&serde_json::to_string(&vec![variant_b]).unwrap())
+            .unwrap();
+        let merged_b2 = db_b
+            .merge_from_json(&serde_json::to_string(&vec![variant_a]).unwrap())
+            .unwrap();
+        assert_eq!(merged_a2, 0, "converged state must be a merge no-op");
+        assert_eq!(merged_b2, 0, "converged state must be a merge no-op");
+        assert_eq!(db_a.find_by_id(&template.id).unwrap().name, name_a);
+        assert_eq!(db_b.find_by_id(&template.id).unwrap().name, name_b);
+    }
+
+    /// Hardening: an incoming record squatting on THIS node's server VPN IP
+    /// must be re-homed (or skipped), never inserted as-is — otherwise
+    /// `find_by_vpn_ip(server_ip)` starts resolving to a client.
+    #[test]
+    fn merge_from_json_rehomes_record_squatting_server_vpn_ip() {
+        let dir = tempfile::tempdir().unwrap();
+        let db =
+            ClientDatabase::load(&dir.path().join("clients.json"), test_network_config()).unwrap();
+        let server_ip = Ipv4Addr::new(10, 99, 0, 1);
+
+        let mut incoming = db.add_client("template").unwrap();
+        db.remove_client(&incoming.id.clone()).unwrap();
+        incoming.id = "squatter-id".to_string();
+        incoming.name = "squatter".to_string();
+        incoming.psk = [0x55; 32];
+        incoming.vpn_ip = server_ip;
+
+        let merged = db
+            .merge_from_json(&serde_json::to_string(&vec![incoming]).unwrap())
+            .unwrap();
+        assert_eq!(merged, 1, "the record itself must still propagate");
+        let stored = db.find_by_id("squatter-id").expect("record must merge");
+        assert_ne!(
+            stored.vpn_ip, server_ip,
+            "an incoming record must never keep this node's server VPN IP"
+        );
     }
 
     /// Wave B-IP: distinct pool `node_id`s must land in DIFFERENT hard

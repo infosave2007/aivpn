@@ -362,6 +362,13 @@ async fn main() {
     #[cfg(all(feature = "management-api", unix))]
     let mgmt_mask_dir = resolve_mask_dir(&args, file_config.as_ref());
     let mgmt_audit_log_path = Some(std::path::PathBuf::from(&args.audit_log));
+    // P1 (global exit live-swap): same `config_path` computed above (before
+    // `#[cfg(...)]`-gated locals) — not feature/unix-gated, like
+    // `mgmt_server_addr`/`mgmt_audit_log_path` above, since it feeds
+    // `GatewayConfig::server_config_path`, consumed by the unconditional
+    // `mgmt_service` in-tunnel path (`Gateway::dispatch_mgmt_request`'s
+    // `apply_global_exit_update`), not just the Unix-socket REST API.
+    let server_config_path = config_path.as_ref().map(std::path::PathBuf::from);
     #[cfg(all(feature = "management-api", unix))]
     let mgmt_mask_operator_pubkey = resolve_mask_operator_pubkey(&args, file_config.as_ref());
     #[cfg(all(feature = "management-api", unix))]
@@ -557,6 +564,9 @@ async fn main() {
         // its own copies out of `mgmt_server_addr`/`mgmt_audit_log_path`.
         mgmt_server_addr: mgmt_server_addr.clone(),
         audit_log_path: mgmt_audit_log_path.clone(),
+        // P1 (global exit live-swap): see `server_config_path`'s doc comment
+        // above and `GatewayConfig::server_config_path`'s own doc comment.
+        server_config_path: server_config_path.clone(),
         // Wave B1 (pool topology read endpoints): whether `server.json` has
         // a `pool` block at all, regardless of transport — see
         // `GatewayConfig::pool_configured`'s doc comment.
@@ -586,6 +596,15 @@ async fn main() {
                 // take effect on the live gateway. See
                 // `ServeConfig::exit_route_cache`'s doc comment.
                 let mgmt_exit_route_cache = Some(server.exit_route_cache());
+                // P1 REST parity fix: share the SAME `masked_exit_addr` cell
+                // the gateway's in-tunnel `dispatch_mgmt_request` hot-swaps
+                // after every mgmt request (mirrors `mgmt_exit_route_cache`
+                // above) — without this, a confirmed `pool.exit_node` change
+                // over THIS (REST/Unix-socket) transport would persist to
+                // `server.json` but never take effect on the live gateway's
+                // routing until a restart. See
+                // `ServeConfig::masked_exit_addr`'s doc comment.
+                let mgmt_masked_exit_addr = Some(server.masked_exit_addr());
                 #[cfg(feature = "metrics")]
                 let mgmt_metrics = Some(server.metrics());
                 if mgmt_socket.is_some() {
@@ -624,6 +643,7 @@ async fn main() {
                                 pool_registry_slot: Some(pool_registry_slot_for_api),
                                 pool_dialer_slot: Some(pool_dialer_slot_for_api),
                                 exit_route_cache: mgmt_exit_route_cache,
+                                masked_exit_addr: mgmt_masked_exit_addr,
                             },
                         )
                         .await;

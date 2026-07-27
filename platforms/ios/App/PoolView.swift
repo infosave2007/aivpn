@@ -107,10 +107,9 @@ struct PoolView: View {
     }
 
     /// Fires all three GETs concurrently — they're independent read-only
-    /// calls, so there's no need to serialize them over the (already
-    /// internally serialized, one-at-a-time) mgmt FFI channel one after
-    /// another from the UI's perspective; `Task.detached` inside
-    /// `AdminApi.request` still hops each off the calling thread.
+    /// calls, and the tunnel-IPC mgmt path (`AdminApi.request` →
+    /// `VPNManager.mgmtRequest` → the extension's correlated
+    /// `aivpn_mgmt_request` calls) handles concurrent in-flight requests.
     @MainActor
     private func loadAll() async {
         isLoading = true

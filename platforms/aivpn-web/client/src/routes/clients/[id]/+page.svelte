@@ -103,6 +103,7 @@
   const resetMut = createMutation({
     mutationFn: () => clientsApi.resetDevice(id),
     onSuccess: () => { toast = 'Device reset'; toastError = false; setTimeout(() => { toast = ''; }, 3000); },
+    onError: (e: Error) => { toast = e.message; toastError = true; setTimeout(() => { toast = ''; }, 4000); },
   });
 
   const revokeMut = createMutation({
@@ -142,14 +143,27 @@
     return res.connection_key;
   }
 
+  /** Surface key-fetch failures (403 for viewer role, daemon down) as a
+   *  toast — a bare async onclick otherwise dies as an unhandled rejection
+   *  with zero UI feedback. */
+  function keyError(e: unknown) {
+    toast = e instanceof Error ? e.message : 'Failed to load connection key';
+    toastError = true;
+    setTimeout(() => { toast = ''; }, 4000);
+  }
+
   async function showKey() {
-    connKey = await loadKey();
-    connKeyOpen = true;
+    try {
+      connKey = await loadKey();
+      connKeyOpen = true;
+    } catch (e) { keyError(e); }
   }
 
   async function showQr() {
-    qrData = await loadKey();
-    qrOpen = true;
+    try {
+      qrData = await loadKey();
+      qrOpen = true;
+    } catch (e) { keyError(e); }
   }
 
   function formatBytes(b: number): string {

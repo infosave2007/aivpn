@@ -331,7 +331,13 @@ final class AdminStore: ObservableObject {
             self.isLoading = false
             guard let (status, body) = result, status == 200,
                   let decoded = try? JSONDecoder().decode([AdminClientView].self, from: body) else {
-                self.channelUnavailable = (result == nil)
+                // `status == 0` is the daemon's local-failure sentinel (see
+                // `AdminApi.mgmtRequest`'s doc: control channel closed / no
+                // reply within its own timeout) — the daemon answered but the
+                // server is unreachable, which for this UI is the same
+                // "couldn't reach" state as no reply at all, NOT an empty
+                // clients list.
+                self.channelUnavailable = ((result?.status ?? 0) == 0)
                 return
             }
             self.channelUnavailable = false
@@ -460,7 +466,9 @@ final class AdminStore: ObservableObject {
             self.poolLoading = false
             guard let (status, body) = result, status == 200,
                   let decoded = try? JSONDecoder().decode([AdminPoolNodeView].self, from: body) else {
-                self.poolChannelUnavailable = (result == nil)
+                // Same `status == 0` local-failure sentinel handling as
+                // `refreshClients()` above.
+                self.poolChannelUnavailable = ((result?.status ?? 0) == 0)
                 return
             }
             self.poolChannelUnavailable = false
@@ -497,6 +505,20 @@ final class AdminStore: ObservableObject {
             guard let self = self else { return }
             self.auditLoading = false
             guard let (status, body) = result else {
+                self.auditChannelUnavailable = true
+                self.auditNotConfigured = false
+                self.auditEntries = []
+                self.auditVerified = nil
+                self.auditBrokenAt = nil
+                return
+            }
+            // `status == 0` is the daemon's local-failure sentinel (control
+            // channel closed / mgmt_call timeout — see `AdminApi.mgmtRequest`),
+            // NOT the server saying anything about the audit log. Without this
+            // branch it fell through to `auditNotConfigured`, telling the user
+            // "audit log not configured on this server" while the real problem
+            // was an unreachable server.
+            guard status != 0 else {
                 self.auditChannelUnavailable = true
                 self.auditNotConfigured = false
                 self.auditEntries = []

@@ -1,14 +1,19 @@
 import Foundation
 
-// Swift wrapper around the in-tunnel management-API FFI surface exposed by
-// aivpn-ios-core (crates/aivpn-ios-core/include/aivpn_core.h):
-//   uint8_t  aivpn_get_role(void)
-//   intptr_t aivpn_mgmt_request(method, path, body, body_len, out_status, out_buf, out_cap)
-//   intptr_t aivpn_qr_png(text, out_buf, out_cap)
+// Swift wrapper around the in-tunnel management API (Phase A in-app admin).
 //
-// These are declared in the bridging header (App/AivpnCoreBridge.h, which
-// #includes the whole aivpn_core.h), so they're callable directly from
-// Swift with no extra glue.
+// ARCHITECTURE NOTE — why role/mgmt go over provider IPC, not the C FFI:
+// on iOS the tunnel session runs in the Network Extension PROCESS
+// (AivpnTunnel target), which links its own copy of libaivpn_core.a. This
+// app target links a SEPARATE copy (for bootstrap-descriptor verification,
+// QR rendering, and the SSH installer), whose process-globals never see a
+// session: calling `aivpn_get_role()` here always returns 0 and
+// `aivpn_mgmt_request` always returns -1 ("no active tunnel session").
+// So the session-bound surface is routed to the extension process via
+// `VPNManager.mgmtRequest` / the get_traffic "role" field (see
+// PacketTunnelProvider's "mgmt_request" handler), while the STATELESS
+// `aivpn_qr_png` is still called in-process below (declared in
+// App/AivpnCoreBridge.h, which #includes the whole aivpn_core.h).
 //
 // Wire schema below is transcribed from the SERVER side that answers these
 // calls (crates/aivpn-server/src/mgmt_service.rs — `ClientView`,
@@ -220,16 +225,15 @@ enum AdminPatchField<T> {
 
 // MARK: - AdminApi
 
-/// Stateless namespace wrapping the blocking FFI calls. Every public
-/// function is `async` and hops off the caller's thread via
-/// `Task.detached` before touching the FFI, because
-/// `aivpn_mgmt_request`/`aivpn_qr_png` block the calling thread for up to
-/// ~10s. Callers (SwiftUI views) are responsible for hopping back to the
-/// main actor before mutating `@State`/`@Published` UI state with the
-/// result.
+/// Stateless namespace for the in-tunnel management API. Management calls
+/// go over provider IPC to the tunnel extension (see the file header);
+/// the stateless `aivpn_qr_png` FFI is still called in-process, hopping
+/// off the caller's thread via `Task.detached` since it can block.
+/// Callers (SwiftUI views) are responsible for hopping back to the main
+/// actor before mutating `@State`/`@Published` UI state with the result.
 enum AdminApi {
-    /// Buffer convention shared by `aivpn_mgmt_request`/`aivpn_qr_png`
-    /// (see aivpn_core.h): the return value is either the number of bytes
+    /// Buffer convention for the in-process `aivpn_qr_png` call (see
+    /// aivpn_core.h): the return value is either the number of bytes
     /// written (<= capacity passed in), or — when the response didn't fit
     /// — the needed length (> capacity passed in, buffer left untouched),
     /// or -1 on error/timeout.
@@ -243,11 +247,15 @@ enum AdminApi {
     // MARK: Role
 
     /// Current server-assigned role (0=User, 1=Viewer, 2=Admin), cached
-    /// from the last `Capabilities` control message this session. Cheap —
-    /// reads a process-global atomic, no FFI blocking involved. Safe to
-    /// call from any thread, including the main thread.
+    /// from the last `Capabilities` control message this session — as
+    /// polled from the TUNNEL EXTENSION process via get_traffic
+    /// (`VPNManager.adminRole`), NOT this process's `aivpn_get_role()`,
+    /// which reads a different copy of the core that never has a session
+    /// and would always return 0 (see this file's header comment). Cheap;
+    /// main-thread callers only (SwiftUI `body`/actions — every current
+    /// call site), matching `VPNManager`'s own threading rules.
     static func role() -> UInt8 {
-        aivpn_get_role()
+        VPNManager.shared.adminRole
     }
 
     // MARK: QR
@@ -283,51 +291,23 @@ enum AdminApi {
 
     // MARK: Low-level mgmt request
 
-    /// Blocking FFI call — always invoked from a detached task, never
-    /// directly from a SwiftUI callback. Allocates a 64KB response buffer;
-    /// if the server's response doesn't fit, retries exactly once with a
-    /// buffer sized to the reported needed length (see aivpn_core.h's
-    /// documented convention on `aivpn_mgmt_request`).
-    private static func mgmtRequestBlocking(method: UInt8, path: String, body: Data) -> RawResponse? {
-        var status: UInt16 = 0
-        var cap = initialBufferCapacity
-        var bodyBytes = [UInt8](body)
-
-        for _ in 0..<2 {
-            var outBuf = [UInt8](repeating: 0, count: cap)
-            let written: Int = path.withCString { pathPtr in
-                bodyBytes.withUnsafeMutableBufferPointer { bodyBufPtr in
-                    outBuf.withUnsafeMutableBufferPointer { outBufPtr in
-                        aivpn_mgmt_request(
-                            method,
-                            pathPtr,
-                            bodyBufPtr.baseAddress,
-                            bodyBufPtr.count,
-                            &status,
-                            outBufPtr.baseAddress,
-                            outBufPtr.count
-                        )
-                    }
+    /// Routes the call to the TUNNEL EXTENSION process over provider IPC
+    /// (see this file's header comment for why the in-process
+    /// `aivpn_mgmt_request` FFI can never work from the app) and suspends
+    /// until its reply arrives. The extension side enforces the FFI's own
+    /// 10s timeout and its 64KB-then-needed-length buffer retry; a
+    /// not-connected tunnel or an extension-reported transport failure
+    /// resolves to `nil` (mapped to `.transport` by the callers below).
+    private static func request(method: UInt8, path: String, body: Data = Data()) async -> RawResponse? {
+        await withCheckedContinuation { continuation in
+            // VPNManager's IPC surface is main-thread-only (it precondition-
+            // checks the main queue); hop there before touching it.
+            DispatchQueue.main.async {
+                VPNManager.shared.mgmtRequest(method: method, path: path, body: body) { resp in
+                    continuation.resume(returning: resp.map { RawResponse(status: $0.status, body: $0.body) })
                 }
             }
-
-            if written < 0 {
-                return nil
-            }
-            if written <= cap {
-                return RawResponse(status: status, body: Data(outBuf.prefix(written)))
-            }
-            // Needed length reported (written > cap) — retry once with a
-            // buffer of exactly that size.
-            cap = written
         }
-        return nil
-    }
-
-    private static func request(method: UInt8, path: String, body: Data = Data()) async -> RawResponse? {
-        await Task.detached(priority: .userInitiated) {
-            mgmtRequestBlocking(method: method, path: path, body: body)
-        }.value
     }
 
     // MARK: JSON helpers

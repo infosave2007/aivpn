@@ -88,6 +88,22 @@ async function apiJson<T>(path: string, options: RequestInit = {}): Promise<T> {
   return res.json() as Promise<T>;
 }
 
+/**
+ * apiFetch + throw on non-2xx, for endpoints whose success body is empty or
+ * irrelevant. The bare `await apiFetch(...)` pattern silently swallowed every
+ * HTTP error (403 for viewers, 4xx validation, 502 daemon-down): mutations
+ * then ran their onSuccess path — worst case `config.confirm()`, where a
+ * failed confirm means the daemon AUTO-REVERTS the applied change while the
+ * UI reports success.
+ */
+async function apiVoid(path: string, options: RequestInit = {}): Promise<void> {
+  const res = await apiFetch(path, options);
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(text || `HTTP ${res.status}`);
+  }
+}
+
 export interface ClientQos {
   bandwidth_limit_up?: number;
   bandwidth_limit_down?: number;
@@ -249,10 +265,10 @@ export const auth = {
     return apiJson('/web/auth/sessions');
   },
   async sessionDelete(id: string): Promise<void> {
-    await apiFetch(`/web/auth/sessions/${id}`, { method: 'DELETE' });
+    await apiVoid(`/web/auth/sessions/${id}`, { method: 'DELETE' });
   },
   async sessionsDeleteAll(): Promise<void> {
-    await apiFetch('/web/auth/sessions', { method: 'DELETE' });
+    await apiVoid('/web/auth/sessions', { method: 'DELETE' });
   },
 };
 
@@ -303,23 +319,19 @@ export const clients = {
     return apiJson(`/api/v1/clients/${id}`, { method: 'PATCH', body: JSON.stringify(data) });
   },
   async delete(id: string): Promise<void> {
-    await apiFetch(`/api/v1/clients/${id}`, { method: 'DELETE' });
+    await apiVoid(`/api/v1/clients/${id}`, { method: 'DELETE' });
   },
   /** Admin-only: tombstone the client and force-disconnect any active
    *  session. Distinct from delete() — the daemon retains a revocation
    *  record instead of removing the client outright. Irreversible. */
   async revoke(id: string): Promise<void> {
-    const res = await apiFetch(`/api/v1/clients/${id}/revoke`, { method: 'POST' });
-    if (!res.ok) {
-      const text = await res.text();
-      throw new Error(text || `HTTP ${res.status}`);
-    }
+    await apiVoid(`/api/v1/clients/${id}/revoke`, { method: 'POST' });
   },
   async connectionKey(id: string): Promise<{ connection_key: string }> {
     return apiJson(`/api/v1/clients/${id}/connection-key`);
   },
   async resetDevice(id: string): Promise<void> {
-    await apiFetch(`/api/v1/clients/${id}/reset-device`, { method: 'POST' });
+    await apiVoid(`/api/v1/clients/${id}/reset-device`, { method: 'POST' });
   },
 };
 
@@ -354,9 +366,11 @@ export const config = {
     });
   },
   /** Confirm a pending apply-with-rollback write (e.g. from `applyExit()`),
-   *  making it permanent instead of letting it auto-revert. */
+   *  making it permanent instead of letting it auto-revert. Throws on any
+   *  non-2xx — a swallowed confirm failure would let the daemon silently
+   *  auto-revert a change the UI just reported as saved. */
   async confirm(token: string): Promise<void> {
-    await apiFetch('/api/v1/config/confirm', {
+    await apiVoid('/api/v1/config/confirm', {
       method: 'POST',
       body: JSON.stringify({ token }),
     });
@@ -368,14 +382,17 @@ export const masks = {
     return apiJson('/api/v1/masks');
   },
   async upload(name: string, content: string): Promise<void> {
-    await apiFetch(`/api/v1/masks?name=${encodeURIComponent(name)}`, {
+    // Must throw on non-2xx: the server can REJECT an upload (invalid mask
+    // JSON, or Ed25519 signature verification with mask_verify_mode=enforce)
+    // and the masks page reports whatever doesn't throw as a success.
+    await apiVoid(`/api/v1/masks?name=${encodeURIComponent(name)}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: content,
     });
   },
   async delete(name: string): Promise<void> {
-    await apiFetch(`/api/v1/masks/${encodeURIComponent(name)}`, { method: 'DELETE' });
+    await apiVoid(`/api/v1/masks/${encodeURIComponent(name)}`, { method: 'DELETE' });
   },
   /** POST /api/v1/masks/active (management_api.rs set_active_mask / CLI --set-mask
    *  equivalent). `client` accepts either the client's id or its name — the
@@ -429,7 +446,7 @@ export const kernel = {
 
 export const reload = {
   async trigger(): Promise<void> {
-    await apiFetch('/api/v1/reload', { method: 'POST' });
+    await apiVoid('/api/v1/reload', { method: 'POST' });
   },
 };
 

@@ -698,8 +698,79 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                 // and stop treating the tunnel as merely "reconnecting".
                 "handshake_rejected":      aivpn_handshake_was_rejected() != 0,
                 "handshake_reject_reason": Int(aivpn_get_handshake_reject_reason()),
+                // Phase A in-app admin: server-assigned role (0=User,
+                // 1=Viewer, 2=Admin) cached from this session's Capabilities
+                // control message. The role atomic lives in THIS extension
+                // process's copy of the statically-linked core — the app
+                // process links its own copy whose atomic is always 0 — so
+                // the app must learn the role from this poll, never from
+                // calling aivpn_get_role() locally.
+                "role":            Int(aivpn_get_role()),
             ]
             completionHandler?(serialize(resp))
+
+        case "mgmt_request":
+            // Phase A in-app admin: the live control channel (and every
+            // process-global the mgmt FFI uses) exists only in this
+            // extension process — the app process's own copy of the core has
+            // no session — so AdminApi routes every management call here
+            // over provider IPC instead of calling aivpn_mgmt_request
+            // in-process (which would always return -1 there).
+            let methodRaw = json["method"] as? Int ?? -1
+            let path = json["path"] as? String ?? ""
+            guard (0...4).contains(methodRaw), !path.isEmpty else {
+                completionHandler?(serialize(["error": "bad request"]))
+                return
+            }
+            let body = (json["body_b64"] as? String).flatMap { Data(base64Encoded: $0) } ?? Data()
+            // aivpn_mgmt_request blocks its calling thread for up to 10s
+            // awaiting the correlated response — never block the IPC callout
+            // queue with that (the app's 1s get_traffic polls arrive on it).
+            // NE allows invoking completionHandler asynchronously.
+            DispatchQueue.global(qos: .userInitiated).async {
+                var status: UInt16 = 0
+                var cap = 64 * 1024
+                var bodyBytes = [UInt8](body)
+                var responseBody: Data?
+                // Written-len-or-needed-len convention (aivpn_core.h): one
+                // retry with the reported needed length, same as AdminApi's
+                // old in-process loop.
+                for _ in 0..<2 {
+                    var outBuf = [UInt8](repeating: 0, count: cap)
+                    let written: Int = path.withCString { pathPtr in
+                        bodyBytes.withUnsafeMutableBufferPointer { bodyPtr in
+                            outBuf.withUnsafeMutableBufferPointer { outPtr in
+                                aivpn_mgmt_request(
+                                    UInt8(methodRaw),
+                                    pathPtr,
+                                    bodyPtr.baseAddress,
+                                    bodyPtr.count,
+                                    &status,
+                                    outPtr.baseAddress,
+                                    outPtr.count
+                                )
+                            }
+                        }
+                    }
+                    if written < 0 { break }
+                    if written <= cap {
+                        responseBody = Data(outBuf.prefix(written))
+                        break
+                    }
+                    cap = written
+                }
+                guard let responseBody else {
+                    // -1 (no session / channel closed / 10s timeout) or a
+                    // pathological double resize race — the app maps this to
+                    // AdminApiError.transport.
+                    completionHandler?(serialize(["error": "transport"]))
+                    return
+                }
+                completionHandler?(serialize([
+                    "status": Int(status),
+                    "body_b64": responseBody.base64EncodedString(),
+                ]))
+            }
 
         case "record_start":
             let service = json["service"] as? String ?? ""

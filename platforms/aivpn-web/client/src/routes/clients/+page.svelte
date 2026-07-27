@@ -36,6 +36,7 @@
   const deleteMut = createMutation({
     mutationFn: (id: string) => clientsApi.delete(id),
     onSuccess: () => qc.invalidateQueries({ queryKey: ['clients'] }),
+    onError: (err: Error) => { alert(`Delete failed: ${err.message}`); },
   });
 
   const revokeMut = createMutation({

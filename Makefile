@@ -160,7 +160,7 @@ server-tiny: releases/
 	@echo "→ releases/aivpn-server-linux-x86_64-tiny  [minimal]  ($$(du -h releases/aivpn-server-linux-x86_64-tiny | cut -f1))"
 
 client: releases/
-	cargo build --release -p aivpn-client
+	cargo build --release -p aivpn-client --features ssh-install
 	cp target/release/aivpn-client releases/aivpn-client-linux-x86_64
 	chmod +x releases/aivpn-client-linux-x86_64
 	@echo "→ releases/aivpn-client-linux-x86_64  ($$(du -h releases/aivpn-client-linux-x86_64 | cut -f1))"
@@ -208,7 +208,7 @@ client-arm64: releases/
 	    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable && \
 	    . \$$HOME/.cargo/env && \
 	    rustup target add aarch64-unknown-linux-gnu && \
-	    cargo build --release -p aivpn-client --target aarch64-unknown-linux-gnu"
+	    cargo build --release -p aivpn-client --features ssh-install --target aarch64-unknown-linux-gnu"
 	cp target/aarch64-unknown-linux-gnu/release/aivpn-client releases/aivpn-client-linux-arm64
 	chmod +x releases/aivpn-client-linux-arm64
 	@echo "→ releases/aivpn-client-linux-arm64"
@@ -313,7 +313,7 @@ windows: releases/
 	    rustup target add "$$TARGET"; \
 	fi; \
 	echo "Building aivpn-client.exe..."; \
-	cargo build --release --target "$$TARGET" -p aivpn-client; \
+	cargo build --release --target "$$TARGET" -p aivpn-client --features ssh-install; \
 	echo "Building aivpn.exe (GUI)..."; \
 	cargo build --release --target "$$TARGET" -p aivpn-windows; \
 	rm -rf "$$PACKAGE_DIR"; \
@@ -445,8 +445,8 @@ macos:
 	    "$$RUSTUP" update stable 2>/dev/null || true; \
 	    "$$RUSTUP" target add aarch64-apple-darwin x86_64-apple-darwin 2>/dev/null || true; \
 	fi
-	cargo build --release -p aivpn-client --target aarch64-apple-darwin
-	cargo build --release -p aivpn-client --target x86_64-apple-darwin
+	cargo build --release -p aivpn-client --features ssh-install --target aarch64-apple-darwin
+	cargo build --release -p aivpn-client --features ssh-install --target x86_64-apple-darwin
 	@echo "==> Generating ICNS icon from brand source..."
 	@python3 platforms/macos/generate_icon.py 2>/dev/null || true
 	@echo "==> Building macOS app bundle (swiftc + universal + PKG + DMG)..."
@@ -459,7 +459,7 @@ macos:
 # ─────────────────────────────────────────────────────────────────────────────
 linux: releases/
 	cargo build --release -p aivpn-linux
-	cargo build --release -p aivpn-client --bin aivpn-client --bin aivpn-ip-helper
+	cargo build --release -p aivpn-client --features ssh-install --bin aivpn-client --bin aivpn-ip-helper
 	cp target/release/aivpn-linux      releases/aivpn-linux-x86_64
 	cp target/release/aivpn-client     releases/aivpn-client-linux-x86_64
 	cp target/release/aivpn-ip-helper  releases/aivpn-ip-helper-linux-x86_64
@@ -477,7 +477,7 @@ linux-appimage:
 	echo "==> Building aivpn-linux release binary..."; \
 	cargo build --release -p aivpn-linux; \
 	echo "==> Building aivpn-client + aivpn-ip-helper release binaries..."; \
-	cargo build --release -p aivpn-client --bin aivpn-client --bin aivpn-ip-helper; \
+	cargo build --release -p aivpn-client --features ssh-install --bin aivpn-client --bin aivpn-ip-helper; \
 	echo "==> Setting up AppDir..."; \
 	rm -rf "$$APPDIR"; \
 	mkdir -p "$$APPDIR/usr/bin" "$$APPDIR/usr/share/applications" \

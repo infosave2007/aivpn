@@ -42,6 +42,17 @@ class ServerSettingsActivity : AppCompatActivity() {
 
     private var maskOptions: List<MaskOption> = emptyList()
 
+    /**
+     * One row per client from `GET /api/v1/clients`, for the mask section's
+     * client picker. The active-mask override is strictly PER-CLIENT on the
+     * server (`.overrides/{client}.mask`; `resolve_heavy_setting`'s
+     * `ActiveMask` arm 400s on an empty `client` — there is no server-wide
+     * sentinel), so an apply without a selected client is never sent.
+     */
+    private data class ClientOption(val id: String, val name: String)
+
+    private var clientOptions: List<ClientOption> = emptyList()
+
     private lateinit var maskSection: PendingSection
     private lateinit var exitSection: PendingSection
 
@@ -138,6 +149,21 @@ class ServerSettingsActivity : AppCompatActivity() {
             val statusResult = AdminApi.status()
             binding.textNotConnected.visibility = if (statusResult.notConnected) View.VISIBLE else View.GONE
 
+            val clients = fetchClientOptions()
+            clientOptions = clients
+            if (clients.isEmpty()) {
+                binding.spinnerMaskClient.visibility = View.GONE
+                binding.textMaskClientEmpty.visibility = View.VISIBLE
+            } else {
+                binding.textMaskClientEmpty.visibility = View.GONE
+                binding.spinnerMaskClient.visibility = View.VISIBLE
+                binding.spinnerMaskClient.adapter = ArrayAdapter(
+                    this@ServerSettingsActivity,
+                    android.R.layout.simple_spinner_item,
+                    clients.map { if (it.name.isNotBlank() && it.name != it.id) "${it.name} (${it.id})" else it.id }
+                ).also { it.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item) }
+            }
+
             val options = fetchMaskOptions()
             maskOptions = options
             if (options.isEmpty()) {
@@ -156,6 +182,27 @@ class ServerSettingsActivity : AppCompatActivity() {
                 ).also { it.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item) }
             }
         }
+    }
+
+    /**
+     * Client rows for the mask section's client picker, from
+     * `GET /api/v1/clients` (same route [AdminActivity] lists). Returns an
+     * empty list (never throws) on any failure — the caller then hides the
+     * picker and [onApplyMask] refuses to send (an apply without a client is
+     * guaranteed to 400 server-side, see [ClientOption]).
+     */
+    private suspend fun fetchClientOptions(): List<ClientOption> {
+        val result = AdminApi.listClients()
+        if (!result.ok) return emptyList()
+        val arr = result.bodyArray() ?: return emptyList()
+        val out = mutableListOf<ClientOption>()
+        for (i in 0 until arr.length()) {
+            val c = arr.optJSONObject(i) ?: continue
+            val id = c.optString("id", c.optString("client_id", ""))
+            if (id.isEmpty()) continue
+            out.add(ClientOption(id = id, name = c.optString("name", "")))
+        }
+        return out
     }
 
     /**
@@ -215,6 +262,14 @@ class ServerSettingsActivity : AppCompatActivity() {
 
     private fun onApplyMask() {
         if (maskBusy) return
+        val clientPos = binding.spinnerMaskClient.selectedItemPosition
+        val clientId = if (clientPos in clientOptions.indices) clientOptions[clientPos].id else ""
+        if (clientId.isEmpty()) {
+            // Server-side hard requirement — an empty client 400s (per-client
+            // override only), so fail fast with the same hint the picker shows.
+            Toast.makeText(this, getString(R.string.server_settings_mask_no_clients), Toast.LENGTH_SHORT).show()
+            return
+        }
         val maskId = if (maskOptions.isNotEmpty()) {
             val pos = binding.spinnerMask.selectedItemPosition
             if (pos in maskOptions.indices) maskOptions[pos].id else ""
@@ -228,7 +283,7 @@ class ServerSettingsActivity : AppCompatActivity() {
         maskBusy = true
         binding.btnApplyMask.isEnabled = false
         lifecycleScope.launch {
-            val result = AdminApi.applyActiveMask(maskId)
+            val result = AdminApi.applyActiveMask(clientId, maskId)
             maskBusy = false
             binding.btnApplyMask.isEnabled = true
             handleApplyResult(result, maskSection)

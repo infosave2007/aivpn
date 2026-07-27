@@ -1560,7 +1560,32 @@ impl AivpnClient {
             AbortOnDrop(tokio::spawn(std::future::pending::<()>()))
         } else {
             AbortOnDrop(tokio::spawn(async move {
-                match tokio::net::UdpSocket::bind("127.0.0.1:44301").await {
+                // Bind with a bounded retry, not a single attempt: AbortOnDrop
+                // kills the PREVIOUS session's admin loop when its run()
+                // returns, but a detached mgmt-reply task that loop spawned
+                // (see the `AdminCommand::Mgmt` arm below) keeps a clone of
+                // the old socket's `Arc` alive until its `mgmt_call` resolves
+                // — up to the full 10s timeout when the tunnel died with the
+                // call in flight (exactly the reconnect case). A single
+                // failed bind here would leave the admin socket dead for the
+                // WHOLE new session, breaking the desktop GUIs' mgmt/record
+                // bridge until the next reconnect. 48 x 250ms comfortably
+                // covers that 10s worst case.
+                let bind_result = async {
+                    let mut last_err = None;
+                    for _ in 0..48u32 {
+                        match tokio::net::UdpSocket::bind("127.0.0.1:44301").await {
+                            Ok(s) => return Ok(s),
+                            Err(e) => {
+                                last_err = Some(e);
+                                tokio::time::sleep(Duration::from_millis(250)).await;
+                            }
+                        }
+                    }
+                    Err(last_err.expect("loop ran at least once"))
+                }
+                .await;
+                match bind_result {
                     Ok(socket) => {
                         let socket = Arc::new(socket);
                         let mut buf = [0u8; 65536];
@@ -3551,14 +3576,26 @@ impl AivpnClient {
             | ControlPayload::PoolStateDigest { .. }
             | ControlPayload::PoolBucketDigests { .. }
             | ControlPayload::RouteSync { .. }
-            | ControlPayload::PartitionAnnounce { .. } => {
+            | ControlPayload::PartitionAnnounce { .. }
+            | ControlPayload::ChainForward { .. } => {
                 // Normal end-user clients have no use for these pool
-                // anti-entropy messages and silently ignore them, exactly as
-                // before. When the server has embedded this client as a
-                // headless control-only pool-peer dialer (see
+                // anti-entropy messages (or, for `ChainForward`, a reverse
+                // exit reply) and silently ignore them, exactly as before —
+                // their `inbound_control_tap` is `None`, so the block below
+                // is a no-op for them.
+                //
+                // When the server has embedded this client as a headless
+                // control-only pool-peer dialer (see
                 // `ClientConfig::control_only`), forward a clone to the
                 // configured tap instead so the embedder can drive its own
                 // merge logic — never block the receive path on the tap.
+                // `ChainForward` in particular is the PHASE-4 reverse path:
+                // an exit node's reply for one of this entry's clients arrives
+                // here over the masked dial session and MUST reach the tap so
+                // `PoolDialer`'s drain loop can hand it to the gateway's
+                // client-downlink path (`reverse_downlink_tx`). Without this
+                // arm the reply was dropped by the catch-all below and the
+                // masked-exit round trip never completed.
                 if let Some(tap) = &self.config.inbound_control_tap {
                     if let Err(e) = tap.try_send(control) {
                         warn!(

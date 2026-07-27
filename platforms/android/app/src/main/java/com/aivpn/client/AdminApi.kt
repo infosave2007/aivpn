@@ -74,6 +74,12 @@ object AdminApi {
      * see `TunnelPatchClientRequest::exit_node`'s doc comment on the server
      * for the double-Option wire semantics this mirrors (omit key = leave
      * unchanged, `null` = clear, string = set).
+     *
+     * [expiresAt]/[clearExpiresAt] follow the SAME double-Option contract
+     * (`TunnelPatchClientRequest::expires_at`): a blank [expiresAt] is
+     * OMITTED, never sent as `""` — the server deserializes the value as a
+     * `DateTime` and an empty (or "null") string fails that parse, 400-ing
+     * the whole PATCH including every other field in it.
      */
     suspend fun patchClient(
         id: String,
@@ -81,6 +87,7 @@ object AdminApi {
         enabled: Boolean? = null,
         oneTime: Boolean? = null,
         expiresAt: String? = null,
+        clearExpiresAt: Boolean = false,
         exitNode: String? = null,
         clearExitNode: Boolean = false,
     ): MgmtResult {
@@ -88,7 +95,11 @@ object AdminApi {
             if (name != null) put("name", name)
             if (enabled != null) put("enabled", enabled)
             if (oneTime != null) put("one_time", oneTime)
-            if (expiresAt != null) put("expires_at", expiresAt)
+            if (clearExpiresAt) {
+                put("expires_at", JSONObject.NULL)
+            } else if (!expiresAt.isNullOrBlank()) {
+                put("expires_at", expiresAt)
+            }
             if (clearExitNode) {
                 put("exit_node", JSONObject.NULL)
             } else if (!exitNode.isNullOrBlank()) {
@@ -141,18 +152,19 @@ object AdminApi {
     // See [ServerSettingsActivity] for the shared apply→countdown→confirm UI.
 
     /**
-     * `POST /api/v1/config/apply` with `{"client":"","mask":"<mask_id>"}` —
-     * sets the server's ACTIVE mask override, which takes effect immediately
-     * (no server restart) for new/reconnecting sessions. `client` is always
-     * sent empty here: an empty client id selects the server-wide override,
-     * as opposed to a specific client's override (not exposed by this admin
-     * screen — this mirrors the same `HeavySetting::ActiveMask` request
-     * shape `management_api.rs`'s REST `ApplyConfigRequest` uses, just with
-     * `client` fixed to `""`).
+     * `POST /api/v1/config/apply` with `{"client":"<id>","mask":"<mask_id>"}`
+     * — sets the given client's ACTIVE mask override, which takes effect
+     * immediately (no server restart) for that client's new/reconnecting
+     * sessions. The active mask is strictly PER-CLIENT: the server writes
+     * `.overrides/{client}.mask` and `resolve_heavy_setting`'s `ActiveMask`
+     * arm REJECTS an empty `client` with 400 ("fields 'client' and 'mask'
+     * are required") — there is no server-wide sentinel. [clientId] may be a
+     * client id or name (the server resolves `find_by_name` then
+     * `find_by_id`), but must be non-empty.
      */
-    suspend fun applyActiveMask(maskId: String): MgmtResult {
+    suspend fun applyActiveMask(clientId: String, maskId: String): MgmtResult {
         val json = JSONObject().apply {
-            put("client", "")
+            put("client", clientId)
             put("mask", maskId)
         }
         return request(METHOD_POST, "/api/v1/config/apply", json.toString().toByteArray(Charsets.UTF_8))

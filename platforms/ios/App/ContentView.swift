@@ -31,6 +31,8 @@ private struct KeyRowView: View {
     let onDelete: () -> Void
     let onAddNew: () -> Void
 
+    @EnvironmentObject private var loc: LocalizationManager
+
     var body: some View {
         HStack(spacing: 12) {
             Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
@@ -55,10 +57,10 @@ private struct KeyRowView: View {
                     .font(.caption)
             }
             Menu {
-                Button { onAddNew() } label: { Label("Add Key", systemImage: "plus.circle") }
+                Button { onAddNew() } label: { Label(loc.t("add_key"), systemImage: "plus.circle") }
                 Divider()
-                Button { onEdit() } label: { Label("Edit", systemImage: "pencil") }
-                Button(role: .destructive) { onDelete() } label: { Label("Delete", systemImage: "trash") }
+                Button { onEdit() } label: { Label(loc.t("menu_edit"), systemImage: "pencil") }
+                Button(role: .destructive) { onDelete() } label: { Label(loc.t("menu_delete"), systemImage: "trash") }
             } label: {
                 Image(systemName: "ellipsis.circle")
                     .foregroundColor(.secondary)
@@ -68,9 +70,9 @@ private struct KeyRowView: View {
         .contentShape(Rectangle())
         .onTapGesture { onSelect() }
         .contextMenu {
-            Button { onAddNew() } label: { Label("Add Key", systemImage: "plus.circle") }
-            Button { onEdit() } label: { Label("Edit", systemImage: "pencil") }
-            Button(role: .destructive) { onDelete() } label: { Label("Delete", systemImage: "trash") }
+            Button { onAddNew() } label: { Label(loc.t("add_key"), systemImage: "plus.circle") }
+            Button { onEdit() } label: { Label(loc.t("menu_edit"), systemImage: "pencil") }
+            Button(role: .destructive) { onDelete() } label: { Label(loc.t("menu_delete"), systemImage: "trash") }
         }
     }
 }
@@ -380,14 +382,13 @@ struct ContentView: View {
                 // sees the button at all. Viewer gets read-only access
                 // (AdminView/AdminClientDetailView hide every mutating
                 // control behind `canMutate`); Admin is unchanged.
-                // `vpn.isConnected` gates AdminApi.role() being meaningful
-                // (it caches the last Capabilities push, reset to User at
-                // the start of each session) and also re-evaluates this
-                // every second while connected via VPNManager's
-                // durationTimer-driven @Published updates, so the button
-                // appears shortly after the post-handshake Capabilities
-                // message arrives without any extra polling here.
-                if vpn.isConnected && AdminApi.role() >= 1 {
+                // `vpn.adminRole` is polled from the TUNNEL EXTENSION
+                // process via get_traffic (the app process's own
+                // aivpn_get_role() global never sees the session — see
+                // AdminApi.swift's header) and is @Published, so this
+                // toolbar re-evaluates the moment the post-handshake
+                // Capabilities role lands, with no extra polling here.
+                if vpn.isConnected && vpn.adminRole >= 1 {
                     ToolbarItem(placement: .navigationBarTrailing) {
                         Button { showAdmin = true } label: {
                             Image(systemName: "person.badge.key.fill")

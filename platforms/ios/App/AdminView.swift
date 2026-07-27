@@ -3,7 +3,8 @@ import UIKit
 
 // In-app admin screen (P3.2-iOS): client list + add/edit/QR-share/revoke,
 // backed by AdminApi.swift's wrapper around the in-tunnel management API
-// (aivpn_mgmt_request / aivpn_qr_png, see crates/aivpn-ios-core). Presented
+// (routed over provider IPC to the tunnel extension — see AdminApi.swift's
+// architecture note — plus the in-process aivpn_qr_png). Presented
 // from ContentView.swift as a sheet, gated on AdminApi.role() >= 1
 // (Viewer or Admin) — there is no role-editing UI here: role assignment is
 // not exposed over the tunnel (see AdminApi.patchClient's doc comment).
@@ -158,8 +159,8 @@ struct AdminView: View {
 
     /// `true` only for the Admin role (2) — Viewer (1) reaches this screen
     /// (see the header comment's G-A1 note) but every mutating control is
-    /// gated on this. Cheap: `AdminApi.role()` reads a process-global
-    /// atomic, safe to call from `body` on every re-render.
+    /// gated on this. Cheap: `AdminApi.role()` reads the role VPNManager
+    /// polled from the tunnel extension (main-thread; `body` always is).
     private var canMutate: Bool { AdminApi.role() == 2 }
 
     var body: some View {
@@ -740,14 +741,28 @@ private struct AdminClientDetailView: View {
         isSavingEdit = true
         actionError = nil
         let trimmed = editedName.trimmingCharacters(in: .whitespaces)
-        let expiryField: AdminPatchField<Date> = editedHasExpiry ? .set(editedExpiresAt) : .clear
 
-        // Tri-state diff against the original, mirroring how `expiresAt`
-        // decides `.set` vs `.clear` above — but additionally collapses to
-        // `.unchanged` (key omitted entirely) when the trimmed text still
-        // matches what the server last reported, so an edit screen opened
-        // and saved without touching this field never sends a spurious
-        // PATCH that would otherwise just re-set the same value.
+        // Tri-state diff against the original: collapse to `.unchanged`
+        // (key omitted entirely) when the edited value still matches what
+        // the server last reported, so an edit screen opened and saved
+        // without touching the expiry never sends a spurious
+        // `expires_at: null` (or a re-set of the same instant) that would
+        // land a pointless ClientPatch mutation + audit entry server-side.
+        // The 1s tolerance absorbs the fractional seconds chrono serializes
+        // but `iso8601.string(from:)` would drop on the way back.
+        let originalExpiry = client.expires_at.flatMap { adminParseISO8601($0) }
+        let expiryField: AdminPatchField<Date>
+        if editedHasExpiry {
+            if let orig = originalExpiry, abs(orig.timeIntervalSince(editedExpiresAt)) < 1 {
+                expiryField = .unchanged
+            } else {
+                expiryField = .set(editedExpiresAt)
+            }
+        } else {
+            expiryField = originalExpiry == nil ? .unchanged : .clear
+        }
+
+        // Same tri-state diff for the exit node, per the same rule.
         let trimmedExitNode = editedExitNode.trimmingCharacters(in: .whitespaces)
         let originalExitNode = client.exit_node ?? ""
         let exitNodeField: AdminPatchField<String>

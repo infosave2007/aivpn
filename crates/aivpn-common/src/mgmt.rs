@@ -139,6 +139,28 @@ impl MgmtClient {
             .lock()
             .expect("mgmt pending mutex poisoned")
             .insert(req_id, resp_tx);
+        // Cancellation-safe cleanup: this future can be dropped at any
+        // `.await` below (embedder-side `select!`/FFI timeout). Without a
+        // Drop-guard the `pending` entry registered above would leak until
+        // `reset()` — every error/cancel path funnels through this guard
+        // instead of hand-removing in each branch. On the success path
+        // `on_mgmt_response` has already removed the entry, so the guard's
+        // extra remove is a harmless no-op.
+        struct PendingCleanup {
+            pending: Arc<Mutex<HashMap<u32, oneshot::Sender<(u16, Vec<u8>)>>>>,
+            req_id: u32,
+        }
+        impl Drop for PendingCleanup {
+            fn drop(&mut self) {
+                if let Ok(mut pending) = self.pending.lock() {
+                    pending.remove(&self.req_id);
+                }
+            }
+        }
+        let _cleanup = PendingCleanup {
+            pending: self.pending.clone(),
+            req_id,
+        };
 
         let payload = ControlPayload::MgmtRequest {
             req_id,
@@ -147,10 +169,6 @@ impl MgmtClient {
             body,
         };
         if let Err(e) = control_tx.send(payload).await {
-            self.pending
-                .lock()
-                .expect("mgmt pending mutex poisoned")
-                .remove(&req_id);
             return Err(Error::Channel(e.to_string()));
         }
 
@@ -159,24 +177,14 @@ impl MgmtClient {
             Ok(Err(_)) => {
                 // Sender side dropped without sending, which
                 // `on_mgmt_response` never does — defensive guard only.
-                self.pending
-                    .lock()
-                    .expect("mgmt pending mutex poisoned")
-                    .remove(&req_id);
                 Err(Error::Session(
                     "mgmt_call: response channel closed unexpectedly".into(),
                 ))
             }
-            Err(_) => {
-                self.pending
-                    .lock()
-                    .expect("mgmt pending mutex poisoned")
-                    .remove(&req_id);
-                Err(Error::Session(format!(
-                    "mgmt_call: timed out awaiting MgmtResponse for req_id={}",
-                    req_id
-                )))
-            }
+            Err(_) => Err(Error::Session(format!(
+                "mgmt_call: timed out awaiting MgmtResponse for req_id={}",
+                req_id
+            ))),
         }
     }
 }
@@ -313,6 +321,46 @@ mod tests {
         assert!(
             mgmt.pending.lock().unwrap().is_empty(),
             "the timed-out entry must be removed from pending, not leaked"
+        );
+    }
+
+    #[tokio::test]
+    async fn mgmt_call_dropped_mid_flight_cleans_up_pending_entry() {
+        // Regression: an embedder can cancel (drop) the `mgmt_call` future
+        // itself — external `select!`/FFI timeout — after the pending entry
+        // was registered but before any response/timeout. The Drop-guard
+        // must remove the entry, otherwise repeated cancellations grow
+        // `pending` without bound until `reset()`.
+        let mgmt = MgmtClient::new();
+        let (control_tx, _control_rx) = mpsc::channel::<ControlPayload>(4);
+
+        {
+            let fut = mgmt.mgmt_call(
+                &control_tx,
+                0,
+                "/api/v1/clients",
+                vec![],
+                Duration::from_secs(10),
+            );
+            tokio::pin!(fut);
+            // Poll the future exactly once: it registers the pending entry
+            // and parks awaiting the response (`ready(())` wins the race).
+            tokio::select! {
+                biased;
+                _ = &mut fut => panic!("mgmt_call must not resolve with no responder"),
+                _ = std::future::ready(()) => {}
+            }
+            assert_eq!(
+                mgmt.pending.lock().unwrap().len(),
+                1,
+                "the in-flight call must have registered its pending entry"
+            );
+            // `fut` is dropped here — cancelled mid-flight.
+        }
+
+        assert!(
+            mgmt.pending.lock().unwrap().is_empty(),
+            "a cancelled (dropped) mgmt_call must not leak its pending entry"
         );
     }
 

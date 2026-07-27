@@ -251,6 +251,123 @@ pub(crate) fn exits_needing_dial(
     out
 }
 
+/// P1 (global exit live-swap): pure swap of `masked_exit_addr` to
+/// `new_global` plus, on an actual change, a `PoolDialer::add_peer` for the
+/// fresh value — no file I/O. Factored out of `Gateway::apply_global_exit_update`
+/// so it can also be driven by `apply_global_exit_and_teardown` below
+/// (shared by the REST/Unix-socket path), without duplicating the
+/// read-modify-write logic. See `Gateway::apply_global_exit_update`'s doc
+/// comment for the full behavior contract this preserves byte-for-byte.
+fn apply_global_exit_swap(
+    masked_exit_addr: &parking_lot::RwLock<Option<String>>,
+    pool_dialer: Option<&Arc<crate::pool_dialer::PoolDialer>>,
+    new_global: Option<String>,
+) {
+    let Some(dialer) = pool_dialer else {
+        return;
+    };
+    let changed = {
+        let mut current = masked_exit_addr.write();
+        if *current == new_global {
+            false
+        } else {
+            *current = new_global.clone();
+            true
+        }
+    };
+    if changed {
+        if let Some(addr) = new_global {
+            dialer.add_peer(addr);
+        }
+    }
+}
+
+/// Wave B2c (runtime dial add-peer): pure `PoolDialer::add_peer` driver —
+/// factored out of `Gateway::add_dial_peers_for_client_exits` so
+/// `apply_global_exit_and_teardown` below can reuse it. See that method's
+/// doc comment for the full behavior contract.
+fn add_dial_peers_for_client_exits_for(
+    dialer: &Arc<crate::pool_dialer::PoolDialer>,
+    clients: &[ClientConfig],
+) {
+    let already: std::collections::HashSet<String> =
+        dialer.dialed_peer_addrs().into_iter().collect();
+    for addr in exits_needing_dial(clients, &already) {
+        dialer.add_peer(addr);
+    }
+}
+
+/// Wave 2 (dial-teardown): pure `PoolDialer::remove_peer` driver — factored
+/// out of `Gateway::teardown_unused_exit_dials` so `apply_global_exit_and_teardown`
+/// below can reuse it. See that method's doc comment for the full behavior
+/// contract (referenced set = the current global default plus every
+/// distinct per-client `exit_node` in `clients`; never touches a
+/// startup-configured `pool.peers`/`pool.exit_node` dial).
+pub(crate) fn teardown_unused_exit_dials_for(
+    masked_exit_addr: &parking_lot::RwLock<Option<String>>,
+    pool_dialer: Option<&Arc<crate::pool_dialer::PoolDialer>>,
+    clients: &[ClientConfig],
+) {
+    let Some(dialer) = pool_dialer else {
+        return;
+    };
+    let mut needed: std::collections::HashSet<String> = std::collections::HashSet::new();
+    if let Some(g) = masked_exit_addr.read().as_deref() {
+        needed.insert(g.to_string());
+    }
+    for c in clients {
+        if let Some(addr) = c.exit_node.as_deref() {
+            let addr = addr.trim();
+            if !addr.is_empty() {
+                needed.insert(addr.to_string());
+            }
+        }
+    }
+    for addr in dialer.runtime_exit_peer_addrs() {
+        if !needed.contains(&addr) {
+            dialer.remove_peer(&addr);
+        }
+    }
+}
+
+/// P1 REST parity fix: the full global-exit-live-swap side effect —
+/// re-read `pool.exit_node` from `server_config_path`
+/// (`Gateway::read_global_exit_node`), swap `masked_exit_addr` if it
+/// changed (`apply_global_exit_swap`), pick up any newly-referenced
+/// per-client `exit_node` (`add_dial_peers_for_client_exits_for`, Wave
+/// B2c parity), then prune any now-unreferenced RUNTIME exit dial
+/// (`teardown_unused_exit_dials_for`, Wave 2) — bundled into ONE function so
+/// both the in-tunnel path (`Gateway::dispatch_mgmt_request`) and the
+/// REST/Unix-socket path (`management_api::apply_config`/`confirm_config`,
+/// which has no `&Gateway` to call methods on, only the shared handles
+/// `AivpnServer::masked_exit_addr()`/`::pool_dialer()`/`::exit_route_cache()`
+/// already expose) apply a confirmed `pool.exit_node` change to this node's
+/// live routing without a restart, instead of only the tunnel path doing
+/// so.
+///
+/// A no-op — cheaply — when `pool_dialer` is `None` (legacy transport / no
+/// masked pool-client dialer on this node), matching every one of the
+/// individual steps' own preconditions. `server_config_path: None` (no
+/// `server.json` path configured on this node) makes the re-read resolve to
+/// `None` (`Gateway::read_global_exit_node`'s own no-panic contract), which
+/// is treated exactly like "no global exit configured".
+pub(crate) fn apply_global_exit_and_teardown(
+    masked_exit_addr: &Arc<parking_lot::RwLock<Option<String>>>,
+    pool_dialer: Option<&Arc<crate::pool_dialer::PoolDialer>>,
+    server_config_path: Option<&std::path::Path>,
+    db: &ClientDatabase,
+) {
+    let Some(dialer) = pool_dialer else {
+        return;
+    };
+    let new_global = server_config_path.and_then(Gateway::read_global_exit_node);
+    apply_global_exit_swap(masked_exit_addr, Some(dialer), new_global);
+
+    let clients = db.list_clients();
+    add_dial_peers_for_client_exits_for(dialer, &clients);
+    teardown_unused_exit_dials_for(masked_exit_addr, Some(dialer), &clients);
+}
+
 /// Gateway configuration
 #[derive(Clone)]
 pub struct GatewayConfig {
@@ -386,6 +503,20 @@ pub struct GatewayConfig {
     /// the same way in `main.rs` from `--audit-log`. `None` makes that route
     /// return `404 NotFound`, matching the REST path's behavior.
     pub audit_log_path: Option<std::path::PathBuf>,
+    /// P1 (global exit live-swap): on-disk path to `server.json`, used to
+    /// re-read `pool.exit_node` from the in-tunnel `MgmtRequest` side-effect
+    /// hook (`Gateway::dispatch_mgmt_request`'s call to
+    /// `apply_global_exit_and_teardown`) so a confirmed `HeavySetting::ExitNode`
+    /// apply (which only persists
+    /// the change to disk — see that variant's doc comment) also takes
+    /// effect on THIS node's live `masked_exit_addr` without a restart.
+    /// Mirrors `mgmt_server_addr`/`audit_log_path` — same value `main.rs`
+    /// computes for `management_api::ServeConfig::config_path`/
+    /// `mgmt_service::MgmtCtx::config_path`. `None` (e.g. no `--config` and
+    /// neither default path exists) makes the re-read a no-op every time —
+    /// the global default then stays whatever it was resolved to at
+    /// startup, exactly like pre-P1 behavior.
+    pub server_config_path: Option<std::path::PathBuf>,
     /// Wave B1 (pool topology read endpoints): whether pool sync is
     /// configured on this node AT ALL — i.e. `server.json`'s `pool` block
     /// is present — regardless of `pool.transport`. `Gateway` only ever
@@ -450,6 +581,7 @@ impl Default for GatewayConfig {
             pool_client_psk: None,
             mgmt_server_addr: None,
             audit_log_path: None,
+            server_config_path: None,
             pool_configured: false,
         }
     }
@@ -1077,7 +1209,23 @@ pub struct Gateway {
     /// and as the `peer` argument to `PoolDialer::send_to_peer`, or
     /// forwarded `ChainForward` payloads will silently find no live
     /// sender. See `set_masked_exit`.
-    masked_exit_addr: Option<String>,
+    ///
+    /// P1 (global exit live-swap): interior-mutable (`RwLock`, not a plain
+    /// field) so `apply_global_exit_and_teardown` can hot-swap it from the
+    /// mgmt side-effect path (`dispatch_mgmt_request`, and now also the
+    /// REST/Unix-socket `confirm_config`) without needing `&mut self` — the
+    /// hot packet-forwarding read in `exit_decision_for_session`
+    /// takes a short-lived read guard around the pure `choose_exit` call
+    /// only, well before any actual packet send, so a concurrent write here
+    /// never blocks (or is blocked by) a send in flight.
+    ///
+    /// P1 REST parity fix: wrapped in `Arc` (not a bare `RwLock`) so the
+    /// SAME cell can be shared with the REST/Unix-socket management API's
+    /// `ApiState` (via `masked_exit_addr()`/`AivpnServer::masked_exit_addr()`,
+    /// mirroring `exit_route_cache()`'s existing sharing pattern) — without
+    /// this, a `pool.exit_node` change confirmed over REST could only ever
+    /// mutate a copy, never this node's actual live routing state.
+    masked_exit_addr: Arc<parking_lot::RwLock<Option<String>>>,
     /// B2b (per-client exit routing, data plane): caches the resolved
     /// per-client masked-exit target for each client VPN IP, so the
     /// per-packet uplink path never does more than a single `DashMap` get
@@ -1460,6 +1608,19 @@ impl Gateway {
         let server_addr = self.config.mgmt_server_addr.clone();
         let audit_log_path = self.config.audit_log_path.clone();
         let pending_config = self.pending_config.clone();
+        // P1 (global exit live-swap): re-read alongside the dispatch call,
+        // inside the SAME `spawn_blocking` closure below — small disk IO,
+        // kept off the tokio reactor thread exactly like `resolve_heavy_setting`'s
+        // own `server.json` read (which runs on this same blocking thread
+        // when this request happened to be the `ExitNode` heavy-setting
+        // confirm). See `apply_global_exit_and_teardown`.
+        let server_config_path = self.config.server_config_path.clone();
+        // P1 REST parity fix: cheap `Arc` clones so `apply_global_exit_and_teardown`
+        // can run inside the SAME `spawn_blocking` closure below — see that
+        // function's doc comment for why this is now shared with the
+        // REST/Unix-socket path too.
+        let masked_exit_addr = self.masked_exit_addr.clone();
+        let pool_dialer_for_exit = self.pool_dialer.clone();
 
         // Wave B1 (pool topology read endpoints): build the snapshot from
         // live state BEFORE the `spawn_blocking` closure (all its inputs are
@@ -1512,7 +1673,27 @@ impl Gateway {
                 pending_config: Some(&pending_config),
                 pool: Some(pool),
             };
-            mgmt_service::dispatch(&ctx, method, &path, &body)
+            let response = mgmt_service::dispatch(&ctx, method, &path, &body);
+            // P1 (global exit live-swap) + Wave B2c (runtime dial add-peer)
+            // + Wave 2 (dial-teardown), unified: re-read `pool.exit_node`
+            // from `server.json`, swap `masked_exit_addr` if it changed,
+            // pick up any newly-referenced per-client `exit_node`, and prune
+            // any now-unreferenced runtime exit dial — all in the SAME
+            // blocking-thread pass. A confirmed `HeavySetting::ExitNode`
+            // apply (this very request, or an earlier one via the tunnel OR
+            // REST) only ever PERSISTS the change to disk (see that
+            // variant's doc comment); this is what makes it also take
+            // effect on this node's own live routing, without a restart.
+            // See `apply_global_exit_and_teardown`'s doc comment — the SAME
+            // function `management_api::apply_config`/`confirm_config` call
+            // for the REST/Unix-socket path.
+            apply_global_exit_and_teardown(
+                &masked_exit_addr,
+                pool_dialer_for_exit.as_ref(),
+                server_config_path.as_deref(),
+                &db,
+            );
+            response
         })
         .await;
 
@@ -1526,16 +1707,6 @@ impl Gateway {
         // comment for the full invalidation policy.
         self.exit_route_cache.clear();
 
-        // Wave B2c (runtime dial add-peer): the mutation above may have SET
-        // a client's `exit_node` to an address this node has never dialed
-        // (B2b only routes to exits that had a live dial session at
-        // startup — the dial set was fixed at `PoolDialer::new`
-        // construction). Ensure any such address gets a dial task spawned
-        // NOW, so it can go live without a server restart. Cheap: only runs
-        // once per mgmt request (never per-packet), and `add_peer` itself
-        // is an idempotent no-op for every already-tracked address.
-        self.add_dial_peers_for_client_exits();
-
         match result {
             Ok(r) => r,
             Err(e) => {
@@ -1543,6 +1714,111 @@ impl Gateway {
                 (500, Vec::new())
             }
         }
+    }
+
+    /// P1 (global exit live-swap): parse `pool.exit_node` out of the
+    /// `server.json` at `path` as generic JSON — mirrors
+    /// `mgmt_service::resolve_heavy_setting`'s own read-and-parse of the
+    /// same key, but READ-ONLY (no mutation, no rollback tracking) and
+    /// tolerant of any failure by simply returning `None` rather than
+    /// propagating an error: an unreadable/unparsable file or an
+    /// absent/blank key all collapse to "no global exit configured",
+    /// exactly like `main.rs`'s own startup resolution would treat them.
+    /// Never panics.
+    fn read_global_exit_node(path: &std::path::Path) -> Option<String> {
+        let content = std::fs::read_to_string(path).ok()?;
+        let value: serde_json::Value = serde_json::from_str(&content).ok()?;
+        let addr = value
+            .get("pool")?
+            .get("exit_node")?
+            .as_str()?
+            .trim()
+            .to_string();
+        if addr.is_empty() {
+            None
+        } else {
+            Some(addr)
+        }
+    }
+
+    /// P1 (global exit live-swap): apply a freshly re-read `pool.exit_node`
+    /// value (`new_global` — `None` means "the file has no global exit
+    /// configured", see `read_global_exit_node`) to `masked_exit_addr`.
+    ///
+    /// A no-op — cheaply, without ever touching `masked_exit_addr` — when
+    /// `pool_dialer` isn't wired at all (legacy transport / no masked
+    /// pool-client dialer running on this node): the field would stay
+    /// meaningless without a dialer to route through, matching
+    /// `set_masked_exit`'s existing precondition and preserving this
+    /// node's exact pre-P1 behavior in that configuration.
+    ///
+    /// Otherwise: a no-op unless `new_global` actually differs from the
+    /// CURRENT in-memory value (avoids taking the write lock on every mgmt
+    /// request when nothing changed). On an actual change, updates
+    /// `masked_exit_addr` and — if the new value is `Some` — ensures a
+    /// dial task is spawned for it via `PoolDialer::add_peer` (idempotent;
+    /// mirrors B2c's per-client handling), so the new global default goes
+    /// live in this SAME mgmt round-trip rather than only after a fresh
+    /// packet triggers `exit_decision_for_session`. A change to `None`
+    /// (global exit cleared) intentionally does NOT tear down the old
+    /// dial here — that is `teardown_unused_exit_dials`'s job, run right
+    /// after this in `dispatch_mgmt_request`.
+    ///
+    /// A thin `&self` wrapper around the free `apply_global_exit_swap` —
+    /// production code (`dispatch_mgmt_request`) now calls
+    /// `apply_global_exit_and_teardown` directly instead (which itself
+    /// re-reads `new_global` from disk and calls `apply_global_exit_swap`),
+    /// so this method is `#[cfg(test)]`-only: a convenient, direct entry
+    /// point for feeding an already-known value in unit tests.
+    #[cfg(test)]
+    fn apply_global_exit_update(&self, new_global: Option<String>) {
+        apply_global_exit_swap(
+            &self.masked_exit_addr,
+            self.pool_dialer.as_ref(),
+            new_global,
+        );
+    }
+
+    /// Wave 2 (dial-teardown): compute the set of masked-exit addresses
+    /// this node currently has ANY reason to keep dialing — the global
+    /// default (`masked_exit_addr`, if set) plus every distinct per-client
+    /// `exit_node` override still present in `client_db` — and
+    /// `PoolDialer::remove_peer` any RUNTIME-added exit dial (one
+    /// `add_peer` previously spawned for a client or global exit — see
+    /// `PoolDialer::runtime_exit_peer_addrs`) that is no longer in that
+    /// referenced set.
+    ///
+    /// NEVER touches a startup-configured `pool.peers` sync peer or a
+    /// startup `pool.exit_node` (both dialed via `PoolDialer::start()`,
+    /// never tracked as a runtime-exit peer) — `PoolDialer::remove_peer`
+    /// itself independently refuses to act on anything outside that set
+    /// (see its doc comment), so this is belt-and-suspenders against ever
+    /// tearing down real pool-sync membership even if this function's own
+    /// "referenced" computation were ever wrong.
+    ///
+    /// A no-op — cheaply — when `pool_dialer` isn't wired at all (legacy
+    /// transport / no pool-sync at all). Production code now runs this
+    /// logic via `apply_global_exit_and_teardown` (called from the mgmt
+    /// side-effect block in `dispatch_mgmt_request`, right after its own
+    /// swap + `add_dial_peers_for_client_exits_for`), so a mutation that
+    /// clears/changes a client's or the global `exit_node` prunes the
+    /// now-unused dial in the SAME mgmt round-trip that (possibly) added a
+    /// new one.
+    ///
+    /// A thin `&self` wrapper around the free `teardown_unused_exit_dials_for`
+    /// — `#[cfg(test)]`-only, same rationale as `apply_global_exit_update`
+    /// above.
+    #[cfg(test)]
+    fn teardown_unused_exit_dials(&self) {
+        if self.pool_dialer.is_none() {
+            return;
+        }
+        let clients = self
+            .client_db
+            .as_ref()
+            .map(|db| db.list_clients())
+            .unwrap_or_default();
+        teardown_unused_exit_dials_for(&self.masked_exit_addr, self.pool_dialer.as_ref(), &clients);
     }
 
     /// P1.3 (admin revoke): force-disconnect any live session(s) for
@@ -1568,10 +1844,9 @@ impl Gateway {
     /// collects and drops every matching session defensively rather than
     /// assuming exactly one.
     async fn force_disconnect_client(&self, client_id: &str) {
-        let Some(socket) = self.udp_socket.as_ref() else {
+        if self.udp_socket.is_none() {
             return;
-        };
-        let mdh = self.mask_catalog.packet_mdh_bytes();
+        }
         let targets: Vec<([u8; 16], Arc<parking_lot::Mutex<Session>>)> = self
             .session_manager
             .iter_sessions()
@@ -1584,8 +1859,13 @@ impl Gateway {
 
         for (session_id, session) in targets {
             let shutdown = ControlPayload::Shutdown { reason: 4 };
-            if let Err(e) = Self::send_control_message_via(socket, &mdh, &shutdown, &session).await
-            {
+            // `send_control_message` (not `_via` with the CATALOG mdh):
+            // a session running a generated/custom mask has a different
+            // MDH length, and a catalog-mdh packet lands at the wrong
+            // ciphertext offset client-side — the client would never
+            // decode the revoke reason (it still gets disconnected
+            // server-side, but silently).
+            if let Err(e) = self.send_control_message(&shutdown, &session).await {
                 debug!(
                     "force_disconnect_client: Shutdown send failed for revoked client {}: {}",
                     client_id, e
@@ -1922,7 +2202,7 @@ impl Gateway {
             qos_enforcer,
             chain_forwarder: config.chain_forwarder.clone(),
             pool_dialer: None,
-            masked_exit_addr: None,
+            masked_exit_addr: Arc::new(parking_lot::RwLock::new(None)),
             exit_route_cache: Arc::new(DashMap::new()),
             node_registry: None,
             pool_configured: config.pool_configured,
@@ -1986,7 +2266,7 @@ impl Gateway {
         exit_addr: String,
     ) {
         self.pool_dialer = Some(dialer);
-        self.masked_exit_addr = Some(exit_addr);
+        *self.masked_exit_addr.write() = Some(exit_addr);
     }
 
     /// P1.3 (priority pool beacon): install a handle to this node's masked
@@ -2012,6 +2292,17 @@ impl Gateway {
     /// clone); safe to call at any time, including before `run()`.
     pub fn exit_route_cache(&self) -> Arc<DashMap<Ipv4Addr, Option<String>>> {
         self.exit_route_cache.clone()
+    }
+
+    /// P1 REST parity fix: shared handle to the live `masked_exit_addr`
+    /// cell, for callers outside `Gateway`/`AivpnServer`
+    /// (`management_api.rs`'s REST `ApiState`, via
+    /// `AivpnServer::masked_exit_addr()`) that need to observe/hot-swap this
+    /// node's global default exit — mirrors `exit_route_cache()`'s existing
+    /// sharing pattern. Cheap (one `Arc` clone); safe to call at any time,
+    /// including before `run()`.
+    pub fn masked_exit_addr(&self) -> Arc<parking_lot::RwLock<Option<String>>> {
+        self.masked_exit_addr.clone()
     }
 
     /// B2b (per-client exit routing): resolve `ip`'s masked-exit override,
@@ -2062,12 +2353,8 @@ impl Gateway {
         let (Some(dialer), Some(db)) = (self.pool_dialer.as_ref(), self.client_db.as_ref()) else {
             return;
         };
-        let already: std::collections::HashSet<String> =
-            dialer.dialed_peer_addrs().into_iter().collect();
         let clients = db.list_clients();
-        for addr in exits_needing_dial(&clients, &already) {
-            dialer.add_peer(addr);
-        }
+        add_dial_peers_for_client_exits_for(dialer, &clients);
     }
 
     /// B2b (per-client exit routing): resolve the full `ExitDecision` for
@@ -2084,15 +2371,15 @@ impl Gateway {
     ) -> ExitDecision {
         let vpn_ip = session.lock().vpn_ip;
         let client_exit = vpn_ip.and_then(|ip| self.resolve_client_exit_addr(ip));
-        choose_exit(
-            client_exit.as_deref(),
-            self.masked_exit_addr.as_deref(),
-            |addr| {
-                self.pool_dialer
-                    .as_ref()
-                    .is_some_and(|d| d.has_live_session(addr))
-            },
-        )
+        // P1 (global exit live-swap): short-lived read guard — released at
+        // the end of this function, well before `forward_via_exit`'s actual
+        // send. Never held across an `.await`.
+        let global_guard = self.masked_exit_addr.read();
+        choose_exit(client_exit.as_deref(), global_guard.as_deref(), |addr| {
+            self.pool_dialer
+                .as_ref()
+                .is_some_and(|d| d.has_live_session(addr))
+        })
     }
 
     /// B2b (per-client exit routing): execute an `ExitDecision::Send` — try
@@ -2496,6 +2783,19 @@ impl Gateway {
             let mgmt_request_throttle_cleanup = self.mgmt_request_throttle.clone();
             let mask_catalog_cleanup = self.mask_catalog.clone();
             let pending_config_cleanup = self.pending_config.clone();
+            // P1.5 rollback fix: handles for re-applying LIVE state after an
+            // auto-rollback restored `server.json` on disk. Without this the
+            // sweep only reverted the FILE — the tunnel path's live-swap
+            // (`dispatch_mgmt_request` → `apply_global_exit_and_teardown`)
+            // had already pointed `masked_exit_addr` at the new (now rolled
+            // back) exit, and nothing ever swapped it back: the exact
+            // scenario the rollback exists for (admin lost connectivity
+            // after a bad exit change, so no further mgmt request will run
+            // the re-read) left live routing diverged from disk until a
+            // restart.
+            let masked_exit_addr_cleanup = self.masked_exit_addr.clone();
+            let pool_dialer_cleanup = self.pool_dialer.clone();
+            let server_config_path_cleanup = self.config.server_config_path.clone();
             tokio::spawn(async move {
                 loop {
                     tokio::time::sleep(Duration::from_secs(5)).await;
@@ -2658,6 +2958,7 @@ impl Gateway {
                     // `target_path` to its `rollback_value()` — `Some(bytes)`
                     // writes the prior content back, `None` means the file
                     // didn't exist before the change, so it's removed.
+                    let mut rolled_back_any = false;
                     for entry in pending_config_cleanup.tick(Instant::now()) {
                         let path = entry.target_path().to_path_buf();
                         let restore_result = match entry.rollback_value() {
@@ -2670,6 +2971,7 @@ impl Gateway {
                         };
                         match restore_result {
                             Ok(()) => {
+                                rolled_back_any = true;
                                 warn!(
                                     "Pending config auto-rolled-back (unconfirmed within window): {}",
                                     entry.descriptor()
@@ -2683,6 +2985,23 @@ impl Gateway {
                                     e
                                 );
                             }
+                        }
+                    }
+                    // P1.5 rollback fix (see the `masked_exit_addr_cleanup`
+                    // clones above): after restoring the FILE(S), re-run the
+                    // same live-swap side effect every mgmt/confirm path
+                    // uses, so `masked_exit_addr`/runtime exit dials track
+                    // the rolled-back `server.json` instead of staying on
+                    // the reverted value. Cheap no-op when nothing exit-
+                    // related changed or no masked pool dialer exists.
+                    if rolled_back_any {
+                        if let Some(ref db) = client_db_cleanup {
+                            apply_global_exit_and_teardown(
+                                &masked_exit_addr_cleanup,
+                                pool_dialer_cleanup.as_ref(),
+                                server_config_path_cleanup.as_deref(),
+                                db,
+                            );
                         }
                     }
                 }
@@ -6118,8 +6437,8 @@ impl Gateway {
             ControlPayload::PartitionAnnounce {
                 subnet_cidr: peer_cidr,
                 partition_index: peer_index,
-                partition_size: _peer_partition_size,
-                num_partitions: _peer_num_partitions,
+                partition_size: peer_partition_size,
+                num_partitions: peer_num_partitions,
                 explicit: peer_explicit,
             } => {
                 // Wave B-IP.2: a masked pool-peer announces its VPN-IP
@@ -6144,11 +6463,20 @@ impl Gateway {
                     let local_partition_info = db.partition_info();
                     let local_partition =
                         local_partition_info.map(|p| (p.partition_index, p.explicit));
+                    // Decode the UNPARTITIONED sentinel {index:0, size:0,
+                    // num_partitions:1} back to `None` — see
+                    // `decode_peer_partition`'s doc comment.
+                    let peer_partition = crate::pool_partition::decode_peer_partition(
+                        peer_index,
+                        peer_partition_size,
+                        peer_num_partitions,
+                        peer_explicit,
+                    );
                     let check = crate::pool_partition::check_partition(
                         &local_cidr,
                         local_partition,
                         &peer_cidr,
-                        Some((peer_index, peer_explicit)),
+                        peer_partition,
                     );
                     let peer_desc = verified_node_id.unwrap_or_else(|| hash_addr(&client_addr));
 
@@ -7295,6 +7623,7 @@ fn make_kernel_update_tags(sess: &crate::session::Session) -> UpdateTagsPayload 
 
 #[cfg(test)]
 mod tests {
+    use super::apply_global_exit_and_teardown;
     use super::chain_reverse_route_insert;
     use super::chain_reverse_route_lookup;
     use super::choose_exit;
@@ -7600,6 +7929,401 @@ mod tests {
             "REGRESSION INVARIANT: a client with NO per-client exit_node must resolve exactly \
              like the pre-B2b global-only path (local_fallback: false)"
         );
+    }
+
+    // ── P1: global exit live-swap (masked_exit_addr hot-swap) ────────────
+
+    /// `read_global_exit_node` must extract `pool.exit_node` from a real
+    /// `server.json`-shaped file, trimming whitespace.
+    #[test]
+    fn read_global_exit_node_parses_present_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("server.json");
+        std::fs::write(
+            &path,
+            r#"{"listen_addr":"0.0.0.0:443","pool":{"exit_node":"  global-exit.example.com:51820  ","peers":[]}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            Gateway::read_global_exit_node(&path),
+            Some("global-exit.example.com:51820".to_string())
+        );
+    }
+
+    /// A missing file must resolve to `None`, never panic — the common
+    /// case when `server_config_path` was never configured, or the file
+    /// was briefly unreadable.
+    #[test]
+    fn read_global_exit_node_none_when_file_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("does-not-exist.json");
+        assert_eq!(Gateway::read_global_exit_node(&path), None);
+    }
+
+    /// A `server.json` with no `pool` block, or a `pool` block with no
+    /// `exit_node` key, must both resolve to `None`.
+    #[test]
+    fn read_global_exit_node_none_when_key_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("server.json");
+        std::fs::write(&path, r#"{"listen_addr":"0.0.0.0:443"}"#).unwrap();
+        assert_eq!(Gateway::read_global_exit_node(&path), None);
+
+        std::fs::write(&path, r#"{"pool":{"peers":[]}}"#).unwrap();
+        assert_eq!(Gateway::read_global_exit_node(&path), None);
+    }
+
+    /// A blank/whitespace-only `exit_node` value must resolve to `None`,
+    /// not `Some("")`/`Some("   ")`.
+    #[test]
+    fn read_global_exit_node_none_when_value_blank() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("server.json");
+        std::fs::write(&path, r#"{"pool":{"exit_node":"   "}}"#).unwrap();
+        assert_eq!(Gateway::read_global_exit_node(&path), None);
+    }
+
+    /// Core P1 live-swap guarantee: calling `apply_global_exit_update` with
+    /// a new address must (1) make `exit_decision_for_session` route a
+    /// plain (no per-client override) client's packet to the NEW global
+    /// exit, and (2) spawn a dial task for it via `PoolDialer::add_peer` so
+    /// it is actually live — no server restart required. A subsequent
+    /// update to `None` must clear the global default again (`NoExit` for
+    /// a plain client, matching the REGRESSION INVARIANT in `choose_exit`'s
+    /// own tests).
+    #[tokio::test]
+    async fn apply_global_exit_update_live_swaps_masked_exit_addr() {
+        use crate::pool_dialer::PoolDialer;
+        use crate::pool_sync::PoolSyncConfig;
+        use base64::Engine as _;
+
+        let pool_cfg = PoolSyncConfig {
+            peers: vec![],
+            node_id: Some("this-node:443".to_string()),
+            sync_port: None,
+            sync_key: Some(base64::engine::general_purpose::STANDARD.encode([9u8; 32])),
+            exit_node: None,
+            exit_node_enabled: None,
+            sync_beacon_secs: None,
+            transport: Some("masked".to_string()),
+            allow_auto_add: None,
+            node_identity_key: None,
+            require_node_enrollment: None,
+            node_ip_partition: None,
+        };
+        let db_dir = tempfile::tempdir().unwrap();
+        let network = aivpn_common::network_config::VpnNetworkConfig {
+            server_vpn_ip: Ipv4Addr::new(10, 95, 0, 1),
+            prefix_len: 24,
+            mtu: 1400,
+            ..Default::default()
+        };
+        let db = Arc::new(
+            crate::client_db::ClientDatabase::load(&db_dir.path().join("clients.json"), network)
+                .unwrap(),
+        );
+        let dialer = PoolDialer::new(db, &pool_cfg, vec![], None, None)
+            .expect("dialer constructs with a valid sync_key + node_id");
+        dialer.test_mark_started(Arc::new(std::sync::atomic::AtomicBool::new(false)));
+
+        let config = make_test_gateway_config("p1-live-swap");
+        let mut gateway = Gateway::new(config).expect("gateway constructs");
+        gateway.set_pool_dialer(dialer.clone());
+
+        let plain_session = make_bare_session(None);
+        plain_session.lock().vpn_ip = Some(Ipv4Addr::new(10, 95, 0, 50));
+
+        // Before any update: no global default configured at all.
+        assert_eq!(
+            gateway.exit_decision_for_session(&plain_session),
+            ExitDecision::NoExit
+        );
+
+        // Live-swap in a brand-new global exit.
+        gateway.apply_global_exit_update(Some("new-global-exit.example.com:51820".to_string()));
+
+        assert_eq!(
+            gateway.exit_decision_for_session(&plain_session),
+            ExitDecision::Send {
+                addr: "new-global-exit.example.com:51820".to_string(),
+                local_fallback: false,
+            },
+            "choose_exit must observe the NEW global default immediately, without a restart"
+        );
+        assert!(
+            dialer.is_dialed_peer("new-global-exit.example.com:51820"),
+            "the new global exit must get a live dial task via PoolDialer::add_peer"
+        );
+        assert!(
+            dialer.is_runtime_exit_peer("new-global-exit.example.com:51820"),
+            "a global exit dialed via apply_global_exit_update must be a RUNTIME exit peer \
+             (eligible for later teardown), never a startup pool-sync peer"
+        );
+
+        // Clearing the global default must reflect immediately too.
+        gateway.apply_global_exit_update(None);
+        assert_eq!(
+            gateway.exit_decision_for_session(&plain_session),
+            ExitDecision::NoExit,
+            "REGRESSION INVARIANT: clearing the global default must return exactly to NoExit \
+             for a plain client, matching choose_exit's documented truth table"
+        );
+    }
+
+    /// `apply_global_exit_update` must be a safe, cheap no-op when this
+    /// node has no `pool_dialer` wired at all (legacy transport / no
+    /// pool-sync) — `masked_exit_addr` must stay untouched (observed via
+    /// `exit_decision_for_session` still returning `NoExit`).
+    #[test]
+    fn apply_global_exit_update_noop_without_pool_dialer() {
+        let config = make_test_gateway_config("p1-live-swap-no-dialer");
+        let gateway = Gateway::new(config).expect("gateway constructs");
+
+        gateway.apply_global_exit_update(Some("should-be-ignored:51820".to_string()));
+
+        let plain_session = make_bare_session(None);
+        plain_session.lock().vpn_ip = Some(Ipv4Addr::new(10, 96, 0, 50));
+        assert_eq!(
+            gateway.exit_decision_for_session(&plain_session),
+            ExitDecision::NoExit,
+            "without a pool_dialer, a global exit update must never take effect"
+        );
+    }
+
+    // ── Wave 2: dial-teardown (unused exit dial pruning) ─────────────────
+
+    /// `teardown_unused_exit_dials` must remove a RUNTIME exit dial that is
+    /// no longer referenced by the global default OR any client's
+    /// `exit_node`, while leaving a still-referenced runtime exit (and any
+    /// startup pool-sync peer) fully intact.
+    #[tokio::test]
+    async fn teardown_unused_exit_dials_prunes_only_unreferenced_runtime_exits() {
+        use crate::client_db::{ClientDatabase, UpdateClientParams};
+        use crate::pool_dialer::PoolDialer;
+        use crate::pool_sync::PoolSyncConfig;
+        use base64::Engine as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let network = aivpn_common::network_config::VpnNetworkConfig {
+            server_vpn_ip: Ipv4Addr::new(10, 97, 0, 1),
+            prefix_len: 24,
+            mtu: 1400,
+            ..Default::default()
+        };
+        let db = Arc::new(ClientDatabase::load(&dir.path().join("clients.json"), network).unwrap());
+
+        let still_referenced_client = db.add_client("still-referenced").unwrap();
+        db.update_client(
+            &still_referenced_client.id,
+            UpdateClientParams {
+                exit_node: Some(Some("still-referenced-exit:51820".to_string())),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let pool_cfg = PoolSyncConfig {
+            peers: vec!["startup-pool-sync-peer:443".to_string()],
+            node_id: Some("this-node:443".to_string()),
+            sync_port: None,
+            sync_key: Some(base64::engine::general_purpose::STANDARD.encode([9u8; 32])),
+            exit_node: None,
+            exit_node_enabled: None,
+            sync_beacon_secs: None,
+            transport: Some("masked".to_string()),
+            allow_auto_add: None,
+            node_identity_key: None,
+            require_node_enrollment: None,
+            node_ip_partition: None,
+        };
+        let dialer = PoolDialer::new(db.clone(), &pool_cfg, vec![], None, None)
+            .expect("dialer constructs with a valid sync_key + node_id");
+        dialer.test_mark_started(Arc::new(std::sync::atomic::AtomicBool::new(false)));
+        // Simulate the startup pool-sync dial `start()` would spawn for
+        // `pool.peers`, WITHOUT calling the real `start()` (would try a
+        // real network dial for it) — mirrors `pool_dialer.rs`'s own
+        // teardown tests.
+        dialer.test_spawn_startup_peer("startup-pool-sync-peer:443");
+
+        let mut config = make_test_gateway_config("wave2-teardown");
+        config.client_db = Some(db.clone());
+        let mut gateway = Gateway::new(config).expect("gateway constructs");
+        gateway.set_pool_dialer(dialer.clone());
+
+        // Global default + the referenced client's exit both go live via
+        // the SAME runtime paths P1/B2c use.
+        gateway.apply_global_exit_update(Some("global-exit:51820".to_string()));
+        gateway.add_dial_peers_for_client_exits();
+        // A stale runtime exit that NOTHING references any more (e.g. the
+        // client that used to point here was deleted/repointed on a prior
+        // mgmt request).
+        dialer.add_peer("stale-unreferenced-exit:51820");
+
+        assert!(dialer.is_dialed_peer("global-exit:51820"));
+        assert!(dialer.is_dialed_peer("still-referenced-exit:51820"));
+        assert!(dialer.is_dialed_peer("stale-unreferenced-exit:51820"));
+        assert!(dialer.is_dialed_peer("startup-pool-sync-peer:443"));
+
+        gateway.teardown_unused_exit_dials();
+
+        assert!(
+            !dialer.is_dialed_peer("stale-unreferenced-exit:51820"),
+            "an unreferenced runtime exit must be torn down"
+        );
+        assert!(
+            dialer.is_dialed_peer("global-exit:51820"),
+            "the current global default must survive teardown"
+        );
+        assert!(
+            dialer.is_dialed_peer("still-referenced-exit:51820"),
+            "a still-referenced client exit must survive teardown"
+        );
+        assert!(
+            dialer.is_dialed_peer("startup-pool-sync-peer:443"),
+            "CRITICAL: a startup pool-sync peer must NEVER be torn down by this path"
+        );
+    }
+
+    /// P1 REST parity fix: `apply_global_exit_and_teardown` — the function
+    /// shared by BOTH the in-tunnel path (`dispatch_mgmt_request`) and the
+    /// REST/Unix-socket path (`management_api::confirm_config`) — must, in
+    /// one call: (1) re-read `pool.exit_node` from a real `server.json` and
+    /// swap `masked_exit_addr` to the new value, spawning a live dial for
+    /// it; (2) pick up a per-client `exit_node` this node has never dialed
+    /// before (Wave B2c parity); and (3) tear down a stale RUNTIME exit dial
+    /// nothing references any more, while NEVER touching a startup
+    /// `pool.peers` pool-sync dial.
+    #[tokio::test]
+    async fn apply_global_exit_and_teardown_swaps_adds_and_prunes_in_one_call() {
+        use crate::client_db::{ClientDatabase, UpdateClientParams};
+        use crate::pool_dialer::PoolDialer;
+        use crate::pool_sync::PoolSyncConfig;
+        use base64::Engine as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let network = aivpn_common::network_config::VpnNetworkConfig {
+            server_vpn_ip: Ipv4Addr::new(10, 98, 0, 1),
+            prefix_len: 24,
+            mtu: 1400,
+            ..Default::default()
+        };
+        let db = Arc::new(ClientDatabase::load(&dir.path().join("clients.json"), network).unwrap());
+
+        let still_referenced_client = db.add_client("still-referenced").unwrap();
+        db.update_client(
+            &still_referenced_client.id,
+            UpdateClientParams {
+                exit_node: Some(Some("still-referenced-exit:51820".to_string())),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let pool_cfg = PoolSyncConfig {
+            peers: vec!["startup-pool-sync-peer:443".to_string()],
+            node_id: Some("this-node:443".to_string()),
+            sync_port: None,
+            sync_key: Some(base64::engine::general_purpose::STANDARD.encode([9u8; 32])),
+            exit_node: None,
+            exit_node_enabled: None,
+            sync_beacon_secs: None,
+            transport: Some("masked".to_string()),
+            allow_auto_add: None,
+            node_identity_key: None,
+            require_node_enrollment: None,
+            node_ip_partition: None,
+        };
+        let dialer = PoolDialer::new(db.clone(), &pool_cfg, vec![], None, None)
+            .expect("dialer constructs with a valid sync_key + node_id");
+        dialer.test_mark_started(Arc::new(std::sync::atomic::AtomicBool::new(false)));
+        dialer.test_spawn_startup_peer("startup-pool-sync-peer:443");
+        // A stale runtime exit nothing references any more — simulates a
+        // previous mgmt round-trip's now-abandoned global/per-client exit.
+        dialer.add_peer("stale-unreferenced-exit:51820");
+
+        let server_json = dir.path().join("server.json");
+        std::fs::write(
+            &server_json,
+            r#"{"listen_addr":"0.0.0.0:443","pool":{"exit_node":"new-global-exit.example.com:51820"}}"#,
+        )
+        .unwrap();
+
+        let masked_exit_addr: Arc<parking_lot::RwLock<Option<String>>> =
+            Arc::new(parking_lot::RwLock::new(None));
+
+        apply_global_exit_and_teardown(
+            &masked_exit_addr,
+            Some(&dialer),
+            Some(server_json.as_path()),
+            &db,
+        );
+
+        assert_eq!(
+            *masked_exit_addr.read(),
+            Some("new-global-exit.example.com:51820".to_string()),
+            "the global default must be swapped in from server.json in one call"
+        );
+        assert!(
+            dialer.is_dialed_peer("new-global-exit.example.com:51820"),
+            "the new global exit must get a live dial task"
+        );
+        assert!(
+            dialer.is_dialed_peer("still-referenced-exit:51820"),
+            "a per-client exit_node must ALSO go live in the same call (Wave B2c parity)"
+        );
+        assert!(
+            !dialer.is_dialed_peer("stale-unreferenced-exit:51820"),
+            "an unreferenced runtime exit must be torn down in the same call"
+        );
+        assert!(
+            dialer.is_dialed_peer("startup-pool-sync-peer:443"),
+            "CRITICAL: a startup pool-sync peer must NEVER be torn down by this path"
+        );
+    }
+
+    /// `apply_global_exit_and_teardown` must be a safe, cheap no-op — never
+    /// touching `masked_exit_addr` or reading `server_config_path` — when
+    /// `pool_dialer` is `None` (legacy transport / no masked pool-client
+    /// dialer on this node).
+    #[test]
+    fn apply_global_exit_and_teardown_noop_without_pool_dialer() {
+        let dir = tempfile::tempdir().unwrap();
+        let network = aivpn_common::network_config::VpnNetworkConfig {
+            server_vpn_ip: Ipv4Addr::new(10, 99, 0, 1),
+            prefix_len: 24,
+            mtu: 1400,
+            ..Default::default()
+        };
+        let db = Arc::new(
+            crate::client_db::ClientDatabase::load(&dir.path().join("clients.json"), network)
+                .unwrap(),
+        );
+        let server_json = dir.path().join("server.json");
+        std::fs::write(
+            &server_json,
+            r#"{"pool":{"exit_node":"should-be-ignored:51820"}}"#,
+        )
+        .unwrap();
+
+        let masked_exit_addr: Arc<parking_lot::RwLock<Option<String>>> =
+            Arc::new(parking_lot::RwLock::new(None));
+
+        apply_global_exit_and_teardown(&masked_exit_addr, None, Some(server_json.as_path()), &db);
+
+        assert_eq!(
+            *masked_exit_addr.read(),
+            None,
+            "without a pool_dialer, the global exit must never be swapped in"
+        );
+    }
+
+    /// `teardown_unused_exit_dials` must be a safe, cheap no-op when this
+    /// node has no `pool_dialer` wired at all.
+    #[test]
+    fn teardown_unused_exit_dials_noop_without_pool_dialer() {
+        let config = make_test_gateway_config("wave2-teardown-no-dialer");
+        let gateway = Gateway::new(config).expect("gateway constructs");
+        gateway.teardown_unused_exit_dials();
     }
 
     // ── Wave B2c: runtime dial add-peer ─────────────────────────────────

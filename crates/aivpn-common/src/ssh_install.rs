@@ -94,6 +94,13 @@ pub enum SshInstallError {
     /// wrapped further.
     #[error("invalid install params json: {0}")]
     Json(#[from] serde_json::Error),
+    /// The remote command's channel closed without ever reporting an exit
+    /// status — the TCP connection dropped mid-command or the remote process
+    /// was killed by a signal. Surfaced as a hard error so an interrupted
+    /// install is never mistaken for a successful one (it used to be
+    /// silently treated as exit code 0).
+    #[error("remote command ended without an exit status ({0})")]
+    Interrupted(String),
 }
 
 pub type Result<T> = std::result::Result<T, SshInstallError>;
@@ -279,7 +286,9 @@ impl SshSession {
         channel.exec(true, cmd.as_bytes().to_vec()).await?;
 
         let mut exit_code: Option<u32> = None;
+        let mut exit_signal: Option<String> = None;
         let mut line_buf = String::new();
+        let mut err_buf = String::new();
 
         while let Some(msg) = channel.wait().await {
             match msg {
@@ -290,8 +299,28 @@ impl SshSession {
                         on_line(line.trim_end_matches(['\r', '\n']));
                     }
                 }
+                // stderr (SSH_EXTENDED_DATA_STDERR). Surfaced through the
+                // same line callback so failures that only write to stderr
+                // ("sudo: a password is required", apt/curl/systemctl
+                // errors) are visible to the caller/UI instead of being
+                // silently dropped. Buffered separately from stdout so a
+                // partial stdout line is never spliced mid-line with stderr.
+                ChannelMsg::ExtendedData { data, .. } => {
+                    err_buf.push_str(&String::from_utf8_lossy(&data));
+                    while let Some(pos) = err_buf.find('\n') {
+                        let line: String = err_buf.drain(..=pos).collect();
+                        on_line(line.trim_end_matches(['\r', '\n']));
+                    }
+                }
                 ChannelMsg::ExitStatus { exit_status } => {
                     exit_code = Some(exit_status);
+                }
+                // The remote process was killed by a signal (OOM-kill,
+                // manual kill, ...). sshd sends `exit-signal` INSTEAD of
+                // `exit-status` in that case — record it so the fallthrough
+                // below reports a hard error rather than success.
+                ChannelMsg::ExitSignal { signal_name, .. } => {
+                    exit_signal = Some(format!("killed by signal {:?}", signal_name));
                 }
                 ChannelMsg::Close | ChannelMsg::Eof => {
                     // Keep draining until the channel actually closes — there
@@ -307,8 +336,22 @@ impl SshSession {
         if !line_buf.is_empty() {
             on_line(&line_buf);
         }
+        if !err_buf.is_empty() {
+            on_line(&err_buf);
+        }
 
-        Ok(exit_code.unwrap_or(0) as i32)
+        match (exit_code, exit_signal) {
+            (Some(code), _) => Ok(code as i32),
+            // No exit status at all: the process was signal-killed or the
+            // connection dropped mid-command. Treating this as success
+            // (exit 0) previously made an aborted install report as
+            // Finished{exit_code:0} to the UI.
+            (None, signal) => {
+                Err(SshInstallError::Interrupted(signal.unwrap_or_else(|| {
+                    "connection closed before completion".to_string()
+                })))
+            }
+        }
     }
 }
 
@@ -1032,6 +1075,18 @@ pub async fn run_install(
             }
         })
         .await?;
+
+    // Best-effort remote scratch cleanup: the uploaded bundle (script,
+    // masks, and for BinarySource::LocalFile an ~11 MB binary) is no longer
+    // needed once the installer script has run — without this every
+    // run/retry leaked a fresh /tmp/aivpn-install-<hex> directory on the
+    // target host. The install script copies what it needs to its final
+    // locations, so removing the staging dir is safe for any exit code.
+    // Failures are ignored: cleanup must never turn a completed install
+    // into an error.
+    let _ = session
+        .run_streaming(&format!("rm -rf {}", shell_quote(&remote_dir)), |_| {})
+        .await;
 
     on_event(InstallEvent::Finished {
         exit_code,

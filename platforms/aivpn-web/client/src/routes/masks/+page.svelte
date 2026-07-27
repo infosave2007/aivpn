@@ -12,7 +12,10 @@
 
   const deleteMut = createMutation({
     mutationFn: (name: string) => masksApi.delete(name),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ['masks'] }),
+    onSuccess: () => { uploadError = ''; qc.invalidateQueries({ queryKey: ['masks'] }); },
+    // masksApi.delete now throws on non-2xx (e.g. 403 for viewer role, 502
+    // daemon-down) — surface it instead of silently keeping the row.
+    onError: (e: Error) => { uploadError = e.message; },
   });
 
   async function handleUpload(e: Event) {

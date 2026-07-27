@@ -1,3 +1,4 @@
+use iced::futures::SinkExt;
 use iced::widget::{
     button, checkbox, column, container, horizontal_rule, image, pick_list, row, scrollable, text,
     text_input, Space,
@@ -2919,10 +2920,19 @@ impl App {
                 self.server_settings_busy = false;
                 match result {
                     Ok(token) => {
-                        self.server_settings_pending = Some((token, kind));
-                        self.server_settings_countdown = SERVER_SETTINGS_CONFIRM_WINDOW_SECS;
-                        self.server_settings_rolled_back = false;
-                        self.server_settings_error = None;
+                        // An apply whose result lands only after the tunnel
+                        // dropped is a token from a dead session: the
+                        // disconnect handler already cleared the pending
+                        // state, and confirming it later (through a NEW
+                        // session) races the server's own rollback sweep.
+                        // Don't resurrect it — the server rolls the change
+                        // back on its own timeline.
+                        if matches!(self.status, VpnStatus::Connected { .. }) {
+                            self.server_settings_pending = Some((token, kind));
+                            self.server_settings_countdown = SERVER_SETTINGS_CONFIRM_WINDOW_SECS;
+                            self.server_settings_rolled_back = false;
+                            self.server_settings_error = None;
+                        }
                     }
                     Err(e) => self.server_settings_error = Some(e),
                 }
@@ -5448,7 +5458,9 @@ impl App {
                         )));
                         return;
                     };
-                    let _ = sender.try_send(Message::StatusReceived(VpnStatus::Connecting));
+                    let _ = sender
+                        .send(Message::StatusReceived(VpnStatus::Connecting))
+                        .await;
 
                     let mut out = BufReader::new(stdout).lines();
                     let mut err = BufReader::new(stderr).lines();
@@ -5494,19 +5506,18 @@ impl App {
                     // so this line always arrives via `err`, never `out`; still
                     // checked on both streams in case a future client build ever
                     // emits it differently.
-                    let check_connected =
-                        |sender: &mut iced::futures::channel::mpsc::Sender<Message>, l: &str| {
-                            if l.contains("Connected") || l.contains("TUN interface") {
-                                let ip = l
-                                    .split_whitespace()
-                                    .find(|t| t.contains('.') && t.contains('/'))
-                                    .map(|s| s.to_string())
-                                    .unwrap_or_default();
-                                let _ = sender.try_send(Message::StatusReceived(
-                                    VpnStatus::Connected { vpn_ip: ip },
-                                ));
-                            }
-                        };
+                    let check_connected = |l: &str| -> Option<Message> {
+                        if l.contains("Connected") || l.contains("TUN interface") {
+                            let ip = l
+                                .split_whitespace()
+                                .find(|t| t.contains('.') && t.contains('/'))
+                                .map(|s| s.to_string())
+                                .unwrap_or_default();
+                            Some(Message::StatusReceived(VpnStatus::Connected { vpn_ip: ip }))
+                        } else {
+                            None
+                        }
+                    };
 
                     // Once one machine-readable line has been seen the
                     // heuristic is disabled for the rest of the session: it
@@ -5514,39 +5525,60 @@ impl App {
                     // "TUN interface") and would fight the authoritative
                     // protocol.
                     let mut saw_status_line = false;
-                    let mut handle_line =
-                        |sender: &mut iced::futures::channel::mpsc::Sender<Message>, l: &str| {
-                            // 3c: orthogonal to VpnStatus (can co-occur with
-                            // Connecting/Connected), so it's dispatched
-                            // separately rather than through parse_status_line.
-                            if l.trim() == "AIVPN-STATUS bootstrap-fallback" {
-                                let _ = sender.try_send(Message::BootstrapFallbackDetected);
-                            }
-                            if let Some(status) = parse_status_line(l) {
-                                saw_status_line = true;
-                                let _ = sender.try_send(Message::StatusReceived(status));
-                            } else if !saw_status_line {
-                                check_connected(sender, l);
-                            }
-                        };
+                    let mut line_messages = |l: &str| -> Vec<Message> {
+                        let mut msgs = Vec::new();
+                        // 3c: orthogonal to VpnStatus (can co-occur with
+                        // Connecting/Connected), so it's dispatched
+                        // separately rather than through parse_status_line.
+                        if l.trim() == "AIVPN-STATUS bootstrap-fallback" {
+                            msgs.push(Message::BootstrapFallbackDetected);
+                        }
+                        if let Some(status) = parse_status_line(l) {
+                            saw_status_line = true;
+                            msgs.push(Message::StatusReceived(status));
+                        } else if !saw_status_line {
+                            msgs.extend(check_connected(l));
+                        }
+                        msgs
+                    };
 
+                    // Drain BOTH streams to their own EOF (same fix as the
+                    // install-wizard subscription): on child exit both pipes
+                    // EOF and `select!` polls in random order — a bare
+                    // `_ => break` on whichever EOF lands first silently
+                    // dropped final status lines (e.g. "AIVPN-STATUS
+                    // rejected <reason>") still buffered on the OTHER
+                    // stream. Status/log messages are `send().await`ed (not
+                    // `try_send`) so a burst of log lines can never overflow
+                    // the channel and silently drop a status transition.
+                    let mut out_done = false;
+                    let mut err_done = false;
                     loop {
                         tokio::select! {
-                            line = out.next_line() => match line {
+                            line = out.next_line(), if !out_done => match line {
                                 Ok(Some(l)) => {
-                                    handle_line(&mut sender, &l);
-                                    let _ = sender.try_send(Message::LogLine(strip_ansi(&l)));
+                                    for m in line_messages(&l) {
+                                        let _ = sender.send(m).await;
+                                    }
+                                    let _ = sender.send(Message::LogLine(strip_ansi(&l))).await;
                                 }
-                                _ => break,
+                                _ => out_done = true,
                             },
-                            line = err.next_line() => match line {
+                            line = err.next_line(), if !err_done => match line {
                                 Ok(Some(l)) => {
-                                    handle_line(&mut sender, &l);
+                                    for m in line_messages(&l) {
+                                        let _ = sender.send(m).await;
+                                    }
                                     let _ = sender
-                                        .try_send(Message::LogLine(format!("[err] {}", strip_ansi(&l))));
+                                        .send(Message::LogLine(format!("[err] {}", strip_ansi(&l))))
+                                        .await;
                                 }
-                                _ => break,
+                                _ => err_done = true,
                             },
+                            else => break,
+                        }
+                        if out_done && err_done {
+                            break;
                         }
                     }
 
@@ -5562,7 +5594,12 @@ impl App {
                         let _ = c.wait().await;
                     }
                     remove_client_pidfile();
-                    let _ = sender.try_send(Message::StatusReceived(VpnStatus::Disconnected));
+                    // send().await, not try_send: this terminal status is what
+                    // lets the UI leave Connected/Connecting — if it were
+                    // dropped on a full channel the status would stick forever.
+                    let _ = sender
+                        .send(Message::StatusReceived(VpnStatus::Disconnected))
+                        .await;
                 });
                 Subscription::run_with_id("aivpn_worker", stream)
             }

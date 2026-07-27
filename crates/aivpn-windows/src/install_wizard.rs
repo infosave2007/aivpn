@@ -429,6 +429,34 @@ pub fn spawn_install(
             }
         };
 
+        // BUG FIX (review): stderr was `Stdio::piped()` but never read. A
+        // child that writes more than the OS pipe buffer (~64KB) to stderr
+        // (verbose SSH transport errors, tracing output) blocked forever on
+        // a full pipe nobody drained — stdout then never reached EOF, the
+        // loop below never ended, and the wizard sat on "Installing…"
+        // forever with no terminal marker. Drain stderr on its own thread,
+        // forwarding non-empty lines to the UI log as Raw lines (stderr is
+        // the CLI's log/error channel, never a `##AIVPN` marker stream — so
+        // no marker parsing here, a terminal state can only come from
+        // stdout or the synthetic `gui_process` line). If the receiver is
+        // gone, keep draining without sending so the child can still exit.
+        let stderr_drain = child.stderr.take().map(|stderr| {
+            let tx = tx.clone();
+            std::thread::spawn(move || {
+                let reader = BufReader::new(stderr);
+                for line in reader.lines() {
+                    let Ok(l) = line else { break };
+                    let trimmed = l.trim_end_matches(['\r', '\n']);
+                    if trimmed.trim().is_empty() {
+                        continue;
+                    }
+                    // Send failure = wizard closed; keep reading (drain)
+                    // so the child never blocks on a full stderr pipe.
+                    let _ = tx.send(InstallLine::Raw(trimmed.to_string()));
+                }
+            })
+        });
+
         if let Some(stdout) = child.stdout.take() {
             let reader = BufReader::new(stdout);
             for line in reader.lines() {
@@ -447,6 +475,12 @@ pub fn spawn_install(
         }
 
         let status = child.wait();
+        // Join AFTER wait() (child exit closes its stderr, ending the drain
+        // thread at EOF) and BEFORE the terminal marker below, so no stray
+        // stderr line ever arrives after `gui_process`.
+        if let Some(h) = stderr_drain {
+            let _ = h.join();
+        }
         let exit_code = status.as_ref().ok().and_then(|s| s.code()).unwrap_or(-1);
         let ok = matches!(&status, Ok(s) if s.success());
         let msg = match &status {
@@ -754,6 +788,85 @@ mod tests {
             }
             _ => panic!("expected Marker"),
         }
+    }
+
+    // --- spawn_install stderr drain (deadlock regression) ---------------------
+
+    /// Regression test for the undrained-stderr deadlock: a child that
+    /// writes far more than the OS pipe buffer (~64KB) to stderr used to
+    /// block forever mid-write (nobody read that pipe), so stdout never
+    /// reached EOF and `spawn_install`'s thread never sent the terminal
+    /// `gui_process` marker. With the drain thread, the child runs to
+    /// completion and the marker arrives. Unix-only: builds the fake
+    /// "client binary" as a shell script.
+    #[cfg(unix)]
+    #[test]
+    fn spawn_install_survives_stderr_flood_and_reports_exit() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!(
+            "aivpn-win-test-stderr-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("fake-client.sh");
+        // ~1MB of stderr (16k lines x 64 chars), one stdout marker, exit 0.
+        std::fs::write(
+            &script,
+            "#!/bin/sh\n\
+             i=0\n\
+             while [ $i -lt 16000 ]; do\n\
+               echo 'stderr noise line 0123456789 0123456789 0123456789 xx' 1>&2\n\
+               i=$((i+1))\n\
+             done\n\
+             echo '##AIVPN {\"step\":\"done\",\"status\":\"ok\",\"connection_key\":null}'\n\
+             exit 0\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let target = base_target();
+        let (tx, rx) = std::sync::mpsc::channel();
+        spawn_install(script.clone(), target, None, tx);
+
+        // The whole run should finish quickly; poll with a hard deadline so
+        // a regression fails the test instead of hanging the harness.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let mut saw_done_marker = false;
+        let mut saw_gui_process_ok = false;
+        let mut stderr_lines = 0usize;
+        loop {
+            match rx.recv_timeout(std::time::Duration::from_millis(200)) {
+                Ok(InstallLine::Marker { step, status, .. }) => {
+                    if step == "done" {
+                        saw_done_marker = true;
+                    }
+                    if step == "gui_process" {
+                        assert_eq!(status, "ok");
+                        saw_gui_process_ok = true;
+                        break;
+                    }
+                }
+                Ok(InstallLine::Raw(_)) => stderr_lines += 1,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "spawn_install deadlocked: stderr flood was never drained"
+                    );
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    panic!("sender dropped without a gui_process terminal marker");
+                }
+            }
+        }
+        assert!(saw_done_marker, "stdout marker line was lost");
+        assert!(saw_gui_process_ok);
+        assert!(
+            stderr_lines > 0,
+            "stderr lines should be forwarded to the install log"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // --- should_auto_import (G-C1) --------------------------------------------

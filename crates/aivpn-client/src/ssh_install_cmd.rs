@@ -38,7 +38,6 @@
 //! (`Finished.exit_code`) when the SSH session made it that far; otherwise
 //! (connect/auth/fingerprint failure) it's `1`.
 
-use std::io::Read as _;
 use std::path::PathBuf;
 
 use base64::Engine as _;
@@ -393,6 +392,11 @@ fn post_connect_error_marker_line(err: &ssh_install::SshInstallError) -> String 
         ssh_install::SshInstallError::Ssh(_) => "ssh_error",
         ssh_install::SshInstallError::Key(_) => "key_error",
         ssh_install::SshInstallError::Json(_) => "json_error",
+        // The remote command's channel closed without an exit status (TCP
+        // drop mid-install / remote process killed by a signal) — a distinct
+        // code so a GUI can say "install interrupted, state on the server is
+        // unknown" instead of a generic ssh error.
+        ssh_install::SshInstallError::Interrupted(_) => "interrupted",
         // Unreachable in practice post-Connected (these only ever occur
         // during the initial `connect()` handshake), but matched explicitly
         // rather than falling into a catch-all so this stays exhaustive if
@@ -482,12 +486,17 @@ async fn run_install_cmd(args: RunArgs) -> i32 {
             }
         },
         AuthMethodChoice::PasswordStdin => {
+            // Read exactly ONE line, not to EOF: a GUI parent that writes
+            // "password\n" and keeps the pipe open (to read our stdout
+            // markers) must not deadlock us waiting for stdin EOF while it
+            // waits for our output — and an interactive user typing the
+            // password + Enter shouldn't need a Ctrl-D to proceed.
             let mut buf = String::new();
-            if let Err(e) = std::io::stdin().read_to_string(&mut buf) {
+            if let Err(e) = std::io::BufRead::read_line(&mut std::io::stdin().lock(), &mut buf) {
                 eprintln!("ssh-install run: failed to read password from stdin: {e}");
                 return 1;
             }
-            let password = buf.lines().next().unwrap_or("").trim().to_string();
+            let password = buf.trim().to_string();
             (Some(password), None, None)
         }
         AuthMethodChoice::KeyFile(path, passphrase_env) => {
