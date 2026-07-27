@@ -5,16 +5,19 @@
   import { auth } from '$lib/api';
   import {
     LayoutDashboard, Users, Settings2, Shield, Archive,
-    ScrollText, Settings, LogOut, Radio
+    ScrollText, Settings, LogOut, Radio, Network
   } from 'lucide-svelte';
 
   // adminOnly mirrors the server-side viewer allowlist (proxy.ts
   // VIEWER_ALLOWED): config, backup and the audit log 403 for viewers, so
   // don't offer them dead links. This is display-only — access is enforced
   // server-side regardless, and the pages also surface 403s themselves.
+  // /api/v1/pool/* is a plain GET proxied route, allowed for viewers too
+  // (requireReadAccess), so Pool is adminOnly: false like Dashboard/Clients.
   const navItems = [
     { href: '/dashboard', label: 'Dashboard', icon: LayoutDashboard, adminOnly: false },
     { href: '/clients', label: 'Clients', icon: Users, adminOnly: false },
+    { href: '/pool', label: 'Pool', icon: Network, adminOnly: false },
     { href: '/config', label: 'Config', icon: Settings2, adminOnly: true },
     { href: '/masks', label: 'Masks', icon: Shield, adminOnly: false },
     { href: '/backup', label: 'Backup', icon: Archive, adminOnly: true },

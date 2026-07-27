@@ -175,6 +175,18 @@ pub struct PoolSyncConfig {
     /// dropped outright instead of being trusted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub require_node_enrollment: Option<bool>,
+    /// Wave B-IP: explicit override for this node's hard VPN-IP partition
+    /// index (see `ClientDatabase::set_node_partition_explicit`). When set,
+    /// replaces the default `hash(node_id) % num_partitions` derivation with
+    /// this exact index — lets an operator rule out even a hash collision
+    /// between two nodes' `node_id`s, or hand-balance partitions across a
+    /// pool larger than the default sizing targets. Any value is accepted
+    /// (it is taken modulo the resolved partition count), so a simple
+    /// per-node incrementing counter (0, 1, 2, …) is a safe choice without
+    /// needing to know the exact partition count. `None` (default) uses the
+    /// hash-derived index.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_ip_partition: Option<u32>,
 }
 
 impl PoolSyncConfig {
@@ -721,6 +733,7 @@ mod tests {
             allow_auto_add: None,
             node_identity_key: None,
             require_node_enrollment: None,
+            node_ip_partition: None,
         }
     }
 

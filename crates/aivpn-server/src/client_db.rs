@@ -113,6 +113,21 @@ pub struct ClientConfig {
     /// proven to belong to the connecting peer.
     #[serde(default, skip_serializing_if = "is_role_user")]
     pub role: ClientRole,
+    /// Optional per-client exit-node override for multi-hop routing (Wave
+    /// B2a config layer): when set, this client's egress SHOULD route
+    /// through the named pool exit node (`host:port`) instead of the
+    /// server's global default (`pool.exit_node` in server.json — see
+    /// `mgmt_service::HeavySetting::ExitNode`). `None` (default) falls back
+    /// to the global default.
+    ///
+    /// STORAGE ONLY as of Wave B2a: nothing in the data plane
+    /// (`ChainForwarder` / gateway forwarding / `pool_dialer` exit
+    /// sessions) reads this field yet — actually routing by it is Wave B2b.
+    /// Synced pool-wide via `merge_from_json`'s LWW/tombstone gate exactly
+    /// like `role`. Validated on `update_client` (see
+    /// `validate_exit_node_addr`) — must be `host:port` or unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_node: Option<String>,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -121,6 +136,23 @@ fn is_false(b: &bool) -> bool {
 
 fn is_role_user(r: &ClientRole) -> bool {
     *r == ClientRole::User
+}
+
+/// Light validation for a client's `exit_node` override: must be `host:port`
+/// with a non-empty host and a numeric `u16` port. This is config plumbing
+/// (Wave B2a) — it deliberately does NOT attempt any DNS/reachability check,
+/// only rejects obviously malformed input before it's persisted and synced
+/// pool-wide.
+pub fn validate_exit_node_addr(addr: &str) -> Result<()> {
+    let (host, port) = addr
+        .rsplit_once(':')
+        .ok_or_else(|| Error::Session("exit_node must be in host:port format".into()))?;
+    if host.is_empty() {
+        return Err(Error::Session("exit_node host must not be empty".into()));
+    }
+    port.parse::<u16>()
+        .map_err(|_| Error::Session("exit_node port must be a valid number (0-65535)".into()))?;
+    Ok(())
 }
 
 /// Encode an `Option<DateTime<Utc>>` as 8 little-endian bytes for
@@ -191,6 +223,23 @@ fn write_record_canonical_fields(hasher: &mut blake3::Hasher, c: &ClientConfig) 
     // must converge in the digest so a pool node can't silently retain a
     // stale role after another node elevates/demotes a client)
     hasher.update(&[c.role.rank()]);
+
+    // exit_node (Wave B2a: present-flag byte + length-prefixed string, same
+    // shape as device_pubkey's present-flag pattern above but variable
+    // length — must converge in the digest so a pool node can't silently
+    // retain a stale per-client exit-node override after another node
+    // changes or clears it)
+    match c.exit_node {
+        Some(ref addr) => {
+            hasher.update(&[1u8]);
+            let bytes = addr.as_bytes();
+            hasher.update(&(bytes.len() as u32).to_le_bytes());
+            hasher.update(bytes);
+        }
+        None => {
+            hasher.update(&[0u8]);
+        }
+    }
 }
 
 /// Deterministic bucket assignment for a client `id`: the first 8 bytes of
@@ -263,6 +312,14 @@ pub struct UpdateClientParams {
     /// exposed here, see `update_client`) device-bound; enforced atomically
     /// in `update_client`.
     pub role: Option<ClientRole>,
+    /// None = leave unchanged; Some(None) = clear (fall back to the global
+    /// default `pool.exit_node`); Some(Some(addr)) = set this client's
+    /// exit-node override. `addr` must be `host:port` — validated in
+    /// `update_client` via `validate_exit_node_addr`. Unlike `role`, this
+    /// carries NO device-binding requirement: it's a routing preference an
+    /// Admin sets on behalf of a client, not a privilege the client itself
+    /// is granted.
+    pub exit_node: Option<Option<String>>,
 }
 
 /// Per-client traffic statistics
@@ -297,11 +354,49 @@ impl Default for ClientDbFile {
     }
 }
 
+/// Hard-bounded range of host offsets `[start_offset, end_offset)` (end
+/// exclusive) this node is confined to when allocating NEW VPN IPs — see
+/// `set_node_partition` / `set_node_partition_explicit`. Existing clients'
+/// IPs are never affected by partition bounds, only new allocations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PartitionBounds {
+    start_offset: u32,
+    /// Exclusive.
+    end_offset: u32,
+    /// This node's partition index out of `num_partitions` — see
+    /// `set_node_partition`/`set_node_partition_explicit`.
+    index: u32,
+    /// Total number of partitions the subnet is currently divided into.
+    num_partitions: u32,
+    /// True iff `index` was pinned via `set_node_partition_explicit`
+    /// (`pool.node_ip_partition`) rather than derived from `hash(node_id)`.
+    explicit: bool,
+}
+
+/// This node's active VPN-IP partition assignment, as exposed by
+/// `ClientDatabase::partition_info` — Wave B-IP.2: lets a pool peer
+/// announce its partition state (`ControlPayload::PartitionAnnounce`) for
+/// operator overlap/mismatch visibility. Mirrors `PartitionBounds` but is
+/// `pub` and reports `partition_size` (offsets owned) instead of raw
+/// start/end offsets, which are meaningless outside this node's own subnet
+/// indexing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PartitionInfo {
+    pub partition_index: u32,
+    pub partition_size: u32,
+    pub num_partitions: u32,
+    pub explicit: bool,
+}
+
 /// Thread-safe client database with file persistence
 pub struct ClientDatabase {
     data: RwLock<ClientDbFile>,
     file_path: PathBuf,
     network_config: VpnNetworkConfig,
+    /// This node's hard VPN-IP partition, if pool sync is configured — see
+    /// `set_node_partition`. `None` (default / single-node / legacy) means
+    /// `allocate_vpn_ip` uses the whole subnet, exactly as before Wave B-IP.
+    partition: RwLock<Option<PartitionBounds>>,
     last_mtime: Mutex<Option<std::time::SystemTime>>,
     /// data-plane H4: `save()`'s temp file name is PID-only, so two
     /// concurrent `save()` calls in the SAME process (e.g. an admin update
@@ -347,6 +442,7 @@ impl ClientDatabase {
             data: RwLock::new(data),
             file_path: file_path.to_path_buf(),
             network_config,
+            partition: RwLock::new(None),
             last_mtime,
             save_lock: Mutex::new(()),
         })
@@ -446,6 +542,7 @@ impl ClientDatabase {
             updated_at: Some(Utc::now()),
             deleted: false,
             role: ClientRole::User,
+            exit_node: None,
         };
 
         data.clients.push(client.clone());
@@ -886,6 +983,11 @@ impl ClientDatabase {
                     // node must converge everywhere) — same `incoming_wins`
                     // LWW/tombstone-sticky gate, no separate policy.
                     existing.role = inc.role;
+                    // Wave B2a: `exit_node` follows the exact same policy —
+                    // a per-client routing override set (or cleared) on one
+                    // pool node must converge everywhere, and must not be
+                    // resurrected by a stale peer copy once tombstoned.
+                    existing.exit_node = inc.exit_node;
                     merged += 1;
                 }
             } else if inc.deleted {
@@ -895,39 +997,103 @@ impl ClientDatabase {
                 data.clients.push(inc);
                 merged += 1;
             } else {
-                // H-S-2: Reject incoming records whose vpn_ip is already
-                // assigned to a *different* client — prevents pool sync from
-                // overwriting IP assignments and causing routing collisions.
-                // Tombstones don't hold their IP (allocate_vpn_ip may have
-                // reassigned it), so they don't conflict.
-                let ip_conflict = data
+                // H-S-2 / Wave B-IP: reject-and-reassign incoming records
+                // whose vpn_ip is already assigned to a *different* client —
+                // prevents pool sync from overwriting IP assignments and
+                // causing routing collisions. Tombstones don't hold their IP
+                // (allocate_vpn_ip may have reassigned it), so they don't
+                // conflict.
+                //
+                // With hard per-node partitioning (`set_node_partition`) in
+                // place, two DIFFERENT nodes' independent allocations can no
+                // longer land on the same offset in the first place, so this
+                // branch is now a backstop for residual/legacy cases: a
+                // node_id hash collision, an explicit-partition-override
+                // misconfiguration, or clients that predate partitioning.
+                //
+                // The winner is chosen DETERMINISTICALLY from record content
+                // alone — earlier `created_at` wins, ties broken by
+                // lexicographically smaller `id` — never from "which side
+                // happens to already be resident locally". That means two
+                // nodes merging the same colliding pair independently reach
+                // the IDENTICAL decision without a coordinator. Whichever
+                // side turns out to be the loser (the already-resident local
+                // record, or the freshly-incoming one) is re-homed via
+                // `deterministic_reassign_offset`, a pure function of the
+                // loser's own `id` + this node's partition + current data,
+                // so both nodes also compute the SAME reassigned IP for the
+                // loser in the common one-collision case (a rarer multi-way
+                // conflict may need an extra sync round to fully settle, but
+                // never drops a client). The winner's vpn_ip is never
+                // touched by this branch on either node — that is what keeps
+                // its already-issued connection key valid (no churn).
+                if let Some(conflict_idx) = data
                     .clients
                     .iter()
-                    .any(|c| c.vpn_ip == inc.vpn_ip && c.id != inc.id && !c.deleted);
-                if ip_conflict {
-                    // Each node allocates VPN IPs locally from the same base
-                    // (10.x.0.2…), so clients added INDEPENDENTLY on two pool
-                    // nodes get identical IPs. Silently dropping the incoming
-                    // one (the old behavior) left credentials un-synced forever.
-                    // Instead re-home it onto a free local IP: the credential
-                    // (id + PSK) still propagates, only the local routing IP
-                    // differs per node — which is fine, each node routes it
-                    // locally. The reassignment stays local (the existing-client
-                    // merge branch never overwrites vpn_ip), so it doesn't churn.
-                    match self.allocate_vpn_ip(&mut data).ok() {
-                        Some(free_ip) => {
-                            warn!(
-                                "merge_from_json: client '{}' vpn_ip {} conflicts locally — re-homed to {}",
-                                inc.id, inc.vpn_ip, free_ip
-                            );
-                            inc.vpn_ip = free_ip;
+                    .position(|c| c.vpn_ip == inc.vpn_ip && c.id != inc.id && !c.deleted)
+                {
+                    let incoming_wins =
+                        match inc.created_at.cmp(&data.clients[conflict_idx].created_at) {
+                            std::cmp::Ordering::Less => true,
+                            std::cmp::Ordering::Greater => false,
+                            std::cmp::Ordering::Equal => inc.id < data.clients[conflict_idx].id,
+                        };
+                    if incoming_wins {
+                        // The already-resident local record loses: re-home
+                        // IT in place; the incoming (winning) record keeps
+                        // its vpn_ip unchanged when pushed below.
+                        let loser_id = data.clients[conflict_idx].id.clone();
+                        match self.deterministic_reassign_offset(&loser_id, &data) {
+                            Some(new_ip) => {
+                                warn!(
+                                    "merge_from_json: incoming client '{}' (created {}) beats locally-resident '{}' (created {}) for vpn_ip {} — re-homed loser to {}",
+                                    inc.id,
+                                    inc.created_at,
+                                    loser_id,
+                                    data.clients[conflict_idx].created_at,
+                                    inc.vpn_ip,
+                                    new_ip
+                                );
+                                // Deliberately does NOT touch `updated_at`
+                                // (or any other LWW-governed field): this is
+                                // a routing-layer vpn_ip fix-up, not a
+                                // content change, and must produce a
+                                // byte-identical record to the one the OTHER
+                                // node computes for the same loser via the
+                                // `else` branch below (which also leaves
+                                // `updated_at` alone) — touching it here
+                                // only would make the two sides' converged
+                                // records diverge on `updated_at` even
+                                // though their `vpn_ip` correctly converged.
+                                data.clients[conflict_idx].vpn_ip = new_ip;
+                            }
+                            None => {
+                                warn!(
+                                    "merge_from_json: client '{}' vpn_ip {} conflicts with locally-resident '{}' and no free IP to re-home the loser — dropping incoming",
+                                    inc.id, inc.vpn_ip, loser_id
+                                );
+                                continue;
+                            }
                         }
-                        None => {
-                            warn!(
-                                "merge_from_json: skipping client '{}' — vpn_ip {} conflicts and no free IP to re-home",
-                                inc.id, inc.vpn_ip
-                            );
-                            continue;
+                    } else {
+                        // The incoming record loses: re-home it before
+                        // insertion, leaving the winning local record
+                        // untouched.
+                        match self.deterministic_reassign_offset(&inc.id, &data) {
+                            Some(new_ip) => {
+                                warn!(
+                                    "merge_from_json: client '{}' vpn_ip {} conflicts locally — re-homed to {}",
+                                    inc.id, inc.vpn_ip, new_ip
+                                );
+                                inc.vpn_ip = new_ip;
+                            }
+                            None => {
+                                warn!(
+                                    "merge_from_json: skipping client '{}' — vpn_ip {} conflicts and no free IP to re-home",
+                                    inc.id, inc.vpn_ip
+                                );
+                                continue;
+                            }
                         }
                     }
                 }
@@ -1183,6 +1349,9 @@ impl ClientDatabase {
                 return Err(Error::Session("Client name must not be empty".into()));
             }
         }
+        if let Some(Some(ref addr)) = params.exit_node {
+            validate_exit_node_addr(addr)?;
+        }
         let mut data = self.data.write();
         if let Some(ref new_name) = params.name {
             if data
@@ -1231,6 +1400,9 @@ impl ClientDatabase {
         if let Some(role) = params.role {
             client.role = role;
         }
+        if let Some(exit_node) = params.exit_node {
+            client.exit_node = exit_node;
+        }
         client.updated_at = Some(Utc::now());
         let updated = client.clone();
         drop(data);
@@ -1256,6 +1428,21 @@ impl ClientDatabase {
         }
     }
 
+    /// Allocate the next free VPN IP. When this node has a hard partition
+    /// set (`set_node_partition` / `set_node_partition_explicit`), candidates
+    /// are confined to `[start_offset, end_offset)` of that partition — an
+    /// independent add on a DIFFERENT node's partition can never collide
+    /// with one made here, which is the whole point of Wave B-IP (see the
+    /// module-level `set_node_partition` doc for the full rationale). With
+    /// no partition set (single-node / legacy deployments) this allocates
+    /// across the whole subnet exactly as before.
+    ///
+    /// Existing clients keep whatever IP they were originally given
+    /// regardless of partition bounds — partitioning governs only NEW
+    /// allocations. The pool-wide `already_used` check (which ignores
+    /// tombstones — see the comment below) still scans the *entire* client
+    /// list, not just the partition, so an IP synced in from any other node
+    /// is never handed out twice.
     fn allocate_vpn_ip(&self, data: &mut ClientDbFile) -> Result<Ipv4Addr> {
         let max_host_offset = self.network_config.max_host_offset();
         if max_host_offset < 1 {
@@ -1264,13 +1451,32 @@ impl ClientDatabase {
             ));
         }
 
-        let mut candidate_offset = if data.next_host_offset == 0 {
-            default_next_host_offset()
+        let partition = *self.partition.read();
+        let (range_start, range_end) = match partition {
+            Some(p) => (p.start_offset, p.end_offset),
+            None => (1, max_host_offset + 1),
+        };
+        if range_start >= range_end {
+            // Degenerate/misconfigured partition (shouldn't happen —
+            // `compute_partition_bounds` always produces start < end when
+            // called with num_partitions >= 1 and max_host_offset >= 2 —
+            // but fail closed rather than looping forever or spilling out
+            // of bounds).
+            return Err(Error::Session(
+                "node IP partition exhausted; increase subnet size or partition capacity".into(),
+            ));
+        }
+        let range_len = range_end - range_start;
+
+        let mut candidate_offset = if data.next_host_offset == 0
+            || !(range_start..range_end).contains(&data.next_host_offset)
+        {
+            range_start
         } else {
             data.next_host_offset
         };
 
-        for _ in 0..max_host_offset {
+        for _ in 0..range_len {
             if let Some(candidate_ip) = self.network_config.ip_for_host_offset(candidate_offset) {
                 // Tombstoned (revoked) clients don't hold their VPN IP:
                 // counting them would permanently leak one address per
@@ -1284,8 +1490,8 @@ impl ClientDatabase {
                     .iter()
                     .any(|client| client.vpn_ip == candidate_ip && !client.deleted);
                 if candidate_ip != self.network_config.server_vpn_ip && !already_used {
-                    data.next_host_offset = if candidate_offset >= max_host_offset {
-                        1
+                    data.next_host_offset = if candidate_offset + 1 >= range_end {
+                        range_start
                     } else {
                         candidate_offset + 1
                     };
@@ -1293,57 +1499,240 @@ impl ClientDatabase {
                 }
             }
 
-            candidate_offset = if candidate_offset >= max_host_offset {
-                1
+            candidate_offset = if candidate_offset + 1 >= range_end {
+                range_start
             } else {
                 candidate_offset + 1
             };
         }
 
-        Err(Error::Session(
-            "No more VPN IPs available in configured subnet".into(),
-        ))
+        if partition.is_some() {
+            // Deliberately does NOT fall back to the whole subnet — spilling
+            // into another node's partition would reintroduce exactly the
+            // collision this feature exists to prevent. The operator must
+            // grow the subnet or rebalance partition capacity instead.
+            Err(Error::Session(format!(
+                "node IP partition exhausted (offsets {}..{} of subnet); increase subnet size or partition capacity",
+                range_start,
+                range_end - 1
+            )))
+        } else {
+            Err(Error::Session(
+                "No more VPN IPs available in configured subnet".into(),
+            ))
+        }
     }
 
-    /// 2b: pool-wide VPN-IP coordination. Every freshly-bootstrapped node's
-    /// allocator started counting from the same hardcoded offset
-    /// (`default_next_host_offset() == 2`, i.e. `x.x.0.2`), so two pool nodes
-    /// independently adding their first client — the common case: two admins
-    /// provisioning different nodes' web panels around the same time, before
-    /// any pool_sync round has run — always handed out the identical vpn_ip
-    /// and collided. Deterministically partitioning each node's starting
-    /// offset by a hash of its (unique, operator-assigned) `pool.node_id`
-    /// spreads independent nodes across the address space so their
-    /// allocators start at different points and stop colliding on the very
-    /// first client. This is a best-effort spread, not a hard partition —
-    /// hash collisions or more nodes than spread room are still possible —
-    /// so `merge_from_json`'s re-home-on-conflict path (see its `ip_conflict`
-    /// branch) remains the correctness backstop that guarantees no client is
-    /// ever silently dropped even if two nodes do land on the same offset.
-    ///
-    /// Only nudges a database that has never allocated anything yet (empty
-    /// client list AND counter still at the unmodified default): an
-    /// already-populated node's counter must never move, since jumping it
-    /// forward or backward could hand out an offset this node itself already
-    /// gave to an earlier client, or skip over free ones. Safe to call once
-    /// at startup, unconditionally, whether or not pool sync is configured
-    /// (a `None` `node_id` is simply skipped by the caller).
-    pub fn set_node_partition(&self, node_id: &str) {
+    /// Target number of pool nodes the default partition sizing aims to
+    /// support. Chosen as a sensible default for this project's typical
+    /// pool sizes (a handful of nodes, not hundreds) — see `default_num_partitions`.
+    const TARGET_NUM_PARTITIONS: u32 = 8;
+    /// Floor on `partition_size` (offsets per node) — below this,
+    /// partitioning stops being useful (a node could exhaust its slice after
+    /// a handful of clients), so small subnets shrink `num_partitions`
+    /// instead of shrinking below this floor.
+    const MIN_PARTITION_SIZE: u32 = 8;
+    /// Ceiling on `partition_size` — keeps a single node from hogging an
+    /// oversized chunk of a very large subnet, leaving room for more nodes
+    /// to join the pool later without reconfiguring existing ones.
+    const MAX_PARTITION_SIZE: u32 = 254;
+
+    /// Compute this deployment's default number of partitions from the
+    /// configured subnet size. Aims for `TARGET_NUM_PARTITIONS` (8) nodes,
+    /// each capped at `MAX_PARTITION_SIZE` (254) clients — e.g. on a /16
+    /// (`max_host_offset` ~65534) this yields partition_size=254 and
+    /// ~258 possible partitions (room for far more than 8 nodes, each
+    /// capped at 254 clients, matching a "big subnet -> generous per-node
+    /// cap" target). On the project's default /24 (`max_host_offset` =
+    /// 254) it yields partition_size=31 and 8 partitions (8 nodes x ~31
+    /// clients each). On a subnet too small to give every one of the 8
+    /// target partitions at least `MIN_PARTITION_SIZE` (8) offsets, this
+    /// shrinks below 8 partitions (down to 1 = "no partitioning") rather
+    /// than handing out partitions too small to be useful.
+    fn default_num_partitions(&self) -> u32 {
         let max_host_offset = self.network_config.max_host_offset();
-        // Need at least offsets {1, 2} to have any room to spread into.
         if max_host_offset < 2 {
+            return 1;
+        }
+        let partition_size = (max_host_offset / Self::TARGET_NUM_PARTITIONS)
+            .clamp(Self::MIN_PARTITION_SIZE, Self::MAX_PARTITION_SIZE);
+        (max_host_offset / partition_size).max(1)
+    }
+
+    /// 2b/Wave B-IP: pool-wide VPN-IP coordination via HARD per-node
+    /// partitioning. Every pool node is confined to a disjoint, contiguous
+    /// slice of the subnet's host offsets (see `compute_partition_bounds`);
+    /// `allocate_vpn_ip` only ever hands out offsets from THIS node's slice.
+    /// Two admins independently adding a client on two different pool
+    /// nodes — the common case this exists to fix: e.g. provisioning two
+    /// nodes' web panels around the same time, before any pool_sync round
+    /// has run — therefore CANNOT collide anymore (previously, both nodes'
+    /// allocators counted from the same/overlapping range and handed out
+    /// the identical vpn_ip). This also eliminates the connection-key churn
+    /// the old best-effort start-offset nudge could still cause: a client's
+    /// vpn_ip (embedded in its issued connection key) is never silently
+    /// reassigned by a later pool_sync round just because its node's
+    /// counter walked into another node's territory.
+    ///
+    /// The partition index is `hash(node_id) % num_partitions` — a stable,
+    /// deterministic, non-cryptographic hash (`fnv1a_hash`) of the operator-
+    /// assigned `pool.node_id`, so unrelated nodes are very likely (but,
+    /// with enough nodes, not provably) spread across disjoint partitions.
+    /// Operators who want to rule out even a hash collision (or who are
+    /// running more nodes than fit `default_num_partitions`) can instead
+    /// pin an explicit index via `set_node_partition_explicit` (wired from
+    /// `pool.node_ip_partition` in server config).
+    ///
+    /// `merge_from_json`'s deterministic re-home path (`ip_conflict` branch)
+    /// remains the correctness backstop for the two residual/legacy cases
+    /// this hard partition does not by itself prevent: (a) a genuine hash
+    /// collision between two nodes' `node_id`s, or an explicit-override
+    /// misconfiguration onto the same index, and (b) clients that predate
+    /// partitioning (allocated back when every node shared the whole
+    /// subnet). It never fires for the common case of two nodes in
+    /// DIFFERENT partitions.
+    ///
+    /// Idempotent and safe to call once at startup, unconditionally, whether
+    /// or not pool sync is configured (a `None` `node_id` is simply skipped
+    /// by the caller) — a database with `max_host_offset < 2` or a
+    /// `default_num_partitions() <= 1` (subnet too small to partition
+    /// meaningfully) leaves `self.partition` at `None`, reproducing
+    /// whole-subnet legacy behavior exactly.
+    pub fn set_node_partition(&self, node_id: &str) {
+        let num_partitions = self.default_num_partitions();
+        if num_partitions <= 1 {
             return;
         }
-        let mut data = self.data.write();
-        if !data.clients.is_empty() || data.next_host_offset != default_next_host_offset() {
+        let index = (fnv1a_hash(node_id.as_bytes()) % num_partitions as u64) as u32;
+        self.apply_partition(index, num_partitions, false);
+    }
+
+    /// Explicit-override form of `set_node_partition`: the operator pins
+    /// this node's partition `index` directly (from `pool.node_ip_partition`
+    /// in server config) instead of deriving it from a hash of `node_id`,
+    /// eliminating even the small residual risk of a hash collision between
+    /// two nodes. `num_partitions` defaults to `default_num_partitions()`
+    /// when `None`, matching `set_node_partition`'s sizing; pass `Some(n)`
+    /// to also override the total partition count (e.g. to shrink per-node
+    /// capacity on a larger pool than the default target supports).
+    /// `index` is taken modulo the resolved `num_partitions`, so any value
+    /// (e.g. a simple incrementing counter across nodes: 0, 1, 2, …) is safe
+    /// to pass without the operator needing to know the exact partition
+    /// count.
+    pub fn set_node_partition_explicit(&self, index: u32, num_partitions: Option<u32>) {
+        let num_partitions = num_partitions.unwrap_or_else(|| self.default_num_partitions());
+        if num_partitions <= 1 {
             return;
         }
-        let seed = fnv1a_hash(node_id.as_bytes());
-        // Offsets are valid in 1..=max_host_offset (offset 0 means
-        // "unset" — see `ip_for_host_offset`); offset 1 is normally the
-        // server's own IP, which `allocate_vpn_ip` already skips over on its
-        // first iteration, so including it in the spread is harmless.
-        data.next_host_offset = 1 + (seed % max_host_offset as u64) as u32;
+        self.apply_partition(index % num_partitions, num_partitions, true);
+    }
+
+    fn apply_partition(&self, index: u32, num_partitions: u32, explicit: bool) {
+        let max_host_offset = self.network_config.max_host_offset();
+        if max_host_offset < 2 || num_partitions <= 1 {
+            return;
+        }
+        let bounds = compute_partition_bounds(max_host_offset, num_partitions, index, explicit);
+        *self.partition.write() = Some(bounds);
+    }
+
+    /// This node's active VPN-IP partition assignment, if pool sync is
+    /// configured and the subnet is large enough to partition — `None`
+    /// otherwise (single-node / legacy / too-small-subnet deployments).
+    /// Wave B-IP.2: lets a pool peer announce this over
+    /// `ControlPayload::PartitionAnnounce` for operator overlap/mismatch
+    /// visibility — see `crate::pool_partition::check_partition`.
+    pub fn partition_info(&self) -> Option<PartitionInfo> {
+        let bounds = *self.partition.read();
+        bounds.map(|b| PartitionInfo {
+            partition_index: b.index,
+            partition_size: b.end_offset.saturating_sub(b.start_offset),
+            num_partitions: b.num_partitions,
+            explicit: b.explicit,
+        })
+    }
+
+    /// Deterministic re-home target for `merge_from_json`'s IP-conflict
+    /// backstop: derives a candidate offset purely from `client_id` (via
+    /// `fnv1a_hash`), confined to this node's active partition when one is
+    /// set (else the whole subnet), then linearly probes from there for the
+    /// first offset not already held by a live (non-tombstoned) client in
+    /// `data`. Being a pure function of `client_id` + this node's partition
+    /// bounds + `data`'s current contents — never of mutable allocator
+    /// state like `next_host_offset` — is what lets two independent nodes
+    /// reach the SAME reassignment for the SAME losing client without a
+    /// coordinator: see `merge_from_json`'s `ip_conflict` branch for the
+    /// full convergence argument.
+    fn deterministic_reassign_offset(
+        &self,
+        client_id: &str,
+        data: &ClientDbFile,
+    ) -> Option<Ipv4Addr> {
+        let max_host_offset = self.network_config.max_host_offset();
+        if max_host_offset < 1 {
+            return None;
+        }
+        let partition = *self.partition.read();
+        let (range_start, range_end) = match partition {
+            Some(p) => (p.start_offset, p.end_offset),
+            None => (1, max_host_offset + 1),
+        };
+        if range_start >= range_end {
+            return None;
+        }
+        let range_len = range_end - range_start;
+
+        let seed = fnv1a_hash(client_id.as_bytes());
+        let mut offset = range_start + (seed % range_len as u64) as u32;
+        for _ in 0..range_len {
+            if let Some(candidate_ip) = self.network_config.ip_for_host_offset(offset) {
+                let already_used = data
+                    .clients
+                    .iter()
+                    .any(|c| c.vpn_ip == candidate_ip && !c.deleted);
+                if candidate_ip != self.network_config.server_vpn_ip && !already_used {
+                    return Some(candidate_ip);
+                }
+            }
+            offset = if offset + 1 >= range_end {
+                range_start
+            } else {
+                offset + 1
+            };
+        }
+        None
+    }
+}
+
+/// Compute the contiguous, disjoint `[start_offset, end_offset)` slice of
+/// host offsets `1..=max_host_offset` owned by partition `index` out of
+/// `num_partitions` total, evenly dividing `max_host_offset` by
+/// `num_partitions` and folding the remainder into the LAST partition (so
+/// every offset in `1..=max_host_offset` belongs to exactly one partition,
+/// with no gaps and no overlap). `index` is NOT taken modulo
+/// `num_partitions` here — callers must do that themselves (both current
+/// callers do).
+fn compute_partition_bounds(
+    max_host_offset: u32,
+    num_partitions: u32,
+    index: u32,
+    explicit: bool,
+) -> PartitionBounds {
+    debug_assert!(num_partitions >= 1);
+    debug_assert!(index < num_partitions);
+    let partition_size = (max_host_offset / num_partitions).max(1);
+    let start_offset = (1 + index.saturating_mul(partition_size)).min(max_host_offset);
+    let end_offset = if index + 1 >= num_partitions {
+        max_host_offset + 1
+    } else {
+        (start_offset + partition_size).min(max_host_offset + 1)
+    };
+    PartitionBounds {
+        start_offset,
+        end_offset,
+        index,
+        num_partitions,
+        explicit,
     }
 }
 
@@ -1717,56 +2106,297 @@ mod tests {
         }
     }
 
-    /// 2b: distinct pool `node_id`s must (in the common case) seed different
-    /// VPN-IP allocation starting offsets, so two freshly-bootstrapped nodes
-    /// stop handing out the same "first" IP to independently added clients.
+    /// Wave B-IP: distinct pool `node_id`s must land in DIFFERENT hard
+    /// partitions (the common case), and clients added INDEPENDENTLY on the
+    /// two nodes must never collide on vpn_ip — no coordinator, no lucky
+    /// timing required. Also verifies a full bidirectional merge afterward
+    /// converges with 0 collisions, 0 dropped clients, and — critically —
+    /// no client's vpn_ip ever changes (the hard partition means the
+    /// deterministic re-home backstop never has to fire for this case,
+    /// which is exactly what prevents connection-key churn).
     #[test]
-    fn set_node_partition_spreads_distinct_node_ids_and_is_idempotent_once_populated() {
+    fn distinct_node_ids_get_disjoint_partitions_and_never_collide() {
         let dir = tempfile::tempdir().unwrap();
         let db_a = ClientDatabase::load(&dir.path().join("a.json"), test_network_config()).unwrap();
         let db_b = ClientDatabase::load(&dir.path().join("b.json"), test_network_config()).unwrap();
 
-        db_a.set_node_partition("node-alpha");
-        db_b.set_node_partition("node-beta");
-
-        let offset_a = db_a.data.read().next_host_offset;
-        let offset_b = db_b.data.read().next_host_offset;
-        assert_ne!(
-            offset_a, offset_b,
-            "distinct node_ids should (in the common case) seed distinct \
-             starting offsets — this specific pair is a fixed, checked-in \
-             regression fixture, not a probabilistic flake"
-        );
-
-        // Both offsets must be in the valid allocatable range.
-        let max = test_network_config().max_host_offset();
-        assert!(offset_a >= 1 && offset_a <= max);
-        assert!(offset_b >= 1 && offset_b <= max);
-
-        // A client added after the seed lands on the seeded offset, not the
-        // old hardcoded default.
-        let client_a = db_a.add_client("first-on-a").unwrap();
-        let expected_ip = test_network_config()
-            .ip_for_host_offset(offset_a)
-            .or_else(|| test_network_config().ip_for_host_offset(offset_a + 1))
-            .unwrap();
-        // allocate_vpn_ip skips the server's own IP, so the assigned IP is
-        // either exactly the seeded offset or the next one.
+        let num_partitions = db_a.default_num_partitions();
         assert!(
-            client_a.vpn_ip == test_network_config().ip_for_host_offset(offset_a).unwrap()
-                || client_a.vpn_ip == expected_ip,
-            "first client must be allocated from the seeded offset, not the old default"
+            num_partitions > 1,
+            "test config must yield >1 partitions for this test to be meaningful"
+        );
+        let index_of = |id: &str| (fnv1a_hash(id.as_bytes()) % num_partitions as u64) as u32;
+        let node_a = "node-alpha";
+        let node_b = [
+            "node-beta",
+            "node-gamma",
+            "node-delta",
+            "node-epsilon",
+            "node-zeta",
+        ]
+        .into_iter()
+        .find(|c| index_of(c) != index_of(node_a))
+        .expect("fixture must yield a node_id landing in a different partition");
+
+        db_a.set_node_partition(node_a);
+        db_b.set_node_partition(node_b);
+
+        let clients_a: Vec<_> = (0..5)
+            .map(|i| db_a.add_client(&format!("a-client-{i}")).unwrap())
+            .collect();
+        let clients_b: Vec<_> = (0..5)
+            .map(|i| db_b.add_client(&format!("b-client-{i}")).unwrap())
+            .collect();
+
+        for ca in &clients_a {
+            for cb in &clients_b {
+                assert_ne!(
+                    ca.vpn_ip, cb.vpn_ip,
+                    "independently-allocated IPs on different partitions must never collide"
+                );
+            }
+        }
+
+        let original_a_ips: std::collections::HashMap<String, Ipv4Addr> =
+            clients_a.iter().map(|c| (c.id.clone(), c.vpn_ip)).collect();
+        let original_b_ips: std::collections::HashMap<String, Ipv4Addr> =
+            clients_b.iter().map(|c| (c.id.clone(), c.vpn_ip)).collect();
+
+        // Bidirectional merge.
+        let json_a = db_a.export_json().unwrap();
+        let json_b = db_b.export_json().unwrap();
+        let merged_into_b = db_b.merge_from_json(&json_a).unwrap();
+        let merged_into_a = db_a.merge_from_json(&json_b).unwrap();
+
+        assert_eq!(
+            merged_into_b,
+            clients_a.len(),
+            "0 dropped clients merging A's clients into B"
+        );
+        assert_eq!(
+            merged_into_a,
+            clients_b.len(),
+            "0 dropped clients merging B's clients into A"
         );
 
-        // Idempotency / safety: once a database is populated, re-seeding
-        // must be a no-op — it must never move an already-active counter.
-        let offset_a_after_first_client = db_a.data.read().next_host_offset;
-        db_a.set_node_partition("some-other-node-id");
+        // No client's vpn_ip changed anywhere — no re-home ever fired.
+        for c in &clients_a {
+            assert_eq!(
+                db_a.find_by_id(&c.id).unwrap().vpn_ip,
+                original_a_ips[&c.id]
+            );
+            assert_eq!(
+                db_b.find_by_id(&c.id).unwrap().vpn_ip,
+                original_a_ips[&c.id]
+            );
+        }
+        for c in &clients_b {
+            assert_eq!(
+                db_b.find_by_id(&c.id).unwrap().vpn_ip,
+                original_b_ips[&c.id]
+            );
+            assert_eq!(
+                db_a.find_by_id(&c.id).unwrap().vpn_ip,
+                original_b_ips[&c.id]
+            );
+        }
+
+        // Pool-wide: still 0 collisions after both merges converge.
+        for db in [&db_a, &db_b] {
+            let all = db.list_clients();
+            for x in &all {
+                for y in &all {
+                    if x.id != y.id {
+                        assert_ne!(x.vpn_ip, y.vpn_ip, "no collision after merge convergence");
+                    }
+                }
+            }
+        }
+    }
+
+    /// Wave B-IP: when two nodes are (mis)configured onto the SAME explicit
+    /// partition index — the forced-collision backstop case, e.g. a
+    /// `node_ip_partition` typo, or a `node_id` hash collision on the
+    /// unforced path — independent adds CAN still collide. Merging must then
+    /// deterministically re-home the loser and both nodes must converge to
+    /// the IDENTICAL final assignment without a coordinator: the winner
+    /// (earlier `created_at`) keeps its original vpn_ip unchanged on BOTH
+    /// nodes, and the loser lands on the SAME reassigned vpn_ip on BOTH
+    /// nodes. Zero clients dropped.
+    #[test]
+    fn same_partition_forced_collision_converges_deterministically() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_a = ClientDatabase::load(&dir.path().join("a.json"), test_network_config()).unwrap();
+        let db_b = ClientDatabase::load(&dir.path().join("b.json"), test_network_config()).unwrap();
+
+        let num_partitions = db_a.default_num_partitions();
+        assert!(num_partitions > 1);
+        // Forced onto the SAME partition index on both nodes — this is the
+        // scenario the deterministic re-home backstop exists for.
+        db_a.set_node_partition_explicit(0, Some(num_partitions));
+        db_b.set_node_partition_explicit(0, Some(num_partitions));
+
+        // Both nodes' allocators start at the same offset within the shared
+        // partition, so their first independently-added client collides —
+        // exactly the pre-hard-partition bug, reproduced deliberately here.
+        let x = db_a.add_client("x-on-a").unwrap();
+        let y = db_b.add_client("y-on-b").unwrap();
         assert_eq!(
-            db_a.data.read().next_host_offset,
-            offset_a_after_first_client,
-            "set_node_partition must not touch an already-populated database's counter"
+            x.vpn_ip, y.vpn_ip,
+            "test setup: same explicit partition on both nodes must force a collision"
         );
+
+        // Winner is whichever has the earlier created_at; x was created
+        // first in this test, so x must win on both sides.
+        let json_a = db_a.export_json().unwrap();
+        let json_b = db_b.export_json().unwrap();
+        let merged_into_b = db_b.merge_from_json(&json_a).unwrap();
+        let merged_into_a = db_a.merge_from_json(&json_b).unwrap();
+        assert_eq!(
+            merged_into_b, 1,
+            "colliding client must still merge into B, not be dropped"
+        );
+        assert_eq!(
+            merged_into_a, 1,
+            "colliding client must still merge into A, not be dropped"
+        );
+
+        let x_on_a = db_a.find_by_id(&x.id).unwrap();
+        let x_on_b = db_b.find_by_id(&x.id).unwrap();
+        let y_on_a = db_a.find_by_id(&y.id).unwrap();
+        let y_on_b = db_b.find_by_id(&y.id).unwrap();
+
+        assert_eq!(
+            x_on_a.vpn_ip, x.vpn_ip,
+            "winner x must keep its original vpn_ip on its home node A"
+        );
+        assert_eq!(
+            x_on_b.vpn_ip, x.vpn_ip,
+            "winner x must keep the IDENTICAL vpn_ip on node B — no churn"
+        );
+        assert_ne!(
+            y_on_a.vpn_ip, x.vpn_ip,
+            "loser y must be re-homed off the winner's vpn_ip"
+        );
+        assert_eq!(
+            y_on_a.vpn_ip, y_on_b.vpn_ip,
+            "both nodes must converge to the IDENTICAL reassigned vpn_ip for the loser"
+        );
+    }
+
+    /// Wave B-IP: a node confined to a hard partition must return a clear,
+    /// typed error when that partition is full — never silently spill into
+    /// another node's territory (that would reintroduce the exact collision
+    /// class this feature exists to prevent), and never panic.
+    #[test]
+    fn partition_exhaustion_returns_clear_error_not_spill() {
+        let dir = tempfile::tempdir().unwrap();
+        let db =
+            ClientDatabase::load(&dir.path().join("clients.json"), test_network_config()).unwrap();
+
+        // Explicit override with num_partitions == max_host_offset gives
+        // each partition exactly 1 usable offset. Index 1 avoids index 0,
+        // whose single offset coincides with the server's own VPN IP.
+        let max = test_network_config().max_host_offset();
+        db.set_node_partition_explicit(1, Some(max));
+
+        let first = db.add_client("only-slot").unwrap();
+        let expected_ip = test_network_config().ip_for_host_offset(2).unwrap();
+        assert_eq!(
+            first.vpn_ip, expected_ip,
+            "test setup: partition 1 must be exactly offset 2"
+        );
+
+        let err = db
+            .add_client("no-room")
+            .expect_err("a second client must fail once the 1-offset partition is full");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("partition"),
+            "error must clearly describe partition exhaustion, got: {msg}"
+        );
+
+        // No spill: the only live client is still exactly at the partition's
+        // single offset.
+        assert_eq!(db.list_clients().len(), 1);
+    }
+
+    /// Wave B-IP regression: with no partition configured (single-node /
+    /// legacy deployments, `set_node_partition` never called), allocation
+    /// must still range across the WHOLE subnet exactly as before — no
+    /// artificial ceiling introduced by the partitioning feature.
+    #[test]
+    fn no_partition_set_allocates_across_whole_subnet() {
+        let dir = tempfile::tempdir().unwrap();
+        let db =
+            ClientDatabase::load(&dir.path().join("clients.json"), test_network_config()).unwrap();
+
+        let partition_size_if_it_were_set = {
+            let np = db.default_num_partitions();
+            test_network_config().max_host_offset() / np
+        };
+        // Allocate more clients than a single partition would hold, proving
+        // this un-partitioned node draws from the whole subnet, not some
+        // partition-sized slice.
+        let n = partition_size_if_it_were_set + 5;
+        let clients: Vec<_> = (0..n)
+            .map(|i| db.add_client(&format!("client-{i}")).unwrap())
+            .collect();
+        assert_eq!(clients.len(), n as usize);
+        let unique_ips: std::collections::HashSet<_> = clients.iter().map(|c| c.vpn_ip).collect();
+        assert_eq!(
+            unique_ips.len(),
+            n as usize,
+            "all allocated IPs must be distinct"
+        );
+    }
+
+    /// Wave B-IP: a client that was allocated an IP BEFORE this node had a
+    /// partition configured (or synced in from a peer, from outside this
+    /// node's partition entirely) must keep that IP unchanged forever —
+    /// partitioning governs only NEW allocations, never rewrites existing
+    /// ones. New allocations after the partition is applied must fall
+    /// within the partition's bounds.
+    #[test]
+    fn existing_out_of_partition_client_keeps_ip_new_allocations_use_partition() {
+        let dir = tempfile::tempdir().unwrap();
+        let db =
+            ClientDatabase::load(&dir.path().join("clients.json"), test_network_config()).unwrap();
+
+        // Added before any partition is configured — drawn from the whole
+        // subnet's default starting offset.
+        let legacy = db.add_client("legacy-client").unwrap();
+
+        // Now confine this node to a partition that deliberately EXCLUDES
+        // the legacy client's offset, to make the "keeps its IP" assertion
+        // meaningful rather than incidental.
+        let num_partitions = db.default_num_partitions();
+        assert!(num_partitions > 1);
+        let legacy_offset = test_network_config().host_offset(legacy.vpn_ip);
+        let excluding_index = (0..num_partitions)
+            .find(|&idx| {
+                let bounds_start =
+                    1 + idx * (test_network_config().max_host_offset() / num_partitions);
+                bounds_start > legacy_offset
+            })
+            .expect("fixture must have a partition strictly after the legacy client's offset");
+        db.set_node_partition_explicit(excluding_index, Some(num_partitions));
+
+        // Legacy client is untouched.
+        assert_eq!(db.find_by_id(&legacy.id).unwrap().vpn_ip, legacy.vpn_ip);
+
+        // A fresh allocation now falls inside the configured partition,
+        // strictly after the legacy client's out-of-partition offset.
+        let fresh = db.add_client("fresh-client").unwrap();
+        let fresh_offset = test_network_config().host_offset(fresh.vpn_ip);
+        assert!(
+            fresh_offset > legacy_offset,
+            "new allocation ({fresh_offset}) must fall within the partition, \
+             which starts strictly after the legacy client's offset ({legacy_offset})"
+        );
+
+        // Legacy client still untouched after the new allocation too.
+        assert_eq!(db.find_by_id(&legacy.id).unwrap().vpn_ip, legacy.vpn_ip);
     }
 
     #[test]
@@ -2199,6 +2829,7 @@ mod tests {
             updated_at: Some(Utc::now()),
             deleted: false,
             role: ClientRole::User,
+            exit_node: None,
         };
         let merged = daemon
             .merge_from_json(&serde_json::to_string(&vec![peer_client]).unwrap())
@@ -2264,6 +2895,7 @@ mod tests {
             updated_at: Some(Utc::now()),
             deleted: false,
             role: ClientRole::User,
+            exit_node: None,
         };
 
         let merged = db
@@ -2415,6 +3047,7 @@ mod tests {
             updated_at: Some(client.created_at), // older than the tombstone's updated_at
             deleted: false,
             role: ClientRole::Admin,
+            exit_node: None,
         };
         let merged = db
             .merge_from_json(&serde_json::to_string(&vec![stale_peer_copy]).unwrap())
@@ -2480,5 +3113,221 @@ mod tests {
         )
         .unwrap();
         assert_eq!(db.find_by_id(&client.id).unwrap().role, ClientRole::Admin);
+    }
+
+    // --- Wave B2a: per-client exit_node config layer -------------------
+
+    #[test]
+    fn client_config_exit_node_defaults_to_none_and_roundtrips() {
+        // Absent in the wire JSON (older/pre-B2a record) must default to None.
+        let json = r#"{"id":"a","name":"n","psk":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=","vpn_ip":"10.0.0.2","enabled":true,"created_at":"2026-01-01T00:00:00Z","stats":{"bytes_in":0,"bytes_out":0,"total_connections":0}}"#;
+        let c: ClientConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(c.exit_node, None);
+
+        let c2 = ClientConfig {
+            exit_node: Some("exit.example.com:51820".to_string()),
+            ..c.clone()
+        };
+        let s = serde_json::to_string(&c2).unwrap();
+        assert!(
+            s.contains("exit_node"),
+            "a set exit_node must be present in the serialized JSON"
+        );
+        let back: ClientConfig = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.exit_node, Some("exit.example.com:51820".to_string()));
+
+        // None must be omitted entirely (skip_serializing_if), same
+        // backward-compat contract as `role`/`qos`/`device_pubkey`.
+        let s_none = serde_json::to_string(&c).unwrap();
+        assert!(
+            !s_none.contains("exit_node"),
+            "an unset exit_node must not appear in the serialized JSON"
+        );
+    }
+
+    #[test]
+    fn update_client_sets_and_clears_exit_node_double_option() {
+        let dir = tempfile::tempdir().unwrap();
+        let db =
+            ClientDatabase::load(&dir.path().join("clients.json"), test_network_config()).unwrap();
+        let client = db.add_client("exit-node-client").unwrap();
+        assert_eq!(client.exit_node, None);
+
+        // None (leave unchanged) — a no-op update must not touch exit_node.
+        db.update_client(
+            &client.id,
+            UpdateClientParams {
+                name: Some("exit-node-client".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(db.find_by_id(&client.id).unwrap().exit_node, None);
+
+        // Some(Some(addr)) — set.
+        let updated = db
+            .update_client(
+                &client.id,
+                UpdateClientParams {
+                    exit_node: Some(Some("10.0.9.9:51820".to_string())),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(updated.exit_node, Some("10.0.9.9:51820".to_string()));
+        assert_eq!(
+            db.find_by_id(&client.id).unwrap().exit_node,
+            Some("10.0.9.9:51820".to_string())
+        );
+
+        // Some(None) — clear.
+        let cleared = db
+            .update_client(
+                &client.id,
+                UpdateClientParams {
+                    exit_node: Some(None),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(cleared.exit_node, None);
+        assert_eq!(db.find_by_id(&client.id).unwrap().exit_node, None);
+    }
+
+    #[test]
+    fn update_client_rejects_malformed_exit_node() {
+        let dir = tempfile::tempdir().unwrap();
+        let db =
+            ClientDatabase::load(&dir.path().join("clients.json"), test_network_config()).unwrap();
+        let client = db.add_client("bad-exit-node").unwrap();
+
+        for bad in ["no-port-here", "", ":51820", "host:not-a-port", "host:"] {
+            let err = db
+                .update_client(
+                    &client.id,
+                    UpdateClientParams {
+                        exit_node: Some(Some(bad.to_string())),
+                        ..Default::default()
+                    },
+                )
+                .unwrap_err();
+            assert!(
+                err.to_string().contains("exit_node"),
+                "unexpected error for {:?}: {}",
+                bad,
+                err
+            );
+        }
+        // Must remain unset after all rejected attempts.
+        assert_eq!(db.find_by_id(&client.id).unwrap().exit_node, None);
+
+        // A well-formed value succeeds.
+        db.update_client(
+            &client.id,
+            UpdateClientParams {
+                exit_node: Some(Some("exit.example.com:443".to_string())),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            db.find_by_id(&client.id).unwrap().exit_node,
+            Some("exit.example.com:443".to_string())
+        );
+    }
+
+    /// Pool-sync convergence: an exit_node override set on one node (with a
+    /// newer `updated_at`) must propagate to a peer node via
+    /// `merge_from_json`, exactly like `role`.
+    #[test]
+    fn merge_from_json_converges_exit_node_last_writer_wins() {
+        let dir_a = tempfile::tempdir().unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+        let db_a = ClientDatabase::load(&dir_a.path().join("clients.json"), test_network_config())
+            .unwrap();
+        let db_b = ClientDatabase::load(&dir_b.path().join("clients.json"), test_network_config())
+            .unwrap();
+
+        let client = db_a.add_client("shared-exit").unwrap();
+        db_b.merge_from_json(&db_a.export_json().unwrap()).unwrap();
+        assert_eq!(db_b.find_by_id(&client.id).unwrap().exit_node, None);
+
+        db_a.update_client(
+            &client.id,
+            UpdateClientParams {
+                exit_node: Some(Some("exit-a.example.com:51820".to_string())),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let merged = db_b.merge_from_json(&db_a.export_json().unwrap()).unwrap();
+        assert_eq!(merged, 1, "the exit_node change must merge");
+        assert_eq!(
+            db_b.find_by_id(&client.id).unwrap().exit_node,
+            Some("exit-a.example.com:51820".to_string()),
+            "exit_node must converge pool-wide via merge_from_json"
+        );
+    }
+
+    /// Tombstone-sticky policy must equally protect `exit_node`: a stale
+    /// peer's older live copy must not resurrect a revoked client or
+    /// reintroduce its old exit_node value.
+    #[test]
+    fn merge_from_json_tombstone_does_not_resurrect_exit_node() {
+        let dir = tempfile::tempdir().unwrap();
+        let db =
+            ClientDatabase::load(&dir.path().join("clients.json"), test_network_config()).unwrap();
+
+        let client = db.add_client("revoked-exit").unwrap();
+        db.update_client(
+            &client.id,
+            UpdateClientParams {
+                exit_node: Some(Some("exit-old.example.com:51820".to_string())),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        db.remove_client(&client.id).unwrap();
+        assert!(db.find_by_id(&client.id).is_none());
+
+        let stale_peer_copy = ClientConfig {
+            id: client.id.clone(),
+            name: client.name.clone(),
+            psk: client.psk,
+            vpn_ip: client.vpn_ip,
+            enabled: true,
+            created_at: client.created_at,
+            stats: ClientStats::default(),
+            qos: None,
+            device_pubkey: None,
+            one_time: false,
+            expires_at: None,
+            updated_at: Some(client.created_at), // older than the tombstone's updated_at
+            deleted: false,
+            role: ClientRole::User,
+            exit_node: Some("exit-stale.example.com:51820".to_string()),
+        };
+        let merged = db
+            .merge_from_json(&serde_json::to_string(&vec![stale_peer_copy]).unwrap())
+            .unwrap();
+        assert_eq!(
+            merged, 0,
+            "an older live peer record must not beat a tombstone"
+        );
+        assert!(db.find_by_id(&client.id).is_none());
+        let raw = db
+            .list_clients_including_deleted()
+            .into_iter()
+            .find(|c| c.id == client.id)
+            .unwrap();
+        assert!(raw.deleted);
+        assert_eq!(
+            raw.exit_node,
+            Some("exit-old.example.com:51820".to_string()),
+            "the tombstone keeps whatever exit_node it already had locally — it was not \
+             overwritten by the stale peer"
+        );
     }
 }

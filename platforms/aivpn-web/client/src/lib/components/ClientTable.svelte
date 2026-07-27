@@ -72,6 +72,11 @@
                 exp {new Date(client.expires_at).toLocaleDateString()}
               </span>
             {/if}
+            {#if client.exit_node}
+              <span class="ml-1 text-xs text-purple-500 font-mono" title="Exit node override: {client.exit_node}">
+                exit: {client.exit_node}
+              </span>
+            {/if}
           </td>
           <td class="px-4 py-3 text-gray-600 dark:text-gray-400 font-mono text-xs">{client.vpn_ip}</td>
           <td class="px-4 py-3">

@@ -384,6 +384,26 @@ async fn main() {
     #[cfg(all(feature = "management-api", unix))]
     let mgmt_audit_log = audit_logger.clone();
 
+    // Wave B1 (pool topology read endpoints): deferred-fill handles for the
+    // REST management API's `ServeConfig`. The REST API is spawned (below,
+    // right after `AivpnServer::new()`) BEFORE the pool-sync setup block
+    // further down actually constructs `NodeRegistry`/`PoolDialer` (only
+    // once `pool.transport == "masked"` is confirmed) — reordering that
+    // spawn was judged too invasive for this change. These `Arc<Mutex<
+    // Option<..>>>` cells are handed to `ServeConfig` now (read at REST
+    // request time) and filled in once, later, right where `main.rs`
+    // already calls `server.set_node_registry`/`server.set_pool_dialer` —
+    // see `management_api::ServeConfig::pool_registry_slot`'s doc comment
+    // for why this sidesteps the ordering problem instead of requiring it.
+    #[cfg(all(feature = "management-api", unix))]
+    let mgmt_pool_registry_slot: std::sync::Arc<
+        parking_lot::Mutex<Option<std::sync::Arc<NodeRegistry>>>,
+    > = std::sync::Arc::new(parking_lot::Mutex::new(None));
+    #[cfg(all(feature = "management-api", unix))]
+    let mgmt_pool_dialer_slot: std::sync::Arc<
+        parking_lot::Mutex<Option<std::sync::Arc<PoolDialer>>>,
+    > = std::sync::Arc::new(parking_lot::Mutex::new(None));
+
     // Pool sync — start listener + outbound tasks if pool is configured.
     // An EXPLICITLY passed --pool-config must hard-fail on read/parse errors:
     // silently falling back used to disable pool sync on a simple typo.
@@ -401,11 +421,16 @@ async fn main() {
         None => file_config.as_ref().and_then(|c| c.pool.clone()),
     };
 
-    // 2b: spread this node's VPN-IP allocation starting offset by node_id so
-    // independent adds on different pool nodes don't collide on the same
-    // "first" IP. No-op if the DB already has clients/a moved counter, or if
-    // pool sync isn't configured (no node_id to derive from).
-    if let Some(ref node_id) = pool_sync_config.as_ref().and_then(|c| c.node_id.clone()) {
+    // Wave B-IP: confine this node to a hard, disjoint VPN-IP partition so
+    // independent adds on different pool nodes can never collide (see
+    // `ClientDatabase::set_node_partition` for the full rationale). An
+    // explicit `pool.node_ip_partition` index takes priority — it rules out
+    // even a hash collision between two nodes' `node_id`s — falling back to
+    // the `node_id`-hash-derived index. No-op if pool sync isn't configured
+    // (no node_id/config to derive a partition from).
+    if let Some(node_ip_partition) = pool_sync_config.as_ref().and_then(|c| c.node_ip_partition) {
+        client_db.set_node_partition_explicit(node_ip_partition, None);
+    } else if let Some(ref node_id) = pool_sync_config.as_ref().and_then(|c| c.node_id.clone()) {
         client_db.set_node_partition(node_id);
     }
 
@@ -532,6 +557,10 @@ async fn main() {
         // its own copies out of `mgmt_server_addr`/`mgmt_audit_log_path`.
         mgmt_server_addr: mgmt_server_addr.clone(),
         audit_log_path: mgmt_audit_log_path.clone(),
+        // Wave B1 (pool topology read endpoints): whether `server.json` has
+        // a `pool` block at all, regardless of transport — see
+        // `GatewayConfig::pool_configured`'s doc comment.
+        pool_configured: pool_sync_config.is_some(),
     };
 
     // Create and run server
@@ -554,6 +583,15 @@ async fn main() {
                 if mgmt_socket.is_some() {
                     let db = mgmt_db.clone();
                     let socket = mgmt_socket.clone();
+                    // Wave B1: clone the slots (not move) — the originals
+                    // are needed again later, at the pool-sync setup block
+                    // that fills them in. See their definition's doc comment.
+                    let pool_registry_slot_for_api = mgmt_pool_registry_slot.clone();
+                    let pool_dialer_slot_for_api = mgmt_pool_dialer_slot.clone();
+                    // Copy (bool), not a move of `pool_sync_config` itself —
+                    // that `Option<PoolSyncConfig>` is still needed by
+                    // reference later, in the pool-sync setup block.
+                    let pool_configured_for_api = pool_sync_config.is_some();
                     let handle = tokio::spawn(async move {
                         aivpn_server::management_api::serve(
                             aivpn_server::management_api::ServeConfig {
@@ -574,6 +612,9 @@ async fn main() {
                                 metrics: mgmt_metrics,
                                 socket_group: mgmt_socket_group,
                                 pending_config: mgmt_pending_config,
+                                pool_configured: pool_configured_for_api,
+                                pool_registry_slot: Some(pool_registry_slot_for_api),
+                                pool_dialer_slot: Some(pool_dialer_slot_for_api),
                             },
                         )
                         .await;
@@ -589,6 +630,14 @@ async fn main() {
                 // SIGHUP → reload client database
                 {
                     let db = mgmt_db;
+                    // B2b: clear the gateway's exit-resolution cache
+                    // whenever this reload actually picked up a change —
+                    // otherwise an admin editing `exit_node` directly in
+                    // `clients.json` and sending SIGHUP wouldn't take
+                    // effect until the periodic 10s hot-reload poll (which
+                    // performs the same clear) catches up. See
+                    // `Gateway::exit_route_cache`'s doc comment.
+                    let exit_route_cache = server.exit_route_cache();
                     tokio::spawn(async move {
                         use tokio::signal::unix::{signal, SignalKind};
                         let mut sighup = match signal(SignalKind::hangup()) {
@@ -602,8 +651,11 @@ async fn main() {
                             sighup.recv().await;
                             info!("SIGHUP received — reloading client database");
                             let db = db.clone();
-                            let _ =
+                            let changed =
                                 tokio::task::spawn_blocking(move || db.reload_if_changed()).await;
+                            if matches!(changed, Ok(true)) {
+                                exit_route_cache.clear();
+                            }
                         }
                     });
                 }
@@ -662,11 +714,29 @@ async fn main() {
                     // is cheap here (a handful of small strings) and keeps
                     // `PoolDialer::new`'s existing `&PoolSyncConfig`
                     // interface untouched.
+                    // B2b (per-client exit routing): pre-seed the dial set
+                    // with every CLIENT's `exit_node` override too (not just
+                    // the global default above), so a masked pool-client
+                    // dial_loop already exists for any per-client exit an
+                    // operator configured before this node started. The
+                    // dial set is fixed at `PoolDialer::new` construction —
+                    // there is no runtime add-peer yet (that's a later
+                    // wave); a per-client exit_node added/changed AFTER
+                    // startup that isn't already in this union falls back
+                    // to the global default (`choose_exit` in gateway.rs)
+                    // until this node restarts.
                     let dialer_cfg: PoolSyncConfig = {
                         let mut cfg = pool_cfg.clone();
                         if let Some(ref exit_node) = pool_cfg.exit_node {
                             if !cfg.peers.iter().any(|p| p == exit_node) {
                                 cfg.peers.push(exit_node.clone());
+                            }
+                        }
+                        for client in db.list_clients() {
+                            if let Some(ref client_exit) = client.exit_node {
+                                if !cfg.peers.iter().any(|p| p == client_exit) {
+                                    cfg.peers.push(client_exit.clone());
+                                }
                             }
                         }
                         cfg
@@ -716,6 +786,13 @@ async fn main() {
                         pool_nodes_path,
                         pool_cfg.allow_auto_add(),
                     ));
+                    // Wave B1: fill the REST API's deferred-fill slot (see
+                    // that variable's doc comment) BEFORE `node_registry` is
+                    // moved into `set_node_registry` below.
+                    #[cfg(all(feature = "management-api", unix))]
+                    {
+                        *mgmt_pool_registry_slot.lock() = Some(node_registry.clone());
+                    }
                     server.set_node_registry(node_registry);
                     // D1: enforce crypto-proven node identity in route
                     // authorization when the operator opts in
@@ -745,6 +822,12 @@ async fn main() {
                         // on every masked pool-sync node, not just exit
                         // nodes.
                         server.set_pool_dialer(dialer.clone());
+                        // Wave B1: fill the REST API's deferred-fill slot —
+                        // see `mgmt_pool_registry_slot`'s doc comment.
+                        #[cfg(all(feature = "management-api", unix))]
+                        {
+                            *mgmt_pool_dialer_slot.lock() = Some(dialer.clone());
+                        }
 
                         // PHASE 3: wire the masked exit route BEFORE handing
                         // the dialer's Arc off to `start` (which consumes
@@ -1311,6 +1394,9 @@ fn build_connection_key(
         config_path: config_path.as_deref().map(std::path::Path::new),
         audit_log_path: None,
         pending_config: None,
+        // CLI connection-key builder only ever calls
+        // `mgmt_service::connection_key`, which never reads `ctx.pool`.
+        pool: None,
     };
     aivpn_server::mgmt_service::connection_key(&ctx, client_id)
 }

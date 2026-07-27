@@ -113,6 +113,13 @@ export interface Client {
   /** Optional for backward compatibility with older daemon builds that
    *  predate role assignment — treat a missing value as 'user' in the UI. */
   role?: ClientRole;
+  /** Per-client exit-node override (`host:port`), settable via
+   *  `PATCH /api/v1/clients/:id` with `{"exit_node": "..."}` or
+   *  `{"exit_node": null}` to clear it back to the pool's global default
+   *  (`pool.exit_node` in server.json). Unlike the global default, this
+   *  takes effect live — no server restart required. Optional for backward
+   *  compatibility with older daemon builds that predate this field. */
+  exit_node?: string | null;
   stats: {
     bytes_in: number;
     bytes_out: number;
@@ -292,7 +299,7 @@ export const clients = {
   async create(data: { name: string; one_time?: boolean; expires_at?: string | null; qos?: ClientQos }): Promise<Client> {
     return apiJson('/api/v1/clients', { method: 'POST', body: JSON.stringify(data) });
   },
-  async update(id: string, data: { name?: string; enabled?: boolean; one_time?: boolean; expires_at?: string | null; qos?: ClientQos | null; role?: ClientRole }): Promise<Client> {
+  async update(id: string, data: { name?: string; enabled?: boolean; one_time?: boolean; expires_at?: string | null; qos?: ClientQos | null; role?: ClientRole; exit_node?: string | null }): Promise<Client> {
     return apiJson(`/api/v1/clients/${id}`, { method: 'PATCH', body: JSON.stringify(data) });
   },
   async delete(id: string): Promise<void> {
@@ -316,12 +323,43 @@ export const clients = {
   },
 };
 
+/** Response of `POST /api/v1/config/apply` (management_api.rs ApplyConfigResponse).
+ *  `token` must be passed to `config.confirm()` within the daemon's rollback
+ *  window or the write auto-reverts; `applied` reports whether the write
+ *  actually landed on disk (apply-with-rollback, not a dry-run). */
+export interface ApplyConfigResponse {
+  token: string;
+  applied: boolean;
+}
+
 export const config = {
   async get(): Promise<Record<string, unknown>> {
     return apiJson('/api/v1/config');
   },
   async update(data: Record<string, unknown>): Promise<Record<string, unknown>> {
     return apiJson('/api/v1/config', { method: 'PUT', body: JSON.stringify(data) });
+  },
+  /**
+   * Admin-only: stage the pool-wide default exit node (`pool.exit_node` in
+   * server.json) via apply-with-rollback. Pass `addr` as `host:port` to set
+   * it, or `null` to disable/clear it. Unlike the per-client override, this
+   * does NOT take effect live — it requires a server restart. The returned
+   * `token` MUST be confirmed with `config.confirm()` or the daemon
+   * auto-reverts the write after its rollback window.
+   */
+  async applyExit(addr: string | null): Promise<ApplyConfigResponse> {
+    return apiJson('/api/v1/config/apply', {
+      method: 'POST',
+      body: JSON.stringify({ exit_node: addr }),
+    });
+  },
+  /** Confirm a pending apply-with-rollback write (e.g. from `applyExit()`),
+   *  making it permanent instead of letting it auto-revert. */
+  async confirm(token: string): Promise<void> {
+    await apiFetch('/api/v1/config/confirm', {
+      method: 'POST',
+      body: JSON.stringify({ token }),
+    });
   },
 };
 
@@ -392,6 +430,51 @@ export const kernel = {
 export const reload = {
   async trigger(): Promise<void> {
     await apiFetch('/api/v1/reload', { method: 'POST' });
+  },
+};
+
+/** GET /api/v1/pool/nodes entry (mgmt_service.rs PoolNodeInfo). `verified`
+ *  reflects a durable TOFU/pinned Ed25519 binding in NodeRegistry; `connected`
+ *  is only ever true for this node's own configured dial-set peers (an
+ *  inbound-only peer that dials US has no live-session entry here). */
+export interface PoolNodeInfo {
+  node_id: string;
+  address: string | null;
+  verified: boolean;
+  revoked: boolean;
+  connected: boolean;
+  last_seen_unix: number | null;
+}
+
+/** GET /api/v1/pool/links entry (mgmt_service.rs PoolLinkInfo). */
+export interface PoolLinkInfo {
+  peer: string;
+  connected: boolean;
+  converged: boolean;
+  last_converged_unix: number | null;
+}
+
+/** GET /api/v1/pool/health (mgmt_service.rs PoolHealth). `transport` is
+ *  "masked" (live PoolDialer, real link state below), "legacy" (pool sync
+ *  configured but running the mask-independent PeerSyncer — no link state),
+ *  or "none" (pool sync isn't configured on this node at all). */
+export interface PoolHealth {
+  transport: 'masked' | 'legacy' | 'none';
+  total_nodes: number;
+  connected_peers: number;
+  converged_peers: number;
+  diverged: boolean;
+}
+
+export const pool = {
+  async nodes(): Promise<PoolNodeInfo[]> {
+    return apiJson('/api/v1/pool/nodes');
+  },
+  async links(): Promise<PoolLinkInfo[]> {
+    return apiJson('/api/v1/pool/links');
+  },
+  async health(): Promise<PoolHealth> {
+    return apiJson('/api/v1/pool/health');
   },
 };
 

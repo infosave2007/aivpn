@@ -91,6 +91,40 @@ pub struct ServeConfig {
     /// 500 — see `mgmt_service::apply_heavy`'s doc comment), which only
     /// happens if a caller builds `ServeConfig` without wiring this up.
     pub pending_config: Option<std::sync::Arc<PendingConfigManager>>,
+    /// Wave B1 (pool topology read endpoints): whether pool sync is
+    /// configured on this node AT ALL (`server.json`'s `pool` block
+    /// present), regardless of transport — mirrors
+    /// `gateway::GatewayConfig::pool_configured`; see that field's doc
+    /// comment for why this is needed to tell `"legacy"` apart from
+    /// `"none"` when `pool_dialer_slot` below is empty.
+    pub pool_configured: bool,
+    /// Wave B1: a shared, fillable-later handle to the live `NodeRegistry`.
+    /// `main.rs` constructs this `ServeConfig` (and spawns the REST API)
+    /// BEFORE the pool-sync setup block that actually creates the
+    /// `NodeRegistry`/`PoolDialer` (they're only built once
+    /// `pool.transport == "masked"` is confirmed, deep inside the
+    /// post-`AivpnServer::new()` match arm) — reordering that spawn was
+    /// judged too invasive for this change. Passing the SAME
+    /// `Arc<Mutex<Option<..>>>` cell into both `ServeConfig` (read at
+    /// request time, in `ApiState::mgmt_ctx`) and the pool-sync setup block
+    /// (written once, right after `NodeRegistry::load`/`PoolDialer::new`
+    /// succeed) sidesteps the ordering problem entirely: a REST request
+    /// that lands before the pool-sync block finishes just observes an
+    /// empty slot (degrades to `pool_configured`'s `"legacy"`/`"none"`
+    /// label, never an error) and self-heals on the very next request once
+    /// `main.rs` fills it in — no restart needed. `None` when pool sync
+    /// isn't configured at all (`main.rs` never allocates a cell it will
+    /// never fill).
+    pub pool_registry_slot: Option<
+        std::sync::Arc<
+            parking_lot::Mutex<Option<std::sync::Arc<crate::node_registry::NodeRegistry>>>,
+        >,
+    >,
+    /// Wave B1: same deferred-fill pattern as `pool_registry_slot`, for the
+    /// live `PoolDialer`.
+    pub pool_dialer_slot: Option<
+        std::sync::Arc<parking_lot::Mutex<Option<std::sync::Arc<crate::pool_dialer::PoolDialer>>>>,
+    >,
 }
 
 // ── Shared handler state ─────────────────────────────────────────────────────
@@ -114,6 +148,10 @@ struct ApiState {
     #[cfg(feature = "metrics")]
     metrics: Option<Arc<crate::metrics::MetricsCollector>>,
     pending_config: Option<Arc<PendingConfigManager>>,
+    pool_configured: bool,
+    pool_registry_slot:
+        Option<Arc<parking_lot::Mutex<Option<Arc<crate::node_registry::NodeRegistry>>>>>,
+    pool_dialer_slot: Option<Arc<parking_lot::Mutex<Option<Arc<crate::pool_dialer::PoolDialer>>>>>,
 }
 
 impl ApiState {
@@ -135,6 +173,41 @@ impl ApiState {
             config_path: self.config_path.as_deref(),
             audit_log_path: self.audit_log_path.as_deref(),
             pending_config: self.pending_config.as_deref(),
+            pool: Some(self.build_pool_snapshot()),
+        }
+    }
+
+    /// Wave B1 (pool topology read endpoints): build a fresh
+    /// `mgmt_service::PoolSnapshot` from whatever `pool_registry_slot`/
+    /// `pool_dialer_slot` currently hold — see those fields' doc comments
+    /// (on `ServeConfig`) for the deferred-fill mechanism and why this can
+    /// legitimately observe an empty slot early in the server's lifetime.
+    fn build_pool_snapshot(&self) -> mgmt_service::PoolSnapshot {
+        let dialer = self
+            .pool_dialer_slot
+            .as_ref()
+            .and_then(|slot| slot.lock().clone());
+        match dialer {
+            Some(dialer) => {
+                let registry = self
+                    .pool_registry_slot
+                    .as_ref()
+                    .and_then(|slot| slot.lock().clone());
+                let (registry_nodes, revoked) = match registry {
+                    Some(r) => (r.list(), r.list_revoked()),
+                    None => (Vec::new(), Vec::new()),
+                };
+                let statuses = dialer.pool_status_snapshot();
+                mgmt_service::build_pool_snapshot(mgmt_service::PoolSnapshotInputs {
+                    peers: dialer.peers(),
+                    registry_nodes: &registry_nodes,
+                    revoked: &revoked,
+                    statuses: &statuses,
+                    transport: "masked",
+                })
+            }
+            None if self.pool_configured => mgmt_service::PoolSnapshot::empty("legacy"),
+            None => mgmt_service::PoolSnapshot::empty("none"),
         }
     }
 }
@@ -186,6 +259,13 @@ struct PatchClientRequest {
     expires_at: Option<Option<DateTime<Utc>>>,
     /// Role assignment (web/CLI-only path; the tunnel path is P1.2).
     role: Option<ClientRole>,
+    /// Wave B2a: per-client exit-node override (`host:port`). Pass `null`
+    /// to clear (fall back to the server's global default); omit to leave
+    /// unchanged. Also settable over the tunnel (see
+    /// `mgmt_service::TunnelPatchClientRequest`) — unlike `role`, this is
+    /// not a privilege grant.
+    #[serde(default, deserialize_with = "deserialize_opt_opt")]
+    exit_node: Option<Option<String>>,
 }
 
 /// Deserialises a field that can be absent (don't touch), null (clear), or a value (set).
@@ -293,6 +373,20 @@ async fn list_clients(State(state): State<ApiState>) -> impl IntoResponse {
     Json(clients)
 }
 
+// ── Pool topology (Wave B1) ─────────────────────────────────────────────
+
+async fn get_pool_nodes(State(state): State<ApiState>) -> impl IntoResponse {
+    Json(state.build_pool_snapshot().nodes)
+}
+
+async fn get_pool_health(State(state): State<ApiState>) -> impl IntoResponse {
+    Json(state.build_pool_snapshot().health)
+}
+
+async fn get_pool_links(State(state): State<ApiState>) -> impl IntoResponse {
+    Json(state.build_pool_snapshot().links)
+}
+
 async fn add_client(
     State(state): State<ApiState>,
     Json(body): Json<AddClientRequest>,
@@ -337,6 +431,7 @@ async fn patch_client(
         qos: body.qos,
         expires_at: body.expires_at,
         role: body.role,
+        exit_node: body.exit_node,
     };
     let result = tokio::task::spawn_blocking(move || {
         mgmt_service::update_client(&state.mgmt_ctx(), &id, args)
@@ -830,10 +925,23 @@ async fn set_active_mask(
 // from the web panel can be confirmed from the tunnel (or vice versa) and
 // is swept by the same gateway rollback timer either way.
 
+/// Which [`HeavySetting`] this selects follows the SAME "field presence,
+/// not a type tag" convention as `mgmt_service::TunnelApplyRequest` (see
+/// its doc comment): presence of `exit_node` (even JSON `null`) selects
+/// `HeavySetting::ExitNode`; its absence selects the original
+/// `HeavySetting::ActiveMask` via `client`/`mask` (unchanged wire shape).
 #[derive(Deserialize)]
 struct ApplyConfigRequest {
-    client: String,
-    mask: String,
+    #[serde(default)]
+    client: Option<String>,
+    #[serde(default)]
+    mask: Option<String>,
+    /// Wave B2a: global default exit node (`host:port`), or `null` to
+    /// disable it. See `HeavySetting::ExitNode`'s doc comment — this
+    /// persists to `server.json` with rollback but does NOT live-apply
+    /// (takes effect on restart).
+    #[serde(default, deserialize_with = "deserialize_opt_opt")]
+    exit_node: Option<Option<String>>,
 }
 
 #[derive(Serialize)]
@@ -848,14 +956,15 @@ async fn apply_config(
 ) -> impl IntoResponse {
     let result = tokio::task::spawn_blocking(move || {
         let ctx = state.mgmt_ctx();
-        mgmt_service::apply_heavy(
-            &ctx,
+        let setting = if let Some(exit_node) = body.exit_node {
+            HeavySetting::ExitNode { addr: exit_node }
+        } else {
             HeavySetting::ActiveMask {
-                client: body.client,
-                mask: body.mask,
-            },
-            Instant::now(),
-        )
+                client: body.client.unwrap_or_default(),
+                mask: body.mask.unwrap_or_default(),
+            }
+        };
+        mgmt_service::apply_heavy(&ctx, setting, Instant::now())
     })
     .await;
     match result {
@@ -1277,6 +1386,9 @@ fn router(state: ApiState) -> Router {
         .route("/api/v1/kernel", get(get_kernel))
         .route("/api/v1/events", get(sse_events))
         .route("/api/v1/reload", post(reload))
+        .route("/api/v1/pool/nodes", get(get_pool_nodes))
+        .route("/api/v1/pool/health", get(get_pool_health))
+        .route("/api/v1/pool/links", get(get_pool_links))
         .with_state(state)
 }
 
@@ -1435,6 +1547,9 @@ pub async fn serve(cfg: ServeConfig) {
         #[cfg(feature = "metrics")]
         metrics: cfg.metrics,
         pending_config: cfg.pending_config,
+        pool_configured: cfg.pool_configured,
+        pool_registry_slot: cfg.pool_registry_slot,
+        pool_dialer_slot: cfg.pool_dialer_slot,
     };
     let app = router(state);
 

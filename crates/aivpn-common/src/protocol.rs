@@ -131,6 +131,13 @@ pub enum ControlSubtype {
     /// Server → client: the response to a `MgmtRequest`, correlated by the
     /// same `req_id` (0x26)
     MgmtResponse = 0x26,
+    /// Bidirectional pool-peer announcement of this node's VPN-IP partition
+    /// assignment (Wave B-IP `ClientDatabase::set_node_partition`/
+    /// `_explicit`) and VPN subnet CIDR — pure operator-visibility exchange,
+    /// carries no session/security proof. Either side of a masked pool-peer
+    /// session may send it; a receiver that itself has a partition should
+    /// reply with its own (0x27)
+    PartitionAnnounce = 0x27,
 }
 
 impl ControlSubtype {
@@ -174,6 +181,7 @@ impl ControlSubtype {
             0x24 => Some(Self::Capabilities),
             0x25 => Some(Self::MgmtRequest),
             0x26 => Some(Self::MgmtResponse),
+            0x27 => Some(Self::PartitionAnnounce),
             _ => None,
         }
     }
@@ -573,6 +581,28 @@ pub enum ControlPayload {
         status: u16,
         body: Vec<u8>,
     },
+    /// Wave B-IP.2: a masked pool-peer's VPN-IP partition announcement —
+    /// pure operator-visibility exchange (see `aivpn_server::pool_partition`
+    /// for the receiver-side conflict/mismatch checker). Carries no proof;
+    /// correctness of the disjoint-slice guarantee itself is already
+    /// enforced deterministically by Wave B-IP's `set_node_partition`/
+    /// `_explicit` on each node independently, whether or not either side
+    /// ever sees this message.
+    PartitionAnnounce {
+        /// This node's configured VPN subnet, e.g. "10.0.0.0/24"
+        /// (`VpnNetworkConfig::cidr_string`).
+        subnet_cidr: String,
+        /// `hash(node_id) % num_partitions`, or the operator-pinned
+        /// `pool.node_ip_partition` value when `explicit` is true.
+        partition_index: u32,
+        /// Number of host offsets this node's partition slice spans.
+        partition_size: u32,
+        /// Total number of partitions the subnet is currently divided into.
+        num_partitions: u32,
+        /// True iff `partition_index` came from an operator-pinned
+        /// `pool.node_ip_partition` rather than a hash of `node_id`.
+        explicit: bool,
+    },
 }
 
 /// Aggregated success/fail outcome counters for a single mask, as reported by
@@ -900,6 +930,27 @@ impl ControlPayload {
                 buf.extend_from_slice(&status.to_le_bytes());
                 buf.extend_from_slice(&(body.len() as u32).to_le_bytes());
                 buf.extend_from_slice(body);
+            }
+            Self::PartitionAnnounce {
+                subnet_cidr,
+                partition_index,
+                partition_size,
+                num_partitions,
+                explicit,
+            } => {
+                let cidr_bytes = subnet_cidr.as_bytes();
+                if cidr_bytes.len() > u16::MAX as usize {
+                    return Err(Error::InvalidPacket(
+                        "PartitionAnnounce subnet_cidr too long",
+                    ));
+                }
+                buf.push(ControlSubtype::PartitionAnnounce as u8);
+                buf.extend_from_slice(&(cidr_bytes.len() as u16).to_le_bytes());
+                buf.extend_from_slice(cidr_bytes);
+                buf.extend_from_slice(&partition_index.to_le_bytes());
+                buf.extend_from_slice(&partition_size.to_le_bytes());
+                buf.extend_from_slice(&num_partitions.to_le_bytes());
+                buf.push(*explicit as u8);
             }
         }
 
@@ -1520,6 +1571,38 @@ impl ControlPayload {
                     body,
                 })
             }
+            ControlSubtype::PartitionAnnounce => {
+                if data.len() < 3 {
+                    return Err(Error::InvalidPacket("PartitionAnnounce too short"));
+                }
+                let cidr_len = u16::from_le_bytes([data[1], data[2]]) as usize;
+                let cidr_start = 3;
+                if data.len().saturating_sub(cidr_start) < cidr_len {
+                    return Err(Error::InvalidPacket(
+                        "PartitionAnnounce subnet_cidr truncated",
+                    ));
+                }
+                let cidr_end = cidr_start + cidr_len;
+                let subnet_cidr = String::from_utf8_lossy(&data[cidr_start..cidr_end]).to_string();
+                // partition_index(4) + partition_size(4) + num_partitions(4) + explicit(1)
+                if data.len().saturating_sub(cidr_end) < 13 {
+                    return Err(Error::InvalidPacket("PartitionAnnounce truncated"));
+                }
+                let partition_index =
+                    u32::from_le_bytes(data[cidr_end..cidr_end + 4].try_into().unwrap());
+                let partition_size =
+                    u32::from_le_bytes(data[cidr_end + 4..cidr_end + 8].try_into().unwrap());
+                let num_partitions =
+                    u32::from_le_bytes(data[cidr_end + 8..cidr_end + 12].try_into().unwrap());
+                let explicit = data[cidr_end + 12] != 0;
+                Ok(Self::PartitionAnnounce {
+                    subnet_cidr,
+                    partition_index,
+                    partition_size,
+                    num_partitions,
+                    explicit,
+                })
+            }
         }
     }
 }
@@ -1639,6 +1722,7 @@ mod tests {
             (0x24, ControlSubtype::Capabilities),
             (0x25, ControlSubtype::MgmtRequest),
             (0x26, ControlSubtype::MgmtResponse),
+            (0x27, ControlSubtype::PartitionAnnounce),
         ];
         for (byte, expected) in pairs {
             assert_eq!(
@@ -1649,7 +1733,7 @@ mod tests {
             );
         }
         assert_eq!(ControlSubtype::from_u8(0x00), None);
-        assert_eq!(ControlSubtype::from_u8(0x27), None);
+        assert_eq!(ControlSubtype::from_u8(0x28), None);
     }
 
     // -----------------------------------------------------------------------
@@ -2857,6 +2941,60 @@ mod tests {
             body: vec![0u8; 262_145],
         };
         assert!(too_long_body.encode().is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // PartitionAnnounce (Wave B-IP.2)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn partition_announce_roundtrip() {
+        let msg = ControlPayload::PartitionAnnounce {
+            subnet_cidr: "10.0.0.0/24".to_string(),
+            partition_index: 3,
+            partition_size: 31,
+            num_partitions: 8,
+            explicit: false,
+        };
+        let encoded = msg.encode().unwrap();
+        let decoded = ControlPayload::decode(&encoded).unwrap();
+        assert_eq!(decoded, msg);
+    }
+
+    #[test]
+    fn partition_announce_roundtrip_explicit_and_empty_cidr() {
+        let msg = ControlPayload::PartitionAnnounce {
+            subnet_cidr: String::new(),
+            partition_index: 0,
+            partition_size: 0,
+            num_partitions: 1,
+            explicit: true,
+        };
+        let encoded = msg.encode().unwrap();
+        let decoded = ControlPayload::decode(&encoded).unwrap();
+        assert_eq!(decoded, msg);
+    }
+
+    #[test]
+    fn partition_announce_truncated_bytes_return_error_not_panic() {
+        let full = ControlPayload::PartitionAnnounce {
+            subnet_cidr: "10.1.2.0/24".to_string(),
+            partition_index: 5,
+            partition_size: 31,
+            num_partitions: 8,
+            explicit: true,
+        }
+        .encode()
+        .unwrap();
+
+        for cut in 1..full.len() {
+            let truncated = &full[..cut];
+            assert!(
+                ControlPayload::decode(truncated).is_err(),
+                "expected Err at cut={}",
+                cut
+            );
+        }
     }
 
     #[test]

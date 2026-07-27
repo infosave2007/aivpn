@@ -51,7 +51,7 @@ use serde::{Deserialize, Deserializer};
 
 use crate::audit_log::{AuditActor, AuditLogger};
 use crate::batch_io::PacketBatchIo as _;
-use crate::client_db::{ClientDatabase, ClientRole};
+use crate::client_db::{ClientConfig, ClientDatabase, ClientRole};
 use crate::ebpf_observer::EbpfObserver;
 use crate::mask_gen::generate_and_store_mask;
 use crate::mask_store::MaskStore;
@@ -131,6 +131,124 @@ impl<'de> Deserialize<'de> for ShapingLevel {
             ))),
         }
     }
+}
+
+/// B2b (per-client exit routing, data plane): the resolved outcome of
+/// picking an uplink masked-exit target for one client's `Data`/FEC-recovered
+/// packet, from that client's own `ClientConfig::exit_node` override (B2a)
+/// and the node's global default (`pool.exit_node` / `Gateway::masked_exit_addr`).
+///
+/// Deliberately does not distinguish "which address" beyond the resolved
+/// string — the caller (`Gateway::forward_via_exit`) doesn't need to know
+/// *why* `addr` was picked, only whether a failed `send_to_peer` may
+/// additionally fall back to local TUN egress (`local_fallback`) or must
+/// preserve the pre-B2b silent-drop-on-no-live-session behavior.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ExitDecision {
+    /// Neither a per-client override nor a global default exit is
+    /// configured for this packet — masked-transport exit routing does not
+    /// apply at all. The caller falls through to the legacy
+    /// `chain_forwarder`/local-TUN-egress branch, byte-identical to the
+    /// pre-B2b `self.masked_exit_addr.is_none()` case.
+    NoExit,
+    /// Attempt `PoolDialer::send_to_peer(addr, ChainForward{..})`.
+    ///
+    /// `local_fallback == false` is the pre-B2b, global-default-only case
+    /// (no per-client override involved at all): on a failed send, the
+    /// packet is silently dropped exactly as before — REGRESSION INVARIANT,
+    /// see `choose_exit`'s doc comment.
+    ///
+    /// `local_fallback == true` means `addr` was resolved via (or falls
+    /// back from) a per-client `exit_node` override: a failed send may
+    /// additionally fall back to local TUN/NAT egress instead of dropping,
+    /// per B2b's spec — this path never existed before B2b and only
+    /// engages for clients that actually have a per-client override
+    /// configured.
+    Send { addr: String, local_fallback: bool },
+}
+
+/// B2b (per-client exit routing, data plane): pure decision function —
+/// given `client_exit` (this client's `ClientConfig::exit_node`, already
+/// resolved from the cache/DB), `global` (the node-wide default,
+/// `Gateway::masked_exit_addr`), and a non-mutating `is_live` liveness check
+/// (`PoolDialer::has_live_session`), decides where — if anywhere — to route
+/// this client's masked-transport uplink packet.
+///
+/// Truth table:
+/// - `client_exit = None`, `global = None`            → `NoExit`
+/// - `client_exit = None`, `global = Some(g)`          → `Send{g, local_fallback:false}`
+/// - `client_exit = Some(c)`, `is_live(c)`             → `Send{c, local_fallback:true}`
+/// - `client_exit = Some(c)`, `!is_live(c)`, `global=None`     → `NoExit`
+/// - `client_exit = Some(c)`, `!is_live(c)`, `global=Some(g)`  → `Send{g, local_fallback:true}`
+///
+/// REGRESSION INVARIANT (safety-critical): when `client_exit` is always
+/// `None` (the current common case — no client has a per-client `exit_node`
+/// set), this reduces to exactly the pre-B2b two-way branch on `global`
+/// alone (`NoExit` or `Send{global, local_fallback:false}`, which drops —
+/// never locally egresses — on a failed send). This function must never be
+/// changed in a way that alters that reduction.
+fn choose_exit(
+    client_exit: Option<&str>,
+    global: Option<&str>,
+    is_live: impl Fn(&str) -> bool,
+) -> ExitDecision {
+    match client_exit {
+        Some(c) if is_live(c) => ExitDecision::Send {
+            addr: c.to_string(),
+            local_fallback: true,
+        },
+        Some(_) => match global {
+            Some(g) => ExitDecision::Send {
+                addr: g.to_string(),
+                local_fallback: true,
+            },
+            None => ExitDecision::NoExit,
+        },
+        None => match global {
+            Some(g) => ExitDecision::Send {
+                addr: g.to_string(),
+                local_fallback: false,
+            },
+            None => ExitDecision::NoExit,
+        },
+    }
+}
+
+/// Wave B2c (runtime dial add-peer): pure collection/diff function —
+/// given every client currently in the DB and the set of peer addresses
+/// this node is ALREADY dialing (`already`, from
+/// `PoolDialer::dialed_peer_addrs()`), returns every distinct, non-empty
+/// `exit_node` address referenced by any client that is NOT in `already`.
+/// The caller (`Gateway::add_dial_peers_for_client_exits`) then
+/// `PoolDialer::add_peer`s each returned address so it goes live without a
+/// restart.
+///
+/// Pure and side-effect-free — testable without a live `PoolDialer` or a
+/// real `ClientDatabase` (see the `exits_needing_dial_*` tests below).
+/// Deduped and returned as a `Vec` (stable iteration order over `clients`)
+/// rather than a `HashSet`, purely so a caller that wants to log "these N
+/// addresses are new" gets a deterministic order — the caller doesn't
+/// otherwise care about ordering, since `PoolDialer::add_peer` is
+/// idempotent per-address regardless of call order.
+fn exits_needing_dial(
+    clients: &[ClientConfig],
+    already: &std::collections::HashSet<String>,
+) -> Vec<String> {
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for c in clients {
+        let Some(addr) = c.exit_node.as_deref() else {
+            continue;
+        };
+        let addr = addr.trim();
+        if addr.is_empty() || already.contains(addr) {
+            continue;
+        }
+        if seen.insert(addr.to_string()) {
+            out.push(addr.to_string());
+        }
+    }
+    out
 }
 
 /// Gateway configuration
@@ -268,6 +386,19 @@ pub struct GatewayConfig {
     /// the same way in `main.rs` from `--audit-log`. `None` makes that route
     /// return `404 NotFound`, matching the REST path's behavior.
     pub audit_log_path: Option<std::path::PathBuf>,
+    /// Wave B1 (pool topology read endpoints): whether pool sync is
+    /// configured on this node AT ALL — i.e. `server.json`'s `pool` block
+    /// is present — regardless of `pool.transport`. `Gateway` only ever
+    /// receives a live `node_registry`/`pool_dialer` handle (via
+    /// `set_node_registry`/`set_pool_dialer`) on a MASKED-transport node
+    /// (see `main.rs`'s pool-sync wiring); the legacy, mask-independent
+    /// `PeerSyncer` path runs entirely outside `Gateway` and is invisible to
+    /// it. This flag is how `dispatch_mgmt_request` tells "pool configured,
+    /// but running the legacy transport with no queryable link state"
+    /// (`PoolHealth::transport == "legacy"`) apart from "no pool sync at
+    /// all" (`"none"`) when `pool_dialer` is `None` either way. Defaults to
+    /// `false`.
+    pub pool_configured: bool,
 }
 
 /// Default §2 `report_failure_threshold`. Kept in sync with the client's
@@ -319,6 +450,7 @@ impl Default for GatewayConfig {
             pool_client_psk: None,
             mgmt_server_addr: None,
             audit_log_path: None,
+            pool_configured: false,
         }
     }
 }
@@ -946,11 +1078,35 @@ pub struct Gateway {
     /// forwarded `ChainForward` payloads will silently find no live
     /// sender. See `set_masked_exit`.
     masked_exit_addr: Option<String>,
+    /// B2b (per-client exit routing, data plane): caches the resolved
+    /// per-client masked-exit target for each client VPN IP, so the
+    /// per-packet uplink path never does more than a single `DashMap` get
+    /// (`resolve_client_exit_addr`) instead of a linear
+    /// `ClientDatabase::find_by_vpn_ip` scan on every `Data` packet.
+    /// `None` cached against a key means "this client has no per-client
+    /// `exit_node` override — use the global default"; a missing key means
+    /// "not yet resolved" and triggers exactly one `find_by_vpn_ip` lookup
+    /// on the next packet from that IP.
+    ///
+    /// Invalidated (cleared wholesale — this is a small, low-churn map, one
+    /// entry per currently-active client VPN IP, so a full clear is cheap)
+    /// whenever the underlying `ClientDatabase` can change:
+    /// `reload_if_changed()` returning `true` (periodic hot-reload poll AND
+    /// SIGHUP), after any `dispatch_mgmt_request` mutation (so an admin
+    /// changing a client's `exit_node` takes effect live, without the
+    /// client reconnecting), and after a successful pool-sync
+    /// `merge_from_json` (so an `exit_node` change made on a PEER node also
+    /// takes effect live once it propagates here, not just admin-local
+    /// changes).
+    exit_route_cache: Arc<DashMap<Ipv4Addr, Option<String>>>,
     /// PHASE 4 (per-node identity): binds a masked pool-peer's self-asserted
     /// `node_id` to a durable Ed25519 key via `NodeEnrollment` (TOFU / manual
     /// pin). `None` (default) leaves node identity unauthenticated (pre-Phase-4
     /// behavior). Set on masked-transport nodes via `set_node_registry`.
     node_registry: Option<Arc<crate::node_registry::NodeRegistry>>,
+    /// Wave B1 (pool topology read endpoints): mirrors
+    /// `GatewayConfig::pool_configured` — see that field's doc comment.
+    pool_configured: bool,
     /// PHASE 4 (reverse chain-forward / exit downlink gap): on an exit node,
     /// remembers which masked pool-peer session (a dial-set entry on the
     /// ENTRY side — see `pool_dialer.rs`) an origin client's `ChainForward`
@@ -1305,6 +1461,31 @@ impl Gateway {
         let audit_log_path = self.config.audit_log_path.clone();
         let pending_config = self.pending_config.clone();
 
+        // Wave B1 (pool topology read endpoints): build the snapshot from
+        // live state BEFORE the `spawn_blocking` closure (all its inputs are
+        // already owned `Arc`/`Vec`/`String` clones, so this is cheap and
+        // doesn't need the blocking pool) — see `mgmt_service`'s "Pool
+        // topology views" doc comment for the legacy-transport /
+        // no-pool-sync degradation this implements.
+        let pool = match self.pool_dialer() {
+            Some(dialer) => {
+                let (registry_nodes, revoked) = match self.node_registry() {
+                    Some(registry) => (registry.list(), registry.list_revoked()),
+                    None => (Vec::new(), Vec::new()),
+                };
+                let statuses = dialer.pool_status_snapshot();
+                mgmt_service::build_pool_snapshot(mgmt_service::PoolSnapshotInputs {
+                    peers: dialer.peers(),
+                    registry_nodes: &registry_nodes,
+                    revoked: &revoked,
+                    statuses: &statuses,
+                    transport: "masked",
+                })
+            }
+            None if self.pool_configured => mgmt_service::PoolSnapshot::empty("legacy"),
+            None => mgmt_service::PoolSnapshot::empty("none"),
+        };
+
         let result = tokio::task::spawn_blocking(move || {
             let (server_pub_key, server_signing_pubkey) = if server_private_key != [0u8; 32] {
                 (
@@ -1329,10 +1510,31 @@ impl Gateway {
                 config_path: None,
                 audit_log_path: audit_log_path.as_deref(),
                 pending_config: Some(&pending_config),
+                pool: Some(pool),
             };
             mgmt_service::dispatch(&ctx, method, &path, &body)
         })
         .await;
+
+        // B2b: any mgmt request that reached `mgmt_service::dispatch` may
+        // have mutated the client DB (add/patch/delete, including a client's
+        // `exit_node`) — clear the exit-resolution cache unconditionally
+        // (cheap: read-only GET/list requests just pay one extra
+        // re-resolution on the next packet per active client, and this
+        // guarantees an admin's `exit_node` change takes effect live,
+        // without the client reconnecting). See `exit_route_cache`'s doc
+        // comment for the full invalidation policy.
+        self.exit_route_cache.clear();
+
+        // Wave B2c (runtime dial add-peer): the mutation above may have SET
+        // a client's `exit_node` to an address this node has never dialed
+        // (B2b only routes to exits that had a live dial session at
+        // startup — the dial set was fixed at `PoolDialer::new`
+        // construction). Ensure any such address gets a dial task spawned
+        // NOW, so it can go live without a server restart. Cheap: only runs
+        // once per mgmt request (never per-packet), and `add_peer` itself
+        // is an idempotent no-op for every already-tracked address.
+        self.add_dial_peers_for_client_exits();
 
         match result {
             Ok(r) => r,
@@ -1721,7 +1923,9 @@ impl Gateway {
             chain_forwarder: config.chain_forwarder.clone(),
             pool_dialer: None,
             masked_exit_addr: None,
+            exit_route_cache: Arc::new(DashMap::new()),
             node_registry: None,
+            pool_configured: config.pool_configured,
             chain_reverse_routes: Arc::new(DashMap::new()),
             chain_reverse_insert_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             chain_reverse_tx,
@@ -1801,11 +2005,179 @@ impl Gateway {
         self.pool_dialer = Some(dialer);
     }
 
+    /// B2b (per-client exit routing): shared handle to the exit-resolution
+    /// cache, for callers (`main.rs`'s SIGHUP reload handler) that need to
+    /// invalidate it from outside `Gateway`/`AivpnServer` — see the field's
+    /// doc comment for the full invalidation policy. Cheap (one `Arc`
+    /// clone); safe to call at any time, including before `run()`.
+    pub fn exit_route_cache(&self) -> Arc<DashMap<Ipv4Addr, Option<String>>> {
+        self.exit_route_cache.clone()
+    }
+
+    /// B2b (per-client exit routing): resolve `ip`'s masked-exit override,
+    /// if any, via a single `exit_route_cache` lookup — falling back to
+    /// exactly one `ClientDatabase::find_by_vpn_ip` scan (and caching the
+    /// result, `None` included) the first time this IP is seen since the
+    /// cache was last cleared. See `exit_route_cache`'s doc comment for the
+    /// invalidation policy that keeps this from ever serving a stale
+    /// `exit_node` after an admin change.
+    fn resolve_client_exit_addr(&self, ip: Ipv4Addr) -> Option<String> {
+        if let Some(cached) = self.exit_route_cache.get(&ip) {
+            return cached.clone();
+        }
+        let resolved = self
+            .client_db
+            .as_ref()
+            .and_then(|db| db.find_by_vpn_ip(&ip))
+            .and_then(|c| c.exit_node);
+        self.exit_route_cache.insert(ip, resolved.clone());
+        resolved
+    }
+
+    /// Wave B2c (runtime dial add-peer): scan every non-deleted client's
+    /// `exit_node` and `PoolDialer::add_peer` any address this node isn't
+    /// already dialing — makes a freshly-set (or peer-merged-in) per-client
+    /// exit route go live WITHOUT a server restart. B2b's `choose_exit`
+    /// only ever routes to an exit with a LIVE dial session; before this
+    /// wave, the dial set was fixed at `PoolDialer::new` construction, so an
+    /// admin pointing a client at a brand-new exit address silently fell
+    /// back to the global default (or `NoExit`) forever. Called from
+    /// `dispatch_mgmt_request` (right alongside the existing
+    /// `exit_route_cache.clear()`) and from the `PoolSync` merge arm of
+    /// `handle_control_message` (a peer node's admin can introduce a new
+    /// `exit_node` too).
+    ///
+    /// A no-op — cheaply — when `pool_dialer` isn't wired (legacy transport
+    /// or no pool-sync at all) or `client_db` isn't wired. Uses
+    /// `PoolDialer::dialed_peer_addrs()` as the "already being dialed" set
+    /// so `add_peer` isn't even attempted for an address already tracked
+    /// (though `add_peer` is itself idempotent regardless).
+    ///
+    /// Scope note: this only ever ADDS dial sessions, matching
+    /// `PoolDialer::add_peer`'s own scope note — it never tears one down,
+    /// and it never touches the GLOBAL default (`masked_exit_addr`) path,
+    /// which stays restart-only for this wave (see `PoolDialer::add_peer`'s
+    /// doc comment for both follow-ups).
+    fn add_dial_peers_for_client_exits(&self) {
+        let (Some(dialer), Some(db)) = (self.pool_dialer.as_ref(), self.client_db.as_ref()) else {
+            return;
+        };
+        let already: std::collections::HashSet<String> =
+            dialer.dialed_peer_addrs().into_iter().collect();
+        let clients = db.list_clients();
+        for addr in exits_needing_dial(&clients, &already) {
+            dialer.add_peer(addr);
+        }
+    }
+
+    /// B2b (per-client exit routing): resolve the full `ExitDecision` for
+    /// `session`'s owning client — the pure `choose_exit` decision, fed with
+    /// this client's cached per-client override (`resolve_client_exit_addr`),
+    /// the node's global default (`masked_exit_addr`), and a live-session
+    /// check (`PoolDialer::has_live_session`). A session with no `vpn_ip`
+    /// yet (shouldn't happen for a `Data`/FEC packet post-handshake, but
+    /// handled defensively) has no per-client override to resolve and
+    /// behaves exactly like `client_exit = None`.
+    fn exit_decision_for_session(
+        &self,
+        session: &Arc<parking_lot::Mutex<Session>>,
+    ) -> ExitDecision {
+        let vpn_ip = session.lock().vpn_ip;
+        let client_exit = vpn_ip.and_then(|ip| self.resolve_client_exit_addr(ip));
+        choose_exit(
+            client_exit.as_deref(),
+            self.masked_exit_addr.as_deref(),
+            |addr| {
+                self.pool_dialer
+                    .as_ref()
+                    .is_some_and(|d| d.has_live_session(addr))
+            },
+        )
+    }
+
+    /// B2b (per-client exit routing): execute an `ExitDecision::Send` — try
+    /// `PoolDialer::send_to_peer(addr, ChainForward{payload})`; on failure,
+    /// either silently drop (`local_fallback == false` — the pre-B2b,
+    /// global-default-only behavior, REGRESSION INVARIANT: must never
+    /// change) or fall back to local TUN/NAT egress (`local_fallback ==
+    /// true` — only reachable via a per-client `exit_node` override, a
+    /// strictly new B2b code path). Never falls back to the legacy
+    /// `chain_forwarder` — that stays global-only, wired independently by
+    /// `main.rs` and mutually exclusive with masked-transport exit routing.
+    ///
+    /// Only clones `payload` when `local_fallback` is `true` (it may be
+    /// needed again for the local-egress fallback) — the common
+    /// no-per-client-override path (`local_fallback == false`) moves it
+    /// straight into the `send_to_peer` call, same as the pre-B2b code.
+    async fn forward_via_exit(
+        &self,
+        addr: &str,
+        local_fallback: bool,
+        payload: Vec<u8>,
+    ) -> Result<()> {
+        if !local_fallback {
+            let sent = self
+                .pool_dialer
+                .as_ref()
+                .is_some_and(|d| d.send_to_peer(addr, ControlPayload::ChainForward { payload }));
+            if !sent {
+                debug!(
+                    "masked exit: no live pool-peer session to {} — dropping data packet",
+                    addr
+                );
+            }
+            return Ok(());
+        }
+
+        let sent = self.pool_dialer.as_ref().is_some_and(|d| {
+            d.send_to_peer(
+                addr,
+                ControlPayload::ChainForward {
+                    payload: payload.clone(),
+                },
+            )
+        });
+        if sent {
+            return Ok(());
+        }
+        debug!(
+            "masked exit: client exit {} has no live dial session — falling back to local egress",
+            addr
+        );
+        if let Some(ref tx) = self.tun_write_tx {
+            if tx.send(payload).await.is_err() {
+                debug!("TUN write channel closed, dropping packet");
+            }
+        } else if let Some(ref nat) = self.nat_forwarder {
+            nat.forward_packet(&payload).await?;
+        } else {
+            debug!("NAT disabled, dropping packet");
+        }
+        Ok(())
+    }
+
     /// PHASE 4 (per-node identity): install the pool-node identity registry so
     /// a masked pool-peer's `NodeEnrollment` is verified and its `node_id`
     /// cryptographically bound. `main.rs` wires this on masked-transport nodes.
     pub fn set_node_registry(&mut self, registry: Arc<crate::node_registry::NodeRegistry>) {
         self.node_registry = Some(registry);
+    }
+
+    /// Wave B1 (pool topology read endpoints): shared handle to the
+    /// installed node registry, if any — for `dispatch_mgmt_request` (and,
+    /// via `AivpnServer::node_registry`, the REST `ApiState`) to build a
+    /// `mgmt_service::PoolSnapshot` from live state. `None` on a node with
+    /// no pool sync configured, or one running the legacy transport (see
+    /// `pool_configured`'s doc comment).
+    pub fn node_registry(&self) -> Option<Arc<crate::node_registry::NodeRegistry>> {
+        self.node_registry.clone()
+    }
+
+    /// Wave B1 (pool topology read endpoints): shared handle to the
+    /// installed masked pool-client dialer, if any — see
+    /// [`Self::node_registry`]'s doc comment for the same caveat.
+    pub fn pool_dialer(&self) -> Option<Arc<crate::pool_dialer::PoolDialer>> {
+        self.pool_dialer.clone()
     }
 
     /// BUG D1 fix (route-auth identity enforcement): install the
@@ -2457,10 +2829,18 @@ impl Gateway {
         // Spawn client DB hot-reload task (pick up new clients without restart)
         if let Some(ref db) = self.client_db {
             let db = db.clone();
+            // B2b: invalidate the exit-resolution cache whenever the
+            // on-disk clients DB actually changed (a new/edited/rotated
+            // `exit_node` — e.g. `clients.json` edited directly, or a
+            // sibling process wrote it) — see `exit_route_cache`'s doc
+            // comment for the full invalidation policy.
+            let exit_route_cache = self.exit_route_cache.clone();
             tokio::spawn(async move {
                 loop {
                     tokio::time::sleep(Duration::from_secs(10)).await;
-                    db.reload_if_changed();
+                    if db.reload_if_changed() {
+                        exit_route_cache.clear();
+                    }
                 }
             });
             info!("Client DB hot-reload task spawned (10s interval)");
@@ -4922,55 +5302,54 @@ impl Gateway {
                     }
                 }
 
-                // Site peers send subnet traffic — never relay to the exit node.
+                // Site peers send subnet traffic — never relay to the exit node
+                // (masked or legacy chain_forwarder), regardless of any exit
+                // configuration; always local TUN/NAT egress. Unchanged by B2b.
+                //
+                // B2b: for non-site-peer traffic, `exit_decision_for_session`
+                // resolves this CLIENT's own `exit_node` override (B2a,
+                // cached in `exit_route_cache`), falling back to the node's
+                // global default (`self.masked_exit_addr`, sourced from
+                // `pool.exit_node`) exactly as before when no per-client
+                // override is set — see `choose_exit`'s doc comment for the
+                // REGRESSION INVARIANT this preserves.
                 let is_site_peer_now = session.lock().is_site_peer;
-                if !is_site_peer_now && self.masked_exit_addr.is_some() {
-                    // PHASE 3 (exit over masked transport): forward the
-                    // client's inner IP payload to the exit node over its
-                    // already-dialed masked pool-peer session, instead of
-                    // the legacy dedicated-socket `ChainForwarder` below.
-                    //
-                    // PERF NOTE (operator tradeoff, not a bug): this rides
-                    // the pool dialer's control channel — mimicry-first,
-                    // indistinguishable on the wire from ordinary masked
-                    // control traffic, at the cost of a per-packet control
-                    // envelope. The legacy `ChainForwarder` path uses a
-                    // dedicated UDP socket instead — higher throughput, but
-                    // a distinguishable extra flow. `pool.transport`
-                    // ("masked" vs legacy/default) is how the operator picks.
-                    let exit_addr = self.masked_exit_addr.as_deref().unwrap_or("");
-                    let sent = self.pool_dialer.as_ref().is_some_and(|d| {
-                        d.send_to_peer(
-                            exit_addr,
-                            ControlPayload::ChainForward {
-                                payload: payload.to_vec(),
-                            },
-                        )
-                    });
-                    if !sent {
-                        // Data-plane drop, same semantics as a dropped UDP
-                        // packet — never block the data path on this.
-                        debug!(
-                            "masked exit: no live pool-peer session to {} — dropping data packet",
-                            exit_addr
-                        );
+                if !is_site_peer_now {
+                    match self.exit_decision_for_session(session) {
+                        ExitDecision::Send {
+                            addr,
+                            local_fallback,
+                        } => {
+                            self.forward_via_exit(&addr, local_fallback, payload.to_vec())
+                                .await?;
+                        }
+                        ExitDecision::NoExit => {
+                            // No exit configured at all (neither per-client
+                            // nor global) — legacy chain_forwarder/local TUN
+                            // egress, byte-identical to the pre-B2b
+                            // `masked_exit_addr.is_none()` branch.
+                            if let Some(ref cf) = self.chain_forwarder {
+                                // Multi-hop: relay to exit node instead of local NAT
+                                cf.forward(payload.to_vec()).await;
+                            } else if let Some(ref tx) = self.tun_write_tx {
+                                if tx.send(payload.to_vec()).await.is_err() {
+                                    debug!("TUN write channel closed, dropping packet");
+                                }
+                            } else if let Some(ref nat) = self.nat_forwarder {
+                                nat.forward_packet(payload).await?;
+                            } else {
+                                debug!("NAT disabled, dropping packet");
+                            }
+                        }
                     }
+                } else if let Some(ref tx) = self.tun_write_tx {
+                    if tx.send(payload.to_vec()).await.is_err() {
+                        debug!("TUN write channel closed, dropping packet");
+                    }
+                } else if let Some(ref nat) = self.nat_forwarder {
+                    nat.forward_packet(payload).await?;
                 } else {
-                    let use_chain_forward = self.chain_forwarder.is_some() && !is_site_peer_now;
-                    if use_chain_forward {
-                        if let Some(ref cf) = self.chain_forwarder {
-                            // Multi-hop: relay to exit node instead of local NAT
-                            cf.forward(payload.to_vec()).await;
-                        }
-                    } else if let Some(ref tx) = self.tun_write_tx {
-                        if tx.send(payload.to_vec()).await.is_err() {
-                            debug!("TUN write channel closed, dropping packet");
-                        }
-                    } else if let Some(ref nat) = self.nat_forwarder {
-                        nat.forward_packet(payload).await?;
-                    } else {
-                        debug!("NAT disabled, dropping packet");
-                    }
+                    debug!("NAT disabled, dropping packet");
                 }
 
                 // Accumulate payload into FEC XOR buffer for server-side recovery.
@@ -5088,32 +5467,36 @@ impl Gateway {
                                          {}->{} at ingress",
                                         inner_src, inner_dst
                                     );
-                                } else if !is_site_peer && self.masked_exit_addr.is_some() {
-                                    // PHASE 3 (exit over masked transport),
-                                    // FEC-recovered packet path — see the
-                                    // PERF NOTE at the primary Data-packet
-                                    // site above; the same tradeoff applies.
-                                    let exit_addr = self.masked_exit_addr.as_deref().unwrap_or("");
-                                    let sent = self.pool_dialer.as_ref().is_some_and(|d| {
-                                        d.send_to_peer(
-                                            exit_addr,
-                                            ControlPayload::ChainForward { payload: recovered },
-                                        )
-                                    });
-                                    if !sent {
-                                        debug!(
-                                            "masked exit: no live pool-peer session to {} — \
-                                             dropping recovered packet",
-                                            exit_addr
-                                        );
+                                } else if !is_site_peer {
+                                    // B2b: same per-client-exit-then-global
+                                    // resolution as the primary Data-packet
+                                    // site above — see `choose_exit`'s doc
+                                    // comment for the REGRESSION INVARIANT
+                                    // this preserves when no per-client
+                                    // override is set.
+                                    match self.exit_decision_for_session(session) {
+                                        ExitDecision::Send {
+                                            addr,
+                                            local_fallback,
+                                        } => {
+                                            self.forward_via_exit(&addr, local_fallback, recovered)
+                                                .await?;
+                                        }
+                                        ExitDecision::NoExit => {
+                                            if let Some(ref cf) = self.chain_forwarder {
+                                                cf.forward(recovered).await;
+                                            } else if let Some(ref tx) = self.tun_write_tx {
+                                                let _ = tx.send(recovered).await;
+                                            } else if let Some(ref nat) = self.nat_forwarder {
+                                                nat.forward_packet(&recovered).await?;
+                                            }
+                                        }
                                     }
                                 } else {
-                                    let use_chain = self.chain_forwarder.is_some() && !is_site_peer;
-                                    if use_chain {
-                                        if let Some(ref cf) = self.chain_forwarder {
-                                            cf.forward(recovered).await;
-                                        }
-                                    } else if let Some(ref tx) = self.tun_write_tx {
+                                    // is_site_peer: subnet traffic never relays to an
+                                    // exit or the legacy chain_forwarder — local egress
+                                    // only, unchanged by B2b.
+                                    if let Some(ref tx) = self.tun_write_tx {
                                         let _ = tx.send(recovered).await;
                                     } else if let Some(ref nat) = self.nat_forwarder {
                                         nat.forward_packet(&recovered).await?;
@@ -5427,11 +5810,28 @@ impl Gateway {
                 } else if let Some(ref db) = self.client_db {
                     let json_str = String::from_utf8_lossy(&clients_json);
                     match db.merge_from_json(&json_str) {
-                        Ok(n) => info!(
-                            "pool_sync: merged {} clients from peer {}",
-                            n,
-                            hash_addr(&client_addr)
-                        ),
+                        Ok(n) => {
+                            info!(
+                                "pool_sync: merged {} clients from peer {}",
+                                n,
+                                hash_addr(&client_addr)
+                            );
+                            // B2b: a peer's merge can change a client's
+                            // `exit_node` (e.g. an admin set it on a
+                            // DIFFERENT pool node) — clear the local
+                            // exit-resolution cache so that takes effect
+                            // live here too, not just on the node the
+                            // change was made on. See `exit_route_cache`'s
+                            // doc comment.
+                            self.exit_route_cache.clear();
+                            // Wave B2c: same reasoning as the mgmt-mutation
+                            // hook above — a merged-in `exit_node` this node
+                            // never dialed at startup needs a runtime
+                            // add_peer too, or B2b's live-routing decision
+                            // would just keep falling back to the global
+                            // default forever.
+                            self.add_dial_peers_for_client_exits();
+                        }
                         Err(e) => warn!(
                             "pool_sync: merge failed from {}: {}",
                             hash_addr(&client_addr),
@@ -5711,6 +6111,93 @@ impl Gateway {
                 } else {
                     debug!(
                         "NodeEnrollment from {} ignored — no node registry configured",
+                        hash_addr(&client_addr)
+                    );
+                }
+            }
+            ControlPayload::PartitionAnnounce {
+                subnet_cidr: peer_cidr,
+                partition_index: peer_index,
+                partition_size: _peer_partition_size,
+                num_partitions: _peer_num_partitions,
+                explicit: peer_explicit,
+            } => {
+                // Wave B-IP.2: a masked pool-peer announces its VPN-IP
+                // partition assignment (Wave B-IP's `set_node_partition`/
+                // `_explicit`) purely for operator visibility — the
+                // disjoint-slice allocation guarantee itself is already
+                // enforced deterministically on each node independently,
+                // whether or not either side ever sees this message. Gated
+                // on `is_masked_pool_peer` like the other pool anti-entropy
+                // control types above.
+                let (is_masked_pool, verified_node_id) = {
+                    let sess = session.lock();
+                    (sess.is_masked_pool_peer, sess.verified_node_id.clone())
+                };
+                if !is_masked_pool {
+                    debug!(
+                        "PartitionAnnounce from {} ignored — not a masked pool-peer session",
+                        hash_addr(&client_addr)
+                    );
+                } else if let Some(ref db) = self.client_db {
+                    let local_cidr = db.network_config().cidr_string();
+                    let local_partition_info = db.partition_info();
+                    let local_partition =
+                        local_partition_info.map(|p| (p.partition_index, p.explicit));
+                    let check = crate::pool_partition::check_partition(
+                        &local_cidr,
+                        local_partition,
+                        &peer_cidr,
+                        Some((peer_index, peer_explicit)),
+                    );
+                    let peer_desc = verified_node_id.unwrap_or_else(|| hash_addr(&client_addr));
+
+                    let should_log = {
+                        let mut sess = session.lock();
+                        let changed = sess.last_partition_check != Some(check);
+                        sess.last_partition_check = Some(check);
+                        changed
+                    };
+                    if should_log {
+                        crate::pool_partition::log_partition_check(
+                            check,
+                            &peer_desc,
+                            &local_cidr,
+                            &peer_cidr,
+                        );
+                    }
+
+                    // Reply with our own announce so the dialing peer's
+                    // anti-entropy loop (which has no other way to learn
+                    // OUR partition state — the gateway never dials out)
+                    // can run the same check from its side too, over this
+                    // same session. `unwrap_or` covers the "this node has
+                    // no partition configured" case with a self-describing
+                    // sentinel (num_partitions: 1, explicit: false) rather
+                    // than skipping the reply.
+                    let info = local_partition_info.unwrap_or(crate::client_db::PartitionInfo {
+                        partition_index: 0,
+                        partition_size: 0,
+                        num_partitions: 1,
+                        explicit: false,
+                    });
+                    let reply = ControlPayload::PartitionAnnounce {
+                        subnet_cidr: local_cidr,
+                        partition_index: info.partition_index,
+                        partition_size: info.partition_size,
+                        num_partitions: info.num_partitions,
+                        explicit: info.explicit,
+                    };
+                    if let Err(e) = self.send_control_message(&reply, session).await {
+                        warn!(
+                            "PartitionAnnounce: failed to send reply to {}: {}",
+                            hash_addr(&client_addr),
+                            e
+                        );
+                    }
+                } else {
+                    debug!(
+                        "PartitionAnnounce from {} ignored — no client_db configured",
                         hash_addr(&client_addr)
                     );
                 }
@@ -6810,6 +7297,8 @@ fn make_kernel_update_tags(sess: &crate::session::Session) -> UpdateTagsPayload 
 mod tests {
     use super::chain_reverse_route_insert;
     use super::chain_reverse_route_lookup;
+    use super::choose_exit;
+    use super::exits_needing_dial;
     use super::inner_l7_prefix;
     use super::mask_feedback_throttled;
     use super::mask_preference_throttled;
@@ -6819,6 +7308,8 @@ mod tests {
     use super::try_claim_mask_preference_slot;
     use super::try_claim_mgmt_slot;
     use super::verify_device_enrollment_proof;
+    use super::ClientConfig;
+    use super::ExitDecision;
     use super::Gateway;
     use super::GatewayConfig;
     use super::MaskCatalog;
@@ -6834,6 +7325,550 @@ mod tests {
     use std::net::{Ipv4Addr, SocketAddr};
     use std::sync::Arc;
     use std::time::{Duration, Instant};
+
+    // --- Wave B2b: per-client exit routing (data plane) -----------------
+
+    /// REGRESSION INVARIANT: with no per-client `exit_node` at all (the
+    /// current common case), `choose_exit` must reduce to exactly the
+    /// pre-B2b two-way branch on the global default alone — `NoExit` when
+    /// unset, otherwise `Send{global, local_fallback:false}` (never locally
+    /// egresses on a failed send — matches the pre-B2b silent-drop
+    /// behavior). `is_live` must not even be consulted in this case.
+    #[test]
+    fn choose_exit_no_client_override_matches_pre_b2b_behavior() {
+        assert_eq!(
+            choose_exit(None, None, |_| panic!("is_live must not be called")),
+            ExitDecision::NoExit,
+            "no client override and no global default — legacy chain_forwarder/local path"
+        );
+        assert_eq!(
+            choose_exit(None, Some("exit.example.com:443"), |_| panic!(
+                "is_live must not be called"
+            )),
+            ExitDecision::Send {
+                addr: "exit.example.com:443".to_string(),
+                local_fallback: false,
+            },
+            "no client override — must use the global default with NO local-egress fallback \
+             (byte-identical to the pre-B2b masked_exit_addr-only branch)"
+        );
+    }
+
+    /// A client with a live per-client `exit_node` override routes to its
+    /// own exit, regardless of what the global default is (or isn't).
+    #[test]
+    fn choose_exit_routes_live_client_override_to_its_own_exit() {
+        let decision = choose_exit(
+            Some("client-exit-a:51820"),
+            Some("global-exit:51820"),
+            |addr| addr == "client-exit-a:51820",
+        );
+        assert_eq!(
+            decision,
+            ExitDecision::Send {
+                addr: "client-exit-a:51820".to_string(),
+                local_fallback: true,
+            }
+        );
+
+        // Also true with no global default configured at all.
+        let decision_no_global = choose_exit(Some("client-exit-a:51820"), None, |addr| {
+            addr == "client-exit-a:51820"
+        });
+        assert_eq!(
+            decision_no_global,
+            ExitDecision::Send {
+                addr: "client-exit-a:51820".to_string(),
+                local_fallback: true,
+            }
+        );
+    }
+
+    /// A client whose per-client `exit_node` override has no live dial
+    /// session falls back to the global default, with local-egress fallback
+    /// enabled (unlike the plain-global-default case above).
+    #[test]
+    fn choose_exit_falls_back_to_global_when_client_override_not_live() {
+        let decision = choose_exit(
+            Some("client-exit-b:51820"),
+            Some("global-exit:51820"),
+            |_| false, // nothing is live
+        );
+        assert_eq!(
+            decision,
+            ExitDecision::Send {
+                addr: "global-exit:51820".to_string(),
+                local_fallback: true,
+            },
+            "per-client override not live — falls back to the global default, with local \
+             egress permitted if THAT also fails"
+        );
+    }
+
+    /// A client whose per-client `exit_node` override has no live session
+    /// AND there is no global default either — nothing to route to at all;
+    /// the caller falls through to local TUN egress via the `NoExit` path.
+    #[test]
+    fn choose_exit_no_exit_when_client_override_not_live_and_no_global() {
+        let decision = choose_exit(Some("client-exit-c:51820"), None, |_| false);
+        assert_eq!(decision, ExitDecision::NoExit);
+    }
+
+    /// `resolve_client_exit_addr` must: (1) return a client's own
+    /// `exit_node` when set, (2) return `None` for a client with no
+    /// override AND for an IP matching no client at all, and (3) actually
+    /// CACHE the result — a DB change made without invalidating the cache
+    /// must not be observed until the cache is explicitly cleared (the same
+    /// `.clear()` call the reload/mgmt-mutation/pool-merge hooks perform).
+    #[test]
+    fn resolve_client_exit_addr_uses_client_override_and_caches_result() {
+        use crate::client_db::{ClientDatabase, UpdateClientParams};
+
+        let dir = tempfile::tempdir().unwrap();
+        let network = aivpn_common::network_config::VpnNetworkConfig {
+            server_vpn_ip: Ipv4Addr::new(10, 77, 0, 1),
+            prefix_len: 24,
+            mtu: 1400,
+            ..Default::default()
+        };
+        let db = Arc::new(ClientDatabase::load(&dir.path().join("clients.json"), network).unwrap());
+        let with_exit = db.add_client("has-exit").unwrap();
+        db.update_client(
+            &with_exit.id,
+            UpdateClientParams {
+                exit_node: Some(Some("exit-a.example.com:51820".to_string())),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let without_exit = db.add_client("no-exit").unwrap();
+
+        let mut config = make_test_gateway_config("exit-cache");
+        config.client_db = Some(db.clone());
+        let gateway = Gateway::new(config).expect("gateway constructs");
+
+        assert_eq!(
+            gateway.resolve_client_exit_addr(with_exit.vpn_ip),
+            Some("exit-a.example.com:51820".to_string()),
+            "must return the client's own exit_node override"
+        );
+        assert_eq!(
+            gateway.resolve_client_exit_addr(without_exit.vpn_ip),
+            None,
+            "a client with no override resolves to None (caller falls back to global)"
+        );
+        let unknown_ip = Ipv4Addr::new(10, 77, 0, 250);
+        assert_eq!(
+            gateway.resolve_client_exit_addr(unknown_ip),
+            None,
+            "an IP matching no client at all also resolves to None, not a scan every time"
+        );
+
+        // Mutate the DB directly WITHOUT invalidating the cache — the
+        // already-cached (now stale) `None` must still be served.
+        db.update_client(
+            &without_exit.id,
+            UpdateClientParams {
+                exit_node: Some(Some("exit-b.example.com:51820".to_string())),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            gateway.resolve_client_exit_addr(without_exit.vpn_ip),
+            None,
+            "a cached result must be served until the cache is explicitly invalidated"
+        );
+
+        // After invalidation (the exact `.clear()` the reload/mgmt/pool-merge
+        // hooks call), the next resolution re-scans and picks up the change.
+        gateway.exit_route_cache().clear();
+        assert_eq!(
+            gateway.resolve_client_exit_addr(without_exit.vpn_ip),
+            Some("exit-b.example.com:51820".to_string()),
+            "after cache invalidation, the new exit_node must be resolved"
+        );
+    }
+
+    /// End-to-end `exit_decision_for_session` wiring (cache + `choose_exit`
+    /// + `PoolDialer::has_live_session`) against a REAL `Gateway` +
+    /// `PoolDialer`, covering the three routing-helper scenarios from the
+    /// B2b spec:
+    /// - a client with `exit_node` A and a LIVE session to A → forwards to A
+    /// - a client with `exit_node` B but NO live session to B → falls back
+    ///   to the global default
+    /// - a client with no `exit_node` at all → uses the global default,
+    ///   with `local_fallback: false` (the REGRESSION-INVARIANT path,
+    ///   byte-identical to pre-B2b `Send{addr: global}`)
+    #[tokio::test]
+    async fn exit_decision_for_session_routes_per_client_then_falls_back_to_global() {
+        use crate::client_db::{ClientDatabase, UpdateClientParams};
+        use crate::pool_dialer::PoolDialer;
+        use crate::pool_sync::PoolSyncConfig;
+        use base64::Engine as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let network = aivpn_common::network_config::VpnNetworkConfig {
+            server_vpn_ip: Ipv4Addr::new(10, 88, 0, 1),
+            prefix_len: 24,
+            mtu: 1400,
+            ..Default::default()
+        };
+        let db = Arc::new(ClientDatabase::load(&dir.path().join("clients.json"), network).unwrap());
+
+        let live_client = db.add_client("live-exit").unwrap();
+        db.update_client(
+            &live_client.id,
+            UpdateClientParams {
+                exit_node: Some(Some("exit-a.example.com:51820".to_string())),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let dead_client = db.add_client("dead-exit").unwrap();
+        db.update_client(
+            &dead_client.id,
+            UpdateClientParams {
+                exit_node: Some(Some("exit-b.example.com:51820".to_string())),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let plain_client = db.add_client("no-exit").unwrap();
+
+        let pool_cfg = PoolSyncConfig {
+            peers: vec![
+                "exit-a.example.com:51820".to_string(),
+                "exit-b.example.com:51820".to_string(),
+            ],
+            node_id: Some("this-node:443".to_string()),
+            sync_port: None,
+            sync_key: Some(base64::engine::general_purpose::STANDARD.encode([9u8; 32])),
+            exit_node: None,
+            exit_node_enabled: None,
+            sync_beacon_secs: None,
+            transport: Some("masked".to_string()),
+            allow_auto_add: None,
+            node_identity_key: None,
+            require_node_enrollment: None,
+            node_ip_partition: None,
+        };
+        let dialer = PoolDialer::new(db.clone(), &pool_cfg, vec![], None, None)
+            .expect("dialer constructs with a valid sync_key + node_id");
+        // Only exit-a has a live dialed session; exit-b's dial_loop is
+        // still backing off / never connected.
+        let _rx_a = dialer.test_register_live_session("exit-a.example.com:51820");
+
+        let mut config = make_test_gateway_config("exit-decision");
+        config.client_db = Some(db.clone());
+        let mut gateway = Gateway::new(config).expect("gateway constructs");
+        gateway.set_masked_exit(dialer, "global-exit.example.com:51820".to_string());
+
+        let live_session = make_bare_session(Some(live_client.id.clone()));
+        live_session.lock().vpn_ip = Some(live_client.vpn_ip);
+        assert_eq!(
+            gateway.exit_decision_for_session(&live_session),
+            ExitDecision::Send {
+                addr: "exit-a.example.com:51820".to_string(),
+                local_fallback: true,
+            },
+            "a client with a LIVE per-client exit session must route to its own exit"
+        );
+
+        let dead_session = make_bare_session(Some(dead_client.id.clone()));
+        dead_session.lock().vpn_ip = Some(dead_client.vpn_ip);
+        assert_eq!(
+            gateway.exit_decision_for_session(&dead_session),
+            ExitDecision::Send {
+                addr: "global-exit.example.com:51820".to_string(),
+                local_fallback: true,
+            },
+            "a client whose per-client exit has NO live session must fall back to the global \
+             default"
+        );
+
+        let plain_session = make_bare_session(Some(plain_client.id.clone()));
+        plain_session.lock().vpn_ip = Some(plain_client.vpn_ip);
+        assert_eq!(
+            gateway.exit_decision_for_session(&plain_session),
+            ExitDecision::Send {
+                addr: "global-exit.example.com:51820".to_string(),
+                local_fallback: false,
+            },
+            "REGRESSION INVARIANT: a client with NO per-client exit_node must resolve exactly \
+             like the pre-B2b global-only path (local_fallback: false)"
+        );
+    }
+
+    // ── Wave B2c: runtime dial add-peer ─────────────────────────────────
+
+    /// No clients at all — `exits_needing_dial` must return an empty `Vec`,
+    /// not panic.
+    #[test]
+    fn exits_needing_dial_empty_when_no_clients() {
+        let already = std::collections::HashSet::new();
+        assert!(exits_needing_dial(&[], &already).is_empty());
+    }
+
+    /// A client with no `exit_node` at all (the common case) contributes
+    /// nothing to the result.
+    #[test]
+    fn exits_needing_dial_ignores_clients_without_exit_node() {
+        let mut client = test_client_config("no-exit");
+        client.exit_node = None;
+        let already = std::collections::HashSet::new();
+        assert!(exits_needing_dial(&[client], &already).is_empty());
+    }
+
+    /// A client whose `exit_node` is already in `already` (this node is
+    /// dialing it) must NOT be returned — the whole point of the diff.
+    #[test]
+    fn exits_needing_dial_excludes_already_dialed_addresses() {
+        let mut client = test_client_config("has-exit");
+        client.exit_node = Some("exit-a:51820".to_string());
+        let mut already = std::collections::HashSet::new();
+        already.insert("exit-a:51820".to_string());
+        assert!(exits_needing_dial(&[client], &already).is_empty());
+    }
+
+    /// A client whose `exit_node` is NOT in `already` must be returned —
+    /// the core "this needs a runtime add_peer" case.
+    #[test]
+    fn exits_needing_dial_returns_new_exit_addresses() {
+        let mut client = test_client_config("has-exit");
+        client.exit_node = Some("brand-new-exit:51820".to_string());
+        let already = std::collections::HashSet::new();
+        assert_eq!(
+            exits_needing_dial(&[client], &already),
+            vec!["brand-new-exit:51820".to_string()]
+        );
+    }
+
+    /// Two different clients pointed at the SAME new exit address must
+    /// only produce that address once — `add_peer` would be idempotent
+    /// anyway, but the diff function itself should not hand the caller
+    /// duplicate work.
+    #[test]
+    fn exits_needing_dial_dedupes_shared_new_exit_across_clients() {
+        let mut client_a = test_client_config("client-a");
+        client_a.exit_node = Some("shared-exit:51820".to_string());
+        let mut client_b = test_client_config("client-b");
+        client_b.exit_node = Some("shared-exit:51820".to_string());
+        let already = std::collections::HashSet::new();
+
+        let result = exits_needing_dial(&[client_a, client_b], &already);
+        assert_eq!(result, vec!["shared-exit:51820".to_string()]);
+    }
+
+    /// A mix: one client already dialed, one client with a genuinely new
+    /// exit, one client with no exit_node at all — only the genuinely new
+    /// address must come back.
+    #[test]
+    fn exits_needing_dial_mixed_scenario_returns_only_new_addresses() {
+        let mut already_dialed = test_client_config("already-dialed");
+        already_dialed.exit_node = Some("old-exit:51820".to_string());
+        let mut new_exit = test_client_config("new-exit-client");
+        new_exit.exit_node = Some("fresh-exit:51820".to_string());
+        let no_exit = test_client_config("plain-client");
+
+        let mut already = std::collections::HashSet::new();
+        already.insert("old-exit:51820".to_string());
+
+        let result = exits_needing_dial(&[already_dialed, new_exit, no_exit], &already);
+        assert_eq!(result, vec!["fresh-exit:51820".to_string()]);
+    }
+
+    /// An empty/whitespace-only `exit_node` value must be ignored
+    /// defensively (shouldn't occur in practice — `validate_exit_node_addr`
+    /// rejects it at write time — but the diff function must not treat it
+    /// as a real address to dial).
+    #[test]
+    fn exits_needing_dial_ignores_blank_exit_node() {
+        let mut client = test_client_config("blank-exit");
+        client.exit_node = Some("   ".to_string());
+        let already = std::collections::HashSet::new();
+        assert!(exits_needing_dial(&[client], &already).is_empty());
+    }
+
+    /// Minimal `ClientConfig` builder for `exits_needing_dial` unit tests —
+    /// only `id`/`exit_node` matter to that function, but a real
+    /// `ClientConfig` needs the other fields populated to construct at all.
+    /// Mirrors the field set client_db.rs's own tests use to hand-build a
+    /// `ClientConfig` (e.g. its `peer_client`/`incoming` test fixtures).
+    fn test_client_config(id: &str) -> ClientConfig {
+        use crate::client_db::{ClientRole, ClientStats};
+        ClientConfig {
+            id: id.to_string(),
+            name: id.to_string(),
+            psk: [0u8; 32],
+            vpn_ip: Ipv4Addr::new(10, 99, 0, 2),
+            enabled: true,
+            created_at: chrono::Utc::now(),
+            stats: ClientStats::default(),
+            qos: None,
+            device_pubkey: None,
+            one_time: false,
+            expires_at: None,
+            updated_at: None,
+            deleted: false,
+            role: ClientRole::User,
+            exit_node: None,
+        }
+    }
+
+    /// End-to-end (well short of a network) check of `Gateway::
+    /// add_dial_peers_for_client_exits`: with a real `ClientDatabase`
+    /// holding a client whose `exit_node` was just set to an address the
+    /// node's `PoolDialer` was NOT configured to dial at startup, calling
+    /// the hook must actually register that address in the dialer's dial
+    /// set (`is_dialed_peer`) — the live-wiring guarantee this whole wave
+    /// exists to provide.
+    #[tokio::test]
+    async fn add_dial_peers_for_client_exits_dials_a_freshly_set_client_exit() {
+        use crate::client_db::{ClientDatabase, UpdateClientParams};
+        use crate::pool_dialer::PoolDialer;
+        use crate::pool_sync::PoolSyncConfig;
+        use base64::Engine as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let network = aivpn_common::network_config::VpnNetworkConfig {
+            server_vpn_ip: Ipv4Addr::new(10, 91, 0, 1),
+            prefix_len: 24,
+            mtu: 1400,
+            ..Default::default()
+        };
+        let db = Arc::new(ClientDatabase::load(&dir.path().join("clients.json"), network).unwrap());
+
+        let client = db.add_client("needs-runtime-dial").unwrap();
+        db.update_client(
+            &client.id,
+            UpdateClientParams {
+                exit_node: Some(Some("runtime-exit.example.com:51820".to_string())),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let pool_cfg = PoolSyncConfig {
+            peers: vec!["startup-peer:443".to_string()],
+            node_id: Some("this-node:443".to_string()),
+            sync_port: None,
+            sync_key: Some(base64::engine::general_purpose::STANDARD.encode([9u8; 32])),
+            exit_node: None,
+            exit_node_enabled: None,
+            sync_beacon_secs: None,
+            transport: Some("masked".to_string()),
+            allow_auto_add: None,
+            node_identity_key: None,
+            require_node_enrollment: None,
+            node_ip_partition: None,
+        };
+        let dialer = PoolDialer::new(db.clone(), &pool_cfg, vec![], None, None)
+            .expect("dialer constructs with a valid sync_key + node_id");
+        // Simulate `start()`: the runtime-added exit must NOT already be
+        // dialed at this point.
+        dialer.test_mark_started(Arc::new(std::sync::atomic::AtomicBool::new(false)));
+        assert!(!dialer.is_dialed_peer("runtime-exit.example.com:51820"));
+
+        let mut config = make_test_gateway_config("b2c-runtime-add-peer");
+        config.client_db = Some(db.clone());
+        let mut gateway = Gateway::new(config).expect("gateway constructs");
+        gateway.set_pool_dialer(dialer.clone());
+
+        gateway.add_dial_peers_for_client_exits();
+
+        assert!(
+            dialer.is_dialed_peer("runtime-exit.example.com:51820"),
+            "a freshly set per-client exit_node must be dialed at runtime, without a restart"
+        );
+    }
+
+    /// Calling the hook again after nothing changed must not spawn a
+    /// second dial task for the same address — `add_peer`'s idempotency
+    /// carries through the whole hook.
+    #[tokio::test]
+    async fn add_dial_peers_for_client_exits_is_idempotent_across_repeated_calls() {
+        use crate::client_db::{ClientDatabase, UpdateClientParams};
+        use crate::pool_dialer::PoolDialer;
+        use crate::pool_sync::PoolSyncConfig;
+        use base64::Engine as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let network = aivpn_common::network_config::VpnNetworkConfig {
+            server_vpn_ip: Ipv4Addr::new(10, 92, 0, 1),
+            prefix_len: 24,
+            mtu: 1400,
+            ..Default::default()
+        };
+        let db = Arc::new(ClientDatabase::load(&dir.path().join("clients.json"), network).unwrap());
+        let client = db.add_client("repeat-hook").unwrap();
+        db.update_client(
+            &client.id,
+            UpdateClientParams {
+                exit_node: Some(Some("repeat-exit.example.com:51820".to_string())),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let pool_cfg = PoolSyncConfig {
+            peers: vec![],
+            node_id: Some("this-node:443".to_string()),
+            sync_port: None,
+            sync_key: Some(base64::engine::general_purpose::STANDARD.encode([9u8; 32])),
+            exit_node: None,
+            exit_node_enabled: None,
+            sync_beacon_secs: None,
+            transport: Some("masked".to_string()),
+            allow_auto_add: None,
+            node_identity_key: None,
+            require_node_enrollment: None,
+            node_ip_partition: None,
+        };
+        let dialer = PoolDialer::new(db.clone(), &pool_cfg, vec![], None, None).unwrap();
+        dialer.test_mark_started(Arc::new(std::sync::atomic::AtomicBool::new(false)));
+
+        let mut config = make_test_gateway_config("b2c-idempotent-hook");
+        config.client_db = Some(db.clone());
+        let mut gateway = Gateway::new(config).expect("gateway constructs");
+        gateway.set_pool_dialer(dialer.clone());
+
+        gateway.add_dial_peers_for_client_exits();
+        assert_eq!(dialer.spawn_count(), 1);
+
+        gateway.add_dial_peers_for_client_exits();
+        assert_eq!(
+            dialer.spawn_count(),
+            1,
+            "a repeated hook call for an unchanged client DB must not double-spawn"
+        );
+    }
+
+    /// The hook must be a safe, cheap no-op when this node has no
+    /// `pool_dialer` wired at all (legacy transport / no pool-sync) — no
+    /// panic, nothing to assert beyond "it returns".
+    #[test]
+    fn add_dial_peers_for_client_exits_noop_without_pool_dialer() {
+        use crate::client_db::ClientDatabase;
+
+        let dir = tempfile::tempdir().unwrap();
+        let network = aivpn_common::network_config::VpnNetworkConfig {
+            server_vpn_ip: Ipv4Addr::new(10, 93, 0, 1),
+            prefix_len: 24,
+            mtu: 1400,
+            ..Default::default()
+        };
+        let db = Arc::new(ClientDatabase::load(&dir.path().join("clients.json"), network).unwrap());
+        db.add_client("no-pool-dialer-client").unwrap();
+
+        let mut config = make_test_gateway_config("b2c-no-dialer");
+        config.client_db = Some(db);
+        let gateway = Gateway::new(config).expect("gateway constructs");
+
+        gateway.add_dial_peers_for_client_exits();
+    }
 
     /// The handshake candidate scan must derive descriptors for a WINDOW of
     /// recent epochs so a client on a slightly stale (but still legitimately
@@ -6957,6 +7992,7 @@ mod tests {
                 allow_auto_add: None,
                 node_identity_key: None,
                 require_node_enrollment: None,
+                node_ip_partition: None,
             };
             let events = EventBus::new(EventSinkConfig {
                 stdout: false,

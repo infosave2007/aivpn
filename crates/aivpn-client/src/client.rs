@@ -3550,7 +3550,8 @@ impl AivpnClient {
             ControlPayload::PoolSync { .. }
             | ControlPayload::PoolStateDigest { .. }
             | ControlPayload::PoolBucketDigests { .. }
-            | ControlPayload::RouteSync { .. } => {
+            | ControlPayload::RouteSync { .. }
+            | ControlPayload::PartitionAnnounce { .. } => {
                 // Normal end-user clients have no use for these pool
                 // anti-entropy messages and silently ignore them, exactly as
                 // before. When the server has embedded this client as a

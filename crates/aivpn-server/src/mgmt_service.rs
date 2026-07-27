@@ -57,6 +57,16 @@ pub struct MgmtCtx<'a> {
     /// tunnel-initiated apply must be swept by the SAME timer regardless of
     /// which transport started it.
     pub pending_config: Option<&'a PendingConfigManager>,
+    /// Wave B1 (pool topology read endpoints): a pre-built, owned snapshot
+    /// of this node's pool state, or `None` when pool sync isn't configured
+    /// at all on this node. Owned (not borrowed) because both callers build
+    /// it fresh from live state just before constructing `MgmtCtx` (see
+    /// `gateway.rs`'s `dispatch_mgmt_request` and `management_api.rs`'s
+    /// `ApiState::mgmt_ctx`) — there is no long-lived `PoolSnapshot` to
+    /// borrow from. The `pool/{nodes,health,links}` routes degrade to `200`
+    /// with empty lists / `transport: "none"` when this is `None`, never an
+    /// error — see [`PoolHealth::empty`] and the `dispatch` arms below.
+    pub pool: Option<PoolSnapshot>,
 }
 
 // ── Errors ───────────────────────────────────────────────────────────────
@@ -119,6 +129,11 @@ pub struct ClientView {
     pub qos: Option<crate::qos::ClientQos>,
     pub expires_at: Option<DateTime<Utc>>,
     pub role: ClientRole,
+    /// Wave B2a: this client's per-client exit-node override, or `None` to
+    /// fall back to the server's global default (`pool.exit_node`). Storage
+    /// only — see `ClientConfig::exit_node`'s doc comment for the routing
+    /// caveat (Wave B2b wires the actual data-plane routing decision).
+    pub exit_node: Option<String>,
 }
 
 impl From<ClientConfig> for ClientView {
@@ -135,6 +150,7 @@ impl From<ClientConfig> for ClientView {
             qos: c.qos,
             expires_at: c.expires_at,
             role: c.role,
+            exit_node: c.exit_node,
         }
     }
 }
@@ -161,6 +177,11 @@ pub struct UpdateClientArgs {
     pub qos: Option<Option<crate::qos::ClientQos>>,
     pub expires_at: Option<Option<DateTime<Utc>>>,
     pub role: Option<ClientRole>,
+    /// Wave B2a: same double-Option semantics as `qos`/`expires_at`. Unlike
+    /// `role`, this IS settable over the in-tunnel path (see
+    /// `TunnelPatchClientRequest`) — it's a routing preference, not a
+    /// privilege escalation.
+    pub exit_node: Option<Option<String>>,
 }
 
 // ── Status / audit views ────────────────────────────────────────────────
@@ -174,6 +195,275 @@ pub struct StatusView {
 
 fn kernel_loaded() -> bool {
     std::path::Path::new("/dev/aivpn").exists()
+}
+
+// ── Pool topology views (Wave B1) ───────────────────────────────────────
+//
+// Read-only pool topology exposed over the SAME curated mgmt path as
+// client-CRUD (Phase A): `GET /api/v1/pool/{nodes,health,links}`, both
+// in-tunnel (`gateway.rs`'s `dispatch_mgmt_request`) and REST
+// (`management_api.rs`'s `ApiState::mgmt_ctx`). Built by MERGING three
+// independently-sourced views of "who is in the pool":
+//
+//   - configured membership (`PoolDialer::peers()` — `host:port` addresses,
+//     this node's self-filtered masked-transport dial set);
+//   - crypto identity (`NodeRegistry::list()`/`list_revoked()` — `node_id ->
+//     pubkey` bindings, keyed by `node_id`, which by convention SHOULD equal
+//     a peer's `host:port` but isn't guaranteed to — see `PoolSyncConfig::
+//     node_id`'s doc comment);
+//   - live/retained sync state (`PoolDialer::pool_status_snapshot()` —
+//     connected/converged/last-seen, keyed by the dialed peer address).
+//
+// The merge key is simply the string itself: an address that happens to
+// equal a bound `node_id` merges into one [`PoolNodeInfo`] entry with both
+// `address` and `verified: true` populated; anything that doesn't match
+// still shows up as its own (partial) entry rather than being dropped —
+// "represent what you can" per the module's design brief, never silently
+// hide a peer just because the two identity systems don't line up.
+//
+// **Legacy-transport degradation**: [`PoolDialer`]/[`crate::node_registry::
+// NodeRegistry`] are ONLY ever constructed on a masked-transport node (see
+// `main.rs`'s pool-sync wiring) — the legacy, mask-independent `PeerSyncer`
+// path has no dialed sessions and therefore no notion of "peer link state"
+// at all. A node running legacy pool sync (or no pool sync) simply has no
+// `PoolDialer`/`NodeRegistry` to build a snapshot from; both call sites
+// detect this and hand `dispatch` a degraded [`PoolSnapshot::empty`]
+// (`transport: "legacy"` or `"none"`) instead of attempting to call into
+// either type — see those call sites' doc comments for how they tell the
+// two degraded cases apart.
+
+/// One pool node as reported by [`build_pool_snapshot`]. `node_id` is
+/// always populated (falling back to the address string when no crypto
+/// identity is bound for it — see the module doc's merge-key note);
+/// `address` is `None` for a node this registry knows about but that isn't
+/// (or isn't yet) one of this node's configured dial-set peers.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PoolNodeInfo {
+    pub node_id: String,
+    pub address: Option<String>,
+    /// `true` iff `node_id` has a durable, TOFU/manually-pinned Ed25519
+    /// binding in [`crate::node_registry::NodeRegistry`] (i.e. it appears in
+    /// `NodeRegistry::list()`).
+    pub verified: bool,
+    /// `true` iff `node_id` (or the matching address) appears in
+    /// `NodeRegistry::list_revoked()`.
+    pub revoked: bool,
+    /// `true` iff a masked dialed session to this peer is up right now.
+    /// Always `false` for a node this registry only knows about via
+    /// `NodeRegistry` (we track live sessions only for our own configured
+    /// dial-set peers — an inbound-only peer that dials US has no entry in
+    /// `PoolDialer::pool_status_snapshot`).
+    pub connected: bool,
+    pub last_seen_unix: Option<i64>,
+}
+
+/// One live/retained sync link, as reported by [`build_pool_snapshot`] —
+/// one entry per [`crate::pool_dialer::PeerSyncStatus`] this node has ever
+/// observed for a dialed peer (see that type's doc comment for what
+/// `connected`/`converged` mean).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PoolLinkInfo {
+    pub peer: String,
+    pub connected: bool,
+    pub converged: bool,
+    pub last_converged_unix: Option<i64>,
+    /// Wave B-IP.2: true iff the most recent `ControlPayload::PartitionAnnounce`
+    /// exchange with this peer found both nodes claiming the same VPN-IP
+    /// partition index on the same subnet — see
+    /// `crate::pool_partition::PartitionCheck::IndexConflict`.
+    pub partition_conflict: bool,
+    /// Wave B-IP.2: true iff the most recent `ControlPayload::PartitionAnnounce`
+    /// exchange with this peer found a different VPN subnet CIDR than ours —
+    /// see `crate::pool_partition::PartitionCheck::SubnetMismatch`.
+    pub subnet_mismatch: bool,
+}
+
+/// Aggregate pool-sync health summary, as reported by [`build_pool_snapshot`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PoolHealth {
+    /// `"masked"` (this node runs [`crate::pool_dialer::PoolDialer`]),
+    /// `"legacy"` (pool sync is configured but runs the mask-independent
+    /// `PeerSyncer`, which has no queryable link state — see the module
+    /// doc's legacy-transport note), or `"none"` (pool sync isn't
+    /// configured on this node at all).
+    pub transport: String,
+    pub total_nodes: usize,
+    pub connected_peers: usize,
+    pub converged_peers: usize,
+    /// `true` iff at least one currently-connected peer's last anti-entropy
+    /// signal was a mismatch (i.e. `connected && !converged` for some
+    /// entry) — a coarse "is anything actively out of sync right now"
+    /// summary flag for a dashboard, not a precise count.
+    pub diverged: bool,
+    /// Wave B-IP.2: true iff any link's `partition_conflict` is set — a
+    /// coarse "at least one peer collides with our VPN-IP partition index"
+    /// dashboard flag, not a precise count.
+    pub partition_conflict: bool,
+    /// Wave B-IP.2: true iff any link's `subnet_mismatch` is set — a coarse
+    /// "at least one peer disagrees with our VPN subnet" dashboard flag.
+    pub subnet_mismatch: bool,
+}
+
+impl PoolHealth {
+    /// The degraded health view for `transport` `"legacy"` or `"none"` —
+    /// see [`PoolSnapshot::empty`].
+    fn empty(transport: &str) -> Self {
+        Self {
+            transport: transport.to_string(),
+            total_nodes: 0,
+            connected_peers: 0,
+            converged_peers: 0,
+            diverged: false,
+            partition_conflict: false,
+            subnet_mismatch: false,
+        }
+    }
+}
+
+/// The full pool topology view returned by `GET /api/v1/pool/{nodes,health,
+/// links}` — `dispatch` slices out the field the specific route asked for
+/// (see the `Route::Pool*` arms below).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct PoolSnapshot {
+    pub nodes: Vec<PoolNodeInfo>,
+    pub links: Vec<PoolLinkInfo>,
+    pub health: PoolHealth,
+}
+
+impl PoolSnapshot {
+    /// The degraded snapshot a call site hands `MgmtCtx::pool` when there is
+    /// no live [`crate::pool_dialer::PoolDialer`] to build a real one from —
+    /// `transport` should be `"legacy"` (pool sync configured, but running
+    /// the legacy mask-independent transport) or `"none"` (pool sync isn't
+    /// configured at all). Never an error condition: the `pool/*` routes
+    /// always return `200` for this.
+    pub fn empty(transport: &str) -> Self {
+        Self {
+            nodes: Vec::new(),
+            links: Vec::new(),
+            health: PoolHealth::empty(transport),
+        }
+    }
+}
+
+/// Inputs to [`build_pool_snapshot`] — a pure function of already-collected
+/// data, so it's trivially unit-testable with fake inputs (no `PoolDialer`/
+/// `NodeRegistry`/live session needed). Both real call sites
+/// (`gateway.rs`'s `dispatch_mgmt_request`, `management_api.rs`'s
+/// `ApiState::mgmt_ctx`) collect these from a live `PoolDialer`/
+/// `NodeRegistry` pair before calling in.
+pub struct PoolSnapshotInputs<'a> {
+    /// `PoolDialer::peers()` — this node's configured masked-transport dial
+    /// set (addresses).
+    pub peers: &'a [String],
+    /// `NodeRegistry::list()` — bound `(node_id, pubkey)` pairs.
+    pub registry_nodes: &'a [(String, [u8; 32])],
+    /// `NodeRegistry::list_revoked()` — revoked `node_id`s.
+    pub revoked: &'a [String],
+    /// `PoolDialer::pool_status_snapshot()` — retained per-peer sync state,
+    /// keyed by dialed peer address.
+    pub statuses: &'a [(String, crate::pool_dialer::PeerSyncStatus)],
+    /// Always `"masked"` from both real call sites (this function is only
+    /// ever called when a live `PoolDialer` exists) — taken as a parameter
+    /// rather than hardcoded so a test can exercise the merge logic without
+    /// asserting a specific literal.
+    pub transport: &'a str,
+}
+
+/// Merge [`PoolSnapshotInputs`] into one [`PoolSnapshot`]. Pure and
+/// side-effect-free — see that type's doc comment for the merge-key
+/// semantics. Node/link ordering is deterministic (nodes sorted by
+/// `node_id`, links sorted by `peer`) so callers/tests can compare shapes
+/// without normalizing order themselves.
+pub fn build_pool_snapshot(inputs: PoolSnapshotInputs) -> PoolSnapshot {
+    use std::collections::{BTreeMap, HashSet};
+
+    let revoked_set: HashSet<&str> = inputs.revoked.iter().map(String::as_str).collect();
+    let mut nodes: BTreeMap<String, PoolNodeInfo> = BTreeMap::new();
+
+    let blank_node = |key: &str, revoked_set: &HashSet<&str>| PoolNodeInfo {
+        node_id: key.to_string(),
+        address: None,
+        verified: false,
+        revoked: revoked_set.contains(key),
+        connected: false,
+        last_seen_unix: None,
+    };
+
+    // 1. Crypto identity: every bound node_id is `verified: true`.
+    for (node_id, _pubkey) in inputs.registry_nodes {
+        let mut entry = blank_node(node_id, &revoked_set);
+        entry.verified = true;
+        nodes.insert(node_id.clone(), entry);
+    }
+
+    // 2. Revoked node_ids that aren't (or are no longer) bound — `revoke()`
+    //    removes the binding, so a revoked identity is typically absent
+    //    from `registry_nodes` above; still surface it (verified: false,
+    //    revoked: true) rather than silently dropping it.
+    for node_id in inputs.revoked {
+        nodes
+            .entry(node_id.clone())
+            .or_insert_with(|| blank_node(node_id, &revoked_set));
+    }
+
+    // 3. Configured membership: fill in `address` on a matching identity
+    //    entry, or add a new (unverified) one keyed by the address itself.
+    for peer in inputs.peers {
+        let entry = nodes
+            .entry(peer.clone())
+            .or_insert_with(|| blank_node(peer, &revoked_set));
+        entry.address = Some(peer.clone());
+    }
+
+    // 4. Live/retained sync state: merge connected/last_seen onto a
+    //    matching node entry (creating one, address-keyed, if none exists —
+    //    e.g. an exit_node peer not otherwise in `peers`), and build the
+    //    `links` list one-to-one with `statuses`.
+    let mut links: Vec<PoolLinkInfo> = Vec::with_capacity(inputs.statuses.len());
+    for (peer, status) in inputs.statuses {
+        let entry = nodes.entry(peer.clone()).or_insert_with(|| {
+            let mut e = blank_node(peer, &revoked_set);
+            e.address = Some(peer.clone());
+            e
+        });
+        entry.connected = status.connected;
+        entry.last_seen_unix = status.last_seen_unix;
+
+        links.push(PoolLinkInfo {
+            peer: peer.clone(),
+            connected: status.connected,
+            converged: status.converged,
+            last_converged_unix: status.last_converged_unix,
+            partition_conflict: status.partition_conflict,
+            subnet_mismatch: status.subnet_mismatch,
+        });
+    }
+    links.sort_by(|a, b| a.peer.cmp(&b.peer));
+
+    let total_nodes = nodes.len();
+    let connected_peers = inputs.statuses.iter().filter(|(_, s)| s.connected).count();
+    let converged_peers = inputs.statuses.iter().filter(|(_, s)| s.converged).count();
+    let diverged = inputs
+        .statuses
+        .iter()
+        .any(|(_, s)| s.connected && !s.converged);
+    let partition_conflict = inputs.statuses.iter().any(|(_, s)| s.partition_conflict);
+    let subnet_mismatch = inputs.statuses.iter().any(|(_, s)| s.subnet_mismatch);
+
+    PoolSnapshot {
+        nodes: nodes.into_values().collect(),
+        links,
+        health: PoolHealth {
+            transport: inputs.transport.to_string(),
+            total_nodes,
+            connected_peers,
+            converged_peers,
+            diverged,
+            partition_conflict,
+            subnet_mismatch,
+        },
+    }
 }
 
 fn client_name_valid(name: &str) -> Result<(), MgmtError> {
@@ -261,6 +551,7 @@ pub fn update_client(
         qos: args.qos,
         expires_at: args.expires_at,
         role: args.role,
+        exit_node: args.exit_node,
     };
     match ctx.db.update_client(id, params) {
         Ok(c) => {
@@ -274,6 +565,8 @@ pub fn update_client(
                 Err(MgmtError::NotFound)
             } else if msg.contains("device binding") {
                 Err(MgmtError::Forbidden)
+            } else if msg.contains("exit_node") {
+                Err(MgmtError::BadRequest(msg))
             } else {
                 Err(MgmtError::Conflict(msg))
             }
@@ -511,12 +804,24 @@ pub fn audit_verify(ctx: &MgmtCtx, limit: usize) -> Result<AuditVerifyView, Mgmt
 // `resolve_heavy_setting` arm below, without touching the rollback engine.
 
 /// One heavy, rollback-guarded setting `apply_heavy` knows how to apply.
-/// Only one variant exists in v1 (see the module boundary note above);
-/// Phase B's exit-node op is expected to add a sibling variant here.
 pub enum HeavySetting {
     /// Set client `client`'s active-mask override to `mask` — same file
     /// `management_api.rs::set_active_mask` writes.
     ActiveMask { client: String, mask: String },
+    /// Wave B2a: set (or clear, when `addr` is `None`) the server's GLOBAL
+    /// default exit node — `pool.exit_node` in `server.json`. This is the
+    /// fallback used by any client that has no per-client
+    /// `ClientConfig::exit_node` override set (see that field's doc
+    /// comment).
+    ///
+    /// IMPORTANT SCOPE NOTE: this only PERSISTS the change to `server.json`
+    /// with the same apply-with-rollback safety net every other
+    /// `HeavySetting` gets — it does NOT live-apply. `pool.exit_node` is
+    /// read once at startup (`main.rs`/pool wiring); the new value takes
+    /// effect only after the server process is restarted. Live-applying a
+    /// global exit-node change without a restart is Wave B2c, not this
+    /// wave.
+    ExitNode { addr: Option<String> },
 }
 
 /// Result of resolving a [`HeavySetting`] to a concrete file write, before
@@ -568,6 +873,62 @@ fn resolve_heavy_setting(
                 target_path,
                 new_content: mask.as_bytes().to_vec(),
                 descriptor: format!("active mask: {} -> {}", resolved_client.id, mask),
+            })
+        }
+        HeavySetting::ExitNode { addr } => {
+            if let Some(a) = addr {
+                crate::client_db::validate_exit_node_addr(a)
+                    .map_err(|e| MgmtError::BadRequest(e.to_string()))?;
+            }
+
+            let config_path = ctx.config_path.ok_or_else(|| {
+                MgmtError::Unavailable("server config path not configured on this node".into())
+            })?;
+
+            // Read-mutate-write round-trip: parse the EXISTING server.json
+            // as generic JSON (not `ServerFileConfig` — round-tripping
+            // through the typed struct would silently drop any field this
+            // server build doesn't know about, corrupting a config written
+            // by a newer/differently-featured node), touch only
+            // `pool.exit_node`, and re-serialize. `apply_heavy` (the only
+            // caller) separately reads the file's CURRENT bytes as `prior`
+            // for rollback — this function only computes `new_content`.
+            let content = std::fs::read_to_string(config_path)
+                .map_err(|e| MgmtError::Internal(format!("read config: {}", e)))?;
+            let mut value: serde_json::Value = serde_json::from_str(&content)
+                .map_err(|e| MgmtError::Internal(format!("parse config: {}", e)))?;
+            let obj = value
+                .as_object_mut()
+                .ok_or_else(|| MgmtError::Internal("config root is not a JSON object".into()))?;
+            let pool_entry = obj
+                .entry("pool".to_string())
+                .or_insert_with(|| serde_json::json!({}));
+            if !pool_entry.is_object() {
+                *pool_entry = serde_json::json!({});
+            }
+            let pool_obj = pool_entry.as_object_mut().expect("just ensured object");
+            match addr {
+                Some(a) => {
+                    pool_obj.insert(
+                        "exit_node".to_string(),
+                        serde_json::Value::String(a.clone()),
+                    );
+                }
+                None => {
+                    pool_obj.remove("exit_node");
+                }
+            }
+            let new_content = serde_json::to_string_pretty(&value)
+                .map_err(|e| MgmtError::Internal(format!("serialize config: {}", e)))?
+                .into_bytes();
+
+            Ok(ResolvedHeavyWrite {
+                target_path: config_path.to_path_buf(),
+                new_content,
+                descriptor: format!(
+                    "global exit node: {}",
+                    addr.as_deref().unwrap_or("(disabled)")
+                ),
             })
         }
     }
@@ -758,6 +1119,13 @@ enum Route {
     ConfigApply,
     /// P1.5: `POST /api/v1/config/confirm`.
     ConfigConfirm,
+    /// Wave B1: `GET /api/v1/pool/nodes` — see the "Pool topology views"
+    /// section above.
+    PoolNodes,
+    /// Wave B1: `GET /api/v1/pool/health`.
+    PoolHealth,
+    /// Wave B1: `GET /api/v1/pool/links`.
+    PoolLinks,
 }
 
 /// Parse `?limit=N` out of a raw query string, clamped to
@@ -828,6 +1196,9 @@ fn classify_route(method: u8, path: &str) -> Option<Route> {
         }),
         (METHOD_POST, ["config", "apply"]) => Some(Route::ConfigApply),
         (METHOD_POST, ["config", "confirm"]) => Some(Route::ConfigConfirm),
+        (METHOD_GET, ["pool", "nodes"]) => Some(Route::PoolNodes),
+        (METHOD_GET, ["pool", "health"]) => Some(Route::PoolHealth),
+        (METHOD_GET, ["pool", "links"]) => Some(Route::PoolLinks),
         _ => None,
     }
 }
@@ -943,16 +1314,30 @@ struct TunnelPatchClientRequest {
     qos: Option<Option<crate::qos::ClientQos>>,
     #[serde(default, deserialize_with = "deserialize_opt_opt")]
     expires_at: Option<Option<DateTime<Utc>>>,
+    /// Wave B2a: UNLIKE `role`, `exit_node` IS settable over the tunnel —
+    /// see `UpdateClientArgs::exit_node`'s doc comment for why this is
+    /// safe (a routing preference, not a privilege grant). Pass `null` to
+    /// clear (fall back to the global default); omit to leave unchanged.
+    #[serde(default, deserialize_with = "deserialize_opt_opt")]
+    exit_node: Option<Option<String>>,
 }
 
-/// Wire body for `POST /api/v1/config/apply` — v1 supports only the
-/// active-mask heavy op (see [`HeavySetting`]); a future `HeavySetting`
-/// variant (e.g. Phase B's exit-node op) would extend this struct with
-/// its own optional fields.
+/// Wire body for `POST /api/v1/config/apply`. Which [`HeavySetting`] this
+/// selects is determined by WHICH fields are present, not a `type` tag:
+/// presence of the `exit_node` key (even as JSON `null`, to clear it)
+/// selects [`HeavySetting::ExitNode`]; its absence selects the original
+/// v1 [`HeavySetting::ActiveMask`] using `client`/`mask` (unchanged wire
+/// shape, so existing callers are unaffected). Mirrors
+/// `management_api.rs`'s `ApplyConfigRequest`, which the same convention.
 #[derive(Deserialize)]
 struct TunnelApplyRequest {
-    client: String,
-    mask: String,
+    #[serde(default)]
+    client: Option<String>,
+    #[serde(default)]
+    mask: Option<String>,
+    /// Wave B2a: presence (even `null`) selects `HeavySetting::ExitNode`.
+    #[serde(default, deserialize_with = "deserialize_opt_opt")]
+    exit_node: Option<Option<String>>,
 }
 
 /// Wire body for `POST /api/v1/config/confirm`.
@@ -1011,6 +1396,9 @@ pub fn dispatch(ctx: &MgmtCtx, method: u8, path: &str, body: &[u8]) -> (u16, Vec
                 // Never settable over the tunnel — see this route's doc
                 // comment and `TunnelPatchClientRequest`.
                 role: None,
+                // Wave B2a: settable over the tunnel — see
+                // `TunnelPatchClientRequest::exit_node`'s doc comment.
+                exit_node: req.exit_node,
             };
             match update_client(ctx, &id, args) {
                 Ok(view) => json_response(200, &view),
@@ -1053,9 +1441,13 @@ pub fn dispatch(ctx: &MgmtCtx, method: u8, path: &str, body: &[u8]) -> (u16, Vec
                 Ok(r) => r,
                 Err(_) => return (400, Vec::new()),
             };
-            let setting = HeavySetting::ActiveMask {
-                client: req.client,
-                mask: req.mask,
+            let setting = if let Some(exit_node) = req.exit_node {
+                HeavySetting::ExitNode { addr: exit_node }
+            } else {
+                HeavySetting::ActiveMask {
+                    client: req.client.unwrap_or_default(),
+                    mask: req.mask.unwrap_or_default(),
+                }
             };
             match apply_heavy(ctx, setting, Instant::now()) {
                 Ok(resp) => json_response(200, &resp),
@@ -1071,6 +1463,31 @@ pub fn dispatch(ctx: &MgmtCtx, method: u8, path: &str, body: &[u8]) -> (u16, Vec
                 Ok(()) => (204, Vec::new()),
                 Err(e) => err_response(e),
             }
+        }
+        // Wave B1: `ctx.pool` is `None` on a node with no pool sync
+        // configured at all (or when a caller built `MgmtCtx` without
+        // wiring it — should not happen for a real REST/tunnel caller, see
+        // that field's doc comment) — degrade to the same `empty("none")`
+        // shape a real "pool not configured" node would report, rather than
+        // erroring. Always `200`.
+        Route::PoolNodes => {
+            let empty = PoolSnapshot::empty("none");
+            let nodes = ctx.pool.as_ref().map(|p| &p.nodes).unwrap_or(&empty.nodes);
+            json_response(200, nodes)
+        }
+        Route::PoolHealth => {
+            let health = ctx
+                .pool
+                .as_ref()
+                .map(|p| &p.health)
+                .cloned()
+                .unwrap_or_else(|| PoolHealth::empty("none"));
+            json_response(200, &health)
+        }
+        Route::PoolLinks => {
+            let empty = PoolSnapshot::empty("none");
+            let links = ctx.pool.as_ref().map(|p| &p.links).unwrap_or(&empty.links);
+            json_response(200, links)
         }
     }
 }
@@ -1111,6 +1528,7 @@ mod tests {
             config_path: None,
             audit_log_path: None,
             pending_config: None,
+            pool: None,
         }
     }
 
@@ -1167,6 +1585,7 @@ mod tests {
                 qos: None,
                 expires_at: None,
                 role: Some(ClientRole::Admin),
+                exit_node: None,
             },
         )
         .expect_err("elevating role without a bound device must fail");
@@ -1204,6 +1623,7 @@ mod tests {
                 qos: None,
                 expires_at: None,
                 role: Some(ClientRole::Admin),
+                exit_node: None,
             },
         )
         .expect("elevating a device-bound client's role must succeed");
@@ -1879,5 +2299,599 @@ mod tests {
         assert_eq!(status, 204);
         assert!(body.is_empty());
         assert!(pending.is_empty());
+    }
+
+    // ── Wave B2a: per-client exit_node config layer ─────────────────────
+
+    #[test]
+    fn client_view_exposes_exit_node() {
+        let (_dir, db) = test_db();
+        let mask_dir = std::path::PathBuf::from("/tmp");
+        let c = ctx(&db, &mask_dir);
+        let created = add_client(
+            &c,
+            AddClientArgs {
+                name: "rex".into(),
+                one_time: false,
+                expires_at: None,
+                role: ClientRole::User,
+                qos: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(created.exit_node, None);
+
+        let updated = update_client(
+            &c,
+            &created.id,
+            UpdateClientArgs {
+                name: None,
+                enabled: None,
+                one_time: None,
+                qos: None,
+                expires_at: None,
+                role: None,
+                exit_node: Some(Some("exit.example.com:51820".to_string())),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            updated.exit_node,
+            Some("exit.example.com:51820".to_string())
+        );
+    }
+
+    /// UNLIKE `role` (see `dispatch_patch_client_ignores_role_field_in_body`),
+    /// `exit_node` MUST be settable over the tunnel PATCH path — it's a
+    /// routing preference, not a privilege escalation.
+    #[test]
+    fn dispatch_patch_client_sets_exit_node_over_tunnel() {
+        let (_dir, db) = test_db();
+        let mask_dir = std::path::PathBuf::from("/tmp");
+        let c = ctx(&db, &mask_dir);
+        let created = add_client(
+            &c,
+            AddClientArgs {
+                name: "sam".into(),
+                one_time: false,
+                expires_at: None,
+                role: ClientRole::User,
+                qos: None,
+            },
+        )
+        .unwrap();
+
+        let path = format!("/api/v1/clients/{}", created.id);
+        let body = br#"{"exit_node":"exit.example.com:51820"}"#;
+        let (status, resp_body) = dispatch(&c, METHOD_PATCH, &path, body);
+        assert_eq!(status, 200);
+        let updated: serde_json::Value = serde_json::from_slice(&resp_body).unwrap();
+        assert_eq!(updated["exit_node"], "exit.example.com:51820");
+
+        // null clears it back to "fall back to the global default".
+        let clear_body = br#"{"exit_node":null}"#;
+        let (status2, resp_body2) = dispatch(&c, METHOD_PATCH, &path, clear_body);
+        assert_eq!(status2, 200);
+        let updated2: serde_json::Value = serde_json::from_slice(&resp_body2).unwrap();
+        assert!(updated2["exit_node"].is_null());
+    }
+
+    #[test]
+    fn dispatch_patch_client_rejects_malformed_exit_node() {
+        let (_dir, db) = test_db();
+        let mask_dir = std::path::PathBuf::from("/tmp");
+        let c = ctx(&db, &mask_dir);
+        let created = add_client(
+            &c,
+            AddClientArgs {
+                name: "tara".into(),
+                one_time: false,
+                expires_at: None,
+                role: ClientRole::User,
+                qos: None,
+            },
+        )
+        .unwrap();
+
+        let path = format!("/api/v1/clients/{}", created.id);
+        let body = br#"{"exit_node":"not-a-valid-addr"}"#;
+        let (status, _) = dispatch(&c, METHOD_PATCH, &path, body);
+        assert_eq!(status, 400);
+    }
+
+    fn ctx_with_pending_and_config<'a>(
+        db: &'a ClientDatabase,
+        mask_dir: &'a Path,
+        pending: &'a PendingConfigManager,
+        config_path: &'a Path,
+    ) -> MgmtCtx<'a> {
+        let mut c = ctx_with_pending(db, mask_dir, pending);
+        c.config_path = Some(config_path);
+        c
+    }
+
+    #[test]
+    fn apply_heavy_exit_node_writes_pool_exit_node_to_server_json_with_rollback_prior() {
+        let (_dir, db) = test_db();
+        let mask_tmp = tempfile::tempdir().unwrap();
+        let mask_dir = mask_tmp.path().to_path_buf();
+        let config_tmp = tempfile::tempdir().unwrap();
+        let config_path = config_tmp.path().join("server.json");
+        let original: &[u8] = br#"{"listen_addr":"0.0.0.0:443"}"#;
+        std::fs::write(&config_path, original).unwrap();
+
+        let pending = PendingConfigManager::new();
+        let c = ctx_with_pending_and_config(&db, &mask_dir, &pending, &config_path);
+
+        let resp = apply_heavy(
+            &c,
+            HeavySetting::ExitNode {
+                addr: Some("198.51.100.7:51820".to_string()),
+            },
+            Instant::now(),
+        )
+        .expect("apply_heavy ExitNode should succeed");
+        assert!(resp.applied);
+        assert!(!resp.token.is_empty());
+        assert_eq!(
+            pending.len(),
+            1,
+            "apply_heavy must register a pending entry"
+        );
+
+        let written: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+        assert_eq!(written["pool"]["exit_node"], "198.51.100.7:51820");
+        assert_eq!(
+            written["listen_addr"], "0.0.0.0:443",
+            "the read-mutate-write round-trip must preserve unrelated existing keys"
+        );
+
+        // Rollback prior must be the file's ORIGINAL bytes, exactly.
+        let expired_at =
+            Instant::now() + PENDING_CONFIG_TIMEOUT + std::time::Duration::from_secs(1);
+        let mut expired = pending.tick(expired_at);
+        assert_eq!(expired.len(), 1, "the unconfirmed entry must be swept");
+        let entry = expired.pop().unwrap();
+        assert_eq!(entry.target_path(), config_path.as_path());
+        assert_eq!(
+            entry.rollback_value(),
+            Some(original),
+            "prior bytes for rollback must be the file's ORIGINAL content, byte-for-byte"
+        );
+
+        // Simulate the gateway sweep task performing the actual restore.
+        std::fs::write(&config_path, entry.rollback_value().unwrap()).unwrap();
+        assert_eq!(std::fs::read(&config_path).unwrap(), original);
+    }
+
+    #[test]
+    fn apply_heavy_exit_node_none_clears_existing_value() {
+        let (_dir, db) = test_db();
+        let mask_tmp = tempfile::tempdir().unwrap();
+        let mask_dir = mask_tmp.path().to_path_buf();
+        let config_tmp = tempfile::tempdir().unwrap();
+        let config_path = config_tmp.path().join("server.json");
+        std::fs::write(
+            &config_path,
+            br#"{"listen_addr":"0.0.0.0:443","pool":{"exit_node":"old.example.com:1","peers":[]}}"#,
+        )
+        .unwrap();
+
+        let pending = PendingConfigManager::new();
+        let c = ctx_with_pending_and_config(&db, &mask_dir, &pending, &config_path);
+
+        apply_heavy(&c, HeavySetting::ExitNode { addr: None }, Instant::now())
+            .expect("clearing exit_node should succeed");
+
+        let written: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+        assert!(
+            written["pool"]["exit_node"].is_null(),
+            "exit_node key must be removed, not just emptied"
+        );
+        assert_eq!(
+            written["pool"]["peers"],
+            serde_json::json!([]),
+            "unrelated pool sub-keys must survive the clear"
+        );
+    }
+
+    #[test]
+    fn apply_heavy_exit_node_rejects_malformed_addr_and_registers_nothing() {
+        let (_dir, db) = test_db();
+        let mask_tmp = tempfile::tempdir().unwrap();
+        let mask_dir = mask_tmp.path().to_path_buf();
+        let config_tmp = tempfile::tempdir().unwrap();
+        let config_path = config_tmp.path().join("server.json");
+        std::fs::write(&config_path, br#"{}"#).unwrap();
+
+        let pending = PendingConfigManager::new();
+        let c = ctx_with_pending_and_config(&db, &mask_dir, &pending, &config_path);
+
+        let err = apply_heavy(
+            &c,
+            HeavySetting::ExitNode {
+                addr: Some("not-a-valid-addr".to_string()),
+            },
+            Instant::now(),
+        )
+        .expect_err("a malformed exit_node addr must be rejected");
+        assert!(matches!(err, MgmtError::BadRequest(_)));
+        assert!(
+            pending.is_empty(),
+            "a rejected apply must never register a pending rollback"
+        );
+    }
+
+    #[test]
+    fn apply_heavy_exit_node_without_config_path_is_unavailable() {
+        let (_dir, db) = test_db();
+        let mask_tmp = tempfile::tempdir().unwrap();
+        let mask_dir = mask_tmp.path().to_path_buf();
+        let pending = PendingConfigManager::new();
+        let c = ctx_with_pending(&db, &mask_dir, &pending); // no config_path wired
+
+        let err = apply_heavy(
+            &c,
+            HeavySetting::ExitNode {
+                addr: Some("1.2.3.4:1".to_string()),
+            },
+            Instant::now(),
+        )
+        .expect_err("ExitNode must fail cleanly when this node has no config_path");
+        assert!(matches!(err, MgmtError::Unavailable(_)));
+    }
+
+    /// `POST /api/v1/config/apply` is the SAME curated route for every
+    /// `HeavySetting` (v1 `ActiveMask` and Wave B2a `ExitNode` alike) — see
+    /// `classify_route`/`authorize`, which never inspect the request body.
+    /// `authorize_config_apply_and_confirm_are_admin_only` already proves
+    /// Admin-only for this exact route; this test additionally exercises
+    /// `dispatch` end-to-end with an `exit_node` body to confirm the
+    /// ExitNode heavy op is actually reachable through it.
+    #[test]
+    fn dispatch_config_apply_exit_node_is_reachable_and_gated_admin_only() {
+        let (_dir, db) = test_db();
+        let mask_tmp = tempfile::tempdir().unwrap();
+        let mask_dir = mask_tmp.path().to_path_buf();
+        let config_tmp = tempfile::tempdir().unwrap();
+        let config_path = config_tmp.path().join("server.json");
+        std::fs::write(&config_path, br#"{}"#).unwrap();
+        let pending = PendingConfigManager::new();
+        let c = ctx_with_pending_and_config(&db, &mask_dir, &pending, &config_path);
+
+        assert!(authorize(ROLE_ADMIN, METHOD_POST, "/api/v1/config/apply"));
+        assert!(!authorize(ROLE_VIEWER, METHOD_POST, "/api/v1/config/apply"));
+        assert!(!authorize(ROLE_USER, METHOD_POST, "/api/v1/config/apply"));
+
+        let body = serde_json::to_vec(&serde_json::json!({"exit_node": "9.9.9.9:51820"})).unwrap();
+        let (status, resp_body) = dispatch(&c, METHOD_POST, "/api/v1/config/apply", &body);
+        assert_eq!(status, 200);
+        let resp: serde_json::Value = serde_json::from_slice(&resp_body).unwrap();
+        assert_eq!(resp["applied"], true);
+
+        let written: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+        assert_eq!(written["pool"]["exit_node"], "9.9.9.9:51820");
+    }
+
+    // ── Wave B1: pool topology read endpoints ───────────────────────────
+
+    fn sample_status(
+        connected: bool,
+        converged: bool,
+        last_converged_unix: Option<i64>,
+        last_seen_unix: Option<i64>,
+    ) -> crate::pool_dialer::PeerSyncStatus {
+        crate::pool_dialer::PeerSyncStatus {
+            connected,
+            last_converged_unix,
+            converged,
+            last_seen_unix,
+            partition_conflict: false,
+            subnet_mismatch: false,
+        }
+    }
+
+    /// The core merge case: a peer that is both configured (an address in
+    /// `peers`) AND bound in the registry AND has live status all collapse
+    /// into ONE node entry — not three separate ones — because its address
+    /// happens to equal its `node_id` (the documented convention).
+    #[test]
+    fn build_pool_snapshot_merges_config_registry_and_status_for_matching_identity() {
+        let peers = vec!["node-a:443".to_string()];
+        let registry_nodes = vec![("node-a:443".to_string(), [7u8; 32])];
+        let revoked: Vec<String> = vec![];
+        let statuses = vec![(
+            "node-a:443".to_string(),
+            sample_status(true, true, Some(1000), Some(1000)),
+        )];
+
+        let snap = build_pool_snapshot(PoolSnapshotInputs {
+            peers: &peers,
+            registry_nodes: &registry_nodes,
+            revoked: &revoked,
+            statuses: &statuses,
+            transport: "masked",
+        });
+
+        assert_eq!(
+            snap.nodes.len(),
+            1,
+            "matching address/node_id must merge into one entry"
+        );
+        let node = &snap.nodes[0];
+        assert_eq!(node.node_id, "node-a:443");
+        assert_eq!(node.address.as_deref(), Some("node-a:443"));
+        assert!(node.verified);
+        assert!(!node.revoked);
+        assert!(node.connected);
+        assert_eq!(node.last_seen_unix, Some(1000));
+
+        assert_eq!(snap.links.len(), 1);
+        assert_eq!(snap.links[0].peer, "node-a:443");
+        assert!(snap.links[0].converged);
+        assert_eq!(snap.links[0].last_converged_unix, Some(1000));
+
+        assert_eq!(snap.health.transport, "masked");
+        assert_eq!(snap.health.total_nodes, 1);
+        assert_eq!(snap.health.connected_peers, 1);
+        assert_eq!(snap.health.converged_peers, 1);
+        assert!(!snap.health.diverged);
+    }
+
+    /// When identity keys DON'T line up (registry keyed by a `node_id` that
+    /// isn't the dial address), the merge must not silently drop or
+    /// conflate them — "represent what you can" per the design brief.
+    #[test]
+    fn build_pool_snapshot_keeps_non_matching_identity_and_address_as_separate_entries() {
+        let peers = vec!["203.0.113.5:443".to_string()];
+        let registry_nodes = vec![("node-b-identity".to_string(), [9u8; 32])];
+        let revoked: Vec<String> = vec![];
+        let statuses: Vec<(String, crate::pool_dialer::PeerSyncStatus)> = vec![];
+
+        let snap = build_pool_snapshot(PoolSnapshotInputs {
+            peers: &peers,
+            registry_nodes: &registry_nodes,
+            revoked: &revoked,
+            statuses: &statuses,
+            transport: "masked",
+        });
+
+        assert_eq!(
+            snap.nodes.len(),
+            2,
+            "non-matching identity/address must both be represented"
+        );
+        let by_id: std::collections::HashMap<&str, &PoolNodeInfo> =
+            snap.nodes.iter().map(|n| (n.node_id.as_str(), n)).collect();
+        assert!(by_id["node-b-identity"].verified);
+        assert!(by_id["node-b-identity"].address.is_none());
+        assert!(!by_id["203.0.113.5:443"].verified);
+        assert_eq!(
+            by_id["203.0.113.5:443"].address.as_deref(),
+            Some("203.0.113.5:443")
+        );
+    }
+
+    /// A revoked node_id no longer present in `registry_nodes` (revoke()
+    /// removes the binding) must still surface as its own entry —
+    /// `revoked: true`, `verified: false` — rather than vanishing.
+    #[test]
+    fn build_pool_snapshot_surfaces_revoked_identity_no_longer_bound() {
+        let peers: Vec<String> = vec![];
+        let registry_nodes: Vec<(String, [u8; 32])> = vec![];
+        let revoked = vec!["node-c:443".to_string()];
+        let statuses: Vec<(String, crate::pool_dialer::PeerSyncStatus)> = vec![];
+
+        let snap = build_pool_snapshot(PoolSnapshotInputs {
+            peers: &peers,
+            registry_nodes: &registry_nodes,
+            revoked: &revoked,
+            statuses: &statuses,
+            transport: "masked",
+        });
+
+        assert_eq!(snap.nodes.len(), 1);
+        assert_eq!(snap.nodes[0].node_id, "node-c:443");
+        assert!(snap.nodes[0].revoked);
+        assert!(!snap.nodes[0].verified);
+    }
+
+    /// `diverged` is true iff some CONNECTED peer's last signal was a
+    /// mismatch — a disconnected-and-never-converged peer must not trip it.
+    #[test]
+    fn build_pool_snapshot_diverged_true_only_for_connected_mismatched_peer() {
+        let peers = vec!["p1:443".to_string(), "p2:443".to_string()];
+        let registry_nodes: Vec<(String, [u8; 32])> = vec![];
+        let revoked: Vec<String> = vec![];
+        let statuses = vec![
+            (
+                "p1:443".to_string(),
+                sample_status(true, false, None, Some(500)),
+            ),
+            (
+                "p2:443".to_string(),
+                sample_status(false, false, None, Some(100)),
+            ),
+        ];
+
+        let snap = build_pool_snapshot(PoolSnapshotInputs {
+            peers: &peers,
+            registry_nodes: &registry_nodes,
+            revoked: &revoked,
+            statuses: &statuses,
+            transport: "masked",
+        });
+
+        assert!(snap.health.diverged);
+        assert_eq!(snap.health.connected_peers, 1);
+        assert_eq!(snap.health.converged_peers, 0);
+    }
+
+    /// Empty inputs (no pool sync configured) must build a well-formed,
+    /// empty snapshot — never panic on empty slices.
+    #[test]
+    fn build_pool_snapshot_empty_inputs_yields_empty_snapshot() {
+        let snap = build_pool_snapshot(PoolSnapshotInputs {
+            peers: &[],
+            registry_nodes: &[],
+            revoked: &[],
+            statuses: &[],
+            transport: "masked",
+        });
+        assert!(snap.nodes.is_empty());
+        assert!(snap.links.is_empty());
+        assert_eq!(snap.health.total_nodes, 0);
+        assert!(!snap.health.diverged);
+    }
+
+    /// `PoolSnapshot::empty` — the degraded value both call sites hand
+    /// `MgmtCtx::pool` when there's no live `PoolDialer` — must always yield
+    /// empty lists and echo the given transport label.
+    #[test]
+    fn pool_snapshot_empty_has_given_transport_and_empty_lists() {
+        for transport in ["legacy", "none"] {
+            let snap = PoolSnapshot::empty(transport);
+            assert!(snap.nodes.is_empty());
+            assert!(snap.links.is_empty());
+            assert_eq!(snap.health.transport, transport);
+            assert_eq!(snap.health.total_nodes, 0);
+        }
+    }
+
+    fn ctx_with_pool<'a>(
+        db: &'a ClientDatabase,
+        mask_dir: &'a Path,
+        pool: Option<PoolSnapshot>,
+    ) -> MgmtCtx<'a> {
+        let mut c = ctx(db, mask_dir);
+        c.pool = pool;
+        c
+    }
+
+    /// `GET /api/v1/pool/nodes` with `ctx.pool == None` (no pool sync
+    /// configured on this node) must degrade to `200` + an empty array —
+    /// never a 404/500.
+    #[test]
+    fn dispatch_pool_nodes_returns_200_empty_when_ctx_pool_none() {
+        let (_dir, db) = test_db();
+        let mask_dir = std::path::PathBuf::from("/tmp");
+        let c = ctx_with_pool(&db, &mask_dir, None);
+
+        let (status, body) = dispatch(&c, METHOD_GET, "/api/v1/pool/nodes", &[]);
+        assert_eq!(status, 200);
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed, serde_json::json!([]));
+    }
+
+    /// `GET /api/v1/pool/health` with `ctx.pool == None` must degrade to
+    /// `200` + `transport: "none"`, not an error.
+    #[test]
+    fn dispatch_pool_health_returns_200_transport_none_when_ctx_pool_none() {
+        let (_dir, db) = test_db();
+        let mask_dir = std::path::PathBuf::from("/tmp");
+        let c = ctx_with_pool(&db, &mask_dir, None);
+
+        let (status, body) = dispatch(&c, METHOD_GET, "/api/v1/pool/health", &[]);
+        assert_eq!(status, 200);
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["transport"], "none");
+        assert_eq!(parsed["total_nodes"], 0);
+    }
+
+    /// `GET /api/v1/pool/links` with `ctx.pool == None` must degrade to
+    /// `200` + an empty array.
+    #[test]
+    fn dispatch_pool_links_returns_200_empty_when_ctx_pool_none() {
+        let (_dir, db) = test_db();
+        let mask_dir = std::path::PathBuf::from("/tmp");
+        let c = ctx_with_pool(&db, &mask_dir, None);
+
+        let (status, body) = dispatch(&c, METHOD_GET, "/api/v1/pool/links", &[]);
+        assert_eq!(status, 200);
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed, serde_json::json!([]));
+    }
+
+    /// With a real `Some(PoolSnapshot)` wired in, `dispatch` returns exactly
+    /// that snapshot's field, sliced per-route — confirms the three routes
+    /// actually read `ctx.pool` rather than always degrading.
+    #[test]
+    fn dispatch_pool_routes_return_populated_snapshot_when_ctx_pool_is_some() {
+        let (_dir, db) = test_db();
+        let mask_dir = std::path::PathBuf::from("/tmp");
+        let snapshot = build_pool_snapshot(PoolSnapshotInputs {
+            peers: &["peer-z:443".to_string()],
+            registry_nodes: &[("peer-z:443".to_string(), [3u8; 32])],
+            revoked: &[],
+            statuses: &[(
+                "peer-z:443".to_string(),
+                sample_status(true, true, Some(42), Some(42)),
+            )],
+            transport: "masked",
+        });
+        let c = ctx_with_pool(&db, &mask_dir, Some(snapshot));
+
+        let (status, body) = dispatch(&c, METHOD_GET, "/api/v1/pool/nodes", &[]);
+        assert_eq!(status, 200);
+        let nodes: Vec<PoolNodeInfo> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].node_id, "peer-z:443");
+        assert!(nodes[0].verified);
+        assert!(nodes[0].connected);
+
+        let (status, body) = dispatch(&c, METHOD_GET, "/api/v1/pool/health", &[]);
+        assert_eq!(status, 200);
+        let health: PoolHealth = serde_json::from_slice(&body).unwrap();
+        assert_eq!(health.transport, "masked");
+        assert_eq!(health.connected_peers, 1);
+
+        let (status, body) = dispatch(&c, METHOD_GET, "/api/v1/pool/links", &[]);
+        assert_eq!(status, 200);
+        let links: Vec<PoolLinkInfo> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].peer, "peer-z:443");
+        assert!(links[0].converged);
+    }
+
+    /// Viewer (read-only) must be allowed on all three GET pool routes —
+    /// they fall out of the existing "Viewer = GET only" rule automatically,
+    /// this just confirms the allowlist entries actually classify.
+    #[test]
+    fn authorize_viewer_allowed_on_pool_get_routes() {
+        assert!(authorize(ROLE_VIEWER, METHOD_GET, "/api/v1/pool/nodes"));
+        assert!(authorize(ROLE_VIEWER, METHOD_GET, "/api/v1/pool/health"));
+        assert!(authorize(ROLE_VIEWER, METHOD_GET, "/api/v1/pool/links"));
+    }
+
+    /// Admin is allowed too (Admin = every curated route).
+    #[test]
+    fn authorize_admin_allowed_on_pool_get_routes() {
+        assert!(authorize(ROLE_ADMIN, METHOD_GET, "/api/v1/pool/nodes"));
+        assert!(authorize(ROLE_ADMIN, METHOD_GET, "/api/v1/pool/health"));
+        assert!(authorize(ROLE_ADMIN, METHOD_GET, "/api/v1/pool/links"));
+    }
+
+    /// User (no management access) is denied on all three, same as every
+    /// other curated route.
+    #[test]
+    fn authorize_user_denied_on_pool_get_routes() {
+        assert!(!authorize(ROLE_USER, METHOD_GET, "/api/v1/pool/nodes"));
+        assert!(!authorize(ROLE_USER, METHOD_GET, "/api/v1/pool/health"));
+        assert!(!authorize(ROLE_USER, METHOD_GET, "/api/v1/pool/links"));
+    }
+
+    /// Pool routes are GET-only over the tunnel (read-only by design) —
+    /// even Admin gets no POST/PATCH/DELETE on `/api/v1/pool/*` since no
+    /// such route exists in `classify_route`'s allowlist at all.
+    #[test]
+    fn authorize_pool_routes_reject_non_get_methods_for_every_role() {
+        for role in [ROLE_USER, ROLE_VIEWER, ROLE_ADMIN] {
+            assert!(!authorize(role, METHOD_POST, "/api/v1/pool/nodes"));
+            assert!(!authorize(role, METHOD_PATCH, "/api/v1/pool/health"));
+            assert!(!authorize(role, METHOD_DELETE, "/api/v1/pool/links"));
+        }
     }
 }

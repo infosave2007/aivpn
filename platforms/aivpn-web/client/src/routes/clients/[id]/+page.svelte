@@ -27,12 +27,18 @@
   });
 
   let form = $state<Partial<Client> & { qos: ClientQos }>({ qos: {} });
+  // Exit-node override is edited as plain text (empty = clear to global
+  // default) rather than through `form.exit_node` directly, so an
+  // untouched null/undefined field never gets coerced to '' and flagged
+  // as a change in buildPatch().
+  let exitNodeInput = $state('');
   let toast = $state('');
   let toastError = $state(false);
 
   $effect(() => {
     if ($query.data) {
       form = { ...$query.data, qos: { ...($query.data.qos ?? {}) } };
+      exitNodeInput = $query.data.exit_node ?? '';
     }
   });
 
@@ -54,6 +60,12 @@
     if (form.enabled !== undefined && form.enabled !== orig.enabled) patch.enabled = form.enabled;
     if (form.one_time !== undefined && form.one_time !== orig.one_time) patch.one_time = form.one_time;
     if (isAdmin && form.role !== undefined && form.role !== (orig.role ?? 'user')) patch.role = form.role;
+
+    if (isAdmin) {
+      const trimmed = exitNodeInput.trim();
+      const nextExitNode = trimmed === '' ? null : trimmed;
+      if (nextExitNode !== (orig.exit_node ?? null)) patch.exit_node = nextExitNode;
+    }
 
     const newQos: ClientQos = {};
     const up = qosNum(form.qos.bandwidth_limit_up);
@@ -207,6 +219,20 @@
               <option value={r}>{r}</option>
             {/each}
           </select>
+        </div>
+
+        <div>
+          <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1" for="cexit">Exit node</label>
+          <input
+            id="cexit"
+            type="text"
+            bind:value={exitNodeInput}
+            placeholder="host:port (empty = use pool default)"
+            class="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-white text-sm font-mono focus:outline-none focus:ring-2 focus:ring-indigo-500"
+          />
+          <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">
+            Overrides the pool's global default exit node for this client only. Takes effect live — no restart needed. Leave empty to fall back to the global default.
+          </p>
         </div>
       {/if}
 

@@ -327,6 +327,15 @@ impl AivpnServer {
         self.gateway.pending_config()
     }
 
+    /// B2b (per-client exit routing): shared handle to the gateway's
+    /// exit-resolution cache, for callers outside `Gateway`/`AivpnServer`
+    /// (`main.rs`'s SIGHUP client-DB-reload handler) that need to
+    /// invalidate it after an out-of-band DB change. See
+    /// `Gateway::exit_route_cache`'s doc comment.
+    pub fn exit_route_cache(&self) -> Arc<dashmap::DashMap<std::net::Ipv4Addr, Option<String>>> {
+        self.gateway.exit_route_cache()
+    }
+
     /// Set multi-hop chain forwarder.  Must be called before `run()`.
     pub fn set_chain_forwarder(&mut self, cf: Arc<crate::chain_forwarder::ChainForwarder>) {
         self.gateway.set_chain_forwarder(cf);

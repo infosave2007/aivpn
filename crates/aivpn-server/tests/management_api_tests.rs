@@ -95,6 +95,9 @@ async fn spawn_server_with_key(
             metrics: None,
             socket_group: None,
             pending_config: None,
+            pool_configured: false,
+            pool_registry_slot: None,
+            pool_dialer_slot: None,
         })
         .await;
     });

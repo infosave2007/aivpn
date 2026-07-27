@@ -73,11 +73,13 @@
 //! something control-only sessions need. Flagged for a future fix, not
 //! addressed here.
 
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use chrono::Utc;
+use serde::Serialize;
 use tracing::{debug, info, warn};
 
 use aivpn_client::client::{AivpnClient, ClientConfig};
@@ -138,6 +140,11 @@ pub struct PoolDialer {
     /// all of them without reaching into the per-peer dial tasks directly.
     peer_senders:
         Arc<parking_lot::Mutex<HashMap<String, tokio::sync::mpsc::Sender<ControlPayload>>>>,
+    /// Wave B1 (pool topology read endpoints): retained per-peer sync
+    /// status, updated by `run_one_session` (connect/disconnect) and
+    /// `anti_entropy` (convergence/divergence). See [`PeerSyncStatus`] and
+    /// [`Self::pool_status_snapshot`].
+    pool_status: Arc<parking_lot::Mutex<HashMap<String, PeerSyncStatus>>>,
     /// PHASE 4 (reverse chain-forward): when this node is an entry that
     /// dials an exit node (`main.rs` passes `Some(..)` only when this node
     /// runs the masked pool-client transport AND has `pool.exit_node`
@@ -168,6 +175,34 @@ pub struct PoolDialer {
     /// forwarded into the `ClientConfig` (`node_identity`/`pool_node_id`)
     /// passed to `AivpnClient::new` in [`Self::run_one_session`].
     node_identity: Option<ed25519_dalek::SigningKey>,
+    /// Wave B2c (runtime dial add-peer): the peer addresses that currently
+    /// have (or are about to have) a `dial_loop` task spawned for them — a
+    /// SUPERSET of `self.peers` (the startup-configured dial set) once
+    /// `add_peer` has added any runtime peer. Populated by
+    /// [`Self::spawn_dial_loop`] BEFORE it actually spawns, so it doubles as
+    /// the idempotency gate: a repeated `start()`/`add_peer` call for an
+    /// address already tracked here is guaranteed to no-op rather than
+    /// double-spawn a `dial_loop`. Distinct from `peer_senders` (which only
+    /// holds an entry while a session is actually CONNECTED) — an address
+    /// stays in this set for the whole process lifetime once dialed, through
+    /// every reconnect/backoff cycle, while `peer_senders` only intermittently
+    /// contains it.
+    dialed_peers: Arc<parking_lot::Mutex<HashSet<String>>>,
+    /// Wave B2c: the shutdown flag `start()` was called with, retained so
+    /// [`Self::add_peer`] can spawn additional `dial_loop` tasks that share
+    /// the EXACT same shutdown signal as the peers dialed at startup — a
+    /// runtime-added dial task must stop on the same signal as everything
+    /// else, not run forever independent of process shutdown. `None` until
+    /// `start()` runs; [`Self::spawn_dial_loop`] treats that as "the dialer
+    /// hasn't been started yet" and refuses to spawn (see its doc comment).
+    shutdown: Arc<parking_lot::Mutex<Option<Arc<AtomicBool>>>>,
+    /// Wave B2c: counts every dial task [`Self::spawn_dial_loop`] actually
+    /// spawned (i.e. every time the idempotency gate above let a NEW peer
+    /// through). Kept unconditionally (not `cfg(test)`) for simplicity —
+    /// the counter itself is cheap (one atomic increment per peer, ever) —
+    /// but in practice it exists so tests can assert "`add_peer` didn't
+    /// double-spawn" without needing to observe a real live connection.
+    spawn_count: Arc<AtomicUsize>,
 }
 
 impl PoolDialer {
@@ -265,8 +300,12 @@ impl PoolDialer {
             node_id: config.node_id.clone(),
             local_subnets,
             peer_senders: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            pool_status: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             reverse_downlink_tx,
             node_identity,
+            dialed_peers: Arc::new(parking_lot::Mutex::new(HashSet::new())),
+            shutdown: Arc::new(parking_lot::Mutex::new(None)),
+            spawn_count: Arc::new(AtomicUsize::new(0)),
         }))
     }
 
@@ -284,6 +323,68 @@ impl PoolDialer {
         }
     }
 
+    /// B2b (per-client exit routing): non-mutating liveness check for
+    /// `peer` — `true` iff a live dialed session is currently registered in
+    /// `peer_senders`, without attempting to queue anything. Used by
+    /// `gateway.rs`'s `choose_exit` decision to pick between a client's
+    /// per-client `exit_node` override and the node's global default
+    /// BEFORE committing to a `send_to_peer` call, so the decision itself
+    /// stays a pure, side-effect-free check. A `true` here does not
+    /// guarantee a subsequent `send_to_peer` will succeed (the session can
+    /// drop between the two calls) — callers must still handle that
+    /// `send_to_peer` returning `false`.
+    pub fn has_live_session(&self, peer: &str) -> bool {
+        self.peer_senders.lock().contains_key(peer)
+    }
+
+    /// Test-only: register a fake live session for `peer` in `peer_senders`,
+    /// exactly as `run_one_session` does after a real successful dial — for
+    /// tests OUTSIDE this module (e.g. `gateway.rs`'s B2b
+    /// `exit_decision_for_session`/`forward_via_exit` integration tests)
+    /// that need `has_live_session`/`send_to_peer` to observe `peer` as
+    /// live without driving a real socket/session. `pub(crate)` + `cfg(test)`
+    /// keeps this out of non-test builds entirely.
+    #[cfg(test)]
+    pub(crate) fn test_register_live_session(
+        &self,
+        peer: &str,
+    ) -> tokio::sync::mpsc::Receiver<ControlPayload> {
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        self.peer_senders.lock().insert(peer.to_string(), tx);
+        rx
+    }
+
+    /// Wave B2c test-only: simulate `start()` having run — sets the
+    /// `shutdown` field so `add_peer` will actually spawn a `dial_loop`
+    /// task, WITHOUT spawning tasks for the startup-configured `self.peers`
+    /// (unlike a real `start()` call, which would try to actually dial
+    /// them). Lets `add_peer` idempotency tests exercise the real
+    /// `spawn_dial_loop` path (including the real `tokio::spawn` call) for
+    /// just the one runtime-added peer under test, without any of this
+    /// dialer's OTHER configured peers making real (bound-to-fail) network
+    /// attempts in the background for the rest of the test process.
+    #[cfg(test)]
+    pub(crate) fn test_mark_started(&self, shutdown: Arc<AtomicBool>) {
+        *self.shutdown.lock() = Some(shutdown);
+    }
+
+    /// Wave B2c test-only: `true` iff `peer` is currently tracked in
+    /// `dialed_peers` (i.e. `spawn_dial_loop` successfully claimed it,
+    /// whether or not the spawned task has connected yet).
+    #[cfg(test)]
+    pub(crate) fn is_dialed_peer(&self, peer: &str) -> bool {
+        self.dialed_peers.lock().contains(peer)
+    }
+
+    /// Wave B2c test-only: how many `dial_loop` tasks this dialer has
+    /// actually spawned in total (startup `start()` peers + any `add_peer`
+    /// runtime additions) — the idempotency proxy `add_peer` tests assert
+    /// on to confirm a repeated call never double-spawns.
+    #[cfg(test)]
+    pub(crate) fn spawn_count(&self) -> usize {
+        self.spawn_count.load(Ordering::Relaxed)
+    }
+
     /// Queue `payload` for delivery to every currently-connected peer.
     /// Returns the number of peers it was successfully queued for.
     pub fn broadcast(&self, payload: ControlPayload) -> usize {
@@ -294,19 +395,146 @@ impl PoolDialer {
             .count()
     }
 
+    /// Wave B1 (pool topology read endpoints): snapshot of every peer's
+    /// retained sync status. Includes peers that were once connected but
+    /// currently aren't — `PeerSyncStatus::connected` on the entry reflects
+    /// the LIVE state as of the last update, not just "ever seen".
+    pub fn pool_status_snapshot(&self) -> Vec<(String, PeerSyncStatus)> {
+        self.pool_status
+            .lock()
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
+    }
+
+    /// This node's configured masked-transport dial set: self-filtered
+    /// (see [`Self::new`]) and, when `main.rs` wired an exit node, including
+    /// `pool.exit_node`. Used by the Phase B pool topology read endpoints as
+    /// the "configured membership" input to `mgmt_service::build_pool_snapshot`.
+    pub fn peers(&self) -> &[String] {
+        &self.peers
+    }
+
+    /// Peers with a currently-live dialed session (the keys of
+    /// `peer_senders`, at the moment of the call).
+    pub fn connected_peers(&self) -> Vec<String> {
+        self.peer_senders.lock().keys().cloned().collect()
+    }
+
     /// Spawn one reconnecting dialer task per configured peer.
     pub fn start(self: Arc<Self>, shutdown: Arc<AtomicBool>) {
+        // Retained so `add_peer` (Wave B2c) can spawn additional dial tasks
+        // sharing this exact shutdown signal, and so `spawn_dial_loop` can
+        // tell "not started yet" apart from "started" (see both fields'
+        // doc comments).
+        *self.shutdown.lock() = Some(shutdown);
+
         info!(
             "pool_dialer: active ({} peers, masked pool-client transport)",
             self.peers.len()
         );
         for peer in self.peers.clone() {
-            let me = self.clone();
-            let shutdown = shutdown.clone();
-            tokio::spawn(async move {
-                me.dial_loop(peer, shutdown).await;
-            });
+            self.spawn_dial_loop(peer);
         }
+    }
+
+    /// Shared per-peer spawn logic used by BOTH `start()` (the startup-
+    /// configured dial set) and [`Self::add_peer`] (Wave B2c runtime
+    /// additions) — factored out so the two call sites can never drift on
+    /// how a dial task is constructed.
+    ///
+    /// Idempotent: returns `false` without spawning anything if `peer`
+    /// already has a task tracked in `dialed_peers` (a duplicate `start()`
+    /// peer, or a repeated `add_peer` call for the same address), or if
+    /// `start()` has not run yet (no shutdown flag exists to hand the new
+    /// task, so — rather than spawn a task with no way to ever be told to
+    /// stop — this rolls back the `dialed_peers` insert and no-ops, letting
+    /// a legitimate later `start()`/`add_peer` call spawn it for real).
+    fn spawn_dial_loop(self: &Arc<Self>, peer: String) -> bool {
+        {
+            let mut dialed = self.dialed_peers.lock();
+            if !dialed.insert(peer.clone()) {
+                debug!(
+                    "pool_dialer: spawn_dial_loop({}) — already dialing, no-op",
+                    peer
+                );
+                return false;
+            }
+        }
+
+        let shutdown = match self.shutdown.lock().clone() {
+            Some(s) => s,
+            None => {
+                self.dialed_peers.lock().remove(&peer);
+                warn!(
+                    "pool_dialer: spawn_dial_loop({}) called before start() — dropped",
+                    peer
+                );
+                return false;
+            }
+        };
+
+        self.spawn_count.fetch_add(1, Ordering::Relaxed);
+        let me = self.clone();
+        tokio::spawn(async move {
+            me.dial_loop(peer, shutdown).await;
+        });
+        true
+    }
+
+    /// Wave B2c (runtime dial add-peer): idempotently ensure `addr` has a
+    /// live `dial_loop` task, so a per-client `exit_node` set to an address
+    /// this node was NOT already dialing at startup goes live WITHOUT a
+    /// server restart. Called from `gateway.rs` after any mgmt mutation
+    /// that may have set/changed a client's `exit_node`, and after a
+    /// successful pool-sync `merge_from_json` (a peer node's admin can also
+    /// introduce a new exit_node, which then needs dialing here too).
+    ///
+    /// A no-op when:
+    /// - `addr` (after trimming) is empty;
+    /// - `addr` equals this node's own configured `node_id` — never
+    ///   self-dial, mirrors [`Self::new`]'s startup self-filter;
+    /// - `addr` already has a dial task tracked — startup-configured OR a
+    ///   previous `add_peer` call (see [`Self::spawn_dial_loop`]'s
+    ///   idempotency gate);
+    /// - the dialer has not been [`Self::start`]ed yet.
+    ///
+    /// Scope note (Wave B2c): this only ADDS dial sessions. Teardown of an
+    /// unused runtime-added session (e.g. after an admin later clears that
+    /// client's `exit_node` and no other client references it) is
+    /// intentionally NOT implemented here — an idling unused dial session
+    /// is acceptable for this wave; pruning it is a future optimization.
+    /// Making the global default (`masked_exit_addr`) itself hot-swappable
+    /// is a separate follow-up, also out of scope here.
+    pub fn add_peer(self: &Arc<Self>, addr: impl Into<String>) {
+        let addr = addr.into();
+        let addr = addr.trim();
+        if addr.is_empty() {
+            return;
+        }
+        if self.node_id.as_deref().is_some_and(|id| id == addr) {
+            debug!(
+                "pool_dialer: add_peer({}) ignored — this node's own node_id",
+                addr
+            );
+            return;
+        }
+        if self.spawn_dial_loop(addr.to_string()) {
+            info!(
+                "pool_dialer: runtime add_peer — now dialing new peer {} (live without restart)",
+                addr
+            );
+        }
+    }
+
+    /// Wave B2c: every peer address currently tracked in `dialed_peers` —
+    /// the startup-configured dial set PLUS any peer `add_peer` has added
+    /// at runtime. Used by `gateway.rs`'s post-mutation hook to compute
+    /// which of a scanned client DB's `exit_node` addresses are actually
+    /// new (see `exits_needing_dial`), so a redundant `add_peer` call isn't
+    /// even attempted for an address already being dialed.
+    pub fn dialed_peer_addrs(&self) -> Vec<String> {
+        self.dialed_peers.lock().iter().cloned().collect()
     }
 
     /// Reconnect loop for a single peer: dial, run anti-entropy until the
@@ -404,6 +632,26 @@ impl PoolDialer {
             .lock()
             .insert(peer.to_string(), ctrl.clone());
 
+        // Wave B1 (pool topology read endpoints): record this connect so
+        // `pool_status_snapshot` reflects a live session immediately, even
+        // before the first anti-entropy beacon/convergence signal arrives.
+        {
+            let now = Utc::now().timestamp();
+            let mut status = self.pool_status.lock();
+            let entry = status
+                .entry(peer.to_string())
+                .or_insert_with(|| PeerSyncStatus {
+                    connected: false,
+                    last_converged_unix: None,
+                    converged: false,
+                    last_seen_unix: None,
+                    partition_conflict: false,
+                    subnet_mismatch: false,
+                });
+            entry.connected = true;
+            entry.last_seen_unix = Some(now);
+        }
+
         // PHASE 3: advertise our local subnets to this peer immediately on
         // connect (in addition to the periodic re-advertise folded into
         // `anti_entropy`'s beacon tick below) so a freshly (re)connected
@@ -443,6 +691,7 @@ impl PoolDialer {
         let local_subnets = self.local_subnets.clone();
         let node_id = self.node_id.clone();
         let reverse_downlink_tx = self.reverse_downlink_tx.clone();
+        let pool_status = self.pool_status.clone();
         let driver = tokio::spawn(async move {
             anti_entropy(
                 ctrl,
@@ -453,6 +702,7 @@ impl PoolDialer {
                 local_subnets,
                 node_id,
                 reverse_downlink_tx,
+                pool_status,
             )
             .await;
         });
@@ -466,8 +716,127 @@ impl PoolDialer {
         // behind for `send_to_peer`/`broadcast` to find.
         self.peer_senders.lock().remove(peer);
 
+        // Wave B1: mirror the disconnect into the retained status too —
+        // `converged`/`last_converged_unix` are left untouched (they record
+        // the last time convergence WAS observed, which stays meaningful
+        // across a disconnect/reconnect).
+        if let Some(entry) = self.pool_status.lock().get_mut(peer) {
+            entry.connected = false;
+        }
+
         run_result
     }
+}
+
+/// Wave B1 (pool topology read endpoints): live per-peer sync status,
+/// retained across anti-entropy rounds so `mgmt_service::build_pool_snapshot`
+/// can report it over the curated mgmt path (`GET /api/v1/pool/*`). Unlike
+/// `PoolDialer::peer_senders` (a live map that only ever reflects "is a
+/// session up right now") this is a small, `Clone`-able, `Serialize`-able
+/// summary retained for the endpoints — cleared/refreshed as
+/// `run_one_session`/`anti_entropy` observe connect/disconnect/convergence
+/// events, never read back into any protocol decision.
+#[derive(Debug, Clone, Serialize)]
+pub struct PeerSyncStatus {
+    /// A masked dialed session to this peer is up right now (mirrors
+    /// `peer_senders`'s membership at the moment this was last updated).
+    pub connected: bool,
+    /// Unix seconds of the most recent observed convergence (root or
+    /// bucket digest match) with this peer. `None` if never observed.
+    pub last_converged_unix: Option<i64>,
+    /// Whether the last anti-entropy signal from this peer indicated
+    /// convergence (root/bucket digests matched) as opposed to a mismatch
+    /// that triggered (or is still resolving) a bucket-diff/`PoolSync`
+    /// exchange.
+    pub converged: bool,
+    /// Unix seconds of the most recent activity (connect or any
+    /// convergence/divergence signal) observed for this peer.
+    pub last_seen_unix: Option<i64>,
+    /// Wave B-IP.2: true iff the most recent `ControlPayload::PartitionAnnounce`
+    /// exchange with this peer resolved to `PartitionCheck::IndexConflict` —
+    /// both nodes claim the same VPN-IP partition index on the same subnet.
+    pub partition_conflict: bool,
+    /// Wave B-IP.2: true iff the most recent `ControlPayload::PartitionAnnounce`
+    /// exchange with this peer resolved to `PartitionCheck::SubnetMismatch` —
+    /// this peer is configured with a different VPN subnet than ours.
+    pub subnet_mismatch: bool,
+}
+
+/// Mark `peer` as converged as of `now` (unix seconds) — called from
+/// `anti_entropy` whenever a `PoolStateDigest`/`PoolBucketDigests` exchange
+/// shows agreement with `peer`. Creates a fresh entry (optimistically
+/// `connected: true`, since only a live session can receive this signal) if
+/// none existed yet.
+fn mark_converged(
+    pool_status: &parking_lot::Mutex<HashMap<String, PeerSyncStatus>>,
+    peer: &str,
+    now: i64,
+) {
+    let mut status = pool_status.lock();
+    let entry = status
+        .entry(peer.to_string())
+        .or_insert_with(|| PeerSyncStatus {
+            connected: true,
+            last_converged_unix: None,
+            converged: false,
+            last_seen_unix: None,
+            partition_conflict: false,
+            subnet_mismatch: false,
+        });
+    entry.converged = true;
+    entry.last_converged_unix = Some(now);
+    entry.last_seen_unix = Some(now);
+}
+
+/// Mark `peer` as currently diverged as of `now` (unix seconds) — called
+/// from `anti_entropy` whenever a digest mismatch is observed. Leaves
+/// `last_converged_unix` untouched (it records the last time convergence
+/// WAS observed, not "now").
+fn mark_diverged(
+    pool_status: &parking_lot::Mutex<HashMap<String, PeerSyncStatus>>,
+    peer: &str,
+    now: i64,
+) {
+    let mut status = pool_status.lock();
+    let entry = status
+        .entry(peer.to_string())
+        .or_insert_with(|| PeerSyncStatus {
+            connected: true,
+            last_converged_unix: None,
+            converged: false,
+            last_seen_unix: None,
+            partition_conflict: false,
+            subnet_mismatch: false,
+        });
+    entry.converged = false;
+    entry.last_seen_unix = Some(now);
+}
+
+/// Wave B-IP.2: record `check` (from a `ControlPayload::PartitionAnnounce`
+/// exchange with `peer`) onto that peer's `PeerSyncStatus`, so
+/// `GET /api/v1/pool/health`/`links` can badge a partition-index collision
+/// or subnet mismatch. Overwrites unconditionally — the flags always reflect
+/// the MOST RECENT check, not a sticky "ever seen" latch, so a resolved
+/// misconfiguration clears itself on the next converged announce.
+fn mark_partition_check(
+    pool_status: &parking_lot::Mutex<HashMap<String, PeerSyncStatus>>,
+    peer: &str,
+    check: crate::pool_partition::PartitionCheck,
+) {
+    use crate::pool_partition::PartitionCheck;
+    let mut status = pool_status.lock();
+    let entry = status
+        .entry(peer.to_string())
+        .or_insert_with(|| PeerSyncStatus {
+            connected: true,
+            last_converged_unix: None,
+            converged: false,
+            last_seen_unix: None,
+            partition_conflict: false,
+            subnet_mismatch: false,
+        });
+    entry.partition_conflict = matches!(check, PartitionCheck::IndexConflict { .. });
+    entry.subnet_mismatch = matches!(check, PartitionCheck::SubnetMismatch);
 }
 
 /// A peer that has gone this many beacon intervals without its root digest
@@ -509,6 +878,7 @@ async fn anti_entropy(
     local_subnets: Vec<String>,
     node_id: Option<String>,
     reverse_downlink_tx: Option<tokio::sync::mpsc::Sender<Vec<u8>>>,
+    pool_status: Arc<parking_lot::Mutex<HashMap<String, PeerSyncStatus>>>,
 ) {
     let mut beacon = tokio::time::interval(Duration::from_secs(beacon_secs));
     // The first tick fires immediately; that's desirable here — beacon as
@@ -519,6 +889,10 @@ async fn anti_entropy(
     // round never spuriously warns.
     let mut last_converged = std::time::Instant::now();
     let mut warned_stale = false;
+    // Wave B-IP.2: dedupe the partition-conflict/subnet-mismatch log to one
+    // line per state TRANSITION (mirrors `warned_stale`'s latch) instead of
+    // re-logging on every beacon interval.
+    let mut last_partition_check: Option<crate::pool_partition::PartitionCheck> = None;
 
     loop {
         tokio::select! {
@@ -560,6 +934,36 @@ async fn anti_entropy(
                 // against cross-session replay. This dialer no longer builds
                 // or resends one here.
 
+                // Wave B-IP.2: announce our VPN-IP partition assignment on
+                // the same cadence as the state-digest beacon — this dialer
+                // (unlike `NodeEnrollment` above) has `db` directly, so no
+                // session-transcript binding or extra plumbing through
+                // `aivpn-client`'s `ClientConfig` is needed; it's a plain
+                // operator-visibility payload, not a security proof. Sent
+                // on every beacon (self-healing, like `PoolStateDigest`)
+                // rather than once, so a late-configured/late-repartitioned
+                // peer's mismatch is picked up without a reconnect.
+                let local_cidr = db.network_config().cidr_string();
+                let local_partition = db.partition_info().unwrap_or(crate::client_db::PartitionInfo {
+                    partition_index: 0,
+                    partition_size: 0,
+                    num_partitions: 1,
+                    explicit: false,
+                });
+                if ctrl
+                    .send(ControlPayload::PartitionAnnounce {
+                        subnet_cidr: local_cidr,
+                        partition_index: local_partition.partition_index,
+                        partition_size: local_partition.partition_size,
+                        num_partitions: local_partition.num_partitions,
+                        explicit: local_partition.explicit,
+                    })
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+
                 let stale_for = last_converged.elapsed();
                 let stale_threshold = Duration::from_secs(beacon_secs) * STALE_WARN_BEACONS;
                 if !warned_stale && stale_for >= stale_threshold {
@@ -579,7 +983,9 @@ async fn anti_entropy(
                             // Converged — reset the stale-visibility latch.
                             last_converged = std::time::Instant::now();
                             warned_stale = false;
+                            mark_converged(&pool_status, &peer, Utc::now().timestamp());
                         } else {
+                            mark_diverged(&pool_status, &peer, Utc::now().timestamp());
                             // Phase 2: send our bucketed digest (not the
                             // whole DB) so the peer can work out exactly
                             // which buckets differ and push us the delta.
@@ -612,6 +1018,7 @@ async fn anti_entropy(
                             &peer_buckets,
                         );
                         if !differing.is_empty() {
+                            mark_diverged(&pool_status, &peer, Utc::now().timestamp());
                             let clients_json =
                                 db.clients_json_for_buckets(&differing).into_bytes();
                             if ctrl
@@ -638,6 +1045,7 @@ async fn anti_entropy(
                             // it too.
                             last_converged = std::time::Instant::now();
                             warned_stale = false;
+                            mark_converged(&pool_status, &peer, Utc::now().timestamp());
                         }
                         if reply_requested {
                             // Hand our own buckets back so the peer can
@@ -702,6 +1110,37 @@ async fn anti_entropy(
                         if let Some(tx) = &reverse_downlink_tx {
                             let _ = tx.try_send(payload);
                         }
+                    }
+                    Some(ControlPayload::PartitionAnnounce {
+                        subnet_cidr: peer_cidr,
+                        partition_index: peer_index,
+                        partition_size: _peer_partition_size,
+                        num_partitions: _peer_num_partitions,
+                        explicit: peer_explicit,
+                    }) => {
+                        // Wave B-IP.2: this is the gateway's reply to the
+                        // announce we just sent on this same beacon tick
+                        // (see the `PartitionAnnounce` reply in
+                        // `gateway.rs`'s `handle_control_message`) — run the
+                        // identical check from our side so a conflict is
+                        // visible regardless of which side happens to log
+                        // first.
+                        let local_cidr = db.network_config().cidr_string();
+                        let local_partition =
+                            db.partition_info().map(|p| (p.partition_index, p.explicit));
+                        let check = crate::pool_partition::check_partition(
+                            &local_cidr,
+                            local_partition,
+                            &peer_cidr,
+                            Some((peer_index, peer_explicit)),
+                        );
+                        if last_partition_check != Some(check) {
+                            crate::pool_partition::log_partition_check(
+                                check, &peer, &local_cidr, &peer_cidr,
+                            );
+                            last_partition_check = Some(check);
+                        }
+                        mark_partition_check(&pool_status, &peer, check);
                     }
                     Some(_) => {
                         // Any other future control variant — not our concern here.
@@ -810,6 +1249,7 @@ mod tests {
             allow_auto_add: None,
             node_identity_key: None,
             require_node_enrollment: None,
+            node_ip_partition: None,
         }
     }
 
@@ -921,6 +1361,31 @@ mod tests {
         assert_eq!(n, 0);
     }
 
+    /// `has_live_session` must mirror `send_to_peer`'s notion of "live"
+    /// exactly (same `peer_senders` map, non-mutating) — false before
+    /// registration, true once registered, false again after removal.
+    #[test]
+    fn has_live_session_tracks_peer_senders_membership() {
+        let cfg = base_pool_config();
+        let dialer = PoolDialer::new(test_db(), &cfg, vec![], None, None).unwrap();
+
+        assert!(!dialer.has_live_session("peer-a:443"));
+
+        let (tx, _rx) = tokio::sync::mpsc::channel::<ControlPayload>(4);
+        dialer
+            .peer_senders
+            .lock()
+            .insert("peer-a:443".to_string(), tx);
+        assert!(dialer.has_live_session("peer-a:443"));
+        assert!(
+            !dialer.has_live_session("peer-b:443"),
+            "an unrelated peer must not appear live"
+        );
+
+        dialer.peer_senders.lock().remove("peer-a:443");
+        assert!(!dialer.has_live_session("peer-a:443"));
+    }
+
     /// Registry insert/remove/broadcast logic exercised directly against
     /// `peer_senders` (no live socket/session needed — this is the same map
     /// `run_one_session` inserts into after connecting and removes from when
@@ -973,6 +1438,250 @@ mod tests {
             dialer.broadcast(ControlPayload::PoolStateDigest { digest: [0u8; 32] }),
             0,
             "no connected peers left"
+        );
+    }
+
+    // ── Wave B1: pool topology read-endpoint retained state ────────────
+
+    /// A freshly constructed dialer has no retained sync status for any
+    /// peer yet — `pool_status_snapshot` must return an empty vec, not
+    /// panic or fabricate an entry.
+    #[test]
+    fn pool_status_snapshot_empty_initially() {
+        let cfg = base_pool_config();
+        let dialer = PoolDialer::new(test_db(), &cfg, vec![], None, None).unwrap();
+        assert!(dialer.pool_status_snapshot().is_empty());
+    }
+
+    /// `connected_peers` mirrors `peer_senders`'s membership and starts
+    /// empty, matching `broadcast_zero_when_no_peers_connected`'s coverage
+    /// of the same underlying map from the other accessor.
+    #[test]
+    fn connected_peers_empty_initially() {
+        let cfg = base_pool_config();
+        let dialer = PoolDialer::new(test_db(), &cfg, vec![], None, None).unwrap();
+        assert!(dialer.connected_peers().is_empty());
+    }
+
+    /// `peers()` exposes the same self-filtered dial set `self_is_filtered_
+    /// out_of_peers` already verifies against the private field — confirms
+    /// the public getter agrees with it.
+    #[test]
+    fn peers_getter_matches_self_filtered_dial_set() {
+        let mut cfg = base_pool_config();
+        cfg.peers = vec!["this-node:443".to_string(), "peer-b:443".to_string()];
+        let dialer = PoolDialer::new(test_db(), &cfg, vec![], None, None).unwrap();
+        assert_eq!(dialer.peers(), &["peer-b:443".to_string()]);
+    }
+
+    /// Direct manipulation of the retained `pool_status` map (the same
+    /// pattern `peer_senders_registry_insert_send_remove_round_trip` uses
+    /// for `peer_senders`, since driving a real `run_one_session`/
+    /// `anti_entropy` round needs a live socket) confirms
+    /// `pool_status_snapshot` reflects whatever is stored, unmodified.
+    #[test]
+    fn pool_status_snapshot_reflects_stored_entries() {
+        let cfg = base_pool_config();
+        let dialer = PoolDialer::new(test_db(), &cfg, vec![], None, None).unwrap();
+        dialer.pool_status.lock().insert(
+            "peer-a:443".to_string(),
+            PeerSyncStatus {
+                connected: true,
+                last_converged_unix: Some(1_700_000_000),
+                converged: true,
+                last_seen_unix: Some(1_700_000_005),
+                partition_conflict: false,
+                subnet_mismatch: false,
+            },
+        );
+
+        let snap = dialer.pool_status_snapshot();
+        assert_eq!(snap.len(), 1);
+        let (peer, status) = &snap[0];
+        assert_eq!(peer, "peer-a:443");
+        assert!(status.connected);
+        assert!(status.converged);
+        assert_eq!(status.last_converged_unix, Some(1_700_000_000));
+        assert_eq!(status.last_seen_unix, Some(1_700_000_005));
+    }
+
+    /// `mark_converged`/`mark_diverged` (the helpers `anti_entropy` calls)
+    /// create a fresh entry optimistically `connected: true` when none
+    /// existed, and correctly flip `converged` without disturbing
+    /// `last_converged_unix` on a divergence signal.
+    #[test]
+    fn mark_converged_then_diverged_updates_status_correctly() {
+        let pool_status: Arc<parking_lot::Mutex<HashMap<String, PeerSyncStatus>>> =
+            Arc::new(parking_lot::Mutex::new(HashMap::new()));
+
+        mark_converged(&pool_status, "peer-x:443", 1000);
+        {
+            let status = pool_status.lock();
+            let entry = status.get("peer-x:443").unwrap();
+            assert!(entry.connected);
+            assert!(entry.converged);
+            assert_eq!(entry.last_converged_unix, Some(1000));
+            assert_eq!(entry.last_seen_unix, Some(1000));
+        }
+
+        mark_diverged(&pool_status, "peer-x:443", 2000);
+        {
+            let status = pool_status.lock();
+            let entry = status.get("peer-x:443").unwrap();
+            assert!(!entry.converged);
+            // last_converged_unix records the last time convergence WAS
+            // observed — a divergence signal must not clear it.
+            assert_eq!(entry.last_converged_unix, Some(1000));
+            assert_eq!(entry.last_seen_unix, Some(2000));
+        }
+    }
+
+    // ── Wave B2c: runtime dial add-peer ─────────────────────────────────
+
+    /// Before `start()` ever runs, `add_peer` must be a safe no-op: no
+    /// task spawned (so this needs no tokio runtime — the guard in
+    /// `spawn_dial_loop` returns before ever calling `tokio::spawn`), and
+    /// the address must not linger in `dialed_peers` afterwards (the
+    /// rollback), so a LATER legitimate `start()`/`add_peer` can still pick
+    /// it up.
+    #[test]
+    fn add_peer_before_start_is_noop() {
+        let cfg = base_pool_config();
+        let dialer = PoolDialer::new(test_db(), &cfg, vec![], None, None).unwrap();
+
+        dialer.add_peer("late-peer:443");
+
+        assert_eq!(dialer.spawn_count(), 0, "dialer was never start()ed");
+        assert!(
+            !dialer.is_dialed_peer("late-peer:443"),
+            "the rejected add must not leave a stale entry behind"
+        );
+    }
+
+    /// Core B2c idempotency guarantee: calling `add_peer` twice for the
+    /// SAME new address (one this node was NOT dialing at startup) must
+    /// spawn exactly one `dial_loop` task, not two — verified via the
+    /// `spawn_count` proxy rather than trying to observe a real network
+    /// connection.
+    #[tokio::test]
+    async fn add_peer_is_idempotent_and_spawns_exactly_once() {
+        let cfg = base_pool_config();
+        let dialer = PoolDialer::new(test_db(), &cfg, vec![], None, None).unwrap();
+        dialer.test_mark_started(Arc::new(AtomicBool::new(false)));
+
+        assert!(!dialer.is_dialed_peer("new-exit:51820"));
+
+        dialer.add_peer("new-exit:51820");
+        assert_eq!(dialer.spawn_count(), 1);
+        assert!(
+            dialer.is_dialed_peer("new-exit:51820"),
+            "add_peer must register the new address in the dial set"
+        );
+
+        // Repeated call for the exact same address — must NOT double-spawn.
+        dialer.add_peer("new-exit:51820");
+        assert_eq!(
+            dialer.spawn_count(),
+            1,
+            "a repeated add_peer for an already-dialed address must be a no-op"
+        );
+    }
+
+    /// `add_peer` for a genuinely different second address, after the
+    /// first is already being dialed, must spawn a second task — the
+    /// idempotency gate is per-address, not "at most one add_peer spawn
+    /// ever".
+    #[tokio::test]
+    async fn add_peer_spawns_once_per_distinct_new_address() {
+        let cfg = base_pool_config();
+        let dialer = PoolDialer::new(test_db(), &cfg, vec![], None, None).unwrap();
+        dialer.test_mark_started(Arc::new(AtomicBool::new(false)));
+
+        dialer.add_peer("exit-one:51820");
+        dialer.add_peer("exit-two:51820");
+        dialer.add_peer("exit-one:51820"); // repeat, must not add a 3rd
+
+        assert_eq!(dialer.spawn_count(), 2);
+        assert!(dialer.is_dialed_peer("exit-one:51820"));
+        assert!(dialer.is_dialed_peer("exit-two:51820"));
+    }
+
+    /// `add_peer` must never dial this node's own configured `node_id` —
+    /// mirrors `self_is_filtered_out_of_peers`'s startup-time guarantee for
+    /// the runtime-add path.
+    #[tokio::test]
+    async fn add_peer_skips_own_node_id() {
+        let cfg = base_pool_config(); // node_id = "this-node:443"
+        let dialer = PoolDialer::new(test_db(), &cfg, vec![], None, None).unwrap();
+        dialer.test_mark_started(Arc::new(AtomicBool::new(false)));
+
+        dialer.add_peer("this-node:443");
+
+        assert_eq!(dialer.spawn_count(), 0);
+        assert!(!dialer.is_dialed_peer("this-node:443"));
+    }
+
+    /// An empty (or all-whitespace) address must be rejected without
+    /// panicking or spawning anything.
+    #[tokio::test]
+    async fn add_peer_rejects_empty_address() {
+        let cfg = base_pool_config();
+        let dialer = PoolDialer::new(test_db(), &cfg, vec![], None, None).unwrap();
+        dialer.test_mark_started(Arc::new(AtomicBool::new(false)));
+
+        dialer.add_peer("   ");
+
+        assert_eq!(dialer.spawn_count(), 0);
+    }
+
+    /// End-to-end plumbing check: once `add_peer` has registered a runtime
+    /// peer in the dial set, that SAME address string is exactly what
+    /// `has_live_session`/`send_to_peer` (the B2b routing decision) key on
+    /// once a real session connects — simulated here via
+    /// `test_register_live_session` rather than a live socket, per the
+    /// task's guidance. Confirms `add_peer` and the live-session registry
+    /// agree on the peer's identity (no normalization/casing drift between
+    /// the two paths).
+    #[tokio::test]
+    async fn add_peer_registered_address_is_reachable_once_session_connects() {
+        let cfg = base_pool_config();
+        let dialer = PoolDialer::new(test_db(), &cfg, vec![], None, None).unwrap();
+        dialer.test_mark_started(Arc::new(AtomicBool::new(false)));
+
+        dialer.add_peer("fresh-exit.example.com:51820");
+        assert!(dialer.is_dialed_peer("fresh-exit.example.com:51820"));
+
+        // No live session yet — the routing decision must not see it as
+        // live just because a dial task was spawned.
+        assert!(!dialer.has_live_session("fresh-exit.example.com:51820"));
+
+        // Simulate the dial task's `run_one_session` succeeding.
+        let _rx = dialer.test_register_live_session("fresh-exit.example.com:51820");
+        assert!(dialer.has_live_session("fresh-exit.example.com:51820"));
+        assert!(dialer.send_to_peer(
+            "fresh-exit.example.com:51820",
+            ControlPayload::PoolStateDigest { digest: [0u8; 32] }
+        ));
+    }
+
+    /// `dialed_peer_addrs` must reflect both the startup-configured peer
+    /// (added by `start()`... simulated here via `test_mark_started` +
+    /// manual `add_peer`, since a real `start()` would attempt a live
+    /// dial) and any runtime `add_peer` additions.
+    #[tokio::test]
+    async fn dialed_peer_addrs_reflects_all_tracked_peers() {
+        let cfg = base_pool_config();
+        let dialer = PoolDialer::new(test_db(), &cfg, vec![], None, None).unwrap();
+        dialer.test_mark_started(Arc::new(AtomicBool::new(false)));
+
+        dialer.add_peer("peer-a:443");
+        dialer.add_peer("peer-b:443");
+
+        let mut addrs = dialer.dialed_peer_addrs();
+        addrs.sort();
+        assert_eq!(
+            addrs,
+            vec!["peer-a:443".to_string(), "peer-b:443".to_string()]
         );
     }
 }

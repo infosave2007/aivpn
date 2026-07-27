@@ -219,6 +219,15 @@ pub struct Session {
     /// pool-client handshake.
     pub verified_node_id: Option<String>,
 
+    /// Wave B-IP.2: the last `pool_partition::PartitionCheck` decision
+    /// computed for this session's peer (from an inbound
+    /// `ControlPayload::PartitionAnnounce`). `None` until the first
+    /// announce arrives. Used purely to dedupe the operator-visibility
+    /// log — a peer that keeps re-announcing the same conflict/mismatch
+    /// (or stays fine) logs only on a state TRANSITION, not on every
+    /// anti-entropy beacon.
+    pub last_partition_check: Option<crate::pool_partition::PartitionCheck>,
+
     /// Return-routability gate for the (potentially amplifying)
     /// `BootstrapDescriptorUpdate` burst: set once that burst has actually
     /// been sent for this session. Sending is deferred from immediately
@@ -438,6 +447,7 @@ impl Session {
             is_pool_peer: false,
             is_masked_pool_peer: false,
             verified_node_id: None,
+            last_partition_check: None,
             bootstrap_descriptors_sent: false,
             pending_rekey_keypair: None,
             pending_rekey_attempts: 0,

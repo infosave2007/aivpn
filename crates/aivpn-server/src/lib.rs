@@ -48,6 +48,7 @@ pub mod audit_log;
 pub mod backup;
 pub mod ebpf_observer;
 pub mod pool_dialer;
+pub mod pool_partition;
 pub mod pool_sync;
 pub mod qos;
 pub mod tc_loader;
