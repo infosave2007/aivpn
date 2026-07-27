@@ -5,8 +5,12 @@
 
 pub mod encryptor;
 pub mod io;
+pub mod platform;
+pub mod run_loop;
 pub mod state;
 
 pub use encryptor::*;
 pub use io::*;
+pub use platform::*;
+pub use run_loop::*;
 pub use state::*;

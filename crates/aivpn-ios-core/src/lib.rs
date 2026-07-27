@@ -326,9 +326,19 @@ pub extern "C" fn aivpn_get_quality_score() -> libc::c_int {
 }
 
 /// Most recent AdaptiveHint level received from the server (0–3).
+///
+/// The shared tunnel core stores the hint as `level + 1` so that 0 can mean
+/// "no hint received this session" — a distinction Android's JNI getter needs
+/// (it reports -1 for "no hint"). `saturating_sub(1)` undoes the shift here,
+/// so every value Swift observes is byte-identical to what this getter
+/// returned before the shift existed: a real hint maps back to its raw level,
+/// and "no hint" still reports 0 (indistinguishable from Off, exactly as
+/// before — deliberately NOT changed to a sentinel Swift has never handled).
 #[no_mangle]
 pub extern "C" fn aivpn_get_adaptive_level_hint() -> libc::c_int {
-    ACTIVE_ADAPTIVE_LEVEL.load(Ordering::Relaxed) as libc::c_int
+    ACTIVE_ADAPTIVE_LEVEL
+        .load(Ordering::Relaxed)
+        .saturating_sub(1) as libc::c_int
 }
 
 /// VPN IPv4 the server assigned to this session in its ServerHello network
