@@ -70,6 +70,16 @@ class VPNManager: ObservableObject {
     /// tunnel retry forever with no other visible signal, so this drives a
     /// one-time local notification prompting the user to re-provision.
     @Published var certRejected: Bool = false
+    /// Set when the server sends an AEAD-authenticated `HandshakeReject` —
+    /// polled from get_traffic, same pattern as certRejected above. Unlike a
+    /// transient disconnect this is a TERMINAL refusal (the extension's
+    /// in-process reconnect loop already stopped retrying once it saw this),
+    /// so it drives a one-time local notification explaining WHY instead of
+    /// leaving the user staring at a tunnel that silently gave up.
+    @Published var handshakeRejected: Bool = false
+    /// Reason code for the most recent `handshakeRejected`: 0 = unspecified,
+    /// 1 = one-time key already used, 2 = client expired, 3 = client disabled.
+    @Published var handshakeRejectReason: Int = 0
     /// Server-pushed mask catalog (polled from the tunnel via get_traffic).
     /// Drives the dynamic mask Picker + its "(авто)" marker.
     @Published var maskCatalog: [MaskCatalogEntry] = []
@@ -262,6 +272,8 @@ class VPNManager: ObservableObject {
                 liveQuality = 0
                 serverAdaptiveLevel = 0
                 certRejected = false
+                handshakeRejected = false
+                handshakeRejectReason = 0
             }
         @unknown default:
             break
@@ -542,6 +554,24 @@ class VPNManager: ObservableObject {
                 self.postNotification(
                     title: LocalizationManager.shared.t("cert_rejected_title"),
                     body: LocalizationManager.shared.t("cert_rejected_body"))
+            }
+            if let rejected = r["handshake_rejected"] as? Bool, rejected, !self.handshakeRejected {
+                self.handshakeRejected = true
+                self.handshakeRejectReason = r["handshake_reject_reason"] as? Int ?? 0
+                // The extension's in-process reconnect loop already stopped
+                // retrying (see PacketTunnelProvider's aivpn_handshake_was_rejected
+                // check) — this is a one-time explanatory notification, not a
+                // prompt to retry, so pick body text per reason code.
+                let bodyKey: String
+                switch self.handshakeRejectReason {
+                case 1: bodyKey = "handshake_reject_reason_1"
+                case 2: bodyKey = "handshake_reject_reason_2"
+                case 3: bodyKey = "handshake_reject_reason_3"
+                default: bodyKey = "handshake_reject_reason_0"
+                }
+                self.postNotification(
+                    title: LocalizationManager.shared.t("handshake_rejected_title"),
+                    body: LocalizationManager.shared.t(bodyKey))
             }
             if let stateStr = r["recording_state"] as? String {
                 // Don't let the tunnel's "idle" overwrite terminal states the user

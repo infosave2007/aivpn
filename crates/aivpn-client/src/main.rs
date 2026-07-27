@@ -4,7 +4,7 @@ use aivpn_client::adaptive::{AdaptiveConfig, AdaptiveMonitor};
 use aivpn_client::bench::run_bench;
 use aivpn_client::bootstrap_cache;
 use aivpn_client::bootstrap_loader::{self, BootstrapConfig};
-use aivpn_client::client::{base_mask_family, ClientConfig};
+use aivpn_client::client::{base_mask_family, handshake_reject_message, ClientConfig};
 use aivpn_client::mask_feedback_log::{MaskFeedbackLog, RegionalHintsStore};
 use aivpn_client::server_pool::{PoolMode, ServerEntry, ServerPool};
 use aivpn_client::tunnel::TunnelConfig;
@@ -983,6 +983,13 @@ async fn main() {
     // server matches via its builtin candidate set. Reset on any real connect.
     const HANDSHAKE_FALLBACK_THRESHOLD: u32 = 3;
     let mut handshake_fail_streak: u32 = 0;
+    // 3b: native OS network-change listener, spawned ONCE for the whole
+    // process lifetime (see net_change.rs) — best-effort, `None` when
+    // unsupported/unavailable, in which case the client falls back to the
+    // existing poll-based watchdogs unchanged. The same `Arc<Notify>` handle
+    // is threaded into every reconnect iteration's `ClientConfig` below so a
+    // single OS registration serves every `AivpnClient::run()` call.
+    let network_change_notify = aivpn_client::net_change::spawn();
     // Whether the user opted in to sharing outcome data (failures + successes).
     // Recording a failure additionally requires a country code (the server
     // aggregates per region and drops feedback without one).
@@ -1106,6 +1113,19 @@ async fn main() {
             }
         };
 
+        // 3c: whether THIS iteration's initial_mask came from the resilience
+        // fallback below rather than normal bootstrap selection. Threaded
+        // into ClientConfig so the client can surface it to file-polling
+        // GUIs (Windows traffic.stats `fallback:` key); the stdout
+        // AIVPN-STATUS line right below covers stdout-reading GUIs (Linux)
+        // and the CLI. Declared unconditionally (defaults false) so
+        // production-secure builds — which never take the branch below —
+        // still have a value to put in ClientConfig. `mut` is unused (and
+        // allowed) specifically in production-secure builds, where the
+        // fallback branch that mutates it is compiled out entirely.
+        #[allow(unused_mut)]
+        let mut is_bootstrap_fallback = false;
+
         // Resilience net (F1): after repeated handshakes that never connected,
         // abandon the descriptor-derived mask for the built-in default preset,
         // which every server matches. Only in builds that permit the built-in
@@ -1119,6 +1139,11 @@ async fn main() {
                 "{} consecutive handshakes never connected — falling back to the built-in default mask (a cached bootstrap descriptor may be unmatchable by this server, e.g. after a server-key change)",
                 handshake_fail_streak
             );
+            // 3c: machine-readable status line (mirrors "AIVPN-STATUS
+            // connected <ip>") so the CLI and stdout-reading GUIs (Linux)
+            // can show a "using built-in mask (fallback)" indicator.
+            println!("AIVPN-STATUS bootstrap-fallback");
+            is_bootstrap_fallback = true;
             bootstrap_default()
         } else {
             initial_mask
@@ -1326,6 +1351,8 @@ async fn main() {
             country_code,
             mask_operator_pubkey,
             mask_verify_mode,
+            network_change_notify: network_change_notify.clone(),
+            is_bootstrap_fallback,
         };
 
         match AivpnClient::new(config) {
@@ -1413,6 +1440,21 @@ async fn main() {
                         break;
                     }
                     Err(e) => {
+                        // 3f: an authenticated HandshakeReject is a terminal,
+                        // PSK-proven refusal (one-time key already used /
+                        // expired / disabled) — retrying would only hammer
+                        // the server with a request it will refuse forever.
+                        // Stop the reconnect loop instead of backing off and
+                        // trying again, mirroring the clean-shutdown Ok(())
+                        // arm above (kill-switch deactivated, process exits).
+                        if client.terminal_rejected() {
+                            error!(
+                                "Handshake rejected by server: {} — not retrying",
+                                handshake_reject_message(client.reject_reason())
+                            );
+                            client.deactivate_kill_switch();
+                            break;
+                        }
                         // A connection that stayed up beyond the healthy threshold is
                         // treated as a genuinely established session, so its backoff
                         // resets to the initial value. Without this, a transient drop

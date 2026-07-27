@@ -609,7 +609,11 @@ pub fn build_temporal_fsm(sizes: &[u16], iats: &[f64]) -> (Vec<FSMState>, u16) {
         return build_fsm_from_sizes(sizes);
     }
     let data: Vec<f64> = sizes.iter().map(|&s| s as f64).collect();
-    let fit = match gmm::select_best_bic(&data, GMM_MAX_COMPONENTS) {
+    let fit = match gmm::select_best_bic_min_cluster(
+        &data,
+        GMM_MAX_COMPONENTS,
+        gmm::MIN_CLUSTER_WEIGHT,
+    ) {
         Some(f) if f.k() >= 2 => f,
         _ => return build_fsm_from_sizes(sizes),
     };
@@ -679,7 +683,11 @@ pub fn build_size_iat_joint(sizes: &[u16], iats: &[f64]) -> Option<SizeIatGmm2d>
         return None;
     }
     let data: Vec<f64> = sizes.iter().map(|&s| s as f64).collect();
-    let fit = match gmm::select_best_bic(&data, GMM_MAX_COMPONENTS) {
+    let fit = match gmm::select_best_bic_min_cluster(
+        &data,
+        GMM_MAX_COMPONENTS,
+        gmm::MIN_CLUSTER_WEIGHT,
+    ) {
         Some(f) if f.k() >= 2 => f,
         _ => return None,
     };
@@ -1339,7 +1347,9 @@ fn build_size_distribution(direction: &DirectionalAnalysis) -> SizeDistribution 
     // histogram for unimodal or small-sample recordings.
     if USE_GMM_DISTRIBUTIONS && sorted.len() >= GMM_MIN_SAMPLES {
         let data: Vec<f64> = sorted.iter().map(|&s| s as f64).collect();
-        if let Some(fit) = gmm::select_best_bic(&data, GMM_MAX_COMPONENTS) {
+        if let Some(fit) =
+            gmm::select_best_bic_min_cluster(&data, GMM_MAX_COMPONENTS, gmm::MIN_CLUSTER_WEIGHT)
+        {
             if fit.k() >= 2 {
                 if let Some(flat) = fit.to_flat_params(GMM_MIN_COMPONENT_WEIGHT) {
                     return SizeDistribution {
@@ -1396,7 +1406,9 @@ fn build_iat_distribution(direction: &DirectionalAnalysis) -> IATDistribution {
     // (audio cadence + control tail, DNS req/resp asymmetry, QUIC ACK-vs-data).
     // Falls through to the empirical quantile sampler otherwise.
     if USE_GMM_DISTRIBUTIONS && sorted.len() >= GMM_MIN_SAMPLES {
-        if let Some(fit) = gmm::select_best_bic(sorted, GMM_MAX_COMPONENTS) {
+        if let Some(fit) =
+            gmm::select_best_bic_min_cluster(sorted, GMM_MAX_COMPONENTS, gmm::MIN_CLUSTER_WEIGHT)
+        {
             if fit.k() >= 2 {
                 if let Some(flat) = fit.to_flat_params(GMM_MIN_COMPONENT_WEIGHT) {
                     let jitter = (direction.iat_std_ms.max(0.1) as f64) * 0.02;

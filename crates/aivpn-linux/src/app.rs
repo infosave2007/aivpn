@@ -646,6 +646,12 @@ pub enum Message {
     OldClientReaped,
     Disconnect,
     StatusReceived(VpnStatus),
+    /// 3c: the client printed "AIVPN-STATUS bootstrap-fallback" — it gave up
+    /// on the descriptor-derived mask after repeated dead handshakes and is
+    /// using the built-in default mask instead. Orthogonal to `VpnStatus`
+    /// (can be true while Connecting or Connected), so it isn't folded into
+    /// that enum.
+    BootstrapFallbackDetected,
     LogLine(String),
     ClearLog,
     SelectProfile(usize),
@@ -1000,6 +1006,9 @@ fn t<'a>(lang: &str, key: &'a str) -> &'a str {
         "+ Add" => "+ Добавить",
         "Edit" => "Ред.",
         "Diagnostics" => "Диагностика",
+        // 3c: bootstrap-fallback indicator (client fell back to the
+        // built-in default mask after repeated dead handshakes).
+        "Using built-in mask (fallback)" => "Встроенная маска (аварийный режим)",
         "Running diagnostics..." => "Диагностика...",
         "Adaptive mode" => "Адаптивный режим",
         "Mask profile" => "Маска трафика",
@@ -1076,6 +1085,11 @@ pub struct App {
     bench_result: Option<String>,
     logs_open: bool,
     bootstrap_open: bool,
+    /// 3c: true once this session's client child has emitted
+    /// "AIVPN-STATUS bootstrap-fallback" (see `Message::BootstrapFallbackDetected`).
+    /// Reset on every new `Connect` so a badge from a previous session never
+    /// bleeds into the next one.
+    bootstrap_fallback: bool,
 }
 
 impl App {
@@ -1122,6 +1136,7 @@ impl App {
                 bench_result: None,
                 logs_open: false,
                 bootstrap_open: false,
+                bootstrap_fallback: false,
             },
             Task::none(),
         )
@@ -1192,6 +1207,10 @@ impl App {
     pub fn update(&mut self, msg: Message) -> Task<Message> {
         match msg {
             Message::Connect => {
+                // 3c: a new connection attempt starts clean — any fallback
+                // badge from a previous session must not persist into this
+                // one until (if) the new child re-emits the status line.
+                self.bootstrap_fallback = false;
                 if let Some(k) = self.storage.selected_key() {
                     let key = k.key.clone();
                     // Kill any existing child before starting a new connection to
@@ -1272,6 +1291,7 @@ impl App {
                 }
                 drop(guard);
                 self.status = VpnStatus::Disconnected;
+                self.bootstrap_fallback = false;
                 self.push_log("Disconnected".to_string());
             }
             Message::StatusReceived(s) => {
@@ -1321,6 +1341,9 @@ impl App {
                         terminate_child_graceful(child, self.launched_kill_switch);
                     }
                 }
+            }
+            Message::BootstrapFallbackDetected => {
+                self.bootstrap_fallback = true;
             }
             Message::LogLine(line) => {
                 self.push_log(line);
@@ -1945,6 +1968,20 @@ impl App {
         .padding([10, 12])
         .width(Length::Fill);
 
+        // 3c: brief indicator shown while this session is running on the
+        // built-in default mask (bootstrap-fallback) rather than a normal
+        // bootstrap-derived one — only meaningful while a connection is
+        // active/being attempted, and cleared on every new Connect/Disconnect
+        // (see Message::Connect / Message::Disconnect / BootstrapFallbackDetected).
+        let fallback_badge: Element<Message> = if self.bootstrap_fallback && busy {
+            text(t(lang, "Using built-in mask (fallback)"))
+                .size(11)
+                .color(Color::from_rgb(1.0, 0.65, 0.15))
+                .into()
+        } else {
+            Space::with_height(0).into()
+        };
+
         // ── Profiles ──────────────────────────────────────────────────────────
         let profiles_header = row![
             text(t(lang, "Profiles")).size(14),
@@ -2412,6 +2449,7 @@ impl App {
                     horizontal_rule(1),
                     Space::with_height(6),
                     status_card,
+                    fallback_badge,
                     Space::with_height(8),
                     horizontal_rule(1),
                     Space::with_height(6),
@@ -2750,6 +2788,22 @@ impl App {
                             }),
                             "reconnecting" => Some(VpnStatus::Connecting),
                             "disconnected" => Some(VpnStatus::Disconnected),
+                            // 3f: authenticated terminal handshake refusal —
+                            // surfaced as an Error status (same red/urgent UI
+                            // treatment as any other fatal client-side
+                            // error). Mapped from the client's ASCII token
+                            // (see handshake_reject_token in client.rs) so
+                            // this doesn't depend on its English log wording.
+                            "rejected" => {
+                                let token = it.next().unwrap_or("unspecified");
+                                let msg = match token {
+                                    "one_time_used" => "server: one-time key already used",
+                                    "expired" => "server: client expired",
+                                    "disabled" => "server: client disabled",
+                                    _ => "server: connection refused",
+                                };
+                                Some(VpnStatus::Error(msg.to_string()))
+                            }
                             _ => None,
                         }
                     };
@@ -2783,6 +2837,12 @@ impl App {
                     let mut saw_status_line = false;
                     let mut handle_line =
                         |sender: &mut iced::futures::channel::mpsc::Sender<Message>, l: &str| {
+                            // 3c: orthogonal to VpnStatus (can co-occur with
+                            // Connecting/Connected), so it's dispatched
+                            // separately rather than through parse_status_line.
+                            if l.trim() == "AIVPN-STATUS bootstrap-fallback" {
+                                let _ = sender.try_send(Message::BootstrapFallbackDetected);
+                            }
                             if let Some(status) = parse_status_line(l) {
                                 saw_status_line = true;
                                 let _ = sender.try_send(Message::StatusReceived(status));

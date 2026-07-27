@@ -27,7 +27,8 @@ use tokio::time;
 
 use aivpn_common::client_wire::{
     build_inner_packet, build_shaped_mdh_packet, decode_downlink_any_mdh_len,
-    obfuscate_client_eph_pub, process_server_hello_with_mdh_len, RecvWindow, DEFAULT_MDH_LEN,
+    decode_packet_with_mdh_len, obfuscate_client_eph_pub, process_server_hello_with_mdh_len,
+    RecvWindow, DEFAULT_MDH_LEN,
 };
 use aivpn_common::crypto::{derive_session_keys, device_enrollment_proof, KeyPair, SessionKeys};
 use aivpn_common::error::{Error, Result};
@@ -344,6 +345,23 @@ pub static EVER_CONNECTED: AtomicBool = AtomicBool::new(false);
 /// so a stale rejection from a previous attempt is never misreported for a
 /// fresh one.
 pub static CERT_REJECTED: AtomicBool = AtomicBool::new(false);
+/// Set when the server sends `HandshakeReject` — an AEAD-authenticated,
+/// handshake-time refusal the server only ever sends to a peer that has
+/// already proven knowledge of the PSK (probers without it still get
+/// silence; see the `ControlPayload::HandshakeReject` doc comment in
+/// aivpn-common). Unlike a timeout/tag-mismatch this is a TERMINAL refusal —
+/// retrying can never succeed — so the platform must stop the in-extension
+/// reconnect loop instead of hammering the server forever. Swift polls this
+/// via `aivpn_handshake_was_rejected()` / `aivpn_get_handshake_reject_reason()`
+/// (see lib.rs) and surfaces the reason to the user. Reset at the start of
+/// every `run_tunnel_ios` call so a stale rejection from a previous attempt
+/// is never misreported for a fresh one.
+pub static HANDSHAKE_REJECTED: AtomicBool = AtomicBool::new(false);
+/// Reason code from the most recent `HandshakeReject` (see
+/// `HANDSHAKE_REJECTED`). 0 = unspecified, 1 = one-time key already used,
+/// 2 = client expired, 3 = client disabled. Only meaningful when
+/// `HANDSHAKE_REJECTED` is true.
+pub static HANDSHAKE_REJECT_REASON: AtomicU8 = AtomicU8::new(0);
 /// Consecutive attempts that died on a handshake TIMEOUT without ever
 /// connecting, carried across `run_tunnel_ios` calls (the tunnel extension
 /// process stays alive across the Swift reconnect loop). At
@@ -841,6 +859,8 @@ pub async fn run_tunnel_ios(
     // attempt's outcome/FeedbackConfig is never misattributed to this one.
     EVER_CONNECTED.store(false, Ordering::Relaxed);
     CERT_REJECTED.store(false, Ordering::Relaxed);
+    HANDSHAKE_REJECTED.store(false, Ordering::Relaxed);
+    HANDSHAKE_REJECT_REASON.store(0, Ordering::Relaxed);
     ACTIVE_FEEDBACK_THRESHOLD.store(0, Ordering::Relaxed);
     ACTIVE_FEEDBACK_INTERVAL.store(0, Ordering::Relaxed);
     MASK_FEEDBACK_SENT.store(false, Ordering::Relaxed);
@@ -1035,6 +1055,41 @@ pub async fn run_tunnel_ios(
                     }
                     Err(e) => return Err(Error::Io(e)),
                 };
+                // Peek for a terminal `HandshakeReject` BEFORE handing the datagram
+                // to process_server_hello_with_mdh_len, which only understands
+                // ServerHello and would otherwise discard a reject as just another
+                // "non-ServerHello datagram — ignoring" and keep retrying handshake
+                // resends until the 10 s deadline (then the platform's own backoff
+                // loop retries again) — exactly the "keep hammering an authenticated
+                // refusal" bug this feature exists to fix. Decoded with a scratch
+                // clone of recv_win (RecvWindow: Clone) so a miss here — the common
+                // case, a real ServerHello or noise — leaves the real recv_win
+                // untouched and process_server_hello_with_mdh_len below behaves
+                // exactly as before.
+                let mut reject_peek_win = recv_win.clone();
+                if let Ok(peeked) = decode_packet_with_mdh_len(
+                    &recv_buf[..n],
+                    &keys,
+                    &mut reject_peek_win,
+                    mdh_len,
+                ) {
+                    if peeked.header.inner_type == InnerType::Control {
+                        if let Ok(ControlPayload::HandshakeReject { reason }) =
+                            ControlPayload::decode(&peeked.payload)
+                        {
+                            log::warn!(
+                                "aivpn: server sent HandshakeReject (reason={}) during handshake — authenticated refusal, not retrying",
+                                reason
+                            );
+                            HANDSHAKE_REJECTED.store(true, Ordering::Relaxed);
+                            HANDSHAKE_REJECT_REASON.store(reason, Ordering::Relaxed);
+                            return Err(Error::Session(format!(
+                                "HandshakeReject: reason={}",
+                                reason
+                            )));
+                        }
+                    }
+                }
                 // Tolerate a reordered early control push (or an undecodable
                 // datagram) instead of failing the whole attempt on the first
                 // packet — keep waiting for the real ServerHello until the
@@ -2147,6 +2202,28 @@ pub async fn run_tunnel_ios(
                                     // silence — desktop only logs this; mobile has no console the
                                     // user will ever see.
                                     CERT_REJECTED.store(true, Ordering::Relaxed);
+                                }
+                                aivpn_common::protocol::ControlPayload::HandshakeReject { reason } => {
+                                    // AEAD-authenticated terminal refusal arriving mid-session
+                                    // (e.g. a one-time key/expiry/disable state change the
+                                    // server discovers after the initial handshake already
+                                    // completed). Same handling as the handshake-wait loop's
+                                    // peek above: surface the reason and end the session with
+                                    // an error so the platform reconnect loop can inspect
+                                    // HANDSHAKE_REJECTED and stop retrying instead of treating
+                                    // this like any other recoverable disconnect.
+                                    log::warn!(
+                                        "aivpn: server sent HandshakeReject (reason={}) — authenticated refusal, not retrying",
+                                        reason
+                                    );
+                                    HANDSHAKE_REJECTED.store(true, Ordering::Relaxed);
+                                    HANDSHAKE_REJECT_REASON.store(reason, Ordering::Relaxed);
+                                    tun_reader.abort();
+                                    upload_task.abort();
+                                    return Err(Error::Session(format!(
+                                        "HandshakeReject: reason={}",
+                                        reason
+                                    )));
                                 }
                                 aivpn_common::protocol::ControlPayload::RecordingAck { session_id, status } => {
                                     log::info!("aivpn: RecordingAck status={}", status);

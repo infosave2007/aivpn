@@ -1,0 +1,265 @@
+//! Native OS network-change listener (3b).
+//!
+//! Best-effort push notification for "the OS just reported a network
+//! interface/address change" (Wi-Fi switch, cable unplug, new default
+//! route), so the client's reconnect path can react in milliseconds instead
+//! of waiting on the poll-based watchdogs in `client.rs` (RX-silence tick is
+//! 5 s; the underlying-source-IP carrier-change probe additionally needs two
+//! consecutive disagreeing ticks, ~5-10 s).
+//!
+//! `spawn()` starts a platform-specific OS-level listener ONCE for the whole
+//! process lifetime and returns a shared [`tokio::sync::Notify`] handle. The
+//! same handle is threaded into every `AivpnClient::run()` call across
+//! reconnects (via `ClientConfig::network_change_notify`) so a single OS
+//! registration serves the entire process, not one per connection attempt.
+//!
+//! Deliberately best-effort and non-fatal: if the platform listener can't be
+//! started (unsupported platform, permission denied, syscall failure), the
+//! `Option` is `None` and callers fall back to the existing poll-based
+//! watchdog behavior — this is a latency optimization, not a correctness
+//! dependency.
+//!
+//! macOS already gets equivalent behavior from `NWPathMonitor` in the native
+//! GUI/core layer (outside this crate) — no listener is added here for it.
+
+use std::sync::Arc;
+use tokio::sync::Notify;
+
+/// Start the best-effort native network-change listener for this platform.
+/// Returns `None` when no listener is implemented for this platform, or the
+/// platform-specific setup failed (logged at `debug`/`warn`, never fatal).
+pub fn spawn() -> Option<Arc<Notify>> {
+    #[cfg(target_os = "linux")]
+    {
+        linux_impl::spawn()
+    }
+    #[cfg(windows)]
+    {
+        windows_impl::spawn()
+    }
+    #[cfg(not(any(target_os = "linux", windows)))]
+    {
+        None
+    }
+}
+
+#[cfg(target_os = "linux")]
+mod linux_impl {
+    use super::*;
+    use std::mem::size_of;
+
+    // Multicast groups on the NETLINK_ROUTE family. Values from
+    // linux/rtnetlink.h — not exposed by the `libc` crate, so declared
+    // locally (same pattern as the existing raw-libc use elsewhere in this
+    // crate, e.g. `bootstrap_cache.rs`'s `libc::flock`).
+    const RTMGRP_LINK: u32 = 0x1; // interface up/down/added/removed
+    const RTMGRP_IPV4_IFADDR: u32 = 0x10; // IPv4 address add/remove (DHCP renew, roam)
+    const RTMGRP_IPV6_IFADDR: u32 = 0x100; // IPv6 address add/remove
+
+    #[repr(C)]
+    struct sockaddr_nl {
+        nl_family: libc::sa_family_t,
+        nl_pad: u16,
+        nl_pid: u32,
+        nl_groups: u32,
+    }
+
+    pub fn spawn() -> Option<Arc<Notify>> {
+        // SAFETY: standard three-syscall netlink route-socket setup
+        // (socket/bind), mirroring the well-known `ip monitor` pattern. No
+        // pointers escape this function except the raw fd, which is owned
+        // exclusively by the spawned thread below and closed on every exit
+        // path.
+        let fd = unsafe {
+            libc::socket(
+                libc::AF_NETLINK,
+                libc::SOCK_RAW | libc::SOCK_CLOEXEC,
+                libc::NETLINK_ROUTE,
+            )
+        };
+        if fd < 0 {
+            tracing::debug!(
+                "net_change: netlink socket() failed: {}",
+                std::io::Error::last_os_error()
+            );
+            return None;
+        }
+
+        let mut addr: sockaddr_nl = unsafe { std::mem::zeroed() };
+        addr.nl_family = libc::AF_NETLINK as libc::sa_family_t;
+        addr.nl_groups = RTMGRP_LINK | RTMGRP_IPV4_IFADDR | RTMGRP_IPV6_IFADDR;
+
+        // SAFETY: `addr` is a valid, fully-initialized sockaddr_nl for the
+        // duration of this call; `size_of::<sockaddr_nl>()` matches its
+        // actual size (repr(C), same layout the kernel expects).
+        let ret = unsafe {
+            libc::bind(
+                fd,
+                &addr as *const sockaddr_nl as *const libc::sockaddr,
+                size_of::<sockaddr_nl>() as libc::socklen_t,
+            )
+        };
+        if ret < 0 {
+            tracing::debug!(
+                "net_change: netlink bind() failed: {}",
+                std::io::Error::last_os_error()
+            );
+            unsafe { libc::close(fd) };
+            return None;
+        }
+
+        let notify = Arc::new(Notify::new());
+        let notify_for_thread = notify.clone();
+        let spawned = std::thread::Builder::new()
+            .name("aivpn-netchange".into())
+            .spawn(move || {
+                let mut buf = [0u8; 4096];
+                loop {
+                    // SAFETY: `buf` is a valid, appropriately-sized buffer
+                    // for the duration of the call; `fd` is a socket owned
+                    // by this thread.
+                    let n = unsafe {
+                        libc::recv(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0)
+                    };
+                    if n <= 0 {
+                        // Socket closed or errored — stop silently
+                        // (best-effort listener; the poll-based watchdogs
+                        // still cover reconnection).
+                        break;
+                    }
+                    // Any datagram on this multicast group is itself the
+                    // signal (link up/down or address add/remove) — no need
+                    // to parse the nlmsghdr payload to decide to reconnect.
+                    notify_for_thread.notify_one();
+                }
+                unsafe { libc::close(fd) };
+            });
+        match spawned {
+            Ok(_join_handle) => {
+                // Detached: the listener runs for the whole process
+                // lifetime, same as the client's other background threads.
+                Some(notify)
+            }
+            Err(e) => {
+                tracing::debug!("net_change: failed to spawn netlink listener thread: {}", e);
+                unsafe { libc::close(fd) };
+                None
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+mod windows_impl {
+    use super::*;
+    use std::os::raw::c_void;
+
+    // ── Raw FFI for NotifyIpInterfaceChange (Netioapi.h, exported by
+    // Iphlpapi.dll/Iphlpapi.lib) ────────────────────────────────────────────
+    //
+    // NOT available in the vendored `winapi` 0.3.9 crate already used by
+    // this workspace (checked: `winapi::um::netioapi` does not exist in that
+    // version; `winapi::um::iphlpapi` only has the legacy
+    // NotifyAddrChange/NotifyRouteChange overlapped-I/O API). Declared here
+    // by hand against the documented Win32 ABI instead of adding a new
+    // top-level dependency (`windows`/`windows-sys`) that can't be resolved
+    // or compiled in this sandbox for verification.
+    //
+    // Reference signature (Microsoft Learn, netioapi.h — unchanged since
+    // Windows Vista):
+    //   NETIOAPI_API NotifyIpInterfaceChange(
+    //       ADDRESS_FAMILY Family,                       // USHORT
+    //       PIPINTERFACE_CHANGE_CALLBACK Callback,        // extern "system" fn
+    //       PVOID CallerContext,
+    //       BOOLEAN InitialNotification,                  // u8
+    //       HANDLE *NotificationHandle
+    //   ) -> NETIOAPI_API;                                 // DWORD (u32) error code, NO_ERROR=0
+    //
+    //   typedef VOID (*PIPINTERFACE_CHANGE_CALLBACK)(
+    //       PVOID CallerContext,
+    //       PMIB_IPINTERFACE_ROW Row,                      // never dereferenced here —
+    //       MIB_NOTIFICATION_TYPE NotificationType         // declared as an opaque pointer
+    //   );                                                  // and c_int-sized enum below
+    //
+    // RISK NOTE (see task hand-off): this signature could not be verified
+    // against a live Microsoft Learn fetch in this sandbox (network access
+    // to learn.microsoft.com was blocked). It is transcribed from stable,
+    // extensively-documented Win32 API surface unchanged for over a decade,
+    // matching the pattern used by established crates (e.g. `if-watch`,
+    // `network-interface`). Flagged for hand-review before a Windows build,
+    // per the task's own instruction.
+    const AF_UNSPEC: u16 = 0;
+
+    #[link(name = "iphlpapi")]
+    extern "system" {
+        fn NotifyIpInterfaceChange(
+            family: u16,
+            callback: extern "system" fn(*mut c_void, *const c_void, i32),
+            caller_context: *mut c_void,
+            initial_notification: u8,
+            notification_handle: *mut *mut c_void,
+        ) -> u32;
+    }
+
+    // CallerContext round-trips a leaked `Arc<Notify>` clone (see `spawn()`
+    // below) so the callback — invoked on an arbitrary OS worker thread, not
+    // this crate's tokio runtime — can signal the reconnect path without any
+    // shared mutable state.
+    extern "system" fn ip_interface_change_callback(
+        caller_context: *mut c_void,
+        _row: *const c_void,
+        _notification_type: i32,
+    ) {
+        if caller_context.is_null() {
+            return;
+        }
+        // SAFETY: `caller_context` is the raw pointer produced by
+        // `Arc::into_raw` in `spawn()` below, passed through unchanged by
+        // the OS. Borrowed (not reconstructed into an owning `Arc`) so this
+        // callback — which may fire many times over the process lifetime —
+        // never decrements the refcount; the registration intentionally
+        // leaks one `Arc` clone for the process lifetime (never
+        // unregistered — see `spawn()`).
+        let notify: &Notify = unsafe { &*(caller_context as *const Notify) };
+        notify.notify_one();
+    }
+
+    pub fn spawn() -> Option<Arc<Notify>> {
+        let notify = Arc::new(Notify::new());
+        // Leak one strong reference for the OS callback to borrow from for
+        // the process lifetime. This registration is intentionally never
+        // cancelled (`CancelMibChangeNotify2` not called) — the client
+        // process holds it until exit, mirroring the netlink listener
+        // thread on Linux, which is also never joined/torn down.
+        let ctx_arc = notify.clone();
+        let ctx_ptr = Arc::into_raw(ctx_arc) as *mut c_void;
+
+        let mut handle: *mut c_void = std::ptr::null_mut();
+        // SAFETY: `ip_interface_change_callback` matches the declared
+        // extern "system" fn pointer type; `ctx_ptr` stays valid for the
+        // process lifetime (leaked above); `handle` is a valid out-pointer.
+        let ret = unsafe {
+            NotifyIpInterfaceChange(
+                AF_UNSPEC,
+                ip_interface_change_callback,
+                ctx_ptr,
+                0, // InitialNotification = FALSE — don't fire immediately on register
+                &mut handle,
+            )
+        };
+        if ret != 0 {
+            tracing::debug!(
+                "net_change: NotifyIpInterfaceChange failed, error code {}",
+                ret
+            );
+            // Reclaim and drop the leaked Arc so it doesn't stay leaked
+            // forever on the failure path (registration never happened, so
+            // no callback will ever borrow it).
+            unsafe {
+                drop(Arc::from_raw(ctx_ptr as *const Notify));
+            }
+            return None;
+        }
+        Some(notify)
+    }
+}

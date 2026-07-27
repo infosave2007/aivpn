@@ -9,6 +9,10 @@
     <string name="status_error">Error: %s</string>
     <string name="status_native_lib_unavailable">Error: native library unavailable — reinstall the app</string>
     <string name="status_cert_rejected">Server rejected the certificate — re-provisioning required</string>
+    <string name="status_handshake_reject_one_time_used">This one-time key has already been used</string>
+    <string name="status_handshake_reject_expired">This client key has expired</string>
+    <string name="status_handshake_reject_disabled">This client has been disabled by the server</string>
+    <string name="status_handshake_reject_unspecified">Server refused the connection</string>
     <string name="btn_connect">Connect</string>
     <string name="btn_disconnect">Disconnect</string>
     <string name="hint_server">Server address</string>

@@ -581,6 +581,22 @@ class AivpnService : VpnService() {
                         isEstablished = false
                         connectedAtMillis = 0L
                         if (manualDisconnect) break
+                        // 3f: an authenticated HandshakeReject is TERMINAL — the server
+                        // already proved it read our PSK-authenticated handshake and
+                        // refused this exact credential (one-time key used / expired /
+                        // disabled), so retrying can never succeed. Stop the loop instead
+                        // of backing off and hammering the server forever under the same
+                        // rejected credential (mirrors the FatalConfigException terminal-
+                        // stop path above — same `break` + `lastStatusText` + finally-block
+                        // terminal notification, just triggered by a polled JNI flag
+                        // instead of a typed exception, since the reject arrives async
+                        // over the wire rather than as a Kotlin-thrown error).
+                        val rejectReason = AivpnJni.handshakeRejectReason()
+                        if (rejectReason >= 0) {
+                            Log.e(TAG, "Handshake rejected by server (reason=$rejectReason) — not retrying")
+                            lastStatusText = handshakeRejectMessage(rejectReason)
+                            break
+                        }
                         // Rebuild the TUN on an error-triggered reconnect instead of
                         // reusing it. A reused interface that survives an underlying
                         // network change (Wi-Fi→cellular) keeps tunnelling app packets
@@ -683,6 +699,20 @@ class AivpnService : VpnService() {
      * path) instead of retrying forever every [MAX_RETRY_DELAY_MS].
      */
     private class FatalConfigException(message: String) : Exception(message)
+
+    /**
+     * User-facing text for an authenticated `HandshakeReject` reason code (see
+     * `ControlPayload::HandshakeReject` in aivpn-common/protocol.rs and
+     * `AivpnJni.handshakeRejectReason()`). 1=one-time key already used,
+     * 2=client expired, 3=client disabled; anything else (including the
+     * `0` "unspecified" code) falls back to a generic refusal message.
+     */
+    private fun handshakeRejectMessage(reason: Int): String = when (reason) {
+        1 -> getString(R.string.status_handshake_reject_one_time_used)
+        2 -> getString(R.string.status_handshake_reject_expired)
+        3 -> getString(R.string.status_handshake_reject_disabled)
+        else -> getString(R.string.status_handshake_reject_unspecified)
+    }
 
     /**
      * One tunnel session.  Blocks until the Rust core exits (error or rekey interval).

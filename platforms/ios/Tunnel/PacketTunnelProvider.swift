@@ -515,6 +515,18 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                 self.appGroupDefaults?.set(Int(streak), forKey: self.failStreakKey)
                 // User/OS-initiated stop: exit the loop immediately, no retry.
                 if self.isStopped { break }
+                // Terminal authenticated refusal (HandshakeReject): the server
+                // has already verified this peer's PSK proof and refused for a
+                // reason retrying can never fix (one-time key already used /
+                // expired / disabled — see aivpn_get_handshake_reject_reason()).
+                // Stop the reconnect loop immediately, same as a user stop,
+                // instead of burning the backoff budget hammering a refusal
+                // that will repeat identically on every attempt.
+                if aivpn_handshake_was_rejected() != 0 {
+                    os_log(.error, "aivpn: server sent HandshakeReject (reason=%d) — authenticated refusal, giving up",
+                           aivpn_get_handshake_reject_reason())
+                    break
+                }
                 // A session that established and lived >60 s was healthy —
                 // whatever ended it is a fresh incident, not a continuation of
                 // an earlier failure run. Reset the attempt budget.
@@ -681,6 +693,11 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                 // this session so VPNManager can prompt the user to
                 // re-provision instead of the tunnel silently retrying forever.
                 "cert_rejected":   aivpn_cert_was_rejected() != 0,
+                // AEAD-authenticated terminal handshake refusal — surfaced the
+                // same way as cert_rejected above so VPNManager can show WHY
+                // and stop treating the tunnel as merely "reconnecting".
+                "handshake_rejected":      aivpn_handshake_was_rejected() != 0,
+                "handshake_reject_reason": Int(aivpn_get_handshake_reject_reason()),
             ]
             completionHandler?(serialize(resp))
 

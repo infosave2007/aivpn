@@ -20,6 +20,7 @@ pub mod dns_proxy;
 pub mod kill_switch;
 pub mod mask_catalog;
 pub mod mask_feedback_log;
+pub mod net_change;
 pub mod proxy;
 pub mod record_cmd;
 pub mod secure_write;

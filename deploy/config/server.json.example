@@ -19,11 +19,12 @@
   "session_timeout_secs": null,
 
   "management_socket": "/run/aivpn/api.sock",
+  "management_socket_group": null,
 
   "allow_peer_routing": false,
 
   "neural_enabled": true,
-  "downlink_shaping": true,
+  "downlink_shaping": "full",
 
   "mask_verify_mode": "warn",
   "mask_signing_key": null,

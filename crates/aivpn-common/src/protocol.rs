@@ -107,6 +107,7 @@ pub enum ControlSubtype {
     /// Server pushes the catalog of masks the client may select, each tagged
     /// with an auto-generated flag so pickers can mark generated masks (0x1F)
     MaskCatalog = 0x1F,
+    HandshakeReject = 0x20,
 }
 
 impl ControlSubtype {
@@ -143,6 +144,7 @@ impl ControlSubtype {
             0x1D => Some(Self::RegionalMaskHints),
             0x1E => Some(Self::FeedbackConfig),
             0x1F => Some(Self::MaskCatalog),
+            0x20 => Some(Self::HandshakeReject),
             _ => None,
         }
     }
@@ -322,6 +324,15 @@ pub enum ControlPayload {
         server_ts_ms: u64,
     },
     Shutdown {
+        reason: u8,
+    },
+    /// Handshake-time authenticated reject. Sent ONLY to a peer that has
+    /// already proven knowledge of the PSK during the handshake (so probers
+    /// without the PSK still get silence — unobservability preserved). Tells
+    /// the client WHY it was refused so it can show a message and STOP the
+    /// reconnect loop instead of hammering forever. `reason`: 1=one-time key
+    /// already used, 2=expired, 3=disabled, 0=unspecified.
+    HandshakeReject {
         reason: u8,
     },
     ControlAck {
@@ -523,6 +534,10 @@ impl ControlPayload {
             }
             Self::Shutdown { reason } => {
                 buf.push(ControlSubtype::Shutdown as u8);
+                buf.push(*reason);
+            }
+            Self::HandshakeReject { reason } => {
+                buf.push(ControlSubtype::HandshakeReject as u8);
                 buf.push(*reason);
             }
             Self::ControlAck {
@@ -806,6 +821,12 @@ impl ControlPayload {
                     return Err(Error::InvalidPacket("Shutdown too short"));
                 }
                 Ok(Self::Shutdown { reason: data[1] })
+            }
+            ControlSubtype::HandshakeReject => {
+                if data.len() < 2 {
+                    return Err(Error::InvalidPacket("HandshakeReject too short"));
+                }
+                Ok(Self::HandshakeReject { reason: data[1] })
             }
             ControlSubtype::ControlAck => {
                 if data.len() < 4 {
@@ -1303,6 +1324,7 @@ mod tests {
             (0x1D, ControlSubtype::RegionalMaskHints),
             (0x1E, ControlSubtype::FeedbackConfig),
             (0x1F, ControlSubtype::MaskCatalog),
+            (0x20, ControlSubtype::HandshakeReject),
         ];
         for (byte, expected) in pairs {
             assert_eq!(

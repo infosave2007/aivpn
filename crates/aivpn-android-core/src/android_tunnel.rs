@@ -369,6 +369,21 @@ pub static MASK_FEEDBACK_SENT: AtomicBool = AtomicBool::new(false);
 /// accept, with no signal to the user. The platform polls and clears this
 /// (see `AivpnJni.certRejected()`/`AivpnService.kt`) to prompt re-provisioning.
 pub static CERT_REJECTED: AtomicBool = AtomicBool::new(false);
+/// Set when the server sends `HandshakeReject` — an AUTHENTICATED refusal
+/// (the peer already proved PSK knowledge during the handshake; see the doc
+/// comment on `ControlPayload::HandshakeReject` in aivpn-common/protocol.rs).
+/// Unlike a transient network error or handshake timeout, retrying can never
+/// succeed here, so the receive loop returns `Err` immediately after
+/// recording this flag+reason. The platform (`AivpnJni.handshakeRejectReason()`
+/// / `AivpnService.kt`) polls it right after `runTunnel()` returns and must
+/// STOP its reconnect loop instead of backing off and retrying forever —
+/// mirrors the `FatalConfigException` terminal-stop path already used there
+/// for permanently-invalid config.
+pub static HANDSHAKE_REJECTED: AtomicBool = AtomicBool::new(false);
+/// Reason code accompanying `HANDSHAKE_REJECTED` (only meaningful once that
+/// flag is observed true). 1=one-time key already used, 2=client expired,
+/// 3=client disabled, 0=unspecified — see `ControlPayload::HandshakeReject`.
+pub static HANDSHAKE_REJECT_REASON: AtomicU8 = AtomicU8::new(0);
 /// The base mask family this attempt requested (normalized via
 /// `base_mask_family`), set as soon as the initial mask is chosen —
 /// regardless of whether §2 reporting is enabled — so the platform layer can
@@ -975,6 +990,8 @@ pub async fn run_tunnel_android(
     ACTIVE_FEEDBACK_INTERVAL.store(0, Ordering::Relaxed);
     MASK_FEEDBACK_SENT.store(false, Ordering::Relaxed);
     CERT_REJECTED.store(false, Ordering::Relaxed);
+    HANDSHAKE_REJECTED.store(false, Ordering::Relaxed);
+    HANDSHAKE_REJECT_REASON.store(0, Ordering::Relaxed);
     *ATTEMPTED_MASK_FAMILY
         .lock()
         .unwrap_or_else(|e| e.into_inner()) = None;
@@ -1224,6 +1241,43 @@ pub async fn run_tunnel_android(
                         ) {
                             Ok((cfg, server_eph_pub)) => break (cfg, server_eph_pub),
                             Err(e) => {
+                                // 3f: the server's actual send point for an authenticated
+                                // HandshakeReject (see gateway.rs's `handshake_rejected` —
+                                // currently reasons 2=expired/3=disabled) is HERE, in place
+                                // of ServerHello, for a PSK-proven-but-refused peer — not
+                                // in the post-ratchet dispatch loop below. It is encrypted
+                                // with the server's just-derived PRE-ratchet session keys,
+                                // which are exactly this `keys` (unmodified: the call above
+                                // only mutates `keys` on its own success path — see
+                                // `process_server_hello_with_mdh_len`), so it decodes here
+                                // via the same generic control-payload pipeline the main
+                                // loop uses. Try that before falling back to "ignore and
+                                // keep waiting": a HandshakeReject is terminal, so surface
+                                // it immediately instead of burning the full handshake
+                                // timeout on a refusal the server already explained.
+                                if let Ok(decoded) = decode_downlink_any_mdh_len(
+                                    &recv_buf[..n],
+                                    &keys,
+                                    &mut recv_win,
+                                    &mut recv_mdh_candidates,
+                                ) {
+                                    if decoded.header.inner_type == InnerType::Control {
+                                        if let Ok(ControlPayload::HandshakeReject { reason }) =
+                                            ControlPayload::decode(&decoded.payload)
+                                        {
+                                            log::warn!(
+                                                "aivpn: HandshakeReject from server during handshake: reason={} — session terminal, not retrying this credential",
+                                                reason
+                                            );
+                                            HANDSHAKE_REJECT_REASON
+                                                .store(reason, Ordering::Relaxed);
+                                            HANDSHAKE_REJECTED.store(true, Ordering::Relaxed);
+                                            return Err(Error::Session(format!(
+                                                "handshake rejected by server: reason={reason}"
+                                            )));
+                                        }
+                                    }
+                                }
                                 log::debug!(
                                     "aivpn: non-ServerHello datagram during handshake — ignoring: {e}"
                                 );
@@ -2010,31 +2064,49 @@ pub async fn run_tunnel_android(
                                     }
                                 }
                                 ControlPayload::KeepaliveAck { echo_ts } => {
+                                    // BUGFIX (2c): this used to gate the whole update on
+                                    // `now_ms >= echo_ts` and silently drop the sample — not
+                                    // just clamp the RTT — whenever that failed. Unlike a
+                                    // desktop/server clock, a phone's wall clock
+                                    // (`current_timestamp_ms()` is `SystemTime::now()`, not
+                                    // monotonic) routinely steps backward mid-session: NTP/
+                                    // carrier network-time correction, doze-exit clock
+                                    // resync, or a user-visible time change. Any such step
+                                    // between sending the keepalive and receiving its ack
+                                    // made `now_ms < echo_ts` and threw the entire sample
+                                    // away — repeat that on every keepalive for the rest of
+                                    // the session (plausible once the clock has settled into
+                                    // a state that keeps failing the check) and
+                                    // ACTIVE_QUALITY_SCORE never leaves its initial 0, i.e.
+                                    // the observed "quality stuck at 0/100". Desktop
+                                    // client.rs never had this failure mode because its
+                                    // equivalent handler already uses `saturating_sub` (see
+                                    // its `KeepaliveAck` arm) instead of a drop-the-sample
+                                    // guard — mirror that here for parity.
                                     if echo_ts > 0 {
                                         let now_ms = aivpn_common::crypto::current_timestamp_ms();
-                                        if now_ms >= echo_ts {
-                                            let rtt_us = (now_ms - echo_ts) * 1_000;
-                                            quality_tracker.record_rtt(rtt_us);
-                                            quality_tracker.record_received();
-                                            let score = quality_tracker.score();
-                                            ACTIVE_QUALITY_SCORE.store(score, Ordering::Relaxed);
-                                            // Enqueue to the upload task's encryptor rather than
-                                            // building a packet here with a second `send_counter`,
-                                            // which would reuse a nonce already used by the upload
-                                            // task under the same key (see ctrl_tx_recv_loop above).
-                                            let _ = ctrl_tx_recv_loop.try_send(
-                                                ControlPayload::QualityReport {
-                                                    quality: score,
-                                                    rtt_ms: quality_tracker.rtt_ms(),
-                                                    loss_ppm: quality_tracker.loss_ppm(),
-                                                    jitter_ms: quality_tracker.jitter_ms(),
-                                                },
-                                            );
-                                            log::debug!(
-                                                "aivpn: KeepaliveAck rtt={}ms quality={}/100",
-                                                quality_tracker.rtt_ms(), score
-                                            );
-                                        }
+                                        let rtt_us =
+                                            now_ms.saturating_sub(echo_ts).saturating_mul(1_000);
+                                        quality_tracker.record_rtt(rtt_us);
+                                        quality_tracker.record_received();
+                                        let score = quality_tracker.score();
+                                        ACTIVE_QUALITY_SCORE.store(score, Ordering::Relaxed);
+                                        // Enqueue to the upload task's encryptor rather than
+                                        // building a packet here with a second `send_counter`,
+                                        // which would reuse a nonce already used by the upload
+                                        // task under the same key (see ctrl_tx_recv_loop above).
+                                        let _ = ctrl_tx_recv_loop.try_send(
+                                            ControlPayload::QualityReport {
+                                                quality: score,
+                                                rtt_ms: quality_tracker.rtt_ms(),
+                                                loss_ppm: quality_tracker.loss_ppm(),
+                                                jitter_ms: quality_tracker.jitter_ms(),
+                                            },
+                                        );
+                                        log::debug!(
+                                            "aivpn: KeepaliveAck rtt={}ms quality={}/100",
+                                            quality_tracker.rtt_ms(), score
+                                        );
                                     }
                                 }
                                 ControlPayload::AdaptiveHint { level } => {
@@ -2276,6 +2348,30 @@ pub async fn run_tunnel_android(
                                     tun_reader_task.abort();
                                     upload_sender_task.abort();
                                     return Err(Error::Session(format!("server shutdown: {reason}")));
+                                }
+                                ControlPayload::HandshakeReject { reason } => {
+                                    // 3f — authenticated, TERMINAL refusal. The server only ever
+                                    // sends this to a peer that already proved PSK knowledge
+                                    // during the handshake (see the doc comment on
+                                    // `ControlPayload::HandshakeReject`), so — unlike a timeout
+                                    // or a transient network error — retrying this exact
+                                    // credential can never succeed. Record the reason for the
+                                    // platform (see HANDSHAKE_REJECTED doc comment) BEFORE
+                                    // returning, so `AivpnJni.handshakeRejectReason()` observes
+                                    // it as soon as `runTunnel()` returns and the Kotlin
+                                    // reconnect loop can stop hammering instead of backing off
+                                    // and retrying forever under the same rejected credential.
+                                    log::warn!(
+                                        "aivpn: HandshakeReject from server: reason={} — session terminal, not retrying this credential",
+                                        reason
+                                    );
+                                    HANDSHAKE_REJECT_REASON.store(reason, Ordering::Relaxed);
+                                    HANDSHAKE_REJECTED.store(true, Ordering::Relaxed);
+                                    tun_reader_task.abort();
+                                    upload_sender_task.abort();
+                                    return Err(Error::Session(format!(
+                                        "handshake rejected by server: reason={reason}"
+                                    )));
                                 }
                                 ControlPayload::BootstrapDescriptorUpdate { descriptor_data } => {
                                     // Apply desktop client.rs's size guard (reject >512 KiB), then

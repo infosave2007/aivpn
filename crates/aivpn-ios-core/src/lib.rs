@@ -390,6 +390,27 @@ pub extern "C" fn aivpn_cert_was_rejected() -> libc::c_int {
     crate::ios_tunnel::CERT_REJECTED.load(Ordering::Relaxed) as libc::c_int
 }
 
+/// Whether the server sent `HandshakeReject` — an AEAD-authenticated,
+/// handshake-time refusal sent only to a peer that already proved knowledge
+/// of the PSK — during the most recently completed `aivpn_run_tunnel` call.
+/// `0` = not rejected. Unlike a timeout or a transient disconnect, this is a
+/// TERMINAL refusal: the platform must stop its reconnect loop instead of
+/// retrying (see `aivpn_get_handshake_reject_reason` for why).
+#[no_mangle]
+pub extern "C" fn aivpn_handshake_was_rejected() -> libc::c_int {
+    crate::ios_tunnel::HANDSHAKE_REJECTED.load(Ordering::Relaxed) as libc::c_int
+}
+
+/// Reason code for the most recent `HandshakeReject` (only meaningful when
+/// `aivpn_handshake_was_rejected` returns non-zero). `0` = unspecified,
+/// `1` = one-time key already used, `2` = client expired, `3` = client
+/// disabled — matches `ControlPayload::HandshakeReject`'s `reason` field in
+/// aivpn-common's protocol.rs.
+#[no_mangle]
+pub extern "C" fn aivpn_get_handshake_reject_reason() -> libc::c_int {
+    crate::ios_tunnel::HANDSHAKE_REJECT_REASON.load(Ordering::Relaxed) as libc::c_int
+}
+
 /// §2 crowdsourced blocking feedback — whether a `MaskFeedback` control
 /// message was actually sent during the most recently completed
 /// `aivpn_run_tunnel` call (a share send or a hints-only probe). The platform

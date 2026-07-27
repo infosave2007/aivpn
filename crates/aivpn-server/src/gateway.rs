@@ -41,6 +41,14 @@ use zeroize::Zeroize;
 /// this would risk IP fragmentation and a DPI-visible size anomaly.
 const SAFE_DOWNLINK_BUDGET: usize = 1380;
 
+/// 1c `ShapingLevel::Light` padding ceiling. Small enough that most of the
+/// bandwidth/CPU cost `Full` pays for full size-distribution padding is
+/// avoided, but non-zero so `Light` downlink packets are still not trivially
+/// distinguishable from `Off`'s "always exactly the unpadded payload size".
+const LIGHT_SHAPING_MAX_PAD: u16 = 96;
+
+use serde::{Deserialize, Deserializer};
+
 use crate::audit_log::{AuditActor, AuditLogger};
 use crate::batch_io::PacketBatchIo as _;
 use crate::client_db::ClientDatabase;
@@ -59,6 +67,69 @@ use aivpn_common::event_log::EventBus;
 struct QueuedPacket {
     packet_data: Vec<u8>,
     client_addr: SocketAddr,
+}
+
+/// Covertness↔throughput tradeoff for server→client (downlink) padding
+/// (1c). Sourced from the `"downlink_shaping"` key in server.json (accepts
+/// either the legacy bool or one of `"off"`/`"light"`/`"full"`) or
+/// `--shaping-level` / `AIVPN_SHAPING_LEVEL` on the CLI.
+///
+/// * **`Full`** (default, `true`) — pad every downlink DATA packet to the
+///   session mask's own size distribution, exactly the historical (only)
+///   behavior. Maximizes traffic-shape covertness: uplink and downlink share
+///   one size signature on the 5-tuple. Costs the most per packet — a
+///   size-distribution sample, a padding-strategy calculation, and the
+///   padding bytes themselves go out on the wire.
+/// * **`Light`** — still pads (so downlink packets are not trivially
+///   distinguishable from uplink by "always exactly the unpadded IP-payload
+///   size"), but caps the padding budget far below `Full`'s target, trading
+///   most of the covertness for most of the throughput back.
+/// * **`Off`** (`false`) — no downlink padding at all, the historical
+///   `downlink_shaping: false`. Maximum throughput; downlink packet sizes
+///   leak the exact payload size.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ShapingLevel {
+    /// No downlink padding — maximum throughput, least covert.
+    Off,
+    /// Capped padding budget — partial covertness, most of the throughput.
+    Light,
+    /// Full mask size-distribution padding (default; matches historical `true`).
+    #[default]
+    Full,
+}
+
+impl std::str::FromStr for ShapingLevel {
+    type Err = String;
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "off" | "false" => Ok(ShapingLevel::Off),
+            "light" => Ok(ShapingLevel::Light),
+            "full" | "true" => Ok(ShapingLevel::Full),
+            other => Err(format!(
+                "invalid shaping level {:?}: expected \"off\", \"light\", or \"full\"",
+                other
+            )),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ShapingLevel {
+    /// Accepts the historical bool (`true`→`Full`, `false`→`Off`) for
+    /// backward compatibility with existing `server.json` files, as well as
+    /// the new `"off"`/`"light"`/`"full"` strings (case-insensitive).
+    fn deserialize<D: Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        use serde::de::Error as _;
+        let v = serde_json::Value::deserialize(d)?;
+        match v {
+            serde_json::Value::Bool(true) => Ok(ShapingLevel::Full),
+            serde_json::Value::Bool(false) => Ok(ShapingLevel::Off),
+            serde_json::Value::String(ref s) => s.parse().map_err(D::Error::custom),
+            other => Err(D::Error::custom(format!(
+                "downlink_shaping must be a bool or one of \"off\"/\"light\"/\"full\", got: {}",
+                other
+            ))),
+        }
+    }
 }
 
 /// Gateway configuration
@@ -136,17 +207,19 @@ pub struct GatewayConfig {
     /// would use if it deferred to the active mask instead of an explicit
     /// `base_mask_id`.
     pub polymorphic_base_mask: Option<String>,
-    /// A7 downlink shaping parity. When `true` (default), the server pads
-    /// server→client DATA packets to a size sampled from the session mask's
-    /// own size distribution — the same distribution the client uses for
-    /// uplink — so uplink and downlink packets share one size signature on a
-    /// 5-tuple instead of downlink being systematically smaller (pad_len=0).
-    /// Padding is written into the existing `pad_len` field, which every
-    /// client already strips (`parse_downlink_inner`), so this is wire- and
-    /// decode-compatible with all client versions. Set `false` for the
-    /// throughput-first profile (no downlink padding). Sourced from the
-    /// optional `"downlink_shaping"` key in server.json.
-    pub downlink_shaping: bool,
+    /// A7/1c downlink shaping level: the covertness↔throughput tradeoff for
+    /// server→client DATA padding. `Full` (default) pads to a size sampled
+    /// from the session mask's own size distribution — the same distribution
+    /// the client uses for uplink — so uplink and downlink packets share one
+    /// size signature on a 5-tuple instead of downlink being systematically
+    /// smaller (pad_len=0). `Light` still pads but at a capped budget;
+    /// `Off` disables downlink padding entirely (max throughput). Padding is
+    /// written into the existing `pad_len` field, which every client already
+    /// strips (`parse_downlink_inner`), so every level is wire- and
+    /// decode-compatible with all client versions. Sourced from the optional
+    /// `"downlink_shaping"` key in server.json (bool or string) or
+    /// `--shaping-level`. See [`ShapingLevel`] for the full tradeoff writeup.
+    pub downlink_shaping: ShapingLevel,
     /// R2 Phase B: operator Ed25519 mask-signing key SEED (32 bytes). When
     /// `Some`, freshly generated masks are signed after the KS self-test
     /// passes. Separate from `server_private_key`/`signing_key` (transport):
@@ -207,7 +280,7 @@ impl Default for GatewayConfig {
             feedback_report_interval_secs: DEFAULT_FEEDBACK_REPORT_INTERVAL_SECS,
             polymorphic_all_sessions: false,
             polymorphic_base_mask: None,
-            downlink_shaping: true,
+            downlink_shaping: ShapingLevel::Full,
             mask_signing_key: None,
             mask_operator_pubkey: None,
             mask_verify_mode: aivpn_common::mask::MaskVerifyMode::default(),
@@ -2040,7 +2113,7 @@ impl Gateway {
         client_db: Option<Arc<ClientDatabase>>,
         qos_enforcer: Arc<crate::qos::QosEnforcer>,
         allow_peer_routing: bool,
-        downlink_shaping: bool,
+        downlink_shaping: ShapingLevel,
     ) {
         let mut buf = vec![0u8; MAX_PACKET_SIZE];
         let server_ip = server_vpn_ip;
@@ -2134,7 +2207,7 @@ impl Gateway {
         recorder: Option<Arc<RecordingManager>>,
         client_db: Option<Arc<ClientDatabase>>,
         qos_enforcer: Arc<crate::qos::QosEnforcer>,
-        downlink_shaping: bool,
+        downlink_shaping: ShapingLevel,
     ) {
         // A7: RNG for downlink padding size sampling + filler bytes. Per-worker
         // (not per-packet) to avoid re-seeding on the hot path.
@@ -2218,37 +2291,54 @@ impl Gateway {
                     // Use the session's own mask for MDH so the client can
                     // decode with the mask it currently expects (bootstrap
                     // or runtime after MaskUpdate is processed).
-                    let session_mdh = sess
-                        .mask
-                        .as_ref()
-                        .map(packet_mdh_bytes_for_mask)
-                        .unwrap_or_else(|| mask.header_template.clone());
-
-                    // A7: size downlink padding from the SESSION mask's own size
-                    // distribution — the same distribution + padding strategy the
-                    // client applies to uplink — so both directions share one size
-                    // signature on the 5-tuple. Computed under the lock while the
-                    // mask is borrowed; the filler bytes are written after the lock
-                    // is dropped. Legacy downlink framing: base overhead carries the
-                    // TAG_SIZE prefix, the 2-byte pad_len field, and the AEAD tag.
-                    let pad_len: u16 = if downlink_shaping {
-                        if let Some(ref m) = sess.mask {
-                            let base_overhead = TAG_SIZE
-                                + session_mdh.len()
-                                + 2
-                                + n
-                                + aivpn_common::crypto::POLY1305_TAG_SIZE;
-                            let target = m.size_distribution.sample(&mut rng);
-                            let requested =
-                                m.padding_strategy
-                                    .calc_padding(base_overhead, target, &mut rng);
-                            let max_pad = SAFE_DOWNLINK_BUDGET.saturating_sub(base_overhead) as u16;
-                            requested.min(max_pad)
-                        } else {
-                            0
-                        }
+                    // 1a: round-robin the session's pre-generated MDH pool
+                    // instead of calling the mask's RNG-based generator fresh
+                    // on every downlink packet (see `Session::next_mdh`).
+                    let session_mdh = if sess.mask.is_some() {
+                        sess.next_mdh()
                     } else {
-                        0
+                        mask.header_template.clone()
+                    };
+
+                    // A7/1c: size downlink padding from the SESSION mask's own
+                    // size distribution — the same distribution + padding
+                    // strategy the client applies to uplink — so both
+                    // directions share one size signature on the 5-tuple.
+                    // Computed under the lock while the mask is borrowed; the
+                    // filler bytes are written after the lock is dropped.
+                    // Legacy downlink framing: base overhead carries the
+                    // TAG_SIZE prefix, the 2-byte pad_len field, and the AEAD
+                    // tag. `ShapingLevel::Light` uses the same sampling but
+                    // caps the result to a small fixed budget, trading most of
+                    // the covertness back for throughput; `Off` skips it
+                    // entirely.
+                    let pad_len: u16 = match downlink_shaping {
+                        ShapingLevel::Off => 0,
+                        ShapingLevel::Full | ShapingLevel::Light => {
+                            if let Some(ref m) = sess.mask {
+                                let base_overhead = TAG_SIZE
+                                    + session_mdh.len()
+                                    + 2
+                                    + n
+                                    + aivpn_common::crypto::POLY1305_TAG_SIZE;
+                                let target = m.size_distribution.sample(&mut rng);
+                                let requested = m.padding_strategy.calc_padding(
+                                    base_overhead,
+                                    target,
+                                    &mut rng,
+                                );
+                                let max_pad =
+                                    SAFE_DOWNLINK_BUDGET.saturating_sub(base_overhead) as u16;
+                                let capped = requested.min(max_pad);
+                                if downlink_shaping == ShapingLevel::Light {
+                                    capped.min(LIGHT_SHAPING_MAX_PAD)
+                                } else {
+                                    capped
+                                }
+                            } else {
+                                0
+                            }
+                        }
                     };
                     // Pre-accumulate downlink bytes estimate (IP packet + overhead)
                     // This avoids a second lock after send_to
@@ -2923,17 +3013,22 @@ impl Gateway {
             {
                 let clients = db.list_clients();
                 let mut found = None;
+                // 3f: set when a PSK-PROVEN peer (tag matched) is turned away
+                // for one-time-used/expired/disabled — distinguishes an
+                // authenticated, explained refusal from a genuine "no client's
+                // PSK matches this packet" below, so the latter's cooldown
+                // bookkeeping and misleading "tag mismatch" log line don't
+                // fire for a legitimate credential holder.
+                let mut handshake_rejected: Option<u8> = None;
+                // NOTE: disabled/expired clients are NOT pre-filtered out of
+                // this scan (unlike before 3f) — their tag must still be
+                // checked so a genuinely PSK-proven-but-refused peer can be
+                // told WHY (HandshakeReject) instead of silently dropped
+                // indistinguishably from an unauthenticated prober. This adds
+                // a cheap `handshake_tag_precheck` per disabled/expired client
+                // to every unmatched handshake attempt — negligible relative
+                // to the existing per-candidate DH/tag cost.
                 'bootstrap: for client_cfg in &clients {
-                    if !client_cfg.enabled {
-                        continue;
-                    }
-                    if client_cfg
-                        .expires_at
-                        .is_some_and(|t| t <= chrono::Utc::now())
-                    {
-                        continue;
-                    }
-
                     let psk = client_cfg.psk;
                     let candidate_masks = self
                         .bootstrap_descriptors
@@ -3000,6 +3095,65 @@ impl Gateway {
                             Ok(sess) => {
                                 let validation = sess.lock().validate_handshake_tag(&cand_tag);
                                 if validation.is_some() {
+                                    // 3f: PSK is now PROVEN (the handshake tag
+                                    // matched THIS client's derived tag) — an
+                                    // unauthenticated prober can never reach
+                                    // this branch, so telling this specific
+                                    // peer WHY it is refused does not leak
+                                    // anything to a scanner (unobservability
+                                    // is preserved: probers still get total
+                                    // silence via the generic no-match path
+                                    // below).
+                                    let reject_reason: Option<u8> = if !client_cfg.enabled {
+                                        Some(3) // disabled
+                                    } else if client_cfg
+                                        .expires_at
+                                        .is_some_and(|t| t <= chrono::Utc::now())
+                                    {
+                                        Some(2) // expired
+                                    } else {
+                                        None
+                                    };
+                                    if let Some(reason) = reject_reason {
+                                        let reason_str =
+                                            if reason == 3 { "disabled" } else { "expired" };
+                                        warn!(
+                                            "Handshake from {} matched PSK-proven client '{}' but it is {} — sending authenticated HandshakeReject",
+                                            hash_addr(&client_addr),
+                                            client_cfg.id,
+                                            reason_str
+                                        );
+                                        self.audit_log.log(
+                                            AuditActor::System,
+                                            "handshake_rejected",
+                                            &client_cfg.id,
+                                            reason_str,
+                                        );
+                                        // Bind the session to the SPECIFIC
+                                        // candidate mask that just matched
+                                        // before replying — the client parses
+                                        // our reply's MDH framing using the
+                                        // mask IT sent the handshake with
+                                        // (which may not be the server's
+                                        // default/primary mask, e.g. a covert
+                                        // descriptor-derived candidate).
+                                        // `send_control_message` falls back to
+                                        // the server's default mask when
+                                        // `sess.mask` is unset, which would
+                                        // mismatch and leave the client unable
+                                        // to decode this reply.
+                                        sess.lock().mask = Some(bootstrap_mask.clone());
+                                        let _ = self
+                                            .send_control_message(
+                                                &ControlPayload::HandshakeReject { reason },
+                                                &sess,
+                                            )
+                                            .await;
+                                        let sid = sess.lock().session_id;
+                                        self.session_manager.rollback_failed_session(&sid);
+                                        handshake_rejected = Some(reason);
+                                        break 'bootstrap;
+                                    }
                                     // `mask_id` is `bootstrap:epoch-<N>:<base>:<slot>:<hex>`
                                     // for a covert descriptor mask, or a bare preset
                                     // name for the public-preset fallback. Surfacing
@@ -3041,6 +3195,21 @@ impl Gateway {
                 match found {
                     Some(f) => f,
                     None => {
+                        if let Some(reason) = handshake_rejected {
+                            // 3f: this handshake WAS from a PSK-proven client
+                            // — it already got an authenticated
+                            // HandshakeReject above explaining why. Skip the
+                            // generic "no match" cooldown/log path below
+                            // (that one is for probers with no valid PSK at
+                            // all) and don't surface this as an Err — nothing
+                            // about the packet itself was invalid.
+                            debug!(
+                                "Handshake from {} concluded: authenticated HandshakeReject (reason {}) already sent",
+                                hash_addr(&client_addr),
+                                reason
+                            );
+                            return Ok(());
+                        }
                         // Track failed handshake for cooldown
                         let ip = client_addr.ip();
                         let fail_count =
@@ -3189,6 +3358,10 @@ impl Gateway {
             {
                 let mut sess = session.lock();
                 sess.mask = Some(bootstrap_mask.clone());
+                // 1a: build the per-session MDH pool for the bootstrap mask
+                // now, so the first downlink packet does not pay a lazy-init
+                // RNG cost inside the hot path.
+                sess.rebuild_mdh_pool();
             }
 
             // Record handshake in client DB
@@ -4511,6 +4684,15 @@ impl Gateway {
                         Ok(true) => info!("Device enrolled and bound for client {}", cid),
                         Ok(false) => debug!("Device binding verified for client {}", cid),
                         Err(e) => {
+                            // 3f: one-time key already used — a DIFFERENT
+                            // device already bound this one_time credential.
+                            // The session is already tag-validated/AEAD
+                            // established (this is a decrypted, authenticated
+                            // in-session control message), so PSK possession
+                            // is proven — send the specific, authenticated
+                            // HandshakeReject{reason:1} instead of the
+                            // generic Shutdown so the client can show why and
+                            // stop retrying.
                             warn!("Device binding mismatch for {}: {}", cid, e);
                             self.audit_log.log(
                                 AuditActor::System,
@@ -4518,8 +4700,8 @@ impl Gateway {
                                 cid,
                                 "denied",
                             );
-                            let shutdown = ControlPayload::Shutdown { reason: 4 };
-                            let _ = self.send_control_message(&shutdown, session).await;
+                            let reject = ControlPayload::HandshakeReject { reason: 1 };
+                            let _ = self.send_control_message(&reject, session).await;
                             let session_id = session.lock().session_id;
                             self.session_manager.remove_session(&session_id);
                         }
@@ -4823,6 +5005,13 @@ impl Gateway {
                 // Server→client only; a client should never send this. Ignore.
                 debug!(
                     "Unexpected FeedbackConfig from client {} ignored",
+                    hash_addr(&client_addr)
+                );
+            }
+            ControlPayload::HandshakeReject { .. } => {
+                // Server→client only (3f); a client should never send this. Ignore.
+                debug!(
+                    "Unexpected HandshakeReject from client {} ignored",
                     hash_addr(&client_addr)
                 );
             }

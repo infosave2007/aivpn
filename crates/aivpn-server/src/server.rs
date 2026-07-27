@@ -248,6 +248,14 @@ pub struct ServerArgs {
     /// Write --export-bootstrap-descriptor output to this file instead of stdout.
     #[arg(long, value_name = "PATH")]
     pub bootstrap_output: Option<String>,
+
+    /// Downlink padding covertness↔throughput tradeoff: off | light | full
+    /// (default full). `full` pads every server→client DATA packet to the
+    /// session mask's size distribution (max covertness); `light` pads with a
+    /// small capped budget; `off` disables downlink padding (max throughput).
+    /// Overrides server.json "downlink_shaping".
+    #[arg(long, value_name = "LEVEL", env = "AIVPN_SHAPING_LEVEL")]
+    pub shaping_level: Option<String>,
 }
 
 /// AIVPN Server instance

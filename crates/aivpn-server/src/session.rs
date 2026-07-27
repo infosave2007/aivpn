@@ -266,7 +266,26 @@ pub struct Session {
     /// rebuild EVERY session's window — O(sessions × window) BLAKE3 per miss).
     /// 0 = never built.
     pub tag_window_tw: u64,
+
+    /// 1a perf fix: pre-generated pool of mask-dependent headers (MDH) for
+    /// this session's current `mask`, so `next_mdh()` round-robins through
+    /// cached headers on the downlink hot path instead of calling the mask's
+    /// RNG-based `HeaderSpec::generate()` fresh for every packet. Empty when
+    /// `mask` is `None` or has no dynamic `header_spec` (a static
+    /// `header_template` mask always yields the same bytes, so no pool is
+    /// needed). Rebuilt by `rebuild_mdh_pool()` whenever `mask` changes —
+    /// scoped per-session (not a global cache) so per-session polymorphic
+    /// mask variants (unique `mask_id` per session) never share a pool and a
+    /// mask switch can never serve a stale header.
+    mdh_pool: Vec<Vec<u8>>,
+    /// Round-robin cursor into `mdh_pool`.
+    mdh_pool_idx: usize,
 }
+
+/// Number of headers pre-generated per mask pool (1a). Large enough that the
+/// on-wire header distribution still looks freshly random across a session's
+/// packet stream; small enough to build in microseconds on a mask switch.
+const MDH_POOL_SIZE: usize = 64;
 
 /// Anti-replay bitmap tracking which of the last `TAG_WINDOW_SIZE` counters
 /// (relative to the newest seen) have already been received. Bit 0 is the
@@ -400,7 +419,50 @@ impl Session {
             kernel_install_sig: 0,
             kernel_dl_window: 0,
             tag_window_tw: 0,
+            mdh_pool: Vec::new(),
+            mdh_pool_idx: 0,
         }
+    }
+
+    /// Rebuild `mdh_pool` for the session's current `mask`. Cheap relative to
+    /// per-packet cost but never called on the hot path itself — only from
+    /// the two places `mask` is assigned (initial bootstrap mask and
+    /// `commit_pending_mask` below).
+    pub fn rebuild_mdh_pool(&mut self) {
+        self.mdh_pool.clear();
+        self.mdh_pool_idx = 0;
+        if let Some(spec) = self.mask.as_ref().and_then(|m| m.header_spec.as_ref()) {
+            let mut rng = rand::thread_rng();
+            self.mdh_pool = (0..MDH_POOL_SIZE)
+                .map(|_| spec.generate(&mut rng))
+                .collect();
+        }
+    }
+
+    /// Next mask-dependent header for a downlink packet (1a). Round-robins
+    /// through the pre-generated pool — no RNG call on the hot path — falling
+    /// back to the static `header_template` for masks with no `header_spec`,
+    /// and lazily (re)building the pool if it is unexpectedly empty (should
+    /// not happen once `rebuild_mdh_pool` runs on every mask assignment, but
+    /// keeps this safe against future call sites that set `mask` directly).
+    pub fn next_mdh(&mut self) -> Vec<u8> {
+        let Some(mask) = self.mask.as_ref() else {
+            return Vec::new();
+        };
+        if mask.header_spec.is_none() {
+            return mask.header_template.clone();
+        }
+        if self.mdh_pool.is_empty() {
+            self.rebuild_mdh_pool();
+        }
+        if self.mdh_pool.is_empty() {
+            // header_spec generated zero-length headers (e.g. no fields) —
+            // nothing to round-robin; return the empty header directly.
+            return Vec::new();
+        }
+        let idx = self.mdh_pool_idx % self.mdh_pool.len();
+        self.mdh_pool_idx = self.mdh_pool_idx.wrapping_add(1);
+        self.mdh_pool[idx].clone()
     }
 
     /// Compute next nonce for encryption from send_counter (u64)
@@ -697,6 +759,9 @@ impl Session {
                 let (new_mask, _) = self.pending_mask.take().unwrap();
                 info!("Committing deferred mask switch to '{}'", new_mask.mask_id);
                 self.mask = Some(new_mask);
+                // 1a: the old pool's headers belong to the mask we just left
+                // — rebuild before the next downlink packet picks one up.
+                self.rebuild_mdh_pool();
                 // Reset FSM state for the new mask
                 self.fsm_state = 0;
                 self.fsm_packets = 0;

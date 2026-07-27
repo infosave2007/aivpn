@@ -72,6 +72,14 @@ pub struct ServeConfig {
     /// of `management-api` never needs to know about `MetricsCollector`.
     #[cfg(feature = "metrics")]
     pub metrics: Option<Arc<crate::metrics::MetricsCollector>>,
+    /// 3a: optional numeric GID to chown the socket's group to. When `Some`,
+    /// the socket is created mode 0660 (group read/write added) instead of
+    /// the default owner-only 0600, and its group ownership is set to this
+    /// GID (owner is left as the server process's uid). Lets an operator run
+    /// a non-root web-panel container's uid in this group so it can open the
+    /// socket without running aivpn-server itself as that uid. `None` (the
+    /// default) keeps the existing owner-only 0600 socket.
+    pub socket_group: Option<u32>,
 }
 
 // ── Shared handler state ─────────────────────────────────────────────────────
@@ -1237,6 +1245,23 @@ fn router(state: ApiState) -> Router {
 
 // ── Entry point ───────────────────────────────────────────────────────────────
 
+/// 3a: chown `path`'s group to `gid`, leaving the owner (uid) unchanged.
+/// Passing `-1` (all-ones) as the uid argument to `chown(2)` is the POSIX
+/// idiom for "leave this ID alone" — used here so the socket keeps being
+/// owned by the server process's uid and only the group changes.
+fn chown_group_only(path: &std::path::Path, gid: u32) -> std::io::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    let c_path = CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "path contains NUL"))?;
+    let ret = unsafe { libc::chown(c_path.as_ptr(), -1i32 as libc::uid_t, gid as libc::gid_t) };
+    if ret != 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
 pub async fn serve(cfg: ServeConfig) {
     let Some(db) = cfg.db else {
         tracing::info!("Management API: no client database configured, skipping");
@@ -1313,13 +1338,35 @@ pub async fn serve(cfg: ServeConfig) {
             return;
         }
     };
+    // 3a: mode 0660 (adds group r/w) when an operator-configured group is
+    // set, so a non-root web-panel container in that group can open the
+    // socket; otherwise keep the historical owner-only 0600.
+    let socket_mode: u32 = if cfg.socket_group.is_some() {
+        0o660
+    } else {
+        0o600
+    };
     if let Err(e) = std::fs::set_permissions(
         &staged_sock,
-        std::os::unix::fs::PermissionsExt::from_mode(0o600),
+        std::os::unix::fs::PermissionsExt::from_mode(socket_mode),
     ) {
         tracing::warn!("Management API: failed to set socket permissions: {}", e);
         let _ = std::fs::remove_dir_all(&staging_dir);
         return;
+    }
+    if let Some(gid) = cfg.socket_group {
+        // Still inside the 0700 staging dir at this point — chown before the
+        // rename into the final (public) path, same ordering rationale as
+        // the mode change above.
+        if let Err(e) = chown_group_only(&staged_sock, gid) {
+            tracing::warn!(
+                "Management API: failed to chown socket group to gid {}: {}",
+                gid,
+                e
+            );
+            let _ = std::fs::remove_dir_all(&staging_dir);
+            return;
+        }
     }
     if let Err(e) = std::fs::rename(&staged_sock, &path) {
         tracing::warn!(

@@ -186,6 +186,32 @@ fn data_stall_confirmed(strikes: &mut u32, verdict: Option<&'static str>) -> Opt
     }
 }
 
+/// 3f: human-readable message for a `HandshakeReject` reason code. See
+/// `ControlPayload::HandshakeReject`'s doc comment in aivpn-common for the
+/// authoritative mapping: 1=one-time key already used, 2=expired,
+/// 3=disabled, 0/other=unspecified.
+pub fn handshake_reject_message(reason: u8) -> &'static str {
+    match reason {
+        1 => "one-time key already used",
+        2 => "client expired",
+        3 => "client disabled",
+        _ => "refused",
+    }
+}
+
+/// 3f: short machine-readable token for the `AIVPN-STATUS rejected <token>`
+/// stdout line — mirrors `handshake_reject_message` but as an ASCII token a
+/// GUI can match without depending on the English wording (the GUI maps the
+/// token to its own localized string).
+fn handshake_reject_token(reason: u8) -> &'static str {
+    match reason {
+        1 => "one_time_used",
+        2 => "expired",
+        3 => "disabled",
+        _ => "unspecified",
+    }
+}
+
 /// Upper bound on the rekey-ack rendezvous wait. The ack normally fires
 /// sub-millisecond (it is a local oneshot fired by the upload task right
 /// after encrypting the KeyRotate response), so 5 s can only elapse if the
@@ -347,6 +373,20 @@ pub struct ClientConfig {
     /// are authenticated by the session channel and are not independently
     /// signature-verifiable.
     pub mask_verify_mode: aivpn_common::mask::MaskVerifyMode,
+    /// 3b: shared handle to the process-wide native network-change listener
+    /// (see `net_change.rs`), spawned ONCE in `main.rs` before the reconnect
+    /// loop and threaded into every `ClientConfig`/`run()` call across
+    /// reconnects. `None` when no platform listener is implemented, or the
+    /// platform-specific registration failed — the client then relies solely
+    /// on the existing poll-based watchdogs (unchanged behavior).
+    pub network_change_notify: Option<Arc<tokio::sync::Notify>>,
+    /// 3c: true when `main.rs` selected this run's `initial_mask` via the
+    /// "3 consecutive handshakes never connected" resilience fallback
+    /// (built-in default mask) rather than the normal bootstrap-derived
+    /// selection. Threaded through so the stats-writer task can surface it
+    /// to file-polling GUIs (Windows) via the `fallback:` key — mirrors how
+    /// `ip:` was added for the same "GUI can't read child stdout" reason.
+    pub is_bootstrap_fallback: bool,
 }
 
 /// Client state
@@ -531,6 +571,17 @@ pub struct AivpnClient {
     /// task polls this to know when to stop resending (see the ServerHello
     /// handler's retry spawn).
     polymorphic_confirmed: Arc<AtomicBool>,
+    /// 3f: set true when the server sent an authenticated `HandshakeReject`
+    /// (subtype 0x20) — a terminal, PSK-proven refusal (one-time key already
+    /// used / client expired / client disabled). `main.rs`'s reconnect loop
+    /// checks this after `run()` returns and stops retrying instead of
+    /// backing off and reconnecting, since retrying against a definitive
+    /// refusal would only hammer the server forever.
+    terminal_rejected: bool,
+    /// Reason code from the `HandshakeReject` that set `terminal_rejected`
+    /// (see `handshake_reject_message` for the mapping). Meaningless while
+    /// `terminal_rejected` is false.
+    reject_reason: u8,
     /// Kernel-module accelerator (Linux only, auto-detected via /dev/aivpn).
     #[cfg(target_os = "linux")]
     kernel_accel: Option<Arc<KernelAccel>>,
@@ -655,6 +706,8 @@ impl AivpnClient {
             regional_mask_hints: None,
             ever_connected: Arc::new(AtomicBool::new(false)),
             polymorphic_confirmed: Arc::new(AtomicBool::new(false)),
+            terminal_rejected: false,
+            reject_reason: 0,
         })
     }
 
@@ -922,6 +975,22 @@ impl AivpnClient {
     /// FAILURE outcome for the mask it tried to use.
     pub fn ever_connected(&self) -> bool {
         self.ever_connected.load(Ordering::Relaxed)
+    }
+
+    /// 3f: true when the server sent an authenticated `HandshakeReject`
+    /// during this run. `main.rs`'s reconnect loop checks this after
+    /// `run()` returns and, when true, stops the reconnect loop instead of
+    /// backing off and retrying — see `handshake_reject_message` for the
+    /// human-readable reason (via `reject_reason()`).
+    pub fn terminal_rejected(&self) -> bool {
+        self.terminal_rejected
+    }
+
+    /// Reason code the server sent with the terminal `HandshakeReject` (only
+    /// meaningful when `terminal_rejected()` is true). See
+    /// `handshake_reject_message` for the mapping.
+    pub fn reject_reason(&self) -> u8 {
+        self.reject_reason
     }
 
     /// Latest observed round-trip time in milliseconds (0 if never measured).
@@ -1412,6 +1481,13 @@ impl AivpnClient {
         let stats_bytes_sent = self.bytes_sent.clone();
         let stats_bytes_received = self.bytes_received.clone();
         let stats_current_vpn_ip = self.current_vpn_ip.clone();
+        // 3c: whether THIS run's initial_mask came from main.rs's
+        // "3 consecutive dead handshakes" resilience fallback rather than
+        // normal bootstrap selection. Constant for the run's lifetime (set
+        // once by main.rs before constructing this ClientConfig), so a
+        // plain captured bool is enough — no need for an Arc<AtomicBool>
+        // like the live-updated `ip:` field above.
+        let stats_bootstrap_fallback = self.config.is_bootstrap_fallback;
         let stats_task = tokio::spawn(async move {
             // Determine platform-appropriate stats paths
             #[cfg(target_os = "windows")]
@@ -1452,8 +1528,8 @@ impl AivpnClient {
                 .unwrap_or_else(|e| e.into_inner())
                 .clone();
             let initial = format!(
-                "sent:0,received:0,since:{},ip:{}",
-                session_since_ms, initial_ip
+                "sent:0,received:0,since:{},ip:{},fallback:{}",
+                session_since_ms, initial_ip, stats_bootstrap_fallback as u8
             );
             for path in &stats_paths {
                 let p = path.clone();
@@ -1483,8 +1559,8 @@ impl AivpnClient {
                     .unwrap_or_else(|e| e.into_inner())
                     .clone();
                 let stats = format!(
-                    "sent:{},received:{},since:{},ip:{}",
-                    sent, received, session_since_ms, ip
+                    "sent:{},received:{},since:{},ip:{},fallback:{}",
+                    sent, received, session_since_ms, ip, stats_bootstrap_fallback as u8
                 );
                 for path in &stats_paths {
                     let p = path.clone();
@@ -1601,6 +1677,44 @@ impl AivpnClient {
                         info!("Shutdown requested");
                         stats_task.abort();
                         break Ok(());
+                    }
+                }
+
+                // 3b: native OS network-change listener (see net_change.rs).
+                // Best-effort — `None` when unsupported/unavailable, in
+                // which case this branch never fires and the existing
+                // poll-based watchdogs below are the only reconnect trigger
+                // (today's behavior, unchanged). When it DOES fire, react
+                // immediately instead of waiting the 5-10s+ these watchdogs
+                // need to notice the same change passively.
+                _ = async {
+                    match self.config.network_change_notify.as_ref() {
+                        Some(n) => n.notified().await,
+                        None => std::future::pending::<()>().await,
+                    }
+                } => {
+                    // The Linux listener subscribes to LINK + IPv4/IPv6 IFADDR
+                    // groups, so bringing up OUR OWN tun (link up + its v4 addr
+                    // + kernel-assigned v6 link-local) emits exactly those
+                    // events every connect. Reacting to them would tear the
+                    // session down microseconds after the init handshake goes
+                    // out — before the server reply can arrive — and each retry
+                    // rebuilds the tun, re-emitting the events: an unbreakable
+                    // reconnect loop that never establishes. Only honor the
+                    // signal once the tunnel is actually up (≥1 authenticated
+                    // RX advanced last_rx off connect_instant); until then the
+                    // burst is self-inflicted setup churn — drain and ignore it.
+                    // A genuine change during the pre-establishment window is
+                    // still covered by the handshake-fallback path and the
+                    // poll-based carrier-change watchdog below.
+                    if last_rx == connect_instant {
+                        tracing::debug!(
+                            "Network-change event during connection setup — \
+                             ignoring self-inflicted tun churn (tunnel not yet established)"
+                        );
+                    } else {
+                        warn!("Native network-change event detected — reconnecting immediately");
+                        break Err(Error::Session("network change detected".into()));
                     }
                 }
 
@@ -3009,6 +3123,26 @@ impl AivpnClient {
                 info!("MaskCatalog from server: {} masks", masks.len());
                 crate::mask_catalog::write_mask_catalog(&masks);
             }
+            ControlPayload::HandshakeReject { reason } => {
+                // Authenticated (PSK-proven) terminal refusal — see the
+                // doc comment on `ControlPayload::HandshakeReject` in
+                // aivpn-common. Log the reason, surface it on stdout as a
+                // machine-readable status line (mirrors "AIVPN-STATUS
+                // connected <ip>") so the CLI and both desktop GUIs can show
+                // it, and set the terminal flag so `main.rs`'s reconnect
+                // loop stops instead of retrying forever against a refusal
+                // that will never change on its own.
+                let message = handshake_reject_message(reason);
+                error!(
+                    "Handshake rejected by server: {} (reason={})",
+                    message, reason
+                );
+                println!("AIVPN-STATUS rejected {}", handshake_reject_token(reason));
+                self.terminal_rejected = true;
+                self.reject_reason = reason;
+                self.disconnect().await;
+                return Err(Error::Session(format!("handshake rejected: {}", message)));
+            }
             _ => {}
         }
         Ok(())
@@ -3417,6 +3551,8 @@ mod tests {
             country_code: None,
             mask_operator_pubkey: None,
             mask_verify_mode: aivpn_common::mask::MaskVerifyMode::default(),
+            network_change_notify: None,
+            is_bootstrap_fallback: false,
         }
     }
 

@@ -865,6 +865,60 @@ impl ClientDatabase {
             "No more VPN IPs available in configured subnet".into(),
         ))
     }
+
+    /// 2b: pool-wide VPN-IP coordination. Every freshly-bootstrapped node's
+    /// allocator started counting from the same hardcoded offset
+    /// (`default_next_host_offset() == 2`, i.e. `x.x.0.2`), so two pool nodes
+    /// independently adding their first client — the common case: two admins
+    /// provisioning different nodes' web panels around the same time, before
+    /// any pool_sync round has run — always handed out the identical vpn_ip
+    /// and collided. Deterministically partitioning each node's starting
+    /// offset by a hash of its (unique, operator-assigned) `pool.node_id`
+    /// spreads independent nodes across the address space so their
+    /// allocators start at different points and stop colliding on the very
+    /// first client. This is a best-effort spread, not a hard partition —
+    /// hash collisions or more nodes than spread room are still possible —
+    /// so `merge_from_json`'s re-home-on-conflict path (see its `ip_conflict`
+    /// branch) remains the correctness backstop that guarantees no client is
+    /// ever silently dropped even if two nodes do land on the same offset.
+    ///
+    /// Only nudges a database that has never allocated anything yet (empty
+    /// client list AND counter still at the unmodified default): an
+    /// already-populated node's counter must never move, since jumping it
+    /// forward or backward could hand out an offset this node itself already
+    /// gave to an earlier client, or skip over free ones. Safe to call once
+    /// at startup, unconditionally, whether or not pool sync is configured
+    /// (a `None` `node_id` is simply skipped by the caller).
+    pub fn set_node_partition(&self, node_id: &str) {
+        let max_host_offset = self.network_config.max_host_offset();
+        // Need at least offsets {1, 2} to have any room to spread into.
+        if max_host_offset < 2 {
+            return;
+        }
+        let mut data = self.data.write();
+        if !data.clients.is_empty() || data.next_host_offset != default_next_host_offset() {
+            return;
+        }
+        let seed = fnv1a_hash(node_id.as_bytes());
+        // Offsets are valid in 1..=max_host_offset (offset 0 means
+        // "unset" — see `ip_for_host_offset`); offset 1 is normally the
+        // server's own IP, which `allocate_vpn_ip` already skips over on its
+        // first iteration, so including it in the spread is harmless.
+        data.next_host_offset = 1 + (seed % max_host_offset as u64) as u32;
+    }
+}
+
+/// Small deterministic non-cryptographic hash (FNV-1a) used only to spread
+/// pool nodes' VPN-IP allocation starting offsets — see `set_node_partition`.
+/// Not security-sensitive: worst case of a collision is the pre-existing
+/// re-home-on-conflict path in `merge_from_json` doing a little more work.
+fn fnv1a_hash(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for &b in bytes {
+        hash ^= b as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
 }
 
 /// Custom serde for Option<[u8; 32]> as base64 string or null
@@ -1159,6 +1213,120 @@ mod tests {
         assert!(
             db.find_by_id("peer-new-id").is_some(),
             "tombstone must not block an incoming live client on the same IP"
+        );
+    }
+
+    /// 2b regression: two pool nodes independently add a client and both
+    /// allocate the SAME vpn_ip (the reported bug — both start at
+    /// `x.x.0.2`). `merge_from_json` must re-home the incoming record onto a
+    /// free local IP rather than silently dropping it (the old behavior,
+    /// which left the credential permanently un-synced to this node).
+    #[test]
+    fn merge_from_json_rehomes_ip_conflicting_incoming_client() {
+        let dir = tempfile::tempdir().unwrap();
+        let db =
+            ClientDatabase::load(&dir.path().join("clients.json"), test_network_config()).unwrap();
+
+        // Locally added client — gets the first offset, 10.99.0.2.
+        let local = db.add_client("local-alice").unwrap();
+
+        // A DIFFERENT client, added independently on another pool node whose
+        // allocator also started at the same default offset, so it too got
+        // 10.99.0.2 — a genuine cross-node collision on the wire.
+        let mut incoming = local.clone();
+        incoming.id = "peer-node-client-id".to_string();
+        incoming.name = "peer-bob".to_string();
+        incoming.psk = [0x77; 32];
+        incoming.vpn_ip = local.vpn_ip;
+        assert_eq!(
+            incoming.vpn_ip, local.vpn_ip,
+            "test setup: both records must collide on the same vpn_ip"
+        );
+
+        let merged = db
+            .merge_from_json(&serde_json::to_string(&vec![incoming]).unwrap())
+            .unwrap();
+        assert_eq!(merged, 1, "the colliding incoming client must still merge");
+
+        // The credential (id + PSK) must have propagated — this is the
+        // actual bug: it used to be silently dropped instead.
+        let rehomed = db
+            .find_by_id("peer-node-client-id")
+            .expect("colliding incoming client must be present after merge, not dropped");
+        assert_ne!(
+            rehomed.vpn_ip, local.vpn_ip,
+            "the incoming client must be re-homed to a DIFFERENT local vpn_ip, \
+             not silently overwrite or share the existing client's IP"
+        );
+
+        // The original local client must be completely untouched.
+        let local_after = db.find_by_id(&local.id).unwrap();
+        assert_eq!(local_after.vpn_ip, local.vpn_ip);
+
+        // No two live (non-tombstoned) clients may share a vpn_ip after the
+        // merge — the whole point of the fix.
+        let all = db.list_clients();
+        for a in &all {
+            for b in &all {
+                if a.id != b.id {
+                    assert_ne!(
+                        a.vpn_ip, b.vpn_ip,
+                        "no two live clients may share a vpn_ip after merge"
+                    );
+                }
+            }
+        }
+    }
+
+    /// 2b: distinct pool `node_id`s must (in the common case) seed different
+    /// VPN-IP allocation starting offsets, so two freshly-bootstrapped nodes
+    /// stop handing out the same "first" IP to independently added clients.
+    #[test]
+    fn set_node_partition_spreads_distinct_node_ids_and_is_idempotent_once_populated() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_a = ClientDatabase::load(&dir.path().join("a.json"), test_network_config()).unwrap();
+        let db_b = ClientDatabase::load(&dir.path().join("b.json"), test_network_config()).unwrap();
+
+        db_a.set_node_partition("node-alpha");
+        db_b.set_node_partition("node-beta");
+
+        let offset_a = db_a.data.read().next_host_offset;
+        let offset_b = db_b.data.read().next_host_offset;
+        assert_ne!(
+            offset_a, offset_b,
+            "distinct node_ids should (in the common case) seed distinct \
+             starting offsets — this specific pair is a fixed, checked-in \
+             regression fixture, not a probabilistic flake"
+        );
+
+        // Both offsets must be in the valid allocatable range.
+        let max = test_network_config().max_host_offset();
+        assert!(offset_a >= 1 && offset_a <= max);
+        assert!(offset_b >= 1 && offset_b <= max);
+
+        // A client added after the seed lands on the seeded offset, not the
+        // old hardcoded default.
+        let client_a = db_a.add_client("first-on-a").unwrap();
+        let expected_ip = test_network_config()
+            .ip_for_host_offset(offset_a)
+            .or_else(|| test_network_config().ip_for_host_offset(offset_a + 1))
+            .unwrap();
+        // allocate_vpn_ip skips the server's own IP, so the assigned IP is
+        // either exactly the seeded offset or the next one.
+        assert!(
+            client_a.vpn_ip == test_network_config().ip_for_host_offset(offset_a).unwrap()
+                || client_a.vpn_ip == expected_ip,
+            "first client must be allocated from the seeded offset, not the old default"
+        );
+
+        // Idempotency / safety: once a database is populated, re-seeding
+        // must be a no-op — it must never move an already-active counter.
+        let offset_a_after_first_client = db_a.data.read().next_host_offset;
+        db_a.set_node_partition("some-other-node-id");
+        assert_eq!(
+            db_a.data.read().next_host_offset,
+            offset_a_after_first_client,
+            "set_node_partition must not touch an already-populated database's counter"
         );
     }
 }

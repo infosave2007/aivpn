@@ -93,6 +93,7 @@ async fn spawn_server_with_key(
             mask_verify_mode: aivpn_common::mask::MaskVerifyMode::default(),
             #[cfg(feature = "metrics")]
             metrics: None,
+            socket_group: None,
         })
         .await;
     });

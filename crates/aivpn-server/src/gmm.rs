@@ -220,6 +220,50 @@ pub fn select_best_bic(data: &[f64], max_k: usize) -> Option<Gmm1d> {
         })
 }
 
+/// R6a min-cluster component floor for production mask selection. A component
+/// carrying less than this fraction of the mass is a spurious mode the BIC
+/// sweep over-fit, not a behaviour a DPI adversary would ever see repeated —
+/// see `research/mask-generation/phase2b/report/r6_report.md`.
+pub const MIN_CLUSTER_WEIGHT: f64 = 0.05;
+
+/// Like [`select_best_bic`], but enforces the R6a min-cluster constraint
+/// *during* selection instead of pruning spurious modes post-hoc: among the
+/// swept fits, keep only those whose **smallest** component weight is at least
+/// `min_cluster_weight`, then take argmin BIC among the admissible `k`.
+///
+/// Rationale (R6a, `phase2b/report/r6_report.md`): plain argmin-BIC with a
+/// full-covariance 1-D sweep keeps decreasing to the top of the range (k*=7-8)
+/// by adding <5 %-weight micro-modes, then relies on `to_flat_params`'s
+/// post-hoc prune to hide them — but the surviving components were still fit
+/// under the over-K model, so the reported mask is dishonest. Rejecting the
+/// whole `k` up front yields the honest interior optimum (DNS 4, QUIC 5,
+/// WebRTC 2 on the study corpus) whose held-out KS fit is equal-or-better,
+/// with cleaner modes that a flow-statistics classifier finds *harder* to
+/// separate from real traffic, not easier.
+///
+/// `k=1` always has a single weight of 1.0, so it is always admissible: this
+/// degrades gracefully to the unimodal fit when no multimodal `k` clears the
+/// floor, and never returns `None` on data [`select_best_bic`] would fit.
+pub fn select_best_bic_min_cluster(
+    data: &[f64],
+    max_k: usize,
+    min_cluster_weight: f64,
+) -> Option<Gmm1d> {
+    let sweep = fit_sweep(data, max_k);
+    let admissible: Vec<Gmm1d> = sweep
+        .into_iter()
+        .filter(|g| {
+            g.bic.is_finite()
+                && g.weights.iter().cloned().fold(f64::INFINITY, f64::min) >= min_cluster_weight
+        })
+        .collect();
+    admissible.into_iter().min_by(|a, b| {
+        a.bic
+            .partial_cmp(&b.bic)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -305,6 +349,66 @@ mod tests {
         assert_eq!(a.means, b.means);
         assert_eq!(a.vars, b.vars);
         assert_eq!(a.weights, b.weights);
+    }
+
+    #[test]
+    fn min_cluster_rejects_spurious_tiny_modes() {
+        // 98 % of the mass in one tight Gaussian, 2 % scattered far away — a
+        // plain argmin-BIC sweep is tempted to spend a <5 %-weight component on
+        // the outlier smear. The min-cluster rule must refuse any k whose
+        // smallest weight is under the floor, so every surviving component of
+        // the chosen fit carries real mass.
+        let mut rng = StdRng::seed_from_u64(11);
+        let mut data: Vec<f64> = Vec::new();
+        for _ in 0..1960 {
+            let u1: f64 = rng.gen::<f64>().max(1e-12);
+            let u2: f64 = rng.gen();
+            let z = (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos();
+            data.push(100.0 + 5.0 * z);
+        }
+        for _ in 0..40 {
+            data.push(1200.0 + rng.gen::<f64>() * 400.0); // 2 % far outliers
+        }
+        let best = select_best_bic_min_cluster(&data, 8, MIN_CLUSTER_WEIGHT).expect("fit");
+        let min_w = best.weights.iter().cloned().fold(f64::INFINITY, f64::min);
+        assert!(
+            min_w >= MIN_CLUSTER_WEIGHT,
+            "selected fit has a sub-floor component (min weight {min_w}, k={})",
+            best.k()
+        );
+    }
+
+    #[test]
+    fn min_cluster_still_finds_clear_bimodal() {
+        // Two well-separated 50/50 modes clear the floor comfortably, so the
+        // constrained selector must still pick a multimodal fit.
+        let data = sample_bimodal(2000, 42);
+        let best = select_best_bic_min_cluster(&data, 8, MIN_CLUSTER_WEIGHT).expect("fit");
+        assert!(best.k() >= 2, "expected multimodal fit, got k={}", best.k());
+        let min_w = best.weights.iter().cloned().fold(f64::INFINITY, f64::min);
+        assert!(min_w >= MIN_CLUSTER_WEIGHT);
+    }
+
+    #[test]
+    fn min_cluster_falls_back_to_unimodal_not_none() {
+        // Clean single Gaussian: no multimodal k clears the floor, but k=1
+        // (weight 1.0) always does — must return a unimodal fit, never None.
+        let mut rng = StdRng::seed_from_u64(7);
+        let data: Vec<f64> = (0..1500)
+            .map(|_| {
+                let u1: f64 = rng.gen::<f64>().max(1e-12);
+                let u2: f64 = rng.gen();
+                let z = (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos();
+                100.0 + 5.0 * z
+            })
+            .collect();
+        let best = select_best_bic_min_cluster(&data, 8, MIN_CLUSTER_WEIGHT).expect("fit");
+        assert_eq!(
+            best.k(),
+            1,
+            "unimodal data should pick k=1, got {}",
+            best.k()
+        );
     }
 
     #[test]

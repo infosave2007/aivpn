@@ -363,6 +363,13 @@ pub fn t(lang: Lang, key: &str) -> &'static str {
         (Lang::En, "vpn_ip_label") => "IP",
         (Lang::Ru, "vpn_ip_label") => "IP",
 
+        // 3c: bootstrap-fallback indicator — live value from the client's
+        // traffic.stats `fallback:` key (this GUI's child stdout is piped to
+        // Stdio::null(), so unlike Linux it can't read the client's
+        // "AIVPN-STATUS bootstrap-fallback" stdout line directly).
+        (Lang::En, "bootstrap_fallback_label") => "Using built-in mask (fallback)",
+        (Lang::Ru, "bootstrap_fallback_label") => "Встроенная маска (аварийный режим)",
+
         // Tray connect/disconnect
         (Lang::En, "tray_connect") => "Connect",
         (Lang::Ru, "tray_connect") => "Подключить",

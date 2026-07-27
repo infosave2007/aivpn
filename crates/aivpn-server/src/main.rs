@@ -345,6 +345,10 @@ async fn main() {
     let mgmt_mask_operator_pubkey = resolve_mask_operator_pubkey(&args, file_config.as_ref());
     #[cfg(all(feature = "management-api", unix))]
     let mgmt_mask_verify_mode = resolve_mask_verify_mode(&args, file_config.as_ref());
+    // 3a: optional GID to chown the management socket's group to (config-only —
+    // server.json "management_socket_group"; no CLI flag).
+    #[cfg(all(feature = "management-api", unix))]
+    let mgmt_socket_group = file_config.as_ref().and_then(|c| c.management_socket_group);
 
     // Build structured event bus (stdout JSONL sink)
     let event_bus = EventBus::new(EventSinkConfig {
@@ -375,6 +379,14 @@ async fn main() {
         }
         None => file_config.as_ref().and_then(|c| c.pool.clone()),
     };
+
+    // 2b: spread this node's VPN-IP allocation starting offset by node_id so
+    // independent adds on different pool nodes don't collide on the same
+    // "first" IP. No-op if the DB already has clients/a moved counter, or if
+    // pool sync isn't configured (no node_id to derive from).
+    if let Some(ref node_id) = pool_sync_config.as_ref().and_then(|c| c.node_id.clone()) {
+        client_db.set_node_partition(node_id);
+    }
 
     // Clone client_db for pool sync before it is consumed by GatewayConfig.
     let client_db_for_sync: Option<Arc<ClientDatabase>> =
@@ -464,10 +476,7 @@ async fn main() {
             .as_ref()
             .and_then(|c| c.polymorphic.as_ref())
             .and_then(|p| p.base_mask.clone()),
-        downlink_shaping: file_config
-            .as_ref()
-            .and_then(|c| c.downlink_shaping)
-            .unwrap_or(true),
+        downlink_shaping: resolve_shaping_level(&args, file_config.as_ref()),
         // R2 Phase B: operator mask signing + config-gated verification.
         mask_signing_key: resolve_mask_signing_key(&args, file_config.as_ref()),
         mask_operator_pubkey: resolve_mask_operator_pubkey(&args, file_config.as_ref()),
@@ -508,6 +517,7 @@ async fn main() {
                                 mask_verify_mode: mgmt_mask_verify_mode,
                                 #[cfg(feature = "metrics")]
                                 metrics: mgmt_metrics,
+                                socket_group: mgmt_socket_group,
                             },
                         )
                         .await;
@@ -758,6 +768,23 @@ fn resolve_mask_verify_mode(
             std::process::exit(1);
         }),
     }
+}
+
+/// Resolve the downlink shaping level (1c): CLI/env → server.json → default
+/// (`Full`, matching the historical `downlink_shaping: true`/absent behavior).
+fn resolve_shaping_level(
+    args: &ServerArgs,
+    file_config: Option<&ServerFileConfig>,
+) -> aivpn_server::gateway::ShapingLevel {
+    if let Some(s) = &args.shaping_level {
+        return s.parse().unwrap_or_else(|e: String| {
+            eprintln!("--shaping-level: {}", e);
+            std::process::exit(1);
+        });
+    }
+    file_config
+        .and_then(|c| c.downlink_shaping)
+        .unwrap_or_default()
 }
 
 /// `--gen-mask-signing-key PATH`: generate a fresh operator Ed25519 seed,
@@ -2034,6 +2061,7 @@ mod tests {
             sign_mask_dir: None,
             export_bootstrap_descriptor: false,
             bootstrap_output: None,
+            shaping_level: None,
         }
     }
 

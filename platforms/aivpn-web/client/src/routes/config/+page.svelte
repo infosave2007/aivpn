@@ -6,9 +6,10 @@
   interface FieldDef {
     key: string;
     label: string;
-    type: 'text' | 'number' | 'checkbox';
+    type: 'text' | 'number' | 'checkbox' | 'select';
     hint: string;
     placeholder?: string;
+    options?: { value: string; label: string }[];
   }
 
   const FIELDS: FieldDef[] = [
@@ -21,18 +22,27 @@
     { key: 'idle_timeout_secs', label: 'Idle Timeout (s)', type: 'number', hint: 'Disconnect idle sessions after N seconds. 0 = disabled.' },
     { key: 'tun_mtu', label: 'TUN MTU', type: 'number', hint: 'TUN interface MTU. Default 1420. Reduce if downstream links fragment packets.' },
     { key: 'allow_peer_routing', label: 'Allow Peer Routing', type: 'checkbox', hint: 'Route traffic between VPN peers (site-to-site mesh). Disable to isolate peers.' },
+    { key: 'downlink_shaping', label: 'Downlink Shaping', type: 'select', hint: 'Balance level for downlink traffic-shape padding. Off = no shaping, Light = reduced overhead, Full = maximum shaping (default). Older servers store this as a bool (true=full/false=off) — it is normalized to a level here and sent back as a level.', options: [
+      { value: 'off', label: 'Off' },
+      { value: 'light', label: 'Light' },
+      { value: 'full', label: 'Full (default)' },
+    ] },
   ];
 
   // Complex sub-objects editable as raw JSON. bootstrap_publish is a valid
   // server key (management_api.rs CONFIG_KNOWN_KEYS) with no dedicated form
   // section — without it here it was impossible to edit AND (before the
   // merge-based apply below) got silently destroyed on every Apply. Same
-  // reasoning applies to neural_enabled/neural/feedback/polymorphic/
-  // downlink_shaping (ServerFileConfig, server_config.rs) — valid keys with
-  // no form control, previously rejected by the advanced-JSON whitelist.
+  // reasoning applies to neural_enabled/neural/feedback/polymorphic — valid
+  // keys with no form control, previously rejected by the advanced-JSON
+  // whitelist. downlink_shaping now has its own dedicated select field above
+  // (FIELDS) and is deliberately NOT listed here: buildConfig() applies the
+  // FIELDS merge first and the advanced-JSON merge last, so if the same key
+  // were in both, a stale cached value in the advanced JSON textarea would
+  // silently clobber a change made through the dedicated select on Apply.
   const ADVANCED_KEYS = [
     'network_config', 'site_to_site', 'mtls', 'dns', 'bootstrap_publish',
-    'neural_enabled', 'neural', 'feedback', 'polymorphic', 'downlink_shaping',
+    'neural_enabled', 'neural', 'feedback', 'polymorphic',
   ];
 
   // Simple field values
@@ -69,6 +79,15 @@
       const cfg = $query.data as Record<string, unknown>;
       for (const f of FIELDS) {
         if (cfg[f.key] !== undefined) fv[f.key] = cfg[f.key] as string | number | boolean;
+      }
+      // downlink_shaping predates the level enum: a server that hasn't been
+      // upgraded yet still returns a bool (true=full/false=off) here. Fold it
+      // into the level string so the select above always has a level value,
+      // and so the next Apply sends the level form back (forward migration).
+      // If the field is absent entirely, leave fv unset — buildConfig() then
+      // omits it from the PUT, and the server's own default (Full) applies.
+      if (typeof fv['downlink_shaping'] === 'boolean') {
+        fv['downlink_shaping'] = fv['downlink_shaping'] ? 'full' : 'off';
       }
       const pool = cfg['pool'] as {
         peers?: string[]; sync_key?: string; exit_node?: string;
@@ -240,6 +259,15 @@
               class="rounded text-indigo-600 focus:ring-indigo-500" />
             <span class="text-sm text-gray-600 dark:text-gray-400">{fv[f.key] ? 'Enabled' : 'Disabled'}</span>
           </label>
+        {:else if f.type === 'select'}
+          <select id={f.key}
+            value={(fv[f.key] as string) ?? 'full'}
+            onchange={(e) => { fv[f.key] = (e.target as HTMLSelectElement).value; }}
+            class="w-44 px-3 py-1.5 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-white text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500">
+            {#each f.options ?? [] as opt (opt.value)}
+              <option value={opt.value}>{opt.label}</option>
+            {/each}
+          </select>
         {:else if f.type === 'number'}
           <input id={f.key} type="number"
             value={fv[f.key] as number ?? ''}
@@ -369,7 +397,7 @@
   <div class="bg-white dark:bg-gray-800 rounded-xl border border-gray-200 dark:border-gray-700 overflow-hidden">
     <button type="button" onclick={() => { showAdvanced = !showAdvanced; }}
       class="w-full flex items-center justify-between px-4 py-3 text-sm font-medium text-gray-600 dark:text-gray-400 hover:bg-gray-50 dark:hover:bg-gray-700/50 transition-colors">
-      <span>Advanced — raw JSON (<code class="font-mono text-xs">network_config</code>, <code class="font-mono text-xs">dns</code>, <code class="font-mono text-xs">site_to_site</code>, <code class="font-mono text-xs">mtls</code>, <code class="font-mono text-xs">bootstrap_publish</code>, <code class="font-mono text-xs">neural_enabled</code>, <code class="font-mono text-xs">neural</code>, <code class="font-mono text-xs">feedback</code>, <code class="font-mono text-xs">polymorphic</code>, <code class="font-mono text-xs">downlink_shaping</code>)</span>
+      <span>Advanced — raw JSON (<code class="font-mono text-xs">network_config</code>, <code class="font-mono text-xs">dns</code>, <code class="font-mono text-xs">site_to_site</code>, <code class="font-mono text-xs">mtls</code>, <code class="font-mono text-xs">bootstrap_publish</code>, <code class="font-mono text-xs">neural_enabled</code>, <code class="font-mono text-xs">neural</code>, <code class="font-mono text-xs">feedback</code>, <code class="font-mono text-xs">polymorphic</code>)</span>
       <span>{showAdvanced ? '▲' : '▼'}</span>
     </button>
     {#if showAdvanced}

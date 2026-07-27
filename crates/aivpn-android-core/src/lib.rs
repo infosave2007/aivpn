@@ -17,7 +17,8 @@ use android_tunnel::{
     take_recording_feedback_json, ACTIVE_ADAPTIVE_LEVEL, ACTIVE_FEEDBACK_INTERVAL,
     ACTIVE_FEEDBACK_THRESHOLD, ACTIVE_MASK_CATALOG_JSON, ACTIVE_QUALITY_SCORE,
     ACTIVE_REGIONAL_HINTS_JSON, ASSIGNED_VPN_IP, ATTEMPTED_MASK_FAMILY, CERT_REJECTED,
-    EVER_CONNECTED, MASK_CATALOG_SEQ, MASK_FEEDBACK_SENT, REGIONAL_HINTS_SEQ,
+    EVER_CONNECTED, HANDSHAKE_REJECTED, HANDSHAKE_REJECT_REASON, MASK_CATALOG_SEQ,
+    MASK_FEEDBACK_SENT, REGIONAL_HINTS_SEQ,
 };
 
 use std::sync::atomic::Ordering;
@@ -527,6 +528,28 @@ pub extern "system" fn Java_com_aivpn_client_AivpnJni_certRejected(
     _class: JClass,
 ) -> jni::sys::jboolean {
     CERT_REJECTED.swap(false, Ordering::Relaxed) as jni::sys::jboolean
+}
+
+/// Returns the `HandshakeReject` reason code (0=unspecified, 1=one-time key
+/// already used, 2=client expired, 3=client disabled) and atomically clears
+/// the pending flag, or `-1` if no `HandshakeReject` has been observed since
+/// the last call (mirrors the `-1` = "nothing yet" sentinel used by
+/// `getAdaptiveLevelHint`). Unlike `certRejected`, this is TERMINAL: the
+/// server only ever sends `HandshakeReject` to a peer that already proved
+/// PSK knowledge during the handshake, so retrying under the same credential
+/// can never succeed. The caller (`AivpnService.kt`) must stop its reconnect
+/// loop instead of backing off and retrying — see the `HANDSHAKE_REJECTED`
+/// doc comment in `android_tunnel.rs`.
+#[no_mangle]
+pub extern "system" fn Java_com_aivpn_client_AivpnJni_handshakeRejectReason(
+    _env: JNIEnv,
+    _class: JClass,
+) -> jint {
+    if HANDSHAKE_REJECTED.swap(false, Ordering::Relaxed) {
+        HANDSHAKE_REJECT_REASON.load(Ordering::Relaxed) as jint
+    } else {
+        -1
+    }
 }
 
 // ──────────────────────────────────────────────────────────

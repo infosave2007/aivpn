@@ -35,6 +35,7 @@ use serde::{Deserialize, Deserializer};
 use crate::bootstrap_publish::BootstrapPublishConfig;
 #[cfg(feature = "dns")]
 use crate::dns_proxy::DnsProxyConfig;
+use crate::gateway::ShapingLevel;
 use crate::mtls::MtlsConfig;
 use crate::neural::NeuralConfig;
 use crate::pool_sync::PoolSyncConfig;
@@ -158,11 +159,20 @@ pub struct ServerFileConfig {
     pub dns: Option<serde_json::Value>,
     #[serde(default)]
     pub allow_peer_routing: Option<bool>,
-    /// A7 downlink shaping parity. Absent = enabled (pad server→client DATA to
-    /// the session mask's own size distribution). Set `false` for the
-    /// throughput-first profile.
+    /// A7/1c downlink shaping level: covertness↔throughput tradeoff for
+    /// server→client DATA padding. Absent = `Full` (pad to the session
+    /// mask's own size distribution, the historical behavior). Accepts
+    /// either the legacy bool (`true`→`Full`, `false`→`Off`) or one of the
+    /// strings `"off"` | `"light"` | `"full"` — see [`crate::gateway::ShapingLevel`].
     #[serde(default)]
-    pub downlink_shaping: Option<bool>,
+    pub downlink_shaping: Option<ShapingLevel>,
+    /// 3a: optional numeric GID to chown the management-API Unix socket's
+    /// group to (mode becomes 0660 instead of the default 0600, owner
+    /// unchanged). Lets a non-root web-panel container in this group open
+    /// the socket without running the aivpn-server process itself as that
+    /// uid. `None` (default) keeps the existing owner-only 0600 socket.
+    #[serde(default)]
+    pub management_socket_group: Option<u32>,
     /// Neural Resonance master switch. Absent = enabled (the default). Set
     /// `false` to turn off compromise detection entirely: the gateway skips the
     /// periodic resonance loop, so neither the per-mask autoencoder (MSE) nor
@@ -221,6 +231,7 @@ pub const CONFIG_KNOWN_KEYS: &[&str] = &[
     "tun_mtu",
     "pool",
     "management_socket",
+    "management_socket_group",
     "site_to_site",
     "mtls",
     "dns",

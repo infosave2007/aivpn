@@ -31,6 +31,14 @@ pub struct TrafficStats {
     /// `ip:` field arrives, or if that field failed to parse as an IPv4
     /// address (e.g. a torn read of the non-atomic stats write).
     pub vpn_ip: Option<String>,
+    /// 3c: true when the client's `fallback:1` key in traffic.stats says
+    /// this session is running on the built-in default mask (bootstrap
+    /// resilience fallback after repeated dead handshakes) rather than a
+    /// normal bootstrap-derived one. Unlike Linux (which also gets the
+    /// "AIVPN-STATUS bootstrap-fallback" stdout line), this GUI's child
+    /// stdout is piped to `Stdio::null()` (see `connect()`), so the stats
+    /// file is the only channel — same reason `vpn_ip` above exists.
+    pub fallback: bool,
 }
 
 // ── Recording ───────────────────────────────────────────────────────────────
@@ -177,6 +185,13 @@ impl VpnManager {
                 bytes_received: 0,
                 quality_score: 0,
                 server_adaptive_level: 0,
+                // Pre-existing field (`vpn_ip`) was missing from this
+                // literal in the working tree before this change — a latent
+                // compile error this crate can't be built to catch on a
+                // non-Windows host. Filled in here alongside the new
+                // `fallback` field (3c) since both are being touched.
+                vpn_ip: None,
+                fallback: false,
             },
             last_poll: None,
             client_binary,
@@ -476,6 +491,7 @@ impl VpnManager {
                 self.stats.bytes_sent = 0;
                 self.stats.bytes_received = 0;
                 self.stats.vpn_ip = None;
+                self.stats.fallback = false;
                 self.session_since_ms = None;
                 // Request initial recording status
                 self.request_recording_status_refresh();
@@ -679,6 +695,7 @@ impl VpnManager {
         self.stats.bytes_sent = 0;
         self.stats.bytes_received = 0;
         self.stats.vpn_ip = None;
+        self.stats.fallback = false;
         self.session_since_ms = None;
         self.connected_since = None;
         self.last_error = None;
@@ -768,6 +785,7 @@ impl VpnManager {
                     self.stats.bytes_sent = 0;
                     self.stats.bytes_received = 0;
                     self.stats.vpn_ip = None;
+                    self.stats.fallback = false;
                     self.session_since_ms = None;
                     return;
                 }
@@ -796,6 +814,7 @@ impl VpnManager {
                     self.stats.bytes_sent = 0;
                     self.stats.bytes_received = 0;
                     self.stats.vpn_ip = None;
+                    self.stats.fallback = false;
                     self.session_since_ms = None;
                     return;
                 }
@@ -1048,7 +1067,14 @@ impl VpnManager {
 
         for path in &paths {
             if let Ok(content) = std::fs::read_to_string(path) {
-                if let Some((sent, recv, since, ip)) = Self::parse_stats(&content) {
+                if let Some((sent, recv, since, ip, fallback)) = Self::parse_stats(&content) {
+                    // 3c: direct overwrite, no monotonic/plausibility gate —
+                    // this is a live boolean flag (like `ip` above), not a
+                    // counter; a rare torn-read misfire self-corrects within
+                    // one more 500ms poll tick. Absent key (old client
+                    // binary, or a not-currently-falling-back session) reads
+                    // as `false`.
+                    self.stats.fallback = fallback;
                     // Plausibility gate (torn-read hardening, mirrors the
                     // `since` gate below): only accept an `ip` that parses as
                     // IPv4 — a partial/interleaved read of the non-atomic
@@ -1136,19 +1162,24 @@ impl VpnManager {
         (0, 0)
     }
 
-    fn parse_stats(content: &str) -> Option<(u64, u64, Option<u64>, Option<String>)> {
-        // Format: "sent:12345,received:67890[,since:<unix-ms>][,ip:<vpn-ip>]"
+    fn parse_stats(content: &str) -> Option<(u64, u64, Option<u64>, Option<String>, bool)> {
+        // Format: "sent:12345,received:67890[,since:<unix-ms>][,ip:<vpn-ip>][,fallback:0|1]"
         // — `since` is the session epoch, absent in pre-session zero-writes
         // and in files from old client binaries. `ip` is the client's
         // currently-effective VPN IP (HIGH #2, client parity): absent in the
         // same cases as `since`, and re-written on every tick so a pool
         // re-home to a different server-assigned IP shows up here even
-        // though the GUI's own child stdout is piped to Stdio::null().
+        // though the GUI's own child stdout is piped to Stdio::null(). `fallback`
+        // (3c) is 1 while this session is running on the built-in default
+        // mask (bootstrap resilience fallback); absent/anything-but-"1"
+        // reads as not-falling-back — same absent-key backward compat as
+        // `since`/`ip`.
         let content = content.trim();
         let mut sent = None;
         let mut recv = None;
         let mut since = None;
         let mut ip = None;
+        let mut fallback = false;
 
         for part in content.split(',') {
             let mut kv = part.splitn(2, ':');
@@ -1157,12 +1188,13 @@ impl VpnManager {
                 (Some("received"), Some(v)) => recv = v.trim().parse().ok(),
                 (Some("since"), Some(v)) => since = v.trim().parse().ok(),
                 (Some("ip"), Some(v)) => ip = Some(v.trim().to_string()),
+                (Some("fallback"), Some(v)) => fallback = v.trim() == "1",
                 _ => {}
             }
         }
 
         match (sent, recv) {
-            (Some(s), Some(r)) => Some((s, r, since, ip)),
+            (Some(s), Some(r)) => Some((s, r, since, ip, fallback)),
             _ => None,
         }
     }

@@ -166,6 +166,18 @@ object AivpnJni {
      */
     external fun certRejected(): Boolean
 
+    /**
+     * Returns the `HandshakeReject` reason code (0=unspecified, 1=one-time key
+     * already used, 2=client expired, 3=client disabled) and atomically clears
+     * the pending flag, or -1 if no `HandshakeReject` has been observed since
+     * the last call. Unlike [certRejected], this is a TERMINAL, authenticated
+     * refusal — the server only ever sends it to a peer that already proved
+     * PSK knowledge during the handshake — so the caller must STOP the
+     * reconnect loop instead of backing off and retrying under the same
+     * credential.
+     */
+    external fun handshakeRejectReason(): Int
+
     // ──────────── §2 crowdsourced blocking feedback getters ────────────
     //
     // `runTunnel` handles exactly one connection attempt per call, so this

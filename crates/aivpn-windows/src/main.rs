@@ -1151,6 +1151,17 @@ impl eframe::App for AivpnApp {
                                     );
                                 }
                             }
+                            // 3c: bootstrap-fallback indicator — live value
+                            // from traffic.stats `fallback:` key (this GUI's
+                            // child stdout is Stdio::null(), so the stats
+                            // file is the only channel; see TrafficStats::fallback).
+                            if (is_connected || is_busy) && self.vpn.stats().fallback {
+                                ui.label(
+                                    egui::RichText::new(t(lang, "bootstrap_fallback_label"))
+                                        .size(11.0)
+                                        .color(egui::Color32::from_rgb(0xFF, 0xA7, 0x26)),
+                                );
+                            }
                             // Warn when disconnected and no key is available/selected
                             if !is_connected && !is_busy {
                                 let warn_color = egui::Color32::from_rgb(0xFF, 0xA7, 0x26);

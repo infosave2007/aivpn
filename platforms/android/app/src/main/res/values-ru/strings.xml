@@ -9,6 +9,10 @@
     <string name="status_error">Ошибка: %s</string>
     <string name="status_native_lib_unavailable">Ошибка: нативная библиотека недоступна — переустановите приложение</string>
     <string name="status_cert_rejected">Сервер отклонил сертификат — требуется повторное предоставление</string>
+    <string name="status_handshake_reject_one_time_used">Этот одноразовый ключ уже был использован</string>
+    <string name="status_handshake_reject_expired">Срок действия ключа клиента истёк</string>
+    <string name="status_handshake_reject_disabled">Этот клиент отключён сервером</string>
+    <string name="status_handshake_reject_unspecified">Сервер отклонил подключение</string>
     <string name="btn_connect">Подключить</string>
     <string name="btn_disconnect">Отключить</string>
     <string name="hint_server">Адрес сервера</string>

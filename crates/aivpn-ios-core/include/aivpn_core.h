@@ -231,6 +231,20 @@ int aivpn_ever_connected(void);
 /// silence.
 int aivpn_cert_was_rejected(void);
 
+/// Whether the server sent HandshakeReject (an AEAD-authenticated,
+/// handshake-time refusal sent only to a peer that already proved knowledge
+/// of the PSK) during the most recently completed aivpn_run_tunnel call.
+/// 0 = not rejected. Unlike a timeout or transient disconnect this is a
+/// TERMINAL refusal — the platform must stop its reconnect loop instead of
+/// retrying. Poll alongside get_traffic and, when 1, show the user the
+/// reason from aivpn_get_handshake_reject_reason() and stop reconnecting.
+int aivpn_handshake_was_rejected(void);
+
+/// Reason code for the most recent HandshakeReject (only meaningful when
+/// aivpn_handshake_was_rejected() returns non-zero). 0 = unspecified,
+/// 1 = one-time key already used, 2 = client expired, 3 = client disabled.
+int aivpn_get_handshake_reject_reason(void);
+
 /// §2 crowdsourced blocking feedback — whether a MaskFeedback control message
 /// was actually sent during the most recently completed aivpn_run_tunnel call
 /// (a share send or a hints-only probe). Use to decide whether to clear the
