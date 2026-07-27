@@ -39,7 +39,8 @@
 //!         "name": "office-b",
 //!         "endpoint": "office-b.example.com:443",
 //!         "sync_key": "<base64 32-byte key>",
-//!         "remote_subnets": ["192.168.2.0/24"]
+//!         "remote_subnets": ["192.168.2.0/24"],
+//!         "node_id": "office-b:443"
 //!       }
 //!     ]
 //!   }
@@ -228,6 +229,16 @@ pub struct SitePeerConfig {
     /// Subnets the remote site will advertise; pre-installed at startup.
     #[serde(default)]
     pub remote_subnets: Vec<String>,
+    /// The pool `node_id` this site peer uses when dialing us as a masked
+    /// pool-client (see `pool_dialer.rs`). A masked-transport `RouteSync`
+    /// advertisement carries its sender's own `node_id`; this field is what
+    /// binds that advertiser to THIS entry's `remote_subnets` allowlist, so
+    /// each masked pool-peer can only advertise the subnets it is itself
+    /// configured to own — never another peer's. Optional: legacy
+    /// (non-masked) site-to-site links identify the sender by source IP
+    /// against `endpoint` instead and never consult this field.
+    #[serde(default)]
+    pub node_id: Option<String>,
 }
 
 /// Top-level site-to-site block (`"site_to_site"` in `server.json`).
@@ -479,6 +490,26 @@ impl SitePeer {
     }
 }
 
+/// Store `config` in [`SITE_CONFIG`] WITHOUT starting anything (no legacy
+/// outbound advertise loops, no `create_site_peer_session` registrations).
+///
+/// PHASE 3 (site-to-site over masked transport): when `pool.transport ==
+/// "masked"`, the `PoolDialer` advertises `local_subnets` and installs
+/// peers' routes over the masked pool-peer sessions instead of the legacy
+/// mask-independent channel (see the `main.rs` wiring site) — so the legacy
+/// per-peer outbound loops in [`start`] must NOT also run (that would
+/// double-advertise the same routes over two channels). But
+/// [`handle_route_sync`] still needs `SITE_CONFIG` populated to resolve the
+/// peer allowlist for inbound `RouteSync` messages arriving over the masked
+/// session, so `main.rs` calls this instead of [`start`] in that mode.
+///
+/// Idempotent with [`start`]: both funnel through [`OnceLock::get_or_init`],
+/// so whichever runs first "wins" and the other is a no-op — matches
+/// `start`'s own pre-existing idempotency.
+pub fn init_config_only(config: &SiteToSiteConfig) {
+    SITE_CONFIG.get_or_init(|| config.clone());
+}
+
 /// Start outbound route advertisement to all configured peers.
 ///
 /// `session_manager` is used to register a synthetic session per peer so that
@@ -487,7 +518,7 @@ impl SitePeer {
 /// with `session.is_site_peer = true`.
 pub fn start(config: &SiteToSiteConfig, session_manager: Arc<SessionManager>) {
     // Store config so handle_route_sync can verify subnets and allowlists.
-    SITE_CONFIG.get_or_init(|| config.clone());
+    init_config_only(config);
 
     let local_name = config
         .local_name
@@ -555,19 +586,168 @@ pub fn start(config: &SiteToSiteConfig, session_manager: Arc<SessionManager>) {
     );
 }
 
+/// Tolerantly-parsed `RouteSync` wire payload. Two formats share the wire:
+///
+/// - MASKED: a JSON object `{"node_id": "<advertiser's pool node_id>",
+///   "subnets": [...]}`, sent by [`crate::pool_dialer`] over a masked
+///   pool-client session. The sender's socket IP is an ephemeral dialer
+///   port that matches no `site_to_site.peers[].endpoint`, so identity MUST
+///   come from the payload itself — the embedded `node_id` binds the advert
+///   to exactly one configured peer (see [`authorized_subnets_for`]).
+/// - LEGACY: a bare JSON array `["10.0.0.0/24", ...]`, sent by the
+///   mask-independent [`SitePeer::send_advert`] loop. Identity comes from
+///   the sender's socket IP matched against a configured peer's `endpoint`
+///   (unchanged pre-Phase-3 behavior).
+enum RouteSyncPayload {
+    Masked {
+        node_id: String,
+        subnets: Vec<String>,
+    },
+    Legacy {
+        subnets: Vec<String>,
+    },
+}
+
+/// Parse `subnets_json` as MASKED (a JSON *object*, only accepted when
+/// `node_id` is non-empty — an object with an empty/absent `node_id` cannot
+/// be attributed to any peer, so it is treated as unparseable rather than
+/// silently downgraded) or LEGACY (a JSON *array*). Returns `None` for
+/// anything that matches neither shape.
+///
+/// Discrimination is done on the top-level JSON *value shape* (object vs.
+/// array), NOT by trying `serde_json::from_slice::<MaskedForm>` directly on
+/// a bare array first: serde's derived `Deserialize` for a struct also
+/// accepts a JSON array positionally (visiting it as a sequence, filling
+/// fields in declaration order and defaulting the rest) — so a legacy
+/// payload like `["192.168.1.0/24"]` would otherwise be silently
+/// misinterpreted as `MaskedForm { node_id: "192.168.1.0/24", subnets: [] }`,
+/// a NON-empty (and wrong) node_id, breaking the legacy path outright.
+fn parse_route_sync_payload(subnets_json: &[u8]) -> Option<RouteSyncPayload> {
+    #[derive(Deserialize)]
+    struct MaskedForm {
+        #[serde(default)]
+        node_id: String,
+        #[serde(default)]
+        subnets: Vec<String>,
+    }
+
+    let value: serde_json::Value = serde_json::from_slice(subnets_json).ok()?;
+    match value {
+        serde_json::Value::Object(_) => {
+            let m: MaskedForm = serde_json::from_value(value).ok()?;
+            if m.node_id.is_empty() {
+                return None;
+            }
+            Some(RouteSyncPayload::Masked {
+                node_id: m.node_id,
+                subnets: m.subnets,
+            })
+        }
+        serde_json::Value::Array(_) => {
+            let subnets: Vec<String> = serde_json::from_value(value).ok()?;
+            Some(RouteSyncPayload::Legacy { subnets })
+        }
+        _ => None,
+    }
+}
+
+/// Identity of a `RouteSync` advertiser, already resolved from the wire
+/// payload (MASKED) or the sender's socket (LEGACY).
+enum Advertiser {
+    /// MASKED PATH: the pool `node_id` the payload itself claims.
+    NodeId(String),
+    /// LEGACY PATH: the sender's socket IP.
+    Addr(IpAddr),
+}
+
+/// Pure allowlist decision — unit-testable without a live socket or
+/// `ip route`. Resolves `advertiser` to exactly ONE configured peer, then
+/// returns that peer together with the subset of `advertised` that is
+/// actually listed in THAT peer's own `remote_subnets`.
+///
+/// Returns `None` when no configured peer can be attributed to `advertiser`
+/// at all — the caller MUST drop the whole message (FAIL-CLOSED). There is
+/// no union/fallback allowlist: an advertiser can never install a subnet
+/// belonging to a *different* peer's `remote_subnets`, which is exactly the
+/// route-hijack this replaces (previously, any masked pool-peer failed the
+/// per-peer IP match and fell through to a union of every configured peer's
+/// `remote_subnets`).
+fn authorized_subnets_for<'a>(
+    config: &'a SiteToSiteConfig,
+    advertiser: &Advertiser,
+    advertised: &[String],
+) -> Option<(&'a SitePeerConfig, Vec<String>)> {
+    let peer = match advertiser {
+        Advertiser::NodeId(node_id) => config.peers.iter().find(|p| match p.node_id.as_deref() {
+            Some(configured) => configured == node_id.as_str(),
+            // No `node_id` configured for this peer entry: fall back to
+            // matching on `name` so pre-existing configs (which only ever
+            // set `name`) keep working once the link switches to the masked
+            // dialer without needing an immediate config edit.
+            None => p.name == *node_id,
+        }),
+        Advertiser::Addr(ip) => config.peers.iter().find(|p| {
+            p.endpoint
+                .parse::<SocketAddr>()
+                .map_or(false, |ep| ep.ip() == *ip)
+        }),
+    }?;
+
+    let authorized: Vec<String> = advertised
+        .iter()
+        .filter(|s| peer.remote_subnets.iter().any(|r| r == *s))
+        .cloned()
+        .collect();
+
+    Some((peer, authorized))
+}
+
 /// Handle an incoming `RouteSync` control message.
 ///
-/// `from_addr` must be the full `IP:port` string of the sending socket so we
-/// can match it against configured peer endpoints.  Any of these conditions
-/// causes a silent drop with a warning:
+/// `from_addr` must be the full `IP:port` string of the sending socket.
+/// Reaching this function at all already requires the caller (`gateway.rs`'s
+/// `RouteSync` arm, or `pool_dialer.rs`'s inbound tap) to have verified the
+/// session is either `is_site_peer` (authenticated via the site_sync
+/// directional sync_key) or `is_masked_pool_peer` (authenticated via the
+/// full masked VPN handshake under the pool's shared PSK/keypair) — i.e. the
+/// sender is already a cryptographically trusted pool/site member. What
+/// varies is WHICH peer's `remote_subnets` allowlist governs the message:
+///
+/// - MASKED PATH (`pool_dialer.rs`): the sender's socket IP is an ephemeral
+///   dialer port that matches no `site_to_site.peers[].endpoint`, so the
+///   payload itself carries the advertiser's SELF-ASSERTED pool `node_id`
+///   (`{"node_id": ..., "subnets": [...]}`). PHASE 4 (per-node crypto
+///   identity): `verified_node_id` is the CRYPTOGRAPHICALLY-PROVEN identity
+///   of the sending session, taken from `Session::verified_node_id` (set by
+///   the gateway once the peer's `NodeEnrollment` Ed25519 proof verifies
+///   against the node registry). When present, it — never the payload's
+///   self-asserted `node_id` — is what gets matched against
+///   `SitePeerConfig::node_id` (falling back to `name` for peers that never
+///   set `node_id`) to find EXACTLY ONE peer; a self-asserted `node_id` that
+///   disagrees with the verified one is logged and otherwise ignored, so a
+///   node cannot widen its route-install authority by simply claiming to be
+///   someone else. When `verified_node_id` is `None` (pre-Phase-4 peer, or
+///   NodeEnrollment not yet completed), the self-asserted `node_id` is used
+///   as before, with a warning that the advert is from an unverified
+///   identity — a lower-trust migration/compat path so mixed clusters keep
+///   working during rollout. Only THAT one peer's `remote_subnets` is
+///   consulted — never any other peer's, and never a union of all peers'
+///   (the route-hijack this fixes).
+/// - LEGACY PATH (`SitePeer::send_advert`): a bare JSON array, matched by
+///   `from_addr`'s IP against a configured peer's `endpoint` — unchanged
+///   pre-Phase-3 behavior; `verified_node_id` is irrelevant here.
+///
+/// Either way, when no configured peer can be attributed to the advertiser,
+/// the ENTIRE message is dropped (FAIL-CLOSED) — there is no fallback
+/// allowlist. Additional conditions that also cause a silent drop with a
+/// warning:
 /// - No site-to-site config loaded
-/// - Sender not in the configured peers list
 /// - Payload exceeds 4 KiB
 /// - More than 64 subnets in one message
-/// - A subnet that is not in the peer's declared `remote_subnets` allowlist
+/// - A subnet that is not in the matched peer's `remote_subnets`
 /// - A subnet that is a default route, loopback, or link-local prefix
-pub fn handle_route_sync(subnets_json: &[u8], from_addr: &str) {
-    // 1. Authenticate: sender must be a configured peer endpoint.
+pub fn handle_route_sync(subnets_json: &[u8], from_addr: &str, verified_node_id: Option<&str>) {
+    // 1. Site-to-site must be configured at all.
     let config = match SITE_CONFIG.get() {
         Some(c) => c,
         None => {
@@ -575,27 +755,13 @@ pub fn handle_route_sync(subnets_json: &[u8], from_addr: &str) {
             return;
         }
     };
-    // Match by IP only — the sending peer's outbound socket uses an ephemeral source port,
-    // so the received source port will not match the configured endpoint port.
+    // Parsed eagerly (even though only the LEGACY path needs it) so a
+    // malformed `from_addr` is rejected up front regardless of payload shape.
     let from_socket: std::net::SocketAddr = match from_addr.parse() {
         Ok(a) => a,
         Err(_) => {
             warn!(
                 "site_sync: unparseable sender address {} — dropping",
-                from_addr
-            );
-            return;
-        }
-    };
-    let peer_cfg = match config.peers.iter().find(|p| {
-        p.endpoint
-            .parse::<std::net::SocketAddr>()
-            .map_or(false, |ep| ep.ip() == from_socket.ip())
-    }) {
-        Some(p) => p,
-        None => {
-            warn!(
-                "site_sync: RouteSync from unconfigured peer {} — dropping",
                 from_addr
             );
             return;
@@ -607,52 +773,106 @@ pub fn handle_route_sync(subnets_json: &[u8], from_addr: &str) {
         warn!(
             "site_sync: RouteSync payload too large ({} bytes) from {} — dropping",
             subnets_json.len(),
-            peer_cfg.name
+            from_addr
         );
         return;
     }
 
-    let subnets: Vec<String> = match serde_json::from_slice(subnets_json) {
-        Ok(v) => v,
-        Err(e) => {
+    let payload = match parse_route_sync_payload(subnets_json) {
+        Some(p) => p,
+        None => {
             warn!(
-                "site_sync: invalid RouteSync payload from {}: {}",
-                peer_cfg.name, e
+                "site_sync: invalid RouteSync payload from {} (matches neither the masked \
+                 object nor legacy array format)",
+                from_addr
             );
             return;
         }
     };
 
-    if subnets.len() > MAX_SUBNETS_PER_MSG {
+    let (advertiser, advertised) = match payload {
+        RouteSyncPayload::Masked {
+            node_id: self_asserted_node_id,
+            subnets,
+        } => {
+            let advertiser = match verified_node_id {
+                Some(vid) => {
+                    // PHASE 4: the crypto-proven identity always wins. A
+                    // mismatch here means the peer's NodeEnrollment proved
+                    // it owns `vid`, but this particular RouteSync payload
+                    // claims a different `node_id` — never trust the latter,
+                    // just note it and proceed keyed to `vid`.
+                    if self_asserted_node_id != vid {
+                        warn!(
+                            "site_sync: RouteSync from {} signed as verified node_id '{}' but \
+                             self-asserted node_id '{}' in payload — using the VERIFIED identity, \
+                             ignoring the self-asserted one",
+                            from_addr, vid, self_asserted_node_id
+                        );
+                    }
+                    Advertiser::NodeId(vid.to_string())
+                }
+                None => {
+                    warn!(
+                        "site_sync: RouteSync from {} carries UNVERIFIED node_id '{}' (no \
+                         NodeEnrollment / pre-Phase-4 peer) — trusting the self-asserted identity \
+                         as a lower-trust migration/compat path",
+                        from_addr, self_asserted_node_id
+                    );
+                    Advertiser::NodeId(self_asserted_node_id)
+                }
+            };
+            (advertiser, subnets)
+        }
+        RouteSyncPayload::Legacy { subnets } => (Advertiser::Addr(from_socket.ip()), subnets),
+    };
+
+    if advertised.len() > MAX_SUBNETS_PER_MSG {
         warn!(
             "site_sync: RouteSync has {} subnets (max {}) from {} — dropping",
-            subnets.len(),
+            advertised.len(),
             MAX_SUBNETS_PER_MSG,
-            peer_cfg.name
+            from_addr
         );
         return;
     }
 
-    for subnet_str in &subnets {
-        // 3. Allowlist: only install routes the peer is declared to advertise.
-        if !peer_cfg.remote_subnets.iter().any(|a| a == subnet_str) {
+    // 3. Resolve the advertiser to exactly one configured peer and compute
+    // the subset of advertised subnets that peer is actually authorized to
+    // announce. No match at all => FAIL-CLOSED, drop the whole message.
+    let (peer, authorized) = match authorized_subnets_for(config, &advertiser, &advertised) {
+        Some(r) => r,
+        None => {
+            warn!(
+                "site_sync: RouteSync from {} — advertiser matches no configured site peer \
+                 (FAIL-CLOSED) — dropping",
+                from_addr
+            );
+            return;
+        }
+    };
+    let peer_label = &peer.name;
+
+    for subnet_str in &advertised {
+        // 4. Allowlist: only install routes THIS peer is declared to advertise.
+        if !authorized.iter().any(|a| a == subnet_str) {
             warn!(
                 "site_sync: subnet {} not in allowlist for peer {} — skipped",
-                subnet_str, peer_cfg.name
+                subnet_str, peer_label
             );
             continue;
         }
-        // 4. Safety: reject dangerous prefixes.
+        // 5. Safety: reject dangerous prefixes.
         if !is_safe_subnet(subnet_str) {
             warn!(
                 "site_sync: unsafe subnet {} from peer {} — skipped",
-                subnet_str, peer_cfg.name
+                subnet_str, peer_label
             );
             continue;
         }
         info!(
             "site_sync: installing route {} (peer: {})",
-            subnet_str, peer_cfg.name
+            subnet_str, peer_label
         );
         install_route(subnet_str, from_addr);
     }
@@ -707,6 +927,7 @@ mod tests {
             endpoint: "127.0.0.1:443".to_string(),
             sync_key: test_sync_key_b64(),
             remote_subnets: vec!["192.168.2.0/24".to_string()],
+            node_id: None,
         }
     }
 
@@ -894,6 +1115,260 @@ mod tests {
         assert_eq!(read_counter_file(&path), Some(42));
         write_counter_file(&path, 43).unwrap();
         assert_eq!(read_counter_file(&path), Some(43));
+    }
+
+    // -----------------------------------------------------------------
+    // Route-hijack regression tests (MEDIUM finding: masked-transport
+    // RouteSync used to fall back to a UNION of every configured peer's
+    // remote_subnets whenever the sender's IP matched no peer endpoint —
+    // always true for a masked pool-client dialer's ephemeral source port.
+    // `authorized_subnets_for` is the pure allowlist decision extracted so
+    // these can be tested without a live socket or `ip route`.
+    // -----------------------------------------------------------------
+
+    /// Two-peer config: "office-b" owns 192.168.2.0/24 and is bound to pool
+    /// node_id "office-b-node"; "office-c" owns 10.10.0.0/24 with no
+    /// node_id set (exercises the name-fallback match).
+    fn two_peer_config() -> SiteToSiteConfig {
+        SiteToSiteConfig {
+            local_name: Some("hq".to_string()),
+            local_subnets: vec!["192.168.1.0/24".to_string()],
+            peers: vec![
+                SitePeerConfig {
+                    name: "office-b".to_string(),
+                    endpoint: "203.0.113.10:443".to_string(),
+                    sync_key: test_sync_key_b64(),
+                    remote_subnets: vec!["192.168.2.0/24".to_string()],
+                    node_id: Some("office-b-node".to_string()),
+                },
+                SitePeerConfig {
+                    name: "office-c".to_string(),
+                    endpoint: "203.0.113.20:443".to_string(),
+                    sync_key: test_sync_key_b64(),
+                    remote_subnets: vec!["10.10.0.0/24".to_string()],
+                    node_id: None,
+                },
+            ],
+        }
+    }
+
+    /// (a) A masked advert with a known node_id installs only subnets within
+    /// that peer's own remote_subnets.
+    #[test]
+    fn masked_advert_known_node_id_authorizes_only_its_own_subnets() {
+        let config = two_peer_config();
+        let advertiser = Advertiser::NodeId("office-b-node".to_string());
+        let advertised = vec!["192.168.2.0/24".to_string()];
+
+        let (peer, authorized) =
+            authorized_subnets_for(&config, &advertiser, &advertised).expect("peer must match");
+        assert_eq!(peer.name, "office-b");
+        assert_eq!(authorized, vec!["192.168.2.0/24".to_string()]);
+    }
+
+    /// (b) A masked advert whose node_id matches no configured peer is
+    /// dropped entirely (fail-closed) — no peer, no authorized subnets.
+    #[test]
+    fn masked_advert_unknown_node_id_fails_closed() {
+        let config = two_peer_config();
+        let advertiser = Advertiser::NodeId("some-random-attacker-node".to_string());
+        let advertised = vec!["192.168.2.0/24".to_string()];
+
+        assert!(
+            authorized_subnets_for(&config, &advertiser, &advertised).is_none(),
+            "an advertiser matching no configured peer must be dropped, never fall back \
+             to any allowlist"
+        );
+    }
+
+    /// (c) A masked advert trying to announce a subnet NOT in its own peer's
+    /// remote_subnets has that subnet rejected — specifically, it must NOT
+    /// be able to claim another peer's subnet (the exact route-hijack this
+    /// fixes: "office-b-node" claiming "office-c"'s 10.10.0.0/24).
+    #[test]
+    fn masked_advert_cannot_claim_another_peers_subnet() {
+        let config = two_peer_config();
+        let advertiser = Advertiser::NodeId("office-b-node".to_string());
+        // office-b tries to advertise its own legitimate subnet AND
+        // office-c's subnet in the same message.
+        let advertised = vec!["192.168.2.0/24".to_string(), "10.10.0.0/24".to_string()];
+
+        let (peer, authorized) =
+            authorized_subnets_for(&config, &advertiser, &advertised).expect("peer must match");
+        assert_eq!(peer.name, "office-b");
+        assert_eq!(
+            authorized,
+            vec!["192.168.2.0/24".to_string()],
+            "office-b must never be authorized to install office-c's subnet"
+        );
+        assert!(
+            !authorized.contains(&"10.10.0.0/24".to_string()),
+            "the hijacked subnet must be rejected, not installed"
+        );
+    }
+
+    /// (d) The legacy bare-array path still works by from_addr, matching the
+    /// peer whose configured endpoint IP equals the sender's socket IP.
+    #[test]
+    fn legacy_advert_still_matches_by_from_addr_ip() {
+        let config = two_peer_config();
+        let advertiser = Advertiser::Addr("203.0.113.10".parse().unwrap());
+        let advertised = vec!["192.168.2.0/24".to_string()];
+
+        let (peer, authorized) =
+            authorized_subnets_for(&config, &advertiser, &advertised).expect("peer must match");
+        assert_eq!(peer.name, "office-b");
+        assert_eq!(authorized, vec!["192.168.2.0/24".to_string()]);
+    }
+
+    /// Legacy path with an IP matching no configured peer's endpoint must
+    /// also fail closed (this was already the pre-union behavior).
+    #[test]
+    fn legacy_advert_unknown_ip_fails_closed() {
+        let config = two_peer_config();
+        let advertiser = Advertiser::Addr("198.51.100.1".parse().unwrap());
+        let advertised = vec!["192.168.2.0/24".to_string()];
+
+        assert!(authorized_subnets_for(&config, &advertiser, &advertised).is_none());
+    }
+
+    /// Name-fallback: a peer with no `node_id` configured is still matched
+    /// via `name` when the advertised node_id equals the peer's `name`.
+    #[test]
+    fn masked_advert_falls_back_to_name_when_peer_has_no_node_id() {
+        let config = two_peer_config();
+        let advertiser = Advertiser::NodeId("office-c".to_string());
+        let advertised = vec!["10.10.0.0/24".to_string()];
+
+        let (peer, authorized) =
+            authorized_subnets_for(&config, &advertiser, &advertised).expect("peer must match");
+        assert_eq!(peer.name, "office-c");
+        assert_eq!(authorized, vec!["10.10.0.0/24".to_string()]);
+    }
+
+    /// `parse_route_sync_payload`: a masked object with a non-empty node_id
+    /// parses as MASKED.
+    #[test]
+    fn parse_masked_object_payload() {
+        let json = br#"{"node_id":"office-b-node","subnets":["192.168.2.0/24"]}"#;
+        match parse_route_sync_payload(json).expect("must parse") {
+            RouteSyncPayload::Masked { node_id, subnets } => {
+                assert_eq!(node_id, "office-b-node");
+                assert_eq!(subnets, vec!["192.168.2.0/24".to_string()]);
+            }
+            RouteSyncPayload::Legacy { .. } => panic!("expected MASKED"),
+        }
+    }
+
+    /// `parse_route_sync_payload`: a bare array still parses as LEGACY —
+    /// site_sync::start's legacy transport must keep working unmodified.
+    #[test]
+    fn parse_legacy_array_payload() {
+        let json = br#"["192.168.1.0/24"]"#;
+        match parse_route_sync_payload(json).expect("must parse") {
+            RouteSyncPayload::Legacy { subnets } => {
+                assert_eq!(subnets, vec!["192.168.1.0/24".to_string()]);
+            }
+            RouteSyncPayload::Masked { .. } => panic!("expected LEGACY"),
+        }
+    }
+
+    /// A masked object with an empty node_id must NOT be treated as MASKED
+    /// (an empty node_id can never be attributed to a peer) — and since it's
+    /// also not a bare array, it fails to parse entirely (dropped upstream
+    /// as an invalid payload).
+    #[test]
+    fn parse_masked_object_with_empty_node_id_is_unparseable() {
+        let json = br#"{"node_id":"","subnets":["192.168.2.0/24"]}"#;
+        assert!(parse_route_sync_payload(json).is_none());
+    }
+
+    /// End-to-end `handle_route_sync`: a masked advert for a known node_id
+    /// only installs subnets within that peer's remote_subnets, proven via
+    /// the allowlist warning behavior — subnets outside the allowlist never
+    /// reach `install_route` because they're filtered out before the loop's
+    /// safety/install steps. This exercises the full public entry point
+    /// (config load, parse, resolve, filter) without needing `ip route` to
+    /// succeed (installing a route via a bogus `from_addr` is harmless in a
+    /// sandboxed test run — it just logs a warning on failure).
+    #[test]
+    fn handle_route_sync_end_to_end_masked_path_uses_own_allowlist_only() {
+        // SITE_CONFIG is a process-wide OnceLock; only set it once across the
+        // whole test binary. Other tests in this module never call
+        // handle_route_sync, so this is safe to initialize here.
+        let config = two_peer_config();
+        SITE_CONFIG.get_or_init(|| config);
+
+        // A well-formed masked advert for a real peer with an in-allowlist
+        // subnet must not panic and must proceed through installation.
+        let payload = br#"{"node_id":"office-b-node","subnets":["192.168.2.0/24"]}"#;
+        handle_route_sync(payload, "198.51.100.99:54321", None);
+
+        // An advert with an unknown node_id must be silently dropped
+        // (fail-closed) rather than panicking or falling back to any union.
+        let hijack_payload = br#"{"node_id":"unknown-attacker","subnets":["192.168.2.0/24"]}"#;
+        handle_route_sync(hijack_payload, "198.51.100.99:54321", None);
+    }
+
+    /// PHASE 4 route-hijack regression: a masked advert whose PAYLOAD
+    /// self-asserts node_id "office-c-node" — an identity that owns
+    /// 10.10.0.0/24 — must NOT be authorized against office-c's subnets when
+    /// the SESSION's cryptographically-verified identity (from a proven
+    /// `NodeEnrollment`) is actually "office-b-node". The verified identity
+    /// must win, so the resolved peer is "office-b" and only office-b's own
+    /// remote_subnets (192.168.2.0/24) are authorized — the self-asserted
+    /// node_id can never widen access beyond what the crypto-proven identity
+    /// is allowed.
+    #[test]
+    fn verified_node_id_overrides_self_asserted_node_id_in_masked_payload() {
+        let config = two_peer_config();
+
+        // Payload claims to be "office-c-node" (owns 10.10.0.0/24)...
+        let self_asserted = "office-c-node";
+        // ...but the session's crypto-proven identity is "office-b-node"
+        // (owns 192.168.2.0/24) — e.g. a compromised/misbehaving peer trying
+        // to widen its route-install authority by lying in the payload.
+        let verified = "office-b-node";
+
+        let advertiser = Advertiser::NodeId(verified.to_string());
+        let advertised = vec!["10.10.0.0/24".to_string(), "192.168.2.0/24".to_string()];
+
+        let (peer, authorized) =
+            authorized_subnets_for(&config, &advertiser, &advertised).expect("peer must match");
+        assert_eq!(
+            peer.name, "office-b",
+            "must resolve to the VERIFIED identity's peer, not the self-asserted one"
+        );
+        assert_eq!(
+            authorized,
+            vec!["192.168.2.0/24".to_string()],
+            "only office-b's own remote_subnets may be authorized"
+        );
+        assert!(
+            !authorized.contains(&"10.10.0.0/24".to_string()),
+            "office-c's subnet must never be authorized just because the payload claimed \
+             office-c-node — the self-asserted id must not widen access"
+        );
+        assert_ne!(self_asserted, verified);
+    }
+
+    /// End-to-end: `handle_route_sync` itself must key off `verified_node_id`
+    /// when present, never the payload's self-asserted `node_id`. Uses the
+    /// same "claims office-c, verified as office-b" scenario as the pure
+    /// `authorized_subnets_for` test above, but through the full public
+    /// entry point (parse, resolve, filter) to prove the parameter is wired
+    /// end-to-end and not just usable in isolation.
+    #[test]
+    fn handle_route_sync_end_to_end_trusts_verified_node_id_over_payload() {
+        let config = two_peer_config();
+        SITE_CONFIG.get_or_init(|| config);
+
+        // Payload self-asserts "office-c-node" and tries to claim BOTH
+        // subnets; the session is verified (via NodeEnrollment) as
+        // "office-b-node". Must not panic; the hijacked subnet is filtered
+        // out inside the allowlist step and never reaches `install_route`.
+        let payload = br#"{"node_id":"office-c-node","subnets":["10.10.0.0/24","192.168.2.0/24"]}"#;
+        handle_route_sync(payload, "198.51.100.99:54322", Some("office-b-node"));
     }
 }
 

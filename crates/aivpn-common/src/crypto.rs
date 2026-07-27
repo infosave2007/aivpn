@@ -61,6 +61,22 @@ const PEER_DIR_S2C_CONTEXT: &str = "aivpn-peer-dir-s2c-v1";
 /// DH-shaped input.
 const DEVICE_ENROLLMENT_PROOF_CONTEXT: &str = "aivpn-device-enrollment-v2";
 
+/// Domain-separation context for the PSK an aivpn server derives from
+/// `sync_key` when it dials a pool PEER as a masked pool-client (see
+/// [`pool_client_psk`]).
+const HKDF_POOL_CLIENT_PSK_CONTEXT: &str = "aivpn-pool-client-psk-v1";
+/// Domain-separation context for the pool-wide shared X25519 server static
+/// keypair derived from `sync_key` (see [`pool_server_keypair`]).
+const HKDF_POOL_SERVER_STATIC_CONTEXT: &str = "aivpn-pool-server-static-v1";
+
+/// Domain-separation context for the canonical `NodeEnrollment` signing
+/// message (see [`node_enrollment_signing_bytes`]). Distinct from every other
+/// context in this file, so a node-enrollment signature can never be replayed
+/// as, or confused with, a signature produced for any other purpose (mask
+/// signing, bootstrap descriptors, ServerHello, ...) even if those also use
+/// Ed25519 over attacker-influenced bytes.
+const NODE_ENROLLMENT_CONTEXT: &str = "aivpn-node-enrollment-v1";
+
 /// Session keys derived from key exchange
 #[derive(Clone, Zeroize, ZeroizeOnDrop)]
 pub struct SessionKeys {
@@ -287,6 +303,154 @@ pub fn derive_directional_peer_keys(
     } else {
         (s2c, c2s)
     })
+}
+
+/// Derive the PSK an aivpn server uses when it dials a pool PEER as a masked
+/// pool-client.
+///
+/// Domain-separated from `sync_key` itself (via BLAKE3 `derive_key` under a
+/// dedicated context) and from the directional peer-link keys produced by
+/// [`derive_directional_peer_keys`], so this PSK can never be confused with,
+/// or substituted for, either of those even though all three are derived from
+/// the same 32-byte pool secret.
+pub fn pool_client_psk(sync_key: &[u8; 32]) -> [u8; 32] {
+    blake3::derive_key(HKDF_POOL_CLIENT_PSK_CONTEXT, sync_key)
+}
+
+/// Derive the single pool-wide X25519 server identity every pool node
+/// shares (all hold the same `sync_key`).
+///
+/// A dialing node uses `.public_key_bytes()` of the returned keypair as the
+/// peer's `server_public_key` for the masked handshake; the receiving server
+/// uses this same keypair to unmask the client ephemeral public key and
+/// compute the DH shared secret for the pool-client handshake candidate.
+///
+/// This works because the trust model for a pool is a single-operator
+/// trusted pool (all nodes hold the shared symmetric `sync_key`), so a
+/// shared server identity across the whole pool is acceptable — every node
+/// derives the identical keypair from `sync_key` and can act as "the" pool
+/// server for any peer that dials it. Mutual-distrust, per-node server
+/// identities are a possible future extension but are not required by the
+/// current trust model.
+pub fn pool_server_keypair(sync_key: &[u8; 32]) -> KeyPair {
+    let seed = blake3::derive_key(HKDF_POOL_SERVER_STATIC_CONTEXT, sync_key);
+    KeyPair::from_private_key(seed)
+}
+
+/// Derive a pool node's long-term Ed25519 identity keypair from a 32-byte
+/// seed.
+///
+/// This is the node's durable proof-of-identity key — distinct from any
+/// session-scoped X25519 ephemeral key and from the pool-wide shared
+/// `pool_server_keypair`. Its `verifying_key().to_bytes()` output is the
+/// `node_pub` a peer PINS to a `node_id` the first time it sees a valid
+/// [`verify_node_enrollment`] proof for that pair (Phase 4 TOFU / operator
+/// manual-approval), so a later impostor who merely knows (or guesses) the
+/// `node_id` string cannot re-assert it without also holding this seed.
+///
+/// Deterministic: the same seed always yields the same keypair, so an
+/// operator can persist just the 32-byte seed (e.g. in server config) rather
+/// than a full expanded Ed25519 secret key.
+pub fn node_identity_from_seed(seed: &[u8; 32]) -> ed25519_dalek::SigningKey {
+    ed25519_dalek::SigningKey::from_bytes(seed)
+}
+
+/// Build the canonical, unambiguous byte string a pool node signs (and a
+/// peer reconstructs to verify) to prove ownership of `node_id` bound to
+/// `node_pub`, for a given `time_window` (see [`compute_time_window`]),
+/// SESSION-BOUND to `server_eph_pub || client_eph_pub` — the masked
+/// pool-peer session's ephemeral handshake transcript.
+///
+/// Wire framing (all fields concatenated in this fixed order):
+/// 1. `NODE_ENROLLMENT_CONTEXT` bytes ("aivpn-node-enrollment-v1") — domain
+///    separation, so this message can never collide with signing input built
+///    for any other purpose.
+/// 2. `node_id` length-prefixed as 4 bytes little-endian `u32`, followed by
+///    the UTF-8 `node_id` bytes themselves. The length prefix — not a
+///    delimiter byte — makes the framing unambiguous: without it, ids like
+///    `("ab", "c")` and `("a", "bc")` could concatenate to identical bytes
+///    once `node_pub`/`time_window` are appended (mirrors the length-prefix
+///    reasoning already used by [`derive_peer_pair_key`]).
+/// 3. The raw 32 `node_pub` bytes.
+/// 4. `time_window` as 8 bytes little-endian `u64` — binds the proof to a
+///    coarse time slice so a captured enrollment message cannot be replayed
+///    indefinitely (mirrors the resonance-tag time-window pattern).
+/// 5. The raw 32 `server_eph_pub` bytes, then the raw 32 `client_eph_pub`
+///    bytes (in that fixed order) — this session's ephemeral X25519
+///    handshake transcript. Both sides of a masked pool-peer session know
+///    both values without either needing to be sent on the wire: the server
+///    generates `server_eph_pub` and learns `client_eph_pub` from the
+///    handshake it received; the dialing client learns `server_eph_pub` from
+///    `ServerHello` and already knows its own `client_eph_pub`. Binding the
+///    proof to this pair makes a captured, otherwise-valid
+///    `(node_id, node_pub, time_window, signature)` tuple useless if replayed
+///    onto a DIFFERENT masked pool-peer session — that session's transcript
+///    differs, so the reconstructed message (and therefore the signature
+///    check) no longer matches. This mirrors
+///    [`device_enrollment_proof`]'s session-binding scheme for the same
+///    reason: a time-window alone only bounds replay to a ~2-minute wall-
+///    clock slice, not to one session.
+///
+/// This function is deterministic and produces identical output for
+/// identical inputs on both the signer and the verifier.
+pub fn node_enrollment_signing_bytes(
+    node_id: &str,
+    node_pub: &[u8; 32],
+    time_window: u64,
+    server_eph_pub: &[u8; 32],
+    client_eph_pub: &[u8; 32],
+) -> Vec<u8> {
+    let ctx_bytes = NODE_ENROLLMENT_CONTEXT.as_bytes();
+    let node_id_bytes = node_id.as_bytes();
+    let mut material =
+        Vec::with_capacity(ctx_bytes.len() + 4 + node_id_bytes.len() + 32 + 8 + 32 + 32);
+    material.extend_from_slice(ctx_bytes);
+    material.extend_from_slice(&(node_id_bytes.len() as u32).to_le_bytes());
+    material.extend_from_slice(node_id_bytes);
+    material.extend_from_slice(node_pub);
+    material.extend_from_slice(&time_window.to_le_bytes());
+    material.extend_from_slice(server_eph_pub);
+    material.extend_from_slice(client_eph_pub);
+    material
+}
+
+/// Verify a `NodeEnrollment` proof: that the holder of the Ed25519 private
+/// key corresponding to `node_pub` signed
+/// `(node_id, node_pub, time_window, server_eph_pub, client_eph_pub)` via
+/// [`node_enrollment_signing_bytes`] — i.e. that the proof is valid AND was
+/// produced for THIS session's ephemeral transcript, not replayed from a
+/// different one.
+///
+/// Returns `false` — never panics — for a malformed `node_pub` (bytes that
+/// are not a valid Ed25519 point) or a signature that fails verification, so
+/// callers can treat this as a plain boolean gate without a `Result` match
+/// for the "attacker-controlled bytes on the wire" case.
+pub fn verify_node_enrollment(
+    node_pub: &[u8; 32],
+    node_id: &str,
+    time_window: u64,
+    signature: &[u8; 64],
+    server_eph_pub: &[u8; 32],
+    client_eph_pub: &[u8; 32],
+) -> bool {
+    use ed25519_dalek::{Signature, VerifyingKey};
+
+    let vk = match VerifyingKey::from_bytes(node_pub) {
+        Ok(vk) => vk,
+        Err(_) => return false,
+    };
+    let message = node_enrollment_signing_bytes(
+        node_id,
+        node_pub,
+        time_window,
+        server_eph_pub,
+        client_eph_pub,
+    );
+    let sig = Signature::from_bytes(signature);
+    // `verify_strict` rejects small-order / non-canonical verifying keys (e.g.
+    // the all-zero point) — both a stricter security posture for node identity
+    // and a fail-closed guard against a peer presenting a degenerate node_pub.
+    vk.verify_strict(&message, &sig).is_ok()
 }
 
 /// Encrypt payload into a caller-owned buffer using ChaCha20-Poly1305.
@@ -752,5 +916,411 @@ mod tests {
         let without_psk = derive_session_keys(&dh, None, &eph_pub);
 
         assert_ne!(with_psk.session_key, without_psk.session_key);
+    }
+
+    #[test]
+    fn test_pool_client_psk_deterministic_and_domain_separated() {
+        let sync_key = [0x42u8; 32];
+
+        let psk1 = pool_client_psk(&sync_key);
+        let psk2 = pool_client_psk(&sync_key);
+        assert_eq!(psk1, psk2, "pool_client_psk must be deterministic");
+
+        // Must not collapse back to the raw sync_key.
+        assert_ne!(psk1, sync_key);
+
+        // Must be domain-separated from the directional peer-link keys
+        // derived from the same secret.
+        let (send, recv) = derive_directional_peer_keys(&sync_key, "node-a", "node-b").unwrap();
+        assert_ne!(psk1, send);
+        assert_ne!(psk1, recv);
+    }
+
+    #[test]
+    fn test_pool_client_psk_differs_across_sync_keys() {
+        let sync_key_a = [0x11u8; 32];
+        let sync_key_b = [0x22u8; 32];
+
+        let psk_a = pool_client_psk(&sync_key_a);
+        let psk_b = pool_client_psk(&sync_key_b);
+        assert_ne!(psk_a, psk_b);
+    }
+
+    #[test]
+    fn test_pool_server_keypair_deterministic() {
+        let sync_key = [0x77u8; 32];
+
+        let kp1 = pool_server_keypair(&sync_key);
+        let kp2 = pool_server_keypair(&sync_key);
+
+        assert_eq!(
+            kp1.public_key_bytes(),
+            kp2.public_key_bytes(),
+            "pool_server_keypair must derive the same identity from the same sync_key"
+        );
+    }
+
+    #[test]
+    fn test_pool_server_keypair_differs_across_sync_keys() {
+        let sync_key_a = [0x99u8; 32];
+        let sync_key_b = [0xAAu8; 32];
+
+        let kp_a = pool_server_keypair(&sync_key_a);
+        let kp_b = pool_server_keypair(&sync_key_b);
+
+        assert_ne!(kp_a.public_key_bytes(), kp_b.public_key_bytes());
+    }
+
+    #[test]
+    fn test_pool_server_keypair_dh_roundtrip_with_client_ephemeral() {
+        // This is exactly what the masked pool-client handshake relies on:
+        // the dialing node's ephemeral key and the pool-wide server static
+        // key must agree on the same shared secret via X25519 symmetry.
+        let sync_key = [0xBBu8; 32];
+        let server_kp = pool_server_keypair(&sync_key);
+        let client_eph = KeyPair::generate();
+
+        let client_side = client_eph
+            .compute_shared(&server_kp.public_key_bytes())
+            .unwrap();
+        let server_side = server_kp
+            .compute_shared(&client_eph.public_key_bytes())
+            .unwrap();
+
+        assert_eq!(client_side, server_side);
+    }
+
+    /// Fixed test transcript — an arbitrary but consistent
+    /// (server_eph_pub, client_eph_pub) pair used by every test below that
+    /// doesn't specifically exercise the transcript-binding property itself.
+    const TEST_SERVER_EPH: [u8; 32] = [0xE1u8; 32];
+    const TEST_CLIENT_EPH: [u8; 32] = [0xE2u8; 32];
+
+    #[test]
+    fn test_node_enrollment_verifies_valid_signature() {
+        use ed25519_dalek::Signer;
+
+        let seed = [0x01u8; 32];
+        let signing_key = node_identity_from_seed(&seed);
+        let node_pub = signing_key.verifying_key().to_bytes();
+        let node_id = "node-alpha";
+        let time_window = 12345u64;
+
+        let msg = node_enrollment_signing_bytes(
+            node_id,
+            &node_pub,
+            time_window,
+            &TEST_SERVER_EPH,
+            &TEST_CLIENT_EPH,
+        );
+        let signature = signing_key.sign(&msg).to_bytes();
+
+        assert!(verify_node_enrollment(
+            &node_pub,
+            node_id,
+            time_window,
+            &signature,
+            &TEST_SERVER_EPH,
+            &TEST_CLIENT_EPH,
+        ));
+    }
+
+    #[test]
+    fn test_node_enrollment_rejects_tampered_node_id() {
+        use ed25519_dalek::Signer;
+
+        let seed = [0x02u8; 32];
+        let signing_key = node_identity_from_seed(&seed);
+        let node_pub = signing_key.verifying_key().to_bytes();
+        let time_window = 100u64;
+
+        let msg = node_enrollment_signing_bytes(
+            "original-id",
+            &node_pub,
+            time_window,
+            &TEST_SERVER_EPH,
+            &TEST_CLIENT_EPH,
+        );
+        let signature = signing_key.sign(&msg).to_bytes();
+
+        assert!(!verify_node_enrollment(
+            &node_pub,
+            "tampered-id",
+            time_window,
+            &signature,
+            &TEST_SERVER_EPH,
+            &TEST_CLIENT_EPH,
+        ));
+    }
+
+    #[test]
+    fn test_node_enrollment_rejects_tampered_time_window() {
+        use ed25519_dalek::Signer;
+
+        let seed = [0x03u8; 32];
+        let signing_key = node_identity_from_seed(&seed);
+        let node_pub = signing_key.verifying_key().to_bytes();
+        let node_id = "node-beta";
+
+        let msg = node_enrollment_signing_bytes(
+            node_id,
+            &node_pub,
+            1000,
+            &TEST_SERVER_EPH,
+            &TEST_CLIENT_EPH,
+        );
+        let signature = signing_key.sign(&msg).to_bytes();
+
+        assert!(!verify_node_enrollment(
+            &node_pub,
+            node_id,
+            1001,
+            &signature,
+            &TEST_SERVER_EPH,
+            &TEST_CLIENT_EPH,
+        ));
+    }
+
+    #[test]
+    fn test_node_enrollment_rejects_tampered_node_pub() {
+        use ed25519_dalek::Signer;
+
+        let seed = [0x04u8; 32];
+        let signing_key = node_identity_from_seed(&seed);
+        let node_pub = signing_key.verifying_key().to_bytes();
+        let node_id = "node-gamma";
+        let time_window = 55u64;
+
+        let msg = node_enrollment_signing_bytes(
+            node_id,
+            &node_pub,
+            time_window,
+            &TEST_SERVER_EPH,
+            &TEST_CLIENT_EPH,
+        );
+        let signature = signing_key.sign(&msg).to_bytes();
+
+        // A different node_pub than the one actually signed for must fail,
+        // even with a byte-valid Ed25519 point.
+        let other_signing_key = node_identity_from_seed(&[0x05u8; 32]);
+        let other_pub = other_signing_key.verifying_key().to_bytes();
+
+        assert!(!verify_node_enrollment(
+            &other_pub,
+            node_id,
+            time_window,
+            &signature,
+            &TEST_SERVER_EPH,
+            &TEST_CLIENT_EPH,
+        ));
+    }
+
+    #[test]
+    fn test_node_enrollment_rejects_tampered_signature() {
+        use ed25519_dalek::Signer;
+
+        let seed = [0x06u8; 32];
+        let signing_key = node_identity_from_seed(&seed);
+        let node_pub = signing_key.verifying_key().to_bytes();
+        let node_id = "node-delta";
+        let time_window = 7u64;
+
+        let msg = node_enrollment_signing_bytes(
+            node_id,
+            &node_pub,
+            time_window,
+            &TEST_SERVER_EPH,
+            &TEST_CLIENT_EPH,
+        );
+        let mut signature = signing_key.sign(&msg).to_bytes();
+        signature[0] ^= 0xFF;
+
+        assert!(!verify_node_enrollment(
+            &node_pub,
+            node_id,
+            time_window,
+            &signature,
+            &TEST_SERVER_EPH,
+            &TEST_CLIENT_EPH,
+        ));
+    }
+
+    #[test]
+    fn test_node_enrollment_rejects_different_nodes_key() {
+        use ed25519_dalek::Signer;
+
+        let node_id = "node-epsilon";
+        let time_window = 9u64;
+
+        let key_a = node_identity_from_seed(&[0x07u8; 32]);
+        let pub_a = key_a.verifying_key().to_bytes();
+        let key_b = node_identity_from_seed(&[0x08u8; 32]);
+        let pub_b = key_b.verifying_key().to_bytes();
+
+        // Sign the message that claims to be for pub_a's key, but actually
+        // sign it with node B's private key (an impostor asserting A's identity).
+        let msg = node_enrollment_signing_bytes(
+            node_id,
+            &pub_a,
+            time_window,
+            &TEST_SERVER_EPH,
+            &TEST_CLIENT_EPH,
+        );
+        let forged_signature = key_b.sign(&msg).to_bytes();
+
+        assert!(!verify_node_enrollment(
+            &pub_a,
+            node_id,
+            time_window,
+            &forged_signature,
+            &TEST_SERVER_EPH,
+            &TEST_CLIENT_EPH,
+        ));
+
+        // Sanity: node B's own key over its own pub does verify.
+        let msg_b = node_enrollment_signing_bytes(
+            node_id,
+            &pub_b,
+            time_window,
+            &TEST_SERVER_EPH,
+            &TEST_CLIENT_EPH,
+        );
+        let sig_b = key_b.sign(&msg_b).to_bytes();
+        assert!(verify_node_enrollment(
+            &pub_b,
+            node_id,
+            time_window,
+            &sig_b,
+            &TEST_SERVER_EPH,
+            &TEST_CLIENT_EPH,
+        ));
+    }
+
+    #[test]
+    fn test_node_enrollment_malformed_node_pub_returns_false_not_panic() {
+        // All-zero bytes and other non-canonical byte strings are not
+        // guaranteed to be a valid Ed25519 point; verify_node_enrollment must
+        // fail closed rather than panic.
+        let malformed_pub = [0u8; 32];
+        let node_id = "node-zero";
+        let time_window = 1u64;
+        let signature = [0u8; 64];
+
+        assert!(!verify_node_enrollment(
+            &malformed_pub,
+            node_id,
+            time_window,
+            &signature,
+            &TEST_SERVER_EPH,
+            &TEST_CLIENT_EPH,
+        ));
+
+        // 0xFF-filled bytes are also not a canonical compressed point.
+        let malformed_pub2 = [0xFFu8; 32];
+        assert!(!verify_node_enrollment(
+            &malformed_pub2,
+            node_id,
+            time_window,
+            &signature,
+            &TEST_SERVER_EPH,
+            &TEST_CLIENT_EPH,
+        ));
+    }
+
+    #[test]
+    fn test_node_enrollment_signing_bytes_deterministic_and_length_prefixed() {
+        let node_pub = [0xAAu8; 32];
+        let msg1 = node_enrollment_signing_bytes(
+            "node-x",
+            &node_pub,
+            42,
+            &TEST_SERVER_EPH,
+            &TEST_CLIENT_EPH,
+        );
+        let msg2 = node_enrollment_signing_bytes(
+            "node-x",
+            &node_pub,
+            42,
+            &TEST_SERVER_EPH,
+            &TEST_CLIENT_EPH,
+        );
+        assert_eq!(msg1, msg2, "signing bytes must be deterministic");
+
+        // Length-prefix disambiguation: ("ab","c"...) style concatenation
+        // collision must not occur once node_pub/time_window differ in
+        // position due to the prefix — different node_id strings that would
+        // naively concatenate the same way must produce different messages.
+        let msg_a =
+            node_enrollment_signing_bytes("ab", &node_pub, 42, &TEST_SERVER_EPH, &TEST_CLIENT_EPH);
+        let msg_b =
+            node_enrollment_signing_bytes("a", &node_pub, 42, &TEST_SERVER_EPH, &TEST_CLIENT_EPH);
+        assert_ne!(msg_a, msg_b);
+    }
+
+    /// B2/D2 fix — the core anti-replay property: a `NodeEnrollment` proof
+    /// captured off one masked pool-peer session must NOT verify when
+    /// replayed onto a DIFFERENT session, even with the exact same
+    /// `(node_id, node_pub, time_window, signature)` tuple. Before this fix,
+    /// `verify_node_enrollment` had no session-transcript input at all, so a
+    /// captured valid enrollment tuple verified identically regardless of
+    /// which masked pool-peer session it was replayed on — letting an
+    /// attacker who observes one peer's enrollment steal its verified node
+    /// identity on a session with a different peer.
+    #[test]
+    fn test_node_enrollment_rejects_cross_session_replay() {
+        use ed25519_dalek::Signer;
+
+        let seed = [0x09u8; 32];
+        let signing_key = node_identity_from_seed(&seed);
+        let node_pub = signing_key.verifying_key().to_bytes();
+        let node_id = "node-zeta";
+        let time_window = 4242u64;
+
+        let session_a_server_eph = [0x11u8; 32];
+        let session_a_client_eph = [0x22u8; 32];
+        let msg = node_enrollment_signing_bytes(
+            node_id,
+            &node_pub,
+            time_window,
+            &session_a_server_eph,
+            &session_a_client_eph,
+        );
+        let signature = signing_key.sign(&msg).to_bytes();
+
+        // Verifies under the transcript it was signed for.
+        assert!(verify_node_enrollment(
+            &node_pub,
+            node_id,
+            time_window,
+            &signature,
+            &session_a_server_eph,
+            &session_a_client_eph,
+        ));
+
+        // The exact same tuple replayed onto a session with a different
+        // transcript (different server_eph_pub AND/OR client_eph_pub) must
+        // be rejected.
+        let session_b_server_eph = [0x33u8; 32];
+        let session_b_client_eph = [0x44u8; 32];
+        assert!(!verify_node_enrollment(
+            &node_pub,
+            node_id,
+            time_window,
+            &signature,
+            &session_b_server_eph,
+            &session_b_client_eph,
+        ));
+
+        // Even a one-sided mismatch (only the client_eph_pub differs, as
+        // would happen if an attacker dials the SAME server with a fresh
+        // ephemeral key while replaying a captured proof) must fail too.
+        assert!(!verify_node_enrollment(
+            &node_pub,
+            node_id,
+            time_window,
+            &signature,
+            &session_a_server_eph,
+            &session_b_client_eph,
+        ));
     }
 }

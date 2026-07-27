@@ -130,6 +130,74 @@ pub struct PoolSyncConfig {
     /// rejected, preventing this node from being used as an open relay.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exit_node_enabled: Option<bool>,
+    /// FORK-B pool-sync dialer ([`crate::pool_dialer::PoolDialer`]):
+    /// interval, in seconds, between `PoolStateDigest` beacons sent over a
+    /// dialed masked pool-client session. `None` defaults to 30. Ignored
+    /// unless `transport` is `"masked"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sync_beacon_secs: Option<u64>,
+    /// FORK-B pool-sync transport selector: `"legacy"` (default, `None`) runs
+    /// the existing mask-independent push-only [`PeerSyncer`]; `"masked"`
+    /// activates [`crate::pool_dialer::PoolDialer`] instead — each node
+    /// dials its peers as a fully masked, headless pool-client and runs
+    /// bidirectional anti-entropy over that session. Additive: any value
+    /// other than exactly `"masked"` (including unset) reproduces the
+    /// pre-existing legacy behavior byte-for-byte.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport: Option<String>,
+    /// Phase 4 (per-node cryptographic identity): whether an UNKNOWN peer
+    /// `node_id` presenting a valid `NodeEnrollment` proof gets bound
+    /// (Trust-On-First-Use) automatically, or is rejected pending manual
+    /// operator approval (e.g. via a future admin/CLI pinning command).
+    /// `None` defaults to `true` — TOFU — so an existing masked pool
+    /// deployment upgraded to a build with `node_registry` wired in keeps
+    /// working without any operator action; set explicitly to `false` to
+    /// require manual pinning of every pool node's identity key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_auto_add: Option<bool>,
+    /// Path to this node's own 32-byte Ed25519 identity seed (see
+    /// `aivpn_common::crypto::node_identity_from_seed`), used by the masked
+    /// pool-client dialer to sign this node's own `NodeEnrollment` proof
+    /// when connecting to a peer. Consumed by the dialer, not by anything in
+    /// this file — wiring it into `PoolDialer` is a separate task.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_identity_key: Option<String>,
+    /// BUG D1 (route-auth identity enforcement): whether a masked pool-peer
+    /// session MUST have a crypto-verified `verified_node_id` (bound via a
+    /// validated `NodeEnrollment` proof) before its `RouteSync` announcements
+    /// are honored. `None`/`false` (default) keeps the pre-existing
+    /// migration-safe behavior — `handle_route_sync` is called with
+    /// `verified_node_id` when present and otherwise falls back to the
+    /// self-asserted node_id embedded in the payload (with a warn). Set to
+    /// `true` on a deployment that has fully rolled out per-node identity
+    /// (Phase 4 `NodeEnrollment`) to require every route-announcing peer to
+    /// have proven its identity — self-asserted-identity RouteSync is
+    /// dropped outright instead of being trusted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub require_node_enrollment: Option<bool>,
+}
+
+impl PoolSyncConfig {
+    /// `true` only when `transport` is exactly `"masked"` — see the
+    /// `transport` field doc for the additive/gating rationale.
+    pub fn transport_is_masked(&self) -> bool {
+        self.transport.as_deref() == Some("masked")
+    }
+
+    /// Whether an unknown pool-node identity should be auto-bound
+    /// (Trust-On-First-Use) on first valid `NodeEnrollment` proof. Defaults
+    /// to `true` when unset — see the `allow_auto_add` field doc.
+    pub fn allow_auto_add(&self) -> bool {
+        self.allow_auto_add.unwrap_or(true)
+    }
+
+    /// Whether `RouteSync` from a masked pool-peer without a crypto-verified
+    /// `verified_node_id` must be dropped rather than trusted with a
+    /// self-asserted identity. Defaults to `false` when unset — see the
+    /// `require_node_enrollment` field doc.
+    pub fn require_node_enrollment(&self) -> bool {
+        self.require_node_enrollment.unwrap_or(false)
+    }
 }
 
 /// One configured pool peer with its directional key material.
@@ -648,6 +716,11 @@ mod tests {
             sync_key: Some(base64::engine::general_purpose::STANDARD.encode([7u8; 32])),
             exit_node: None,
             exit_node_enabled: None,
+            sync_beacon_secs: None,
+            transport: None,
+            allow_auto_add: None,
+            node_identity_key: None,
+            require_node_enrollment: None,
         }
     }
 

@@ -1353,6 +1353,10 @@ async fn main() {
             mask_verify_mode,
             network_change_notify: network_change_notify.clone(),
             is_bootstrap_fallback,
+            control_only: false,
+            inbound_control_tap: None,
+            node_identity: None,
+            pool_node_id: None,
         };
 
         match AivpnClient::new(config) {

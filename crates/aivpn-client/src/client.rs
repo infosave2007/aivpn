@@ -257,6 +257,20 @@ const KERNEL_TAG_REFRESH_STRIDE: u64 = 64;
 /// recovers it. 2048 × ~1.5 KB ≈ 3 MB worst case.
 const PROXY_RX_QUEUE_MAX: usize = 2048;
 
+/// B2/D2 fix: freshness window for the `NodeEnrollment` proof this client
+/// signs on behalf of the embedded pool-peer dialer. MUST match
+/// `aivpn-server`'s `node_registry::NODE_ENROLL_WINDOW_MS` (both 60_000,
+/// private to that module) — a mismatch would make every enrollment this
+/// node sends look stale (or not-yet-valid) to a peer's
+/// `NodeRegistry::authenticate`.
+const NODE_ENROLLMENT_WINDOW_MS: u64 = 60_000;
+
+/// B2/D2 fix: how often `spawn_node_enrollment_resend` re-signs and resends
+/// the `NodeEnrollment` proof over an established pool-peer dialer session.
+/// Well under `NODE_ENROLLMENT_WINDOW_MS`'s ~2-minute freshness bound, so a
+/// peer's registry is never left without a fresh-enough proof between ticks.
+const NODE_ENROLLMENT_RESEND_INTERVAL: Duration = Duration::from_secs(60);
+
 /// Current unix time in milliseconds.
 fn epoch_ms() -> u64 {
     std::time::SystemTime::now()
@@ -316,6 +330,42 @@ fn packet_mdh_len_for_mask(mask: &MaskProfile) -> usize {
         .as_ref()
         .map(|spec| spec.min_length())
         .unwrap_or_else(|| mask.header_template.len())
+}
+
+/// B2/D2 fix: build a fresh, SESSION-BOUND `ControlPayload::NodeEnrollment`
+/// proof. `time_window` is recomputed from the current wall-clock time on
+/// every call (using [`NODE_ENROLLMENT_WINDOW_MS`]), so both the initial send
+/// and every periodic resend carry a current window. `server_eph_pub`/
+/// `client_eph_pub` bind the proof to one specific masked pool-peer session's
+/// ephemeral transcript — see [`ClientConfig::node_identity`]'s doc comment
+/// for why that binding is what closes the cross-session-replay hole this
+/// fix addresses.
+fn build_node_enrollment_payload(
+    node_identity: &ed25519_dalek::SigningKey,
+    node_id: &str,
+    node_pub: &[u8; 32],
+    server_eph_pub: &[u8; 32],
+    client_eph_pub: &[u8; 32],
+) -> ControlPayload {
+    let time_window =
+        crypto::compute_time_window(crypto::current_timestamp_ms(), NODE_ENROLLMENT_WINDOW_MS);
+    let msg = crypto::node_enrollment_signing_bytes(
+        node_id,
+        node_pub,
+        time_window,
+        server_eph_pub,
+        client_eph_pub,
+    );
+    let signature = {
+        use ed25519_dalek::Signer;
+        node_identity.sign(&msg).to_bytes()
+    };
+    ControlPayload::NodeEnrollment {
+        node_id: node_id.to_string(),
+        node_pub: *node_pub,
+        time_window,
+        signature,
+    }
 }
 
 /// Client configuration
@@ -387,6 +437,43 @@ pub struct ClientConfig {
     /// to file-polling GUIs (Windows) via the `fallback:` key — mirrors how
     /// `ip:` was added for the same "GUI can't read child stdout" reason.
     pub is_bootstrap_fallback: bool,
+    /// Headless "control-only" mode: no TUN device, no SOCKS proxy, no local
+    /// admin IPC socket, no stats-file writer, and all `InnerType::Data`
+    /// packets are dropped on receipt. Used when the aivpn SERVER embeds this
+    /// client as a masked pool-peer dialer (completes the handshake and
+    /// exchanges CONTROL payloads for DB anti-entropy with a peer node) rather
+    /// than by an end-user device. `false` (default) reproduces the exact
+    /// pre-existing behavior of every other call site.
+    pub control_only: bool,
+    /// When set (only meaningful with `control_only = true`), inbound
+    /// `ControlPayload::PoolSync` / `PoolStateDigest` / `PoolBucketDigests` /
+    /// `RouteSync` messages
+    /// are cloned and forwarded to this channel instead of being silently
+    /// ignored, so the embedding server can drive its own anti-entropy merge
+    /// logic off of them. `None` (default) preserves the previous silent-drop
+    /// behavior for these variants.
+    pub inbound_control_tap: Option<tokio::sync::mpsc::Sender<ControlPayload>>,
+    /// B2/D2 fix (session-bound `NodeEnrollment`, SEND side): this node's own
+    /// durable Ed25519 pool-node identity, `Some` only for the embedded
+    /// `control_only` pool-peer dialer (`aivpn-server`'s `pool_dialer.rs`)
+    /// when `main.rs` resolved a `pool.node_identity_key`. `None` (the
+    /// default, and always the value for every ordinary end-user client) is
+    /// a complete no-op: no `NodeEnrollment` is ever built or sent. When
+    /// `Some`, the `ServerHello` handler signs and sends a `NodeEnrollment`
+    /// proof bound to THIS session's ephemeral transcript
+    /// (`server_eph_pub`/`client_eph_pub`) right after the PFS ratchet
+    /// completes — moved here (out of `pool_dialer.rs`) specifically because
+    /// only this handler has that transcript available, and binding to it is
+    /// what prevents a captured proof from being replayed onto a different
+    /// masked pool-peer session (mirrors `DeviceEnrollment`'s `dh_proof`
+    /// scheme just above in this same handler).
+    pub node_identity: Option<ed25519_dalek::SigningKey>,
+    /// This node's own pool `node_id` string, carried in the `NodeEnrollment`
+    /// proof `node_identity` signs. Only meaningful alongside
+    /// `node_identity: Some(..)`; `None` there is treated as an empty string
+    /// (matching `pool_dialer.rs`'s pre-existing `unwrap_or_default()`
+    /// handling for its own `RouteSync`/enrollment payloads).
+    pub pool_node_id: Option<String>,
 }
 
 /// Client state
@@ -424,6 +511,14 @@ pub struct AivpnClient {
     udp_socket: Option<Arc<UdpSocket>>,
     mimicry_engine: Option<MimicryEngine>,
     pub control_tx: Option<mpsc::Sender<ControlPayload>>,
+    /// Receiver half preset by `control_handle()`, consumed by `run()` in
+    /// place of the receiver it would otherwise create itself. Lets an
+    /// embedder (e.g. the server running this client as a pool-peer dialer
+    /// in `control_only` mode) obtain a `Sender<ControlPayload>` handle
+    /// BEFORE `run(&mut self, ..)` takes `&mut self` for the duration of the
+    /// session, so it can keep pushing payloads (pool DB-sync beacons/
+    /// snapshots) through the masked session while `run()` is executing.
+    preset_control_rx: Option<mpsc::Receiver<ControlPayload>>,
     pending_mask: Arc<Mutex<Option<aivpn_common::mask::MaskProfile>>>,
     session_keys: Option<SessionKeys>,
     upload_state: Option<Arc<Mutex<UploadCryptoState>>>,
@@ -644,6 +739,7 @@ impl AivpnClient {
             udp_socket: None,
             mimicry_engine: None,
             control_tx: None,
+            preset_control_rx: None,
             pending_mask: Arc::new(Mutex::new(None)),
             session_keys: None,
             #[cfg(target_os = "linux")]
@@ -751,13 +847,55 @@ impl AivpnClient {
         });
     }
 
+    /// B2/D2 fix: periodic `NodeEnrollment` resend for the embedded
+    /// `control_only` pool-peer dialer (see `ClientConfig::node_identity`'s
+    /// doc comment). Spawned once per real ratchet from the `ServerHello`
+    /// handler, after the initial send. Rebuilds the proof with a fresh
+    /// `time_window` on every tick but the SAME `server_eph_pub`/
+    /// `client_eph_pub` — both fixed for the life of this session — so a
+    /// peer whose `NodeRegistry` restarted (or that missed our initial
+    /// enrollment) re-learns/re-verifies us without waiting for a fresh
+    /// dial. Exits as soon as `tx.send` fails (the session ended — the
+    /// caller's `AivpnClient`/task is gone, no separate shutdown signal
+    /// needed).
+    fn spawn_node_enrollment_resend(
+        tx: mpsc::Sender<ControlPayload>,
+        node_identity: ed25519_dalek::SigningKey,
+        node_id: String,
+        node_pub: [u8; 32],
+        server_eph_pub: [u8; 32],
+        client_eph_pub: [u8; 32],
+    ) {
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(NODE_ENROLLMENT_RESEND_INTERVAL);
+            // The first tick fires immediately; skip it here since the
+            // caller already sent one right before spawning this task.
+            interval.tick().await;
+            loop {
+                interval.tick().await;
+                let enrollment = build_node_enrollment_payload(
+                    &node_identity,
+                    &node_id,
+                    &node_pub,
+                    &server_eph_pub,
+                    &client_eph_pub,
+                );
+                if tx.send(enrollment).await.is_err() {
+                    // Session gone — nothing left to resend to.
+                    break;
+                }
+            }
+        });
+    }
+
     /// Connect to server
     pub async fn connect(&mut self) -> Result<()> {
         info!("Connecting to AIVPN server...");
         self.state = ClientState::Connecting;
 
-        // Create TUN device first (skipped in proxy mode)
-        if self.config.proxy_listen.is_none() {
+        // Create TUN device first (skipped in proxy mode and in headless
+        // control-only mode, where there is no OS network stack to route).
+        if self.config.proxy_listen.is_none() && !self.config.control_only {
             self.tunnel.create().await?;
         }
 
@@ -876,7 +1014,8 @@ impl AivpnClient {
             let kernel_rx_enabled = std::env::var("AIVPN_CLIENT_KERNEL_RX")
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 .unwrap_or(false);
-            if self.config.proxy_listen.is_some() || !kernel_rx_enabled {
+            if self.config.proxy_listen.is_some() || self.config.control_only || !kernel_rx_enabled
+            {
                 // Proxy mode (no TUN to inject into) or not opted in: user-space
                 // data path exactly as before.
                 self.kernel_accel = None;
@@ -904,7 +1043,7 @@ impl AivpnClient {
             debug_assert!(self.xdp_iface.is_none());
         }
 
-        if self.config.proxy_listen.is_none() {
+        if self.config.proxy_listen.is_none() && !self.config.control_only {
             self.tunnel.set_server_ip(server_addr.ip().to_string());
             // Enable full tunnel only after the server UDP path is established.
             if self.config.tun_config.full_tunnel {
@@ -1303,6 +1442,44 @@ impl AivpnClient {
         self.transition_grace_hard = None;
     }
 
+    /// Obtain an outbound control-channel handle, usable to push
+    /// `ControlPayload`s (e.g. `PoolStateDigest`, `PoolSync`) through this
+    /// client's masked session while `run(&mut self, ..)` is executing.
+    ///
+    /// MUST be called BEFORE `run()`: once `run()` starts it holds `&mut
+    /// self` for the life of the session, so an embedder (the aivpn server,
+    /// running this client as a pool-peer dialer in `control_only` mode)
+    /// cannot otherwise reach `control_tx` concurrently. Calling this first
+    /// presets the receiver `run()` will pick up, and shares the same sender
+    /// clone the client's own internal `send_control` uses — so embedder
+    /// sends and the client's own control traffic are interleaved onto one
+    /// upload task via one channel.
+    ///
+    /// Calling this more than once returns clones of the same sender; it
+    /// does not create additional channels.
+    pub fn control_handle(&mut self) -> mpsc::Sender<ControlPayload> {
+        if self.preset_control_rx.is_none() {
+            // BUG C2 mitigation: this channel also carries the masked exit's
+            // per-packet data plane (the server multiplexes every forwarded
+            // client IP packet onto it as `ControlPayload::ChainForward` via
+            // `pool_dialer.rs`'s `send_to_peer` -> `try_send`), not just the
+            // low-rate pool-sync control beacons a plain client sends. A
+            // capacity of 32 overflows under load and `try_send` silently
+            // drops data packets. 1024 is a cheap, low-risk bump to absorb
+            // bursts; an operator-chosen mimicry-vs-throughput tradeoff. The
+            // fuller fix would be a dedicated data channel separate from
+            // control traffic.
+            let (tx, rx) = mpsc::channel::<ControlPayload>(1024);
+            self.preset_control_rx = Some(rx);
+            self.control_tx = Some(tx.clone());
+            tx
+        } else {
+            self.control_tx
+                .clone()
+                .expect("control_tx set alongside preset_control_rx")
+        }
+    }
+
     /// Run the client main loop
     pub async fn run(&mut self, shutdown: Arc<AtomicBool>) -> Result<()> {
         self.connect().await?;
@@ -1321,8 +1498,22 @@ impl AivpnClient {
         let (tun_to_udp_tx, tun_to_udp_rx) = mpsc::channel::<Vec<u8>>(512);
         let (udp_to_tun_tx, mut udp_to_tun_rx) = mpsc::channel::<Bytes>(512);
         let (admin_tx, mut admin_rx) = mpsc::channel::<String>(16);
-        let (control_tx, control_rx) = mpsc::channel::<ControlPayload>(32);
-        self.control_tx = Some(control_tx.clone());
+        // If `control_handle()` was called before `run()`, its receiver is
+        // preset here and reused verbatim (and `self.control_tx` is already
+        // set to a clone of the same sender) — otherwise, preserve the
+        // original behavior exactly: create a fresh channel and set
+        // `self.control_tx` from it.
+        let (control_tx, control_rx) = if let Some(rx) = self.preset_control_rx.take() {
+            let tx = self
+                .control_tx
+                .clone()
+                .expect("preset_control_rx implies control_tx was set by control_handle()");
+            (tx, rx)
+        } else {
+            let (tx, rx) = mpsc::channel::<ControlPayload>(32);
+            self.control_tx = Some(tx.clone());
+            (tx, rx)
+        };
 
         // mTLS ClientCert is sent inside the ServerHello handler, after the PFS
         // ratchet completes, so it is protected by the ratcheted session keys.
@@ -1332,38 +1523,47 @@ impl AivpnClient {
         // the orphaned task keeps 127.0.0.1:44301 bound across reconnect iterations,
         // causing the next run() call to fail with "Address already in use".
         let admin_token = crate::record_cmd::ensure_admin_token();
-        let _admin_task = AbortOnDrop(tokio::spawn(async move {
-            match tokio::net::UdpSocket::bind("127.0.0.1:44301").await {
-                Ok(socket) => {
-                    let mut buf = [0u8; 1024];
-                    loop {
-                        if let Ok((len, _addr)) = socket.recv_from(&mut buf).await {
-                            if let Ok(raw) = std::str::from_utf8(&buf[..len]) {
-                                match raw.split_once(':').and_then(|(tok, rest)| {
-                                    crate::record_cmd::tokens_match(tok, &admin_token)
-                                        .then(|| rest.to_string())
-                                }) {
-                                    Some(cmd) => {
-                                        let _ = admin_tx.send(cmd).await;
-                                    }
-                                    None => {
-                                        warn!(
-                                            "Rejected admin command: missing or invalid auth token"
-                                        );
+        // Headless control-only mode (server-embedded pool-peer dialer): never
+        // bind the admin IPC socket. This is the hard blocker for running N
+        // dialers in one process — `admin_tx` is intentionally left un-moved
+        // here (not dropped) so `admin_rx.recv()` in the main select loop
+        // below simply pends forever instead of spinning on a closed channel.
+        let _admin_task = if self.config.control_only {
+            AbortOnDrop(tokio::spawn(std::future::pending::<()>()))
+        } else {
+            AbortOnDrop(tokio::spawn(async move {
+                match tokio::net::UdpSocket::bind("127.0.0.1:44301").await {
+                    Ok(socket) => {
+                        let mut buf = [0u8; 1024];
+                        loop {
+                            if let Ok((len, _addr)) = socket.recv_from(&mut buf).await {
+                                if let Ok(raw) = std::str::from_utf8(&buf[..len]) {
+                                    match raw.split_once(':').and_then(|(tok, rest)| {
+                                        crate::record_cmd::tokens_match(tok, &admin_token)
+                                            .then(|| rest.to_string())
+                                    }) {
+                                        Some(cmd) => {
+                                            let _ = admin_tx.send(cmd).await;
+                                        }
+                                        None => {
+                                            warn!(
+                                                "Rejected admin command: missing or invalid auth token"
+                                            );
+                                        }
                                     }
                                 }
                             }
                         }
                     }
+                    Err(e) => {
+                        error!(
+                            "Failed to bind local admin UDP socket 127.0.0.1:44301: {}",
+                            e
+                        );
+                    }
                 }
-                Err(e) => {
-                    error!(
-                        "Failed to bind local admin UDP socket 127.0.0.1:44301: {}",
-                        e
-                    );
-                }
-            }
-        }));
+            }))
+        };
 
         // Proxy mode: start smoltcp + SOCKS5 instead of creating a TUN device
         if let Some(listen_addr) = self.config.proxy_listen {
@@ -1391,8 +1591,9 @@ impl AivpnClient {
             self.proxy_handle = Some(handle);
         }
 
-        // Take the TUN reader for the spawned task (skipped in proxy mode)
-        let tun_task = if self.config.proxy_listen.is_none() {
+        // Take the TUN reader for the spawned task (skipped in proxy mode and
+        // in headless control-only mode, where no TUN device was created).
+        let tun_task = if self.config.proxy_listen.is_none() && !self.config.control_only {
             let mut tun_reader = self
                 .tunnel
                 .take_reader()
@@ -1488,90 +1689,96 @@ impl AivpnClient {
         // plain captured bool is enough — no need for an Arc<AtomicBool>
         // like the live-updated `ip:` field above.
         let stats_bootstrap_fallback = self.config.is_bootstrap_fallback;
-        let stats_task = tokio::spawn(async move {
-            // Determine platform-appropriate stats paths
-            #[cfg(target_os = "windows")]
-            let stats_paths: Vec<std::path::PathBuf> = {
-                let mut paths = Vec::new();
-                if let Some(local_app) = std::env::var_os("LOCALAPPDATA") {
-                    let dir = std::path::PathBuf::from(local_app).join("AIVPN");
-                    let _ = tokio::fs::create_dir_all(&dir).await;
-                    paths.push(dir.join("traffic.stats"));
-                }
-                let tmp = std::env::temp_dir().join("aivpn-traffic.stats");
-                paths.push(tmp);
-                paths
-            };
-            #[cfg(not(target_os = "windows"))]
-            let stats_paths: Vec<std::path::PathBuf> = vec![
-                std::path::PathBuf::from("/var/run/aivpn/traffic.stats"),
-                std::path::PathBuf::from("/tmp/aivpn-traffic.stats"),
-            ];
+        let stats_task = if self.config.control_only {
+            // Headless control-only mode: no stats file — there is no GUI or
+            // CLI observing this in-process pool-peer dialer.
+            tokio::spawn(std::future::pending::<()>())
+        } else {
+            tokio::spawn(async move {
+                // Determine platform-appropriate stats paths
+                #[cfg(target_os = "windows")]
+                let stats_paths: Vec<std::path::PathBuf> = {
+                    let mut paths = Vec::new();
+                    if let Some(local_app) = std::env::var_os("LOCALAPPDATA") {
+                        let dir = std::path::PathBuf::from(local_app).join("AIVPN");
+                        let _ = tokio::fs::create_dir_all(&dir).await;
+                        paths.push(dir.join("traffic.stats"));
+                    }
+                    let tmp = std::env::temp_dir().join("aivpn-traffic.stats");
+                    paths.push(tmp);
+                    paths
+                };
+                #[cfg(not(target_os = "windows"))]
+                let stats_paths: Vec<std::path::PathBuf> = vec![
+                    std::path::PathBuf::from("/var/run/aivpn/traffic.stats"),
+                    std::path::PathBuf::from("/tmp/aivpn-traffic.stats"),
+                ];
 
-            // Session epoch (unix ms), captured ONCE when this session's stats
-            // task starts. GUIs key on a CHANGE in `since` to detect a silent
-            // in-process reconnect: it tells them to accept the new (lower)
-            // counters and restart the displayed uptime together, instead of
-            // freezing on the old totals. The pre-session zero-writes in
-            // main.rs deliberately carry NO `since` — no session exists yet.
-            let session_since_ms = epoch_ms();
+                // Session epoch (unix ms), captured ONCE when this session's stats
+                // task starts. GUIs key on a CHANGE in `since` to detect a silent
+                // in-process reconnect: it tells them to accept the new (lower)
+                // counters and restart the displayed uptime together, instead of
+                // freezing on the old totals. The pre-session zero-writes in
+                // main.rs deliberately carry NO `since` — no session exists yet.
+                let session_since_ms = epoch_ms();
 
-            // Write initial stats. O_NOFOLLOW/create_new-hardened atomic write
-            // (secure_write.rs): these paths fall back to predictable
-            // world-writable /tmp locations, which a local attacker could
-            // pre-plant as a symlink to a file this (possibly root-run)
-            // process can write. Uses spawn_blocking (mirroring what
-            // tokio::fs::write already does internally) since the hardened
-            // write is a handful of sync syscalls, not the tokio async-fs API.
-            let initial_ip = stats_current_vpn_ip
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .clone();
-            let initial = format!(
-                "sent:0,received:0,since:{},ip:{},fallback:{}",
-                session_since_ms, initial_ip, stats_bootstrap_fallback as u8
-            );
-            for path in &stats_paths {
-                let p = path.clone();
-                let data = initial.clone();
-                let _ = tokio::task::spawn_blocking(move || {
-                    crate::secure_write::write_status_best_effort(&p, data.as_bytes())
-                })
-                .await;
-            }
-            info!("Initial stats written");
-
-            let mut interval = tokio::time::interval(Duration::from_secs(1));
-            loop {
-                interval.tick().await;
-                if stats_shutdown.load(Ordering::SeqCst) {
-                    break;
-                }
-                let sent = stats_bytes_sent.load(Ordering::Relaxed);
-                let received = stats_bytes_received.load(Ordering::Relaxed);
-                // Re-read on every tick (not just once at task start): a pool
-                // re-home updates `current_vpn_ip` live via
-                // `apply_server_network_override` while this task keeps
-                // running, so the stats file must reflect the change within
-                // one tick for file-polling GUIs (Windows) to pick it up.
-                let ip = stats_current_vpn_ip
+                // Write initial stats. O_NOFOLLOW/create_new-hardened atomic write
+                // (secure_write.rs): these paths fall back to predictable
+                // world-writable /tmp locations, which a local attacker could
+                // pre-plant as a symlink to a file this (possibly root-run)
+                // process can write. Uses spawn_blocking (mirroring what
+                // tokio::fs::write already does internally) since the hardened
+                // write is a handful of sync syscalls, not the tokio async-fs API.
+                let initial_ip = stats_current_vpn_ip
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .clone();
-                let stats = format!(
-                    "sent:{},received:{},since:{},ip:{},fallback:{}",
-                    sent, received, session_since_ms, ip, stats_bootstrap_fallback as u8
+                let initial = format!(
+                    "sent:0,received:0,since:{},ip:{},fallback:{}",
+                    session_since_ms, initial_ip, stats_bootstrap_fallback as u8
                 );
                 for path in &stats_paths {
                     let p = path.clone();
-                    let data = stats.clone();
+                    let data = initial.clone();
                     let _ = tokio::task::spawn_blocking(move || {
                         crate::secure_write::write_status_best_effort(&p, data.as_bytes())
                     })
                     .await;
                 }
-            }
-        });
+                info!("Initial stats written");
+
+                let mut interval = tokio::time::interval(Duration::from_secs(1));
+                loop {
+                    interval.tick().await;
+                    if stats_shutdown.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    let sent = stats_bytes_sent.load(Ordering::Relaxed);
+                    let received = stats_bytes_received.load(Ordering::Relaxed);
+                    // Re-read on every tick (not just once at task start): a pool
+                    // re-home updates `current_vpn_ip` live via
+                    // `apply_server_network_override` while this task keeps
+                    // running, so the stats file must reflect the change within
+                    // one tick for file-polling GUIs (Windows) to pick it up.
+                    let ip = stats_current_vpn_ip
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .clone();
+                    let stats = format!(
+                        "sent:{},received:{},since:{},ip:{},fallback:{}",
+                        sent, received, session_since_ms, ip, stats_bootstrap_fallback as u8
+                    );
+                    for path in &stats_paths {
+                        let p = path.clone();
+                        let data = stats.clone();
+                        let _ = tokio::task::spawn_blocking(move || {
+                            crate::secure_write::write_status_best_effort(&p, data.as_bytes())
+                        })
+                        .await;
+                    }
+                }
+            })
+        };
 
         // ── Spawn upload task using the shared pipeline ──
         let upload_udp = self
@@ -2282,7 +2489,12 @@ impl AivpnClient {
                 if ip_payload.is_empty() || (ip_payload[0] >> 4 != 4 && ip_payload[0] >> 4 != 6) {
                     return Err(Error::InvalidPacket("Invalid IP version in payload"));
                 }
-                if let Some(h) = &self.proxy_handle {
+                if self.config.control_only {
+                    // Headless control-only mode: no TUN, no SOCKS proxy — a
+                    // pool-peer dialer has nowhere to deliver DATA packets.
+                    // Drop silently rather than erroring on the (never
+                    // created) TUN device.
+                } else if let Some(h) = &self.proxy_handle {
                     {
                         let mut q = h.rx_queue.lock().unwrap_or_else(|e| e.into_inner());
                         // Bound the queue: drop-oldest past the cap so a stalled
@@ -2809,54 +3021,131 @@ impl AivpnClient {
                     self.kernel_install_session();
                 }
 
-                // Send mTLS ClientCert now that the PFS ratchet is complete.
-                // Sending it here ensures the cert is protected by the ratcheted
-                // session keys, not the initial zero-RTT keys.
-                if let Some(cert) = self.config.mtls_cert.clone() {
-                    if let Err(e) = self
-                        .send_control(&ControlPayload::ClientCert {
-                            cert_bytes: cert.clone(),
-                        })
-                        .await
-                    {
-                        warn!("mTLS: failed to queue ClientCert after ratchet: {}", e);
-                    } else {
-                        debug!(
-                            "mTLS: ClientCert queued after PFS ratchet ({} bytes)",
-                            cert.len()
-                        );
+                // The following client-identity announcements (mTLS cert,
+                // recording status, device enrollment) only make sense for an
+                // actual end-user device. A headless control-only pool-peer
+                // dialer is not a device to enroll — skip them entirely.
+                if !self.config.control_only {
+                    // Send mTLS ClientCert now that the PFS ratchet is complete.
+                    // Sending it here ensures the cert is protected by the ratcheted
+                    // session keys, not the initial zero-RTT keys.
+                    if let Some(cert) = self.config.mtls_cert.clone() {
+                        if let Err(e) = self
+                            .send_control(&ControlPayload::ClientCert {
+                                cert_bytes: cert.clone(),
+                            })
+                            .await
+                        {
+                            warn!("mTLS: failed to queue ClientCert after ratchet: {}", e);
+                        } else {
+                            debug!(
+                                "mTLS: ClientCert queued after PFS ratchet ({} bytes)",
+                                cert.len()
+                            );
+                        }
+                    }
+
+                    let _ = self
+                        .send_control(&ControlPayload::RecordingStatusRequest)
+                        .await;
+
+                    // Device enrollment: prove static key ownership to server.
+                    // Sent after ratchet so it is protected by PFS session keys.
+                    // dh_proof is bound to THIS session's ephemeral transcript
+                    // (server_eph_pub || client_eph_pub, matching the server's
+                    // verify_device_enrollment_proof) so it cannot be replayed
+                    // into a different session — see
+                    // crypto::device_enrollment_proof for the scheme.
+                    if let Some(ref skp) = self.static_keypair {
+                        match skp.compute_shared(&self.config.server_public_key) {
+                            Ok(dh_shared) => {
+                                let client_eph_pub = self.keypair.public_key_bytes();
+                                let dh_proof = crypto::device_enrollment_proof(
+                                    &dh_shared,
+                                    &server_eph_pub,
+                                    &client_eph_pub,
+                                );
+                                let enrollment = ControlPayload::DeviceEnrollment {
+                                    static_pub: skp.public_key_bytes(),
+                                    dh_proof,
+                                };
+                                if let Err(e) = self.send_control(&enrollment).await {
+                                    warn!("DeviceEnrollment send failed: {}", e);
+                                }
+                            }
+                            Err(e) => warn!("DeviceEnrollment DH failed: {}", e),
+                        }
                     }
                 }
 
-                let _ = self
-                    .send_control(&ControlPayload::RecordingStatusRequest)
-                    .await;
+                // B2/D2 fix: session-bound NodeEnrollment for the embedded
+                // control_only pool-peer dialer. `node_identity` is `Some`
+                // ONLY when `aivpn-server`'s `pool_dialer.rs` constructed
+                // this client to dial a fellow pool node (see
+                // `ClientConfig::node_identity`'s doc comment) — for every
+                // ordinary end-user client it is `None` and this whole block
+                // is a no-op, matching pre-fix behavior exactly.
+                //
+                // The proof is built HERE (not in pool_dialer.rs, where it
+                // used to be built pre-fix) because only this handler has
+                // this session's ephemeral transcript
+                // (server_eph_pub || client_eph_pub): `server_eph_pub` is the
+                // value this exact ServerHello just carried, and
+                // `client_eph_pub` is `self.keypair.public_key_bytes()` — our
+                // own ephemeral public key for this session, fixed for its
+                // lifetime. Binding to that pair (mirrors
+                // `crypto::device_enrollment_proof`'s scheme above) is what
+                // makes a captured `(node_id, node_pub, time_window,
+                // signature)` tuple useless if replayed onto a DIFFERENT
+                // masked pool-peer session — that session's transcript
+                // differs, so `verify_node_enrollment` on the receiving end
+                // no longer matches.
+                if let Some(node_identity) = self.config.node_identity.clone() {
+                    let client_eph_pub = self.keypair.public_key_bytes();
+                    let node_pub = node_identity.verifying_key().to_bytes();
+                    let node_id = self.config.pool_node_id.clone().unwrap_or_default();
 
-                // Device enrollment: prove static key ownership to server.
-                // Sent after ratchet so it is protected by PFS session keys.
-                // dh_proof is bound to THIS session's ephemeral transcript
-                // (server_eph_pub || client_eph_pub, matching the server's
-                // verify_device_enrollment_proof) so it cannot be replayed
-                // into a different session — see
-                // crypto::device_enrollment_proof for the scheme.
-                if let Some(ref skp) = self.static_keypair {
-                    match skp.compute_shared(&self.config.server_public_key) {
-                        Ok(dh_shared) => {
-                            let client_eph_pub = self.keypair.public_key_bytes();
-                            let dh_proof = crypto::device_enrollment_proof(
-                                &dh_shared,
-                                &server_eph_pub,
-                                &client_eph_pub,
+                    // Send immediately — mirrors DeviceEnrollment's
+                    // reliability behavior above: this fires on every
+                    // ServerHello the client processes (including the
+                    // server's lost-original-ServerHello resends), so a
+                    // dropped first NodeEnrollment packet self-heals the
+                    // next time the server retransmits.
+                    let enrollment = build_node_enrollment_payload(
+                        &node_identity,
+                        &node_id,
+                        &node_pub,
+                        &server_eph_pub,
+                        &client_eph_pub,
+                    );
+                    if let Err(e) = self.send_control(&enrollment).await {
+                        warn!("NodeEnrollment send failed: {}", e);
+                    }
+
+                    // Periodic resend: once per REAL ratchet (a full
+                    // reconnect spawns a brand-new AivpnClient/task, so this
+                    // never accumulates duplicate timers across the client's
+                    // lifetime) so a peer whose NodeRegistry restarted (or
+                    // that never saw our initial enrollment) re-learns/
+                    // re-verifies us without waiting for a fresh dial.
+                    // Rebuilt with a fresh time_window every tick but the
+                    // SAME session transcript — server_eph_pub/client_eph_pub
+                    // are stable for the life of this session.
+                    if !is_duplicate_hello {
+                        if let Some(tx) = self.control_tx.clone() {
+                            Self::spawn_node_enrollment_resend(
+                                tx,
+                                node_identity,
+                                node_id,
+                                node_pub,
+                                server_eph_pub,
+                                client_eph_pub,
                             );
-                            let enrollment = ControlPayload::DeviceEnrollment {
-                                static_pub: skp.public_key_bytes(),
-                                dh_proof,
-                            };
-                            if let Err(e) = self.send_control(&enrollment).await {
-                                warn!("DeviceEnrollment send failed: {}", e);
-                            }
+                        } else {
+                            warn!(
+                                "control_tx not initialized, skipping NodeEnrollment periodic resend"
+                            );
                         }
-                        Err(e) => warn!("DeviceEnrollment DH failed: {}", e),
                     }
                 }
 
@@ -3142,6 +3431,26 @@ impl AivpnClient {
                 self.reject_reason = reason;
                 self.disconnect().await;
                 return Err(Error::Session(format!("handshake rejected: {}", message)));
+            }
+            ControlPayload::PoolSync { .. }
+            | ControlPayload::PoolStateDigest { .. }
+            | ControlPayload::PoolBucketDigests { .. }
+            | ControlPayload::RouteSync { .. } => {
+                // Normal end-user clients have no use for these pool
+                // anti-entropy messages and silently ignore them, exactly as
+                // before. When the server has embedded this client as a
+                // headless control-only pool-peer dialer (see
+                // `ClientConfig::control_only`), forward a clone to the
+                // configured tap instead so the embedder can drive its own
+                // merge logic — never block the receive path on the tap.
+                if let Some(tap) = &self.config.inbound_control_tap {
+                    if let Err(e) = tap.try_send(control) {
+                        warn!(
+                            "inbound_control_tap: failed to forward pool control payload: {}",
+                            e
+                        );
+                    }
+                }
             }
             _ => {}
         }
@@ -3553,6 +3862,10 @@ mod tests {
             mask_verify_mode: aivpn_common::mask::MaskVerifyMode::default(),
             network_change_notify: None,
             is_bootstrap_fallback: false,
+            control_only: false,
+            inbound_control_tap: None,
+            node_identity: None,
+            pool_node_id: None,
         }
     }
 

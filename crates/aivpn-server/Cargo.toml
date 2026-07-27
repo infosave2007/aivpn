@@ -17,6 +17,11 @@ path = "src/bin/aivpn-mask-repair.rs"
 
 [dependencies]
 aivpn-common = { path = "../aivpn-common", version = "*" }
+# FORK-B pool-sync dialer: the server embeds a headless control-only
+# `AivpnClient` to dial pool peers as a masked pool-client (see
+# `pool_dialer.rs`). Only reachable when `pool.transport = "masked"` is
+# configured — additive, no effect on default behavior.
+aivpn-client = { path = "../aivpn-client", version = "*" }
 
 # Crypto
 chacha20poly1305.workspace = true

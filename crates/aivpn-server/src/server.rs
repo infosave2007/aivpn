@@ -90,6 +90,20 @@ pub struct ServerArgs {
     #[arg(long, value_name = "PATH")]
     pub validate_mask: Option<String>,
 
+    /// List all pool nodes bound in the node identity registry
+    /// (`pool_nodes.json`, sibling to --clients-db), one node_id + base64
+    /// pubkey per line. These are the crypto-proven identities (via
+    /// NodeEnrollment) that site-to-site RouteSync authorization trusts.
+    #[arg(long)]
+    pub list_nodes: bool,
+
+    /// Revoke a bound pool node's identity by node_id, removing it from the
+    /// node registry (`pool_nodes.json`, sibling to --clients-db). A
+    /// revoked node must re-bind (TOFU, if still allowed) before its
+    /// RouteSync adverts are trusted again.
+    #[arg(long, value_name = "NODE_ID")]
+    pub revoke_node: Option<String>,
+
     // ── Pool ─────────────────────────────────────────────────────────────────
     /// Pool configuration JSON file path.
     /// Contains: {"peers": ["host:port", ...], "sync_port": 444, "sync_key": "hex"}
@@ -297,6 +311,37 @@ impl AivpnServer {
     /// Set multi-hop chain forwarder.  Must be called before `run()`.
     pub fn set_chain_forwarder(&mut self, cf: Arc<crate::chain_forwarder::ChainForwarder>) {
         self.gateway.set_chain_forwarder(cf);
+    }
+
+    /// PHASE 3 (exit / chain-forward over masked transport): wire the
+    /// masked pool-client exit route in place of the legacy chain forwarder.
+    /// Must be called before `run()`. See `Gateway::set_masked_exit`.
+    pub fn set_masked_exit(
+        &mut self,
+        dialer: Arc<crate::pool_dialer::PoolDialer>,
+        exit_addr: String,
+    ) {
+        self.gateway.set_masked_exit(dialer, exit_addr);
+    }
+
+    /// PHASE 4 (reverse chain-forward): hand out a clone of the sender an
+    /// exit node's reverse-direction `ChainForward` reply should be pushed
+    /// into on this (entry) node. See `Gateway::chain_reverse_downlink_sender`.
+    pub fn chain_reverse_downlink_sender(&self) -> tokio::sync::mpsc::Sender<Vec<u8>> {
+        self.gateway.chain_reverse_downlink_sender()
+    }
+
+    /// PHASE 4 (per-node identity): install the pool-node identity registry.
+    /// Must be called before `run()`. See `Gateway::set_node_registry`.
+    pub fn set_node_registry(&mut self, registry: Arc<crate::node_registry::NodeRegistry>) {
+        self.gateway.set_node_registry(registry);
+    }
+
+    /// D1 (Phase 4): enforce crypto-proven node identity in route
+    /// authorization (`pool.require_node_enrollment`). See
+    /// `Gateway::set_require_node_enrollment`.
+    pub fn set_require_node_enrollment(&mut self, require: bool) {
+        self.gateway.set_require_node_enrollment(require);
     }
 
     /// Return a shared handle to the live Prometheus metrics collector, for

@@ -10,6 +10,8 @@ use aivpn_server::client_db::UpdateClientParams;
 #[cfg(feature = "dns")]
 use aivpn_server::dns_proxy::DnsProxyConfig;
 use aivpn_server::gateway::GatewayConfig;
+use aivpn_server::node_registry::NodeRegistry;
+use aivpn_server::pool_dialer::PoolDialer;
 use aivpn_server::pool_sync::{PeerSyncer, PoolSyncConfig};
 use aivpn_server::qos::{dscp_by_name, parse_bandwidth, ClientQos, QosEnforcer};
 use aivpn_server::server_config::{MtuSetting, ServerFileConfig};
@@ -193,6 +195,22 @@ async fn main() {
     }
     if let Some(ref id) = args.show_client {
         handle_show_client(&client_db, id, &args);
+        return;
+    }
+    // PHASE 4 (per-node crypto identity): --list-nodes / --revoke-node
+    // operate on the pool-node identity registry (`pool_nodes.json`,
+    // resolved as a sibling of --clients-db — same convention `main()`
+    // itself uses when wiring up the masked-transport NodeRegistry). These
+    // are CLI-only management commands: run, print, and exit before the
+    // gateway starts, exactly like --add-client/--show-client above.
+    if args.list_nodes {
+        let pool_nodes_path = Path::new(&args.clients_db).with_file_name("pool_nodes.json");
+        handle_list_nodes(&pool_nodes_path);
+        return;
+    }
+    if let Some(ref node_id) = args.revoke_node {
+        let pool_nodes_path = Path::new(&args.clients_db).with_file_name("pool_nodes.json");
+        handle_revoke_node(&pool_nodes_path, node_id);
         return;
     }
     if let Some(ref output_path) = args.export.clone() {
@@ -392,6 +410,23 @@ async fn main() {
     let client_db_for_sync: Option<Arc<ClientDatabase>> =
         pool_sync_config.as_ref().map(|_| client_db.clone());
 
+    // FORK-B pool-sync DIALER: decode `sync_key` once, up front, reused both
+    // to derive the gateway's masked-pool-client recognition keys below and
+    // to construct `PoolDialer` further down. Only meaningful when
+    // `transport = "masked"` — for the default/legacy transport this stays
+    // `None` and `GatewayConfig::pool_server_keypair`/`pool_client_psk` stay
+    // `None`, reproducing byte-for-byte the pre-existing behavior.
+    let pool_masked_sync_key: Option<[u8; 32]> = pool_sync_config
+        .as_ref()
+        .filter(|c| c.transport_is_masked())
+        .and_then(|c| c.sync_key.as_deref())
+        .and_then(|k| {
+            use base64::Engine as _;
+            base64::engine::general_purpose::STANDARD.decode(k).ok()
+        })
+        .and_then(|b| b.try_into().ok())
+        .filter(|k: &[u8; 32]| k != &[0u8; 32]);
+
     // Build per-client QoS enforcer, pre-loaded from the client DB
     let qos_enforcer = {
         let enforcer = Arc::new(QosEnforcer::new());
@@ -481,6 +516,13 @@ async fn main() {
         mask_signing_key: resolve_mask_signing_key(&args, file_config.as_ref()),
         mask_operator_pubkey: resolve_mask_operator_pubkey(&args, file_config.as_ref()),
         mask_verify_mode: resolve_mask_verify_mode(&args, file_config.as_ref()),
+        // FORK-B pool-sync masked pool-client recognition: `Some` only when
+        // `pool.transport = "masked"` and a valid `sync_key` is configured
+        // (see `pool_masked_sync_key` above) — every other configuration
+        // (transport unset/"legacy", or no pool config at all) leaves both
+        // `None`, matching the gateway's pre-existing byte-for-byte behavior.
+        pool_server_keypair: pool_masked_sync_key.map(|k| crypto::pool_server_keypair(&k)),
+        pool_client_psk: pool_masked_sync_key.map(|k| crypto::pool_client_psk(&k)),
     };
 
     // Create and run server
@@ -555,8 +597,162 @@ async fn main() {
 
             // Start pool sync after session_manager and mask catalog are initialised.
             // Sync packets ride the existing VPN UDP port — no extra TCP port needed.
+            //
+            // FORK-B: `transport = "masked"` switches to the new `PoolDialer`
+            // (each node dials its peers as a masked, headless pool-client and
+            // runs bidirectional DB anti-entropy over that session) INSTEAD OF
+            // the legacy mask-independent, push-only `PeerSyncer` — the two
+            // are mutually exclusive per node. Any other transport value
+            // (including unset, the default) keeps running the exact
+            // pre-existing `PeerSyncer` path below, unchanged.
+            // PHASE 3 (exit / chain-forward over masked transport): set when
+            // the masked-transport branch below already wired
+            // `server.set_masked_exit(..)` for a configured `exit_node`, so
+            // the legacy dedicated-socket `ChainForwarder` block further
+            // down skips building a second, redundant exit path. Stays
+            // `false` (and the legacy block runs exactly as before) for the
+            // default/legacy transport, or when masked transport has no
+            // `exit_node` configured.
+            let mut masked_exit_wired = false;
+            // BUG E1 fix: tracks whether the masked `PoolDialer` actually
+            // STARTED (set true only inside the `PoolDialer::new(..) =>
+            // Some(dialer)` success branch below), as opposed to merely
+            // being configured (`pool.transport == "masked"`). The
+            // site-to-site channel selection further down must key off
+            // this — not off the config value — so that a bad/missing
+            // `pool.sync_key` (or other `PoolDialer::new` failure) falls
+            // back to the working legacy `site_sync::start` path instead of
+            // going dark.
+            let mut masked_dialer_active = false;
             if let (Some(ref pool_cfg), Some(db)) = (&pool_sync_config, client_db_for_sync) {
-                if let Some(syncer) = PeerSyncer::new(db, pool_cfg, event_bus.clone()) {
+                if pool_cfg.transport_is_masked() {
+                    // PHASE 3 (site-to-site over masked transport): when
+                    // site_to_site is ALSO configured, hand this node's
+                    // local_subnets to the dialer so it advertises them as
+                    // `RouteSync` over the same masked pool-peer sessions —
+                    // reusing pool.peers as the dial set. Empty when
+                    // site-to-site isn't configured, which makes the dialer's
+                    // RouteSync advertise path a no-op (plain pool-sync-only
+                    // masked transport, unchanged from Phase 1/2).
+                    let site_local_subnets: Vec<String> = s2s_config
+                        .as_ref()
+                        .map(|c| c.local_subnets.clone())
+                        .unwrap_or_default();
+
+                    // PHASE 3 (exit / chain-forward): `pool.exit_node` is an
+                    // independent config knob from `pool.peers` — an
+                    // operator may point at an exit node that isn't also a
+                    // pool-sync peer. Make sure the dialer's dial set
+                    // includes it so a masked pool-client session to the
+                    // exit node exists for `ChainForward` to ride. A clone
+                    // is cheap here (a handful of small strings) and keeps
+                    // `PoolDialer::new`'s existing `&PoolSyncConfig`
+                    // interface untouched.
+                    let dialer_cfg: PoolSyncConfig = {
+                        let mut cfg = pool_cfg.clone();
+                        if let Some(ref exit_node) = pool_cfg.exit_node {
+                            if !cfg.peers.iter().any(|p| p == exit_node) {
+                                cfg.peers.push(exit_node.clone());
+                            }
+                        }
+                        cfg
+                    };
+
+                    // PHASE 4 (reverse chain-forward): only an entry node
+                    // that actually dials an exit (masked transport AND
+                    // `pool.exit_node` configured) needs anywhere to deliver
+                    // a reverse-direction `ChainForward` reply — every other
+                    // masked-transport node (plain pool-sync peer, or an
+                    // exit node itself, which routes replies via its own
+                    // `chain_reverse_routes` table instead) leaves this
+                    // `None` and the dialer's inbound tap for `ChainForward`
+                    // simply drops it.
+                    let reverse_downlink_tx = pool_cfg
+                        .exit_node
+                        .is_some()
+                        .then(|| server.chain_reverse_downlink_sender());
+
+                    // PHASE 4 (per-node cryptographic identity): resolve
+                    // this node's own durable Ed25519 identity — loaded from
+                    // `pool.node_identity_key` if configured, else generated
+                    // (and persisted) at `node_identity.key` sibling to the
+                    // clients-db file — and hand it to the dialer so it can
+                    // sign a `NodeEnrollment` proof for every peer it dials.
+                    // Also install the pool-node identity registry
+                    // (`pool_nodes.json`, likewise sibling to clients-db) so
+                    // the gateway's RECEIVE side can bind/verify peers that
+                    // dial IN to us. Both are scoped to masked transport
+                    // only — the legacy `PeerSyncer` branch below never
+                    // reaches this code, so it stays byte-for-byte
+                    // unchanged (no identity, no registry).
+                    let node_identity_key_path = pool_cfg
+                        .node_identity_key
+                        .as_ref()
+                        .map(PathBuf::from)
+                        .unwrap_or_else(|| {
+                            Path::new(&args.clients_db).with_file_name("node_identity.key")
+                        });
+                    let node_identity_seed =
+                        load_or_generate_node_identity_seed(&node_identity_key_path);
+                    let node_signing_key = crypto::node_identity_from_seed(&node_identity_seed);
+
+                    let pool_nodes_path =
+                        Path::new(&args.clients_db).with_file_name("pool_nodes.json");
+                    let node_registry = Arc::new(NodeRegistry::load(
+                        pool_nodes_path,
+                        pool_cfg.allow_auto_add(),
+                    ));
+                    server.set_node_registry(node_registry);
+                    // D1: enforce crypto-proven node identity in route
+                    // authorization when the operator opts in
+                    // (pool.require_node_enrollment). Default false keeps the
+                    // migration-safe behavior (self-asserted node_id trusted
+                    // with a warning) until the whole cluster runs Phase 4.
+                    server.set_require_node_enrollment(pool_cfg.require_node_enrollment());
+
+                    if let Some(dialer) = PoolDialer::new(
+                        db,
+                        &dialer_cfg,
+                        site_local_subnets,
+                        reverse_downlink_tx,
+                        Some(node_signing_key),
+                    ) {
+                        // BUG E1 fix: the masked dialer actually started —
+                        // the site-to-site selection below relies on this,
+                        // not on the config-only `transport_is_masked()`.
+                        masked_dialer_active = true;
+
+                        // PHASE 3: wire the masked exit route BEFORE handing
+                        // the dialer's Arc off to `start` (which consumes
+                        // it) — `exit_addr` here must be byte-for-byte the
+                        // same string just ensured above to be in
+                        // `dialer_cfg.peers`, since it doubles as the
+                        // `PoolDialer::send_to_peer` lookup key.
+                        if let Some(ref exit_node) = pool_cfg.exit_node {
+                            server.set_masked_exit(dialer.clone(), exit_node.clone());
+                            info!(
+                                "Multi-hop: chain forwarding to exit node {} over masked \
+                                 pool-client transport",
+                                exit_node
+                            );
+                            masked_exit_wired = true;
+                        }
+
+                        // No process-wide graceful-shutdown flag exists yet for
+                        // background tasks in this server (the legacy
+                        // `PeerSyncer::start` loops likewise run until process
+                        // exit) — a fresh, never-flipped `AtomicBool` reproduces
+                        // that same "runs until the process exits" behavior
+                        // while still satisfying `AivpnClient::run`'s shutdown
+                        // signature.
+                        let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                        dialer.start(shutdown);
+                        info!(
+                            "Pool sync active ({} peers, masked pool-client transport)",
+                            dialer_cfg.peers.len()
+                        );
+                    }
+                } else if let Some(syncer) = PeerSyncer::new(db, pool_cfg, event_bus.clone()) {
                     syncer.start(server.session_manager());
                     info!(
                         "Pool sync active ({} peers, in-protocol UDP)",
@@ -564,52 +760,102 @@ async fn main() {
                     );
                 }
             }
-            // Multi-hop: create chain forwarder if exit_node is configured
-            if let Some(ref pool_cfg) = pool_sync_config {
-                if let Some(ref exit_node) = pool_cfg.exit_node {
-                    use base64::Engine as _;
-                    let sync_key_opt: Option<[u8; 32]> = pool_cfg
-                        .sync_key
-                        .as_deref()
-                        .and_then(|k| base64::engine::general_purpose::STANDARD.decode(k).ok())
-                        .and_then(|b| b.try_into().ok())
-                        .filter(|k: &[u8; 32]| k != &[0u8; 32]);
-                    match sync_key_opt {
-                        None => {
-                            tracing::error!(
-                                "Multi-hop: pool.sync_key is missing, invalid, or all-zero \
-                                 — chain forwarder NOT started (exit_node={})",
-                                exit_node
-                            );
-                        }
-                        Some(sync_key) => match aivpn_server::chain_forwarder::ChainForwarder::new(
-                            exit_node,
-                            sync_key,
-                            pool_cfg.node_id.as_deref(),
-                        )
-                        .await
-                        {
-                            Some(cf) => {
-                                server.set_chain_forwarder(cf);
-                                info!("Multi-hop: chain forwarding to exit node {}", exit_node);
-                            }
+            // Multi-hop: create the legacy dedicated-socket chain forwarder
+            // if exit_node is configured — but only when the masked
+            // transport branch above didn't already wire the exit route via
+            // `server.set_masked_exit` (`masked_exit_wired`). Under the
+            // default/legacy transport this `if` is always true and the
+            // block below runs exactly as before, byte-for-byte.
+            if !masked_exit_wired {
+                if let Some(ref pool_cfg) = pool_sync_config {
+                    if let Some(ref exit_node) = pool_cfg.exit_node {
+                        use base64::Engine as _;
+                        let sync_key_opt: Option<[u8; 32]> = pool_cfg
+                            .sync_key
+                            .as_deref()
+                            .and_then(|k| base64::engine::general_purpose::STANDARD.decode(k).ok())
+                            .and_then(|b| b.try_into().ok())
+                            .filter(|k: &[u8; 32]| k != &[0u8; 32]);
+                        match sync_key_opt {
                             None => {
-                                error!(
-                                    "Multi-hop: chain forwarder FAILED to start \
-                                         (exit_node={}) — multi-hop is disabled; see the \
-                                         preceding warnings for the cause",
+                                tracing::error!(
+                                    "Multi-hop: pool.sync_key is missing, invalid, or all-zero \
+                                     — chain forwarder NOT started (exit_node={})",
                                     exit_node
                                 );
                             }
-                        },
+                            Some(sync_key) => {
+                                match aivpn_server::chain_forwarder::ChainForwarder::new(
+                                    exit_node,
+                                    sync_key,
+                                    pool_cfg.node_id.as_deref(),
+                                )
+                                .await
+                                {
+                                    Some(cf) => {
+                                        server.set_chain_forwarder(cf);
+                                        info!(
+                                            "Multi-hop: chain forwarding to exit node {}",
+                                            exit_node
+                                        );
+                                    }
+                                    None => {
+                                        error!(
+                                            "Multi-hop: chain forwarder FAILED to start \
+                                             (exit_node={}) — multi-hop is disabled; see the \
+                                             preceding warnings for the cause",
+                                            exit_node
+                                        );
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
 
             // Start site-to-site route sync — pass session_manager so peer sessions are registered.
+            //
+            // PHASE 3: when the masked `PoolDialer` actually STARTED
+            // (`masked_dialer_active`), it already advertises
+            // `s2s_config.local_subnets` (and installs peers' routes) over
+            // the masked pool-peer sessions — see `site_local_subnets`
+            // above. Starting the legacy `site_sync::start` path here TOO
+            // would double-advertise routes over two independent channels
+            // for the same subnets.
+            //
+            // BUG E1 fix: this selection used to key off the config-only
+            // `pool.transport == "masked"` value. If `PoolDialer::new`
+            // failed (missing/invalid/zero `pool.sync_key`, or missing
+            // `pool.node_id`) the masked dialer never started, yet
+            // site-to-site still took the `init_config_only` branch —
+            // silently disabling all outbound route advertising with no
+            // fallback, even though the legacy `site_sync::start` path
+            // (which uses its own independent per-peer sync_key) would have
+            // worked fine. Keying off `masked_dialer_active` — set only in
+            // the `PoolDialer::new` success branch above — makes this a
+            // real fallback: masked dialer up → masked-only advertising;
+            // masked dialer absent or failed to start → legacy
+            // `site_sync::start`. Under the default/legacy transport
+            // (unset or any value other than exactly "masked"),
+            // `masked_dialer_active` stays false and `site_sync` starts
+            // exactly as before.
             if let Some(ref s2s_cfg) = s2s_config {
-                aivpn_server::site_sync::start(s2s_cfg, server.session_manager());
-                info!("Site-to-site active ({} peers)", s2s_cfg.peers.len());
+                if masked_dialer_active {
+                    // Still populate SITE_CONFIG (needed by
+                    // `handle_route_sync`'s allowlist lookup for inbound
+                    // RouteSync arriving over the masked pool-peer session)
+                    // WITHOUT starting the legacy outbound loops/sessions.
+                    aivpn_server::site_sync::init_config_only(s2s_cfg);
+                    info!(
+                        "Site-to-site active ({} peers, advertised over masked pool-client \
+                         transport — legacy site_sync channel not started)",
+                        s2s_cfg.peers.len()
+                    );
+                } else {
+                    aivpn_server::site_sync::start(s2s_cfg, server.session_manager());
+                    info!("Site-to-site active ({} peers)", s2s_cfg.peers.len());
+                }
             }
 
             // Start DNS-over-HTTPS proxy
@@ -841,6 +1087,102 @@ fn handle_gen_mask_signing_key(path: &str) {
         "   Public key (base64) — distribute to servers (--mask-operator-pubkey)\n   and clients (--mask-operator-pubkey / config mask_operator_pubkey):\n   {}",
         base64::engine::general_purpose::STANDARD.encode(pubkey)
     );
+}
+
+/// PHASE 4 (per-node cryptographic identity, SEND side): resolve this node's
+/// own durable Ed25519 identity seed at `path`. Loads it if present (must be
+/// exactly 32 raw bytes — same convention as `--key-file`'s server private
+/// key, see the `server_private_key` loading above); otherwise generates 32
+/// random bytes and persists them atomically with 0600 permissions in a
+/// single `create_new` + `mode` open (mirrors `handle_gen_mask_signing_key`'s
+/// O_EXCL+mode create — no write-then-chmod window). Never logs the seed
+/// itself, only the path it was loaded from or written to.
+///
+/// BUG D4 fix: a failure to PERSIST a freshly generated seed (either the
+/// `create_new` open or the subsequent `write_all`) is FATAL — this used to
+/// fall back to an ephemeral, unpersisted, in-memory-only seed "for this run
+/// only". That fallback is unsafe once peers have TOFU-pinned this node
+/// under its previous identity: every restart after a persist failure would
+/// silently mint a brand-new, never-saved identity, and every peer that
+/// pinned the old one then rejects this node's `NodeEnrollment` with a
+/// `node_pub` mismatch — the node silently loses ALL of its pool
+/// route-sync trust. So we hard-exit here, matching the existing hard-exit
+/// for a malformed/unreadable EXISTING seed file (see the `Err` arms
+/// below) — only the happy path (existing valid seed) and the successful
+/// generate-and-persist path return normally.
+fn load_or_generate_node_identity_seed(path: &Path) -> [u8; 32] {
+    match std::fs::read(path) {
+        Ok(bytes) => {
+            if bytes.len() != 32 {
+                error!(
+                    "Pool-node identity key '{}' must be exactly 32 bytes, got {}",
+                    path.display(),
+                    bytes.len()
+                );
+                std::process::exit(1);
+            }
+            let mut seed = [0u8; 32];
+            seed.copy_from_slice(&bytes);
+            info!("Loaded pool-node identity from {}", path.display());
+            seed
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            use rand::RngCore;
+            let mut seed = [0u8; 32];
+            rand::rngs::OsRng.fill_bytes(&mut seed);
+
+            #[cfg(unix)]
+            let created = {
+                use std::os::unix::fs::OpenOptionsExt;
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(path)
+            };
+            #[cfg(not(unix))]
+            let created = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(path);
+
+            match created {
+                Ok(mut f) => {
+                    use std::io::Write;
+                    if let Err(e) = f.write_all(&seed) {
+                        error!(
+                            "node identity could not be persisted at '{}': {} — refusing to \
+                             run with an ephemeral identity that would break pool trust on \
+                             restart — fix permissions/disk and retry",
+                            path.display(),
+                            e
+                        );
+                        std::process::exit(1);
+                    }
+                    info!("Generated a new pool-node identity at {}", path.display());
+                }
+                Err(e) => {
+                    error!(
+                        "node identity could not be persisted at '{}': {} — refusing to run \
+                         with an ephemeral identity that would break pool trust on restart — \
+                         fix permissions/disk and retry",
+                        path.display(),
+                        e
+                    );
+                    std::process::exit(1);
+                }
+            }
+            seed
+        }
+        Err(e) => {
+            error!(
+                "Failed to read pool-node identity key '{}': {}",
+                path.display(),
+                e
+            );
+            std::process::exit(1);
+        }
+    }
 }
 
 /// `--sign-mask-dir DIR`: sign every `*.json` mask in DIR in place (and its
@@ -1129,6 +1471,45 @@ fn handle_list_clients(db: &ClientDatabase) {
     }
     println!();
     println!("Total: {} client(s)", clients.len());
+}
+
+/// PHASE 4 (per-node crypto identity): print every pool node currently
+/// bound in the node identity registry — the set of `node_id`s whose
+/// `NodeEnrollment` Ed25519 proof this server will accept, and which
+/// `site_sync::handle_route_sync` now trusts over any self-asserted
+/// `node_id` in a RouteSync payload. `allow_auto_add: false` here since a
+/// read-only listing must never itself bind a new (empty) registry entry.
+fn handle_list_nodes(pool_nodes_path: &std::path::Path) {
+    use base64::Engine;
+    let registry = NodeRegistry::load(pool_nodes_path.to_path_buf(), false);
+    let nodes = registry.list();
+    if nodes.is_empty() {
+        println!("No pool nodes bound.");
+        return;
+    }
+    for (node_id, pubkey) in nodes {
+        println!(
+            "{}  {}",
+            node_id,
+            base64::engine::general_purpose::STANDARD.encode(pubkey)
+        );
+    }
+}
+
+/// PHASE 4 (per-node crypto identity): revoke a bound pool node's identity
+/// by `node_id`. A revoked node must re-bind (TOFU, if `allow_auto_add` is
+/// still enabled in the pool config) before its RouteSync adverts are
+/// trusted again — see `site_sync::handle_route_sync`'s `verified_node_id`
+/// handling. `allow_auto_add: false` here too: revocation must never
+/// silently create the registry file with a fresh (empty) state.
+fn handle_revoke_node(pool_nodes_path: &std::path::Path, node_id: &str) {
+    let registry = NodeRegistry::load(pool_nodes_path.to_path_buf(), false);
+    if registry.revoke(node_id) {
+        println!("✅ Pool node '{}' revoked.", node_id);
+    } else {
+        eprintln!("❌ Pool node '{}' not found in the registry.", node_id);
+        std::process::exit(1);
+    }
 }
 
 fn handle_show_client(db: &ClientDatabase, id: &str, args: &ServerArgs) {
@@ -2026,6 +2407,8 @@ mod tests {
             per_ip_pps_limit: 1000,
             mask_dir: None,
             validate_mask: None,
+            list_nodes: false,
+            revoke_node: None,
             #[cfg(all(feature = "management-api", unix))]
             management_socket: None,
             pool_config: None,

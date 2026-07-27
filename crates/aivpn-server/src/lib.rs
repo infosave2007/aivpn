@@ -16,6 +16,7 @@ pub mod batch_io;
 pub mod client_db;
 pub mod gateway;
 pub mod nat;
+pub mod node_registry;
 pub mod server;
 pub mod session;
 
@@ -44,6 +45,7 @@ pub mod recording;
 pub mod audit_log;
 pub mod backup;
 pub mod ebpf_observer;
+pub mod pool_dialer;
 pub mod pool_sync;
 pub mod qos;
 pub mod tc_loader;

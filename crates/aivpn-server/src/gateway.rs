@@ -237,6 +237,20 @@ pub struct GatewayConfig {
     /// existing unsigned corpora keep working. Sourced from
     /// `--mask-verify-mode` / server.json `mask_verify_mode`.
     pub mask_verify_mode: aivpn_common::mask::MaskVerifyMode,
+    /// FORK-B pool-sync redesign: the shared masked-pool-client server
+    /// keypair (`crypto::pool_server_keypair(sync_key)`), used to recognize
+    /// an incoming masked pool-client handshake from a sibling aivpn node —
+    /// the DH side of that handshake is computed against THIS keypair's
+    /// public key rather than the real long-term `server_private_key`.
+    /// `None` (default) disables all masked-pool-peer handshake recognition;
+    /// with it `None` (paired with `pool_client_psk` also `None`) behavior is
+    /// byte-for-byte unchanged from before this feature existed.
+    pub pool_server_keypair: Option<aivpn_common::crypto::KeyPair>,
+    /// FORK-B pool-sync redesign: the shared masked-pool-client PSK
+    /// (`crypto::pool_client_psk(sync_key)`), paired with
+    /// `pool_server_keypair`. Both must be `Some` for masked pool-client
+    /// handshakes to be recognized.
+    pub pool_client_psk: Option<[u8; 32]>,
 }
 
 /// Default §2 `report_failure_threshold`. Kept in sync with the client's
@@ -284,6 +298,8 @@ impl Default for GatewayConfig {
             mask_signing_key: None,
             mask_operator_pubkey: None,
             mask_verify_mode: aivpn_common::mask::MaskVerifyMode::default(),
+            pool_server_keypair: None,
+            pool_client_psk: None,
         }
     }
 }
@@ -655,6 +671,118 @@ fn try_claim_mask_feedback_slot(
     try_claim_slot(throttle, session_id, now, mask_feedback_throttled)
 }
 
+/// PHASE 4 (reverse chain-forward / exit downlink gap): how long an exit
+/// node remembers which masked pool-peer session an origin client's uplink
+/// `ChainForward` most recently arrived on (see `Gateway::chain_reverse_routes`
+/// and `chain_reverse_route_insert`/`chain_reverse_route_lookup`). A downlink
+/// reply for that client's VPN IP arriving after this window has elapsed is
+/// treated as if no route exists — the peer may have reconnected under a new
+/// session id, or the client may simply have gone idle — and falls through to
+/// the pre-existing "TUN: no session for VPN IP" drop instead of being routed
+/// to a session that might no longer be the right one (or might not exist).
+const CHAIN_REVERSE_ROUTE_TTL: Duration = Duration::from_secs(600);
+
+/// Opportunistic sweep cadence for `chain_reverse_routes`, in inserts: every
+/// this-many calls to `chain_reverse_route_insert`, expired entries are
+/// purged via `DashMap::retain`. Keeps the map bounded on a long-running exit
+/// node without a dedicated timer task.
+///
+/// BUG C3 fix: this used to be gated on `routes.len() % CHAIN_REVERSE_SWEEP_EVERY
+/// == 0`, but `len()` only advances on a brand-new key — once the map's
+/// distinct-IP population plateaus (any subnet with <= `CHAIN_REVERSE_SWEEP_EVERY`
+/// live hosts, e.g. any /24 or smaller VPN subnet, which is the overwhelmingly
+/// common case) `len()` stops changing on refresh-only inserts and the gate
+/// never fires again, so the TTL sweep silently stops running for the rest of
+/// the exit node's uptime. Fixed by gating on a dedicated monotonic insert
+/// counter (`Gateway::chain_reverse_insert_count`) instead, which advances on
+/// every insert regardless of whether the key is new.
+const CHAIN_REVERSE_SWEEP_EVERY: usize = 256;
+
+/// Record that `src_ip`'s uplink `ChainForward` traffic arrived on the masked
+/// pool-peer session `session_id`, so a later downlink reply to `src_ip` can
+/// be routed back over that same session instead of being dropped (see
+/// `Gateway::chain_reverse_routes`'s doc comment for the full picture).
+/// Opportunistically sweeps entries older than `CHAIN_REVERSE_ROUTE_TTL`
+/// every `CHAIN_REVERSE_SWEEP_EVERY` inserts (driven by `insert_count`, a
+/// monotonic counter of calls to this function — see `CHAIN_REVERSE_SWEEP_EVERY`'s
+/// doc comment for why this can't be `routes.len()`).
+///
+/// BUG C1 fix: does NOT unconditionally overwrite an existing entry anymore.
+/// Any masked pool-peer can send a `ChainForward` with an arbitrary inner
+/// source IP (only the *subnet* is validated, not that the sender legitimately
+/// owns that specific address — see the src-IP-spoofing check's own doc
+/// comment in `handle_control_message`'s `ChainForward` arm), so a second,
+/// unrelated peer forging a victim client's `inner_src` could previously
+/// last-writer-wins hijack that IP's reverse route and silently steal its
+/// downlink traffic. Now a LIVE (non-expired) entry for a DIFFERENT
+/// `session_id` is left untouched (first-writer-wins-with-TTL); the entry is
+/// only inserted/refreshed when there is no existing entry, the existing
+/// entry has already expired, or the existing entry belongs to the SAME
+/// `session_id` (a legitimate refresh, which still updates the `Instant`).
+fn chain_reverse_route_insert(
+    routes: &DashMap<Ipv4Addr, ([u8; 16], Instant)>,
+    insert_count: &std::sync::atomic::AtomicUsize,
+    src_ip: Ipv4Addr,
+    session_id: [u8; 16],
+    now: Instant,
+) {
+    match routes.entry(src_ip) {
+        dashmap::mapref::entry::Entry::Vacant(v) => {
+            v.insert((session_id, now));
+        }
+        dashmap::mapref::entry::Entry::Occupied(mut o) => {
+            let (existing_session_id, last_seen) = *o.get();
+            let expired = now.duration_since(last_seen) >= CHAIN_REVERSE_ROUTE_TTL;
+            if existing_session_id == session_id || expired {
+                o.insert((session_id, now));
+            }
+            // else: a LIVE entry for a different session owns this IP —
+            // refuse to overwrite it (BUG C1).
+        }
+    }
+    let n = insert_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    if n % CHAIN_REVERSE_SWEEP_EVERY == 0 {
+        routes.retain(|_, (_, last_seen)| now.duration_since(*last_seen) < CHAIN_REVERSE_ROUTE_TTL);
+    }
+}
+
+/// Look up the masked pool-peer session id a downlink reply to `dst_ip`
+/// should be routed back over. Returns `None` both when there is no recorded
+/// route and when the recorded route is older than `CHAIN_REVERSE_ROUTE_TTL`
+/// — a stale entry is left in place for the next opportunistic sweep rather
+/// than removed here, keeping this a plain read.
+fn chain_reverse_route_lookup(
+    routes: &DashMap<Ipv4Addr, ([u8; 16], Instant)>,
+    dst_ip: &Ipv4Addr,
+    now: Instant,
+) -> Option<[u8; 16]> {
+    routes.get(dst_ip).and_then(|entry| {
+        let (session_id, last_seen) = *entry;
+        (now.duration_since(last_seen) < CHAIN_REVERSE_ROUTE_TTL).then_some(session_id)
+    })
+}
+
+/// BUG D1 fix (route-auth identity enforcement): `true` when a `RouteSync`
+/// from a masked pool-peer session must be dropped outright rather than
+/// processed with a self-asserted identity. Only fires when ALL of: the
+/// session is a masked pool-peer (`is_masked_pool`); the deployment has
+/// opted into strict enforcement (`require_node_enrollment`); and the
+/// session has no crypto-verified `verified_node_id` yet (no successful
+/// `NodeEnrollment` proof). Legacy `is_site_peer`-only sessions are never
+/// affected — they're authenticated via the directional site_sync key, not
+/// per-node identity, so this gate simply doesn't apply to them. Pulled out
+/// of the `ControlPayload::RouteSync` arm in `handle_control_message` as a
+/// pure function so the gate condition is directly unit-testable without
+/// needing to drive a full session + site_sync-configured RouteSync
+/// round-trip.
+fn route_sync_must_be_dropped_unverified(
+    is_masked_pool: bool,
+    require_node_enrollment: bool,
+    verified_node_id: &Option<String>,
+) -> bool {
+    is_masked_pool && require_node_enrollment && verified_node_id.is_none()
+}
+
 fn hash_addr(addr: &SocketAddr) -> String {
     let hash = crypto::blake3_hash(addr.to_string().as_bytes());
     format!(
@@ -767,6 +895,71 @@ pub struct Gateway {
     qos_enforcer: Arc<QosEnforcer>,
     /// Multi-hop exit node forwarder (None = local NAT).
     chain_forwarder: Option<Arc<crate::chain_forwarder::ChainForwarder>>,
+    /// PHASE 3 (exit / chain-forward over masked transport): the
+    /// `PoolDialer` this node uses to reach `masked_exit_addr` as a masked
+    /// pool-peer session, instead of the legacy dedicated-socket
+    /// `ChainForwarder`. `Some` only when `pool.transport == "masked"` AND
+    /// an `exit_node` is configured — see `set_masked_exit`. The two exit
+    /// strategies are the operator's `pool.transport` choice (wired
+    /// mutually exclusively in `main.rs`); both fields staying `None` (the
+    /// default) reproduces the exact pre-existing single-hop behavior.
+    pool_dialer: Option<Arc<crate::pool_dialer::PoolDialer>>,
+    /// The exit node's dial-set key (`host:port`) — MUST be the exact
+    /// string used both as an entry in `pool_dialer`'s configured peer set
+    /// and as the `peer` argument to `PoolDialer::send_to_peer`, or
+    /// forwarded `ChainForward` payloads will silently find no live
+    /// sender. See `set_masked_exit`.
+    masked_exit_addr: Option<String>,
+    /// PHASE 4 (per-node identity): binds a masked pool-peer's self-asserted
+    /// `node_id` to a durable Ed25519 key via `NodeEnrollment` (TOFU / manual
+    /// pin). `None` (default) leaves node identity unauthenticated (pre-Phase-4
+    /// behavior). Set on masked-transport nodes via `set_node_registry`.
+    node_registry: Option<Arc<crate::node_registry::NodeRegistry>>,
+    /// PHASE 4 (reverse chain-forward / exit downlink gap): on an exit node,
+    /// remembers which masked pool-peer session (a dial-set entry on the
+    /// ENTRY side — see `pool_dialer.rs`) an origin client's `ChainForward`
+    /// uplink most recently arrived on, keyed by that client's VPN IP as
+    /// embedded in the forwarded packet's own IP header (the exit has no
+    /// local `Session` for it — the client is registered on the entry, not
+    /// here). The TUN read loop's downlink worker (`downlink_worker`)
+    /// consults this whenever `SessionManager::get_session_by_vpn_ip` finds
+    /// no local session for a reply's destination; if a route is still
+    /// within `CHAIN_REVERSE_ROUTE_TTL`, the reply is sent back to the entry
+    /// as a `ChainForward` control message over that same session instead of
+    /// being silently dropped (closing the pre-existing "TUN: no session for
+    /// VPN IP" gap for exit-node reply traffic). Populated in the
+    /// `ChainForward` RECEIVE arm of `handle_control_message`, gated
+    /// strictly on `is_masked_pool_peer` — never the legacy dedicated-socket
+    /// `is_pool_peer`/`is_site_peer` roles, which relay over a fixed UDP
+    /// socket with no session-based return path to record here. Empty and
+    /// inert on any node that never acts as a masked-transport exit.
+    chain_reverse_routes: Arc<DashMap<Ipv4Addr, ([u8; 16], Instant)>>,
+    /// BUG C3 fix: monotonic count of calls to `chain_reverse_route_insert`,
+    /// driving its opportunistic TTL sweep instead of `chain_reverse_routes.len()`
+    /// (which plateaus — and so stops firing the sweep — once the map's
+    /// distinct-IP population stabilizes, the common case for any subnet no
+    /// larger than `CHAIN_REVERSE_SWEEP_EVERY` hosts). See
+    /// `chain_reverse_route_insert`'s doc comment.
+    chain_reverse_insert_count: Arc<std::sync::atomic::AtomicUsize>,
+    /// PHASE 4 (reverse chain-forward / entry-side downlink): sender half of
+    /// the channel `pool_dialer.rs`'s `anti_entropy` forwards a reverse
+    /// `ChainForward` payload into — see `chain_reverse_downlink_sender`,
+    /// which hands a clone of this out to `PoolDialer::new` (wired by
+    /// `main.rs` only on nodes that both run the masked pool-client
+    /// transport AND have `pool.exit_node` configured, i.e. entry nodes that
+    /// actually dial an exit). The receiver half (`chain_reverse_rx`) is
+    /// taken by `run()` and handed to `tun_read_loop`, which drains it into
+    /// the SAME per-worker downlink dispatch (`downlink_worker`, sharded by
+    /// dst VPN IP) the ordinary TUN reader feeds — i.e. the normal
+    /// client-downlink encrypt+send path — and deliberately NEVER into
+    /// `tun_write_tx`, which would wrongly re-inject the packet into this
+    /// node's own local TUN/internet egress instead of delivering it to the
+    /// origin client.
+    chain_reverse_tx: mpsc::Sender<Vec<u8>>,
+    /// Receiver half of `chain_reverse_tx`. `Some` until `run()` takes it to
+    /// hand to `tun_read_loop`; `None` afterward (there is only ever one
+    /// consumer). See `chain_reverse_tx`'s doc comment.
+    chain_reverse_rx: Option<mpsc::Receiver<Vec<u8>>>,
     /// Append-only audit log (H-S-8).
     audit_log: AuditLogger,
     /// §2 crowdsourced blocking feedback — k-anonymity-gated aggregation of
@@ -788,6 +981,22 @@ pub struct Gateway {
     /// `MASK_FEEDBACK_THROTTLE` and the `MaskFeedback` arm in
     /// `handle_control_message`.
     mask_feedback_throttle: Arc<DashMap<[u8; 16], Instant>>,
+    /// FORK-B pool-sync: mirrors `GatewayConfig::pool_server_keypair`. `None`
+    /// disables all masked-pool-peer handshake recognition.
+    pool_server_keypair: Option<aivpn_common::crypto::KeyPair>,
+    /// FORK-B pool-sync: mirrors `GatewayConfig::pool_client_psk`.
+    pool_client_psk: Option<[u8; 32]>,
+    /// BUG D1 fix (route-auth identity enforcement): when `true`, a masked
+    /// pool-peer session's `RouteSync` announcement is dropped unless the
+    /// session has a crypto-verified `verified_node_id` (see the
+    /// `ControlPayload::RouteSync` arm in `handle_control_message` and
+    /// `pool_sync::PoolSyncConfig::require_node_enrollment`, which this is
+    /// meant to mirror). Currently hardcoded to `false` at construction
+    /// (see `Gateway::new`'s doc comment there) rather than sourced from
+    /// `GatewayConfig`, since `main.rs` builds `GatewayConfig` with an
+    /// exhaustive struct literal and threading this through it is a
+    /// separate, out-of-scope task.
+    require_node_enrollment: bool,
 }
 
 /// Per-session `MaskPreference` throttle window. `handle_control_message`'s
@@ -1223,6 +1432,12 @@ impl Gateway {
         let qos_enforcer = config.qos_enforcer.clone();
         let audit_log = config.audit_log.clone();
 
+        // PHASE 4 (reverse chain-forward): channel is always constructed —
+        // cheap and inert when this node never dials an exit — so
+        // `chain_reverse_downlink_sender` needs no `Option` handling at the
+        // call site. See the fields' doc comments.
+        let (chain_reverse_tx, chain_reverse_rx) = mpsc::channel::<Vec<u8>>(4096);
+
         Ok(Self {
             config: config.clone(),
             session_manager,
@@ -1250,16 +1465,96 @@ impl Gateway {
             event_bus,
             qos_enforcer,
             chain_forwarder: config.chain_forwarder.clone(),
+            pool_dialer: None,
+            masked_exit_addr: None,
+            node_registry: None,
+            chain_reverse_routes: Arc::new(DashMap::new()),
+            chain_reverse_insert_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            chain_reverse_tx,
+            chain_reverse_rx: Some(chain_reverse_rx),
             audit_log,
             mask_feedback: Arc::new(crate::mask_feedback::MaskFeedbackStore::new()),
             mask_preference_throttle: Arc::new(DashMap::new()),
             mask_feedback_throttle: Arc::new(DashMap::new()),
+            pool_server_keypair: config.pool_server_keypair,
+            pool_client_psk: config.pool_client_psk,
+            // BUG D1 fix: NOT sourced from `GatewayConfig` — `main.rs`
+            // constructs `GatewayConfig` with an exhaustive struct literal
+            // (no `..Default::default()`), so adding a field there would
+            // require an out-of-scope edit to `main.rs` (this task is
+            // scoped to `gateway.rs`/`pool_sync.rs` only). Hardcoded to
+            // `false` here — migration-safe, byte-for-byte unchanged
+            // default behavior. TODO(main.rs wiring, separate task): thread
+            // `pool.require_node_enrollment()` (see
+            // `pool_sync::PoolSyncConfig::require_node_enrollment`) through
+            // `GatewayConfig` (alongside the existing
+            // `pool_server_keypair`/`pool_client_psk` wiring at the
+            // `GatewayConfig { .. }` literal in `main.rs`) and read it here
+            // instead of the literal `false`.
+            require_node_enrollment: false,
         })
     }
 
     /// Set (or replace) the multi-hop chain forwarder after server construction.
     pub fn set_chain_forwarder(&mut self, cf: Arc<crate::chain_forwarder::ChainForwarder>) {
         self.chain_forwarder = Some(cf);
+    }
+
+    /// PHASE 3 (exit / chain-forward over masked transport): wire the
+    /// masked pool-client exit route in place of the legacy `ChainForwarder`.
+    /// `dialer` must already be dialing `exit_addr` (see the `main.rs`
+    /// wiring site, which appends the exit node to the `PoolDialer`'s dial
+    /// set when it isn't already one of `pool.peers`); `exit_addr` must be
+    /// the exact same string used as that dial-set entry, since it doubles
+    /// as the `PoolDialer::send_to_peer` lookup key. Must be called before
+    /// `run()`. `main.rs` selects exactly one of `set_chain_forwarder` /
+    /// `set_masked_exit` per `pool.transport` — the client-data-path sites
+    /// prefer the masked route whenever `masked_exit_addr` is `Some`.
+    pub fn set_masked_exit(
+        &mut self,
+        dialer: Arc<crate::pool_dialer::PoolDialer>,
+        exit_addr: String,
+    ) {
+        self.pool_dialer = Some(dialer);
+        self.masked_exit_addr = Some(exit_addr);
+    }
+
+    /// PHASE 4 (per-node identity): install the pool-node identity registry so
+    /// a masked pool-peer's `NodeEnrollment` is verified and its `node_id`
+    /// cryptographically bound. `main.rs` wires this on masked-transport nodes.
+    pub fn set_node_registry(&mut self, registry: Arc<crate::node_registry::NodeRegistry>) {
+        self.node_registry = Some(registry);
+    }
+
+    /// BUG D1 fix (route-auth identity enforcement): install the
+    /// `require_node_enrollment` policy — when `true`, a masked pool-peer's
+    /// `RouteSync` is dropped unless its session has already proven a
+    /// crypto-verified identity via `NodeEnrollment`. Defaults to `false`
+    /// (set at construction) for migration-safe, byte-for-byte unchanged
+    /// behavior. TODO(main.rs wiring, separate task): once `main.rs` reads
+    /// `pool.require_node_enrollment()` from the parsed `PoolSyncConfig`
+    /// (see `pool_sync::PoolSyncConfig::require_node_enrollment`), it should
+    /// call this setter post-construction — the same pattern already used
+    /// for `set_node_registry` above — rather than needing a new field on
+    /// `GatewayConfig`'s exhaustive struct literal.
+    pub fn set_require_node_enrollment(&mut self, require: bool) {
+        self.require_node_enrollment = require;
+    }
+
+    /// PHASE 4 (reverse chain-forward): hand out a clone of the sender an
+    /// exit node's reverse-direction `ChainForward` reply should be pushed
+    /// into on THIS (entry) node, so it reaches the origin client over the
+    /// normal downlink path instead of being dropped. `main.rs` wires a
+    /// clone of this into `PoolDialer::new` only when this node is both
+    /// running the masked pool-client transport AND has `pool.exit_node`
+    /// configured (i.e. only on entry nodes that actually dial an exit) —
+    /// see `pool_dialer.rs`'s `anti_entropy`, which forwards inbound
+    /// `ChainForward` payloads here via `try_send`. Cheap and safe to call
+    /// unconditionally: the channel always exists (see `chain_reverse_tx`'s
+    /// doc comment), so a node that never dials an exit simply never has
+    /// anything sent into it.
+    pub fn chain_reverse_downlink_sender(&self) -> mpsc::Sender<Vec<u8>> {
+        self.chain_reverse_tx.clone()
     }
 
     async fn send_bootstrap_descriptors(
@@ -1498,12 +1793,22 @@ impl Gateway {
                 let qos_enforcer = self.qos_enforcer.clone();
                 let allow_peer_routing = self.config.allow_peer_routing;
                 let downlink_shaping = self.config.downlink_shaping;
+                // PHASE 4 (reverse chain-forward): hand both halves of the
+                // reverse-routing state to `tun_read_loop` — the exit-side
+                // route table (read on a local "no session" miss) and the
+                // entry-side receiver (drained into the same per-worker
+                // downlink dispatch). See the fields' doc comments on
+                // `Gateway`.
+                let chain_reverse_routes = self.chain_reverse_routes.clone();
+                let chain_reverse_rx = self.chain_reverse_rx.take();
                 tokio::spawn(async move {
                     Self::tun_read_loop(
                         tun_reader,
                         tun_tx,
                         sessions,
                         socket,
+                        chain_reverse_routes,
+                        chain_reverse_rx,
                         mask,
                         server_vpn_ip,
                         recorder,
@@ -2102,11 +2407,14 @@ impl Gateway {
     }
 
     /// TUN read loop: reads packets from TUN device and routes them back to clients
+    #[allow(clippy::too_many_arguments)]
     async fn tun_read_loop(
         mut tun_reader: tun::DeviceReader,
         tun_writer: tokio::sync::mpsc::Sender<Vec<u8>>,
         sessions: Arc<SessionManager>,
         socket: Arc<UdpSocket>,
+        chain_reverse_routes: Arc<DashMap<Ipv4Addr, ([u8; 16], Instant)>>,
+        chain_reverse_rx: Option<mpsc::Receiver<Vec<u8>>>,
         mask: MaskProfile,
         server_vpn_ip: Ipv4Addr,
         recorder: Option<Arc<RecordingManager>>,
@@ -2134,6 +2442,7 @@ impl Gateway {
                 worker_id,
                 sessions.clone(),
                 socket.clone(),
+                chain_reverse_routes.clone(),
                 mask.clone(),
                 recorder.clone(),
                 client_db.clone(),
@@ -2142,6 +2451,40 @@ impl Gateway {
             ));
         }
         info!("Downlink sharded across {} workers", worker_count);
+
+        // PHASE 4 (reverse chain-forward, ENTRY side): if this node dials an
+        // exit over the masked pool-client transport, `chain_reverse_rx`
+        // carries reply packets the exit sent back for one of our clients
+        // (see `Gateway::chain_reverse_tx`'s doc comment and
+        // `pool_dialer.rs`'s `anti_entropy` inbound `ChainForward` tap).
+        // Dispatch each one into the SAME per-worker downlink channels the
+        // ordinary TUN reader feeds below — i.e. the normal client-downlink
+        // encrypt+send path (session lookup, QoS, encryption, UDP send) —
+        // sharded by dst VPN IP exactly like a locally-read TUN packet.
+        // Deliberately NOT written to `tun_writer`: that would re-inject the
+        // packet into this node's own local TUN/internet egress instead of
+        // delivering it to the client. `None` (no exit configured, or not
+        // running masked transport) makes this a no-op.
+        if let Some(mut rx) = chain_reverse_rx {
+            let reverse_worker_txs = worker_txs.clone();
+            let reverse_worker_count = worker_count;
+            tokio::spawn(async move {
+                while let Some(packet) = rx.recv().await {
+                    if packet.len() < 20 || (packet[0] >> 4) != 4 {
+                        continue; // Not IPv4
+                    }
+                    let dst_ip = Ipv4Addr::new(packet[16], packet[17], packet[18], packet[19]);
+                    let worker_idx = (u32::from(dst_ip) as usize) % reverse_worker_count;
+                    if reverse_worker_txs[worker_idx].send(packet).await.is_err() {
+                        debug!(
+                            "chain_reverse: downlink worker {} channel closed — dropping reply for {}",
+                            worker_idx, dst_ip
+                        );
+                    }
+                }
+            });
+            info!("chain_reverse: reverse-chain-forward downlink dispatch active");
+        }
 
         loop {
             match tun_reader.read(&mut buf).await {
@@ -2203,6 +2546,7 @@ impl Gateway {
         worker_id: usize,
         sessions: Arc<SessionManager>,
         socket: Arc<UdpSocket>,
+        chain_reverse_routes: Arc<DashMap<Ipv4Addr, ([u8; 16], Instant)>>,
         mask: MaskProfile,
         recorder: Option<Arc<RecordingManager>>,
         client_db: Option<Arc<ClientDatabase>>,
@@ -2258,7 +2602,55 @@ impl Gateway {
                 let session = match sessions.get_session_by_vpn_ip(&dst_ip) {
                     Some(s) => s,
                     None => {
-                        debug!("TUN: no session for VPN IP {}", dst_ip);
+                        // PHASE 4 (reverse chain-forward): dst_ip may be an
+                        // origin client that lives on a different (entry)
+                        // node — this exit only ever saw it via a masked
+                        // pool-peer's ChainForward uplink (see the
+                        // ChainForward RECEIVE arm in
+                        // `handle_control_message`, which populates
+                        // `chain_reverse_routes`). If a route for it is
+                        // still fresh, send this reply back over that SAME
+                        // session as a ChainForward control message instead
+                        // of silently dropping it — the pre-existing
+                        // exit-downlink gap this closes. Falls through to
+                        // the original drop+debug when there is no route,
+                        // the route is stale, or the peer session is gone.
+                        match chain_reverse_route_lookup(
+                            &chain_reverse_routes,
+                            &dst_ip,
+                            Instant::now(),
+                        )
+                        .and_then(|session_id| sessions.get_session(&session_id))
+                        {
+                            Some(peer_session) => {
+                                let mdh = {
+                                    let sess = peer_session.lock();
+                                    sess.mask
+                                        .as_ref()
+                                        .map(packet_mdh_bytes_for_mask)
+                                        .unwrap_or_else(|| mask.header_template.clone())
+                                };
+                                let reverse_payload = ControlPayload::ChainForward {
+                                    payload: packet.to_vec(),
+                                };
+                                if let Err(e) = Self::send_control_message_via(
+                                    &socket,
+                                    &mdh,
+                                    &reverse_payload,
+                                    &peer_session,
+                                )
+                                .await
+                                {
+                                    debug!(
+                                        "chain_reverse: failed to send reverse ChainForward for {}: {}",
+                                        dst_ip, e
+                                    );
+                                }
+                            }
+                            None => {
+                                debug!("TUN: no session for VPN IP {}", dst_ip);
+                            }
+                        }
                         continue;
                     }
                 };
@@ -3009,8 +3401,121 @@ impl Gateway {
             // DH + PSK to find one whose derived tags match.
             // Falls back to no-PSK for backward compatibility.
             let builtin_bootstrap_masks = aivpn_common::mask::preset_masks::all();
-            let (session, matched_client_id, bootstrap_mask) = if let Some(ref db) = self.client_db
-            {
+
+            // FORK-B pool-sync redesign: before trying the normal client_db /
+            // legacy handshake scans, check whether this packet is a sibling
+            // aivpn server dialing us as a masked pool-client. The dialer
+            // computes its DH1 side against our shared `pool_server_keypair`
+            // (not our real long-term server static key) and its PSK is the
+            // shared `pool_client_psk`, so this needs its own candidate scan
+            // over the built-in preset masks — the same layout-aware
+            // eph/tag extraction as the client_db scan below, just keyed off
+            // the pool keypair/PSK instead of a per-client one.
+            //
+            // Skipped entirely (falls through to the existing client_db /
+            // legacy paths unchanged) when either `pool_server_keypair` or
+            // `pool_client_psk` is `None` — additive, byte-for-byte
+            // unchanged behavior for any deployment that hasn't configured
+            // pool sync.
+            let masked_peer: Option<(Arc<parking_lot::Mutex<Session>>, MaskProfile)> =
+                if let (Some(pool_kp), Some(pool_psk)) =
+                    (&self.pool_server_keypair, &self.pool_client_psk)
+                {
+                    let mut found_peer = None;
+                    for candidate_mask in aivpn_common::mask::preset_masks::all() {
+                        let (
+                            _,
+                            candidate_handshake_mdh_len,
+                            candidate_eph_offset,
+                            candidate_eph_len,
+                        ) = packet_layout_for_mask(&candidate_mask);
+                        let prefix = tag_prefix_len(candidate_mask.tag_offset);
+                        if packet_data.len() < prefix + candidate_handshake_mdh_len {
+                            continue;
+                        }
+                        let eph_start = prefix + candidate_eph_offset;
+                        if packet_data.len() < eph_start + candidate_eph_len {
+                            continue;
+                        }
+                        let cand_tag =
+                            match extract_tag_for_layout(packet_data, candidate_mask.tag_offset) {
+                                Some(t) => t,
+                                None => continue,
+                            };
+
+                        let mut eph_pub = [0u8; 32];
+                        eph_pub.copy_from_slice(
+                            &packet_data[eph_start..eph_start + candidate_eph_len],
+                        );
+                        // Obfuscated against the shared POOL keypair's public
+                        // key — NOT `self.session_manager.server_public_key()` —
+                        // since the dialer derived its side of DH1 against
+                        // that shared static key, not our real server key.
+                        crypto::obfuscate_eph_pub(&mut eph_pub, &pool_kp.public_key_bytes());
+
+                        if !self.session_manager.handshake_tag_precheck_with_static(
+                            &eph_pub,
+                            Some(*pool_psk),
+                            &cand_tag,
+                            pool_kp,
+                        ) {
+                            continue;
+                        }
+
+                        match self.session_manager.create_masked_pool_peer_session(
+                            client_addr,
+                            eph_pub,
+                            pool_kp,
+                            pool_psk,
+                        ) {
+                            Ok(sess) => {
+                                let validation = sess.lock().validate_handshake_tag(&cand_tag);
+                                if validation.is_some() {
+                                    tag = cand_tag;
+                                    sess.lock().mask = Some(candidate_mask.clone());
+                                    // BUG B1 fix: a validated masked pool-client
+                                    // handshake gets a fresh random session_id
+                                    // every time (see
+                                    // `cleanup_masked_peer_sessions_for_ip`'s doc
+                                    // comment) and none of the existing
+                                    // `cleanup_old_sessions_for_ip`/`_vpn_ip`/
+                                    // `_client_id` dedup paths ever fire for
+                                    // masked peers (no vpn_ip/client_id). Without
+                                    // this, a reconnecting dialer — or anyone who
+                                    // knows the pool-client PSK — piles up a new
+                                    // permanent session per handshake instead of
+                                    // collapsing to one live session per source
+                                    // IP.
+                                    let new_session_id = sess.lock().session_id;
+                                    self.session_manager.cleanup_masked_peer_sessions_for_ip(
+                                        &client_addr.ip(),
+                                        &new_session_id,
+                                    );
+                                    debug!(
+                                        "Masked pool-client handshake SUCCESS from {} via mask {}",
+                                        hash_addr(&client_addr),
+                                        candidate_mask.mask_id
+                                    );
+                                    found_peer = Some((sess, candidate_mask));
+                                    break;
+                                }
+                                let sid = sess.lock().session_id;
+                                self.session_manager.rollback_failed_session(&sid);
+                            }
+                            Err(e) => {
+                                debug!("create_masked_pool_peer_session failed: {}", e);
+                                continue;
+                            }
+                        }
+                    }
+                    found_peer
+                } else {
+                    None
+                };
+
+            let (session, matched_client_id, bootstrap_mask) = if let Some((s, m)) = masked_peer {
+                (s, None, m)
+            } else if let Some(ref db) = self.client_db {
                 let clients = db.list_clients();
                 let mut found = None;
                 // 3f: set when a PSK-PROVEN peer (tag matched) is turned away
@@ -4062,21 +4567,54 @@ impl Gateway {
                 }
 
                 // Site peers send subnet traffic — never relay to the exit node.
-                let use_chain_forward =
-                    self.chain_forwarder.is_some() && !session.lock().is_site_peer;
-                if use_chain_forward {
-                    if let Some(ref cf) = self.chain_forwarder {
-                        // Multi-hop: relay to exit node instead of local NAT
-                        cf.forward(payload.to_vec()).await;
+                let is_site_peer_now = session.lock().is_site_peer;
+                if !is_site_peer_now && self.masked_exit_addr.is_some() {
+                    // PHASE 3 (exit over masked transport): forward the
+                    // client's inner IP payload to the exit node over its
+                    // already-dialed masked pool-peer session, instead of
+                    // the legacy dedicated-socket `ChainForwarder` below.
+                    //
+                    // PERF NOTE (operator tradeoff, not a bug): this rides
+                    // the pool dialer's control channel — mimicry-first,
+                    // indistinguishable on the wire from ordinary masked
+                    // control traffic, at the cost of a per-packet control
+                    // envelope. The legacy `ChainForwarder` path uses a
+                    // dedicated UDP socket instead — higher throughput, but
+                    // a distinguishable extra flow. `pool.transport`
+                    // ("masked" vs legacy/default) is how the operator picks.
+                    let exit_addr = self.masked_exit_addr.as_deref().unwrap_or("");
+                    let sent = self.pool_dialer.as_ref().is_some_and(|d| {
+                        d.send_to_peer(
+                            exit_addr,
+                            ControlPayload::ChainForward {
+                                payload: payload.to_vec(),
+                            },
+                        )
+                    });
+                    if !sent {
+                        // Data-plane drop, same semantics as a dropped UDP
+                        // packet — never block the data path on this.
+                        debug!(
+                            "masked exit: no live pool-peer session to {} — dropping data packet",
+                            exit_addr
+                        );
                     }
-                } else if let Some(ref tx) = self.tun_write_tx {
-                    if tx.send(payload.to_vec()).await.is_err() {
-                        debug!("TUN write channel closed, dropping packet");
-                    }
-                } else if let Some(ref nat) = self.nat_forwarder {
-                    nat.forward_packet(payload).await?;
                 } else {
-                    debug!("NAT disabled, dropping packet");
+                    let use_chain_forward = self.chain_forwarder.is_some() && !is_site_peer_now;
+                    if use_chain_forward {
+                        if let Some(ref cf) = self.chain_forwarder {
+                            // Multi-hop: relay to exit node instead of local NAT
+                            cf.forward(payload.to_vec()).await;
+                        }
+                    } else if let Some(ref tx) = self.tun_write_tx {
+                        if tx.send(payload.to_vec()).await.is_err() {
+                            debug!("TUN write channel closed, dropping packet");
+                        }
+                    } else if let Some(ref nat) = self.nat_forwarder {
+                        nat.forward_packet(payload).await?;
+                    } else {
+                        debug!("NAT disabled, dropping packet");
+                    }
                 }
 
                 // Accumulate payload into FEC XOR buffer for server-side recovery.
@@ -4194,6 +4732,25 @@ impl Gateway {
                                          {}->{} at ingress",
                                         inner_src, inner_dst
                                     );
+                                } else if !is_site_peer && self.masked_exit_addr.is_some() {
+                                    // PHASE 3 (exit over masked transport),
+                                    // FEC-recovered packet path — see the
+                                    // PERF NOTE at the primary Data-packet
+                                    // site above; the same tradeoff applies.
+                                    let exit_addr = self.masked_exit_addr.as_deref().unwrap_or("");
+                                    let sent = self.pool_dialer.as_ref().is_some_and(|d| {
+                                        d.send_to_peer(
+                                            exit_addr,
+                                            ControlPayload::ChainForward { payload: recovered },
+                                        )
+                                    });
+                                    if !sent {
+                                        debug!(
+                                            "masked exit: no live pool-peer session to {} — \
+                                             dropping recovered packet",
+                                            exit_addr
+                                        );
+                                    }
                                 } else {
                                     let use_chain = self.chain_forwarder.is_some() && !is_site_peer;
                                     if use_chain {
@@ -4470,11 +5027,19 @@ impl Gateway {
                 // Client-side only, ignore on server
             }
             ControlPayload::PoolSync { clients_json } => {
-                // Only accept PoolSync from sessions registered as pool peers.
-                // A regular VPN client sending PoolSync would be able to inject
-                // or overwrite arbitrary client records in the database.
-                let is_pool = session.lock().is_pool_peer;
-                if !is_pool {
+                // Accept PoolSync from sessions registered as EITHER the
+                // legacy synthetic pool-peer role, or a FORK-B masked
+                // pool-client (a sibling node that dialed us through the
+                // normal masked handshake path — see `masked_peer` in
+                // `handle_packet`). A regular VPN client sending PoolSync
+                // would be able to inject or overwrite arbitrary client
+                // records in the database, so both checks still gate on an
+                // explicit peer-role flag rather than trusting any session.
+                let (is_pool, is_masked_pool) = {
+                    let sess = session.lock();
+                    (sess.is_pool_peer, sess.is_masked_pool_peer)
+                };
+                if !is_pool && !is_masked_pool {
                     warn!(
                         "pool_sync: rejected from non-pool session {}",
                         hash_addr(&client_addr)
@@ -4501,12 +5066,277 @@ impl Gateway {
                     }
                 }
             }
+            ControlPayload::PoolStateDigest { digest } => {
+                // FORK-B pool-sync reactive convergence, Phase 2: a masked
+                // pool-client peer periodically (or on-change) announces its
+                // root DB-state digest. If it differs from ours, we no
+                // longer push the WHOLE client DB (Phase 1) — instead we
+                // send our bucketed (Merkle-lite) digest, with
+                // `reply_requested: true`, so the peer can work out exactly
+                // which buckets actually differ, push us its delta, AND hand
+                // its own bucket digests back to us in turn (see the
+                // `PoolBucketDigests` arm below) — one working edge
+                // reconciles both directions over a single session. We
+                // deliberately do NOT also echo a `PoolStateDigest` here:
+                // that echo used to make the peer's own inbound-digest arm
+                // fire again and echo back, an unbounded digest ping-pong.
+                //
+                // Gated strictly on `is_masked_pool_peer` (never the legacy
+                // `is_pool_peer` role, and never an ordinary client session):
+                // the legacy synthetic pool-peer path has its own push-only
+                // pool_sync mechanism and never sends this control message,
+                // so treating it as authoritative for a role it doesn't use
+                // would be a silent no-op at best; an ordinary client
+                // session sending this is not a peer at all.
+                let is_masked_pool = session.lock().is_masked_pool_peer;
+                if !is_masked_pool {
+                    debug!(
+                        "PoolStateDigest from {} ignored — not a masked pool-peer session",
+                        hash_addr(&client_addr)
+                    );
+                } else if let Some(ref db) = self.client_db {
+                    let local = db.state_digest();
+                    if digest != local {
+                        debug!(
+                            "PoolStateDigest mismatch from {} — sending bucket digests for reactive convergence",
+                            hash_addr(&client_addr)
+                        );
+                        if let Err(e) = self
+                            .send_control_message(
+                                &ControlPayload::PoolBucketDigests {
+                                    digests: db.bucket_digests(),
+                                    reply_requested: true,
+                                },
+                                session,
+                            )
+                            .await
+                        {
+                            warn!(
+                                "PoolStateDigest: failed to send bucket digests to {}: {}",
+                                hash_addr(&client_addr),
+                                e
+                            );
+                        }
+                    }
+                } else {
+                    debug!(
+                        "PoolStateDigest from {} ignored — no client_db configured",
+                        hash_addr(&client_addr)
+                    );
+                }
+            }
+            ControlPayload::PoolBucketDigests {
+                digests,
+                reply_requested,
+            } => {
+                // Phase 2: peer sent its bucketed digests in reaction to our
+                // root-digest mismatch (or in reply to our own bucket
+                // message). Diff against our own bucket_digests() and reply
+                // with a PoolSync containing ONLY the records in the buckets
+                // that actually differ — the peer's `merge_from_json` folds
+                // them in.
+                //
+                // If `reply_requested` is set, ALSO hand our own
+                // bucket_digests() back with `reply_requested: false` — this
+                // completes the reverse direction of the exchange (the peer
+                // can now compute ITS differing buckets and push them to
+                // us). `reply_requested: false` is never itself answered
+                // with another `PoolBucketDigests`, which bounds the
+                // exchange and prevents a ping-pong.
+                let is_masked_pool = session.lock().is_masked_pool_peer;
+                if !is_masked_pool {
+                    debug!(
+                        "PoolBucketDigests from {} ignored — not a masked pool-peer session",
+                        hash_addr(&client_addr)
+                    );
+                } else if let Some(ref db) = self.client_db {
+                    let local_buckets = db.bucket_digests();
+                    let differing =
+                        crate::client_db::differing_pool_buckets(&local_buckets, &digests);
+                    if differing.is_empty() {
+                        debug!(
+                            "PoolBucketDigests from {} — no differing buckets, nothing to send",
+                            hash_addr(&client_addr)
+                        );
+                    } else {
+                        let clients_json = db.clients_json_for_buckets(&differing).into_bytes();
+                        debug!(
+                            "PoolBucketDigests from {} — {} differing bucket(s), sending delta",
+                            hash_addr(&client_addr),
+                            differing.len()
+                        );
+                        if let Err(e) = self
+                            .send_control_message(
+                                &ControlPayload::PoolSync { clients_json },
+                                session,
+                            )
+                            .await
+                        {
+                            warn!(
+                                "PoolBucketDigests: failed to send PoolSync delta to {}: {}",
+                                hash_addr(&client_addr),
+                                e
+                            );
+                        }
+                    }
+                    if reply_requested {
+                        if let Err(e) = self
+                            .send_control_message(
+                                &ControlPayload::PoolBucketDigests {
+                                    digests: local_buckets,
+                                    reply_requested: false,
+                                },
+                                session,
+                            )
+                            .await
+                        {
+                            warn!(
+                                "PoolBucketDigests: failed to send reply bucket digests to {}: {}",
+                                hash_addr(&client_addr),
+                                e
+                            );
+                        }
+                    }
+                } else {
+                    debug!(
+                        "PoolBucketDigests from {} ignored — no client_db configured",
+                        hash_addr(&client_addr)
+                    );
+                }
+            }
             ControlPayload::RouteSync { subnets_json } => {
-                if session.lock().is_site_peer {
-                    crate::site_sync::handle_route_sync(&subnets_json, &client_addr.to_string());
+                // PHASE 3 (site-to-site over masked transport): accept
+                // RouteSync from EITHER the legacy synthetic site-peer role
+                // (`is_site_peer`, authenticated via the site_sync directional
+                // sync_key) OR a FORK-B masked pool-client (`is_masked_pool_peer`
+                // — a sibling node that dialed us through the normal masked
+                // handshake, see `pool_dialer.rs`). An ordinary VPN client
+                // session has neither flag set and is still rejected below.
+                // PHASE 4 (per-node crypto identity): also read the
+                // session's `verified_node_id` — set by the NodeEnrollment
+                // arm below once this peer's Ed25519 proof verifies against
+                // the node registry — so `handle_route_sync` can key the
+                // route allowlist to the cryptographically-proven identity
+                // instead of trusting the payload's self-asserted node_id.
+                let (is_site, is_masked_pool, verified_node_id) = {
+                    let sess = session.lock();
+                    (
+                        sess.is_site_peer,
+                        sess.is_masked_pool_peer,
+                        sess.verified_node_id.clone(),
+                    )
+                };
+                // BUG D1 fix: when `require_node_enrollment` is set, a masked
+                // pool-peer's RouteSync MUST carry a crypto-verified identity
+                // — drop it outright rather than falling back to trusting the
+                // payload's self-asserted node_id. Without this gate, route
+                // authorization ultimately keys off whatever node_id string
+                // an unverified peer simply claims in the RouteSync payload
+                // itself (see `handle_route_sync`'s fallback), which is not a
+                // proof of identity at all. Legacy `is_site_peer` sessions
+                // (authenticated via the directional site_sync key, not
+                // per-node identity) are unaffected — this gate only applies
+                // to `is_masked_pool`. Pulled out into
+                // `route_sync_must_be_dropped_unverified` so the gate
+                // condition itself is directly unit-testable.
+                if route_sync_must_be_dropped_unverified(
+                    is_masked_pool,
+                    self.require_node_enrollment,
+                    &verified_node_id,
+                ) {
+                    warn!(
+                        "site_sync: RouteSync from masked pool-peer {} dropped — \
+                         require_node_enrollment is set and this session has no \
+                         crypto-verified node identity",
+                        hash_addr(&client_addr)
+                    );
+                } else if is_site || is_masked_pool {
+                    crate::site_sync::handle_route_sync(
+                        &subnets_json,
+                        &client_addr.to_string(),
+                        verified_node_id.as_deref(),
+                    );
                 } else {
                     warn!(
                         "site_sync: RouteSync from non-peer session {} — dropping",
+                        hash_addr(&client_addr)
+                    );
+                }
+            }
+            ControlPayload::NodeEnrollment {
+                node_id,
+                node_pub,
+                time_window,
+                signature,
+            } => {
+                // PHASE 4 (per-node identity): a masked pool-peer proves
+                // ownership of its self-asserted node_id with a durable Ed25519
+                // key. Verify + bind (TOFU / manual pin) via the node registry
+                // and, on success, stamp the crypto-authenticated node_id onto
+                // the session so route authorization can trust it over the
+                // self-asserted string. Only meaningful on a masked pool-peer
+                // session with a configured registry; ignored otherwise (the
+                // session stays up — an unverified node simply isn't trusted).
+                // B2/D2 fix (session-bound proof): the verified transcript is
+                // this session's OWN ephemeral X25519 pair — `eph_pub` (the
+                // client's, learned during the handshake) and `server_eph_pub`
+                // (this server's own, generated in `build_and_insert_session`
+                // and set exactly once per session). Reading them off the
+                // session under lock, rather than trusting anything from the
+                // wire payload, is what makes a captured proof from a
+                // DIFFERENT session fail here: its transcript won't match.
+                let (is_masked_pool, session_server_eph_pub, session_client_eph_pub) = {
+                    let sess = session.lock();
+                    (sess.is_masked_pool_peer, sess.server_eph_pub, sess.eph_pub)
+                };
+                if !is_masked_pool {
+                    debug!(
+                        "NodeEnrollment from {} ignored — not a masked pool-peer session",
+                        hash_addr(&client_addr)
+                    );
+                } else if let Some(ref registry) = self.node_registry {
+                    use crate::node_registry::NodeAuthOutcome;
+                    // `server_eph_pub` is only `None` if this arrives before
+                    // `build_and_insert_session` ever ran for this session,
+                    // which cannot happen (the session must already exist to
+                    // reach this control-payload handler at all) — fail
+                    // closed with an all-zero transcript on the
+                    // theoretically-unreachable `None` case rather than
+                    // panicking or skipping the check.
+                    let server_eph_pub_for_check = session_server_eph_pub.unwrap_or([0u8; 32]);
+                    match registry.authenticate(
+                        &node_id,
+                        &node_pub,
+                        time_window,
+                        &signature,
+                        &server_eph_pub_for_check,
+                        &session_client_eph_pub,
+                    ) {
+                        NodeAuthOutcome::Verified => {
+                            session.lock().verified_node_id = Some(node_id.clone());
+                            debug!(
+                                "NodeEnrollment from {} verified node_id",
+                                hash_addr(&client_addr)
+                            );
+                        }
+                        NodeAuthOutcome::BoundNew => {
+                            session.lock().verified_node_id = Some(node_id.clone());
+                            info!(
+                                "NodeEnrollment from {} bound a new pool-node identity (TOFU)",
+                                hash_addr(&client_addr)
+                            );
+                        }
+                        NodeAuthOutcome::Rejected(reason) => {
+                            warn!(
+                                "NodeEnrollment from {} rejected: {}",
+                                hash_addr(&client_addr),
+                                reason
+                            );
+                        }
+                    }
+                } else {
+                    debug!(
+                        "NodeEnrollment from {} ignored — no node registry configured",
                         hash_addr(&client_addr)
                     );
                 }
@@ -4544,25 +5374,44 @@ impl Gateway {
                         // an exact match against a field that is always
                         // None. Ordinary (non-peer) client sessions keep the
                         // strict exact-match check — no relaxation there.
-                        let src_ip_ok = {
+                        // PHASE 4 (reverse chain-forward): also surface
+                        // whether THIS session is a masked pool-peer and, if
+                        // so, the packet's parsed IPv4 source — needed below
+                        // to populate `chain_reverse_routes` so a downlink
+                        // reply to that source can find its way back over
+                        // this exact session. `pkt_src_ipv4` deliberately
+                        // mirrors the same parse already done for the
+                        // src-IP-spoofing check rather than re-parsing the
+                        // payload a second time.
+                        let (src_ip_ok, is_masked_pool_entry, pkt_src_ipv4) = {
                             let sess = session.lock();
-                            let is_peer_session = sess.is_pool_peer || sess.is_site_peer;
+                            // PHASE 3: also accept a masked pool-peer session
+                            // as a chain-forward entry node (a sibling node
+                            // that dialed us via `pool_dialer.rs`'s masked
+                            // pool-client handshake) — same relaxed
+                            // subnet-contains check as the legacy
+                            // `is_pool_peer`/`is_site_peer` roles, since it
+                            // likewise relays on behalf of many downstream
+                            // clients authenticated by the entry node.
+                            let is_peer_session =
+                                sess.is_pool_peer || sess.is_site_peer || sess.is_masked_pool_peer;
                             match ip_version {
                                 Some(4) => {
                                     if payload.len() >= 20 {
                                         let src: [u8; 4] = payload[12..16].try_into().unwrap();
                                         let pkt_src = std::net::Ipv4Addr::from(src);
-                                        if is_peer_session {
+                                        let ok = if is_peer_session {
                                             self.config.network_config.contains(pkt_src)
                                         } else {
                                             sess.vpn_ip.map_or(false, |vpn| vpn == pkt_src)
-                                        }
+                                        };
+                                        (ok, sess.is_masked_pool_peer, Some(pkt_src))
                                     } else {
-                                        false
+                                        (false, false, None)
                                     }
                                 }
                                 // IPv6: no per-session IPv6 address assigned — reject
-                                _ => false,
+                                _ => (false, false, None),
                             }
                         };
                         if !src_ip_ok {
@@ -4570,8 +5419,68 @@ impl Gateway {
                                 "chain_forward: source IP mismatch from {} — dropping",
                                 hash_addr(&client_addr)
                             );
-                        } else if let Some(ref tx) = self.tun_write_tx {
-                            let _ = tx.send(payload).await;
+                        } else {
+                            // PHASE 4 (reverse chain-forward): remember that
+                            // this client VPN IP's uplink traffic arrived on
+                            // THIS masked pool-peer session, so the TUN read
+                            // loop's downlink worker can route a reply back
+                            // here instead of dropping it (see
+                            // `Gateway::chain_reverse_routes`'s doc comment).
+                            // Strictly gated on `is_masked_pool_peer` — the
+                            // legacy dedicated-socket `ChainForwarder` roles
+                            // (`is_pool_peer`/`is_site_peer`) have no
+                            // session-based return channel to record here.
+                            if is_masked_pool_entry {
+                                if let Some(src_ip) = pkt_src_ipv4 {
+                                    let session_id = session.lock().session_id;
+                                    chain_reverse_route_insert(
+                                        &self.chain_reverse_routes,
+                                        &self.chain_reverse_insert_count,
+                                        src_ip,
+                                        session_id,
+                                        Instant::now(),
+                                    );
+                                }
+                            }
+                            // BUG C4 fix: apply the SAME `allow_peer_routing`
+                            // gate ordinary client Data packets already get
+                            // (see "Block intra-VPN routing at ingress" in
+                            // the DATA arm above) to ChainForward-relayed
+                            // packets too. Without this, a masked pool-peer
+                            // relaying on behalf of many downstream clients
+                            // could reach another LOCAL VPN client's session
+                            // via `inner_dst` even when peer routing is
+                            // disabled — the exact intra-VPN routing the
+                            // DATA-path gate exists to block, just reached
+                            // through a different arm. Parses `inner_dst`
+                            // straight out of the (already length-validated
+                            // for IPv4, `min_len == 20`) payload; IPv6
+                            // ChainForward payloads have no per-session VPN
+                            // IP to match against here, so they fall through
+                            // unaffected by this check (existing IPv6
+                            // handling is unchanged).
+                            let drop_for_peer_routing = !self.config.allow_peer_routing
+                                && payload.len() >= 20
+                                && ip_version == Some(4)
+                                && {
+                                    let inner_dst = std::net::Ipv4Addr::new(
+                                        payload[16],
+                                        payload[17],
+                                        payload[18],
+                                        payload[19],
+                                    );
+                                    self.session_manager
+                                        .get_session_by_vpn_ip(&inner_dst)
+                                        .is_some()
+                                };
+                            if drop_for_peer_routing {
+                                debug!(
+                                    "chain_forward: peer routing disabled — dropping relayed packet to local VPN session from {}",
+                                    hash_addr(&client_addr)
+                                );
+                            } else if let Some(ref tx) = self.tun_write_tx {
+                                let _ = tx.send(payload).await;
+                            }
                         }
                     }
                 } else {
@@ -5435,21 +6344,27 @@ fn make_kernel_update_tags(sess: &crate::session::Session) -> UpdateTagsPayload 
 
 #[cfg(test)]
 mod tests {
+    use super::chain_reverse_route_insert;
+    use super::chain_reverse_route_lookup;
     use super::inner_l7_prefix;
     use super::mask_feedback_throttled;
     use super::mask_preference_throttled;
     use super::polymorphic_variant_already_active;
+    use super::route_sync_must_be_dropped_unverified;
     use super::try_claim_mask_feedback_slot;
     use super::try_claim_mask_preference_slot;
     use super::verify_device_enrollment_proof;
     use super::Gateway;
     use super::GatewayConfig;
     use super::MaskCatalog;
+    use super::CHAIN_REVERSE_ROUTE_TTL;
+    use super::CHAIN_REVERSE_SWEEP_EVERY;
     use super::MASK_FEEDBACK_THROTTLE;
     use super::MASK_PREFERENCE_THROTTLE;
     use aivpn_common::crypto::TAG_SIZE;
     use aivpn_common::mask::preset_masks::webrtc_zoom_v3;
     use dashmap::DashMap;
+    use std::net::Ipv4Addr;
     use std::time::{Duration, Instant};
 
     /// The handshake candidate scan must derive descriptors for a WINDOW of
@@ -5569,6 +6484,11 @@ mod tests {
                 sync_key: Some(base64::engine::general_purpose::STANDARD.encode([7u8; 32])),
                 exit_node: None,
                 exit_node_enabled: None,
+                sync_beacon_secs: None,
+                transport: None,
+                allow_auto_add: None,
+                node_identity_key: None,
+                require_node_enrollment: None,
             };
             let events = EventBus::new(EventSinkConfig {
                 stdout: false,
@@ -5865,6 +6785,262 @@ mod tests {
         // the last two (3s, 5s) do not. Irrelevant in practice (idempotency
         // catches all of them first) but documented here for clarity.
         assert_eq!(within_window, vec![true, true, false, false]);
+    }
+
+    /// PHASE 4 (reverse chain-forward): `chain_reverse_route_insert` then
+    /// `chain_reverse_route_lookup` for the same VPN IP round-trips the
+    /// exact session id recorded, immediately (well within the TTL).
+    #[test]
+    fn chain_reverse_route_insert_then_lookup_round_trips() {
+        let routes: DashMap<Ipv4Addr, ([u8; 16], Instant)> = DashMap::new();
+        let counter = std::sync::atomic::AtomicUsize::new(0);
+        let src_ip = Ipv4Addr::new(10, 0, 0, 2);
+        let session_id = [9u8; 16];
+        let now = Instant::now();
+
+        chain_reverse_route_insert(&routes, &counter, src_ip, session_id, now);
+
+        assert_eq!(
+            chain_reverse_route_lookup(&routes, &src_ip, now),
+            Some(session_id)
+        );
+    }
+
+    /// A lookup for a VPN IP that was never recorded finds nothing.
+    #[test]
+    fn chain_reverse_route_lookup_unknown_ip_returns_none() {
+        let routes: DashMap<Ipv4Addr, ([u8; 16], Instant)> = DashMap::new();
+        let now = Instant::now();
+        assert_eq!(
+            chain_reverse_route_lookup(&routes, &Ipv4Addr::new(10, 0, 0, 9), now),
+            None
+        );
+    }
+
+    /// A route recorded at `now` is still found just before
+    /// `CHAIN_REVERSE_ROUTE_TTL` elapses, but is treated as absent once the
+    /// TTL has fully elapsed — the exact TTL-eviction boundary the exit
+    /// node's TUN read loop relies on to stop routing replies to a peer
+    /// session that may no longer be the right (or even a live) one.
+    #[test]
+    fn chain_reverse_route_lookup_honors_ttl_boundary() {
+        let routes: DashMap<Ipv4Addr, ([u8; 16], Instant)> = DashMap::new();
+        let counter = std::sync::atomic::AtomicUsize::new(0);
+        let src_ip = Ipv4Addr::new(10, 0, 0, 3);
+        let session_id = [3u8; 16];
+        let inserted_at = Instant::now();
+        chain_reverse_route_insert(&routes, &counter, src_ip, session_id, inserted_at);
+
+        let just_before_ttl = inserted_at + CHAIN_REVERSE_ROUTE_TTL - Duration::from_millis(1);
+        assert_eq!(
+            chain_reverse_route_lookup(&routes, &src_ip, just_before_ttl),
+            Some(session_id),
+            "route must still be honored just before the TTL elapses"
+        );
+
+        let at_or_after_ttl = inserted_at + CHAIN_REVERSE_ROUTE_TTL;
+        assert_eq!(
+            chain_reverse_route_lookup(&routes, &src_ip, at_or_after_ttl),
+            None,
+            "route must be treated as expired once the TTL has fully elapsed"
+        );
+    }
+
+    /// A later insert for the same VPN IP from the SAME session_id (e.g. the
+    /// client's traffic simply continues arriving on the same masked
+    /// pool-peer session) refreshes the recorded `Instant` rather than being
+    /// refused — the same-session case of the BUG C1 fix.
+    #[test]
+    fn chain_reverse_route_insert_refreshes_same_session_for_same_ip() {
+        let routes: DashMap<Ipv4Addr, ([u8; 16], Instant)> = DashMap::new();
+        let counter = std::sync::atomic::AtomicUsize::new(0);
+        let src_ip = Ipv4Addr::new(10, 0, 0, 4);
+        let session_id = [1u8; 16];
+        let t0 = Instant::now();
+
+        chain_reverse_route_insert(&routes, &counter, src_ip, session_id, t0);
+        let t1 = t0 + Duration::from_secs(1);
+        chain_reverse_route_insert(&routes, &counter, src_ip, session_id, t1);
+
+        assert_eq!(
+            chain_reverse_route_lookup(&routes, &src_ip, t1),
+            Some(session_id)
+        );
+    }
+
+    /// BUG C1 (reverse-route poisoning): a LIVE (non-expired) entry for a
+    /// given VPN IP must NOT be overwritten by an insert from a DIFFERENT
+    /// session_id — otherwise any masked pool-peer could forge a victim
+    /// client's `inner_src` in a `ChainForward` and hijack that IP's
+    /// downlink reverse route out from under the legitimate session. This is
+    /// first-writer-wins-with-TTL: the original session keeps the route
+    /// until it expires.
+    #[test]
+    fn chain_reverse_route_insert_refuses_to_overwrite_live_different_session() {
+        let routes: DashMap<Ipv4Addr, ([u8; 16], Instant)> = DashMap::new();
+        let counter = std::sync::atomic::AtomicUsize::new(0);
+        let src_ip = Ipv4Addr::new(10, 0, 0, 4);
+        let legit_session = [1u8; 16];
+        let attacker_session = [2u8; 16];
+        let t0 = Instant::now();
+
+        chain_reverse_route_insert(&routes, &counter, src_ip, legit_session, t0);
+        let t1 = t0 + Duration::from_secs(1);
+        // An unrelated peer forges a ChainForward claiming the same inner
+        // source IP while the legitimate route is still live.
+        chain_reverse_route_insert(&routes, &counter, src_ip, attacker_session, t1);
+
+        assert_eq!(
+            chain_reverse_route_lookup(&routes, &src_ip, t1),
+            Some(legit_session),
+            "a live route must not be hijacked by a different session_id"
+        );
+    }
+
+    /// BUG C1 companion: once the original session's route has fully
+    /// expired (at/past `CHAIN_REVERSE_ROUTE_TTL`), a different session_id
+    /// MAY claim the IP — an expired entry is not "live" and is fair game,
+    /// otherwise a VPN IP whose original peer session is long gone could
+    /// never be routed to again.
+    #[test]
+    fn chain_reverse_route_insert_allows_overwrite_after_expiry() {
+        let routes: DashMap<Ipv4Addr, ([u8; 16], Instant)> = DashMap::new();
+        let counter = std::sync::atomic::AtomicUsize::new(0);
+        let src_ip = Ipv4Addr::new(10, 0, 0, 4);
+        let old_session = [1u8; 16];
+        let new_session = [2u8; 16];
+        let t0 = Instant::now();
+
+        chain_reverse_route_insert(&routes, &counter, src_ip, old_session, t0);
+        let t1 = t0 + CHAIN_REVERSE_ROUTE_TTL;
+        chain_reverse_route_insert(&routes, &counter, src_ip, new_session, t1);
+
+        assert_eq!(
+            chain_reverse_route_lookup(&routes, &src_ip, t1),
+            Some(new_session),
+            "an expired route may be claimed by a different session_id"
+        );
+    }
+
+    /// The opportunistic sweep (triggered every `CHAIN_REVERSE_SWEEP_EVERY`
+    /// inserts, tracked by a monotonic insert counter — see the BUG C3 fix)
+    /// purges entries older than `CHAIN_REVERSE_ROUTE_TTL` without needing a
+    /// dedicated timer task. Pre-populate the map with one stale entry and
+    /// one fresh one, then drive exactly `CHAIN_REVERSE_SWEEP_EVERY` more
+    /// inserts (of throwaway IPs, all at a `now` timestamp that is fresh
+    /// relative to itself but far past the stale entry's insert time) so the
+    /// sweep condition (`insert_count % CHAIN_REVERSE_SWEEP_EVERY == 0`)
+    /// fires, and confirm the stale entry is gone while the fresh one
+    /// survives.
+    #[test]
+    fn chain_reverse_route_insert_sweeps_expired_entries_opportunistically() {
+        let routes: DashMap<Ipv4Addr, ([u8; 16], Instant)> = DashMap::new();
+        let counter = std::sync::atomic::AtomicUsize::new(0);
+        let stale_ip = Ipv4Addr::new(10, 0, 0, 5);
+        let fresh_ip = Ipv4Addr::new(10, 0, 0, 6);
+        let t0 = Instant::now();
+
+        // A route recorded long enough ago to already be past the TTL by
+        // the time the sweep runs below.
+        chain_reverse_route_insert(&routes, &counter, stale_ip, [1u8; 16], t0);
+
+        let sweep_now = t0 + CHAIN_REVERSE_ROUTE_TTL + Duration::from_secs(1);
+
+        // A route recorded fresh (at `sweep_now`) — must survive the sweep.
+        chain_reverse_route_insert(&routes, &counter, fresh_ip, [2u8; 16], sweep_now);
+
+        // Drive enough additional inserts (distinct throwaway IPs) at
+        // `sweep_now` to land exactly on an `insert_count %
+        // CHAIN_REVERSE_SWEEP_EVERY == 0` boundary and trigger the
+        // opportunistic sweep.
+        let mut next_octet: u32 = 10;
+        while counter.load(std::sync::atomic::Ordering::Relaxed) % CHAIN_REVERSE_SWEEP_EVERY != 0 {
+            let filler_ip = Ipv4Addr::from(0x0A00_0000u32 + next_octet);
+            next_octet += 1;
+            chain_reverse_route_insert(&routes, &counter, filler_ip, [0u8; 16], sweep_now);
+        }
+
+        assert!(
+            !routes.contains_key(&stale_ip),
+            "stale entry must be purged by the opportunistic sweep"
+        );
+        assert!(
+            routes.contains_key(&fresh_ip),
+            "fresh entry must survive the opportunistic sweep"
+        );
+    }
+
+    /// BUG C3 regression guard: on a subnet with far fewer distinct hosts
+    /// than `CHAIN_REVERSE_SWEEP_EVERY` (the common case — any /24 or
+    /// smaller), repeated same-session refresh-only inserts for a small
+    /// stable set of IPs must still eventually trigger the sweep. Before the
+    /// fix this was gated on `routes.len() % CHAIN_REVERSE_SWEEP_EVERY == 0`,
+    /// which never advances once all the distinct keys already exist, so the
+    /// sweep would never fire again for the rest of the process's life.
+    #[test]
+    fn chain_reverse_route_insert_sweep_fires_on_small_stable_subnet() {
+        let routes: DashMap<Ipv4Addr, ([u8; 16], Instant)> = DashMap::new();
+        let counter = std::sync::atomic::AtomicUsize::new(0);
+        let stale_ip = Ipv4Addr::new(10, 0, 0, 5);
+        let churn_ip = Ipv4Addr::new(10, 0, 0, 6);
+        let churn_session = [7u8; 16];
+        let t0 = Instant::now();
+
+        chain_reverse_route_insert(&routes, &counter, stale_ip, [1u8; 16], t0);
+        let sweep_now = t0 + CHAIN_REVERSE_ROUTE_TTL + Duration::from_secs(1);
+        chain_reverse_route_insert(&routes, &counter, churn_ip, churn_session, sweep_now);
+
+        // `routes.len()` is now 2 and never grows again — only same-session
+        // refreshes for `churn_ip` follow, exactly the low-host-count
+        // scenario BUG C3 fixes.
+        assert_eq!(routes.len(), 2);
+        while counter.load(std::sync::atomic::Ordering::Relaxed) % CHAIN_REVERSE_SWEEP_EVERY != 0 {
+            chain_reverse_route_insert(&routes, &counter, churn_ip, churn_session, sweep_now);
+        }
+
+        assert!(
+            !routes.contains_key(&stale_ip),
+            "stale entry must be purged even though routes.len() plateaued at 2"
+        );
+        assert!(
+            routes.contains_key(&churn_ip),
+            "the actively-refreshed entry must survive the opportunistic sweep"
+        );
+    }
+
+    /// BUG D1 (route-auth identity enforcement): `route_sync_must_be_dropped_unverified`
+    /// only fires when the session is a masked pool-peer, strict enforcement
+    /// is on, AND the session has no crypto-verified identity yet. Any other
+    /// combination (not strict, already verified, or not a masked pool-peer
+    /// at all — e.g. a legacy `is_site_peer`-only session) must NOT be
+    /// dropped by this gate.
+    #[test]
+    fn route_sync_drop_gate_fires_only_when_strict_and_unverified_masked_peer() {
+        // Strict + masked pool-peer + no verified identity: drop.
+        assert!(route_sync_must_be_dropped_unverified(true, true, &None));
+
+        // Strict + masked pool-peer + verified identity: NOT dropped —
+        // `handle_route_sync` is called with the proven identity.
+        assert!(!route_sync_must_be_dropped_unverified(
+            true,
+            true,
+            &Some("node-a:443".to_string())
+        ));
+
+        // require_node_enrollment off (default): never dropped by this gate,
+        // regardless of verification — migration-safe legacy behavior.
+        assert!(!route_sync_must_be_dropped_unverified(true, false, &None));
+        assert!(!route_sync_must_be_dropped_unverified(
+            true,
+            false,
+            &Some("node-a:443".to_string())
+        ));
+
+        // Not a masked pool-peer session (e.g. legacy is_site_peer-only,
+        // authenticated via the directional site_sync key rather than
+        // per-node identity): this gate never applies, strict or not.
+        assert!(!route_sync_must_be_dropped_unverified(false, true, &None));
+        assert!(!route_sync_must_be_dropped_unverified(false, false, &None));
     }
 
     /// §3 F sign-amplification (LOW #3): proves the atomic

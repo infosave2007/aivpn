@@ -108,6 +108,17 @@ pub enum ControlSubtype {
     /// with an auto-generated flag so pickers can mark generated masks (0x1F)
     MaskCatalog = 0x1F,
     HandshakeReject = 0x20,
+    /// Pool anti-entropy state-digest beacon — fixed 32-byte BLAKE3 digest (0x21)
+    PoolStateDigest = 0x21,
+    /// Pool anti-entropy Phase 2 bucketed (Merkle-lite) digest exchange —
+    /// sent in reaction to a `PoolStateDigest` mismatch so only the
+    /// differing buckets' records need to travel, not the whole DB (0x22)
+    PoolBucketDigests = 0x22,
+    /// Phase 4 per-node cryptographic identity proof — a pool node signs
+    /// `(node_id, node_pub, time_window)` with its long-term Ed25519 identity
+    /// key so a peer can bind/pin `node_id` to `node_pub` instead of trusting
+    /// a self-asserted `node_id` string (0x23)
+    NodeEnrollment = 0x23,
 }
 
 impl ControlSubtype {
@@ -145,6 +156,9 @@ impl ControlSubtype {
             0x1E => Some(Self::FeedbackConfig),
             0x1F => Some(Self::MaskCatalog),
             0x20 => Some(Self::HandshakeReject),
+            0x21 => Some(Self::PoolStateDigest),
+            0x22 => Some(Self::PoolBucketDigests),
+            0x23 => Some(Self::NodeEnrollment),
             _ => None,
         }
     }
@@ -382,6 +396,47 @@ pub enum ControlPayload {
     PoolSync {
         clients_json: Vec<u8>,
     },
+    /// Pool anti-entropy beacon: BLAKE3 digest of the sender's canonical
+    /// merged client-DB state. Peers compare digests and only exchange a full
+    /// PoolSync snapshot when they differ. Fixed 32-byte body.
+    PoolStateDigest {
+        digest: [u8; 32],
+    },
+    /// Phase 2 bucketed (Merkle-lite) digest delta: `ClientDatabase::bucket_digests()`
+    /// output, `POOL_SYNC_BUCKETS * 8` bytes (8 bytes per bucket). Sent in
+    /// reaction to a `PoolStateDigest` mismatch; the receiver diffs it
+    /// against its own `bucket_digests()` and replies with a `PoolSync`
+    /// containing only the records in the differing buckets.
+    ///
+    /// `reply_requested` completes the reverse direction of a bucket
+    /// exchange over a single (possibly one-way-dialed) session: when set,
+    /// the receiver — after sending its own differing-bucket `PoolSync` —
+    /// also sends back its own `bucket_digests()` with `reply_requested:
+    /// false`, so the original sender can compute ITS differing buckets and
+    /// push them too. `reply_requested: false` never triggers another bucket
+    /// message, which bounds the exchange and prevents a digest/bucket
+    /// ping-pong.
+    PoolBucketDigests {
+        digests: Vec<u8>,
+        reply_requested: bool,
+    },
+    /// Phase 4 per-node cryptographic identity proof. A pool node proves
+    /// ownership of its `node_id` by signing `(node_id, node_pub,
+    /// time_window)` — via `aivpn_common::crypto::node_enrollment_signing_bytes`
+    /// — with its long-term Ed25519 identity key
+    /// (`aivpn_common::crypto::node_identity_from_seed`). The receiver
+    /// verifies with `aivpn_common::crypto::verify_node_enrollment` and, on
+    /// success, binds/pins `node_id` → `node_pub` (Phase 4 TOFU / operator
+    /// manual approval — the binding policy itself is out of scope here).
+    /// This message only PROVES identity ownership; it carries no other pool
+    /// state.
+    NodeEnrollment {
+        node_id: String,
+        node_pub: [u8; 32],
+        time_window: u64,
+        #[serde(with = "serde_bytes")]
+        signature: [u8; 64],
+    },
     /// Site-to-site subnet advertisement — JSON array of CIDR strings.
     RouteSync {
         subnets_json: Vec<u8>,
@@ -539,6 +594,35 @@ impl ControlPayload {
             Self::HandshakeReject { reason } => {
                 buf.push(ControlSubtype::HandshakeReject as u8);
                 buf.push(*reason);
+            }
+            Self::PoolStateDigest { digest } => {
+                buf.push(ControlSubtype::PoolStateDigest as u8);
+                buf.extend_from_slice(digest);
+            }
+            Self::PoolBucketDigests {
+                digests,
+                reply_requested,
+            } => {
+                buf.push(ControlSubtype::PoolBucketDigests as u8);
+                buf.extend_from_slice(&((1 + digests.len()) as u32).to_le_bytes());
+                buf.push(*reply_requested as u8);
+                buf.extend_from_slice(digests);
+            }
+            Self::NodeEnrollment {
+                node_id,
+                node_pub,
+                time_window,
+                signature,
+            } => {
+                buf.push(ControlSubtype::NodeEnrollment as u8);
+                let node_id_bytes = node_id.as_bytes();
+                let total_len = (4 + node_id_bytes.len() + 32 + 8 + 64) as u32;
+                buf.extend_from_slice(&total_len.to_le_bytes());
+                buf.extend_from_slice(&(node_id_bytes.len() as u32).to_le_bytes());
+                buf.extend_from_slice(node_id_bytes);
+                buf.extend_from_slice(node_pub);
+                buf.extend_from_slice(&time_window.to_le_bytes());
+                buf.extend_from_slice(signature);
             }
             Self::ControlAck {
                 ack_seq,
@@ -827,6 +911,86 @@ impl ControlPayload {
                     return Err(Error::InvalidPacket("HandshakeReject too short"));
                 }
                 Ok(Self::HandshakeReject { reason: data[1] })
+            }
+            ControlSubtype::PoolStateDigest => {
+                if data.len() < 1 + 32 {
+                    return Err(Error::InvalidPacket("PoolStateDigest too short"));
+                }
+                let mut digest = [0u8; 32];
+                digest.copy_from_slice(&data[1..1 + 32]);
+                Ok(Self::PoolStateDigest { digest })
+            }
+            ControlSubtype::PoolBucketDigests => {
+                if data.len() < 6 {
+                    return Err(Error::InvalidPacket("PoolBucketDigests too short"));
+                }
+                let payload_len = u32::from_le_bytes([data[1], data[2], data[3], data[4]]) as usize;
+                if payload_len < 1 {
+                    return Err(Error::InvalidPacket("PoolBucketDigests invalid length"));
+                }
+                // Overflow-safe on 32-bit targets, same reasoning as PoolSync.
+                if data.len().saturating_sub(5) < payload_len {
+                    return Err(Error::InvalidPacket("PoolBucketDigests invalid length"));
+                }
+                let reply_requested = data[5] != 0;
+                let digests_len = payload_len - 1;
+                Ok(Self::PoolBucketDigests {
+                    digests: data[6..6 + digests_len].to_vec(),
+                    reply_requested,
+                })
+            }
+            ControlSubtype::NodeEnrollment => {
+                // subtype(1) + total_len(4) + node_id_len(4) = 9 minimum to
+                // read both length fields.
+                if data.len() < 9 {
+                    return Err(Error::InvalidPacket("NodeEnrollment too short"));
+                }
+                let total_len = u32::from_le_bytes([data[1], data[2], data[3], data[4]]) as usize;
+                // Overflow-safe on 32-bit targets, same reasoning as PoolSync.
+                if data.len().saturating_sub(5) < total_len {
+                    return Err(Error::InvalidPacket("NodeEnrollment invalid length"));
+                }
+                // total_len must at least cover node_id_len(4) + node_pub(32)
+                // + time_window(8) + signature(64), even for an empty node_id.
+                if total_len < 4 + 32 + 8 + 64 {
+                    return Err(Error::InvalidPacket("NodeEnrollment invalid length"));
+                }
+                let node_id_len = u32::from_le_bytes([data[5], data[6], data[7], data[8]]) as usize;
+                // The declared total_len must exactly account for
+                // node_id_len + node_pub + time_window + signature — this
+                // rejects an inconsistent (attacker-crafted) pair of length
+                // fields instead of silently misreading the trailing bytes.
+                if total_len != 4 + node_id_len + 32 + 8 + 64 {
+                    return Err(Error::InvalidPacket("NodeEnrollment length mismatch"));
+                }
+
+                let mut offset = 9usize;
+                if data.len() < offset + node_id_len {
+                    return Err(Error::InvalidPacket("NodeEnrollment node_id truncated"));
+                }
+                let node_id =
+                    String::from_utf8_lossy(&data[offset..offset + node_id_len]).to_string();
+                offset += node_id_len;
+
+                if data.len() < offset + 32 + 8 + 64 {
+                    return Err(Error::InvalidPacket("NodeEnrollment truncated"));
+                }
+                let mut node_pub = [0u8; 32];
+                node_pub.copy_from_slice(&data[offset..offset + 32]);
+                offset += 32;
+
+                let time_window = u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap());
+                offset += 8;
+
+                let mut signature = [0u8; 64];
+                signature.copy_from_slice(&data[offset..offset + 64]);
+
+                Ok(Self::NodeEnrollment {
+                    node_id,
+                    node_pub,
+                    time_window,
+                    signature,
+                })
             }
             ControlSubtype::ControlAck => {
                 if data.len() < 4 {
@@ -1325,6 +1489,9 @@ mod tests {
             (0x1E, ControlSubtype::FeedbackConfig),
             (0x1F, ControlSubtype::MaskCatalog),
             (0x20, ControlSubtype::HandshakeReject),
+            (0x21, ControlSubtype::PoolStateDigest),
+            (0x22, ControlSubtype::PoolBucketDigests),
+            (0x23, ControlSubtype::NodeEnrollment),
         ];
         for (byte, expected) in pairs {
             assert_eq!(
@@ -1335,7 +1502,7 @@ mod tests {
             );
         }
         assert_eq!(ControlSubtype::from_u8(0x00), None);
-        assert_eq!(ControlSubtype::from_u8(0x20), None);
+        assert_eq!(ControlSubtype::from_u8(0x24), None);
     }
 
     // -----------------------------------------------------------------------
@@ -1820,6 +1987,115 @@ mod tests {
     }
 
     #[test]
+    fn control_payload_pool_state_digest_roundtrip() {
+        let digest = [0xABu8; 32];
+        let p = ControlPayload::PoolStateDigest { digest };
+        let decoded = roundtrip(&p);
+        if let ControlPayload::PoolStateDigest { digest: d } = decoded {
+            assert_eq!(d, digest);
+        } else {
+            panic!("wrong variant");
+        }
+    }
+
+    #[test]
+    fn control_payload_pool_bucket_digests_roundtrip() {
+        let digests = vec![0xCDu8; 64 * 8]; // POOL_SYNC_BUCKETS * 8
+        for reply_requested in [true, false] {
+            let p = ControlPayload::PoolBucketDigests {
+                digests: digests.clone(),
+                reply_requested,
+            };
+            let decoded = roundtrip(&p);
+            if let ControlPayload::PoolBucketDigests {
+                digests: d,
+                reply_requested: r,
+            } = decoded
+            {
+                assert_eq!(d, digests);
+                assert_eq!(r, reply_requested);
+            } else {
+                panic!("wrong variant");
+            }
+        }
+    }
+
+    #[test]
+    fn control_payload_pool_bucket_digests_empty_roundtrip() {
+        for reply_requested in [true, false] {
+            let p = ControlPayload::PoolBucketDigests {
+                digests: vec![],
+                reply_requested,
+            };
+            let decoded = roundtrip(&p);
+            if let ControlPayload::PoolBucketDigests {
+                digests: d,
+                reply_requested: r,
+            } = decoded
+            {
+                assert!(d.is_empty());
+                assert_eq!(r, reply_requested);
+            } else {
+                panic!("wrong variant");
+            }
+        }
+    }
+
+    #[test]
+    fn control_payload_node_enrollment_roundtrip() {
+        let node_id = "node-alpha-01".to_string();
+        let node_pub = [0x5Au8; 32];
+        let time_window = 123_456_789u64;
+        let signature = [0x7Bu8; 64];
+
+        let p = ControlPayload::NodeEnrollment {
+            node_id: node_id.clone(),
+            node_pub,
+            time_window,
+            signature,
+        };
+        let decoded = roundtrip(&p);
+        if let ControlPayload::NodeEnrollment {
+            node_id: n,
+            node_pub: pk,
+            time_window: tw,
+            signature: sig,
+        } = decoded
+        {
+            assert_eq!(n, node_id);
+            assert_eq!(pk, node_pub);
+            assert_eq!(tw, time_window);
+            assert_eq!(sig, signature);
+        } else {
+            panic!("wrong variant");
+        }
+    }
+
+    #[test]
+    fn control_payload_node_enrollment_empty_node_id_roundtrips() {
+        // Sibling string-bearing variants (e.g. RecordingStart's `service`)
+        // allow an empty string to round-trip rather than rejecting it — the
+        // wire format has no minimum-length constraint on node_id, so match
+        // that convention here.
+        let node_pub = [0x11u8; 32];
+        let time_window = 1u64;
+        let signature = [0x22u8; 64];
+
+        let p = ControlPayload::NodeEnrollment {
+            node_id: String::new(),
+            node_pub,
+            time_window,
+            signature,
+        };
+        let decoded = roundtrip(&p);
+        if let ControlPayload::NodeEnrollment { node_id: n, .. } = decoded {
+            assert!(n.is_empty());
+        } else {
+            panic!("wrong variant");
+        }
+    }
+
+    #[test]
     fn control_payload_route_sync_roundtrip() {
         let subnets_json = br#"["10.0.0.0/8","192.168.0.0/16"]"#.to_vec();
         let p = ControlPayload::RouteSync {
@@ -2270,6 +2546,71 @@ mod tests {
         // subtype + length=9999 but no payload bytes
         let mut data = vec![0x12u8];
         data.extend_from_slice(&9999u32.to_le_bytes());
+        assert!(ControlPayload::decode(&data).is_err());
+    }
+
+    #[test]
+    fn control_payload_pool_state_digest_too_short_returns_error() {
+        // subtype + 31 bytes — needs 32
+        let mut data = vec![0x21u8];
+        data.extend_from_slice(&[0xAB; 31]);
+        assert!(ControlPayload::decode(&data).is_err());
+    }
+
+    #[test]
+    fn control_payload_pool_bucket_digests_too_short_returns_error() {
+        // only 3 bytes — needs 6 (subtype + u32 len + flag byte)
+        assert!(ControlPayload::decode(&[0x22, 0x00, 0x00]).is_err());
+    }
+
+    #[test]
+    fn control_payload_pool_bucket_digests_length_exceeds_data_returns_error() {
+        let mut data = vec![0x22u8];
+        data.extend_from_slice(&9999u32.to_le_bytes());
+        data.push(0u8); // flag byte present, but payload_len (9999) exceeds actual data
+        assert!(ControlPayload::decode(&data).is_err());
+    }
+
+    #[test]
+    fn control_payload_pool_bucket_digests_zero_length_returns_error() {
+        // payload_len = 0 is invalid now: the flag byte alone requires
+        // payload_len >= 1.
+        let mut data = vec![0x22u8];
+        data.extend_from_slice(&0u32.to_le_bytes());
+        assert!(ControlPayload::decode(&data).is_err());
+    }
+
+    #[test]
+    fn control_payload_node_enrollment_too_short_returns_error() {
+        // only 8 bytes — needs 9 (subtype + u32 total_len + u32 node_id_len)
+        assert!(ControlPayload::decode(&[0x23, 0, 0, 0, 0, 0, 0, 0]).is_err());
+    }
+
+    #[test]
+    fn control_payload_node_enrollment_total_len_exceeds_data_returns_error() {
+        let mut data = vec![0x23u8];
+        data.extend_from_slice(&9999u32.to_le_bytes()); // total_len far exceeds actual data
+        data.extend_from_slice(&0u32.to_le_bytes()); // node_id_len = 0
+        assert!(ControlPayload::decode(&data).is_err());
+    }
+
+    #[test]
+    fn control_payload_node_enrollment_total_len_below_minimum_returns_error() {
+        // total_len must be >= 4 + 32 + 8 + 64 = 108 even for an empty node_id.
+        let mut data = vec![0x23u8];
+        data.extend_from_slice(&10u32.to_le_bytes());
+        data.extend_from_slice(&0u32.to_le_bytes());
+        assert!(ControlPayload::decode(&data).is_err());
+    }
+
+    #[test]
+    fn control_payload_node_enrollment_inconsistent_lengths_returns_error() {
+        // total_len says 108 (empty node_id) but node_id_len claims 5 bytes —
+        // the two length fields disagree and must be rejected, not misread.
+        let mut data = vec![0x23u8];
+        data.extend_from_slice(&108u32.to_le_bytes());
+        data.extend_from_slice(&5u32.to_le_bytes());
+        data.extend_from_slice(&[0u8; 5 + 32 + 8 + 64]);
         assert!(ControlPayload::decode(&data).is_err());
     }
 
