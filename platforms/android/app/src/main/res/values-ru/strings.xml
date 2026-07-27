@@ -214,4 +214,37 @@
     <string name="bg_health_oem_generic">На некоторых устройствах также нужно включить «Автозапуск» для AIVPN в фирменном приложении батареи/безопасности.</string>
     <string name="bg_health_hint_ok">Фон: защищено</string>
     <string name="bg_health_hint_risk">Фон: под угрозой — нажмите, чтобы исправить</string>
+
+    <!-- In-app admin: client management (P3.1) -->
+    <string name="admin_menu_title">Управление клиентами</string>
+    <string name="desc_admin_menu">Добавление, отзыв и управление подключёнными клиентами (админ)</string>
+    <string name="admin_title">Управление клиентами</string>
+    <string name="admin_refresh">Обновить</string>
+    <string name="admin_not_connected">Нет подключения — подключитесь к VPN, чтобы управлять клиентами</string>
+    <string name="admin_no_clients">Пока нет клиентов</string>
+    <string name="admin_add_client">Добавить клиента</string>
+    <string name="admin_action_key">Ключ</string>
+    <string name="admin_action_edit">Изменить</string>
+    <string name="admin_action_reset">Сброс устройства</string>
+    <string name="admin_action_revoke">Отозвать</string>
+    <string name="admin_dialog_add_title">Добавить клиента</string>
+    <string name="admin_dialog_edit_title">Изменить клиента</string>
+    <string name="admin_hint_name">Имя клиента</string>
+    <string name="admin_hint_expiry">Срок действия (ISO 8601, необязательно)</string>
+    <string name="admin_one_time">Одноразовый ключ</string>
+    <string name="admin_enabled">Включён</string>
+    <string name="admin_status_enabled">Включён</string>
+    <string name="admin_status_disabled">Отключён</string>
+    <string name="admin_status_one_time">Одноразовый</string>
+    <string name="admin_status_expires">Истекает: %s</string>
+    <string name="admin_revoke_confirm_title">Отозвать клиента?</string>
+    <string name="admin_revoke_confirm_msg">Это навсегда отзовёт \"%s\" и отключит его. Продолжить?</string>
+    <string name="admin_reset_confirm_title">Сбросить привязку устройства?</string>
+    <string name="admin_reset_confirm_msg">\"%s\" потребуется заново привязать устройство при следующем подключении. Продолжить?</string>
+    <string name="admin_share">Поделиться</string>
+    <string name="admin_copy">Копировать</string>
+    <string name="admin_copied">Скопировано</string>
+    <string name="admin_reject_reason_prefix">Отклонено: %s</string>
+    <string name="admin_error_generic">Ошибка запроса (%d)</string>
+    <string name="admin_error_with_reason">Ошибка запроса (%1$d): %2$s</string>
 </resources>

@@ -315,6 +315,7 @@ struct ContentView: View {
     @State private var showDeleteConfirm: Bool = false
     @State private var showSplitTunnel: Bool = false
     @State private var showBootstrapDiscovery: Bool = false
+    @State private var showAdmin: Bool = false
 
     var body: some View {
         NavigationStack {
@@ -366,6 +367,23 @@ struct ContentView: View {
                 ToolbarItem(placement: .navigationBarTrailing) {
                     Button { showSplitTunnel = true } label: {
                         Image(systemName: "network")
+                    }
+                }
+                // In-app admin (P3.2): only the server-assigned Admin role
+                // (2) may reach the client-management screen — Viewer/User
+                // never see the button at all. `vpn.isConnected` gates
+                // AdminApi.role() being meaningful (it caches the last
+                // Capabilities push, reset to User at the start of each
+                // session) and also re-evaluates this every second while
+                // connected via VPNManager's durationTimer-driven
+                // @Published updates, so the button appears shortly after
+                // the post-handshake Capabilities message arrives without
+                // any extra polling here.
+                if vpn.isConnected && AdminApi.role() == 2 {
+                    ToolbarItem(placement: .navigationBarTrailing) {
+                        Button { showAdmin = true } label: {
+                            Image(systemName: "person.badge.key.fill")
+                        }
                     }
                 }
             }
@@ -426,6 +444,10 @@ struct ContentView: View {
         .sheet(isPresented: $showBootstrapDiscovery) {
             BootstrapDiscoveryView()
                 .environmentObject(vpn)
+                .environmentObject(loc)
+        }
+        .sheet(isPresented: $showAdmin) {
+            AdminView()
                 .environmentObject(loc)
         }
         .sheet(isPresented: $showDiagnostics) {

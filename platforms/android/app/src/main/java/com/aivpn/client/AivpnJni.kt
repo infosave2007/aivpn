@@ -281,4 +281,44 @@ object AivpnJni {
         signingPublicKey: ByteArray,
         nowUnixSecs: Long,
     ): Boolean
+
+    // ──────────── In-app admin: client management (P3.1) ────────────
+    //
+    // These three exports back the curated management-API client used by
+    // [AdminApi] / [AdminActivity]. They operate on the currently-active tunnel
+    // session (process-global, like the getters above) — there is no separate
+    // "admin connection". Callers MUST check [isAvailable] first, same as any
+    // other `external fun` on this object.
+
+    /**
+     * This device's role on the currently-configured identity: 0=User,
+     * 1=Viewer, 2=Admin. Role is bound to the client's cryptographic identity
+     * (set server-side) and is NOT assignable over the tunnel — there is no
+     * corresponding setter here.
+     */
+    external fun getRole(): Int
+
+    /**
+     * Issues one request against the curated management API
+     * (`/api/v1/clients`, `/api/v1/status`, `/api/v1/audit-log`, ...) over the
+     * active tunnel session and blocks for up to ~10s waiting for the reply.
+     *
+     * @param method HTTP method byte: 0=GET, 1=POST, 2=PATCH, 3=DELETE, 4=PUT.
+     * @param path   Request path, e.g. "/api/v1/clients/{id}".
+     * @param body   Request body bytes (JSON), or an empty array for methods
+     *               without a body.
+     * @return       `[status_hi, status_lo, ...response_body]` — a 2-byte
+     *               big-endian HTTP status prefix followed by the response
+     *               body bytes. An EMPTY array means the call did not
+     *               complete (not connected / timed out) — callers must
+     *               check `size < 2` before indexing.
+     */
+    external fun mgmtRequest(method: Int, path: String, body: ByteArray): ByteArray
+
+    /**
+     * Renders `text` (typically an `aivpn://...` connection key) as a PNG QR
+     * code and returns the raw PNG bytes, or an empty array on failure.
+     * Decode with [android.graphics.BitmapFactory.decodeByteArray].
+     */
+    external fun qrPng(text: String): ByteArray
 }

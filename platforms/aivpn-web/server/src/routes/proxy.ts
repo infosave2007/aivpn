@@ -53,7 +53,14 @@ const VIEWER_ALLOWED: Array<{ method: string; pattern: RegExp }> = [
  *
  * Deliberately EXCLUDED (viewers get 403): config + backup + bootstrap +
  * clients/:id/connection-key (all expose operator or client secrets) and
- * audit-log (admin action history + client IPs — admin-only oversight data).
+ * audit-log (admin action history + client IPs — admin-only oversight data,
+ * including with ?verify=1 — the query string doesn't affect the canonical
+ * path this allowlist matches against, see canonicalizeForAuthz below).
+ *
+ * POST clients/:id/revoke and PATCH clients/:id (role assignment) are never
+ * reachable by viewers regardless of this allowlist: requireReadAccess()
+ * rejects any non-GET request from a viewer before this check ever runs
+ * (defence-in-depth — they're also simply absent from VIEWER_ALLOWED).
  */
 export function isViewerAllowed(method: string, path: string): boolean {
   return VIEWER_ALLOWED.some((r) => r.method === method && r.pattern.test(path))

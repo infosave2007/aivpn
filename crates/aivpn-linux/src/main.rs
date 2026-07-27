@@ -1,3 +1,4 @@
+mod admin;
 mod app;
 mod key_storage;
 mod settings;

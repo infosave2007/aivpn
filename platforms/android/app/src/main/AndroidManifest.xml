@@ -49,6 +49,12 @@
             android:exported="false"
             android:parentActivityName=".MainActivity" />
 
+        <!-- In-app admin: client management (Admin/Viewer role gated) -->
+        <activity
+            android:name=".AdminActivity"
+            android:exported="false"
+            android:parentActivityName=".MainActivity" />
+
         <service
             android:name=".AivpnService"
             android:permission="android.permission.BIND_VPN_SERVICE"

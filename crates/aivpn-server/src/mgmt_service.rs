@@ -1022,7 +1022,9 @@ pub fn dispatch(ctx: &MgmtCtx, method: u8, path: &str, body: &[u8]) -> (u16, Vec
             Err(e) => err_response(e),
         },
         Route::ClientConnectionKey(id) => match connection_key(ctx, &id) {
-            Ok(key) => json_response(200, &serde_json::json!({ "key": key })),
+            // Field name unified with the REST handler (management_api::get_connection_key)
+            // so tunnel and socket clients parse the same key. Both use "connection_key".
+            Ok(key) => json_response(200, &serde_json::json!({ "connection_key": key })),
             Err(e) => err_response(e),
         },
         Route::ClientResetDevice(id) => match reset_device(ctx, &id) {
@@ -1494,7 +1496,9 @@ mod tests {
         let (status, body) = dispatch(&c, METHOD_GET, &path, &[]);
         assert_eq!(status, 200);
         let json: serde_json::Value = serde_json::from_slice(&body).expect("valid JSON body");
-        let key = json["key"].as_str().expect("response has string 'key'");
+        let key = json["connection_key"]
+            .as_str()
+            .expect("response has string 'connection_key'");
         assert!(
             key.starts_with("aivpn://"),
             "connection key must start with aivpn:// scheme, got: {}",

@@ -55,6 +55,13 @@ struct ContentView: View {
     @AppStorage("maskCountryCode") private var maskCountryCode: String = ""
     @AppStorage("themePreference") private var themePreference: String = "system"
     @State private var showDiagnostics: Bool = false
+    // P3.3-macOS: cached server-assigned role, refreshed (off main thread —
+    // AdminApi.role() blocks on a socket round trip up to 10s) whenever the
+    // tunnel connects. nil = unknown/unreachable/not connected; the admin
+    // section only ever shows for an explicit AdminApi.roleAdmin match, so
+    // "unknown" and "not admin" both fail closed to "hidden", never a
+    // false-positive reveal.
+    @State private var adminRole: UInt8? = nil
     @State private var benchRunning: Bool = false
     @State private var benchResult: BenchDisplayResult? = nil
     @State private var editingKeyId: String?
@@ -782,6 +789,35 @@ struct ContentView: View {
                 Divider()
             }
 
+            // Admin: client-management console (P3.3-macOS). Only ever shown
+            // when the server-assigned role cached from the last Capabilities
+            // control message is Admin (2) — never assignable from this app,
+            // the server decides. Opens its own window (AdminWindowController)
+            // rather than an inline section: the popover is a fixed 360×440
+            // and a client list + add-client form + QR/save-panel flow needs
+            // real room, the same way "Manage…"/"Preferences…" in other
+            // menu-bar apps opens a separate window instead of growing the
+            // popover indefinitely.
+            if vpn.isConnected, adminRole == AdminApi.roleAdmin {
+                Button(action: { AdminWindowController.shared.show() }) {
+                    HStack {
+                        Image(systemName: "person.2.badge.gearshape")
+                            .font(.caption)
+                        Text(loc.t("admin_panel_button"))
+                            .font(.caption)
+                        Spacer()
+                        Image(systemName: "chevron.right")
+                            .font(.caption2)
+                            .foregroundColor(.secondary)
+                    }
+                }
+                .buttonStyle(.plain)
+                .padding(.horizontal, 16)
+                .padding(.vertical, 8)
+
+                Divider()
+            }
+
             // Connect / Disconnect button
             Button(action: {
                 if vpn.isConnected {
@@ -924,10 +960,22 @@ struct ContentView: View {
         .preferredColorScheme(colorSchemeOverride)
         .onAppear {
             connectOnLaunch = LaunchAgentManager.shared.isEnabled
+            if vpn.isConnected {
+                refreshAdminRole()
+            }
         }
         .onReceive(vpn.$isConnected) { connected in
             if let appDelegate = NSApp.delegate as? AppDelegate {
                 appDelegate.updateStatusIcon(connected: connected)
+            }
+            if connected {
+                refreshAdminRole()
+            } else {
+                // Role is only meaningful for a live session (cached from
+                // Capabilities, reset server-side on reconnect) — clear it
+                // immediately on disconnect so a stale Admin reveal can't
+                // outlive the session that granted it.
+                adminRole = nil
             }
         }
         .confirmationDialog(loc.t("delete_key_confirm"), isPresented: $showDeleteConfirm) {
@@ -1071,6 +1119,20 @@ struct ContentView: View {
             return true
         default:
             return false
+        }
+    }
+
+    /// Refreshes `adminRole` from the running daemon. `AdminApi.role()`
+    /// performs a blocking socket round trip (up to 10s) so it MUST run off
+    /// the main thread — SwiftUI would otherwise freeze the whole popover
+    /// for up to that long on every connect. A stale/failed read (nil) just
+    /// keeps the admin section hidden; it never shows a wrong role.
+    private func refreshAdminRole() {
+        DispatchQueue.global(qos: .utility).async {
+            let role = AdminApi.role()
+            DispatchQueue.main.async {
+                adminRole = role
+            }
         }
     }
 }

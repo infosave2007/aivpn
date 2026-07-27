@@ -2,21 +2,27 @@
   import { createQuery } from '@tanstack/svelte-query';
   import { auditLog, isAuditResultOk } from '$lib/api';
   import StatusBadge from '$lib/components/StatusBadge.svelte';
-  import { Search } from 'lucide-svelte';
+  import { Search, ShieldCheck, ShieldAlert } from 'lucide-svelte';
 
   // No SSE here: the /web/events stream only carries named `state` status
   // ticks — the server emits no audit events at all, so the previous
   // live-tail listener could never fire. Poll the audit log instead.
+  //
+  // `verify: true` asks the daemon to walk the hash chain server-side and
+  // report whether every entry still links correctly to the previous one —
+  // used below to render the tamper-evidence badge.
   const query = createQuery({
-    queryKey: ['audit-log'],
-    queryFn: () => auditLog.list(200),
+    queryKey: ['audit-log', 'verify'],
+    queryFn: () => auditLog.list({ limit: 200, verify: true }),
     refetchInterval: 10_000,
   });
+
+  const entries = $derived($query.data?.entries ?? []);
 
   let search = $state('');
   let filterResult = $state<'' | 'ok' | 'fail'>('');
 
-  const filtered = $derived(($query.data ?? []).filter((e) => {
+  const filtered = $derived((entries).filter((e) => {
     const matchSearch = !search || [e.actor, e.action, e.target].some((f) => f?.toLowerCase().includes(search.toLowerCase()));
     // Server emits "ok"/"accepted" (success) and "fail"/"rejected"/"denied"
     // (failure) — map the two filter buckets onto those real values.
@@ -35,7 +41,22 @@
 </script>
 
 <div class="space-y-4">
-  <h1 class="text-2xl font-bold text-gray-900 dark:text-white">Audit Log</h1>
+  <div class="flex items-center gap-3">
+    <h1 class="text-2xl font-bold text-gray-900 dark:text-white">Audit Log</h1>
+    {#if $query.data}
+      {#if $query.data.verified}
+        <span class="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-400">
+          <ShieldCheck size={14} />
+          Chain verified ✓
+        </span>
+      {:else}
+        <span class="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-400">
+          <ShieldAlert size={14} />
+          Tampering detected at entry {$query.data.broken_at ?? '?'} ✗
+        </span>
+      {/if}
+    {/if}
+  </div>
 
   <div class="flex items-center gap-3">
     <div class="relative flex-1 max-w-xs">

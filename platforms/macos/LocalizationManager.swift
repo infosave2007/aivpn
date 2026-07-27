@@ -438,6 +438,176 @@ class LocalizationManager: ObservableObject {
             "en": "ISO 3166-1 alpha-2 country code (2 letters), used only for regional mask hints. Leave empty to disable.",
             "ru": "Код страны ISO 3166-1 alpha-2 (2 буквы), используется только для региональных подсказок по маскам. Оставьте пустым для отключения."
         ],
+
+        // MARK: - Admin (P3.3-macOS client management)
+        "admin_panel_button": [
+            "en": "Manage Clients (Admin)",
+            "ru": "Управление клиентами (админ)"
+        ],
+        "admin_panel_title": [
+            "en": "Client Management",
+            "ru": "Управление клиентами"
+        ],
+        "admin_clients": [
+            "en": "Clients",
+            "ru": "Клиенты"
+        ],
+        "admin_no_clients": [
+            "en": "No clients yet.",
+            "ru": "Клиентов пока нет."
+        ],
+        "admin_add_client": [
+            "en": "Add Client",
+            "ru": "Добавить клиента"
+        ],
+        "admin_client_name": [
+            "en": "Client name",
+            "ru": "Имя клиента"
+        ],
+        "admin_one_time": [
+            "en": "One-time (revoke after first connect)",
+            "ru": "Одноразовый (отозвать после первого подключения)"
+        ],
+        "admin_expires_at": [
+            "en": "Expires",
+            "ru": "Истекает"
+        ],
+        "admin_expires_enable": [
+            "en": "Set expiration date",
+            "ru": "Задать срок действия"
+        ],
+        "admin_create": [
+            "en": "Create",
+            "ru": "Создать"
+        ],
+        "admin_creating": [
+            "en": "Creating…",
+            "ru": "Создание…"
+        ],
+        "admin_role_user": [
+            "en": "User",
+            "ru": "Пользователь"
+        ],
+        "admin_role_viewer": [
+            "en": "Viewer",
+            "ru": "Наблюдатель"
+        ],
+        "admin_role_admin": [
+            "en": "Admin",
+            "ru": "Администратор"
+        ],
+        "admin_status_enabled": [
+            "en": "Enabled",
+            "ru": "Включён"
+        ],
+        "admin_status_disabled": [
+            "en": "Disabled",
+            "ru": "Отключён"
+        ],
+        "admin_edit": [
+            "en": "Edit",
+            "ru": "Изменить"
+        ],
+        "admin_save": [
+            "en": "Save",
+            "ru": "Сохранить"
+        ],
+        "admin_cancel": [
+            "en": "Cancel",
+            "ru": "Отмена"
+        ],
+        "admin_revoke": [
+            "en": "Revoke",
+            "ru": "Отозвать"
+        ],
+        "admin_revoke_confirm_title": [
+            "en": "Revoke this client?",
+            "ru": "Отозвать этого клиента?"
+        ],
+        "admin_revoke_confirm_message": [
+            "en": "This immediately disconnects the client and invalidates its connection key. This cannot be undone.",
+            "ru": "Клиент будет немедленно отключён, а его ключ подключения станет недействительным. Это действие необратимо."
+        ],
+        "admin_reset_device": [
+            "en": "Reset Device Binding",
+            "ru": "Сбросить привязку устройства"
+        ],
+        "admin_reset_device_confirm_title": [
+            "en": "Reset device binding?",
+            "ru": "Сбросить привязку устройства?"
+        ],
+        "admin_reset_device_confirm_message": [
+            "en": "The client will be able to re-enroll from a new device using the same connection key.",
+            "ru": "Клиент сможет повторно подключиться с нового устройства, используя тот же ключ подключения."
+        ],
+        "admin_show_key": [
+            "en": "Show Connection Key",
+            "ru": "Показать ключ подключения"
+        ],
+        "admin_connection_key": [
+            "en": "Connection Key",
+            "ru": "Ключ подключения"
+        ],
+        "admin_qr_loading": [
+            "en": "Generating QR code…",
+            "ru": "Генерация QR-кода…"
+        ],
+        "admin_qr_failed": [
+            "en": "Could not generate QR code",
+            "ru": "Не удалось создать QR-код"
+        ],
+        "admin_save_to_file": [
+            "en": "Save to File…",
+            "ru": "Сохранить в файл…"
+        ],
+        "admin_copy_key": [
+            "en": "Copy Key",
+            "ru": "Скопировать ключ"
+        ],
+        "admin_copied": [
+            "en": "Copied",
+            "ru": "Скопировано"
+        ],
+        "admin_loading": [
+            "en": "Loading…",
+            "ru": "Загрузка…"
+        ],
+        "admin_refresh": [
+            "en": "Refresh",
+            "ru": "Обновить"
+        ],
+        "admin_close": [
+            "en": "Close",
+            "ru": "Закрыть"
+        ],
+        "admin_error_generic": [
+            "en": "Request failed. Is AIVPN connected?",
+            "ru": "Запрос не выполнен. AIVPN подключён?"
+        ],
+        "admin_unavailable_title": [
+            "en": "Admin panel unavailable",
+            "ru": "Панель администратора недоступна"
+        ],
+        "admin_unavailable_message": [
+            "en": "The admin channel could not be reached. Make sure you're connected, and note that in full-tunnel mode the admin socket token is only readable while running in SOCKS5 proxy mode.",
+            "ru": "Не удалось подключиться к каналу администрирования. Убедитесь, что AIVPN подключён; учтите, что в режиме полного туннеля токен админ-сокета доступен для чтения только в режиме SOCKS5-прокси."
+        ],
+        "admin_not_admin_role": [
+            "en": "Your account does not have admin access on this server.",
+            "ru": "У вашей учётной записи нет прав администратора на этом сервере."
+        ],
+        "admin_device_bound": [
+            "en": "Device bound",
+            "ru": "Устройство привязано"
+        ],
+        "admin_vpn_ip": [
+            "en": "VPN IP",
+            "ru": "VPN IP"
+        ],
+        "admin_created_at": [
+            "en": "Created",
+            "ru": "Создан"
+        ],
     ]
 
     init() {

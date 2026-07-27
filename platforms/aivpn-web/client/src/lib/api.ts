@@ -94,6 +94,12 @@ export interface ClientQos {
   dscp_class?: string;
 }
 
+/** Per-client role in the pool/admin control-channel (NOT the web-panel login
+ *  role, which is only 'admin' | 'viewer' — see server/src/db/schema.ts). This
+ *  is the client's role field set via PATCH /api/v1/clients/:id and is only
+ *  assignable through the web/CLI, never over the tunnel. */
+export type ClientRole = 'user' | 'viewer' | 'admin';
+
 export interface Client {
   id: string;
   name: string;
@@ -104,6 +110,9 @@ export interface Client {
   created_at: string;
   expires_at?: string | null;
   qos?: ClientQos;
+  /** Optional for backward compatibility with older daemon builds that
+   *  predate role assignment — treat a missing value as 'user' in the UI. */
+  role?: ClientRole;
   stats: {
     bytes_in: number;
     bytes_out: number;
@@ -283,11 +292,21 @@ export const clients = {
   async create(data: { name: string; one_time?: boolean; expires_at?: string | null; qos?: ClientQos }): Promise<Client> {
     return apiJson('/api/v1/clients', { method: 'POST', body: JSON.stringify(data) });
   },
-  async update(id: string, data: { name?: string; enabled?: boolean; one_time?: boolean; expires_at?: string | null; qos?: ClientQos | null }): Promise<Client> {
+  async update(id: string, data: { name?: string; enabled?: boolean; one_time?: boolean; expires_at?: string | null; qos?: ClientQos | null; role?: ClientRole }): Promise<Client> {
     return apiJson(`/api/v1/clients/${id}`, { method: 'PATCH', body: JSON.stringify(data) });
   },
   async delete(id: string): Promise<void> {
     await apiFetch(`/api/v1/clients/${id}`, { method: 'DELETE' });
+  },
+  /** Admin-only: tombstone the client and force-disconnect any active
+   *  session. Distinct from delete() — the daemon retains a revocation
+   *  record instead of removing the client outright. Irreversible. */
+  async revoke(id: string): Promise<void> {
+    const res = await apiFetch(`/api/v1/clients/${id}/revoke`, { method: 'POST' });
+    if (!res.ok) {
+      const text = await res.text();
+      throw new Error(text || `HTTP ${res.status}`);
+    }
   },
   async connectionKey(id: string): Promise<{ connection_key: string }> {
     return apiJson(`/api/v1/clients/${id}/connection-key`);
@@ -332,10 +351,36 @@ export const masks = {
   },
 };
 
+/** GET /api/v1/audit-log?verify=1 response shape: the hash-chain is walked
+ *  server-side and `verified` reports whether every entry's hash correctly
+ *  links to the previous one. `broken_at` is the (0-based) index of the first
+ *  entry where the chain no longer verifies, or null when `verified` is true. */
+export interface AuditVerifyResponse {
+  entries: AuditLogEntry[];
+  verified: boolean;
+  broken_at: number | null;
+}
+
+// Overloads: passing `verify: true` switches the return shape to the
+// hash-chain verification envelope; everything else (bare limit, or params
+// without verify) keeps the plain-array shape callers already rely on.
+// (Overload signatures are only valid on a standalone function/class member —
+// not on an object-literal method — hence this is declared outside `auditLog`
+// and assigned in below.)
+function auditLogList(params: { limit?: number; verify: true }): Promise<AuditVerifyResponse>;
+function auditLogList(params?: number | { limit?: number; verify?: false }): Promise<AuditLogEntry[]>;
+async function auditLogList(
+  params?: number | { limit?: number; verify?: boolean },
+): Promise<AuditLogEntry[] | AuditVerifyResponse> {
+  const opts = typeof params === 'number' ? { limit: params } : (params ?? {});
+  const limit = opts.limit ?? 200;
+  const qs = new URLSearchParams({ limit: String(limit) });
+  if (opts.verify) qs.set('verify', '1');
+  return apiJson(`/api/v1/audit-log?${qs.toString()}`);
+}
+
 export const auditLog = {
-  async list(limit = 200): Promise<AuditLogEntry[]> {
-    return apiJson(`/api/v1/audit-log?limit=${limit}`);
-  },
+  list: auditLogList,
 };
 
 export const kernel = {

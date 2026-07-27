@@ -214,4 +214,37 @@
     <string name="bg_health_oem_generic">Some devices also require enabling “Autostart” for AIVPN in the manufacturer’s battery/security app.</string>
     <string name="bg_health_hint_ok">Background: protected</string>
     <string name="bg_health_hint_risk">Background: at risk — tap to fix</string>
+
+    <!-- In-app admin: client management (P3.1) -->
+    <string name="admin_menu_title">Client management</string>
+    <string name="desc_admin_menu">Add, revoke, and manage connected clients (admin)</string>
+    <string name="admin_title">Client Management</string>
+    <string name="admin_refresh">Refresh</string>
+    <string name="admin_not_connected">Not connected — connect to the VPN to manage clients</string>
+    <string name="admin_no_clients">No clients yet</string>
+    <string name="admin_add_client">Add client</string>
+    <string name="admin_action_key">Key</string>
+    <string name="admin_action_edit">Edit</string>
+    <string name="admin_action_reset">Reset device</string>
+    <string name="admin_action_revoke">Revoke</string>
+    <string name="admin_dialog_add_title">Add client</string>
+    <string name="admin_dialog_edit_title">Edit client</string>
+    <string name="admin_hint_name">Client name</string>
+    <string name="admin_hint_expiry">Expires at (ISO 8601, optional)</string>
+    <string name="admin_one_time">One-time key</string>
+    <string name="admin_enabled">Enabled</string>
+    <string name="admin_status_enabled">Enabled</string>
+    <string name="admin_status_disabled">Disabled</string>
+    <string name="admin_status_one_time">One-time</string>
+    <string name="admin_status_expires">Expires: %s</string>
+    <string name="admin_revoke_confirm_title">Revoke client?</string>
+    <string name="admin_revoke_confirm_msg">This permanently revokes \"%s\" and disconnects it. Continue?</string>
+    <string name="admin_reset_confirm_title">Reset device binding?</string>
+    <string name="admin_reset_confirm_msg">\"%s\" will need to re-enroll its device on next connect. Continue?</string>
+    <string name="admin_share">Share</string>
+    <string name="admin_copy">Copy</string>
+    <string name="admin_copied">Copied</string>
+    <string name="admin_reject_reason_prefix">Rejected: %s</string>
+    <string name="admin_error_generic">Request failed (%d)</string>
+    <string name="admin_error_with_reason">Request failed (%1$d): %2$s</string>
 </resources>

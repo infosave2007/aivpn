@@ -761,8 +761,17 @@ class MainActivity : AppCompatActivity() {
             ": " + if (autoConnect) getString(R.string.auto_connect_state_on)
                    else getString(R.string.auto_connect_state_off)
 
+        // In-app admin entry: visible for Admin (full read/write) and Viewer
+        // (read-only list inside AdminActivity), hidden entirely for role
+        // User(0) or when the role can't be determined (e.g. .so not loaded).
+        val mgmtRole = try {
+            if (AivpnJni.isAvailable) AivpnJni.getRole() else -1
+        } catch (_: Throwable) {
+            -1
+        }
+
         data class Item(val title: String, val desc: String, val id: Int)
-        val items = listOf(
+        val items = mutableListOf(
             Item(getString(R.string.adaptive_mode) + ": " + levelNames[currentLevel],
                  getString(R.string.desc_adaptive_mode), MENU_ADAPTIVE),
             Item(autoConnectLabel,                   getString(R.string.desc_auto_connect),  MENU_AUTO_CONNECT),
@@ -773,6 +782,9 @@ class MainActivity : AppCompatActivity() {
             Item(getString(R.string.bootstrap_discovery), getString(R.string.desc_bootstrap_discovery), MENU_BOOTSTRAP_DISCOVERY),
             Item(getString(R.string.mask_privacy), getString(R.string.desc_mask_privacy), MENU_MASK_PRIVACY),
         )
+        if (mgmtRole == 1 || mgmtRole == 2) {
+            items.add(Item(getString(R.string.admin_menu_title), getString(R.string.desc_admin_menu), MENU_ADMIN))
+        }
 
         val dialogCtx = android.view.ContextThemeWrapper(this, R.style.Theme_AIVPN_Dialog)
         val container = LinearLayout(dialogCtx).apply {
@@ -860,6 +872,7 @@ class MainActivity : AppCompatActivity() {
             MENU_OS_KILL_SWITCH -> startActivity(Intent(android.provider.Settings.ACTION_VPN_SETTINGS))
             MENU_BOOTSTRAP_DISCOVERY -> showBootstrapDiscoveryDialog()
             MENU_MASK_PRIVACY -> showMaskPrivacyDialog()
+            MENU_ADMIN -> startActivity(Intent(this, AdminActivity::class.java))
         }
     }
 
@@ -1398,6 +1411,7 @@ class MainActivity : AppCompatActivity() {
         private const val MENU_AUTO_CONNECT = 1006
         private const val MENU_BOOTSTRAP_DISCOVERY = 1007
         private const val MENU_MASK_PRIVACY = 1008
+        private const val MENU_ADMIN = 1009
 
         val MASK_OPTIONS = arrayOf(
             "auto",

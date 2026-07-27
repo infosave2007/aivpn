@@ -1,5 +1,6 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
+mod admin;
 mod key_storage;
 mod localization;
 mod vpn_manager;
@@ -503,6 +504,8 @@ struct TrayHandles {
 // ── App struct ─────────────────────────────────────────────────────────────
 
 #[cfg(windows)]
+use admin::{AdminRequest, AdminResponse};
+#[cfg(windows)]
 use key_storage::KeyStorage;
 #[cfg(windows)]
 use localization::{t, AppSettings, Lang};
@@ -561,15 +564,104 @@ struct AivpnApp {
     quit_requested: std::sync::Arc<std::sync::atomic::AtomicBool>,
     connect_requested: std::sync::Arc<std::sync::atomic::AtomicBool>,
     tray_thread_shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
+
+    // ── Admin panel (P3.4) — in-tunnel client management, Admin role only ──
+    admin_tx: std::sync::mpsc::Sender<AdminResponse>,
+    admin_rx: std::sync::mpsc::Receiver<AdminResponse>,
+    /// Server-assigned role cached for the CURRENT session (0/1/2). `None`
+    /// until the `role` query answers; the panel only ever shows once this
+    /// is `Some(2)` — fails closed (never shown) on a query error.
+    admin_role: Option<u8>,
+    admin_clients_loaded: bool,
+    admin_clients: Vec<admin::AdminClient>,
+    admin_clients_loading: bool,
+    admin_clients_error: Option<String>,
+    /// Client ids with an operation (delete/revoke/reset-device) in flight —
+    /// disables that row's buttons so a slow ~5s mgmt round-trip can't be
+    /// double-clicked into two concurrent operations on the same client.
+    admin_busy_ids: std::collections::HashSet<String>,
+    admin_status: Option<admin::AdminStatus>,
+    admin_audit: Vec<admin::AuditEntry>,
+    admin_audit_loading: bool,
+    admin_audit_error: Option<String>,
+
+    admin_show_add: bool,
+    admin_add_name: String,
+    admin_add_one_time: bool,
+    admin_add_expiry: String,
+    admin_add_error: Option<String>,
+    admin_add_busy: bool,
+
+    admin_edit_id: Option<String>,
+    admin_edit_name: String,
+    admin_edit_enabled: bool,
+    admin_edit_expiry: String,
+    admin_edit_error: Option<String>,
+    admin_edit_busy: bool,
+
+    // Connection-key / QR viewer window
+    admin_key_id: Option<String>,
+    admin_key_name: String,
+    admin_key_value: Option<String>,
+    admin_key_loading: bool,
+    admin_key_error: Option<String>,
+    admin_key_saved_msg: Option<String>,
+    admin_qr_png: Option<Vec<u8>>,
+    admin_qr_texture: Option<eframe::egui::TextureHandle>,
+    admin_qr_loading: bool,
+    admin_qr_error: Option<String>,
+    admin_qr_saved_msg: Option<String>,
+
+    // Revoke confirmation modal
+    admin_revoke_id: Option<String>,
+    admin_revoke_name: String,
 }
 
 #[cfg(windows)]
 impl AivpnApp {
     fn new(settings: AppSettings, ctx: &eframe::egui::Context) -> Self {
+        let (admin_tx, admin_rx) = std::sync::mpsc::channel();
         let mut app = Self {
             settings,
             vpn: VpnManager::new(),
             keys: KeyStorage::load(),
+            admin_tx,
+            admin_rx,
+            admin_role: None,
+            admin_clients_loaded: false,
+            admin_clients: Vec::new(),
+            admin_clients_loading: false,
+            admin_clients_error: None,
+            admin_busy_ids: std::collections::HashSet::new(),
+            admin_status: None,
+            admin_audit: Vec::new(),
+            admin_audit_loading: false,
+            admin_audit_error: None,
+            admin_show_add: false,
+            admin_add_name: String::new(),
+            admin_add_one_time: false,
+            admin_add_expiry: String::new(),
+            admin_add_error: None,
+            admin_add_busy: false,
+            admin_edit_id: None,
+            admin_edit_name: String::new(),
+            admin_edit_enabled: true,
+            admin_edit_expiry: String::new(),
+            admin_edit_error: None,
+            admin_edit_busy: false,
+            admin_key_id: None,
+            admin_key_name: String::new(),
+            admin_key_value: None,
+            admin_key_loading: false,
+            admin_key_error: None,
+            admin_key_saved_msg: None,
+            admin_qr_png: None,
+            admin_qr_texture: None,
+            admin_qr_loading: false,
+            admin_qr_error: None,
+            admin_qr_saved_msg: None,
+            admin_revoke_id: None,
+            admin_revoke_name: String::new(),
             connected_since: None,
             last_conn_state: ConnectionState::Disconnected,
             error_msg: None,
@@ -762,11 +854,25 @@ impl AivpnApp {
         if cur != self.last_conn_state {
             if cur == ConnectionState::Connected {
                 self.connected_since = Some(Instant::now());
+                // P3.4: query the server-assigned role once per new
+                // session — the admin panel only appears once this comes
+                // back Some(2). Reset first so a stale role from a PREVIOUS
+                // session's Admin client can't leak into a new session
+                // against a non-admin one while the query is in flight.
+                self.admin_role = None;
+                self.admin_clients_loaded = false;
+                admin::spawn(
+                    self.vpn.client_binary.clone(),
+                    AdminRequest::Role,
+                    self.admin_tx.clone(),
+                );
             } else if self.last_conn_state == ConnectionState::Connected {
                 self.connected_since = None;
+                self.reset_admin_state();
             }
             self.last_conn_state = cur;
         }
+        self.poll_admin();
         if let Some(at) = self.error_at {
             if at.elapsed().as_secs() > 8 {
                 self.error_msg = None;
@@ -777,6 +883,662 @@ impl AivpnApp {
             if at.elapsed().as_secs() >= 2 {
                 self.settings.save();
                 self.dirty_at = None;
+            }
+        }
+    }
+
+    // ── Admin panel (P3.4) ──────────────────────────────────────────────
+
+    /// Drain every pending `AdminResponse` and apply it to UI state. Called
+    /// once per `tick()`.
+    fn poll_admin(&mut self) {
+        while let Ok(msg) = self.admin_rx.try_recv() {
+            match msg {
+                AdminResponse::Role(r) => match r {
+                    Ok(role) => {
+                        self.admin_role = Some(role);
+                        if role == 2 && !self.admin_clients_loaded {
+                            self.admin_clients_loaded = true;
+                            self.refresh_admin_clients();
+                        }
+                    }
+                    Err(_) => {
+                        // Fails closed: an unreadable/unknown role never
+                        // shows the panel, same as an explicit User role.
+                        self.admin_role = Some(0);
+                    }
+                },
+                AdminResponse::Clients(r) => {
+                    self.admin_clients_loading = false;
+                    match r {
+                        Ok(list) => {
+                            self.admin_clients = list;
+                            self.admin_clients_error = None;
+                        }
+                        Err(e) => self.admin_clients_error = Some(e),
+                    }
+                }
+                AdminResponse::ClientSaved(r) => {
+                    let editing = self.admin_edit_id.is_some();
+                    self.admin_add_busy = false;
+                    self.admin_edit_busy = false;
+                    match r {
+                        Ok(_) => {
+                            self.admin_show_add = false;
+                            self.admin_edit_id = None;
+                            self.admin_add_error = None;
+                            self.admin_edit_error = None;
+                            self.refresh_admin_clients();
+                        }
+                        Err(e) => {
+                            if editing {
+                                self.admin_edit_error = Some(e);
+                            } else {
+                                self.admin_add_error = Some(e);
+                            }
+                        }
+                    }
+                }
+                AdminResponse::ClientDeleted { id, result } => {
+                    self.admin_busy_ids.remove(&id);
+                    match result {
+                        Ok(()) => self.refresh_admin_clients(),
+                        Err(e) => self.show_error(e),
+                    }
+                }
+                AdminResponse::ClientRevoked { id, result } => {
+                    self.admin_busy_ids.remove(&id);
+                    if self.admin_revoke_id.as_deref() == Some(id.as_str()) {
+                        self.admin_revoke_id = None;
+                    }
+                    match result {
+                        Ok(()) => self.refresh_admin_clients(),
+                        Err(e) => self.show_error(e),
+                    }
+                }
+                AdminResponse::DeviceReset { id, result } => {
+                    self.admin_busy_ids.remove(&id);
+                    match result {
+                        Ok(()) => self.refresh_admin_clients(),
+                        Err(e) => self.show_error(e),
+                    }
+                }
+                AdminResponse::ConnectionKey { id, result } => {
+                    self.admin_key_loading = false;
+                    if self.admin_key_id.as_deref() == Some(id.as_str()) {
+                        match result {
+                            Ok(key) => {
+                                self.admin_key_value = Some(key);
+                                self.admin_key_error = None;
+                            }
+                            Err(e) => self.admin_key_error = Some(e),
+                        }
+                    }
+                }
+                AdminResponse::Qr { id, result } => {
+                    self.admin_qr_loading = false;
+                    if self.admin_key_id.as_deref() == Some(id.as_str()) {
+                        match result {
+                            Ok(png) => {
+                                self.admin_qr_png = Some(png);
+                                self.admin_qr_texture = None; // rebuilt lazily on next draw
+                                self.admin_qr_error = None;
+                            }
+                            Err(e) => self.admin_qr_error = Some(e),
+                        }
+                    }
+                }
+                AdminResponse::Status(r) => {
+                    if let Ok(s) = r {
+                        self.admin_status = Some(s);
+                    }
+                }
+                AdminResponse::AuditLog(r) => {
+                    self.admin_audit_loading = false;
+                    match r {
+                        Ok(list) => {
+                            self.admin_audit = list;
+                            self.admin_audit_error = None;
+                        }
+                        Err(e) => self.admin_audit_error = Some(e),
+                    }
+                }
+            }
+        }
+    }
+
+    fn refresh_admin_clients(&mut self) {
+        self.admin_clients_loading = true;
+        self.admin_clients_error = None;
+        admin::spawn(
+            self.vpn.client_binary.clone(),
+            AdminRequest::ListClients,
+            self.admin_tx.clone(),
+        );
+    }
+
+    /// Clear every admin-panel field back to its pre-session default.
+    /// Called when the session leaves the Connected state — the panel
+    /// (and its cached role/clients/dialogs) belongs to that one session
+    /// only, never carries over to the next connect.
+    fn reset_admin_state(&mut self) {
+        self.admin_role = None;
+        self.admin_clients_loaded = false;
+        self.admin_clients.clear();
+        self.admin_clients_loading = false;
+        self.admin_clients_error = None;
+        self.admin_busy_ids.clear();
+        self.admin_status = None;
+        self.admin_audit.clear();
+        self.admin_audit_loading = false;
+        self.admin_audit_error = None;
+        self.admin_show_add = false;
+        self.admin_add_error = None;
+        self.admin_add_busy = false;
+        self.admin_edit_id = None;
+        self.admin_edit_error = None;
+        self.admin_edit_busy = false;
+        self.admin_key_id = None;
+        self.admin_key_value = None;
+        self.admin_key_loading = false;
+        self.admin_key_error = None;
+        self.admin_key_saved_msg = None;
+        self.admin_qr_png = None;
+        self.admin_qr_texture = None;
+        self.admin_qr_loading = false;
+        self.admin_qr_error = None;
+        self.admin_qr_saved_msg = None;
+        self.admin_revoke_id = None;
+    }
+
+    /// Save the currently-displayed connection key to a `.txt` file next to
+    /// the user's Downloads (falling back to their home directory). No file
+    /// dialog is bundled here — this crate is kept dependency-light and
+    /// already ships no `rfd`/similar — so the destination is fixed rather
+    /// than user-chosen; the resulting path is shown back in the UI.
+    fn save_admin_key_to_file(&mut self, key: &str) {
+        let dir = dirs::download_dir()
+            .or_else(dirs::home_dir)
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        let path = dir.join(format!("aivpn-key-{}.txt", self.sanitized_admin_key_name()));
+        match std::fs::write(&path, key) {
+            Ok(()) => self.admin_key_saved_msg = Some(path.display().to_string()),
+            Err(e) => self.admin_key_error = Some(format!("Failed to save key: {e}")),
+        }
+    }
+
+    /// Save the currently-displayed QR PNG next to the user's Downloads
+    /// (same rationale/fallback as `save_admin_key_to_file`).
+    fn save_admin_qr_to_file(&mut self, png: &[u8]) {
+        let dir = dirs::download_dir()
+            .or_else(dirs::home_dir)
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        let path = dir.join(format!("aivpn-key-{}.png", self.sanitized_admin_key_name()));
+        match std::fs::write(&path, png) {
+            Ok(()) => self.admin_qr_saved_msg = Some(path.display().to_string()),
+            Err(e) => self.admin_qr_error = Some(format!("Failed to save QR: {e}")),
+        }
+    }
+
+    /// Filesystem-safe stem derived from the client name currently shown in
+    /// the key/QR viewer — falls back to "client" if the name has no
+    /// alphanumeric characters at all (e.g. emoji-only names).
+    fn sanitized_admin_key_name(&self) -> String {
+        let safe: String = self
+            .admin_key_name
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+            .collect();
+        if safe.is_empty() {
+            "client".to_string()
+        } else {
+            safe
+        }
+    }
+
+    /// Client-list + add/edit forms — drawn inline inside the main scroll
+    /// area (see call site in `update()`), following the same pattern as
+    /// the Recording/Diagnostics sections above it. Only ever called while
+    /// `admin_role == Some(2)`.
+    fn draw_admin_panel(&mut self, ui: &mut eframe::egui::Ui, lang: Lang) {
+        use eframe::egui;
+
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new(t(lang, "admin_panel")).strong());
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.small_button(t(lang, "admin_refresh")).clicked() {
+                    self.refresh_admin_clients();
+                }
+                if ui.small_button("  +  ").clicked() {
+                    self.admin_show_add = true;
+                    self.admin_edit_id = None;
+                    self.admin_add_name.clear();
+                    self.admin_add_one_time = false;
+                    self.admin_add_expiry.clear();
+                    self.admin_add_error = None;
+                }
+            });
+        });
+
+        if self.admin_clients_loading {
+            ui.weak(t(lang, "admin_loading"));
+        }
+        if let Some(err) = &self.admin_clients_error {
+            ui.colored_label(egui::Color32::from_rgb(0xEF, 0x53, 0x50), err);
+        }
+
+        let frame = egui::Frame::group(ui.style())
+            .inner_margin(egui::Margin::same(4i8))
+            .corner_radius(egui::CornerRadius::same(4));
+        frame.show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            egui::ScrollArea::vertical()
+                .id_salt("admin_clients")
+                .max_height(200.0)
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    if self.admin_clients.is_empty() && !self.admin_clients_loading {
+                        ui.weak(t(lang, "admin_no_clients"));
+                    }
+                    // Snapshot first: the per-row buttons below mutate
+                    // `self` (busy set, dialog state), so nothing here may
+                    // hold a borrow of `self.admin_clients` while that runs.
+                    let clients = self.admin_clients.clone();
+                    for c in &clients {
+                        let busy = self.admin_busy_ids.contains(&c.id);
+                        ui.group(|ui| {
+                            ui.set_width(ui.available_width());
+                            ui.horizontal(|ui| {
+                                let status_color = if c.enabled {
+                                    egui::Color32::from_rgb(0x4C, 0xAF, 0x50)
+                                } else {
+                                    egui::Color32::from_rgb(0x78, 0x78, 0x78)
+                                };
+                                ui.colored_label(status_color, "●");
+                                ui.label(egui::RichText::new(&c.name).strong());
+                                ui.label(
+                                    egui::RichText::new(format!("({})", c.role))
+                                        .size(11.0)
+                                        .weak(),
+                                );
+                                if c.one_time {
+                                    ui.label(
+                                        egui::RichText::new(t(lang, "admin_one_time_badge"))
+                                            .size(10.0)
+                                            .weak(),
+                                    );
+                                }
+                            });
+                            ui.label(egui::RichText::new(&c.vpn_ip).size(11.0).weak());
+                            if let Some(exp) = &c.expires_at {
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "{}: {exp}",
+                                        t(lang, "admin_expires")
+                                    ))
+                                    .size(10.0)
+                                    .weak(),
+                                );
+                            }
+                            ui.horizontal(|ui| {
+                                if ui
+                                    .add_enabled(!busy, egui::Button::new(t(lang, "admin_key_qr")))
+                                    .clicked()
+                                {
+                                    self.admin_key_id = Some(c.id.clone());
+                                    self.admin_key_name = c.name.clone();
+                                    self.admin_key_value = None;
+                                    self.admin_key_error = None;
+                                    self.admin_key_saved_msg = None;
+                                    self.admin_key_loading = true;
+                                    self.admin_qr_png = None;
+                                    self.admin_qr_texture = None;
+                                    self.admin_qr_error = None;
+                                    self.admin_qr_saved_msg = None;
+                                    admin::spawn(
+                                        self.vpn.client_binary.clone(),
+                                        AdminRequest::ConnectionKey { id: c.id.clone() },
+                                        self.admin_tx.clone(),
+                                    );
+                                }
+                                if ui
+                                    .add_enabled(!busy, egui::Button::new(t(lang, "edit")))
+                                    .clicked()
+                                {
+                                    self.admin_show_add = false;
+                                    self.admin_edit_id = Some(c.id.clone());
+                                    self.admin_edit_name = c.name.clone();
+                                    self.admin_edit_enabled = c.enabled;
+                                    self.admin_edit_expiry =
+                                        c.expires_at.clone().unwrap_or_default();
+                                    self.admin_edit_error = None;
+                                }
+                                if ui
+                                    .add_enabled(
+                                        !busy,
+                                        egui::Button::new(t(lang, "admin_reset_device")),
+                                    )
+                                    .clicked()
+                                {
+                                    self.admin_busy_ids.insert(c.id.clone());
+                                    admin::spawn(
+                                        self.vpn.client_binary.clone(),
+                                        AdminRequest::ResetDevice { id: c.id.clone() },
+                                        self.admin_tx.clone(),
+                                    );
+                                }
+                                let revoke_btn = egui::Button::new(
+                                    egui::RichText::new(t(lang, "admin_revoke"))
+                                        .color(egui::Color32::WHITE),
+                                )
+                                .fill(egui::Color32::from_rgb(0xC6, 0x28, 0x28));
+                                if ui.add_enabled(!busy, revoke_btn).clicked() {
+                                    self.admin_revoke_id = Some(c.id.clone());
+                                    self.admin_revoke_name = c.name.clone();
+                                }
+                            });
+                        });
+                    }
+                });
+        });
+
+        // ── Add-client form ─────────────────────────────────────────────
+        if self.admin_show_add {
+            ui.add_space(4.0);
+            ui.label(egui::RichText::new(t(lang, "admin_add_client")).strong());
+            ui.add(
+                egui::TextEdit::singleline(&mut self.admin_add_name)
+                    .desired_width(f32::INFINITY)
+                    .hint_text(t(lang, "key_name")),
+            );
+            ui.checkbox(&mut self.admin_add_one_time, t(lang, "admin_one_time"));
+            ui.label(t(lang, "admin_expiry_hint"));
+            ui.add(
+                egui::TextEdit::singleline(&mut self.admin_add_expiry)
+                    .desired_width(f32::INFINITY)
+                    .hint_text("2026-08-01T00:00:00Z"),
+            );
+            if let Some(err) = &self.admin_add_error {
+                ui.colored_label(egui::Color32::from_rgb(0xEF, 0x53, 0x50), err);
+            }
+            ui.horizontal(|ui| {
+                let can_save = !self.admin_add_name.trim().is_empty() && !self.admin_add_busy;
+                if ui
+                    .add_enabled(can_save, egui::Button::new(t(lang, "save")))
+                    .clicked()
+                {
+                    self.admin_add_busy = true;
+                    self.admin_add_error = None;
+                    let form = admin::NewClientForm {
+                        name: self.admin_add_name.trim().to_string(),
+                        one_time: self.admin_add_one_time,
+                        expires_at: self.admin_add_expiry.trim().to_string(),
+                    };
+                    admin::spawn(
+                        self.vpn.client_binary.clone(),
+                        AdminRequest::AddClient(form),
+                        self.admin_tx.clone(),
+                    );
+                }
+                if ui
+                    .add_enabled(!self.admin_add_busy, egui::Button::new(t(lang, "cancel")))
+                    .clicked()
+                {
+                    self.admin_show_add = false;
+                    self.admin_add_error = None;
+                }
+            });
+        }
+
+        // ── Edit-client form ────────────────────────────────────────────
+        if let Some(id) = self.admin_edit_id.clone() {
+            ui.add_space(4.0);
+            ui.label(
+                egui::RichText::new(format!("{}: {}", t(lang, "edit"), self.admin_edit_name))
+                    .strong(),
+            );
+            ui.add(
+                egui::TextEdit::singleline(&mut self.admin_edit_name)
+                    .desired_width(f32::INFINITY)
+                    .hint_text(t(lang, "key_name")),
+            );
+            ui.checkbox(&mut self.admin_edit_enabled, t(lang, "admin_enabled"));
+            ui.label(t(lang, "admin_expiry_hint"));
+            ui.add(
+                egui::TextEdit::singleline(&mut self.admin_edit_expiry)
+                    .desired_width(f32::INFINITY)
+                    .hint_text("2026-08-01T00:00:00Z"),
+            );
+            if let Some(err) = &self.admin_edit_error {
+                ui.colored_label(egui::Color32::from_rgb(0xEF, 0x53, 0x50), err);
+            }
+            ui.horizontal(|ui| {
+                let can_save = !self.admin_edit_name.trim().is_empty() && !self.admin_edit_busy;
+                if ui
+                    .add_enabled(can_save, egui::Button::new(t(lang, "save")))
+                    .clicked()
+                {
+                    self.admin_edit_busy = true;
+                    self.admin_edit_error = None;
+                    let form = admin::EditClientForm {
+                        id: id.clone(),
+                        name: self.admin_edit_name.trim().to_string(),
+                        enabled: self.admin_edit_enabled,
+                        expires_at: self.admin_edit_expiry.trim().to_string(),
+                    };
+                    admin::spawn(
+                        self.vpn.client_binary.clone(),
+                        AdminRequest::EditClient(form),
+                        self.admin_tx.clone(),
+                    );
+                }
+                if ui
+                    .add_enabled(!self.admin_edit_busy, egui::Button::new(t(lang, "cancel")))
+                    .clicked()
+                {
+                    self.admin_edit_id = None;
+                    self.admin_edit_error = None;
+                }
+            });
+        }
+
+        // ── Server status + audit log (read-only) ───────────────────────
+        egui::CollapsingHeader::new(t(lang, "admin_status_audit")).show(ui, |ui| {
+            if ui.button(t(lang, "admin_refresh")).clicked() {
+                admin::spawn(
+                    self.vpn.client_binary.clone(),
+                    AdminRequest::Status,
+                    self.admin_tx.clone(),
+                );
+                self.admin_audit_loading = true;
+                self.admin_audit_error = None;
+                admin::spawn(
+                    self.vpn.client_binary.clone(),
+                    AdminRequest::AuditLog,
+                    self.admin_tx.clone(),
+                );
+            }
+            if let Some(s) = &self.admin_status {
+                ui.label(format!(
+                    "{}: {}/{}   {}: {}",
+                    t(lang, "admin_status_clients"),
+                    s.clients_enabled,
+                    s.clients_total,
+                    t(lang, "admin_status_kernel"),
+                    if s.kernel_module { "✓" } else { "✗" }
+                ));
+            }
+            if self.admin_audit_loading {
+                ui.weak(t(lang, "admin_loading"));
+            }
+            if let Some(err) = &self.admin_audit_error {
+                ui.colored_label(egui::Color32::from_rgb(0xEF, 0x53, 0x50), err);
+            }
+            egui::ScrollArea::vertical()
+                .id_salt("admin_audit")
+                .max_height(120.0)
+                .show(ui, |ui| {
+                    for e in &self.admin_audit {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "[{}] {} {} {} — {}",
+                                e.ts, e.actor, e.action, e.target, e.result
+                            ))
+                            .size(10.0)
+                            .weak(),
+                        );
+                    }
+                });
+        });
+    }
+
+    /// Connection-key / QR viewer window and the revoke-confirmation modal —
+    /// both are separate top-level egui containers, so they're drawn once
+    /// per frame from `update()` alongside the existing key add/edit
+    /// viewport dialog, rather than nested inside `draw_admin_panel`'s
+    /// `CentralPanel` closure.
+    fn draw_admin_extras(&mut self, ctx: &eframe::egui::Context, lang: Lang) {
+        use eframe::egui;
+
+        if self.admin_key_id.is_some() {
+            let mut open = true;
+            let title = format!("{}: {}", t(lang, "admin_key_qr"), self.admin_key_name);
+            egui::Window::new(title)
+                .id(egui::Id::new("admin_key_window"))
+                .collapsible(false)
+                .resizable(true)
+                .open(&mut open)
+                .show(ctx, |ui| {
+                    if self.admin_key_loading {
+                        ui.weak(t(lang, "admin_loading"));
+                    }
+                    if let Some(err) = &self.admin_key_error {
+                        ui.colored_label(egui::Color32::from_rgb(0xEF, 0x53, 0x50), err);
+                    }
+                    if let Some(key) = self.admin_key_value.clone() {
+                        let mut display_key = key.clone();
+                        ui.add(
+                            egui::TextEdit::multiline(&mut display_key)
+                                .desired_width(360.0)
+                                .desired_rows(3)
+                                .font(egui::TextStyle::Monospace)
+                                .interactive(false),
+                        );
+                        ui.horizontal(|ui| {
+                            if ui.button(t(lang, "copy")).clicked() {
+                                ctx.copy_text(key.clone());
+                            }
+                            if ui.button(t(lang, "admin_save_key_file")).clicked() {
+                                self.save_admin_key_to_file(&key);
+                            }
+                            if !self.admin_qr_loading && self.admin_qr_png.is_none() {
+                                if ui.button(t(lang, "admin_show_qr")).clicked() {
+                                    self.admin_qr_loading = true;
+                                    self.admin_qr_error = None;
+                                    let id = self.admin_key_id.clone().unwrap_or_default();
+                                    admin::spawn(
+                                        self.vpn.client_binary.clone(),
+                                        AdminRequest::Qr {
+                                            id,
+                                            text: key.clone(),
+                                        },
+                                        self.admin_tx.clone(),
+                                    );
+                                }
+                            }
+                        });
+                        if let Some(saved) = &self.admin_key_saved_msg {
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "{}: {saved}",
+                                    t(lang, "admin_saved_to")
+                                ))
+                                .size(11.0)
+                                .weak(),
+                            );
+                        }
+                    }
+                    if self.admin_qr_loading {
+                        ui.weak(t(lang, "admin_loading"));
+                    }
+                    if let Some(err) = &self.admin_qr_error {
+                        ui.colored_label(egui::Color32::from_rgb(0xEF, 0x53, 0x50), err);
+                    }
+                    if let Some(png) = self.admin_qr_png.clone() {
+                        let texture = self.admin_qr_texture.get_or_insert_with(|| {
+                            let (rgba, w, h) = decode_png_rgba(&png);
+                            ctx.load_texture(
+                                "admin-qr",
+                                egui::ColorImage::from_rgba_unmultiplied(
+                                    [w as usize, h as usize],
+                                    &rgba,
+                                ),
+                                egui::TextureOptions::default(),
+                            )
+                        });
+                        ui.image((texture.id(), texture.size_vec2()));
+                        if ui.button(t(lang, "admin_save_qr_file")).clicked() {
+                            self.save_admin_qr_to_file(&png);
+                        }
+                        if let Some(saved) = &self.admin_qr_saved_msg {
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "{}: {saved}",
+                                    t(lang, "admin_saved_to")
+                                ))
+                                .size(11.0)
+                                .weak(),
+                            );
+                        }
+                    }
+                });
+            if !open {
+                self.admin_key_id = None;
+                self.admin_key_value = None;
+                self.admin_qr_png = None;
+                self.admin_qr_texture = None;
+            }
+        }
+
+        if let Some(id) = self.admin_revoke_id.clone() {
+            let name = self.admin_revoke_name.clone();
+            let busy = self.admin_busy_ids.contains(&id);
+            let resp = egui::Modal::new(egui::Id::new("admin_revoke_modal")).show(ctx, |ui| {
+                ui.set_width(300.0);
+                ui.label(egui::RichText::new(t(lang, "admin_revoke_confirm_title")).strong());
+                ui.label(format!(
+                    "{} \u{201c}{name}\u{201d}?",
+                    t(lang, "admin_revoke_confirm_body")
+                ));
+                ui.label(
+                    egui::RichText::new(t(lang, "admin_revoke_confirm_warn"))
+                        .size(11.0)
+                        .weak(),
+                );
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(!busy, egui::Button::new(t(lang, "cancel")))
+                        .clicked()
+                    {
+                        self.admin_revoke_id = None;
+                    }
+                    let revoke_btn = egui::Button::new(
+                        egui::RichText::new(t(lang, "admin_revoke")).color(egui::Color32::WHITE),
+                    )
+                    .fill(egui::Color32::from_rgb(0xC6, 0x28, 0x28));
+                    if ui.add_enabled(!busy, revoke_btn).clicked() {
+                        self.admin_busy_ids.insert(id.clone());
+                        admin::spawn(
+                            self.vpn.client_binary.clone(),
+                            AdminRequest::RevokeClient { id: id.clone() },
+                            self.admin_tx.clone(),
+                        );
+                    }
+                });
+            });
+            if resp.should_close() {
+                self.admin_revoke_id = None;
             }
         }
     }
@@ -1464,6 +2226,12 @@ impl eframe::App for AivpnApp {
                         ui.separator();
                     }
 
+                    // ── Admin panel (P3.4) — Admin role only ────────────────────────
+                    if is_connected && self.admin_role == Some(2) {
+                        self.draw_admin_panel(ui, lang);
+                        ui.separator();
+                    }
+
                     // ── Settings ───────────────────────────────────────────────────
                     let mut ks = self.settings.kill_switch;
                     if ui
@@ -1734,6 +2502,14 @@ impl eframe::App for AivpnApp {
                     }
                 });
         });
+
+        // P3.4: connection-key/QR viewer window + revoke-confirmation modal —
+        // separate top-level containers, drawn once per frame regardless of
+        // whether draw_admin_panel() ran this frame (admin_key_id/
+        // admin_revoke_id can still be Some right after the panel itself
+        // stops being drawn, e.g. a disconnect mid-dialog — reset_admin_state()
+        // clears both, but only on the NEXT tick(), not synchronously here).
+        self.draw_admin_extras(ctx, lang);
 
         // ── Add / Edit dialog — separate OS window (can go outside main window) ──
         if self.show_dialog {

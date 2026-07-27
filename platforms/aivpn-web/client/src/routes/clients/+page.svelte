@@ -1,7 +1,7 @@
 <script lang="ts">
   import { goto } from '$app/navigation';
   import { createQuery, createMutation, useQueryClient } from '@tanstack/svelte-query';
-  import { clients as clientsApi } from '$lib/api';
+  import { clients as clientsApi, type ClientRole } from '$lib/api';
   import ClientTable from '$lib/components/ClientTable.svelte';
   import QrModal from '$lib/components/QrModal.svelte';
   import ConnectionKeyModal from '$lib/components/ConnectionKeyModal.svelte';
@@ -38,6 +38,18 @@
     onSuccess: () => qc.invalidateQueries({ queryKey: ['clients'] }),
   });
 
+  const revokeMut = createMutation({
+    mutationFn: (id: string) => clientsApi.revoke(id),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['clients'] }),
+    onError: (err: Error) => { alert(`Revoke failed: ${err.message}`); },
+  });
+
+  const roleMut = createMutation({
+    mutationFn: (vars: { id: string; role: ClientRole }) => clientsApi.update(vars.id, { role: vars.role }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['clients'] }),
+    onError: (err: Error) => { alert(`Role change failed: ${err.message}`); qc.invalidateQueries({ queryKey: ['clients'] }); },
+  });
+
   let showAddModal = $state(false);
   let newName = $state('');
   let newOneTime = $state(false);
@@ -69,9 +81,19 @@
   }
 
   async function handleDelete(id: string) {
-    if (confirm('Delete this client?')) {
+    if (confirm('Delete this client? This cannot be undone.')) {
       $deleteMut.mutate(id);
     }
+  }
+
+  async function handleRevoke(id: string) {
+    if (confirm('Permanently revoke and disconnect this client? This cannot be undone.')) {
+      $revokeMut.mutate(id);
+    }
+  }
+
+  function handleRoleChange(id: string, role: ClientRole) {
+    $roleMut.mutate({ id, role });
   }
 
   const clientList = $derived($query.data?.items ?? []);
@@ -122,6 +144,8 @@
       clients={clientList}
       onEdit={handleEdit}
       onDelete={handleDelete}
+      onRevoke={handleRevoke}
+      onRoleChange={handleRoleChange}
       onViewKey={handleViewKey}
       onViewQr={handleViewQr}
     />

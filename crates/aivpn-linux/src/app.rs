@@ -1,11 +1,12 @@
 use iced::widget::{
-    button, checkbox, column, container, horizontal_rule, pick_list, row, scrollable, text,
+    button, checkbox, column, container, horizontal_rule, image, pick_list, row, scrollable, text,
     text_input, Space,
 };
 use iced::{Alignment, Background, Border, Color, Element, Length, Subscription, Task, Theme};
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncBufReadExt, BufReader};
 
+use crate::admin::{self, ClientRecord, EditClientArgs, NewClientArgs};
 use crate::key_storage::{ConnectionKey, KeyStorage};
 use crate::settings::{remove_autostart_entry, write_autostart_entry, AppSettings};
 use crate::vpn_manager::{
@@ -702,6 +703,40 @@ pub enum Message {
     ToggleLogPanel,
     SaveLog,
     SaveLogPathChosen(Option<std::path::PathBuf>),
+    // ── Admin client-management panel (in-tunnel management API bridge) ────
+    ToggleAdminPanel,
+    AdminRoleLoaded(Result<u8, String>),
+    AdminRefreshClients,
+    AdminClientsLoaded(Result<Vec<ClientRecord>, String>),
+    AdminNewNameChanged(String),
+    AdminNewOneTimeToggled(bool),
+    AdminNewExpiresChanged(String),
+    AdminAddClient,
+    AdminAddClientResult(Result<ClientRecord, String>),
+    AdminToggleEnabled(String, bool),
+    AdminToggleEnabledResult(Result<ClientRecord, String>),
+    AdminStartEdit(String),
+    AdminEditNameChanged(String),
+    AdminEditExpiresChanged(String),
+    AdminEditSave,
+    AdminEditCancel,
+    AdminEditResult(Result<ClientRecord, String>),
+    AdminResetDevice(String),
+    AdminResetDeviceResult(String, Result<(), String>),
+    AdminRevokeRequest(String),
+    AdminRevokeCancel,
+    AdminRevokeConfirm(String),
+    AdminRevokeResult(String, Result<(), String>),
+    AdminShowKey(String),
+    AdminKeyLoaded(String, Result<String, String>),
+    AdminCloseKeyView,
+    AdminCopyKey(String),
+    AdminSaveKeyToFile,
+    AdminSaveKeyPathChosen(Option<std::path::PathBuf>),
+    AdminRequestQr(String),
+    AdminQrLoaded(String, Result<Vec<u8>, String>),
+    AdminSaveQrToFile,
+    AdminSaveQrPathChosen(Option<std::path::PathBuf>),
     // Misc
     Noop,
 }
@@ -1048,6 +1083,29 @@ fn t<'a>(lang: &str, key: &'a str) -> &'a str {
         "Bootstrap Telegram chat" => "Chat/канал Telegram bootstrap",
         "Bootstrap GitHub repo" => "GitHub-репозиторий bootstrap",
         "Server signing key" => "Ключ подписи сервера",
+        // Admin client-management panel
+        "Admin — Client Management" => "Админ — управление клиентами",
+        "Refresh" => "Обновить",
+        "One-time" => "Одноразовый",
+        "Adding..." => "Добавление...",
+        "Loading..." => "Загрузка...",
+        "No clients" => "Нет клиентов",
+        "enabled" => "включён",
+        "disabled" => "отключён",
+        "one-time" => "одноразовый",
+        "Confirm revoke?" => "Подтвердить отзыв?",
+        "Yes" => "Да",
+        "No" => "Нет",
+        "Key" => "Ключ",
+        "Disable" => "Отключить",
+        "Enable" => "Включить",
+        "Reset device" => "Сбросить устройство",
+        "Revoke" => "Отозвать",
+        "Copy" => "Копировать",
+        "Show QR" => "Показать QR",
+        "Close" => "Закрыть",
+        "Generating QR..." => "Генерация QR...",
+        "Save QR" => "Сохранить QR",
         _ => key,
     }
 }
@@ -1090,6 +1148,33 @@ pub struct App {
     /// Reset on every new `Connect` so a badge from a previous session never
     /// bleeds into the next one.
     bootstrap_fallback: bool,
+    // ── Admin client-management panel ───────────────────────────────────
+    /// Panel disclosure toggle; the panel itself only ever renders when the
+    /// role is also confirmed Admin (see `Message::ToggleAdminPanel`/`view_main`).
+    admin_open: bool,
+    /// Server-assigned role cached by the daemon (0=User,1=Viewer,2=Admin),
+    /// fetched fresh on every new Connected transition. `None` until loaded.
+    admin_role: Option<u8>,
+    admin_clients: Vec<ClientRecord>,
+    admin_clients_loading: bool,
+    admin_error: Option<String>,
+    /// Set while any per-client mutating call (toggle/edit/reset/revoke) is
+    /// in flight, so its row's buttons can be disabled instead of allowing a
+    /// second concurrent request against the same client.
+    admin_busy_id: Option<String>,
+    admin_new_name: String,
+    admin_new_one_time: bool,
+    admin_new_expires: String,
+    admin_edit_id: Option<String>,
+    admin_edit_name: String,
+    admin_edit_expires: String,
+    /// Two-step revoke: first press stores the target id here and the view
+    /// renders a "Confirm revoke? [Yes][No]" row for just that client;
+    /// nothing is revoked until `Message::AdminRevokeConfirm` on the same id.
+    admin_pending_revoke: Option<String>,
+    admin_key_view: Option<(String, String)>,
+    admin_qr: Option<(String, image::Handle)>,
+    admin_qr_loading: Option<String>,
 }
 
 impl App {
@@ -1137,6 +1222,22 @@ impl App {
                 logs_open: false,
                 bootstrap_open: false,
                 bootstrap_fallback: false,
+                admin_open: false,
+                admin_role: None,
+                admin_clients: Vec::new(),
+                admin_clients_loading: false,
+                admin_error: None,
+                admin_busy_id: None,
+                admin_new_name: String::new(),
+                admin_new_one_time: false,
+                admin_new_expires: String::new(),
+                admin_edit_id: None,
+                admin_edit_name: String::new(),
+                admin_edit_expires: String::new(),
+                admin_pending_revoke: None,
+                admin_key_view: None,
+                admin_qr: None,
+                admin_qr_loading: None,
             },
             Task::none(),
         )
@@ -1303,6 +1404,14 @@ impl App {
                 if self.pending_connect {
                     return Task::none();
                 }
+                // Admin panel: the client only has a role to report once a
+                // session is up (the daemon caches it from the handshake),
+                // and any role from a previous session must not bleed into
+                // this one — so fetch fresh on Connected, clear on drop.
+                let became_connected = matches!(s, VpnStatus::Connected { .. })
+                    && !matches!(self.status, VpnStatus::Connected { .. });
+                let became_disconnected = !matches!(s, VpnStatus::Connected { .. })
+                    && matches!(self.status, VpnStatus::Connected { .. });
                 #[cfg(unix)]
                 if matches!(s, VpnStatus::Connected { .. })
                     && !matches!(self.status, VpnStatus::Connected { .. })
@@ -1340,6 +1449,22 @@ impl App {
                     if let Some(child) = guard.take() {
                         terminate_child_graceful(child, self.launched_kill_switch);
                     }
+                }
+                if became_disconnected {
+                    self.admin_role = None;
+                    self.admin_open = false;
+                    self.admin_clients.clear();
+                    self.admin_error = None;
+                    self.admin_key_view = None;
+                    self.admin_qr = None;
+                    self.admin_pending_revoke = None;
+                    self.admin_edit_id = None;
+                } else if became_connected {
+                    self.admin_role = None;
+                    self.admin_clients.clear();
+                    self.admin_clients_loading = false;
+                    self.admin_error = None;
+                    return Task::perform(admin::get_role(), Message::AdminRoleLoaded);
                 }
             }
             Message::BootstrapFallbackDetected => {
@@ -1737,6 +1862,321 @@ impl App {
             Message::DiagnosticsResult(result) => {
                 self.bench_running = false;
                 self.bench_result = result;
+            }
+
+            // ── Admin client-management panel ───────────────────────────
+            Message::ToggleAdminPanel => {
+                self.admin_open = !self.admin_open;
+                if self.admin_open
+                    && self.admin_role == Some(2)
+                    && self.admin_clients.is_empty()
+                    && !self.admin_clients_loading
+                {
+                    self.admin_clients_loading = true;
+                    self.admin_error = None;
+                    return Task::perform(admin::list_clients(), Message::AdminClientsLoaded);
+                }
+            }
+            Message::AdminRoleLoaded(result) => match result {
+                Ok(role) => {
+                    self.admin_role = Some(role);
+                    if role == 2
+                        && self.admin_open
+                        && self.admin_clients.is_empty()
+                        && !self.admin_clients_loading
+                    {
+                        self.admin_clients_loading = true;
+                        return Task::perform(admin::list_clients(), Message::AdminClientsLoaded);
+                    }
+                }
+                Err(_) => {
+                    // Older client daemons (pre-defa271) or a User/Viewer
+                    // role simply have nothing to report here — not an
+                    // error worth surfacing; the panel entry point just
+                    // stays hidden (admin_role remains None).
+                    self.admin_role = None;
+                }
+            },
+            Message::AdminRefreshClients => {
+                self.admin_clients_loading = true;
+                self.admin_error = None;
+                return Task::perform(admin::list_clients(), Message::AdminClientsLoaded);
+            }
+            Message::AdminClientsLoaded(result) => {
+                self.admin_clients_loading = false;
+                match result {
+                    Ok(clients) => {
+                        self.admin_clients = clients;
+                        self.admin_error = None;
+                    }
+                    Err(e) => self.admin_error = Some(e),
+                }
+            }
+            Message::AdminNewNameChanged(s) => self.admin_new_name = s,
+            Message::AdminNewOneTimeToggled(b) => self.admin_new_one_time = b,
+            Message::AdminNewExpiresChanged(s) => self.admin_new_expires = s,
+            Message::AdminAddClient => {
+                let name = self.admin_new_name.trim().to_string();
+                if name.is_empty() || self.admin_busy_id.is_some() {
+                    return Task::none();
+                }
+                self.admin_busy_id = Some(String::new()); // sentinel: "adding new"
+                self.admin_error = None;
+                let args = NewClientArgs {
+                    name,
+                    one_time: self.admin_new_one_time,
+                    expires_at: self.admin_new_expires.trim().to_string(),
+                };
+                return Task::perform(admin::add_client(args), Message::AdminAddClientResult);
+            }
+            Message::AdminAddClientResult(result) => {
+                self.admin_busy_id = None;
+                match result {
+                    Ok(client) => {
+                        self.admin_clients.push(client);
+                        self.admin_new_name.clear();
+                        self.admin_new_one_time = false;
+                        self.admin_new_expires.clear();
+                        self.admin_error = None;
+                    }
+                    Err(e) => self.admin_error = Some(e),
+                }
+            }
+            Message::AdminToggleEnabled(id, enabled) => {
+                if self.admin_busy_id.is_some() {
+                    return Task::none();
+                }
+                self.admin_busy_id = Some(id.clone());
+                let args = EditClientArgs {
+                    enabled: Some(enabled),
+                    ..Default::default()
+                };
+                return Task::perform(
+                    async move { admin::update_client(&id, args).await },
+                    Message::AdminToggleEnabledResult,
+                );
+            }
+            Message::AdminToggleEnabledResult(result) => {
+                self.admin_busy_id = None;
+                match result {
+                    Ok(updated) => {
+                        if let Some(c) = self.admin_clients.iter_mut().find(|c| c.id == updated.id)
+                        {
+                            *c = updated;
+                        }
+                        self.admin_error = None;
+                    }
+                    Err(e) => self.admin_error = Some(e),
+                }
+            }
+            Message::AdminStartEdit(id) => {
+                if let Some(c) = self.admin_clients.iter().find(|c| c.id == id) {
+                    self.admin_edit_id = Some(id);
+                    self.admin_edit_name = c.name.clone();
+                    self.admin_edit_expires = c.expires_at.clone().unwrap_or_default();
+                }
+            }
+            Message::AdminEditNameChanged(s) => self.admin_edit_name = s,
+            Message::AdminEditExpiresChanged(s) => self.admin_edit_expires = s,
+            Message::AdminEditCancel => {
+                self.admin_edit_id = None;
+                self.admin_edit_name.clear();
+                self.admin_edit_expires.clear();
+            }
+            Message::AdminEditSave => {
+                if self.admin_busy_id.is_some() {
+                    return Task::none();
+                }
+                if let Some(id) = self.admin_edit_id.clone() {
+                    self.admin_busy_id = Some(id.clone());
+                    let expires = self.admin_edit_expires.trim().to_string();
+                    let args = EditClientArgs {
+                        name: Some(self.admin_edit_name.trim().to_string()),
+                        enabled: None,
+                        expires_at: Some(if expires.is_empty() {
+                            None
+                        } else {
+                            Some(expires)
+                        }),
+                    };
+                    return Task::perform(
+                        async move { admin::update_client(&id, args).await },
+                        Message::AdminEditResult,
+                    );
+                }
+            }
+            Message::AdminEditResult(result) => {
+                self.admin_busy_id = None;
+                match result {
+                    Ok(updated) => {
+                        if let Some(c) = self.admin_clients.iter_mut().find(|c| c.id == updated.id)
+                        {
+                            *c = updated;
+                        }
+                        self.admin_edit_id = None;
+                        self.admin_edit_name.clear();
+                        self.admin_edit_expires.clear();
+                        self.admin_error = None;
+                    }
+                    Err(e) => self.admin_error = Some(e),
+                }
+            }
+            Message::AdminResetDevice(id) => {
+                if self.admin_busy_id.is_some() {
+                    return Task::none();
+                }
+                self.admin_busy_id = Some(id.clone());
+                return Task::perform(
+                    async move {
+                        let r = admin::reset_device(&id).await;
+                        (id, r)
+                    },
+                    |(id, r)| Message::AdminResetDeviceResult(id, r),
+                );
+            }
+            Message::AdminResetDeviceResult(id, result) => {
+                self.admin_busy_id = None;
+                match result {
+                    Ok(()) => {
+                        self.admin_error = None;
+                        self.push_log(format!("[admin] Device binding reset for {id}"));
+                        self.admin_clients_loading = true;
+                        return Task::perform(admin::list_clients(), Message::AdminClientsLoaded);
+                    }
+                    Err(e) => self.admin_error = Some(e),
+                }
+            }
+            Message::AdminRevokeRequest(id) => {
+                self.admin_pending_revoke = Some(id);
+            }
+            Message::AdminRevokeCancel => {
+                self.admin_pending_revoke = None;
+            }
+            Message::AdminRevokeConfirm(id) => {
+                self.admin_pending_revoke = None;
+                if self.admin_busy_id.is_some() {
+                    return Task::none();
+                }
+                self.admin_busy_id = Some(id.clone());
+                return Task::perform(
+                    async move {
+                        let r = admin::revoke_client(&id).await;
+                        (id, r)
+                    },
+                    |(id, r)| Message::AdminRevokeResult(id, r),
+                );
+            }
+            Message::AdminRevokeResult(id, result) => {
+                self.admin_busy_id = None;
+                match result {
+                    Ok(()) => {
+                        self.admin_clients.retain(|c| c.id != id);
+                        self.push_log(format!("[admin] Revoked client {id}"));
+                        self.admin_error = None;
+                        if self.admin_key_view.as_ref().is_some_and(|(k, _)| k == &id) {
+                            self.admin_key_view = None;
+                            self.admin_qr = None;
+                        }
+                    }
+                    Err(e) => self.admin_error = Some(e),
+                }
+            }
+            Message::AdminShowKey(id) => {
+                if self.admin_busy_id.is_some() {
+                    return Task::none();
+                }
+                self.admin_busy_id = Some(id.clone());
+                return Task::perform(
+                    async move {
+                        let r = admin::connection_key(&id).await;
+                        (id, r)
+                    },
+                    |(id, r)| Message::AdminKeyLoaded(id, r),
+                );
+            }
+            Message::AdminKeyLoaded(id, result) => {
+                self.admin_busy_id = None;
+                match result {
+                    Ok(key) => {
+                        self.admin_key_view = Some((id, key));
+                        self.admin_qr = None;
+                        self.admin_error = None;
+                    }
+                    Err(e) => self.admin_error = Some(e),
+                }
+            }
+            Message::AdminCloseKeyView => {
+                self.admin_key_view = None;
+                self.admin_qr = None;
+            }
+            Message::AdminCopyKey(text) => {
+                return iced::clipboard::write(text);
+            }
+            Message::AdminSaveKeyToFile => {
+                return Task::perform(
+                    async {
+                        rfd::AsyncFileDialog::new()
+                            .set_file_name("aivpn-connection-key.txt")
+                            .save_file()
+                            .await
+                            .map(|h| h.path().to_path_buf())
+                    },
+                    Message::AdminSaveKeyPathChosen,
+                );
+            }
+            Message::AdminSaveKeyPathChosen(path) => {
+                if let (Some(path), Some((_, key))) = (path, &self.admin_key_view) {
+                    let _ = std::fs::write(&path, key);
+                }
+            }
+            Message::AdminRequestQr(id) => {
+                let text = self
+                    .admin_key_view
+                    .as_ref()
+                    .filter(|(kid, _)| kid == &id)
+                    .map(|(_, k)| k.clone());
+                let Some(text) = text else {
+                    self.admin_error =
+                        Some("Load the connection key before generating a QR code".to_string());
+                    return Task::none();
+                };
+                self.admin_qr_loading = Some(id.clone());
+                return Task::perform(
+                    async move {
+                        let r = admin::qr_png(text).await;
+                        (id, r)
+                    },
+                    |(id, r)| Message::AdminQrLoaded(id, r),
+                );
+            }
+            Message::AdminQrLoaded(id, result) => {
+                self.admin_qr_loading = None;
+                match result {
+                    Ok(bytes) => {
+                        self.admin_qr = Some((id, image::Handle::from_bytes(bytes)));
+                        self.admin_error = None;
+                    }
+                    Err(e) => self.admin_error = Some(e),
+                }
+            }
+            Message::AdminSaveQrToFile => {
+                return Task::perform(
+                    async {
+                        rfd::AsyncFileDialog::new()
+                            .set_file_name("aivpn-connection-qr.png")
+                            .save_file()
+                            .await
+                            .map(|h| h.path().to_path_buf())
+                    },
+                    Message::AdminSaveQrPathChosen,
+                );
+            }
+            Message::AdminSaveQrPathChosen(path) => {
+                if let (Some(path), Some((_, handle))) = (path, &self.admin_qr) {
+                    if let image::Handle::Bytes(_, bytes) = handle {
+                        let _ = std::fs::write(&path, bytes.as_ref());
+                    }
+                }
             }
 
             Message::Noop => {}
@@ -2439,6 +2879,18 @@ impl App {
             Space::with_height(0).into()
         };
 
+        // Admin client-management panel: gated on both a confirmed Admin
+        // role (fetched fresh on every Connected transition — see
+        // Message::StatusReceived) AND the panel being connected in the
+        // first place, so a stale role from a just-ended session can never
+        // show a panel that would immediately fail every call.
+        let admin_is_connected = matches!(self.status, VpnStatus::Connected { .. });
+        let admin_section: Element<Message> = if admin_is_connected && self.admin_role == Some(2) {
+            self.view_admin_section()
+        } else {
+            Space::with_height(0).into()
+        };
+
         // Wrap everything in a scrollable so settings + log are reachable
         // in windows smaller than the full content height.
         container(
@@ -2485,6 +2937,8 @@ impl App {
                     horizontal_rule(1),
                     recording_block,
                     Space::with_height(6),
+                    admin_section,
+                    Space::with_height(6),
                     bootstrap_header,
                     bootstrap_box,
                     Space::with_height(4),
@@ -2501,6 +2955,235 @@ impl App {
         .width(Length::Fill)
         .height(Length::Fill)
         .into()
+    }
+
+    /// Admin client-management panel body. Only ever called from
+    /// `view_main` behind the `is_connected && admin_role == Some(2)` gate —
+    /// this method itself does not re-check the role, since it has no
+    /// meaningful "not authorized" rendering of its own (the caller simply
+    /// never invokes it).
+    fn view_admin_section(&self) -> Element<'_, Message> {
+        let lang = self.settings.lang.as_str();
+        let is_dark = self.settings.dark_mode;
+        let muted = if is_dark {
+            Color::from_rgb(0.62, 0.64, 0.70)
+        } else {
+            Color::from_rgb(0.43, 0.45, 0.50)
+        };
+        let danger = Color::from_rgb(0.95, 0.28, 0.18);
+
+        let toggle_label = if self.admin_open {
+            format!("[-] {}", t(lang, "Admin — Client Management"))
+        } else {
+            format!("[+] {}", t(lang, "Admin — Client Management"))
+        };
+        let header = row![
+            button(text(toggle_label))
+                .on_press(Message::ToggleAdminPanel)
+                .style(button::text),
+            Space::with_width(Length::Fill),
+            if self.admin_open {
+                button(t(lang, "Refresh"))
+                    .on_press(Message::AdminRefreshClients)
+                    .style(button::text)
+                    .into()
+            } else {
+                Element::from(Space::with_width(0))
+            },
+        ]
+        .align_y(Alignment::Center);
+
+        if !self.admin_open {
+            return column![header].into();
+        }
+
+        let mut body = column![].spacing(6);
+
+        if let Some(err) = &self.admin_error {
+            body = body.push(text(err).size(12).color(danger));
+        }
+
+        // ── Add-client form ─────────────────────────────────────────────
+        let adding = self.admin_busy_id.as_deref() == Some("");
+        let add_row = row![
+            text_input(t(lang, "Name"), &self.admin_new_name)
+                .on_input(Message::AdminNewNameChanged)
+                .width(Length::FillPortion(2)),
+            checkbox(t(lang, "One-time"), self.admin_new_one_time)
+                .on_toggle(Message::AdminNewOneTimeToggled),
+            text_input("expires (RFC3339, optional)", &self.admin_new_expires)
+                .on_input(Message::AdminNewExpiresChanged)
+                .width(Length::FillPortion(2)),
+            button(text(if adding {
+                t(lang, "Adding...")
+            } else {
+                t(lang, "+ Add")
+            }))
+            .on_press_maybe(
+                (!adding && !self.admin_new_name.trim().is_empty())
+                    .then_some(Message::AdminAddClient)
+            ),
+        ]
+        .spacing(6)
+        .align_y(Alignment::Center);
+        body = body.push(add_row);
+
+        // ── Client list ──────────────────────────────────────────────────
+        if self.admin_clients_loading {
+            body = body.push(text(t(lang, "Loading...")).size(12).color(muted));
+        } else if self.admin_clients.is_empty() {
+            body = body.push(text(t(lang, "No clients")).size(12).color(muted));
+        }
+
+        for c in &self.admin_clients {
+            let busy = self.admin_busy_id.as_deref() == Some(c.id.as_str());
+            let title_row = row![
+                text(format!("{}", c.name)).size(13),
+                text(format!("[{}]", c.role_label())).size(11).color(muted),
+                text(if c.enabled {
+                    t(lang, "enabled")
+                } else {
+                    t(lang, "disabled")
+                })
+                .size(11)
+                .color(if c.enabled { muted } else { danger }),
+                if c.one_time {
+                    text(t(lang, "one-time")).size(11).color(muted)
+                } else {
+                    text("").size(11)
+                },
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center);
+
+            let mut card = column![title_row].spacing(4);
+
+            if self.admin_pending_revoke.as_deref() == Some(c.id.as_str()) {
+                card = card.push(
+                    row![
+                        text(t(lang, "Confirm revoke?")).size(12).color(danger),
+                        button(t(lang, "Yes"))
+                            .on_press(Message::AdminRevokeConfirm(c.id.clone()))
+                            .style(button::danger),
+                        button(t(lang, "No"))
+                            .on_press(Message::AdminRevokeCancel)
+                            .style(button::secondary),
+                    ]
+                    .spacing(6)
+                    .align_y(Alignment::Center),
+                );
+            } else if self.admin_edit_id.as_deref() == Some(c.id.as_str()) {
+                card = card.push(
+                    row![
+                        text_input(t(lang, "Name"), &self.admin_edit_name)
+                            .on_input(Message::AdminEditNameChanged)
+                            .width(Length::FillPortion(2)),
+                        text_input("expires (RFC3339)", &self.admin_edit_expires)
+                            .on_input(Message::AdminEditExpiresChanged)
+                            .width(Length::FillPortion(2)),
+                        button(t(lang, "Save"))
+                            .on_press_maybe((!busy).then_some(Message::AdminEditSave)),
+                        button(t(lang, "Cancel"))
+                            .on_press(Message::AdminEditCancel)
+                            .style(button::secondary),
+                    ]
+                    .spacing(6)
+                    .align_y(Alignment::Center),
+                );
+            } else {
+                card = card.push(
+                    row![
+                        button(t(lang, "Key"))
+                            .on_press_maybe((!busy).then_some(Message::AdminShowKey(c.id.clone()))),
+                        button(t(lang, "Edit")).on_press_maybe(
+                            (!busy).then_some(Message::AdminStartEdit(c.id.clone()))
+                        ),
+                        button(text(if c.enabled {
+                            t(lang, "Disable")
+                        } else {
+                            t(lang, "Enable")
+                        }))
+                        .on_press_maybe(
+                            (!busy)
+                                .then_some(Message::AdminToggleEnabled(c.id.clone(), !c.enabled))
+                        ),
+                        button(t(lang, "Reset device")).on_press_maybe(
+                            (!busy).then_some(Message::AdminResetDevice(c.id.clone()))
+                        ),
+                        button(t(lang, "Revoke"))
+                            .on_press_maybe(
+                                (!busy).then_some(Message::AdminRevokeRequest(c.id.clone()))
+                            )
+                            .style(button::danger),
+                    ]
+                    .spacing(4)
+                    .align_y(Alignment::Center),
+                );
+            }
+
+            if let Some((kid, key)) = &self.admin_key_view {
+                if kid == &c.id {
+                    card = card.push(
+                        scrollable(text(key).size(11))
+                            .width(Length::Fill)
+                            .height(50),
+                    );
+                    card = card.push(
+                        row![
+                            button(t(lang, "Copy")).on_press(Message::AdminCopyKey(key.clone())),
+                            button(t(lang, "Save")).on_press(Message::AdminSaveKeyToFile),
+                            button(t(lang, "Show QR")).on_press_maybe(
+                                (self.admin_qr_loading.is_none())
+                                    .then_some(Message::AdminRequestQr(c.id.clone()))
+                            ),
+                            button(t(lang, "Close"))
+                                .on_press(Message::AdminCloseKeyView)
+                                .style(button::secondary),
+                        ]
+                        .spacing(6)
+                        .align_y(Alignment::Center),
+                    );
+                    if self.admin_qr_loading.as_deref() == Some(c.id.as_str()) {
+                        card = card.push(text(t(lang, "Generating QR...")).size(11).color(muted));
+                    }
+                    if let Some((qid, handle)) = &self.admin_qr {
+                        if qid == &c.id {
+                            card = card.push(
+                                column![
+                                    image(handle.clone()).width(180).height(180),
+                                    button(t(lang, "Save QR"))
+                                        .on_press(Message::AdminSaveQrToFile)
+                                        .style(button::text),
+                                ]
+                                .spacing(4),
+                            );
+                        }
+                    }
+                }
+            }
+
+            body = body.push(container(card).padding(8).width(Length::Fill).style(
+                move |_: &Theme| container::Style {
+                    background: Some(Background::Color(if is_dark {
+                        Color::from_rgb(0.24, 0.25, 0.30)
+                    } else {
+                        Color::from_rgb(0.95, 0.95, 0.97)
+                    })),
+                    border: Border {
+                        radius: 6.0.into(),
+                        width: 1.0,
+                        color: if is_dark {
+                            Color::from_rgba(1.0, 1.0, 1.0, 0.08)
+                        } else {
+                            Color::from_rgba(0.0, 0.0, 0.0, 0.06)
+                        },
+                    },
+                    ..Default::default()
+                },
+            ));
+        }
+
+        column![header, body].spacing(6).into()
     }
 
     fn view_dialog(&self) -> Element<'_, Message> {

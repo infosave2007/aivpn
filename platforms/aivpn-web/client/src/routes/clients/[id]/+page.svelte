@@ -3,10 +3,17 @@
   import { goto } from '$app/navigation';
   import { createQuery, createMutation, useQueryClient } from '@tanstack/svelte-query';
   import { clients as clientsApi, masks as masksApi } from '$lib/api';
-  import type { Client, ClientQos } from '$lib/api';
+  import type { Client, ClientQos, ClientRole } from '$lib/api';
+  import { authStore } from '$lib/stores/auth.svelte';
   import QrModal from '$lib/components/QrModal.svelte';
   import ConnectionKeyModal from '$lib/components/ConnectionKeyModal.svelte';
   import { ArrowLeft, Key, QrCode } from 'lucide-svelte';
+
+  // Role assignment / revoke are web-panel ADMIN-only actions (never
+  // available over the tunnel); the server enforces this independently
+  // (requireReadAccess blocks non-GET for viewers before proxy.ts is reached).
+  const isAdmin = $derived(authStore.user?.role === 'admin');
+  const ROLES: ClientRole[] = ['user', 'viewer', 'admin'];
 
   // Route params are always populated when this component is mounted (the
   // [id] segment matched); the `string | undefined` from the index-signature
@@ -46,6 +53,7 @@
     if (form.name !== undefined && form.name !== orig.name) patch.name = form.name;
     if (form.enabled !== undefined && form.enabled !== orig.enabled) patch.enabled = form.enabled;
     if (form.one_time !== undefined && form.one_time !== orig.one_time) patch.one_time = form.one_time;
+    if (isAdmin && form.role !== undefined && form.role !== (orig.role ?? 'user')) patch.role = form.role;
 
     const newQos: ClientQos = {};
     const up = qosNum(form.qos.bandwidth_limit_up);
@@ -83,6 +91,12 @@
   const resetMut = createMutation({
     mutationFn: () => clientsApi.resetDevice(id),
     onSuccess: () => { toast = 'Device reset'; toastError = false; setTimeout(() => { toast = ''; }, 3000); },
+  });
+
+  const revokeMut = createMutation({
+    mutationFn: () => clientsApi.revoke(id),
+    onSuccess: () => { toast = 'Client revoked and disconnected'; toastError = false; goto('/clients'); },
+    onError: (e: Error) => { toast = e.message; toastError = true; setTimeout(() => { toast = ''; }, 4000); },
   });
 
   // Per-client active-mask override (server: POST /api/v1/masks/active,
@@ -180,6 +194,21 @@
           <span class="text-sm text-gray-700 dark:text-gray-300">One-time use</span>
         </label>
       </div>
+
+      {#if isAdmin}
+        <div>
+          <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1" for="crole">Role</label>
+          <select
+            id="crole"
+            bind:value={form.role}
+            class="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-white text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500"
+          >
+            {#each ROLES as r (r)}
+              <option value={r}>{r}</option>
+            {/each}
+          </select>
+        </div>
+      {/if}
 
       <div class="grid grid-cols-2 gap-4">
         <div>
@@ -292,6 +321,19 @@
       >
         {$resetMut.isPending ? 'Resetting...' : 'Reset Device'}
       </button>
+
+      {#if isAdmin}
+        <div class="mt-6 pt-6 border-t border-red-200 dark:border-red-900">
+          <p class="text-sm text-gray-500 dark:text-gray-400 mb-4">Revoke — tombstone this client and force-disconnect any active session. Distinct from delete; irreversible.</p>
+          <button
+            onclick={() => { if (confirm('Permanently revoke and disconnect this client? This cannot be undone.')) $revokeMut.mutate(); }}
+            disabled={$revokeMut.isPending}
+            class="px-4 py-2 bg-red-600 hover:bg-red-700 disabled:opacity-50 text-white rounded-lg text-sm font-medium"
+          >
+            {$revokeMut.isPending ? 'Revoking...' : 'Revoke Client'}
+          </button>
+        </div>
+      {/if}
     </div>
   {/if}
 </div>

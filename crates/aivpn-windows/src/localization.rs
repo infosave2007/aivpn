@@ -438,6 +438,60 @@ pub fn t(lang: Lang, key: &str) -> &'static str {
         (Lang::En, "country_code") => "Country code (ISO 3166-1 alpha-2, e.g. DE)",
         (Lang::Ru, "country_code") => "Код страны (ISO 3166-1 alpha-2, напр. DE)",
 
+        // Admin panel (P3.4) — in-tunnel client management, Admin role only
+        (Lang::En, "admin_panel") => "Admin — Clients",
+        (Lang::Ru, "admin_panel") => "Админ — Клиенты",
+        (Lang::En, "admin_refresh") => "Refresh",
+        (Lang::Ru, "admin_refresh") => "Обновить",
+        (Lang::En, "admin_loading") => "Loading…",
+        (Lang::Ru, "admin_loading") => "Загрузка…",
+        (Lang::En, "admin_no_clients") => "No clients registered",
+        (Lang::Ru, "admin_no_clients") => "Клиенты не зарегистрированы",
+        (Lang::En, "admin_one_time_badge") => "one-time",
+        (Lang::Ru, "admin_one_time_badge") => "разовый",
+        (Lang::En, "admin_expires") => "Expires",
+        (Lang::Ru, "admin_expires") => "Истекает",
+        (Lang::En, "admin_key_qr") => "Key / QR",
+        (Lang::Ru, "admin_key_qr") => "Ключ / QR",
+        (Lang::En, "admin_reset_device") => "Reset device",
+        (Lang::Ru, "admin_reset_device") => "Сбросить устройство",
+        (Lang::En, "admin_revoke") => "Revoke",
+        (Lang::Ru, "admin_revoke") => "Отозвать",
+        (Lang::En, "admin_add_client") => "Add client",
+        (Lang::Ru, "admin_add_client") => "Добавить клиента",
+        (Lang::En, "admin_one_time") => "One-time enrollment (bind first connecting device)",
+        (Lang::Ru, "admin_one_time") => {
+            "Разовая привязка (первое подключённое устройство)"
+        }
+        (Lang::En, "admin_expiry_hint") => "Expiry (RFC3339, optional)",
+        (Lang::Ru, "admin_expiry_hint") => "Срок действия (RFC3339, необязательно)",
+        (Lang::En, "admin_enabled") => "Enabled",
+        (Lang::Ru, "admin_enabled") => "Включён",
+        (Lang::En, "admin_status_audit") => "Server status & audit log",
+        (Lang::Ru, "admin_status_audit") => "Статус сервера и журнал аудита",
+        (Lang::En, "admin_status_clients") => "Clients enabled/total",
+        (Lang::Ru, "admin_status_clients") => "Клиентов включено/всего",
+        (Lang::En, "admin_status_kernel") => "Kernel module",
+        (Lang::Ru, "admin_status_kernel") => "Kernel-модуль",
+        (Lang::En, "admin_save_key_file") => "Save key to file",
+        (Lang::Ru, "admin_save_key_file") => "Сохранить ключ в файл",
+        (Lang::En, "admin_show_qr") => "Show QR",
+        (Lang::Ru, "admin_show_qr") => "Показать QR",
+        (Lang::En, "admin_save_qr_file") => "Save QR to file",
+        (Lang::Ru, "admin_save_qr_file") => "Сохранить QR в файл",
+        (Lang::En, "admin_saved_to") => "Saved to",
+        (Lang::Ru, "admin_saved_to") => "Сохранено в",
+        (Lang::En, "admin_revoke_confirm_title") => "Revoke client?",
+        (Lang::Ru, "admin_revoke_confirm_title") => "Отозвать клиента?",
+        (Lang::En, "admin_revoke_confirm_body") => "Permanently revoke and disconnect",
+        (Lang::Ru, "admin_revoke_confirm_body") => "Безвозвратно отозвать и отключить",
+        (Lang::En, "admin_revoke_confirm_warn") => {
+            "This cannot be undone. The client's key stops working immediately."
+        }
+        (Lang::Ru, "admin_revoke_confirm_warn") => {
+            "Это необратимо. Ключ клиента перестанет работать немедленно."
+        }
+
         // Default fallback
         (_, _) => "???",
     }
