@@ -1,8 +1,10 @@
+# TODO(security): pin with @sha256:<digest> once a digest is chosen to track.
 FROM debian:bookworm-slim
 
 # Install runtime dependencies
 RUN apt-get update && apt-get install -y \
     ca-certificates \
+    nftables \
     iptables \
     iproute2 \
     netcat-openbsd \
@@ -22,8 +24,8 @@ RUN chmod +x /usr/local/bin/aivpn-server
 
 # Create config directory, mask directory and TUN device node
 RUN mkdir -p /etc/aivpn /var/lib/aivpn/masks /dev/net && \
-    mknod /dev/net/tun c 10 200 2>/dev/null || true && \
-    chmod 600 /dev/net/tun && \
+    { mknod /dev/net/tun c 10 200 2>/dev/null || true; } && \
+    { [ ! -e /dev/net/tun ] || chmod 600 /dev/net/tun; } && \
     chmod +x /usr/local/bin/docker-entrypoint.sh && \
     mkdir -p /usr/share/aivpn
 

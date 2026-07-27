@@ -23,6 +23,7 @@ COPY assets/masks assets/masks/
 RUN cargo build --release --bin aivpn-client
 
 # Stage 2: Runtime
+# TODO(security): pin with @sha256:<digest> once a digest is chosen to track.
 FROM debian:bookworm-slim
 
 RUN apt-get update && apt-get install -y \
@@ -40,7 +41,7 @@ WORKDIR /app
 COPY --from=builder /app/target/release/aivpn-client /usr/local/bin/aivpn-client
 
 RUN mkdir -p /dev/net && \
-    mknod /dev/net/tun c 10 200 2>/dev/null || true && \
-    chmod 600 /dev/net/tun
+    { mknod /dev/net/tun c 10 200 2>/dev/null || true; } && \
+    { [ ! -e /dev/net/tun ] || chmod 600 /dev/net/tun; }
 
 ENTRYPOINT ["/usr/local/bin/aivpn-client"]

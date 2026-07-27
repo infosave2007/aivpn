@@ -94,6 +94,14 @@ class AivpnService : VpnService() {
         @Volatile var tileCallback:    (() -> Unit)?                = null
         /** JSON blob from AivpnJni.getRecordingFeedback(), forwarded as-is; see that method's kdoc for shapes. */
         @Volatile var recordingCallback: ((String) -> Unit)?        = null
+
+        /**
+         * L3: last recording-feedback JSON polled while NO [recordingCallback]
+         * was registered (Activity paused). The Rust side hands each feedback
+         * out exactly once, so dropping it on the floor lost the ack/complete
+         * message forever. MainActivity consumes (and nulls) this on resume.
+         */
+        @Volatile var pendingRecordingFeedback: String? = null
         @Volatile var isRunning     = false
         @Volatile var isServiceActive = false
         @Volatile var lastStatusText = ""
@@ -115,6 +123,20 @@ class AivpnService : VpnService() {
          * this is the ground truth for "connected" (tile ACTIVE state).
          */
         @Volatile var isEstablished = false
+
+        /**
+         * Wall-clock stamp (System.currentTimeMillis) of the CURRENT session's
+         * establishment — the single source of truth for the UI connection
+         * timer. Stamped in [onTunnelReady] on EVERY session, including silent
+         * auto-reconnects, and zeroed wherever [isEstablished] drops, so the
+         * timer and the per-session Rust traffic counters always reset
+         * together. The previous design kept the start time only in the
+         * Activity-scoped ViewModel: an Activity recreated over a surviving
+         * tunnel restarted the timer at "now", while a silent reconnect under
+         * a surviving Activity kept the stale start time next to zeroed
+         * counters. 0 = no established session.
+         */
+        @Volatile var connectedAtMillis = 0L
 
         /** Weak reference to the live service instance, used for socket protection only. */
         @Volatile var instance: AivpnService? = null
@@ -143,6 +165,8 @@ class AivpnService : VpnService() {
     @Volatile private var savedServerSigningKey: String? = null
     @Volatile private var savedMtlsCert: ByteArray? = null
     @Volatile private var savedVpnIp: String?      = null
+    /** Prefs key the current profile's VPN-IP override is stored under (see [vpnIpOverrideKey]). */
+    @Volatile private var savedVpnIpOverrideKey: String? = null
     @Volatile private var savedServerVpnIp: String? = null
     @Volatile private var savedVpnPrefixLen: Int = LEGACY_PREFIX_LEN
     @Volatile private var savedVpnMtu: Int = DEFAULT_TUN_MTU
@@ -156,6 +180,16 @@ class AivpnService : VpnService() {
     // Monotonically-increasing session counter.  Incremented on every new tunnel session.
     // Captured in upgradePendingJob at trigger time so a stale job can't kill a newer session.
     @Volatile private var sessionId: Long = 0L
+
+    // Session ID of the most recent [runTunnel] entry (M4). The process-global Rust
+    // statics (feedback outcome, descriptor store, …) are reset when the NEXT
+    // session's native runTunnel starts — so a superseded session (3 s cancelAndJoin
+    // timeout) that unwinds after that point must skip its end-of-session
+    // bookkeeping: the statics it would read belong to the new session (possibly a
+    // different server). Comparing against [sessionId] instead would be too eager:
+    // it is incremented BEFORE cancelAndJoin, whose non-timeout path waits for the
+    // old finally — where the statics are still the old session's own.
+    @Volatile private var latestRunTunnelSessionId: Long = 0L
 
     // Network change detection
     @Volatile private var networkTrigger: Boolean   = false
@@ -334,6 +368,7 @@ class AivpnService : VpnService() {
             isServiceActive = false
             isRunning = false
             isEstablished = false
+            connectedAtMillis = 0L
             lastStatusText = getString(R.string.status_native_lib_unavailable)
             uiState = UiState.DISCONNECTED
             postStatusCallback(false, lastStatusText)
@@ -348,11 +383,22 @@ class AivpnService : VpnService() {
         // duplicate-CONNECT guard compares like with like.
         val normalizedMask = preferredMask?.takeIf { it.isNotBlank() && it != "auto" }
 
+        // M2/M3: resolve the per-profile VPN-IP override BEFORE the duplicate-
+        // CONNECT guard. savedVpnIp holds the ADOPTED override after a pool
+        // re-home, so comparing it against the raw key-embedded IP flagged every
+        // duplicate CONNECT as a "different target" and restarted a healthy
+        // session (M3). The override itself is keyed per profile identity — not
+        // per serverAddr — so two profiles sharing host:port stop overwriting
+        // each other's override (M2).
+        val overrideKey = vpnIpOverrideKey(serverAddr, serverKeyBase64, pskBase64)
+        val effectiveVpnIp = getSharedPreferences(PrefsKeys.PREFS_NAME, MODE_PRIVATE)
+            .getString(overrideKey, null) ?: vpnIp
+
         val sameTarget =
             savedServerAddr == serverAddr &&
             savedServerKey == serverKeyBase64 &&
             savedPsk == pskBase64 &&
-            savedVpnIp == vpnIp &&
+            savedVpnIp == effectiveVpnIp &&
             savedServerVpnIp == serverVpnIp &&
             savedVpnPrefixLen == normalizedPrefixLen &&
             savedVpnMtu == normalizedMtu &&
@@ -378,9 +424,10 @@ class AivpnService : VpnService() {
         // Prefer a server-assigned VPN IP remembered from an earlier session on
         // this server (pool re-home): the key still embeds the stale colliding
         // IP, so starting the TUN with it would earn an immediate anti-spoof
-        // drop until the poll loop re-adopts the override. Start correct instead.
-        savedVpnIp       = getSharedPreferences(PrefsKeys.PREFS_NAME, MODE_PRIVATE)
-            .getString(PrefsKeys.PREF_VPN_IP_OVERRIDE + serverAddr, null) ?: vpnIp
+        // drop until the poll loop re-adopts the override. Start correct instead
+        // (effectiveVpnIp already resolved the per-profile override above).
+        savedVpnIp       = effectiveVpnIp
+        savedVpnIpOverrideKey = overrideKey
         savedServerVpnIp = serverVpnIp
         savedVpnPrefixLen = normalizedPrefixLen
         savedVpnMtu = normalizedMtu
@@ -447,6 +494,7 @@ class AivpnService : VpnService() {
                     // up, so traffic was never (falsely) reported as "unprotected".
                     isRunning = false
                     isEstablished = false
+                    connectedAtMillis = 0L
                     lastStatusText = getString(R.string.status_disconnected)
                     uiState = UiState.DISCONNECTED
                     postStatusCallback(false, lastStatusText)
@@ -478,6 +526,7 @@ class AivpnService : VpnService() {
                     try {
                         sessionEstablished = false
                         isEstablished = false
+                        connectedAtMillis = 0L
                         networkTrigger = false
                         // A NetworkCallback stopTunnel() that lands during the retry-
                         // delay window (no active native session) leaves a stale
@@ -485,7 +534,7 @@ class AivpnService : VpnService() {
                         // exit on. An intentional new attempt never honors a stale stop.
                         AivpnJni.clearPendingStop()
                         tunnelStartMs = System.currentTimeMillis()
-                        runTunnel()
+                        runTunnel(mySessionId)
                         // runTunnel() returns normally on Rust rekey/network trigger — reconnect fast.
                         // Keep the TUN open on a plain rekey return (no routing gap, fd reuse), BUT
                         // rebuild it on a network-trigger return: a Wi-Fi→cellular switch leaves the
@@ -526,6 +575,7 @@ class AivpnService : VpnService() {
                         Log.e(TAG, "Tunnel error: ${e.message}", e)
                         isRunning = false
                         isEstablished = false
+                        connectedAtMillis = 0L
                         if (manualDisconnect) break
                         // Rebuild the TUN on an error-triggered reconnect instead of
                         // reusing it. A reused interface that survives an underlying
@@ -587,6 +637,7 @@ class AivpnService : VpnService() {
                 if (mySessionId == sessionId) {
                     isRunning = false
                     isEstablished = false
+                    connectedAtMillis = 0L
                     serviceJob = null
                     if (!manualDisconnect) {
                         isServiceActive = false
@@ -597,6 +648,20 @@ class AivpnService : VpnService() {
                             lastStatusText.ifEmpty { getString(R.string.status_disconnected) })
                         stopForeground(STOP_FOREGROUND_REMOVE)
                         stopSelf()
+                    } else {
+                        // H1: stopVpn() already rendered DISCONNECTED, but a late
+                        // onTunnelReady from the dying native session may have raced
+                        // past it — re-flipping uiState/lastStatusText to CONNECTED
+                        // and re-posting the ongoing notification (ID 1) AFTER
+                        // stopVpn's stopForeground removed it. Re-assert the terminal
+                        // state and cancel the zombie notification (idempotent when
+                        // no race happened).
+                        lastStatusText = getString(R.string.status_disconnected)
+                        uiState = UiState.DISCONNECTED
+                        postStatusCallback(false, lastStatusText)
+                        fireTileCallback()
+                        getSystemService(NotificationManager::class.java)
+                            ?.cancel(NOTIFICATION_ID)
                     }
                 }
             }
@@ -617,9 +682,17 @@ class AivpnService : VpnService() {
 
     /**
      * One tunnel session.  Blocks until the Rust core exits (error or rekey interval).
-     * Any exception propagates to the reconnect loop.
+     * Any exception propagates to the reconnect loop. [mySessionId] identifies the
+     * loop that launched this session — the end-of-session bookkeeping in the
+     * finally below is skipped when a newer session has superseded this one (M4).
      */
-    private suspend fun runTunnel() {
+    private suspend fun runTunnel(mySessionId: Long) {
+        // M4: mark this session as the latest one to (be about to) touch the
+        // native statics — set well before AivpnJni.runTunnel resets them, so a
+        // superseded session's finally can never observe reset statics without
+        // also observing this marker change.
+        latestRunTunnelSessionId = mySessionId
+
         // Wait for any usable network before starting (avoids immediate DNS/handshake failure).
         waitForConnectivity()
 
@@ -681,6 +754,7 @@ class AivpnService : VpnService() {
 
         sessionEstablished = false
         isEstablished      = false
+        connectedAtMillis  = 0L
         isRunning          = true
         lastStatusText = getString(R.string.status_connecting)
         uiState = UiState.CONNECTING
@@ -718,20 +792,26 @@ class AivpnService : VpnService() {
                     if (assigned.isNotEmpty() && assigned != savedVpnIp) {
                         Log.w(TAG, "Server assigned VPN IP $assigned (key has $savedVpnIp) — adopting and rebuilding TUN")
                         savedVpnIp = assigned
-                        savedServerAddr?.let { server ->
+                        // M2: persist under the per-profile override key so two
+                        // profiles sharing host:port can't clobber each other.
+                        savedVpnIpOverrideKey?.let { key ->
                             getSharedPreferences(PrefsKeys.PREFS_NAME, MODE_PRIVATE)
                                 .edit()
-                                .putString(PrefsKeys.PREF_VPN_IP_OVERRIDE + server, assigned)
+                                .putString(key, assigned)
                                 .apply()
                         }
                         networkTrigger = true
                         AivpnJni.stopTunnel()
                     }
                     // Forward any pending recording ack/complete/failed/status message to
-                    // whoever is currently observing (MainActivity, if visible).
+                    // whoever is currently observing (MainActivity, if visible). The core
+                    // hands each message out exactly once, so when nobody is observing
+                    // (Activity paused) buffer the last one for delivery on resume (L3).
                     val feedback = AivpnJni.getRecordingFeedback()
                     if (feedback.isNotEmpty()) {
-                        recordingCallback?.invoke(feedback)
+                        val rcb = recordingCallback
+                        if (rcb != null) rcb.invoke(feedback)
+                        else pendingRecordingFeedback = feedback
                     }
                 }
             }
@@ -793,7 +873,19 @@ class AivpnService : VpnService() {
                 // cold start has no cached descriptor and falls back to a public preset.
                 // Run the bookkeeping in NonCancellable in the finally so §2 feedback
                 // state AND the covert descriptor blob are ALWAYS persisted.
+                //
+                // M4 gate: a session superseded by cancelAndJoin timeout unwinds here
+                // AFTER a NEWER session already entered runTunnel and (re)set the
+                // process-global Rust statics these getters read (feedback outcome,
+                // descriptor store — possibly for a DIFFERENT server). A stale
+                // session doing bookkeeping then misattributes the new attempt's
+                // outcome and cross-contaminates per-server descriptors. See
+                // [latestRunTunnelSessionId] for why this is NOT `sessionId`.
                 withContext<Unit>(kotlinx.coroutines.NonCancellable) {
+                    if (mySessionId != latestRunTunnelSessionId) {
+                        Log.d(TAG, "Skipping end-of-session bookkeeping for superseded session $mySessionId (latest $latestRunTunnelSessionId)")
+                        return@withContext
+                    }
                     recordFeedbackOutcome()
                     // Persist any bootstrap descriptors the server pushed this session
                     // (deduped/validity-filtered in the core), keyed PER SERVER (M1) so a
@@ -813,6 +905,7 @@ class AivpnService : VpnService() {
                 statsJob.cancel()
                 isRunning = false
                 isEstablished = false
+                connectedAtMillis = 0L
             }
         }
     }
@@ -833,12 +926,26 @@ class AivpnService : VpnService() {
      */
     @Suppress("unused")
     fun onTunnelReady(host: String) {
+        // H1: a manual disconnect can race the tail of the handshake — stopVpn()
+        // has already rendered DISCONNECTED and removed the foreground
+        // notification, so flipping the shared state back to CONNECTED here
+        // would freeze the UI at "Connected" and re-post a zombie ongoing
+        // notification for a session that is already unwinding. The Rust side
+        // checks stop_requested before this callback, but the flag can be set
+        // between that check and this dispatch — guard here too.
+        if (manualDisconnect || !isServiceActive) {
+            Log.d(TAG, "Ignoring onTunnelReady after disconnect (manual=$manualDisconnect active=$isServiceActive)")
+            return
+        }
         // postConnectUntilMs must be written BEFORE sessionEstablished — network callbacks
         // check sessionEstablished first and then read postConnectUntilMs; if the order were
         // reversed a callback could see sessionEstablished=true while postConnectUntilMs=0.
         postConnectUntilMs = SystemClock.elapsedRealtime() + POST_CONNECT_COOLDOWN_MS
         sessionEstablished = true
         isEstablished = true
+        // New session ⇒ new timer epoch, in lockstep with the Rust per-session
+        // traffic counters that started from zero at this session's birth.
+        connectedAtMillis = System.currentTimeMillis()
         isRunning = true
         lastStatusText = getString(R.string.status_connected, host)
         uiState = UiState.CONNECTED
@@ -1249,6 +1356,7 @@ class AivpnService : VpnService() {
         savedMtlsCert = null
         isRunning = false
         isEstablished = false
+        connectedAtMillis = 0L
         lastStatusText = getString(R.string.status_disconnected)
         uiState = UiState.DISCONNECTED
         postStatusCallback(false, lastStatusText)
@@ -1314,6 +1422,7 @@ class AivpnService : VpnService() {
         } else {
             // Keep the ground truth honest for any later Activity resync.
             isEstablished = false
+            connectedAtMillis = 0L
             lastStatusText = getString(R.string.status_disconnected)
             uiState = UiState.DISCONNECTED
         }
@@ -1334,6 +1443,7 @@ class AivpnService : VpnService() {
      */
     private fun notifyTerminalStop(reason: String) {
         isEstablished = false
+        connectedAtMillis = 0L
         isRunning = false
         lastStatusText = reason
         uiState = UiState.DISCONNECTED
@@ -1669,6 +1779,34 @@ class AivpnService : VpnService() {
         val port = serverAddr.substring(lastColon + 1).toIntOrNull()?.takeIf { it in 1..65535 }
             ?: throw FatalConfigException("Invalid port in server address: $serverAddr")
         return Pair(serverAddr.substring(0, lastColon), port)
+    }
+
+    /**
+     * Prefs key for the persisted server-assigned VPN-IP override, scoped to the
+     * PROFILE identity (serverAddr + server key + PSK hashed, same pattern as
+     * SecureStorage.bootstrapDescriptorsKey) instead of serverAddr alone: two
+     * profiles pointing at the same host:port previously fought over one entry,
+     * so profile A's re-homed IP silently became profile B's TUN address.
+     * Falls back to the legacy serverAddr suffix only if SHA-256 is unavailable
+     * (never on a real device).
+     */
+    private fun vpnIpOverrideKey(
+        serverAddr: String,
+        serverKeyBase64: String,
+        pskBase64: String?,
+    ): String {
+        return try {
+            val md = java.security.MessageDigest.getInstance("SHA-256")
+            val identity = "$serverAddr|$serverKeyBase64|${pskBase64 ?: ""}"
+            val hash = md.digest(identity.toByteArray(Charsets.UTF_8))
+            val suffix = Base64.encodeToString(
+                hash,
+                Base64.URL_SAFE or Base64.NO_PADDING or Base64.NO_WRAP,
+            ).take(16)
+            PrefsKeys.PREF_VPN_IP_OVERRIDE + suffix
+        } catch (e: Exception) {
+            PrefsKeys.PREF_VPN_IP_OVERRIDE + serverAddr
+        }
     }
 
     // ──────────── Profile-keyed connect ────────────

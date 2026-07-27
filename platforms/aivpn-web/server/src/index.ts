@@ -20,8 +20,9 @@ import { oidcRoute } from './routes/oidc'
 import { proxyRoute } from './routes/proxy'
 import { metricsRoute } from './routes/metrics'
 import { eventsRoute } from './routes/events'
-import { checkRateLimit, scheduleRateLimitCleaner } from './ratelimit'
+import { checkRateLimit, isRateLimited, recordRateLimitEvent, scheduleRateLimitCleaner } from './ratelimit'
 import { getClientIp } from './lib/client-ip'
+import { verifyAccessToken } from './auth/jwt'
 
 // ─── Rate limiting ────────────────────────────────────────────────────────────
 // Simple in-process sliding window rate limiter (no Redis required).
@@ -43,6 +44,12 @@ app.use('*', secureHeaders({
     // and dev mode proxies Vite's inline HMR scripts. Hash-based CSP would
     // have to re-hash every dist/*.html at startup and would break dev/HMR;
     // a wrong hash bricks hydration. Revisit if serving moves to SSR.
+    // Residual risk, accepted: this CSP does NOT stop inline-script
+    // injection (reflected/stored XSS) — it only blocks *externally hosted*
+    // script/style origins other than 'self'. It relies entirely on the
+    // absence of unsanitized-HTML sinks elsewhere in the app (verified: no
+    // XSS sinks found in the client). Any future innerHTML-with-user-data or
+    // similar sink would be exploitable despite this header.
     scriptSrc: ["'self'", "'unsafe-inline'"],
     styleSrc: ["'self'", "'unsafe-inline'"],
     imgSrc: ["'self'", 'data:'],
@@ -91,21 +98,57 @@ app.use('/web/auth/*', async (c, next) => {
   // otherwise the socket peer address is used (spoofed XFF would bypass this limit).
   const key = `auth:${getClientIp(c)}`
 
-  if (!checkRateLimit(key, config.AUTH_RATE_MAX, config.AUTH_RATE_WINDOW_MS)) {
+  if (isRateLimited(key, config.AUTH_RATE_MAX, config.AUTH_RATE_WINDOW_MS)) {
     return c.json({ error: 'Too many requests. Please wait before retrying.' }, 429)
   }
 
   await next()
+
+  // Only FAILED requests (4xx/5xx) consume per-IP slots. Successful read-only
+  // auth traffic (GET /me, POST /refresh, GET /oidc/config, passkey listing…)
+  // is free — a browser with several tabs fires many of those on startup and
+  // used to burn through the 10-request window, 429-ing legitimate logins.
+  // Brute-force protection is unchanged: every failed login/TOTP/passkey
+  // attempt still records an event, and the check above rejects before the
+  // handler once the window is full.
+  if (c.res.status >= 400) {
+    recordRateLimitEvent(key, config.AUTH_RATE_MAX)
+  }
 })
+
+// ─── Stable per-identity rate-limit key ────────────────────────────────────────
+//
+// Buckets used to be keyed by sha256(raw Authorization header). That put a
+// successful POST /web/auth/refresh (which mints a brand-new JWT) in a fresh,
+// empty bucket — a refresh→request loop could defeat the /api/v1 and
+// /web/metrics|/web/events caps entirely, since every refresh reset the
+// attacker's own counter. session_id is stable across access-token refreshes
+// (refresh rotates the token but keeps the same `sessions` row / id, including
+// during the cross-tab grace path in routes/auth.ts), so keying on it closes
+// the loop: no number of refreshes grows or resets the bucket.
+//
+// The token is verified here (not just decoded) so a forged/expired
+// Authorization header can't be used to target an arbitrary victim's bucket.
+// On missing/invalid tokens we fall back to an IP-keyed bucket — the request
+// still gets rate limited, and requireAuth() downstream independently
+// rejects it with 401 regardless of what this middleware decided.
+async function stableRateLimitKey(c: Context, prefix: string): Promise<string> {
+  const authHeader = c.req.header('authorization')
+  if (authHeader?.startsWith('Bearer ')) {
+    try {
+      const payload = await verifyAccessToken(authHeader.slice(7))
+      return `${prefix}:session:${payload.session_id}`
+    } catch {
+      // fall through to IP-based key
+    }
+  }
+  return `${prefix}:ip:${getClientIp(c)}`
+}
 
 // ─── API proxy routes — rate limited per user ─────────────────────────────────
 
 app.use('/api/v1/*', async (c, next) => {
-  // Hash the full Authorization token so each user gets an independent bucket.
-  // Slicing the raw JWT would put every user in the same bucket (identical alg/typ prefix).
-  const { createHash } = await import('node:crypto')
-  const rawAuth = c.req.header('authorization') ?? getClientIp(c)
-  const key = `api:${createHash('sha256').update(rawAuth).digest('hex').slice(0, 16)}`
+  const key = await stableRateLimitKey(c, 'api')
 
   if (!checkRateLimit(key, config.API_RATE_MAX, config.API_RATE_WINDOW_MS)) {
     return c.json({ error: 'Too many requests.' }, 429)
@@ -119,9 +162,7 @@ app.use('/api/v1/*', async (c, next) => {
 // load per hit and POST /web/events/ticket mints tickets — both are DoS
 // amplification vectors for any authenticated user (incl. read-only viewers).
 const eventsRateLimit = async (c: Context, next: Next) => {
-  const { createHash } = await import('node:crypto')
-  const rawAuth = c.req.header('authorization') ?? getClientIp(c)
-  const key = `evt:${createHash('sha256').update(rawAuth).digest('hex').slice(0, 16)}`
+  const key = await stableRateLimitKey(c, 'evt')
   if (!checkRateLimit(key, config.API_RATE_MAX, config.API_RATE_WINDOW_MS)) {
     return c.json({ error: 'Too many requests.' }, 429)
   }
@@ -169,11 +210,29 @@ if (config.DEV_MODE) {
 } else {
   // In production: serve built SvelteKit static files
   const clientBuildDir = path.resolve(__dirname, '..', config.CLIENT_BUILD_DIR)
+  const indexHtmlPath = path.join(clientBuildDir, 'index.html')
+
+  // Probe the SPA build ONCE at startup: a missing/misconfigured
+  // CLIENT_BUILD_DIR must produce one clear log line and a stable 503, not an
+  // unhandled throw on every request (which surfaced as opaque 500s with no
+  // hint about the actual problem). Docker note: with the server running from
+  // /app/server/src, the SPA lives at /app/client/build, so the image must set
+  // CLIENT_BUILD_DIR=../client/build (the default resolves to server/client/build).
+  const spaAvailable = await Bun.file(indexHtmlPath).exists()
+  if (!spaAvailable) {
+    console.error(
+      `[server] SPA build not found: ${indexHtmlPath} — the API still works but the web UI will return 503. ` +
+      `Build the client (bun run --cwd client build) or point CLIENT_BUILD_DIR at the SvelteKit build directory.`,
+    )
+  }
 
   app.use('*', serveStatic({ root: clientBuildDir }))
   // SPA fallback: serve index.html for all unmatched routes
   app.get('*', async (c) => {
-    return c.html(await Bun.file(path.join(clientBuildDir, 'index.html')).text())
+    if (!spaAvailable) {
+      return c.text('Web UI build not found on this server (see server log: CLIENT_BUILD_DIR).', 503)
+    }
+    return c.html(await Bun.file(indexHtmlPath).text())
   })
 }
 

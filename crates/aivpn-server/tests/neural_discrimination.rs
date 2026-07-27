@@ -179,8 +179,7 @@ fn neural_rotation_selects_distinct_fallback() {
         catalog.register_mask(m);
     }
     let before = catalog.available_count();
-    catalog.mark_compromised("webrtc_zoom_v3");
-    let fallback = catalog.select_fallback("webrtc_zoom_v3");
+    let fallback = catalog.mark_compromised_with_fallback("webrtc_zoom_v3");
     assert!(fallback.is_some(), "a fallback mask must be available");
     assert_ne!(
         fallback.unwrap().mask_id,

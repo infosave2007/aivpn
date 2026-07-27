@@ -23,6 +23,16 @@ TEAM_ID ?=
 # MikroTik image tag — make mikrotik IMAGE=myrepo/aivpn-mikrotik:latest
 IMAGE    ?= infosave2007/aivpn-mikrotik:latest
 
+# server-deploy: remote SSH user and install dir.
+# USER is only honored when given on the command line (make server-deploy
+# USER=ubuntu ...) — the inherited environment USER (local login) is ignored.
+ifeq ($(origin USER),command line)
+RUSER  ?= $(USER)
+else
+RUSER  ?= root
+endif
+REMOTE ?= /opt/aivpn
+
 .PHONY: help setup check test clippy fmt mask-gate \
         server server-tiny client server-docker \
         server-arm64 client-arm64 \
@@ -507,18 +517,35 @@ deploy:
 	    echo "Generating config/server.key"; \
 	    openssl rand 32 > deploy/config/server.key; chmod 600 deploy/config/server.key; \
 	fi; \
+	SUMS_ASSET=$$ASSET.SHA256SUMS; \
+	SUMS_ARTIFACT=releases/$$SUMS_ASSET; \
 	if [ "$$SKIP_DL" = "1" ]; then \
 	    [ -x "$$ARTIFACT" ] || { echo "ERROR: SKIP_DOWNLOAD=1 but $$ARTIFACT not found" >&2; exit 1; }; \
+	    echo "NOTE: SKIP_DOWNLOAD=1 — no published checksum for a locally-built binary; skipping verification."; \
 	elif [ "$$RELEASE_TAG" = "latest" ]; then \
 	    echo "Downloading $$ASSET (latest)..."; \
 	    curl -fL "https://github.com/$$REPO_SLUG/releases/latest/download/$$ASSET" -o "$$ARTIFACT"; \
+	    echo "Downloading $$SUMS_ASSET (latest)..."; \
+	    curl -fL "https://github.com/$$REPO_SLUG/releases/latest/download/$$SUMS_ASSET" -o "$$SUMS_ARTIFACT" || { \
+	        echo "ERROR: could not download $$SUMS_ASSET — refusing to run an unverified binary." >&2; \
+	        rm -f "$$ARTIFACT"; exit 1; }; \
+	    ( cd releases && sha256sum -c "$$SUMS_ASSET" ) || { \
+	        echo "ERROR: checksum verification FAILED for $$ASSET" >&2; exit 1; }; \
+	    echo "Checksum verified: $$ASSET"; \
 	else \
 	    echo "Downloading $$ASSET ($$RELEASE_TAG)..."; \
-	    DL_URL=$$(curl -fsSL "https://api.github.com/repos/$$REPO_SLUG/releases/tags/$$RELEASE_TAG" | \
-	        python3 -c "import json,sys; d=json.load(sys.stdin); \
+	    REL_JSON=$$(curl -fsSL "https://api.github.com/repos/$$REPO_SLUG/releases/tags/$$RELEASE_TAG"); \
+	    DL_URL=$$(echo "$$REL_JSON" | python3 -c "import json,sys; d=json.load(sys.stdin); \
 [print(a['browser_download_url']) for a in d.get('assets',[]) if a['name']=='$$ASSET']" | head -1); \
+	    SUMS_URL=$$(echo "$$REL_JSON" | python3 -c "import json,sys; d=json.load(sys.stdin); \
+[print(a['browser_download_url']) for a in d.get('assets',[]) if a['name']=='$$SUMS_ASSET']" | head -1); \
 	    [ -n "$$DL_URL" ] || { echo "ERROR: asset not found in release $$RELEASE_TAG" >&2; exit 1; }; \
+	    [ -n "$$SUMS_URL" ] || { echo "ERROR: $$SUMS_ASSET not found in release $$RELEASE_TAG — refusing to run an unverified binary." >&2; exit 1; }; \
 	    curl -fL "$$DL_URL" -o "$$ARTIFACT"; \
+	    curl -fL "$$SUMS_URL" -o "$$SUMS_ARTIFACT"; \
+	    ( cd releases && sha256sum -c "$$SUMS_ASSET" ) || { \
+	        echo "ERROR: checksum verification FAILED for $$ASSET" >&2; exit 1; }; \
+	    echo "Checksum verified: $$ASSET"; \
 	fi; \
 	chmod +x "$$ARTIFACT"; \
 	echo "Enabling IPv4 forwarding..."; \
@@ -544,32 +571,56 @@ print(ipaddress.IPv4Network(f'{sip}/{pl}',strict=False).with_prefixlen)" 2>/dev/
 	echo "Manage clients: docker compose exec aivpn-server aivpn-server --help"
 
 # Usage:
-#   make server-deploy HOST=vps.example.com              (key-based auth)
-#   make server-deploy HOST=vps.example.com SSH_PASS=xx  (password, needs sshpass)
+#   make server-deploy HOST=vps.example.com                     (key-based auth — preferred)
+#   make server-deploy HOST=vps.example.com SSH_PASS_FILE=~/.aivpn-pass  (password from a file, needs sshpass)
+#   make server-deploy HOST=vps.example.com SSH_PASS=xx          (password inline — DISCOURAGED: leaks
+#                                                                   into shell history and `ps` output
+#                                                                   for the life of this recipe; prefer
+#                                                                   SSH_PASS_FILE or key auth instead)
 #   make server-deploy HOST=vps.example.com USER=ubuntu SSH_OPTS="-p 2222"
 # ─────────────────────────────────────────────────────────────────────────────
 server-deploy:
 	@[ -n "$(HOST)" ] || { \
-	    printf "ERROR: HOST is required.\nUsage: make server-deploy HOST=vps.example.com [USER=root] [SSH_PASS=xx]\n" >&2; \
+	    printf "ERROR: HOST is required.\nUsage: make server-deploy HOST=vps.example.com [USER=root] [SSH_PASS_FILE=path]\n" >&2; \
 	    exit 1; }
 	@[ -f releases/aivpn-server-linux-x86_64 ] || { \
 	    echo "ERROR: releases/aivpn-server-linux-x86_64 not found. Run 'make server' or 'make server-docker' first." >&2; \
 	    exit 1; }
 	@set -e; \
-	if [ -n "$(SSH_PASS)" ]; then \
+	if [ -n "$(SSH_PASS_FILE)" ]; then \
+	    [ -f "$(SSH_PASS_FILE)" ] || { echo "ERROR: SSH_PASS_FILE '$(SSH_PASS_FILE)' not found" >&2; exit 1; }; \
+	    command -v sshpass >/dev/null 2>&1 || { echo "ERROR: SSH_PASS_FILE requires sshpass (apt install sshpass)" >&2; exit 1; }; \
+	    SSH_PFX="sshpass -f '$(SSH_PASS_FILE)'"; \
+	    PASS_AUTH=1; \
+	elif [ -n "$(SSH_PASS)" ]; then \
+	    echo "WARNING: SSH_PASS on the command line is visible in shell history and to other" >&2; \
+	    echo "         local users via 'ps' while this recipe runs. Prefer SSH_PASS_FILE=<path>" >&2; \
+	    echo "         (chmod 600 file with just the password) or key-based auth instead." >&2; \
 	    command -v sshpass >/dev/null 2>&1 || { echo "ERROR: SSH_PASS requires sshpass (apt install sshpass)" >&2; exit 1; }; \
 	    SSH_PFX="SSHPASS='$(SSH_PASS)' sshpass -e"; \
+	    PASS_AUTH=1; \
 	else \
 	    SSH_PFX=""; \
+	    PASS_AUTH=0; \
 	fi; \
-	SSHOPTS="$(SSH_OPTS) -o StrictHostKeyChecking=accept-new -o BatchMode=$$([ -n '$(SSH_PASS)' ] && echo no || echo yes)"; \
+	SSHOPTS="$(SSH_OPTS) -o StrictHostKeyChecking=accept-new -o BatchMode=$$([ "$$PASS_AUTH" = 1 ] && echo no || echo yes)"; \
 	R="$(RUSER)@$(HOST)"; \
 	SSH="$$SSH_PFX ssh $$SSHOPTS $$R"; \
 	SCP="$$SSH_PFX scp $$SSHOPTS"; \
 	echo "==> Creating remote directories on $(HOST)..."; \
 	eval "$$SSH" "mkdir -p $(REMOTE)/releases $(REMOTE)/deploy/config $(REMOTE)/deploy/docker $(REMOTE)/masks"; \
+	echo "==> Computing local checksum..."; \
+	LOCAL_SHA=$$(sha256sum releases/aivpn-server-linux-x86_64 | awk '{print $$1}'); \
 	echo "==> Uploading server binary..."; \
 	eval "$$SCP" "releases/aivpn-server-linux-x86_64" "$$R:$(REMOTE)/releases/"; \
+	echo "==> Verifying transferred binary integrity (sha256sum -c)..."; \
+	REMOTE_SHA=$$(eval "$$SSH" "sha256sum $(REMOTE)/releases/aivpn-server-linux-x86_64" | awk '{print $$1}'); \
+	if [ "$$LOCAL_SHA" != "$$REMOTE_SHA" ]; then \
+	    echo "ERROR: checksum mismatch after transfer (local=$$LOCAL_SHA remote=$$REMOTE_SHA)." >&2; \
+	    echo "       Refusing to build/run the remote binary." >&2; \
+	    exit 1; \
+	fi; \
+	echo "Checksum verified: $$LOCAL_SHA"; \
 	echo "==> Uploading Docker files..."; \
 	eval "$$SCP" "docker-compose.yml" "$$R:$(REMOTE)/"; \
 	eval "$$SCP" "deploy/docker/Dockerfile.prebuilt" "deploy/docker/docker-entrypoint.sh" "$$R:$(REMOTE)/deploy/docker/"; \
@@ -609,8 +660,13 @@ windows-docker: releases/
 # ─────────────────────────────────────────────────────────────────────────────
 # Integration test: server + client in Docker bridge network
 # ─────────────────────────────────────────────────────────────────────────────
+# Pass AIVPN_TEST_KEY=aivpn://... to give the test client a real connection
+# key; without it the client exits immediately and the test fails loudly
+# (instead of passing vacuously with an unconfigured client).
 test-docker:
-	docker compose -f deploy/docker/docker-compose.test.yml up --build --abort-on-container-exit
+	@[ -n "$(AIVPN_TEST_KEY)" ] || \
+	    echo "NOTE: AIVPN_TEST_KEY not set — test client has no connection key (run: make test-docker AIVPN_TEST_KEY=aivpn://...)"
+	AIVPN_TEST_KEY="$(AIVPN_TEST_KEY)" docker compose -f deploy/docker/docker-compose.test.yml up --build --abort-on-container-exit
 	docker compose -f deploy/docker/docker-compose.test.yml down
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -644,7 +700,7 @@ mikrotik:
 mikrotik-local:
 	@echo "==> Building local arm64 MikroTik image (no push)..."
 	docker build \
-	  --platform linux/amd64 \
+	  --platform linux/arm64 \
 	  --build-arg MUSL_IMAGE_TAG=aarch64-musl \
 	  --build-arg TARGET_TRIPLE=aarch64-unknown-linux-musl \
 	  -t aivpn-mikrotik:local \
@@ -653,8 +709,8 @@ mikrotik-local:
 
 # ─────────────────────────────────────────────────────────────────────────────
 # OpenWrt — build musl client binaries for common router architectures
-# The OpenWrt package Makefile (aivpn-openwrt/package/aivpn/Makefile) must be
-# built inside the OpenWrt build system or SDK. This target compiles the
+# The OpenWrt package Makefile (platforms/openwrt/package/aivpn/Makefile) must
+# be built inside the OpenWrt build system or SDK. This target compiles the
 # standalone musl client binaries that can be packaged into an ipk manually.
 # ─────────────────────────────────────────────────────────────────────────────
 openwrt: releases/
@@ -667,7 +723,7 @@ openwrt: releases/
 	@echo "→ releases/aivpn-client-linux-mipsel-musl       (MIPS routers)"
 	@echo "→ releases/aivpn-client-linux-aarch64-musl      (AArch64 routers)"
 	@echo ""
-	@echo "Package with the OpenWrt SDK: copy aivpn-openwrt/package/aivpn/ into"
+	@echo "Package with the OpenWrt SDK: copy platforms/openwrt/package/aivpn/ into"
 	@echo "  <sdk>/package/feeds/packages/aivpn and run: make package/aivpn/compile"
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -711,7 +767,18 @@ web:
 	bun install --frozen-lockfile --cwd platforms/aivpn-web; \
 	echo "==> Building aivpn-web..."; \
 	bun run --cwd platforms/aivpn-web build; \
-	echo "→ platforms/aivpn-web/dist/"
+	echo "→ platforms/aivpn-web/dist/"; \
+	echo ""; \
+	echo "DEPLOY NOTE: dist/index.js externalizes the @node-rs/argon2 native"; \
+	echo "addon — the deploy dir MUST also contain node_modules/ (runtime deps)"; \
+	echo "and client/build/ (the SPA), or the bundle fails at startup with"; \
+	echo "'Cannot find module @node-rs/argon2' / serves no UI. Recipe:"; \
+	echo "  deploy/: dist/index.js + client/build/ + server/package.json"; \
+	echo "  cd deploy/ && bun install --production   # materializes node_modules"; \
+	echo "  bun dist/index.js"; \
+	echo "(the repo's own node_modules is a bun workspace symlink store — not"; \
+	echo "shippable as-is). node_modules is platform-specific (native .node"; \
+	echo "binary): run the bun install on the TARGET machine's OS/arch."
 
 web-docker:
 	@echo "==> Building aivpn-web Docker image..."

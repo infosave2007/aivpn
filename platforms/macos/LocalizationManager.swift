@@ -308,7 +308,10 @@ class LocalizationManager: ObservableObject {
             "ru": "FEC"
         ],
         "connect_on_launch": [
-            "en": "Connect on launch",
+            // The toggle only registers a LaunchAgent that starts the app at
+            // login — it does not auto-connect, so the label must not promise
+            // a connection. (RU already said "запускать", which is accurate.)
+            "en": "Launch at login",
             "ru": "Запускать при входе"
         ],
         "connect_on_launch_help": [

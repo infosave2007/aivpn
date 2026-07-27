@@ -20,12 +20,14 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::{DateTime, Utc};
 use hyper_util::rt::TokioIo;
+use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use tokio::net::UnixListener;
 use tokio_stream::wrappers::IntervalStream;
 use tokio_stream::StreamExt as _;
 use tower::util::ServiceExt;
 
+use crate::audit_log::{AuditActor, AuditLogger};
 use crate::client_db::{ClientDatabase, ClientStats, UpdateClientParams};
 
 // ── Config passed by main ────────────────────────────────────────────────────
@@ -37,6 +39,10 @@ pub struct ServeConfig {
     pub socket_path: Option<String>,
     pub server_pub_key: Option<[u8; 32]>,
     pub server_addr: Option<String>,
+    /// Ed25519 signing (verifying) public key, emitted as the `sk` field of
+    /// API-issued connection keys — same value the CLI embeds, so
+    /// panel-provisioned clients can verify signed server messages too.
+    pub server_signing_pubkey: Option<[u8; 32]>,
     /// Path to the server.json config file (for live read/write).
     pub config_path: Option<PathBuf>,
     /// Path to clients.json (for backup export).
@@ -45,6 +51,8 @@ pub struct ServeConfig {
     pub mask_dir: PathBuf,
     /// Path to the append-only audit log (for `GET /api/v1/audit-log`).
     pub audit_log_path: Option<PathBuf>,
+    /// Live audit logger — API mutations are recorded with `AuditActor::Api`.
+    pub audit_log: Option<AuditLogger>,
     /// Live bootstrap descriptors, shared with the gateway's rotation task.
     /// `None` if bootstrap descriptors weren't initialized (should not
     /// normally happen — `Gateway::new()` always builds them).
@@ -74,10 +82,12 @@ struct ApiState {
     started_at: Instant,
     server_pub_key: Option<[u8; 32]>,
     server_addr: Option<String>,
+    server_signing_pubkey: Option<[u8; 32]>,
     config_path: Option<PathBuf>,
     clients_db_path: Option<PathBuf>,
     mask_dir: PathBuf,
     audit_log_path: Option<PathBuf>,
+    audit_log: Option<AuditLogger>,
     bootstrap_descriptors:
         Option<Arc<parking_lot::RwLock<Vec<aivpn_common::mask::BootstrapDescriptor>>>>,
     mask_operator_pubkey: Option<[u8; 32]>,
@@ -205,6 +215,14 @@ fn kernel_loaded() -> bool {
     std::path::Path::new("/dev/aivpn").exists()
 }
 
+/// Audit-log a mutating API action (no-op when no logger was wired up,
+/// e.g. in unit tests).
+fn audit(state: &ApiState, action: &str, target: &str, result: &str) {
+    if let Some(ref log) = state.audit_log {
+        log.log(AuditActor::Api, action, target, result);
+    }
+}
+
 // ── Handlers ─────────────────────────────────────────────────────────────────
 
 async fn get_status(State(state): State<ApiState>) -> impl IntoResponse {
@@ -263,8 +281,14 @@ async fn add_client(
     })
     .await;
     match result {
-        Ok(Ok(c)) => (StatusCode::CREATED, Json(ClientResponse::from(c))).into_response(),
-        Ok(Err(e)) => (StatusCode::CONFLICT, err(e)).into_response(),
+        Ok(Ok(c)) => {
+            audit(&state, "ClientAdd", &format!("{} ({})", c.name, c.id), "ok");
+            (StatusCode::CREATED, Json(ClientResponse::from(c))).into_response()
+        }
+        Ok(Err(e)) => {
+            audit(&state, "ClientAdd", &body.name, &format!("failed: {}", e));
+            (StatusCode::CONFLICT, err(e)).into_response()
+        }
         Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, err("internal error")).into_response(),
     }
 }
@@ -302,9 +326,19 @@ async fn patch_client(
         qos: body.qos,
         expires_at: body.expires_at,
     };
+    let id_for_log = id.clone();
     match tokio::task::spawn_blocking(move || db.update_client(&id, params)).await {
-        Ok(Ok(c)) => Json(ClientResponse::from(c)).into_response(),
+        Ok(Ok(c)) => {
+            audit(&state, "ClientPatch", &id_for_log, "ok");
+            Json(ClientResponse::from(c)).into_response()
+        }
         Ok(Err(e)) => {
+            audit(
+                &state,
+                "ClientPatch",
+                &id_for_log,
+                &format!("failed: {}", e),
+            );
             let status = if e.to_string().contains("not found") {
                 StatusCode::NOT_FOUND
             } else {
@@ -318,18 +352,42 @@ async fn patch_client(
 
 async fn remove_client(State(state): State<ApiState>, Path(id): Path<String>) -> impl IntoResponse {
     let db = state.db.clone();
+    let id_for_log = id.clone();
     match tokio::task::spawn_blocking(move || db.remove_client(&id)).await {
-        Ok(Ok(())) => StatusCode::NO_CONTENT.into_response(),
-        Ok(Err(e)) => (StatusCode::NOT_FOUND, err(e)).into_response(),
+        Ok(Ok(())) => {
+            audit(&state, "ClientRemove", &id_for_log, "ok");
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Ok(Err(e)) => {
+            audit(
+                &state,
+                "ClientRemove",
+                &id_for_log,
+                &format!("failed: {}", e),
+            );
+            (StatusCode::NOT_FOUND, err(e)).into_response()
+        }
         Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, err("internal error")).into_response(),
     }
 }
 
 async fn reset_device(State(state): State<ApiState>, Path(id): Path<String>) -> impl IntoResponse {
     let db = state.db.clone();
+    let id_for_log = id.clone();
     match tokio::task::spawn_blocking(move || db.reset_device_binding(&id)).await {
-        Ok(Ok(())) => Json(serde_json::json!({ "ok": true })).into_response(),
-        Ok(Err(e)) => (StatusCode::NOT_FOUND, err(e)).into_response(),
+        Ok(Ok(())) => {
+            audit(&state, "DeviceReset", &id_for_log, "ok");
+            Json(serde_json::json!({ "ok": true })).into_response()
+        }
+        Ok(Err(e)) => {
+            audit(
+                &state,
+                "DeviceReset",
+                &id_for_log,
+                &format!("failed: {}", e),
+            );
+            (StatusCode::NOT_FOUND, err(e)).into_response()
+        }
         Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, err("internal error")).into_response(),
     }
 }
@@ -373,10 +431,22 @@ async fn get_connection_key(
     use base64::Engine;
     let psk_b64 = base64::engine::general_purpose::STANDARD.encode(&client.psk);
     let pub_b64 = base64::engine::general_purpose::STANDARD.encode(pub_key);
-    let json = serde_json::json!({
+    let mut json = serde_json::json!({
         "s": server_addr, "k": pub_b64, "p": psk_b64,
         "i": client_net_cfg.client_ip, "n": client_net_cfg,
     });
+    // Parity with the CLI's `build_connection_key`: embed the server's
+    // ed25519 signing pubkey (`sk`) and the operator mask-verifying pubkey
+    // (`mop`) so panel-provisioned clients can verify signed server messages
+    // and pushed masks out of the box, exactly like CLI-provisioned ones.
+    if let Some(sk) = &state.server_signing_pubkey {
+        json["sk"] =
+            serde_json::Value::String(base64::engine::general_purpose::STANDARD.encode(sk));
+    }
+    if let Some(mop) = &state.mask_operator_pubkey {
+        json["mop"] =
+            serde_json::Value::String(base64::engine::general_purpose::STANDARD.encode(mop));
+    }
     let json_str = match serde_json::to_string(&json) {
         Ok(s) => s,
         Err(e) => {
@@ -416,28 +486,6 @@ async fn get_config(State(state): State<ApiState>) -> impl IntoResponse {
     }
 }
 
-/// Top-level keys accepted by `PUT /api/v1/config`. Must stay in sync with the
-/// `ServerFileConfig` struct in `main.rs` — a missing entry here rejects an
-/// otherwise-valid config (that was the `bootstrap_publish` regression).
-const CONFIG_KNOWN_KEYS: &[&str] = &[
-    "listen_addr",
-    "tun_name",
-    "tun_addr",
-    "tun_netmask",
-    "network_config",
-    "mask_dir",
-    "bootstrap_mask_files",
-    "session_timeout_secs",
-    "idle_timeout_secs",
-    "tun_mtu",
-    "pool",
-    "site_to_site",
-    "mtls",
-    "dns",
-    "allow_peer_routing",
-    "bootstrap_publish",
-];
-
 async fn put_config(
     State(state): State<ApiState>,
     Json(body): Json<serde_json::Value>,
@@ -454,17 +502,24 @@ async fn put_config(
         )
             .into_response();
     }
-    // Reject unknown top-level keys to catch typos that would be silently ignored
-    if let Some(obj) = body.as_object() {
-        for key in obj.keys() {
-            if !CONFIG_KNOWN_KEYS.contains(&key.as_str()) {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    err(format!("invalid config: unknown field '{}'", key)),
-                )
-                    .into_response();
-            }
-        }
+    // Type-level validation: the body must deserialize into the SAME
+    // `ServerFileConfig` the server parses at startup (deny_unknown_fields
+    // catches typo'd keys). A key-name allowlist used to live here; it
+    // drifted out of sync with the real schema and either 400'd valid
+    // configs or accepted wrong-typed values that bricked the next server
+    // start (`load_server_file_config` exits on parse failure).
+    if let Err(e) = serde_json::from_value::<crate::server_config::ServerFileConfig>(body.clone()) {
+        audit(
+            &state,
+            "ConfigPut",
+            &path.display().to_string(),
+            &format!("rejected: {}", e),
+        );
+        return (
+            StatusCode::BAD_REQUEST,
+            err(format!("invalid config: {}", e)),
+        )
+            .into_response();
     }
     let content = match serde_json::to_string_pretty(&body) {
         Ok(s) => s,
@@ -473,6 +528,7 @@ async fn put_config(
         }
     };
     let db = state.db.clone();
+    let path_for_log = path.display().to_string();
     match tokio::task::spawn_blocking(move || -> Result<(), std::io::Error> {
         let tmp = path.with_extension("tmp");
         std::fs::write(&tmp, &content)?;
@@ -482,12 +538,23 @@ async fn put_config(
     })
     .await
     {
-        Ok(Ok(())) => Json(serde_json::json!({ "ok": true })).into_response(),
-        Ok(Err(e)) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            err(format!("write failed: {}", e)),
-        )
-            .into_response(),
+        Ok(Ok(())) => {
+            audit(&state, "ConfigPut", &path_for_log, "ok");
+            Json(serde_json::json!({ "ok": true })).into_response()
+        }
+        Ok(Err(e)) => {
+            audit(
+                &state,
+                "ConfigPut",
+                &path_for_log,
+                &format!("write failed: {}", e),
+            );
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                err(format!("write failed: {}", e)),
+            )
+                .into_response()
+        }
         Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, err("internal error")).into_response(),
     }
 }
@@ -622,13 +689,19 @@ async fn upload_mask(
     }
     let mask_path = state.mask_dir.join(format!("{}.json", name));
     match tokio::fs::write(&mask_path, &body).await {
-        Ok(()) => Json(serde_json::json!({ "ok": true, "file": format!("{}.json", name) }))
-            .into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            err(format!("write error: {}", e)),
-        )
-            .into_response(),
+        Ok(()) => {
+            audit(&state, "MaskUpload", &name, "ok");
+            Json(serde_json::json!({ "ok": true, "file": format!("{}.json", name) }))
+                .into_response()
+        }
+        Err(e) => {
+            audit(&state, "MaskUpload", &name, &format!("write error: {}", e));
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                err(format!("write error: {}", e)),
+            )
+                .into_response()
+        }
     }
 }
 
@@ -642,17 +715,23 @@ async fn delete_mask(State(state): State<ApiState>, Path(name): Path<String>) ->
     }
     let mask_path = state.mask_dir.join(format!("{}.json", name));
     match tokio::fs::remove_file(&mask_path).await {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Ok(()) => {
+            audit(&state, "MaskDelete", &name, "ok");
+            StatusCode::NO_CONTENT.into_response()
+        }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => (
             StatusCode::NOT_FOUND,
             err(format!("mask '{}' not found", name)),
         )
             .into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            err(format!("delete error: {}", e)),
-        )
-            .into_response(),
+        Err(e) => {
+            audit(&state, "MaskDelete", &name, &format!("delete error: {}", e));
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                err(format!("delete error: {}", e)),
+            )
+                .into_response()
+        }
     }
 }
 
@@ -720,8 +799,16 @@ async fn set_active_mask(
     }
     let override_path = overrides_dir.join(format!("{}.mask", client_id));
     match tokio::fs::write(&override_path, body.mask.as_bytes()).await {
-        Ok(()) => Json(serde_json::json!({ "ok": true, "client": body.client, "mask": body.mask }))
-            .into_response(),
+        Ok(()) => {
+            audit(
+                &state,
+                "MaskSetActive",
+                &format!("{} → {}", client_id, body.mask),
+                "ok",
+            );
+            Json(serde_json::json!({ "ok": true, "client": body.client, "mask": body.mask }))
+                .into_response()
+        }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             err(format!("write error: {}", e)),
@@ -739,11 +826,23 @@ async fn export_backup(State(state): State<ApiState>) -> impl IntoResponse {
     let config_path = state.config_path.clone();
 
     let result = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<u8>> {
-        let ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        let tmp = std::env::temp_dir().join(format!("aivpn-backup-{}.tar.gz", ts));
+        // server-sec HIGH5: a predictable /tmp path with default perms lets
+        // any local user race to read (or pre-create/symlink) the backup —
+        // which contains every client's plaintext PSK. Use an unpredictable
+        // name and create it 0600 up front (before `export_server` ever
+        // writes to it) rather than chmod-ing after the fact.
+        let mut suffix = [0u8; 16];
+        rand::rngs::OsRng.fill_bytes(&mut suffix);
+        let tmp = std::env::temp_dir().join(format!("aivpn-backup-{}.tar.gz", hex::encode(suffix)));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&tmp)?;
+        }
         let opts = ExportOptions {
             include_clients: true,
             include_masks: true,
@@ -819,11 +918,22 @@ async fn import_backup(State(state): State<ApiState>, body: Bytes) -> impl IntoR
     };
 
     let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-        let ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        let tmp = std::env::temp_dir().join(format!("aivpn-import-{}.tar.gz", ts));
+        // server-sec HIGH5: unpredictable name + created 0600 up front (the
+        // uploaded archive contains plaintext PSKs until it is fully
+        // validated and either imported or discarded) instead of a
+        // predictable timestamp path with default perms.
+        let mut suffix = [0u8; 16];
+        rand::rngs::OsRng.fill_bytes(&mut suffix);
+        let tmp = std::env::temp_dir().join(format!("aivpn-import-{}.tar.gz", hex::encode(suffix)));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&tmp)?;
+        }
         std::fs::write(&tmp, &body)?;
         let r = import_server(&tmp, &target_dir, false);
         let _ = std::fs::remove_file(&tmp);
@@ -832,12 +942,23 @@ async fn import_backup(State(state): State<ApiState>, body: Bytes) -> impl IntoR
     .await;
 
     match result {
-        Ok(Ok(())) => Json(serde_json::json!({ "ok": true })).into_response(),
-        Ok(Err(e)) => (
-            StatusCode::BAD_REQUEST,
-            err(format!("import failed: {}", e)),
-        )
-            .into_response(),
+        Ok(Ok(())) => {
+            audit(&state, "BackupImport", "server backup", "ok");
+            Json(serde_json::json!({ "ok": true })).into_response()
+        }
+        Ok(Err(e)) => {
+            audit(
+                &state,
+                "BackupImport",
+                "server backup",
+                &format!("failed: {}", e),
+            );
+            (
+                StatusCode::BAD_REQUEST,
+                err(format!("import failed: {}", e)),
+            )
+                .into_response()
+        }
         Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, err("internal error")).into_response(),
     }
 }
@@ -855,14 +976,27 @@ async fn get_audit_log(
     let limit = q.limit.min(1000);
     let result = tokio::task::spawn_blocking(
         move || -> Result<Vec<crate::audit_log::AuditEntry>, std::io::Error> {
-            use std::io::{BufRead, BufReader};
-            let file = std::fs::File::open(&log_path)?;
-            let reader = BufReader::new(file);
-            let lines: Vec<String> = reader
-                .lines()
-                .filter_map(|l| l.ok())
-                .filter(|l| !l.trim().is_empty())
-                .collect();
+            use std::io::{Read as _, Seek, SeekFrom};
+            // Bounded tail read: the log grows without rotation guarantees,
+            // so never buffer the whole file — read at most enough bytes from
+            // the end to cover `limit` entries (~1 KiB/entry is generous; the
+            // typical entry is ~150 bytes), capped at 4 MiB.
+            let mut file = std::fs::File::open(&log_path)?;
+            let file_len = file.metadata()?.len();
+            let max_bytes = (limit as u64)
+                .saturating_mul(1024)
+                .clamp(64 * 1024, 4 * 1024 * 1024);
+            let start = file_len.saturating_sub(max_bytes);
+            file.seek(SeekFrom::Start(start))?;
+            let mut buf = Vec::with_capacity((file_len - start) as usize);
+            file.read_to_end(&mut buf)?;
+            let text = String::from_utf8_lossy(&buf);
+            let mut lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+            // If we started mid-file, the first line is almost certainly a
+            // truncated entry — drop it (it would fail to parse anyway).
+            if start > 0 && !lines.is_empty() {
+                lines.remove(0);
+            }
             let entries: Vec<crate::audit_log::AuditEntry> = lines
                 .iter()
                 .rev()
@@ -902,7 +1036,11 @@ async fn sse_events(State(state): State<ApiState>) -> impl IntoResponse {
             "uptime_secs": state.started_at.elapsed().as_secs(),
             "clients_total": clients.len(),
             "clients_enabled": clients.iter().filter(|c| c.enabled).count(),
-            "clients_connected": clients.iter()
+            // `last_connected` is never cleared, so this counts clients that
+            // have EVER connected — named accordingly. The LIVE count is
+            // `clients_connected`, derived from the metrics collector's
+            // active-session gauge below (metrics builds only).
+            "clients_ever_connected": clients.iter()
                 .filter(|c| c.stats.last_connected.is_some()).count(),
             "kernel_module": kernel_loaded(),
             "ts": Utc::now().to_rfc3339(),
@@ -921,6 +1059,14 @@ async fn sse_events(State(state): State<ApiState>) -> impl IntoResponse {
             if let Some(obj) = payload.as_object_mut() {
                 obj.insert(
                     "active_sessions".into(),
+                    serde_json::json!(m.active_sessions()),
+                );
+                // Live connected count for the web panel's dashboard chart
+                // (it reads `clients_connected` from this SSE payload). The
+                // previous value counted ever-connected clients and never
+                // went down; the active-session gauge is the real live count.
+                obj.insert(
+                    "clients_connected".into(),
                     serde_json::json!(m.active_sessions()),
                 );
                 obj.insert(
@@ -1137,10 +1283,12 @@ pub async fn serve(cfg: ServeConfig) {
         started_at: Instant::now(),
         server_pub_key: cfg.server_pub_key,
         server_addr: cfg.server_addr,
+        server_signing_pubkey: cfg.server_signing_pubkey,
         config_path: cfg.config_path,
         clients_db_path: cfg.clients_db_path,
         mask_dir: cfg.mask_dir,
         audit_log_path: cfg.audit_log_path,
+        audit_log: cfg.audit_log,
         bootstrap_descriptors: cfg.bootstrap_descriptors,
         mask_operator_pubkey: cfg.mask_operator_pubkey,
         mask_verify_mode: cfg.mask_verify_mode,
@@ -1154,6 +1302,9 @@ pub async fn serve(cfg: ServeConfig) {
             Ok(s) => s,
             Err(e) => {
                 tracing::warn!("Management API: accept error: {}", e);
+                // Back off briefly: a persistent error (e.g. EMFILE) would
+                // otherwise spin this loop at 100% CPU and starve the runtime.
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 continue;
             }
         };
@@ -1171,24 +1322,6 @@ pub async fn serve(cfg: ServeConfig) {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::CONFIG_KNOWN_KEYS;
-
-    /// Regression: the `bootstrap_publish` key is a real `ServerFileConfig`
-    /// field, so the allowlist must accept it — otherwise a valid config
-    /// round-trip through `PUT /api/v1/config` is rejected as "unknown field".
-    #[test]
-    fn config_allowlist_contains_bootstrap_publish() {
-        assert!(CONFIG_KNOWN_KEYS.contains(&"bootstrap_publish"));
-    }
-
-    /// Guard against accidental duplicate/typo entries in the allowlist.
-    #[test]
-    fn config_allowlist_has_no_duplicates() {
-        let mut seen = std::collections::HashSet::new();
-        for k in CONFIG_KNOWN_KEYS {
-            assert!(seen.insert(*k), "duplicate key in CONFIG_KNOWN_KEYS: {k}");
-        }
-    }
-}
+// PUT /api/v1/config validation is now type-level: the body must deserialize
+// into `crate::server_config::ServerFileConfig` (see that module's tests for
+// the shipped-example round-trip and unknown/typo-key rejection coverage).

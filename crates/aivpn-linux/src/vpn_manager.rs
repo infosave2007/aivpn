@@ -23,6 +23,12 @@ pub struct TrafficStats {
     pub bytes_received: u64,
     pub quality_score: u8,
     pub server_adaptive_level: u8,
+    /// Session epoch (unix ms) stamped by the client's stats writer once per
+    /// session (`since:` key). Changes on a silent in-process reconnect, so a
+    /// reader can detect a session restart (counters reset together with the
+    /// timer). None when the file predates the field (old client binary) or
+    /// was a pre-session zero-write.
+    pub connected_since: Option<u64>,
 }
 
 /// Locate a binary named `name` either next to the currently-running
@@ -104,13 +110,20 @@ pub fn read_traffic_stats() -> TrafficStats {
         PathBuf::from("/tmp/traffic.stats"),
     ];
     let mut stats = TrafficStats::default();
-    for path in &candidates {
-        if let Some((_, content)) = read_trusted_stats_file(path) {
-            if let Some(s) = parse_traffic_stats(&content) {
-                stats.bytes_sent = s.bytes_sent;
-                stats.bytes_received = s.bytes_received;
-                break;
-            }
+    // Rank candidates by mtime (exactly like quality.json below): with a
+    // fixed first-parse-wins order, a stale file left at an earlier path by
+    // a previous run shadows the live one being updated at a later path.
+    let mut traffic_by_freshness: Vec<_> = candidates
+        .iter()
+        .filter_map(|p| read_trusted_stats_file(p))
+        .collect();
+    traffic_by_freshness.sort_by(|a, b| b.0.cmp(&a.0));
+    for (_, content) in traffic_by_freshness {
+        if let Some(s) = parse_traffic_stats(&content) {
+            stats.bytes_sent = s.bytes_sent;
+            stats.bytes_received = s.bytes_received;
+            stats.connected_since = s.connected_since;
+            break;
         }
     }
     // The client writes quality.json to /var/run/aivpn/ when it can (root /
@@ -144,17 +157,21 @@ pub fn read_traffic_stats() -> TrafficStats {
 fn parse_traffic_stats(content: &str) -> Option<TrafficStats> {
     let mut sent = None;
     let mut received = None;
+    let mut since = None;
     for part in content.split(',') {
         let part = part.trim();
         if let Some(v) = part.strip_prefix("sent:") {
             sent = v.trim().parse().ok();
         } else if let Some(v) = part.strip_prefix("received:") {
             received = v.trim().parse().ok();
+        } else if let Some(v) = part.strip_prefix("since:") {
+            since = v.trim().parse().ok();
         }
     }
     Some(TrafficStats {
         bytes_sent: sent?,
         bytes_received: received?,
+        connected_since: since,
         ..Default::default()
     })
 }

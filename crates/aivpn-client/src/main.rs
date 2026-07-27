@@ -290,12 +290,20 @@ async fn main() {
     let _log_guard = {
         let args: Vec<String> = std::env::args().collect();
         // Only write to the persistent log file for the main VPN connection mode.
-        // Subcommands (record, bench, status, key) are short-lived GUI polls that
-        // must not truncate the VPN connection log.
+        // Subcommands (record, kill-switch, bench) are short-lived one-off CLI
+        // invocations that must not truncate the VPN connection log. Must match
+        // the real `ClientCommand` variants exactly: `Record`("record"),
+        // `KillSwitch`("kill-switch" — clap's `#[command(name = "kill-switch")]`),
+        // `Bench`("bench"). There is no top-level "status"/"key" subcommand, so
+        // those never matched anything; "kill-switch" was missing entirely,
+        // which meant e.g. `aivpn-client.exe kill-switch clear` — a genuine
+        // one-off admin action — fell through to the main-mode branch below and
+        // truncated %LOCALAPPDATA%\AIVPN\client.log, destroying diagnostic
+        // history from the last real VPN session.
         let is_subcommand = args
             .iter()
             .skip(1)
-            .any(|a| matches!(a.as_str(), "record" | "bench" | "status" | "key"));
+            .any(|a| matches!(a.as_str(), "record" | "kill-switch" | "bench"));
 
         let log_path = if is_subcommand {
             None
@@ -985,8 +993,34 @@ async fn main() {
     // end of each iteration and the proxy is killed during the backoff sleep —
     // creating a DNS leak window on every reconnect.
     let _dns_proxy_handle = args.dns_proxy.as_deref().and_then(|bind_str| {
-        let bind_addr = bind_str.parse::<std::net::SocketAddr>().ok()?;
-        let upstream_addr = args.dns_upstream.parse::<std::net::SocketAddr>().ok()?;
+        // Unlike every other malformed-input path in this file
+        // (--server-key, --proxy-listen, --mtls-cert, --mask-verify-mode,
+        // --tun-addr all log+exit on bad input), a typo'd
+        // --dns-proxy/--dns-upstream used to fail via `.ok()?` with zero
+        // logging — the user's requested DNS leak protection silently never
+        // starts, with nothing in the log to say why. Warn loudly instead so
+        // this is at least visible, without hard-exiting the whole client
+        // over a proxy that's opt-in.
+        let bind_addr = match bind_str.parse::<std::net::SocketAddr>() {
+            Ok(a) => a,
+            Err(e) => {
+                error!(
+                    "--dns-proxy '{}' is not a valid address:port — DNS leak protection NOT started: {}",
+                    bind_str, e
+                );
+                return None;
+            }
+        };
+        let upstream_addr = match args.dns_upstream.parse::<std::net::SocketAddr>() {
+            Ok(a) => a,
+            Err(e) => {
+                error!(
+                    "--dns-upstream '{}' is not a valid address:port — DNS leak protection NOT started: {}",
+                    args.dns_upstream, e
+                );
+                return None;
+            }
+        };
         Some(aivpn_client::dns_proxy::spawn_dns_proxy(
             aivpn_client::dns_proxy::DnsProxyConfig {
                 listen_addr: bind_addr,
@@ -1086,6 +1120,50 @@ async fn main() {
                 handshake_fail_streak
             );
             bootstrap_default()
+        } else {
+            initial_mask
+        };
+
+        // production-secure companion to the fallback above: never drop to an
+        // unsigned builtin mask, but still recover from a cached descriptor the
+        // server can no longer match (rotated signing/session key, expired
+        // epoch) — otherwise `select_initial_mask()` deterministically re-picks
+        // the same newest-`created_at` descriptor every reconnect and the
+        // client is stuck until the descriptor's own (possibly hours/days-long)
+        // `expires_at` passes. Exclude the specific failing descriptor id from
+        // this run's selection (not delete it from disk) so selection advances
+        // to the next-newest still-valid SIGNED descriptor, and kick an
+        // immediate re-fetch in case the operator has since published a fresh
+        // one. Resets the fail streak so the newly-selected descriptor gets its
+        // own full threshold before being excluded in turn.
+        #[cfg(feature = "production-secure")]
+        let initial_mask = if handshake_fail_streak >= HANDSHAKE_FALLBACK_THRESHOLD {
+            let descriptor_id = initial_mask
+                .mask_id
+                .strip_prefix("bootstrap:")
+                .and_then(|rest| rest.split(':').next())
+                .map(|s| s.to_string());
+            if let Some(id) = &descriptor_id {
+                warn!(
+                    "{} consecutive handshakes never connected on descriptor '{}' — excluding it \
+                     from selection and forcing a bootstrap re-fetch (production-secure: no unsigned fallback)",
+                    handshake_fail_streak, id
+                );
+                bootstrap_cache::exclude_descriptor(id);
+                handshake_fail_streak = 0;
+            }
+            let refetched = bootstrap_cache::refresh_from_urls(
+                &bootstrap_descriptor_urls,
+                server_signing_key.as_ref(),
+            )
+            .await;
+            if refetched > 0 {
+                info!(
+                    "Re-fetched {} bootstrap descriptor(s) after a stuck descriptor",
+                    refetched
+                );
+            }
+            bootstrap_cache::select_initial_mask(preshared_key.as_ref()).unwrap_or(initial_mask)
         } else {
             initial_mask
         };
@@ -1224,9 +1302,9 @@ async fn main() {
                 .unwrap_or(false);
 
         // Failover: pick next healthy node from pool, or fall back to primary
-        let active_server = server_pool
-            .as_ref()
-            .and_then(|p| p.next_server())
+        let active_server_addr: Option<std::net::SocketAddr> =
+            server_pool.as_ref().and_then(|p| p.next_server());
+        let active_server = active_server_addr
             .map(|a| a.to_string())
             .unwrap_or_else(|| server_addr.clone());
 
@@ -1289,6 +1367,22 @@ async fn main() {
                     handshake_fail_streak = 0;
                 } else {
                     handshake_fail_streak = handshake_fail_streak.saturating_add(1);
+                }
+
+                // Wire the pool's health tracking to the real connection outcome —
+                // without this, `NodeState::is_healthy()` never sees a failure and
+                // `next_server()` (Failover mode) retries the same dead primary
+                // forever instead of advancing to a peer.
+                if let (Some(pool), Some(addr)) = (server_pool.as_ref(), active_server_addr) {
+                    if client.ever_connected() {
+                        pool.report_success(addr);
+                        let rtt = client.last_rtt_ms();
+                        if rtt > 0 {
+                            pool.update_rtt(addr, rtt as f64);
+                        }
+                    } else {
+                        pool.report_failure(addr);
+                    }
                 }
 
                 if feedback_share_enabled {

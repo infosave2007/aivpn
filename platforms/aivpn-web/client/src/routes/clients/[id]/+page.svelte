@@ -26,8 +26,44 @@
     }
   });
 
+  /** Normalise a QoS form value: only positive finite numbers are limits. */
+  function qosNum(v: unknown): number | undefined {
+    return typeof v === 'number' && Number.isFinite(v) && v > 0 ? v : undefined;
+  }
+
+  /**
+   * Send ONLY changed fields. PATCH semantics on the server: an omitted `qos`
+   * leaves QoS untouched, `null` clears it — the old code spread the ENTIRE
+   * client object (id, stats, …) into the body and always sent a `qos` object
+   * (an empty `{}` when the form was untouched), silently wiping any existing
+   * QoS limits on every unrelated save.
+   */
+  function buildPatch(orig: Client): Parameters<typeof clientsApi.update>[1] {
+    const patch: Parameters<typeof clientsApi.update>[1] = {};
+    if (form.name !== undefined && form.name !== orig.name) patch.name = form.name;
+    if (form.enabled !== undefined && form.enabled !== orig.enabled) patch.enabled = form.enabled;
+    if (form.one_time !== undefined && form.one_time !== orig.one_time) patch.one_time = form.one_time;
+
+    const newQos: ClientQos = {};
+    const up = qosNum(form.qos.bandwidth_limit_up);
+    const down = qosNum(form.qos.bandwidth_limit_down);
+    if (up !== undefined) newQos.bandwidth_limit_up = up;
+    if (down !== undefined) newQos.bandwidth_limit_down = down;
+    if (orig.qos?.dscp_class !== undefined) newQos.dscp_class = orig.qos.dscp_class; // not editable here — preserve
+
+    const origQos: ClientQos = {
+      ...(qosNum(orig.qos?.bandwidth_limit_up) !== undefined ? { bandwidth_limit_up: orig.qos!.bandwidth_limit_up } : {}),
+      ...(qosNum(orig.qos?.bandwidth_limit_down) !== undefined ? { bandwidth_limit_down: orig.qos!.bandwidth_limit_down } : {}),
+      ...(orig.qos?.dscp_class !== undefined ? { dscp_class: orig.qos.dscp_class } : {}),
+    };
+    if (JSON.stringify(newQos) !== JSON.stringify(origQos)) {
+      patch.qos = Object.keys(newQos).length > 0 ? newQos : null; // null clears QoS server-side
+    }
+    return patch;
+  }
+
   const updateMut = createMutation({
-    mutationFn: (data: Partial<Client>) => clientsApi.update(id, data),
+    mutationFn: (data: Parameters<typeof clientsApi.update>[1]) => clientsApi.update(id, data),
     onSuccess: (updated) => {
       qc.setQueryData(['client', id], updated);
       toast = 'Saved successfully';
@@ -95,7 +131,7 @@
     </div>
   {:else if $query.data}
     <form
-      onsubmit={(e) => { e.preventDefault(); $updateMut.mutate(form); }}
+      onsubmit={(e) => { e.preventDefault(); if ($query.data) $updateMut.mutate(buildPatch($query.data)); }}
       class="bg-white dark:bg-gray-800 rounded-xl p-6 border border-gray-200 dark:border-gray-700 space-y-5"
     >
       <h2 class="text-base font-semibold text-gray-900 dark:text-white">Edit Client</h2>

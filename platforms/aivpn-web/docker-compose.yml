@@ -6,8 +6,13 @@ services:
       context: platforms/aivpn-web
       dockerfile: Dockerfile
     restart: unless-stopped
+    # Loopback-only: the panel speaks plain HTTP and is meant to sit behind
+    # the TLS-terminating reverse proxy in deploy/nginx/aivpn-web.conf, which
+    # also overwrites X-Forwarded-For (see AIVPN_WEB_TRUST_PROXY in
+    # .env.example). Publish on all interfaces only if you understand you're
+    # exposing an unencrypted admin panel directly.
     ports:
-      - "8080:8080"
+      - "127.0.0.1:8080:8080"
     environment:
       DATABASE_URL: file:./data/aivpn-web.db
       JWT_SECRET: ${AIVPN_WEB_JWT_SECRET:?required}

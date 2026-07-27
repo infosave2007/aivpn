@@ -12,13 +12,16 @@ use kernel::fs::File;
 use kernel::uaccess::{UserSlice, UserPtr};
 
 // ── UAPI ioctl numbers (mirrored from include/uapi/aivpn.h) ──────────────────
-// _IOW(0xAE, nr, size) = (2<<30)|(magic<<8)|nr|(size<<16)
-// _IOR(0xAE, nr, size) = (1<<30)|(magic<<8)|nr|(size<<16)
+// Kernel _IOC convention (asm-generic/ioctl.h): _IOC_WRITE = 1, _IOC_READ = 2.
+// _IOW(0xAE, nr, size) = (1<<30)|(size<<16)|(magic<<8)|nr
+// _IOR(0xAE, nr, size) = (2<<30)|(size<<16)|(magic<<8)|nr
 // _IOWR = (3<<30); _IO = magic<<8|nr
+// MUST stay identical to crates/aivpn-common/src/kernel_accel.rs (userspace
+// side) — change both together or the production data path breaks.
 
 const MAGIC: u32 = 0xAE;
-const fn iow(nr: u32, sz: u32) -> u32  { (2 << 30) | (MAGIC << 8) | nr | (sz << 16) }
-const fn ior(nr: u32, sz: u32) -> u32  { (1 << 30) | (MAGIC << 8) | nr | (sz << 16) }
+const fn iow(nr: u32, sz: u32) -> u32  { (1 << 30) | (MAGIC << 8) | nr | (sz << 16) }
+const fn ior(nr: u32, sz: u32) -> u32  { (2 << 30) | (MAGIC << 8) | nr | (sz << 16) }
 const fn iowr(nr: u32, sz: u32) -> u32 { (3 << 30) | (MAGIC << 8) | nr | (sz << 16) }
 const fn io(nr: u32) -> u32            { (MAGIC << 8) | nr }
 
@@ -34,6 +37,12 @@ const IOC_SESSION_UPDATE_TAGS: u32 = iow(8, 4116);
 const IOC_SESSION_DOWNLINK:    u32 = iow(9, 4184);
 const IOC_SET_EGRESS:          u32 = iow(10,  12);
 const API_VERSION:             u32 = 5;
+
+// Encoding anchors: numeric values the C _IOW/_IOR macros produce for two
+// representative commands. If iow()/ior() ever drift from the kernel _IOC
+// convention again, the build breaks here instead of the data path.
+const _: () = assert!(IOC_SESSION_ADD == 0x40C0_AE01);
+const _: () = assert!(IOC_GET_VERSION == 0x8004_AE07);
 
 // CAP_NET_ADMIN = 12 (linux/capability.h)
 const CAP_NET_ADMIN: i32 = 12;

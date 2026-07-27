@@ -1,0 +1,73 @@
+# Optional monitoring stack (Prometheus + Grafana) for aivpn-server.
+#
+# Kept in a separate file from the root docker-compose.yml on purpose:
+# Compose validates ${VAR:?required} for every service at parse time
+# regardless of `profiles:` filtering, so Grafana's required admin password
+# would otherwise block plain `aivpn-server`-only deploys too.
+#
+# Usage:
+#   AIVPN_GRAFANA_ADMIN_PASSWORD=<strong-random-value> \
+#   docker compose -f ../../docker-compose.yml -f docker-compose.monitoring.yml \
+#     --profile monitoring up -d
+# (or, from the repo root:)
+#   AIVPN_GRAFANA_ADMIN_PASSWORD=<strong-random-value> \
+#   docker compose -f docker-compose.yml -f deploy/monitoring/docker-compose.monitoring.yml \
+#     --profile monitoring up -d
+services:
+  # Prometheus (optional monitoring)
+  # NOTE: aivpn-server exposes metrics only over the management API unix
+  # socket (/run/aivpn/api.sock) — there is no TCP /metrics endpoint, so
+  # prometheus.yml ships with no active scrape target. To scrape aivpn
+  # metrics, run a unix-socket→TCP exporter sidecar and uncomment the
+  # example job in deploy/monitoring/prometheus.yml.
+  prometheus:
+    image: prom/prometheus:latest
+    restart: unless-stopped
+    # Loopback-only: Prometheus has no auth of its own. Reach it via SSH
+    # tunnel/VPN or put a reverse proxy with auth in front for remote access.
+    ports:
+      - "127.0.0.1:9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/usr/share/prometheus/console_libraries'
+      - '--web.console.templates=/usr/share/prometheus/consoles'
+    networks:
+      - aivpn-monitoring
+    profiles:
+      - monitoring
+
+  # Grafana (optional visualization)
+  grafana:
+    image: grafana/grafana:latest
+    restart: unless-stopped
+    # Loopback-only by default — reach it via SSH tunnel/VPN, or put a
+    # reverse proxy with its own auth in front for remote access.
+    ports:
+      - "127.0.0.1:3000:3000"
+    environment:
+      # Required — no default "admin" password. Set before starting:
+      #   AIVPN_GRAFANA_ADMIN_PASSWORD=<strong-random> docker compose ... --profile monitoring up -d
+      - GF_SECURITY_ADMIN_PASSWORD=${AIVPN_GRAFANA_ADMIN_PASSWORD:?required}
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./grafana/dashboards:/etc/grafana/provisioning/dashboards
+      - ./grafana/datasources:/etc/grafana/provisioning/datasources
+    networks:
+      - aivpn-monitoring
+    depends_on:
+      - prometheus
+    profiles:
+      - monitoring
+
+volumes:
+  prometheus_data:
+  grafana_data:
+
+networks:
+  aivpn-monitoring:
+    driver: bridge

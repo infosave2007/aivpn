@@ -21,7 +21,13 @@ func loadMaskCatalogFile() -> [MaskCatalogItem] {
     for path in paths {
         guard let data = FileManager.default.contents(atPath: path) else { continue }
         if let items = try? JSONDecoder().decode([MaskCatalogItem].self, from: data) {
-            return items
+            // Only surface ids the helper's/client's pattern gate will accept
+            // (lowercase alphanumerics + underscore, ≤64 chars) — a corrupted
+            // or tampered catalog entry must not become a doomed connect.
+            return items.filter {
+                $0.mask_id == "auto" ||
+                $0.mask_id.range(of: "^[a-z0-9_]{1,64}$", options: .regularExpression) != nil
+            }
         }
     }
     return []
@@ -786,41 +792,40 @@ struct ContentView: View {
                         return
                     }
                     
-                    if !vpn.helperAvailable {
-                        vpn.checkHelperAvailable()
-                    } else {
-                        if proxyMode {
-                            // Proxy mode explicitly means "SOCKS5, no root". Never fall
-                            // through to the full-tunnel helper connect on a bad port —
-                            // that would silently start a root VPN the user didn't ask for.
-                            guard let port = Int(proxyPort), port > 1024 else {
-                                vpn.lastError = loc.t("proxy_port_invalid")
-                                return
-                            }
-                            vpn.connectProxy(key: selectedKey.keyValue, proxyPort: port,
-                                             preferredMask: preferredMask == "auto" ? nil : preferredMask,
-                                             polymorphicBase: (polymorphicMask && preferredMask != "auto") ? preferredMask : nil,
-                                             shareMaskFeedback: shareMaskFeedback,
-                                             receiveMaskHints: receiveMaskHints,
-                                             countryCode: maskCountryCode.count == 2 ? maskCountryCode : nil)
-                        } else {
-                            vpn.connect(key: selectedKey.keyValue, fullTunnel: fullTunnel,
-                                        mtlsCertPath: selectedKey.mtlsCertPath,
-                                        excludeRoutes: excludeRoutes.isEmpty ? nil : excludeRoutes,
-                                        adaptiveLevel: adaptiveLevel,
-                                        dnsProxy: dnsProxyAddr.isEmpty ? nil : dnsProxyAddr,
-                                        killSwitch: killSwitch,
-                                        preferredMask: preferredMask == "auto" ? nil : preferredMask,
-                                        polymorphicBase: (polymorphicMask && preferredMask != "auto") ? preferredMask : nil,
-                                        shareMaskFeedback: shareMaskFeedback,
-                                        receiveMaskHints: receiveMaskHints,
-                                        countryCode: maskCountryCode.count == 2 ? maskCountryCode : nil,
-                                        bootstrapCdnUrl: selectedKey.bootstrapCdnUrl,
-                                        bootstrapTelegramToken: selectedKey.bootstrapTelegramToken,
-                                        bootstrapTelegramChat: selectedKey.bootstrapTelegramChat,
-                                        bootstrapGithub: selectedKey.bootstrapGithub,
-                                        serverSigningKey: selectedKey.serverSigningKey)
+                    // No dead "re-check helper" branch here: in non-proxy mode
+                    // the button is disabled while the helper is unavailable,
+                    // and proxy mode doesn't use the helper at all.
+                    if proxyMode {
+                        // Proxy mode explicitly means "SOCKS5, no root". Never fall
+                        // through to the full-tunnel helper connect on a bad port —
+                        // that would silently start a root VPN the user didn't ask for.
+                        guard let port = Int(proxyPort), port > 1024 else {
+                            vpn.lastError = loc.t("proxy_port_invalid")
+                            return
                         }
+                        vpn.connectProxy(key: selectedKey.keyValue, proxyPort: port,
+                                         preferredMask: preferredMask == "auto" ? nil : preferredMask,
+                                         polymorphicBase: (polymorphicMask && preferredMask != "auto") ? preferredMask : nil,
+                                         shareMaskFeedback: shareMaskFeedback,
+                                         receiveMaskHints: receiveMaskHints,
+                                         countryCode: maskCountryCode.count == 2 ? maskCountryCode : nil)
+                    } else {
+                        vpn.connect(key: selectedKey.keyValue, fullTunnel: fullTunnel,
+                                    mtlsCertPath: selectedKey.mtlsCertPath,
+                                    excludeRoutes: excludeRoutes.isEmpty ? nil : excludeRoutes,
+                                    adaptiveLevel: adaptiveLevel,
+                                    dnsProxy: dnsProxyAddr.isEmpty ? nil : dnsProxyAddr,
+                                    killSwitch: killSwitch,
+                                    preferredMask: preferredMask == "auto" ? nil : preferredMask,
+                                    polymorphicBase: (polymorphicMask && preferredMask != "auto") ? preferredMask : nil,
+                                    shareMaskFeedback: shareMaskFeedback,
+                                    receiveMaskHints: receiveMaskHints,
+                                    countryCode: maskCountryCode.count == 2 ? maskCountryCode : nil,
+                                    bootstrapCdnUrl: selectedKey.bootstrapCdnUrl,
+                                    bootstrapTelegramToken: selectedKey.bootstrapTelegramToken,
+                                    bootstrapTelegramChat: selectedKey.bootstrapTelegramChat,
+                                    bootstrapGithub: selectedKey.bootstrapGithub,
+                                    serverSigningKey: selectedKey.serverSigningKey)
                     }
                 }
             }) {
@@ -976,7 +981,10 @@ struct ContentView: View {
     }
 
     private var connectButtonEnabled: Bool {
-        !vpn.isConnecting && vpn.helperAvailable && !vpn.keys.isEmpty
+        // Proxy mode (SOCKS5) never talks to the privileged helper — the
+        // client is launched directly as the current user — so it must not be
+        // gated on helper availability.
+        !vpn.isConnecting && (proxyMode || vpn.helperAvailable) && !vpn.keys.isEmpty
     }
 
     private var connectButtonBackgroundColor: Color {

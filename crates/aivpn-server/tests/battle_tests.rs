@@ -1391,7 +1391,7 @@ fn test_mask_catalog_compromised() {
     catalog.register_mask(mask1);
     let mask2 = aivpn_common::mask::preset_masks::quic_https_v2();
     catalog.register_mask(mask2);
-    catalog.mark_compromised("webrtc_zoom_v3");
+    catalog.mark_compromised_with_fallback("webrtc_zoom_v3");
     assert_eq!(
         catalog.available_count(),
         1,
@@ -1423,18 +1423,39 @@ fn test_mask_catalog_select_fallback() {
     );
 }
 
+// H1 fix: compromising a mask is now refused when doing so would leave the
+// catalog with nothing to fall back to. The old behavior (asserted by this
+// test before the fix) let the catalog empty out entirely once every mask
+// had tripped a detector, which permanently locked out every future
+// handshake — see MaskCatalog::mark_compromised_with_fallback's doc comment.
 #[test]
-fn test_mask_catalog_no_fallback_when_all_compromised() {
+fn test_mask_catalog_second_compromise_refused_when_it_would_empty_catalog() {
     let catalog = MaskCatalog::new();
     let mask1 = webrtc_zoom_v3();
     catalog.register_mask(mask1);
     let mask2 = aivpn_common::mask::preset_masks::quic_https_v2();
     catalog.register_mask(mask2);
-    catalog.mark_compromised("webrtc_zoom_v3");
-    catalog.mark_compromised("quic_https_v2");
-    let fallback = catalog.select_fallback("anything");
-    assert!(fallback.is_none(), "No fallback when all masks compromised");
-    assert_eq!(catalog.available_count(), 0);
+
+    let first = catalog.mark_compromised_with_fallback("webrtc_zoom_v3");
+    assert_eq!(
+        first.map(|m| m.mask_id),
+        Some("quic_https_v2".to_string()),
+        "first compromise succeeds — a fallback exists"
+    );
+    assert_eq!(catalog.available_count(), 1);
+
+    // Compromising the LAST remaining mask must be refused, not empty the
+    // catalog down to zero.
+    let second = catalog.mark_compromised_with_fallback("quic_https_v2");
+    assert!(
+        second.is_none(),
+        "compromising the last mask must be refused"
+    );
+    assert_eq!(
+        catalog.available_count(),
+        1,
+        "the last mask must remain available — the server must never go fully deaf"
+    );
 }
 
 // ============================================================================

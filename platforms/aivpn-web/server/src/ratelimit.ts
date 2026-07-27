@@ -16,10 +16,34 @@
 /** Per-key log of allowed-request timestamps (ms), oldest first. */
 const rateLimitMap = new Map<string, number[]>()
 
+// Hard cap on distinct keys tracked at once. Several callers key this limiter
+// on unauthenticated, attacker-chosen input (e.g. routes/auth.ts's
+// `login_user:${username}` per-username brute-force guard) — without a cap,
+// flooding the login endpoint with a fresh random username on every request
+// grows this map without bound between periodic sweeps (memory-exhaustion
+// DoS). When full, evict the single least-recently-active entry to make room
+// (O(map size), but only paid once every MAX_RATE_LIMIT_KEYS insertions).
+const MAX_RATE_LIMIT_KEYS = 50_000
+
+function evictStalestIfFull(): void {
+  if (rateLimitMap.size < MAX_RATE_LIMIT_KEYS) return
+  let stalestKey: string | undefined
+  let stalestTs = Infinity
+  for (const [k, log] of rateLimitMap) {
+    const last = log.at(-1) ?? -Infinity
+    if (last < stalestTs) {
+      stalestTs = last
+      stalestKey = k
+    }
+  }
+  if (stalestKey !== undefined) rateLimitMap.delete(stalestKey)
+}
+
 export function checkRateLimit(key: string, maxReqs: number, windowMs: number): boolean {
   const now = Date.now()
   let log = rateLimitMap.get(key)
   if (!log) {
+    evictStalestIfFull()
     log = []
     rateLimitMap.set(key, log)
   }
@@ -68,6 +92,7 @@ export function isRateLimited(key: string, maxReqs: number, windowMs: number): b
 export function recordRateLimitEvent(key: string, maxReqs: number): void {
   let log = rateLimitMap.get(key)
   if (!log) {
+    evictStalestIfFull()
     log = []
     rateLimitMap.set(key, log)
   }
@@ -81,6 +106,11 @@ export function recordRateLimitEvent(key: string, maxReqs: number): void {
  * Start a periodic sweep that removes keys idle for more than maxWindowMs * 2
  * (i.e. whose newest allowed request is older than that).
  * Call once at application startup.
+ *
+ * Runs every 15s (not 60s): combined with the MAX_RATE_LIMIT_KEYS hard cap
+ * above, a shorter sweep interval bounds how large the map can grow during an
+ * active many-distinct-keys flood (e.g. per-username login attempts) before
+ * stale entries are reclaimed, independent of the hard cap.
  */
 export function scheduleRateLimitCleaner(maxWindowMs: number): void {
   setInterval(() => {
@@ -90,5 +120,5 @@ export function scheduleRateLimitCleaner(maxWindowMs: number): void {
         rateLimitMap.delete(key)
       }
     }
-  }, 60_000)
+  }, 15_000)
 }

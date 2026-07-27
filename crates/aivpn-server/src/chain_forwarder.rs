@@ -105,8 +105,46 @@ impl ChainForwarder {
         if sync_key == [0u8; 32] {
             return None;
         }
-        let exit_addr: SocketAddr = exit_node.parse().ok()?;
-        let socket = UdpSocket::bind("0.0.0.0:0").await.ok()?;
+        // `exit_node` may be "ip:port" or "hostname:port" (the documented
+        // example is `exit.example.com:443`). A bare `.parse()` fails on DNS
+        // names, silently disabling multi-hop — resolve via the system
+        // resolver instead. NOTE: only the socket address is resolved; key
+        // derivation below intentionally keeps using the exit_node STRING,
+        // which is what the exit node registers as its pool node_id.
+        let exit_addr: SocketAddr = match exit_node.parse() {
+            Ok(addr) => addr,
+            Err(_) => match tokio::net::lookup_host(exit_node).await {
+                Ok(mut addrs) => match addrs.next() {
+                    Some(addr) => addr,
+                    None => {
+                        warn!(
+                            "chain_forward: exit_node '{}' resolved to no addresses — \
+                             ChainForward disabled",
+                            exit_node
+                        );
+                        return None;
+                    }
+                },
+                Err(e) => {
+                    warn!(
+                        "chain_forward: cannot resolve exit_node '{}': {} — \
+                         ChainForward disabled",
+                        exit_node, e
+                    );
+                    return None;
+                }
+            },
+        };
+        let socket = match UdpSocket::bind("0.0.0.0:0").await {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(
+                    "chain_forward: UDP bind failed: {} — ChainForward disabled",
+                    e
+                );
+                return None;
+            }
+        };
         let enc_root: [u8; 32] = match node_id
             .map(str::trim)
             .filter(|s| !s.is_empty())

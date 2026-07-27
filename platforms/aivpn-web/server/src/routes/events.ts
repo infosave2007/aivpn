@@ -176,7 +176,12 @@ events.get('/', async (c) => {
 
     req.on('error', () => {
       release()
-      resolve(new Response('data: {"error":"upstream unavailable"}\n\n', {
+      // Emit a NAMED "state" event: every consumer listens via
+      // addEventListener('state', …), so an unnamed data-only frame (which
+      // only fires onmessage) was invisible — the upstream outage never
+      // surfaced client-side. The one-frame body then ends the stream, and
+      // EventSource auto-reconnects with a fresh ticket.
+      resolve(new Response('event: state\ndata: {"error":"upstream unavailable"}\n\n', {
         status: 200,
         headers: { 'Content-Type': 'text/event-stream' },
       }))

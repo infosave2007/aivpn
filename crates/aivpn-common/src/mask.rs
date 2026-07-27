@@ -337,7 +337,7 @@ pub fn accept_persisted_descriptors(
             None => true,
         })
         .collect();
-    out.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    out.sort_by_key(|d| std::cmp::Reverse(d.created_at));
     out
 }
 
@@ -1756,6 +1756,41 @@ impl MaskProfile {
         }
     }
 
+    /// SINGLE source of truth for the embedded-vs-legacy wire-layout decision.
+    ///
+    /// Returns `true` when a packet whose mimicry header is `mdh_len` bytes long
+    /// hides the 8-byte resonance tag INSIDE that header (no separate tag
+    /// prefix); `false` when the mask falls back to the legacy layout that
+    /// carries the tag as an 8-byte prefix before the header.
+    ///
+    /// The embedded layout is used only when the tag slot fits within the
+    /// header AND does not overlap the embedded ephemeral key. The client
+    /// encoder ([`crate::mimicry`]) and the server uplink decoder
+    /// (`aivpn-server` gateway) MUST both route through this method: deciding it
+    /// independently on each side is what produced the non-QUIC-mask AEAD
+    /// failures (an embedded-tag mask whose tag did not fit `mdh_len` was
+    /// encoded with a legacy prefix by the client but decoded at the embedded
+    /// offset by the server, so every uplink packet failed authentication).
+    pub fn uses_embedded_layout(&self, mdh_len: usize) -> bool {
+        use crate::crypto::TAG_SIZE;
+        match self.embedded_tag_offset() {
+            Some(off) => off + TAG_SIZE <= mdh_len && !self.tag_overlaps_eph_pub(TAG_SIZE),
+            None => false,
+        }
+    }
+
+    /// Effective tag-prefix byte length for a packet with header length
+    /// `mdh_len`: `0` for the embedded layout, `TAG_SIZE` for the legacy
+    /// prefix layout. Companion to [`Self::uses_embedded_layout`] and the one
+    /// value the ciphertext offset must be computed from on both wire ends.
+    pub fn effective_tag_prefix_len(&self, mdh_len: usize) -> usize {
+        if self.uses_embedded_layout(mdh_len) {
+            0
+        } else {
+            crate::crypto::TAG_SIZE
+        }
+    }
+
     /// Get initial FSM state
     pub fn initial_state(&self) -> u16 {
         self.fsm_initial_state
@@ -1951,6 +1986,44 @@ pub mod preset_masks {
 
     pub fn bootstrap_default() -> MaskProfile {
         webrtc_zoom_v3()
+    }
+
+    // Regression: the embedded-vs-legacy wire-layout decision must be
+    // length-aware and identical on both wire ends. An embedded-tag mask whose
+    // tag does not fit the header length (or overlaps the ephemeral key) is
+    // encoded with the 8-byte legacy prefix; before the shared
+    // `uses_embedded_layout` fix the server decoded it at the embedded offset
+    // and every uplink packet failed AEAD (the Jul-14 aead::Error class).
+    #[test]
+    fn embedded_layout_decision_is_length_aware() {
+        use crate::crypto::TAG_SIZE;
+        let mut mask = load_webrtc_vk_teams_v1();
+
+        // Disjoint embedded tag at offset 8, eph key well clear of it.
+        mask.tag_offset = 8;
+        mask.eph_pub_offset = 40;
+        mask.eph_pub_length = 32;
+
+        // Fits (8 + 8 <= 20): embedded layout, no tag prefix.
+        assert!(mask.uses_embedded_layout(20));
+        assert_eq!(mask.effective_tag_prefix_len(20), 0);
+
+        // Does NOT fit (8 + 8 > 12): legacy fallback, 8-byte prefix — the exact
+        // case the client encoder falls back on, so the server must too.
+        assert!(!mask.uses_embedded_layout(12));
+        assert_eq!(mask.effective_tag_prefix_len(12), TAG_SIZE);
+
+        // Overlaps eph_pub ([10,18) vs tag [8,16)): legacy fallback even though
+        // it would fit lengthwise.
+        mask.eph_pub_offset = 10;
+        mask.eph_pub_length = 8;
+        assert!(!mask.uses_embedded_layout(64));
+        assert_eq!(mask.effective_tag_prefix_len(64), TAG_SIZE);
+
+        // Legacy mask (no embedded tag): always the 8-byte prefix.
+        mask.tag_offset = u16::MAX;
+        assert!(!mask.uses_embedded_layout(64));
+        assert_eq!(mask.effective_tag_prefix_len(64), TAG_SIZE);
     }
 }
 

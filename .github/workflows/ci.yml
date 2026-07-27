@@ -26,14 +26,17 @@ jobs:
     - name: Check formatting
       run: cargo fmt --all -- --check
 
+    # aivpn-windows cannot build on the ubuntu runner (Windows-only APIs);
+    # every other workspace crate — including aivpn-linux, which the old
+    # default-members build never covered — is built, tested and linted.
     - name: Build
-      run: cargo build --verbose
+      run: cargo build --workspace --exclude aivpn-windows --verbose
 
     - name: Run tests
-      run: cargo test --verbose
+      run: cargo test --workspace --exclude aivpn-windows --verbose
 
     - name: Clippy
-      run: cargo clippy
+      run: cargo clippy --workspace --all-targets --exclude aivpn-windows -- -D warnings
 
     # R2 Phase A — offline nDPI provenance gate over assets/masks/*.json.
     # The DPI toolchain (nDPI + maskpcap) lives under the gitignored research/
@@ -44,6 +47,27 @@ jobs:
     # docs/R2_PHASE_A.md → "How it plugs into CI".
     - name: Mask DPI gate (R2 Phase A)
       run: make mask-gate
+
+  cargo-audit:
+    runs-on: ubuntu-latest
+    # Advisory-only: reports known vulnerabilities in Cargo.lock without
+    # gating the build (no `-D` / deny-on-warnings equivalent yet). Promote
+    # to a hard failure once the workspace's advisory backlog is triaged.
+    steps:
+    - uses: actions/checkout@v4
+    - name: Setup Rust
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Cache Rust
+      uses: Swatinem/rust-cache@v2
+      with:
+        key: cargo-audit
+
+    - name: Install cargo-audit
+      run: cargo install cargo-audit --locked
+
+    - name: cargo audit (advisory, non-blocking)
+      run: cargo audit || echo "::warning::cargo audit reported findings — see job log"
 
   ios-swift:
     runs-on: macos-15

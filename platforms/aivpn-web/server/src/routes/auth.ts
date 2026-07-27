@@ -27,7 +27,7 @@ import {
 } from '../auth/passkey'
 import { requireAuth, requireAdmin } from '../auth/middleware'
 import { writeAudit } from '../audit'
-import { isRateLimited, recordRateLimitEvent } from '../ratelimit'
+import { checkRateLimit, isRateLimited, recordRateLimitEvent } from '../ratelimit'
 import { config } from '../config'
 import { getClientIp } from '../lib/client-ip'
 import type { UserRole } from '../db/schema'
@@ -275,6 +275,18 @@ auth.post('/logout', requireAuth(), async (c) => {
 // are effectively unchanged beyond that tiny window.
 const REFRESH_ROTATION_GRACE_MS = 10_000
 
+// Defense in depth alongside the session_id-keyed rate-limit buckets in
+// index.ts (which already stop a refresh loop from resetting the /api/v1 and
+// /web/metrics counters): cap how often any single session may mint a fresh
+// token pair here too, independent of caller IP. The per-IP /web/auth/*
+// limiter in index.ts only charges FAILED requests, so a successful refresh
+// loop was otherwise completely free. Same generous budget as the other auth
+// limits — normal usage is one proactive refresh per access-token TTL (15 min)
+// plus the occasional cross-tab burst, both far under this.
+function refreshRateLimited(sessionId: string): boolean {
+  return !checkRateLimit(`refresh:${sessionId}`, config.AUTH_RATE_MAX, config.AUTH_RATE_WINDOW_MS)
+}
+
 auth.post('/refresh', async (c) => {
   const db = await getDb()
   const { users, sessions } = tables()
@@ -327,6 +339,10 @@ auth.post('/refresh', async (c) => {
       return c.json({ error: 'Invalid or expired refresh token' }, 401)
     }
 
+    if (refreshRateLimited(graceSession.id)) {
+      return c.json({ error: 'Too many requests. Please wait before retrying.' }, 429)
+    }
+
     const [graceUser] = await d.select().from(users).where(eq(users.id, graceSession.user_id)).limit(1)
     if (!graceUser) {
       return c.json({ error: 'User not found' }, 401)
@@ -339,6 +355,10 @@ auth.post('/refresh', async (c) => {
       session_id: graceSession.id,
     })
     return c.json({ access_token: graceAccessToken })
+  }
+
+  if (refreshRateLimited(session.id)) {
+    return c.json({ error: 'Too many requests. Please wait before retrying.' }, 429)
   }
 
   const [user] = await d.select().from(users).where(eq(users.id, session.user_id)).limit(1)

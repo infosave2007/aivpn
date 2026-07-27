@@ -140,6 +140,16 @@ pub struct ClientDatabase {
     file_path: PathBuf,
     network_config: VpnNetworkConfig,
     last_mtime: Mutex<Option<std::time::SystemTime>>,
+    /// data-plane H4: `save()`'s temp file name is PID-only, so two
+    /// concurrent `save()` calls in the SAME process (e.g. an admin update
+    /// racing a pool-sync merge or a batched stats flush — all take only a
+    /// shared read lock on `data`, so nothing stops them overlapping) write
+    /// the identical temp path and race on rename order. Whichever rename
+    /// lands last wins even if its snapshot was taken first — a silent lost
+    /// update. Serializing the full read → serialize → write → rename
+    /// sequence behind this mutex makes concurrent saves happen in a strict
+    /// order matching call order, so the most recent save always wins.
+    save_lock: Mutex<()>,
 }
 
 impl ClientDatabase {
@@ -175,11 +185,16 @@ impl ClientDatabase {
             file_path: file_path.to_path_buf(),
             network_config,
             last_mtime,
+            save_lock: Mutex::new(()),
         })
     }
 
     /// Save database to file
     pub fn save(&self) -> Result<()> {
+        // data-plane H4: serialize the whole read → write → rename sequence
+        // so concurrent callers (admin API update, pool-sync merge, batched
+        // stats flush) can never race the same temp file / rename target.
+        let _save_guard = self.save_lock.lock();
         let data = self.data.read();
         let content = serde_json::to_string_pretty(&*data)
             .map_err(|e| Error::Session(format!("Failed to serialize client DB: {}", e)))?;
@@ -190,6 +205,21 @@ impl ClientDatabase {
             .with_extension(format!("{}.tmp", std::process::id()));
         std::fs::write(&tmp_path, &content)
             .map_err(|e| Error::Session(format!("Failed to write client DB: {}", e)))?;
+        // server-sec HIGH4: clients.json holds every client's PSK in
+        // plaintext (base64). std::fs::write() creates the file with the
+        // process umask (commonly 0644 under root) — world/group readable.
+        // Harden the temp file BEFORE the rename makes it visible at the
+        // real path, so there is no window where the final file is
+        // reachable with lax permissions.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Err(e) =
+                std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o600))
+            {
+                warn!("Failed to set clients DB permissions to 0600: {}", e);
+            }
+        }
         std::fs::rename(&tmp_path, &self.file_path)
             .map_err(|e| Error::Session(format!("Failed to rename client DB: {}", e)))?;
 
@@ -199,6 +229,20 @@ impl ClientDatabase {
         }
 
         Ok(())
+    }
+
+    /// Validate that `content` deserializes as a well-formed clients-DB JSON
+    /// document, without loading it into a live database. Used by backup
+    /// import (`backup.rs`) to reject a corrupt or malicious `clients.json`
+    /// BEFORE it is ever written into the live, hot-reloaded config
+    /// directory (data-plane H5).
+    pub(crate) fn validate_json(content: &[u8]) -> Result<()> {
+        if content.iter().all(|b| b.is_ascii_whitespace()) {
+            return Ok(()); // treated as an empty DB, same as `load()`
+        }
+        serde_json::from_slice::<ClientDbFile>(content)
+            .map(|_| ())
+            .map_err(|e| Error::Session(format!("Failed to parse client DB: {}", e)))
     }
 
     /// Add a new client, returns the generated config
@@ -621,6 +665,20 @@ impl ClientDatabase {
                     existing.qos = inc.qos;
                     existing.deleted = inc.deleted;
                     existing.updated_at = inc.updated_at;
+                    // MEDIUM (server-sec): these three were previously never
+                    // synced, silently reverting a security-relevant admin
+                    // change made on ONE pool node back to its old value on
+                    // every other node — e.g. a shortened `expires_at`
+                    // (temporary access) or a `reset_device` (device_pubkey
+                    // cleared to re-enable one-time enrollment) done on node
+                    // A would never take effect on node B, leaving a client
+                    // that should be locked out (or re-bindable) reachable
+                    // there indefinitely. They follow the exact same
+                    // `incoming_wins` decision already computed above — no
+                    // change to the conflict-resolution policy itself.
+                    existing.expires_at = inc.expires_at;
+                    existing.device_pubkey = inc.device_pubkey;
+                    existing.one_time = inc.one_time;
                     merged += 1;
                 }
             } else if inc.deleted {

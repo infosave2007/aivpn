@@ -167,6 +167,9 @@
     <string name="notification_event_channel">События AIVPN</string>
     <string name="notification_event_channel_desc">Уведомления об изменении состояния подключения</string>
 
+    <!-- Канал воркера автопереподключения (тихая заглушка прогресса, expedited work на API < 31) -->
+    <string name="notification_reconnect_channel">Автопереподключение AIVPN</string>
+
     <!-- Оповещения безопасности: неожиданная остановка VPN (трафик больше не защищён) -->
     <string name="notification_alert_channel">Оповещения безопасности AIVPN</string>
     <string name="notification_alert_channel_desc">Неожиданная остановка VPN — трафик может быть не защищён</string>

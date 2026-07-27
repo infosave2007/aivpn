@@ -12,6 +12,16 @@ fn main() {
     use eframe::egui;
     use localization::AppSettings;
 
+    // LOW-2: single-instance guard. The --elevated-connect hop must ignore
+    // the "already running" answer — its non-elevated parent is still alive
+    // for a moment during the handoff — but it still claims a mutex handle so
+    // the guard stays armed after the parent exits.
+    let is_elevated_hop = std::env::args().any(|a| a == "--elevated-connect");
+    if claim_single_instance_mutex() && !is_elevated_hop {
+        focus_existing_instance();
+        return;
+    }
+
     let settings = AppSettings::load();
     let dark = settings.dark_mode;
 
@@ -51,10 +61,13 @@ fn main() {
                 .insert(0, "Inter".to_owned());
             ctx.set_fonts(fonts);
             apply_theme_to_ctx(ctx, dark);
-            let mut app = AivpnApp::new(settings);
+            let mut app = AivpnApp::new(settings, ctx);
             app.init_tray();
             if app.settings.connect_on_startup {
-                app.do_connect();
+                // HIGH-1: must NOT be do_connect() — that toggles, and on an
+                // --elevated-connect hop new() has already started the
+                // connection, so a toggle here would immediately tear it down.
+                app.startup_auto_connect();
             }
             Ok(Box::new(app))
         }),
@@ -179,6 +192,19 @@ fn mask_choices_from_catalog(lang: localization::Lang) -> Option<Vec<(String, St
             if e.mask_id == "auto" {
                 continue;
             }
+            // HIGH: mask_catalog.json is written by aivpn-client from a
+            // server-pushed catalog — an id that fails the same strict
+            // charset vpn_manager::connect() enforces before argv would be
+            // rejected there anyway, but skip it here too so it never even
+            // becomes a clickable option (defense in depth, see
+            // vpn_manager::is_acceptable_mask_id for the full rationale).
+            if !vpn_manager::is_acceptable_mask_id(&e.mask_id) {
+                vpn_manager::gui_log(&format!(
+                    "mask catalog: skipping entry with invalid mask_id {:?}",
+                    e.mask_id
+                ));
+                continue;
+            }
             let display = if e.generated {
                 format!("{}{}", e.label, auto_mask_suffix(lang))
             } else {
@@ -260,7 +286,7 @@ fn make_tray_icon(connected: bool) -> Option<tray_icon::Icon> {
     match tray_icon::Icon::from_rgba(rgba, *width, *height) {
         Ok(icon) => Some(icon),
         Err(e) => {
-            eprintln!("tray: failed to build icon: {e}");
+            vpn_manager::gui_log(&format!("tray: failed to build icon: {e}"));
             None
         }
     }
@@ -366,6 +392,72 @@ fn relaunch_elevated(key_index: usize) -> Result<(), String> {
 
 // ── Win32 helpers ──────────────────────────────────────────────────────────
 
+/// Claim (and intentionally leak, for the process lifetime) the named
+/// single-instance mutex. Returns true when another AIVPN GUI already holds
+/// it; false also when the mutex could not be created at all — an
+/// undiagnosable failure must not block launching the app.
+#[cfg(windows)]
+fn claim_single_instance_mutex() -> bool {
+    use winapi::shared::winerror::ERROR_ALREADY_EXISTS;
+    use winapi::um::errhandlingapi::GetLastError;
+    use winapi::um::synchapi::CreateMutexW;
+    let name: Vec<u16> = "AIVPN_GUI_SingleInstance\0".encode_utf16().collect();
+    unsafe {
+        let h = CreateMutexW(std::ptr::null_mut(), 0, name.as_ptr());
+        if h.is_null() {
+            return false;
+        }
+        // Handle deliberately not closed: the mutex must stay held for the
+        // whole process lifetime; the OS releases it at process exit.
+        GetLastError() == ERROR_ALREADY_EXISTS
+    }
+}
+
+/// Bring the ALREADY-RUNNING instance's window to the foreground before this
+/// duplicate process exits. This is the one place a cross-process
+/// FindWindowW is the point (contrast find_own_aivpn_hwnd()) — any window
+/// titled "AIVPN" here belongs to the other instance, not to us.
+#[cfg(windows)]
+fn focus_existing_instance() {
+    unsafe {
+        use winapi::um::winuser::{FindWindowW, SetForegroundWindow, ShowWindow, SW_RESTORE};
+        let title: Vec<u16> = "AIVPN\0".encode_utf16().collect();
+        let hwnd = FindWindowW(std::ptr::null(), title.as_ptr());
+        if !hwnd.is_null() {
+            ShowWindow(hwnd, SW_RESTORE);
+            SetForegroundWindow(hwnd);
+        }
+    }
+}
+
+/// Locate THIS process's main window (LOW-1). A bare FindWindowW(null,
+/// "AIVPN") matches any top-level window with that title from any process —
+/// so walk all title matches and keep the one owned by our PID.
+#[cfg(windows)]
+fn find_own_aivpn_hwnd() -> winapi::shared::windef::HWND {
+    use winapi::um::processthreadsapi::GetCurrentProcessId;
+    use winapi::um::winuser::{FindWindowExW, GetWindowThreadProcessId};
+    let title: Vec<u16> = "AIVPN\0".encode_utf16().collect();
+    unsafe {
+        let my_pid = GetCurrentProcessId();
+        let mut hwnd = FindWindowExW(
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            title.as_ptr(),
+        );
+        while !hwnd.is_null() {
+            let mut pid: u32 = 0;
+            GetWindowThreadProcessId(hwnd, &mut pid);
+            if pid == my_pid {
+                return hwnd;
+            }
+            hwnd = FindWindowExW(std::ptr::null_mut(), hwnd, std::ptr::null(), title.as_ptr());
+        }
+        std::ptr::null_mut()
+    }
+}
+
 /// Restore + focus the AIVPN window, bypassing SetForegroundWindow restrictions via
 /// AttachThreadInput. Uses SW_RESTORE so a minimized window is un-minimized.
 #[cfg(windows)]
@@ -373,11 +465,10 @@ fn bring_window_to_front() {
     unsafe {
         use winapi::um::processthreadsapi::GetCurrentThreadId;
         use winapi::um::winuser::{
-            AttachThreadInput, BringWindowToTop, FindWindowW, GetForegroundWindow,
-            GetWindowThreadProcessId, SetForegroundWindow, ShowWindow, SW_RESTORE,
+            AttachThreadInput, BringWindowToTop, GetForegroundWindow, GetWindowThreadProcessId,
+            SetForegroundWindow, ShowWindow, SW_RESTORE,
         };
-        let title: Vec<u16> = "AIVPN\0".encode_utf16().collect();
-        let hwnd = FindWindowW(std::ptr::null(), title.as_ptr());
+        let hwnd = find_own_aivpn_hwnd();
         if hwnd.is_null() {
             return;
         }
@@ -418,7 +509,9 @@ use localization::{t, AppSettings, Lang};
 #[cfg(windows)]
 use std::time::Instant;
 #[cfg(windows)]
-use vpn_manager::{format_bytes, BenchResult, ConnectionState, RecordingState, VpnManager};
+use vpn_manager::{
+    format_bytes, gui_log, BenchResult, ConnectionState, RecordingState, VpnManager,
+};
 
 #[cfg(windows)]
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -458,6 +551,10 @@ struct AivpnApp {
 
     window_visible: bool,
     quitting: bool,
+    /// True when this instance was launched via --elevated-connect (the
+    /// self-relaunch-elevated hop): new() already started the connection, so
+    /// the connect_on_startup hook must not fire on top of it (HIGH-1).
+    elevated_connect_hop: bool,
     tray_connected: Option<bool>,
     tray: Option<TrayHandles>,
     tray_show_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -468,7 +565,7 @@ struct AivpnApp {
 
 #[cfg(windows)]
 impl AivpnApp {
-    fn new(settings: AppSettings) -> Self {
+    fn new(settings: AppSettings, ctx: &eframe::egui::Context) -> Self {
         let mut app = Self {
             settings,
             vpn: VpnManager::new(),
@@ -495,6 +592,7 @@ impl AivpnApp {
             recording_service: String::new(),
             window_visible: true,
             quitting: false,
+            elevated_connect_hop: false,
             tray_connected: None,
             tray: None,
             tray_show_flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -502,6 +600,14 @@ impl AivpnApp {
             connect_requested: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tray_thread_shutdown: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
+
+        // HIGH-2: let the background supervision thread wake the egui event
+        // loop when the client child dies while the window is hidden. Must be
+        // registered BEFORE any connect (including the --elevated-connect one
+        // just below) so every session's supervisor gets it.
+        let repaint_ctx = ctx.clone();
+        app.vpn
+            .set_wake_callback(move || repaint_ctx.request_repaint());
 
         // Continuation of a self-relaunch-elevated hop (see relaunch_elevated
         // in do_connect()): this instance IS the elevated one now, launched
@@ -511,6 +617,7 @@ impl AivpnApp {
         // already happened in the process that's now exited.
         let args: Vec<String> = std::env::args().collect();
         if let Some(pos) = args.iter().position(|a| a == "--elevated-connect") {
+            app.elevated_connect_hop = true;
             if let Some(idx) = args.get(pos + 1).and_then(|s| s.parse::<usize>().ok()) {
                 if idx < app.keys.keys.len() {
                     app.keys.selected = Some(idx);
@@ -520,6 +627,19 @@ impl AivpnApp {
         }
 
         app
+    }
+
+    /// `connect_on_startup` entry point — connects only when idle, unlike
+    /// do_connect() whose toggle semantics would DISCONNECT a session that is
+    /// already connecting (HIGH-1: the --elevated-connect session started in
+    /// new() is in exactly that state when the startup hook runs).
+    fn startup_auto_connect(&mut self) {
+        if self.elevated_connect_hop {
+            return;
+        }
+        if !self.vpn.is_connected() && !self.vpn.is_busy() {
+            self.do_connect();
+        }
     }
 
     fn init_tray(&mut self) {
@@ -607,7 +727,7 @@ impl AivpnApp {
                     }
                 });
             }
-            Err(e) => eprintln!("tray init: {e}"),
+            Err(e) => gui_log(&format!("tray init: {e}")),
         }
     }
 
@@ -788,8 +908,14 @@ fn set_autostart(enable: bool) {
     if let Ok((run, _)) = hkcu.create_subkey(run_path) {
         if enable {
             if let Ok(exe) = std::env::current_exe() {
-                let exe_str = format!("\"{}\"", exe.to_string_lossy());
-                let _ = run.set_value("AIVPN", &exe_str);
+                // LOW-6: write the path as an OsString (winreg encodes it to
+                // UTF-16 losslessly) — to_string_lossy would corrupt a path
+                // containing unpaired surrogates and register a broken
+                // autostart command.
+                let mut quoted = std::ffi::OsString::from("\"");
+                quoted.push(exe.as_os_str());
+                quoted.push("\"");
+                let _ = run.set_value("AIVPN", &quoted);
             }
         } else {
             let _ = run.delete_value("AIVPN");
@@ -839,9 +965,22 @@ impl eframe::App for AivpnApp {
         let bytes_rx = self.vpn.stats().bytes_received;
         let bytes_tx = self.vpn.stats().bytes_sent;
         let quality = self.vpn.stats().quality_score;
+        // Uptime comes from the client's session epoch (`since:` in the stats
+        // file, wall-clock now − since): on a silent in-child reconnect the
+        // epoch changes and the stopwatch resets together with the per-session
+        // counters. The GUI-local Instant is only a fallback for old-format
+        // clients that don't write `since` (and the pre-first-write window).
         let uptime = self
-            .connected_since
-            .map(|t| t.elapsed().as_secs())
+            .vpn
+            .session_since_ms()
+            .map(|since_ms| {
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0);
+                now_ms.saturating_sub(since_ms) / 1000
+            })
+            .or_else(|| self.connected_since.map(|t| t.elapsed().as_secs()))
             .unwrap_or(0);
 
         let status_text = match conn_state {
@@ -1600,7 +1739,15 @@ impl eframe::App for AivpnApp {
                         ui.add(
                             egui::TextEdit::singleline(dlg_key)
                                 .desired_width(f32::INFINITY)
-                                .hint_text("aivpn://…"),
+                                .hint_text("aivpn://…")
+                                // LOW/MEDIUM: this field carries the PSK-bearing
+                                // aivpn:// connection key — mask it like a password
+                                // field so it isn't rendered in clear text on screen
+                                // (shoulder-surf / screenshot exposure). Verified
+                                // against the vendored egui 0.31.1 source
+                                // (widgets/text_edit/builder.rs): `password(bool)` is
+                                // a real TextEdit builder method in this version.
+                                .password(true),
                         );
                         ui.add_space(4.0);
                         ui.checkbox(dlg_full_tunnel, t(lang, "full_tunnel"));
@@ -1711,9 +1858,8 @@ impl eframe::App for AivpnApp {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             #[cfg(windows)]
             unsafe {
-                use winapi::um::winuser::{FindWindowW, ShowWindow, SW_HIDE};
-                let title: Vec<u16> = "AIVPN\0".encode_utf16().collect();
-                let hwnd = FindWindowW(std::ptr::null(), title.as_ptr());
+                use winapi::um::winuser::{ShowWindow, SW_HIDE};
+                let hwnd = find_own_aivpn_hwnd();
                 if !hwnd.is_null() {
                     ShowWindow(hwnd, SW_HIDE);
                 }
@@ -1726,9 +1872,8 @@ impl eframe::App for AivpnApp {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             #[cfg(windows)]
             unsafe {
-                use winapi::um::winuser::{FindWindowW, ShowWindow, SW_HIDE};
-                let title: Vec<u16> = "AIVPN\0".encode_utf16().collect();
-                let hwnd = FindWindowW(std::ptr::null(), title.as_ptr());
+                use winapi::um::winuser::{ShowWindow, SW_HIDE};
+                let hwnd = find_own_aivpn_hwnd();
                 if !hwnd.is_null() {
                     ShowWindow(hwnd, SW_HIDE);
                 }

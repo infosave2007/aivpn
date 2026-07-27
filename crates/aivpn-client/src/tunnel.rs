@@ -102,13 +102,28 @@ impl TunnelConfig {
         network_config: ClientNetworkConfig,
         full_tunnel: bool,
     ) -> Self {
+        // Clamp to MAX_PACKET_SIZE (1500): client.rs's FecEncoder is
+        // hardcoded to a 1500-byte parity buffer
+        // (`FecEncoder::new(fec_n, 1500)`), and `FecEncoder::feed()` silently
+        // truncates anything longer — bytes beyond 1500 never get XORed into
+        // repair parity, so any lost packet in a group containing an
+        // oversized member gets "recovered" corrupted/truncated instead of
+        // failing loudly. `network_config.mtu` is server-controlled (pushed
+        // in `apply_server_network_override`) as well as
+        // config-file/bootstrap-controlled here at startup, up to u16::MAX —
+        // this is the single choke point both paths route through before a
+        // `TunnelConfig` (and the MTU actually applied to the TUN device) is
+        // produced.
+        let mtu = network_config
+            .mtu
+            .min(aivpn_common::protocol::MAX_PACKET_SIZE as u16);
         Self {
             tun_name,
             tun_addr: network_config.client_ip.to_string(),
             server_vpn_ip: network_config.server_vpn_ip.to_string(),
             tun_netmask: network_config.netmask_string(),
             prefix_len: network_config.prefix_len,
-            mtu: network_config.mtu,
+            mtu,
             full_tunnel,
             mdh_len: network_config.mdh_len,
             include_routes: Vec::new(),
@@ -194,6 +209,45 @@ pub struct Tunnel {
     split_routes_applied: Vec<String>,
     /// Active kill-switch instance; deactivated on graceful Drop.
     kill_switch_state: Option<KillSwitch>,
+}
+
+/// PID of a currently in-flight `pkexec` child spawned by
+/// `Tunnel::run_via_pkexec_stdin`, if any (0 = none). Tracked so the client
+/// can attempt to kill it from its own shutdown/Drop path —
+/// `Tunnel::drop()` calls `kill_orphaned_pkexec_child()` — instead of
+/// leaving it reparented to init (and the polkit auth dialog still showing)
+/// if this process is killed/crashes while the dialog is up.
+///
+/// This is necessarily a best-effort, PARTIAL mitigation, not a full fix:
+/// `pkexec` is normally installed setuid-root, so it runs with euid 0 from
+/// the instant of its own `exec()` — before the auth dialog even appears.
+/// An unprivileged client cannot `kill()` a process it doesn't own (EPERM);
+/// the same setuid-exec rule is also why `PR_SET_PDEATHSIG` doesn't help
+/// here (the kernel clears it on any setuid/capability-bearing exec). So
+/// this fully closes the orphan window only when the client itself runs as
+/// root (a supported/documented mode — see vpn_manager.rs); for an
+/// unprivileged client it's a harmless no-op attempt, no worse than the
+/// prior status quo, and still covers the actual reachable case of a clean
+/// disconnect/reconnect/panic-unwind racing an open auth dialog (Drop runs
+/// on all of those, just not on SIGKILL of this process).
+#[cfg(target_os = "linux")]
+static ACTIVE_PKEXEC_PID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Best-effort kill of a tracked in-flight `pkexec` child. See
+/// `ACTIVE_PKEXEC_PID` for why this can't be a complete fix.
+#[cfg(target_os = "linux")]
+fn kill_orphaned_pkexec_child() {
+    let pid = ACTIVE_PKEXEC_PID.swap(0, std::sync::atomic::Ordering::SeqCst);
+    if pid != 0 {
+        // SAFETY: FFI call to kill(2) with a pid we obtained from our own
+        // Child::id() and an integer signal constant — no pointers involved.
+        // A permission failure (pid already root-owned) or a stale pid
+        // (process already exited) both just return an ignored errno; this
+        // is best-effort cleanup, not a correctness-critical path.
+        unsafe {
+            libc::kill(pid as i32, libc::SIGKILL);
+        }
+    }
 }
 
 impl Tunnel {
@@ -418,9 +472,18 @@ impl Tunnel {
 
     pub async fn apply_network_config(
         &mut self,
-        network_config: ClientNetworkConfig,
+        mut network_config: ClientNetworkConfig,
     ) -> Result<()> {
         network_config.validate()?;
+        // Clamp to MAX_PACKET_SIZE — see the matching comment in
+        // `TunnelConfig::from_network_config`. This is the live path that
+        // sets the TUN device's actual MTU on a server-pushed
+        // (ServerHello/mid-session) network-config override, so it must be
+        // clamped independently of that other choke point, not just rely on
+        // it.
+        network_config.mtu = network_config
+            .mtu
+            .min(aivpn_common::protocol::MAX_PACKET_SIZE as u16);
         // Remember the address the device carried BEFORE this override: on
         // Linux `ip addr replace <new>` with a different IP ADDS it as a
         // secondary address, the old one stays primary and keeps winning
@@ -667,24 +730,23 @@ impl Tunnel {
             .status();
         info!("IPv6 blocked — all v6 traffic goes to blackhole (no leak possible)");
 
-        // Verify routes
+        // Verify routes — diagnostic-only (just logs which routes are
+        // present). Best-effort: this must never fail the whole connect
+        // attempt just because `netstat` couldn't exec (missing from PATH,
+        // sandboxed environment, transient ENOMEM/EMFILE) — that would abort
+        // an otherwise fully working `configure_macos()` → `create()` →
+        // `connect()` over a logging command.
         info!("Verifying routes...");
-        let output = Command::new("netstat")
-            .args(["-rn", "-f", "inet"])
-            .output()
-            .map_err(|e| {
-                Error::Io(io::Error::new(
-                    io::ErrorKind::Other,
-                    format!("Failed to run netstat: {}", e),
-                ))
-            })?;
-
-        let routes = String::from_utf8_lossy(&output.stdout);
-        if routes.contains(&vpn_network_addr) {
-            info!("Routes verified:");
-            for line in routes.lines().filter(|l| l.contains(&vpn_network_addr)) {
-                debug!("  {}", line.trim());
+        if let Ok(output) = Command::new("netstat").args(["-rn", "-f", "inet"]).output() {
+            let routes = String::from_utf8_lossy(&output.stdout);
+            if routes.contains(&vpn_network_addr) {
+                info!("Routes verified:");
+                for line in routes.lines().filter(|l| l.contains(&vpn_network_addr)) {
+                    debug!("  {}", line.trim());
+                }
             }
+        } else {
+            warn!("Failed to run netstat for route verification (diagnostic-only, continuing)");
         }
 
         Ok(())
@@ -890,6 +952,19 @@ impl Tunnel {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()?;
+
+        ACTIVE_PKEXEC_PID.store(child.id(), std::sync::atomic::Ordering::SeqCst);
+        // Guard clears the tracked PID on every exit path (normal return,
+        // `?`-early-return doesn't apply here, but future edits might add
+        // one) so a completed/reaped child is never mistakenly signaled by
+        // `kill_orphaned_pkexec_child()` later.
+        struct ClearPidOnDrop;
+        impl Drop for ClearPidOnDrop {
+            fn drop(&mut self) {
+                ACTIVE_PKEXEC_PID.store(0, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let _clear_guard = ClearPidOnDrop;
 
         if let Some(mut stdin) = child.stdin.take() {
             // Best-effort: if the helper (or pkexec itself) exits early —
@@ -1574,6 +1649,36 @@ impl Tunnel {
             )?;
         }
 
+        // IPv4 is now fully routed through the TUN via the 0/1+128/1 trick, but
+        // that leaves the OS's pre-existing IPv6 default route untouched — on
+        // any dual-stack network (most residential/mobile ISPs) IPv6-capable
+        // destinations reach the physical NIC directly, fully bypassing the
+        // VPN, while the user believes "full tunnel" protects them. Windows
+        // has no direct equivalent of macOS/Linux's "route ::/0 to a
+        // blackhole" (route.exe doesn't do IPv6; a netsh blackhole route needs
+        // a real interface). `Disable-NetAdapterBinding -ComponentID
+        // ms_tcpip6` is the standard, no-reboot way to pull IPv6 off every
+        // adapter for the session; `disable_full_tunnel` re-enables it.
+        // Best-effort: a failure here (e.g. no admin rights on the binding
+        // call, which differs from the route-add rights already required
+        // above) must not abort an otherwise fully working IPv4 tunnel.
+        let ipv6_disabled = Command::new("powershell")
+            .args([
+                "-Command",
+                "Disable-NetAdapterBinding -Name '*' -ComponentID ms_tcpip6",
+            ])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if ipv6_disabled {
+            info!("IPv6 disabled on all adapters for the session — no v6 leak around full-tunnel");
+        } else {
+            warn!(
+                "Failed to disable IPv6 bindings — full-tunnel mode may not protect IPv6 traffic \
+                 on this dual-stack network"
+            );
+        }
+
         info!("Full tunnel mode enabled — all traffic routed through VPN");
         Ok(())
     }
@@ -1638,6 +1743,13 @@ impl Tunnel {
         if let Some(ref server_ip) = self.server_ip {
             let _ = Command::new("route").args(["delete", server_ip]).status();
         }
+        // Symmetric restore for the IPv6 binding disabled in enable_full_tunnel.
+        let _ = Command::new("powershell")
+            .args([
+                "-Command",
+                "Enable-NetAdapterBinding -Name '*' -ComponentID ms_tcpip6",
+            ])
+            .status();
         info!("Full tunnel routes removed");
     }
 
@@ -2008,6 +2120,13 @@ impl Drop for Tunnel {
     fn drop(&mut self) {
         // Kill-switch is NOT deactivated on drop to persist across reconnects.
         // Call deactivate_kill_switch() explicitly on intentional exit.
+
+        // Best-effort cleanup of an in-flight pkexec child (see
+        // ACTIVE_PKEXEC_PID's doc comment for what this does and doesn't
+        // cover) — runs on every normal disconnect/reconnect-loop iteration
+        // and on unwinding panics, just not on SIGKILL of this process.
+        #[cfg(target_os = "linux")]
+        kill_orphaned_pkexec_child();
 
         self.remove_split_routes();
 

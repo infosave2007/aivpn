@@ -27,3 +27,6 @@ tokio     = { version = "1.35", features = ["rt", "net", "time", "io-util", "mac
 rand      = "0.8"
 log       = "0.4"
 android_logger = "0.14"
+# Transport-level verification of server-signed MaskUpdate control payloads
+# (mirrors aivpn-client/aivpn-common's use of the same crate/version).
+ed25519-dalek = "2.0"

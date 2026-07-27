@@ -57,6 +57,10 @@ pub mod site_sync;
 
 pub mod bootstrap_publish;
 
+// server.json schema — shared by main.rs startup loading and the management
+// API's PUT /api/v1/config type-level validation.
+pub mod server_config;
+
 pub use client_db::ClientDatabase;
 pub use gateway::{Gateway, GatewayConfig};
 pub use nat::NatForwarder;

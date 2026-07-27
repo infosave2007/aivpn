@@ -187,13 +187,13 @@ impl MimicryEngine {
         // We only take the embedded path when the header is long enough to hold
         // the tag AND the tag slot does not overlap the embedded ephemeral key;
         // a malformed mask falls back to the byte-identical legacy layout.
-        let embed_tag_offset = match self.mask.embedded_tag_offset() {
-            Some(off)
-                if off + TAG_SIZE <= mdh.len() && !self.mask.tag_overlaps_eph_pub(TAG_SIZE) =>
-            {
-                Some(off)
-            }
-            Some(off) => {
+        // Embedded-vs-legacy decision goes through the shared MaskProfile method
+        // so the server decoder computes the identical ciphertext offset (see
+        // `MaskProfile::uses_embedded_layout`).
+        let embed_tag_offset = if self.mask.uses_embedded_layout(mdh.len()) {
+            self.mask.embedded_tag_offset()
+        } else {
+            if let Some(off) = self.mask.embedded_tag_offset() {
                 debug!(
                     "mask {} has malformed tag_offset {} (header len {}, eph_pub {}..{}); \
                      falling back to legacy tag-prefix layout",
@@ -203,9 +203,8 @@ impl MimicryEngine {
                     self.mask.eph_pub_offset,
                     self.mask.eph_pub_offset as usize + self.mask.eph_pub_length as usize,
                 );
-                None
             }
-            None => None,
+            None
         };
         // Legacy layout carries an extra TAG_SIZE prefix; the embedded layout does not.
         let tag_prefix_len = if embed_tag_offset.is_some() {

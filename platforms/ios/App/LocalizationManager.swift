@@ -100,6 +100,10 @@ class LocalizationManager: ObservableObject {
             "en": "Cannot save VPN config. Check Network Extension capability in your provisioning profile.",
             "ru": "Не удалось сохранить VPN конфигурацию. Проверьте Network Extension в provisioning profile.",
         ],
+        "error_keychain_write_failed": [
+            "en": "Could not securely store the connection secret in Keychain. Connection cancelled.",
+            "ru": "Не удалось безопасно сохранить секрет подключения в Keychain. Подключение отменено.",
+        ],
         "menu_edit":           ["en": "Edit",            "ru": "Изменить"],
         "menu_delete":         ["en": "Delete",          "ru": "Удалить"],
         "bench_quality_label": ["en": "Quality",         "ru": "Качество"],

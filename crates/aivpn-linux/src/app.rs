@@ -25,7 +25,10 @@ fn strip_ansi(s: &str) -> String {
             if chars.as_str().starts_with('[') {
                 chars.next();
                 for ch in chars.by_ref() {
-                    if ch.is_ascii_alphabetic() {
+                    // CSI sequences are terminated by any final byte in
+                    // 0x40-0x7E, not just letters (e.g. `~` ends cursor/key
+                    // sequences, `@` is ICH).
+                    if ('\x40'..='\x7e').contains(&ch) {
                         break;
                     }
                 }
@@ -118,6 +121,7 @@ async fn terminate_child_wait(
             }
         }
     }
+    remove_client_pidfile();
 }
 
 /// Detached variant for Disconnect / teardown paths: the reap happens on a
@@ -137,12 +141,145 @@ fn is_root() -> bool {
         .unwrap_or(false)
 }
 
+/// Per-user runtime dir for GUI bookkeeping (single-instance lock, client
+/// pidfile). XDG_RUNTIME_DIR is per-user and mode 0700; fall back to the
+/// (also owner-only) cache dir rather than shared /tmp, where another user
+/// could pre-plant the fixed filenames.
+fn aivpn_runtime_dir() -> std::path::PathBuf {
+    dirs::runtime_dir()
+        .or_else(dirs::cache_dir)
+        .unwrap_or_else(std::env::temp_dir)
+        .join("aivpn")
+}
+
+/// starttime (clock ticks since boot, /proc/<pid>/stat field 22) — together
+/// with the pid this uniquely identifies one process incarnation, so a
+/// recycled pid can never be mistaken for our client.
+fn proc_starttime(pid: u32) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // comm (field 2) may itself contain spaces/parens; the fixed-format
+    // fields resume after the LAST ')'. starttime is field 22 overall, i.e.
+    // the 20th whitespace token after `state`.
+    let rest = stat.rsplit_once(')')?.1;
+    rest.split_whitespace().nth(19)?.parse().ok()
+}
+
+fn client_pidfile_path() -> std::path::PathBuf {
+    aivpn_runtime_dir().join("client.pid")
+}
+
+/// Record the freshly spawned client as "<pid> <starttime>" so a GUI that
+/// crashes and restarts can find and re-adopt it (see the recovery in
+/// `App::new`). Removed again at every reap site.
+fn write_client_pidfile(pid: u32) {
+    if let Some(starttime) = proc_starttime(pid) {
+        let path = client_pidfile_path();
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::write(path, format!("{pid} {starttime}"));
+    }
+}
+
+fn remove_client_pidfile() {
+    let _ = std::fs::remove_file(client_pidfile_path());
+}
+
+/// Startup recovery: if the pidfile left by a previous (crashed) GUI run
+/// still names a live process with the same starttime AND comm
+/// "aivpn-client", return it for adoption; otherwise clean up the stale file.
+fn recover_orphaned_client() -> Option<(u32, u64)> {
+    let content = std::fs::read_to_string(client_pidfile_path()).ok()?;
+    let parsed = (|| -> Option<(u32, u64)> {
+        let mut it = content.split_whitespace();
+        let pid: u32 = it.next()?.parse().ok()?;
+        let starttime: u64 = it.next()?.parse().ok()?;
+        if proc_starttime(pid) != Some(starttime) {
+            return None;
+        }
+        let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).ok()?;
+        (comm.trim() == "aivpn-client").then_some((pid, starttime))
+    })();
+    if parsed.is_none() {
+        remove_client_pidfile();
+    }
+    parsed
+}
+
+/// Single-GUI-instance guard. `Ok(guard)` — lock acquired; keep the guard
+/// alive for the whole process (`None` inside means the lock file could not
+/// even be created, in which case we start anyway rather than lock the user
+/// out of their own VPN). `Err(())` — another aivpn-linux already holds it.
+pub fn acquire_single_instance_lock() -> Result<Option<std::fs::File>, ()> {
+    use std::os::unix::io::AsRawFd;
+    let dir = aivpn_runtime_dir();
+    let _ = std::fs::create_dir_all(&dir);
+    let Ok(file) = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .open(dir.join("gui.lock"))
+    else {
+        return Ok(None);
+    };
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        Ok(Some(file))
+    } else {
+        Err(())
+    }
+}
+
+/// SIGTERM an ADOPTED (recovered from a previous GUI run — not our child, so
+/// it cannot be wait()ed) client and poll for its exit; after the grace
+/// period SIGKILL it and clear any firewall rules its kill-switch may have
+/// left. The recovered session's launch flags are unknown, so the clear is
+/// unconditional — a spurious clear is harmless.
+async fn terminate_adopted_wait(pid: u32, starttime: u64) {
+    unsafe {
+        libc::kill(pid as libc::pid_t, libc::SIGTERM);
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    while proc_starttime(pid) == Some(starttime) {
+        if std::time::Instant::now() >= deadline {
+            unsafe {
+                libc::kill(pid as libc::pid_t, libc::SIGKILL);
+            }
+            spawn_kill_switch_clear();
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    remove_client_pidfile();
+}
+
+/// CAP_NET_ADMIN check via the `security.capability` xattr read directly:
+/// getcap(8) lives in libcap2-bin under /usr/sbin and is absent from PATH on
+/// stock Debian, which made a shell-out check always-false there (and thus
+/// re-prompted through pkexec on every connect).
 fn has_net_admin_cap(path: &std::path::Path) -> bool {
-    std::process::Command::new("getcap")
-        .arg(path)
-        .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).contains("cap_net_admin"))
-        .unwrap_or(false)
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(cpath) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+        return false;
+    };
+    let mut buf = [0u8; 64];
+    let n = unsafe {
+        libc::getxattr(
+            cpath.as_ptr(),
+            c"security.capability".as_ptr(),
+            buf.as_mut_ptr() as *mut libc::c_void,
+            buf.len(),
+        )
+    };
+    // struct vfs_cap_data: __le32 magic_etc, then data[0].permitted at offset
+    // 4 (layout shared by v2 and v3). CAP_NET_ADMIN = bit 12, in data[0]; the
+    // EFFECTIVE flag bit in magic_etc is what setcap's `+ep` adds over `+p`.
+    if n < 12 {
+        return false;
+    }
+    const VFS_CAP_FLAGS_EFFECTIVE: u32 = 0x1;
+    const CAP_NET_ADMIN_MASK: u32 = 1 << 12;
+    let magic_etc = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+    let permitted = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
+    permitted & CAP_NET_ADMIN_MASK != 0 && magic_etc & VFS_CAP_FLAGS_EFFECTIVE != 0
 }
 
 /// Refuse to grant CAP_NET_ADMIN to anything that isn't a root-owned,
@@ -316,8 +453,10 @@ async fn ensure_capable_binary(
     let helper_dest = aivpn_ip_helper_path();
     let built_helper = find_ip_helper_binary().ok();
 
-    let needs_copy = match (std::fs::metadata(&persisted), std::fs::metadata(source)) {
-        (Ok(p), Ok(s)) => p.len() != s.len(),
+    // Byte-for-byte: a length-only check let a stale persisted copy that
+    // happened to match the new build's size keep shadowing it forever.
+    let needs_copy = match (std::fs::read(&persisted), std::fs::read(source)) {
+        (Ok(p), Ok(s)) => p != s,
         _ => true,
     };
 
@@ -780,8 +919,31 @@ fn mask_catalog_file_paths() -> Vec<std::path::PathBuf> {
 /// Build picker choices from the server's mask catalog, appending the localized
 /// "(авто)" suffix to auto-generated masks. Returns `None` when no catalog has
 /// been received yet (the caller then falls back to the built-in presets).
+/// Called from `view()` on every render, so the parsed result is cached and
+/// the file is only re-read when its mtime (or path, or language) changes.
 fn mask_choices_from_catalog(lang: &str) -> Option<Vec<MaskChoice>> {
+    type CatalogCache = (
+        std::path::PathBuf,
+        std::time::SystemTime,
+        String,
+        Vec<MaskChoice>,
+    );
+    static CACHE: Mutex<Option<CatalogCache>> = Mutex::new(None);
     for path in mask_catalog_file_paths() {
+        let Ok(mtime) = std::fs::metadata(&path).and_then(|m| m.modified()) else {
+            continue;
+        };
+        {
+            let cache = match CACHE.lock() {
+                Ok(g) => g,
+                Err(e) => e.into_inner(),
+            };
+            if let Some((cp, cm, cl, choices)) = cache.as_ref() {
+                if *cp == path && *cm == mtime && cl == lang {
+                    return Some(choices.clone());
+                }
+            }
+        }
         let Ok(bytes) = std::fs::read(&path) else {
             continue;
         };
@@ -806,6 +968,11 @@ fn mask_choices_from_catalog(lang: &str) -> Option<Vec<MaskChoice>> {
                 display,
             });
         }
+        let mut cache = match CACHE.lock() {
+            Ok(g) => g,
+            Err(e) => e.into_inner(),
+        };
+        *cache = Some((path, mtime, lang.to_string(), choices.clone()));
         return Some(choices);
     }
     None
@@ -885,6 +1052,14 @@ pub struct App {
     /// A reconnect is waiting for the old client to be reaped before the
     /// new one may spawn (see Message::Connect / Message::OldClientReaped).
     pending_connect: bool,
+    /// Kill-switch flag the CURRENT client was launched with. Teardown paths
+    /// consult this, not live settings — toggling the checkbox while
+    /// connected must not skip (or invent) a needed `kill-switch clear`.
+    launched_kill_switch: bool,
+    /// Orphaned aivpn-client adopted at startup from a crashed previous GUI
+    /// run: (pid, /proc starttime). Not our child — torn down via
+    /// `terminate_adopted_wait`, never wait()ed.
+    adopted_client: Option<(u32, u64)>,
     child_handle: Arc<Mutex<Option<tokio::process::Child>>>,
     dialog: DialogMode,
     dlg_name: String,
@@ -907,14 +1082,32 @@ impl App {
     pub fn new() -> (Self, Task<Message>) {
         let settings = AppSettings::load();
         let storage = KeyStorage::load();
+        // Startup recovery: a previous GUI run that crashed (or was
+        // SIGKILLed) leaves its aivpn-client running with the tunnel up.
+        // Adopt it instead of showing Disconnected over a live tunnel and
+        // spawning a second client on the next Connect.
+        let adopted_client = recover_orphaned_client();
+        let mut log_lines = Vec::new();
+        let status = if let Some((pid, _)) = adopted_client {
+            log_lines.push(format!(
+                "Recovered running aivpn-client (pid {pid}) from a previous GUI session"
+            ));
+            VpnStatus::Connected {
+                vpn_ip: "recovered".to_string(),
+            }
+        } else {
+            VpnStatus::Disconnected
+        };
         (
             Self {
                 storage,
                 settings,
-                status: VpnStatus::Disconnected,
-                log_lines: Vec::new(),
+                status,
+                log_lines,
                 connection_key: None,
                 pending_connect: false,
+                launched_kill_switch: false,
+                adopted_client,
                 child_handle: Arc::new(Mutex::new(None)),
                 dialog: DialogMode::None,
                 dlg_name: String::new(),
@@ -939,6 +1132,26 @@ impl App {
     /// (bounded) for the client's SIGTERM cleanup — kill-switch firewall
     /// rules, routes — to finish before kill_on_drop's SIGKILL fires.
     fn shutdown_child_blocking(&mut self) {
+        // Adopted (recovered, non-child) client: same SIGTERM + grace +
+        // SIGKILL sequence, but polled via /proc since it can't be wait()ed.
+        if let Some((pid, starttime)) = self.adopted_client.take() {
+            unsafe {
+                libc::kill(pid as libc::pid_t, libc::SIGTERM);
+            }
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+            while proc_starttime(pid) == Some(starttime) {
+                if std::time::Instant::now() >= deadline {
+                    unsafe {
+                        libc::kill(pid as libc::pid_t, libc::SIGKILL);
+                    }
+                    spawn_kill_switch_clear();
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            remove_client_pidfile();
+            return;
+        }
         let mut guard = match self.child_handle.lock() {
             Ok(g) => g,
             Err(e) => e.into_inner(),
@@ -955,7 +1168,10 @@ impl App {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
         loop {
             match child.try_wait() {
-                Ok(Some(_)) => return,
+                Ok(Some(_)) => {
+                    remove_client_pidfile();
+                    return;
+                }
                 Ok(None) if std::time::Instant::now() < deadline => {
                     std::thread::sleep(std::time::Duration::from_millis(50));
                 }
@@ -967,9 +1183,10 @@ impl App {
         // is detached, so it survives this GUI exiting right after.
         let _ = child.start_kill();
         let _ = child.try_wait();
-        if self.settings.kill_switch {
+        if self.launched_kill_switch {
             spawn_kill_switch_clear();
         }
+        remove_client_pidfile();
     }
 
     pub fn update(&mut self, msg: Message) -> Task<Message> {
@@ -986,6 +1203,16 @@ impl App {
                     let old_child = guard.take();
                     drop(guard);
                     self.status = VpnStatus::Connecting;
+                    if let Some((pid, starttime)) = self.adopted_client.take() {
+                        // Recovered (non-child) client from a previous GUI
+                        // run: same hold-the-spawn sequencing as the
+                        // reconnect path below.
+                        self.pending_connect = true;
+                        self.connection_key = None;
+                        return Task::perform(terminate_adopted_wait(pid, starttime), |_| {
+                            Message::OldClientReaped
+                        });
+                    }
                     if let Some(child) = old_child {
                         // Reconnect: the old client's SIGTERM cleanup (route
                         // restore, kill-switch removal) takes up to ~3 s.
@@ -998,7 +1225,7 @@ impl App {
                         self.pending_connect = true;
                         self.connection_key = None;
                         return Task::perform(
-                            terminate_child_wait(child, self.settings.kill_switch, true),
+                            terminate_child_wait(child, self.launched_kill_switch, true),
                             |_| Message::OldClientReaped,
                         );
                     }
@@ -1008,6 +1235,7 @@ impl App {
                         // currently selected profile when it lands.
                         return Task::none();
                     }
+                    self.launched_kill_switch = self.settings.kill_switch;
                     self.connection_key = Some(key);
                 } else {
                     self.push_log("No profile selected".to_string());
@@ -1019,6 +1247,7 @@ impl App {
                 if self.pending_connect {
                     self.pending_connect = false;
                     if let Some(k) = self.storage.selected_key() {
+                        self.launched_kill_switch = self.settings.kill_switch;
                         self.connection_key = Some(k.key.clone());
                     } else {
                         self.status = VpnStatus::Disconnected;
@@ -1028,6 +1257,9 @@ impl App {
             Message::Disconnect => {
                 self.pending_connect = false;
                 self.connection_key = None;
+                if let Some((pid, starttime)) = self.adopted_client.take() {
+                    tokio::spawn(terminate_adopted_wait(pid, starttime));
+                }
                 // Recover from a poisoned mutex so the kill() always executes.
                 let mut guard = match self.child_handle.lock() {
                     Ok(g) => g,
@@ -1036,7 +1268,7 @@ impl App {
                 if let Some(child) = guard.take() {
                     // SIGTERM (not SIGKILL) so the client clears its
                     // kill-switch firewall rules; reaped on a background task.
-                    terminate_child_graceful(child, self.settings.kill_switch);
+                    terminate_child_graceful(child, self.launched_kill_switch);
                 }
                 drop(guard);
                 self.status = VpnStatus::Disconnected;
@@ -1044,11 +1276,11 @@ impl App {
             }
             Message::StatusReceived(s) => {
                 // While a reconnect waits for the old client's reap, the old
-                // (cancelled) worker stream may still deliver a stale terminal
-                // status; ignore it so it can't overwrite "Connecting".
-                if self.pending_connect
-                    && matches!(s, VpnStatus::Disconnected | VpnStatus::Error(_))
-                {
+                // (cancelled) worker stream may still deliver stale statuses —
+                // including a stale Connected. Drop them ALL so a dead session
+                // can neither overwrite "Connecting" nor flash as live (and
+                // fire a spurious "Connected" notification).
+                if self.pending_connect {
                     return Task::none();
                 }
                 #[cfg(unix)]
@@ -1076,6 +1308,18 @@ impl App {
                 // on the next Connect, hanging forever on "Connecting...".
                 if matches!(self.status, VpnStatus::Disconnected | VpnStatus::Error(_)) {
                     self.connection_key = None;
+                    // A terminal status can now also arrive from an
+                    // AIVPN-STATUS line while the child is still alive or
+                    // unreaped (dropping connection_key cancels the worker
+                    // before its own reap code runs) — terminate and reap it
+                    // here so it can't linger as an orphan/zombie.
+                    let mut guard = match self.child_handle.lock() {
+                        Ok(g) => g,
+                        Err(e) => e.into_inner(),
+                    };
+                    if let Some(child) = guard.take() {
+                        terminate_child_graceful(child, self.launched_kill_switch);
+                    }
                 }
             }
             Message::LogLine(line) => {
@@ -1280,6 +1524,19 @@ impl App {
                 self.settings.save();
             }
             Message::StatsRefresh(s) => {
+                // `since` is the client's per-session epoch: a change while
+                // Connected means the client silently reconnected in-process
+                // (its counters and timer reset together) — surface it.
+                if matches!(self.status, VpnStatus::Connected { .. }) {
+                    if let (Some(old), Some(new)) = (self.stats.connected_since, s.connected_since)
+                    {
+                        if old != new {
+                            self.push_log(
+                                "client session restarted (in-process reconnect)".to_string(),
+                            );
+                        }
+                    }
+                }
                 self.stats = s;
             }
             Message::TrayEvent(action) => match action {
@@ -1307,6 +1564,12 @@ impl App {
                     });
                 }
                 crate::tray::TrayAction::Connect => {
+                    // The ksni tray menu is stateless — gate Connect so a
+                    // click during an in-flight attempt can't trigger a
+                    // second spawn / reconnect storm.
+                    if self.pending_connect || matches!(self.status, VpnStatus::Connecting) {
+                        return Task::none();
+                    }
                     return self.update(Message::Connect);
                 }
                 crate::tray::TrayAction::Disconnect => {
@@ -1610,7 +1873,7 @@ impl App {
         };
 
         let traffic_row: Element<Message> = if is_connected {
-            row![
+            let mut r = row![
                 text(format!("RX {}", format_bytes(self.stats.bytes_received)))
                     .size(11)
                     .color(muted),
@@ -1618,9 +1881,17 @@ impl App {
                 text(format!("TX {}", format_bytes(self.stats.bytes_sent)))
                     .size(11)
                     .color(muted),
-            ]
-            .align_y(Alignment::Center)
-            .into()
+            ];
+            // Live link quality from the client's quality.json (0 = not
+            // reported yet / old client).
+            if self.stats.quality_score > 0 {
+                r = r.push(Space::with_width(6)).push(
+                    text(format!("Q {}%", self.stats.quality_score))
+                        .size(11)
+                        .color(muted),
+                );
+            }
+            r.align_y(Alignment::Center).into()
         } else {
             profile_hint
         };
@@ -1834,11 +2105,15 @@ impl App {
         };
 
         let adaptive_opt = AdaptiveOption::from_level(self.settings.adaptive_level);
-        let fec_text = if self.settings.adaptive_level >= 2 {
-            " [FEC]"
+        // The FEC badge reflects the LIVE level the server actually runs the
+        // session at (quality.json) when connected — not merely the requested
+        // preference, which the adaptive controller may have overridden.
+        let live_level = if is_connected && self.stats.server_adaptive_level > 0 {
+            self.stats.server_adaptive_level
         } else {
-            ""
+            self.settings.adaptive_level
         };
+        let fec_text = if live_level >= 2 { " [FEC]" } else { "" };
         let fec_badge = text(fec_text)
             .color(Color::from_rgb(0.3, 0.8, 0.5))
             .size(11);
@@ -2253,7 +2528,7 @@ impl App {
             Some(key) => {
                 let key = key.clone();
                 let child_handle = self.child_handle.clone();
-                let kill_switch = self.settings.kill_switch;
+                let kill_switch = self.launched_kill_switch;
                 let adaptive_level = self.settings.adaptive_level;
                 let dns_proxy = self.settings.dns_proxy.clone();
                 let exclude_routes: Vec<String> = self
@@ -2398,38 +2673,67 @@ impl App {
                         }
                     };
 
-                    let stdout = match child.stdout.take() {
-                        Some(s) => s,
-                        None => {
-                            let _ = sender.try_send(Message::StatusReceived(VpnStatus::Error(
-                                "stdout pipe unavailable".to_string(),
-                            )));
-                            return;
-                        }
-                    };
-                    let stderr = match child.stderr.take() {
-                        Some(s) => s,
-                        None => {
-                            let _ = sender.try_send(Message::StatusReceived(VpnStatus::Error(
-                                "stderr pipe unavailable".to_string(),
-                            )));
-                            return;
-                        }
-                    };
+                    // Take the pipes and publish the child handle immediately —
+                    // no awaits or early returns in between. Any path that
+                    // drops the Child before it reaches child_handle fires
+                    // kill_on_drop's SIGKILL, bypassing the client's
+                    // kill-switch cleanup (traffic blackout).
+                    let stdout = child.stdout.take();
+                    let stderr = child.stderr.take();
+                    let child_pid = child.id();
                     match child_handle.lock() {
                         Ok(mut guard) => *guard = Some(child),
                         Err(e) => *e.into_inner() = Some(child),
                     }
+                    if let Some(pid) = child_pid {
+                        write_client_pidfile(pid);
+                    }
+                    let (Some(stdout), Some(stderr)) = (stdout, stderr) else {
+                        // Should be impossible with piped stdio — terminate
+                        // the already-published child gracefully, never drop
+                        // it.
+                        let taken = match child_handle.lock() {
+                            Ok(mut g) => g.take(),
+                            Err(e) => e.into_inner().take(),
+                        };
+                        if let Some(c) = taken {
+                            terminate_child_graceful(c, kill_switch);
+                        }
+                        let _ = sender.try_send(Message::StatusReceived(VpnStatus::Error(
+                            "stdout/stderr pipe unavailable".to_string(),
+                        )));
+                        return;
+                    };
                     let _ = sender.try_send(Message::StatusReceived(VpnStatus::Connecting));
 
                     let mut out = BufReader::new(stdout).lines();
                     let mut err = BufReader::new(stderr).lines();
 
-                    // Detects the client's "Connected to server at ..." / TUN-ready log line
-                    // to flip status to Connected. The client's tracing subscriber writes to
-                    // stderr (not stdout — see 9c84bf7, so bench --json's stdout output stays
-                    // clean), so this line always arrives via `err`, never `out`; still checked
-                    // on both streams in case a future client build ever emits it differently.
+                    // Preferred, machine-readable status protocol: newer
+                    // clients print "AIVPN-STATUS connected <vpn_ip>" /
+                    // "AIVPN-STATUS reconnecting" / "AIVPN-STATUS disconnected"
+                    // on stdout. A reconnecting client DEMOTES the UI to
+                    // Connecting instead of showing Connected over a dead,
+                    // silently-retrying tunnel.
+                    let parse_status_line = |l: &str| -> Option<VpnStatus> {
+                        let mut it = l.trim().strip_prefix("AIVPN-STATUS ")?.split_whitespace();
+                        match it.next()? {
+                            "connected" => Some(VpnStatus::Connected {
+                                vpn_ip: it.next().unwrap_or_default().to_string(),
+                            }),
+                            "reconnecting" => Some(VpnStatus::Connecting),
+                            "disconnected" => Some(VpnStatus::Disconnected),
+                            _ => None,
+                        }
+                    };
+
+                    // Fallback heuristic for OLDER clients only: detects the
+                    // "Connected to server at ..." / TUN-ready log line. The
+                    // client's tracing subscriber writes to stderr (not stdout —
+                    // see 9c84bf7, so bench --json's stdout output stays clean),
+                    // so this line always arrives via `err`, never `out`; still
+                    // checked on both streams in case a future client build ever
+                    // emits it differently.
                     let check_connected =
                         |sender: &mut iced::futures::channel::mpsc::Sender<Message>, l: &str| {
                             if l.contains("Connected") || l.contains("TUN interface") {
@@ -2444,18 +2748,34 @@ impl App {
                             }
                         };
 
+                    // Once one machine-readable line has been seen the
+                    // heuristic is disabled for the rest of the session: it
+                    // substring-matches log prose ("Reconnected", pre-handshake
+                    // "TUN interface") and would fight the authoritative
+                    // protocol.
+                    let mut saw_status_line = false;
+                    let mut handle_line =
+                        |sender: &mut iced::futures::channel::mpsc::Sender<Message>, l: &str| {
+                            if let Some(status) = parse_status_line(l) {
+                                saw_status_line = true;
+                                let _ = sender.try_send(Message::StatusReceived(status));
+                            } else if !saw_status_line {
+                                check_connected(sender, l);
+                            }
+                        };
+
                     loop {
                         tokio::select! {
                             line = out.next_line() => match line {
                                 Ok(Some(l)) => {
-                                    check_connected(&mut sender, &l);
+                                    handle_line(&mut sender, &l);
                                     let _ = sender.try_send(Message::LogLine(strip_ansi(&l)));
                                 }
                                 _ => break,
                             },
                             line = err.next_line() => match line {
                                 Ok(Some(l)) => {
-                                    check_connected(&mut sender, &l);
+                                    handle_line(&mut sender, &l);
                                     let _ = sender
                                         .try_send(Message::LogLine(format!("[err] {}", strip_ansi(&l))));
                                 }
@@ -2475,6 +2795,7 @@ impl App {
                     if let Some(mut c) = reaped {
                         let _ = c.wait().await;
                     }
+                    remove_client_pidfile();
                     let _ = sender.try_send(Message::StatusReceived(VpnStatus::Disconnected));
                 });
                 Subscription::run_with_id("aivpn_worker", stream)

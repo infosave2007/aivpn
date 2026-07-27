@@ -514,6 +514,14 @@ class MainActivity : AppCompatActivity() {
             runOnUiThread { handleRecordingFeedback(feedbackJson) }
         }
 
+        // L3: the core hands each recording-feedback message out exactly once;
+        // one polled while this Activity was paused was buffered by the service
+        // instead of dropped. Deliver it now (take-once).
+        AivpnService.pendingRecordingFeedback?.let { buffered ->
+            AivpnService.pendingRecordingFeedback = null
+            handleRecordingFeedback(buffered)
+        }
+
         // Restore UI state from the service tri-state (e.g. after returning from
         // the VPN permission dialog, screen rotation — or after the service DIED
         // while this Activity was paused, which the old two-branch check missed,
@@ -661,12 +669,25 @@ class MainActivity : AppCompatActivity() {
         binding.btnAddProfile.isEnabled = !serviceActive
         renderProfiles()
 
-        // Timer management — connectionStartTime is persisted in ViewModel and survives rotation.
+        // Timer management — the service's connectedAtMillis is the single source
+        // of truth: stamped per session in onTunnelReady, it survives Activity
+        // recreation (no more "timer restarts at app open" over a live tunnel)
+        // and restamps on every silent reconnect (timer and the per-session
+        // traffic counters now reset together instead of drifting apart).
         if (connected) {
-            val isFreshConnect = connectionStartTime == 0L
-            viewModel.setConnected(statusText)  // idempotent: only stamps startTime when it is 0
-            // connectionStartTime is synced synchronously from ViewModel via observer above
-            if (isFreshConnect) {
+            val serviceStart = AivpnService.connectedAtMillis
+            val isFreshSession = serviceStart != connectionStartTime
+            viewModel.setConnected(statusText, serviceStart)
+            // L2: LiveData observers registered in onCreate only become ACTIVE at
+            // onStart, so during onCreate's resyncFromService() the setConnected()
+            // above is NOT delivered synchronously — connectionStartTime stayed 0,
+            // the timerRunnable posted below bailed on its `> 0` guard, and the
+            // timer/start-time fields stayed blank until onResume re-synced. Sync
+            // directly; the observer still restores it on rotation.
+            if (serviceStart > 0) {
+                connectionStartTime = serviceStart
+            }
+            if (isFreshSession) {
                 binding.textUpload.text = "0 B"
                 binding.textDownload.text = "0 B"
             }

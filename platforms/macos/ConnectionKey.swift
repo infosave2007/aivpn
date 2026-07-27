@@ -28,8 +28,7 @@ struct ConnectionKey: Identifiable, Codable, Equatable {
          serverSigningKey: String? = nil) {
         self.id = id
         self.name = name
-        self.keyValue = keyValue.trimmingCharacters(in: .whitespacesAndNewlines)
-            .replacingOccurrences(of: "aivpn://", with: "")
+        self.keyValue = Self.normalizeKeyValue(keyValue)
         self.mtlsCertPath = mtlsCertPath
         self.bootstrapCdnUrl = bootstrapCdnUrl
         self.bootstrapTelegramToken = bootstrapTelegramToken
@@ -62,6 +61,18 @@ struct ConnectionKey: Identifiable, Codable, Equatable {
         self.serverAddress = server
         self.vpnIP = ip
         self.canRecord = record
+    }
+
+    /// Strips surrounding whitespace and a single LEADING "aivpn://" scheme
+    /// prefix. `replacingOccurrences` would also delete the substring from the
+    /// MIDDLE of the payload — silently corrupting any key that happened to
+    /// contain it — so only a prefix strip is correct.
+    static func normalizeKeyValue(_ raw: String) -> String {
+        var value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        if value.hasPrefix("aivpn://") {
+            value = String(value.dropFirst("aivpn://".count))
+        }
+        return value
     }
 
     // MARK: - Strict validation (mirrors the tunnel/client parser requirements)
@@ -125,8 +136,7 @@ struct ConnectionKey: Identifiable, Codable, Equatable {
     /// 64-char hex). Rejecting bad keys here surfaces a clear error at add
     /// time instead of an opaque connect failure later.
     static func isValidKeyString(_ raw: String) -> Bool {
-        let norm = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-            .replacingOccurrences(of: "aivpn://", with: "")
+        let norm = normalizeKeyValue(raw)
         guard let json = decodePayload(norm),
               let s = json["s"] as? String, !s.isEmpty,
               let k = json["k"] as? String, isValid32ByteKey(k) else { return false }
@@ -185,12 +195,21 @@ class KeychainStorage: ObservableObject {
     private let defaults = UserDefaults.standard
     private let selectedKeyKey = "selected_connection_key_id"
 
+    // True when the Keychain REFUSED access during loadKeys (e.g. after an
+    // ad-hoc re-signed update changed the app's code identity). The store is
+    // then "locked", NOT empty: the UI shows no keys, but saveKeys() must
+    // refuse to write — a save from this state would delete/overwrite items
+    // that still exist and silently empty the user's key list.
+    private var storeAccessFailed = false
+
     init() {
         loadKeys()
     }
 
     /// Загрузить ключи из Keychain (с миграцией из старого blob-формата и UserDefaults)
     func loadKeys() {
+        // A fresh load attempt re-evaluates store accessibility.
+        storeAccessFailed = false
         // Migration: if old single-blob key exists, migrate to per-key format and remove it
         if let json = keychain.load(key: keychainKey),
            let data = json.data(using: .utf8),
@@ -203,19 +222,32 @@ class KeychainStorage: ObservableObject {
             // A slot that exists but fails to decode is skipped, not treated as
             // the end of the list — otherwise one corrupted entry would hide the
             // whole tail and the next saveKeys() would irrevocably delete it.
+            // An ACCESS FAILURE (not "missing") marks the whole store as locked.
             var loaded: [ConnectionKey] = []
             var i = 0
-            while let json = keychain.load(key: "ck_\(i)") {
-                if let data = json.data(using: .utf8),
-                   let key = try? JSONDecoder().decode(ConnectionKey.self, from: data) {
-                    loaded.append(key)
-                } else {
-                    NSLog("AIVPN: skipping corrupted Keychain slot ck_%d", i)
+            var reachedEnd = false
+            while !reachedEnd {
+                switch keychain.loadResult(key: "ck_\(i)") {
+                case .found(let json):
+                    if let data = json.data(using: .utf8),
+                       let key = try? JSONDecoder().decode(ConnectionKey.self, from: data) {
+                        loaded.append(key)
+                    } else {
+                        NSLog("AIVPN: skipping corrupted Keychain slot ck_%d", i)
+                    }
+                    i += 1
+                case .missing:
+                    reachedEnd = true
+                case .failure(let status):
+                    NSLog("AIVPN: Keychain denied access to slot ck_%d (OSStatus %d) — treating key store as locked, not empty", i, status)
+                    storeAccessFailed = true
+                    reachedEnd = true
                 }
-                i += 1
             }
-            // Legacy migration: UserDefaults → per-key Keychain
-            if loaded.isEmpty,
+            // Legacy migration: UserDefaults → per-key Keychain. Never migrate
+            // over a locked store — "loaded is empty" is not evidence of an
+            // empty store when reads were refused.
+            if loaded.isEmpty, !storeAccessFailed,
                let data = defaults.data(forKey: "saved_connection_keys"),
                let decoded = try? JSONDecoder().decode([ConnectionKey].self, from: data) {
                 loaded = decoded
@@ -244,6 +276,15 @@ class KeychainStorage: ObservableObject {
     /// Each key is stored as a separate Keychain item so corruption of one entry
     /// does not affect the others. Entries beyond the current count are deleted.
     private func saveKeys() {
+        // Never write from an empty-after-error state: if the Keychain refused
+        // reads at load time the items are likely still there, and this write
+        // path (delete+add per slot, then trailing-slot cleanup) would destroy
+        // them. Losing one session's edits is recoverable; wiping the store on
+        // every ad-hoc re-signed update is not.
+        guard !storeAccessFailed else {
+            NSLog("AIVPN: key store is locked (Keychain access error at load) — refusing to save")
+            return
+        }
         for (i, key) in keys.enumerated() {
             if let encoded = try? JSONEncoder().encode(key),
                let json = String(data: encoded, encoding: .utf8) {
@@ -265,8 +306,7 @@ class KeychainStorage: ObservableObject {
                 bootstrapGithub: String? = nil,
                 serverSigningKey: String? = nil) -> ConnectionKey? {
         // Проверить дубликат по значению ключа
-        if keys.contains(where: { $0.keyValue == keyValue.trimmingCharacters(in: .whitespacesAndNewlines)
-            .replacingOccurrences(of: "aivpn://", with: "") }) {
+        if keys.contains(where: { $0.keyValue == ConnectionKey.normalizeKeyValue(keyValue) }) {
             return nil
         }
 
@@ -304,8 +344,7 @@ class KeychainStorage: ObservableObject {
             return false
         }
 
-        let normalizedKey = keyValue.trimmingCharacters(in: .whitespacesAndNewlines)
-            .replacingOccurrences(of: "aivpn://", with: "")
+        let normalizedKey = ConnectionKey.normalizeKeyValue(keyValue)
 
         if normalizedKey != keys[index].keyValue &&
            keys.contains(where: { $0.id != id && $0.keyValue == normalizedKey }) {

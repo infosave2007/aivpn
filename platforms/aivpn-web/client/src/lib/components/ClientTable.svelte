@@ -17,23 +17,6 @@
     onViewQr: (id: string) => void;
   } = $props();
 
-  let selected = $state<Set<string>>(new Set());
-
-  function toggleAll() {
-    if (selected.size === clients.length) {
-      selected = new Set();
-    } else {
-      selected = new Set(clients.map((c) => c.id));
-    }
-  }
-
-  function toggle(id: string) {
-    const next = new Set(selected);
-    if (next.has(id)) next.delete(id);
-    else next.add(id);
-    selected = next;
-  }
-
   function formatBytes(b: number): string {
     if (b < 1024) return `${b} B`;
     if (b < 1024 * 1024) return `${(b / 1024).toFixed(1)} KB`;
@@ -46,14 +29,6 @@
   <table class="w-full text-sm">
     <thead class="bg-gray-50 dark:bg-gray-800 text-gray-500 dark:text-gray-400">
       <tr>
-        <th class="px-4 py-3 text-left w-10">
-          <input
-            type="checkbox"
-            checked={selected.size === clients.length && clients.length > 0}
-            onchange={toggleAll}
-            class="rounded"
-          />
-        </th>
         <th class="px-4 py-3 text-left font-medium">Name</th>
         <th class="px-4 py-3 text-left font-medium">VPN IP</th>
         <th class="px-4 py-3 text-left font-medium">Status</th>
@@ -65,14 +40,6 @@
     <tbody class="divide-y divide-gray-100 dark:divide-gray-700 bg-white dark:bg-gray-900">
       {#each clients as client (client.id)}
         <tr class="hover:bg-gray-50 dark:hover:bg-gray-800/50 transition-colors">
-          <td class="px-4 py-3">
-            <input
-              type="checkbox"
-              checked={selected.has(client.id)}
-              onchange={() => toggle(client.id)}
-              class="rounded"
-            />
-          </td>
           <td class="px-4 py-3 font-medium text-gray-900 dark:text-white">
             {client.name}
             {#if client.one_time}
@@ -136,7 +103,7 @@
       {/each}
       {#if clients.length === 0}
         <tr>
-          <td colspan="7" class="px-4 py-8 text-center text-gray-400">No clients found</td>
+          <td colspan="6" class="px-4 py-8 text-center text-gray-400">No clients found</td>
         </tr>
       {/if}
     </tbody>

@@ -36,6 +36,13 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const UDP_ASSOCIATE_TIMEOUT: Duration = Duration::from_secs(10);
 const UDP_ASSOCIATE_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 const DNS_QUERY_TIMEOUT: Duration = Duration::from_secs(2);
+/// Grace period to let an in-flight tunnel→client response finish draining
+/// after the client half-closes its write side (a legitimate pattern for
+/// some request/response tools: send request, close write, wait for reply).
+/// Bounds the wait so a target that never responds/hangs still gets cleaned
+/// up instead of leaking indefinitely — same idle-safety concern as the
+/// TCP-CONNECT-leak fix above, just on the opposite direction/trigger.
+const HALF_CLOSE_DRAIN_GRACE: Duration = Duration::from_secs(30);
 
 static SRC_PORT: AtomicU16 = AtomicU16::new(49152);
 
@@ -660,24 +667,21 @@ async fn handle_connect(
             match resolve_via_tunnel(&udp_cmd_tx, &wake_tx, &host, port, /*want_v6=*/ false).await {
                 Ok(a) => a,
                 Err(tunnel_err) => {
-                    debug!(
-                        "DNS via tunnel failed for {host}:{port}: {tunnel_err}; trying system DNS"
+                    // Fail closed instead of falling back to the plain OS
+                    // resolver: that would resolve the hostname itself
+                    // outside the encrypted tunnel — a metadata/DNS leak
+                    // distinct from (and not covered by) the --dns-proxy
+                    // mitigation, which only protects args.dns_upstream
+                    // traffic. The tunnel-DNS resolver is flaky/high-latency
+                    // (2s timeout, single hardcoded 1.1.1.1) but a slow tunnel
+                    // failing CONNECT is strictly preferable to a silent
+                    // hostname leak.
+                    warn!(
+                        "DNS via tunnel failed for {host}:{port}: {tunnel_err}; failing closed \
+                         (not resolving via system DNS, which would leak the hostname outside the tunnel)"
                     );
-                    match tokio::net::lookup_host(format!("{host}:{port}")).await {
-                        Ok(mut iter) => match iter.find(|a| a.ip().is_ipv4()) {
-                            Some(a) => a,
-                            None => {
-                                warn!("TCP CONNECT DNS error {host}:{port}: no IPv4 result");
-                                let _ = session.send_reply(REP_HOST_UNREACHABLE).await;
-                                return;
-                            }
-                        },
-                        Err(e) => {
-                            warn!("TCP CONNECT DNS error {host}:{port}: {e}");
-                            let _ = session.send_reply(REP_HOST_UNREACHABLE).await;
-                            return;
-                        }
-                    }
+                    let _ = session.send_reply(REP_HOST_UNREACHABLE).await;
+                    return;
                 }
             }
         }
@@ -735,6 +739,15 @@ async fn handle_connect(
     .unwrap_or(false);
 
     if !connected {
+        // A late-arriving TCP handshake success (target completes its SYN-ACK
+        // after CONNECT_TIMEOUT) reaches `service_tcp_conn`'s `State::Established`
+        // and tries `ready_tx.send(true)` — silently dropped, the receiver is
+        // already gone by then. Without setting close_flag here the connection
+        // stays live and orphaned: read_half/write_half are never spawned (we
+        // return below) so nothing will ever notice or clean it up — TCP has no
+        // idle timeout unlike UDP associations, so it leaks for the life of the
+        // session. Mirrors the send_reply-failure branch below.
+        close_flag.store(true, Ordering::Relaxed);
         let _ = session.send_reply(REP_HOST_UNREACHABLE).await;
         return;
     }
@@ -775,13 +788,25 @@ async fn handle_connect(
     });
 
     tokio::select! {
-        _ = &mut read_half => {}
+        _ = &mut read_half => {
+            // Client half-closed (or errored) its write side. Don't abort
+            // write_half immediately — a still-in-flight tunnel→client
+            // response would be truncated the instant the client's own read
+            // side sees EOF, even though write_half is otherwise draining
+            // cleanly. close_flag_rd was already set inside read_half's own
+            // task body above, so the tunnel-side stack already knows to
+            // wind down that direction; give write_half a bounded grace
+            // period to finish delivering whatever's still coming before
+            // falling through to the unconditional abort below.
+            let _ = tokio::time::timeout(HALF_CLOSE_DRAIN_GRACE, &mut write_half).await;
+        }
         _ = &mut write_half => {}
     }
 
     close_flag.store(true, Ordering::Relaxed);
     // Abort the sibling half so it doesn't linger detached, parked on a socket
-    // read or channel recv after the connection has already torn down.
+    // read or channel recv after the connection has already torn down. A
+    // no-op for whichever half already finished above.
     read_half.abort();
     write_half.abort();
 }
@@ -948,23 +973,16 @@ async fn handle_udp_associate(
                                 a
                             }
                             Err(tunnel_err) => {
-                                debug!("DNS via tunnel failed for {host}:{port}: {tunnel_err}; trying system DNS");
-                                match tokio::net::lookup_host(format!("{host}:{port}")).await {
-                                    Ok(mut iter) => match iter.find(|a| a.ip().is_ipv4()) {
-                                        Some(a) => {
-                                            dns_cache.insert(key, a);
-                                            a
-                                        }
-                                        None => {
-                                            warn!("SOCKS5 UDP DNS error {host}:{port}: no IPv4 result");
-                                            continue;
-                                        }
-                                    },
-                                    Err(e) => {
-                                        warn!("SOCKS5 UDP DNS error {host}:{port}: {e}");
-                                        continue;
-                                    }
-                                }
+                                // Fail closed (see the matching TCP CONNECT
+                                // comment above): falling back to the system
+                                // resolver would leak the hostname outside the
+                                // tunnel. Drop this datagram and let the
+                                // client retry rather than resolve unsafely.
+                                warn!(
+                                    "SOCKS5 UDP DNS via tunnel failed for {host}:{port}: {tunnel_err}; \
+                                     failing closed (not resolving via system DNS, which would leak the hostname outside the tunnel)"
+                                );
+                                continue;
                             }
                         }
                     }

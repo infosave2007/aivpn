@@ -82,7 +82,11 @@ mod dpapi {
 /// On Windows uses DPAPI; returns Err if DPAPI is unavailable so callers never
 /// silently write a plaintext PSK to disk. Non-Windows builds (cargo check only)
 /// return the value unchanged.
-fn protect_key(key: &str) -> Result<String, String> {
+///
+/// `pub(crate)` so `localization.rs` can reuse the same DPAPI-backed
+/// protection for the Telegram bootstrap bot token (a real credential that
+/// was previously stored in plaintext in settings.json, unlike this key).
+pub(crate) fn protect_key(key: &str) -> Result<String, String> {
     #[cfg(windows)]
     {
         return dpapi::encrypt(key.as_bytes())
@@ -97,7 +101,9 @@ fn protect_key(key: &str) -> Result<String, String> {
 /// Returns Ok(plaintext) on success, Ok(stored) for legacy plaintext (base64 decode fails,
 /// meaning it was never encrypted), or Err if DPAPI decryption fails (encrypted blob that
 /// could not be decrypted — corrupted or from a different user/machine).
-fn unprotect_key(stored: &str) -> Result<String, String> {
+///
+/// `pub(crate)` — see `protect_key` above.
+pub(crate) fn unprotect_key(stored: &str) -> Result<String, String> {
     #[cfg(windows)]
     {
         if let Ok(blob) = base64::engine::general_purpose::STANDARD.decode(stored) {
@@ -191,7 +197,10 @@ impl KeyStorage {
                                 // DPAPI decryption failed — key is corrupted or from a
                                 // different user/machine. Skip it to avoid treating the
                                 // ciphertext blob as a plaintext connection key.
-                                eprintln!("aivpn: skipping corrupt key {:?}: {}", k.name, e);
+                                crate::vpn_manager::gui_log(&format!(
+                                    "aivpn: skipping corrupt key {:?}: {}",
+                                    k.name, e
+                                ));
                                 bad_keys.push(i);
                             }
                         }

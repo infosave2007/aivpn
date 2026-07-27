@@ -68,6 +68,22 @@ const KEEPALIVE_NAT_CAP: Duration = Duration::from_secs(25);
 /// above the cap, since normal keepalives fire well under 20 s.
 const NAT_WARMUP_AFTER: Duration = Duration::from_secs(20);
 
+// ── Post-freeze/suspend liveness probe ──
+// System suspend (laptop lid close) or an outside freeze (SIGSTOP, cgroup
+// freezer) stops this process entirely; the first watchdog tick after wake
+// sees a gap far beyond the 5 s watchdog cadence. A session whose server-side
+// state died during the gap would otherwise linger dead for up to the
+// RX-silence net: keepalives resume unanswered, and the data watchdog needs
+// ≥TX_WITHOUT_RX_MIN_BYTES of uplink to condemn. After a gap this large,
+// demand ANY decodable RX within the probe window instead. Same
+// constants/semantics as android_tunnel.rs.
+const WAKE_GAP_THRESHOLD: Duration = Duration::from_secs(15);
+/// Probe window bounds: max(2×keepalive interval, MIN) capped at MAX — at
+/// least two keepalives (sent immediately after wake) must have a chance to
+/// be answered before the session is condemned.
+const WAKE_PROBE_WINDOW_MIN: Duration = Duration::from_secs(10);
+const WAKE_PROBE_WINDOW_MAX: Duration = Duration::from_secs(60);
+
 /// How long the client keeps the PREVIOUS session keys accepting inbound
 /// packets after an inline rekey. Must cover the server's KeyRotate
 /// retransmit horizon (`MAX_REKEY_SEND_ATTEMPTS` = 5 sends spread over ~16 s
@@ -897,6 +913,13 @@ impl AivpnClient {
         self.ever_connected.load(Ordering::Relaxed)
     }
 
+    /// Latest observed round-trip time in milliseconds (0 if never measured).
+    /// Consulted by `main.rs`'s reconnect loop to feed `ServerPool::update_rtt`
+    /// for `PoolMode::LatencyBased` selection.
+    pub fn last_rtt_ms(&self) -> u16 {
+        self.quality_tracker.rtt_ms()
+    }
+
     async fn apply_server_network_override(
         &mut self,
         network_config: ClientNetworkConfig,
@@ -1377,9 +1400,29 @@ impl AivpnClient {
                 std::path::PathBuf::from("/tmp/aivpn-traffic.stats"),
             ];
 
-            // Write initial stats
+            // Session epoch (unix ms), captured ONCE when this session's stats
+            // task starts. GUIs key on a CHANGE in `since` to detect a silent
+            // in-process reconnect: it tells them to accept the new (lower)
+            // counters and restart the displayed uptime together, instead of
+            // freezing on the old totals. The pre-session zero-writes in
+            // main.rs deliberately carry NO `since` — no session exists yet.
+            let session_since_ms = epoch_ms();
+
+            // Write initial stats. O_NOFOLLOW/create_new-hardened atomic write
+            // (secure_write.rs): these paths fall back to predictable
+            // world-writable /tmp locations, which a local attacker could
+            // pre-plant as a symlink to a file this (possibly root-run)
+            // process can write. Uses spawn_blocking (mirroring what
+            // tokio::fs::write already does internally) since the hardened
+            // write is a handful of sync syscalls, not the tokio async-fs API.
+            let initial = format!("sent:0,received:0,since:{}", session_since_ms);
             for path in &stats_paths {
-                let _ = tokio::fs::write(path, "sent:0,received:0").await;
+                let p = path.clone();
+                let data = initial.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    crate::secure_write::write_status_best_effort(&p, data.as_bytes())
+                })
+                .await;
             }
             info!("Initial stats written");
 
@@ -1391,9 +1434,17 @@ impl AivpnClient {
                 }
                 let sent = stats_bytes_sent.load(Ordering::Relaxed);
                 let received = stats_bytes_received.load(Ordering::Relaxed);
-                let stats = format!("sent:{},received:{}", sent, received);
+                let stats = format!(
+                    "sent:{},received:{},since:{}",
+                    sent, received, session_since_ms
+                );
                 for path in &stats_paths {
-                    let _ = tokio::fs::write(path, &stats).await;
+                    let p = path.clone();
+                    let data = stats.clone();
+                    let _ = tokio::task::spawn_blocking(move || {
+                        crate::secure_write::write_status_best_effort(&p, data.as_bytes())
+                    })
+                    .await;
                 }
             }
         });
@@ -1453,6 +1504,11 @@ impl AivpnClient {
         let mut rx_watchdog = tokio::time::interval(Duration::from_secs(5));
         rx_watchdog.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut last_rx = std::time::Instant::now();
+        // Post-freeze/suspend liveness probe state (see WAKE_GAP_THRESHOLD):
+        // stamp of the previous watchdog tick, and, when a gap was detected,
+        // (deadline, armed_at, gap) of the pending probe.
+        let mut last_watchdog_tick = std::time::Instant::now();
+        let mut wake_probe: Option<(Instant, Instant, Duration)> = None;
         // Reset the DATA-plane liveness markers for THIS connection: they are
         // struct fields (stamped inside process_decoded) and would otherwise
         // carry a stale stall over from a previous session.
@@ -1501,6 +1557,47 @@ impl AivpnClient {
                 }
 
                 _ = rx_watchdog.tick() => {
+                    // Post-freeze/suspend liveness probe (see WAKE_GAP_THRESHOLD):
+                    // a tick gap ≫ the 5 s watchdog cadence means the process
+                    // was frozen or the machine suspended. Arm a probe: unless
+                    // ANY decodable RX arrives within the window (keepalives
+                    // fire immediately after wake), the session is condemned
+                    // now instead of lingering dead until RX silence.
+                    let tick_now = Instant::now();
+                    let tick_gap = tick_now.duration_since(last_watchdog_tick);
+                    last_watchdog_tick = tick_now;
+                    if tick_gap > WAKE_GAP_THRESHOLD && wake_probe.is_none() {
+                        let window = Duration::from_millis(
+                            self.keepalive_interval_ms.load(Ordering::Relaxed),
+                        )
+                        .saturating_mul(2)
+                        .clamp(WAKE_PROBE_WINDOW_MIN, WAKE_PROBE_WINDOW_MAX);
+                        info!(
+                            "Watchdog tick gap {tick_gap:?} (process frozen or system suspended) — \
+                             post-wake liveness probe armed ({window:?})"
+                        );
+                        wake_probe = Some((tick_now + window, tick_now, tick_gap));
+                    }
+                    if let Some((deadline, armed_at, gap)) = wake_probe {
+                        if last_rx >= armed_at {
+                            // Decodable RX after the wake moment — session alive.
+                            wake_probe = None;
+                        } else if tick_now >= deadline {
+                            warn!(
+                                "post-wake liveness probe: no RX for {:?} after a {:?} \
+                                 freeze/suspend gap — reconnecting",
+                                last_rx.elapsed(),
+                                gap,
+                            );
+                            break Err(Error::Session(format!(
+                                "post-wake liveness probe: no RX for {:?} after a {:?} \
+                                 freeze/suspend gap — reconnecting",
+                                last_rx.elapsed(),
+                                gap,
+                            )));
+                        }
+                    }
+
                     // K6: periodic kernel tag-window upkeep. The resonance time
                     // window rotates every 10 s and idle/quiet periods deliver
                     // no fallback packets to drive the receive-path refresh, so
@@ -1920,7 +2017,12 @@ impl AivpnClient {
             keepalive_sent_ms,
             last_tx_ms,
             fec_encoder: if fec_n > 0 {
-                Some(aivpn_common::fec::FecEncoder::new(fec_n, 1500))
+                // 1500 == MAX_PACKET_SIZE. TunnelConfig::from_network_config
+                // and Tunnel::apply_network_config both clamp the (possibly
+                // server-pushed) MTU to this same bound before it's ever
+                // applied to the TUN device, so no payload fed here can
+                // legitimately exceed it — see the comments there.
+                Some(aivpn_common::fec::FecEncoder::new(fec_n, MAX_PACKET_SIZE))
             } else {
                 None
             },
@@ -2080,6 +2182,10 @@ impl AivpnClient {
             } => {
                 // The server signs the raw mask_data bytes (sign_mask() in session.rs).
                 // Verify before deserialising so a bad signature is caught immediately.
+                // `transport_verified` is true ONLY when a server_signing_key is
+                // configured AND the ed25519 signature over THIS exact mask_data
+                // payload checked out — never merely because a key is absent.
+                let mut transport_verified = false;
                 if let Some(signing_key) = &self.config.server_signing_key {
                     use ed25519_dalek::{Signature, Verifier, VerifyingKey};
                     match VerifyingKey::from_bytes(signing_key) {
@@ -2089,6 +2195,7 @@ impl AivpnClient {
                                 warn!("MaskUpdate rejected: invalid ed25519 signature");
                                 return Ok(());
                             }
+                            transport_verified = true;
                         }
                         Err(e) => {
                             warn!("MaskUpdate rejected: bad signing key in config: {}", e);
@@ -2106,7 +2213,24 @@ impl AivpnClient {
                         // over the AEAD-authenticated session channel and are
                         // not independently verifiable (their perturbation
                         // shifts signature-covered fields).
-                        if !new_mask.is_derived_variant() {
+                        //
+                        // SECURITY: that exemption must NOT be granted on the
+                        // mask_id prefix alone. `is_derived_variant()` is a
+                        // pure string-prefix test ("polymorphic:"/"bootstrap:")
+                        // on content that lives INSIDE mask_data — i.e.
+                        // attacker-supplied once transport auth is unavailable
+                        // (no server_signing_key configured, or on a build
+                        // that never sets one). Without also requiring
+                        // transport_verified, anyone able to reach this path
+                        // without a valid transport signature could
+                        // manufacture a mask_id starting with those prefixes
+                        // purely to skip verify_mask_artifact, bypassing the
+                        // operator-signature gate entirely regardless of
+                        // mask_verify_mode. Gate the exemption on BOTH: the
+                        // mask claiming to be a derived variant AND the
+                        // transport signature having actually proven this
+                        // exact payload came from the real server.
+                        if !(new_mask.is_derived_variant() && transport_verified) {
                             let verdict = aivpn_common::mask::verify_mask_artifact(
                                 &new_mask,
                                 self.config.mask_operator_pubkey.as_ref(),
@@ -3088,30 +3212,32 @@ impl AivpnClient {
             r#"{{"quality":{},"rtt_ms":{},"jitter_ms":{},"adaptive":{}}}"#,
             score, rtt_ms, jitter_ms, adaptive_level
         );
+        // O_NOFOLLOW/create_new-hardened atomic write (secure_write.rs): this
+        // falls back to a predictable world-writable /tmp path, which a
+        // local attacker could pre-plant as a symlink to a file this
+        // (possibly root-run) process can write.
         #[cfg(windows)]
         {
             let path = std::env::temp_dir().join("aivpn-quality.json");
-            if let Err(e) = std::fs::write(&path, &content) {
-                debug!("quality file write failed: {e}");
+            if !crate::secure_write::write_status_best_effort(&path, content.as_bytes()) {
+                debug!("quality file write failed");
             }
         }
         #[cfg(not(windows))]
         {
             let primary = std::path::PathBuf::from("/var/run/aivpn/quality.json");
             let fallback = std::path::PathBuf::from("/tmp/aivpn-quality.json");
-            let wrote = if let Some(dir) = primary.parent() {
-                if std::fs::create_dir_all(dir).is_ok() {
-                    std::fs::write(&primary, &content).is_ok()
-                } else {
-                    false
-                }
-            } else {
-                false
-            };
-            if !wrote {
-                if let Err(e) = std::fs::write(&fallback, &content) {
-                    debug!("quality file write failed: {e}");
-                }
+            let dir_ok = primary
+                .parent()
+                .map(std::fs::create_dir_all)
+                .map(|r| r.is_ok())
+                .unwrap_or(false);
+            let wrote = dir_ok
+                && crate::secure_write::write_status_best_effort(&primary, content.as_bytes());
+            if !wrote
+                && !crate::secure_write::write_status_best_effort(&fallback, content.as_bytes())
+            {
+                debug!("quality file write failed");
             }
         }
     }

@@ -347,7 +347,10 @@ int aivpn_egress_set(int udp_fd, u32 tun_ifindex, u32 enable)
 				sock_put(aivpn_egress_sk);
 				aivpn_egress_sk = NULL;
 			}
-			aivpn_egress_net = NULL;
+			if (aivpn_egress_net) {
+				put_net(aivpn_egress_net);
+				aivpn_egress_net = NULL;
+			}
 			WRITE_ONCE(aivpn_egress_tun_ifindex, 0);
 			aivpn_info("downlink egress hook disabled\n");
 		}
@@ -378,7 +381,10 @@ int aivpn_egress_set(int udp_fd, u32 tun_ifindex, u32 enable)
 		}
 		aivpn_egress_sk  = sock->sk;
 		sock_hold(aivpn_egress_sk);
-		aivpn_egress_net = sock_net(aivpn_egress_sk);
+		/* Take our own netns reference: the cached pointer must stay
+		 * valid for nf_unregister_net_hook() at disable/fini time even
+		 * if the socket's implicit hold ever stops covering it. */
+		aivpn_egress_net = get_net(sock_net(aivpn_egress_sk));
 		/* Capture the wire source ip:port from the server socket; the kernel
 		 * xmit socket (created below) carries a different, ephemeral port. */
 		aivpn_egress_saddr = inet_sk(aivpn_egress_sk)->inet_saddr;
@@ -403,6 +409,7 @@ int aivpn_egress_set(int udp_fd, u32 tun_ifindex, u32 enable)
 			aivpn_egress_ksock = NULL;
 			sock_put(aivpn_egress_sk);
 			aivpn_egress_sk  = NULL;
+			put_net(aivpn_egress_net);
 			aivpn_egress_net = NULL;
 			mutex_unlock(&aivpn_egress_lock);
 			aivpn_err("downlink egress kernel socket create failed: %d\n",
@@ -419,6 +426,7 @@ int aivpn_egress_set(int udp_fd, u32 tun_ifindex, u32 enable)
 		aivpn_egress_ksock = NULL;
 		sock_put(aivpn_egress_sk);
 		aivpn_egress_sk  = NULL;
+		put_net(aivpn_egress_net);
 		aivpn_egress_net = NULL;
 		WRITE_ONCE(aivpn_egress_tun_ifindex, 0);
 		mutex_unlock(&aivpn_egress_lock);

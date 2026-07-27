@@ -194,6 +194,18 @@ pub struct Session {
     /// PoolSync is an attempt to inject or overwrite client records.
     pub is_pool_peer: bool,
 
+    /// Return-routability gate for the (potentially amplifying)
+    /// `BootstrapDescriptorUpdate` burst: set once that burst has actually
+    /// been sent for this session. Sending is deferred from immediately
+    /// after ServerHello until the client proves — by sending a packet
+    /// tagged with the ratcheted keys — that it genuinely received
+    /// ServerHello at its real address (see the `is_ratcheted_tag` branch in
+    /// `Gateway::handle_packet`). Without this a spoofed-source handshake
+    /// alone triggers a multi-packet reply burst toward the spoofed victim
+    /// with no proof the initiator can even receive it — a reflection/
+    /// amplification primitive.
+    pub bootstrap_descriptors_sent: bool,
+
     /// Pending keypair for in-flight key rotation. Set when server sends KeyRotate,
     /// cleared when client responds.
     pub pending_rekey_keypair: Option<KeyPair>,
@@ -372,6 +384,7 @@ impl Session {
             mtls_ok: true,
             is_site_peer: false,
             is_pool_peer: false,
+            bootstrap_descriptors_sent: false,
             pending_rekey_keypair: None,
             pending_rekey_attempts: 0,
             last_keyrotate_sent_at: now,

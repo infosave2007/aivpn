@@ -6,18 +6,15 @@ use aivpn_common::mask::{IATDistType, MaskProfile, SizeDistType};
 use aivpn_common::network_config::{netmask_to_prefix_len, ClientNetworkConfig, VpnNetworkConfig};
 use aivpn_server::audit_log::AuditLogger;
 use aivpn_server::backup::{export_server, import_server, ExportOptions};
-use aivpn_server::bootstrap_publish::BootstrapPublishConfig;
 #[cfg(feature = "dns")]
 use aivpn_server::dns_proxy::DnsProxyConfig;
 use aivpn_server::gateway::GatewayConfig;
-use aivpn_server::mtls::MtlsConfig;
-use aivpn_server::neural::NeuralConfig;
 use aivpn_server::pool_sync::{PeerSyncer, PoolSyncConfig};
 use aivpn_server::qos::{dscp_by_name, parse_bandwidth, ClientQos, QosEnforcer};
+use aivpn_server::server_config::{MtuSetting, ServerFileConfig};
 use aivpn_server::site_sync::SiteToSiteConfig;
 use aivpn_server::{AivpnServer, ClientDatabase, ServerArgs};
 use clap::Parser;
-use serde::{Deserialize, Deserializer};
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -26,51 +23,6 @@ use tracing::{error, info};
 const DEFAULT_SERVER_CONFIG_PATH: &str = "/etc/aivpn/server.json";
 const LOCAL_SERVER_CONFIG_PATH: &str = "deploy/config/server.json";
 const DEFAULT_LISTEN_ADDR: &str = "0.0.0.0:443";
-
-/// `"auto"` or a fixed number in `server.json` `tun_mtu` field.
-#[derive(Debug, Clone)]
-enum MtuSetting {
-    Auto,
-    Fixed(u16),
-}
-
-impl<'de> Deserialize<'de> for MtuSetting {
-    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        use serde::de::Error;
-        let v = serde_json::Value::deserialize(d)?;
-        match v {
-            serde_json::Value::String(s) if s == "auto" => Ok(MtuSetting::Auto),
-            serde_json::Value::Number(n) => n
-                .as_u64()
-                .and_then(|n| if n <= 65535 { Some(n as u16) } else { None })
-                .map(MtuSetting::Fixed)
-                .ok_or_else(|| D::Error::custom("tun_mtu must be 0–65535")),
-            _ => Err(D::Error::custom("tun_mtu must be a number or \"auto\"")),
-        }
-    }
-}
-
-/// JSON-only representation of `network_config` that allows `"mtu": "auto"`.
-/// Converted to `VpnNetworkConfig` (with a concrete `u16` MTU) in `resolve_network_config`.
-/// Using a separate struct avoids touching `VpnNetworkConfig` which is also used on the wire.
-#[derive(Debug, Clone, Default, Deserialize)]
-struct JsonNetworkConfig {
-    server_vpn_ip: Option<Ipv4Addr>,
-    prefix_len: Option<u8>,
-    /// `"auto"` or absent → follow `tun_mtu`; a number → fixed (clamped to ≤ tun_mtu).
-    #[serde(default)]
-    mtu: Option<MtuSetting>,
-    #[serde(default)]
-    keepalive_secs: Option<u8>,
-    #[serde(default)]
-    ipv6_enabled: bool,
-    #[serde(default = "default_ipv6_prefix_str")]
-    ipv6_prefix: String,
-}
-
-fn default_ipv6_prefix_str() -> String {
-    "fd10:cafe::/48".to_string()
-}
 
 /// Probe the outbound-interface MTU via `/sys/class/net` and subtract VPN overhead.
 /// Falls back to `DEFAULT_TUN_MTU` on any error.
@@ -102,9 +54,33 @@ fn detect_mtu() -> u16 {
         Some(mtu) => {
             // 20 IP + 8 UDP + 8 tag + 1 pad_len + 2 inner_hdr + 16 poly1305 = 55; round to 64
             let overhead: u16 = 64;
-            let effective = mtu
-                .saturating_sub(overhead)
-                .clamp(1200, aivpn_server::nat::DEFAULT_TUN_MTU);
+            let usable = mtu.saturating_sub(overhead);
+            if usable < 576 {
+                // Physical MTU below the IPv4 minimum after overhead — almost
+                // certainly a mis-detected interface; treat like detection
+                // failure rather than configuring an unusable TUN MTU.
+                info!(
+                    "MTU auto-detection: physical={} (dev={}) leaves only {} usable — \
+                     ignoring, using default {}",
+                    mtu,
+                    iface.as_deref().unwrap_or("?"),
+                    usable,
+                    aivpn_server::nat::DEFAULT_TUN_MTU
+                );
+                return aivpn_server::nat::DEFAULT_TUN_MTU;
+            }
+            // Cap at the default, but never floor ABOVE the usable size: a
+            // small physical MTU used to be clamped UP to 1200, producing
+            // tunnel packets that could not fit the physical link.
+            let effective = usable.min(aivpn_server::nat::DEFAULT_TUN_MTU);
+            if effective < 1200 {
+                tracing::warn!(
+                    "MTU auto-detected below the typical 1200 floor (physical={}, tun={}) — \
+                     small-MTU link, throughput may suffer",
+                    mtu,
+                    effective
+                );
+            }
             info!(
                 "MTU auto-detected: physical={} (dev={}) → tun={}",
                 mtu,
@@ -122,103 +98,6 @@ fn detect_mtu() -> u16 {
             aivpn_server::nat::DEFAULT_TUN_MTU
         }
     }
-}
-
-#[derive(Debug, Clone, Default, Deserialize)]
-struct ServerFileConfig {
-    listen_addr: Option<String>,
-    tun_name: Option<String>,
-    tun_addr: Option<Ipv4Addr>,
-    tun_netmask: Option<Ipv4Addr>,
-    network_config: Option<JsonNetworkConfig>,
-    mask_dir: Option<String>,
-    bootstrap_mask_files: Option<Vec<String>>,
-    session_timeout_secs: Option<u64>,
-    idle_timeout_secs: Option<u64>,
-    tun_mtu: Option<MtuSetting>,
-    #[serde(default)]
-    pool: Option<PoolSyncConfig>,
-    /// Unix socket path for the management HTTP API (the aivpn-web panel
-    /// connects here). CLI `--management-socket` / `AIVPN_MANAGEMENT_SOCKET`
-    /// take precedence; this lets the socket be set from server.json too.
-    #[cfg(all(feature = "management-api", unix))]
-    #[serde(default)]
-    management_socket: Option<String>,
-    #[serde(default)]
-    site_to_site: Option<SiteToSiteConfig>,
-    #[serde(default)]
-    mtls: Option<MtlsConfig>,
-    #[cfg(feature = "dns")]
-    #[serde(default)]
-    dns: Option<DnsProxyConfig>,
-    #[serde(default)]
-    allow_peer_routing: Option<bool>,
-    /// A7 downlink shaping parity. Absent = enabled (pad server→client DATA to
-    /// the session mask's own size distribution). Set `false` for the
-    /// throughput-first profile.
-    #[serde(default)]
-    downlink_shaping: Option<bool>,
-    /// Neural Resonance master switch. Absent = enabled (the default). Set
-    /// `false` to turn off compromise detection entirely: the gateway skips the
-    /// periodic resonance loop, so neither the per-mask autoencoder (MSE) nor
-    /// its sibling inline ML-DPI "reads-as-tunnel" gate runs and neither can
-    /// trigger a mask rotation. Useful for debugging, perf profiling, or
-    /// silencing false positives without a rebuild.
-    #[serde(default)]
-    neural_enabled: Option<bool>,
-    /// Neural Resonance / ML-DPI gate tuning. A `"neural"` block whose fields
-    /// override `NeuralConfig` defaults (thresholds, check interval, rotation
-    /// cooldown). Absent = built-in defaults. Lets operators calibrate detection
-    /// (Part 6) and lets tests force a rotation by dropping the thresholds.
-    #[serde(default)]
-    neural: Option<NeuralConfig>,
-    #[serde(default)]
-    bootstrap_publish: Option<BootstrapPublishConfig>,
-    /// §2 crowdsourced-feedback tuning, pushed to opted-in clients via
-    /// `FeedbackConfig` so thresholds can change without a client release.
-    #[serde(default)]
-    feedback: Option<FeedbackFileConfig>,
-    /// §3 F "every session polymorphic" server policy — see
-    /// `PolymorphicFileConfig`. Absent = disabled (opt-in `MaskPreference`
-    /// remains the only way a client gets a polymorphic mask).
-    #[serde(default)]
-    polymorphic: Option<PolymorphicFileConfig>,
-    /// R2 Phase B: path to the operator Ed25519 mask-signing key (32-byte
-    /// seed, raw or base64). Signs auto-generated masks post self-test.
-    #[serde(default)]
-    mask_signing_key: Option<String>,
-    /// R2 Phase B: operator Ed25519 verifying public key (base64, 32 bytes)
-    /// for mask-load verification. Derived from `mask_signing_key` if absent.
-    #[serde(default)]
-    mask_operator_pubkey: Option<String>,
-    /// R2 Phase B: mask verification mode on disk load: "off" | "warn"
-    /// (default) | "enforce".
-    #[serde(default)]
-    mask_verify_mode: Option<String>,
-}
-
-/// server.json `"feedback"` block (§2 M3). All optional; omitted keys fall back
-/// to the gateway defaults.
-#[derive(Debug, Clone, Default, Deserialize)]
-struct FeedbackFileConfig {
-    /// Min consecutive failures for a mask before a client records a failure.
-    report_failure_threshold: Option<u8>,
-    /// Min spacing (seconds) between a client's successive feedback sends.
-    report_interval_secs: Option<u32>,
-}
-
-/// server.json `"polymorphic"` block (§3 F). Example:
-/// ```json
-/// "polymorphic": { "all_sessions": true, "base_mask": "webrtc_zoom_v3" }
-/// ```
-/// `all_sessions` defaults to `false` (feature disabled) when the block or
-/// key is omitted. `base_mask` is optional — when absent, each session uses
-/// its own current mask as the polymorphic base instead of a fixed preset.
-#[derive(Debug, Clone, Default, Deserialize)]
-struct PolymorphicFileConfig {
-    #[serde(default)]
-    all_sessions: bool,
-    base_mask: Option<String>,
 }
 
 #[tokio::main]
@@ -313,10 +192,6 @@ async fn main() {
     }
     if let Some(ref id) = args.show_client {
         handle_show_client(&client_db, id, &args);
-        return;
-    }
-    if let Some(ref peer_addr) = args.enroll.clone() {
-        handle_enroll(&client_db, peer_addr, &args);
         return;
     }
     if let Some(ref output_path) = args.export.clone() {
@@ -415,6 +290,20 @@ async fn main() {
     } else {
         None
     };
+    // Ed25519 signing (verifying) pubkey for the `sk` field of API-issued
+    // connection keys — same derivation as the CLI's
+    // `load_server_signing_public_key`, so panel-provisioned clients can
+    // verify signed server messages exactly like CLI-provisioned ones.
+    #[cfg(all(feature = "management-api", unix))]
+    let mgmt_signing_pubkey = if server_private_key != [0u8; 32] {
+        Some(
+            aivpn_server::gateway::derive_server_signing_key(&server_private_key)
+                .verifying_key()
+                .to_bytes(),
+        )
+    } else {
+        None
+    };
     #[cfg(all(feature = "management-api", unix))]
     let mgmt_server_addr = args.server_ip.as_ref().map(|ip| {
         if ip.parse::<SocketAddr>().is_ok() {
@@ -448,14 +337,27 @@ async fn main() {
 
     // Audit logger
     let audit_logger = AuditLogger::new(std::path::Path::new(&args.audit_log));
+    // Clone for the management API before GatewayConfig consumes the original,
+    // so API mutations are audit-logged with AuditActor::Api.
+    #[cfg(all(feature = "management-api", unix))]
+    let mgmt_audit_log = audit_logger.clone();
 
-    // Pool sync — start listener + outbound tasks if pool is configured
-    let pool_sync_config: Option<PoolSyncConfig> = args
-        .pool_config
-        .as_deref()
-        .and_then(|p| std::fs::read_to_string(p).ok())
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .or_else(|| file_config.as_ref().and_then(|c| c.pool.clone()));
+    // Pool sync — start listener + outbound tasks if pool is configured.
+    // An EXPLICITLY passed --pool-config must hard-fail on read/parse errors:
+    // silently falling back used to disable pool sync on a simple typo.
+    let pool_sync_config: Option<PoolSyncConfig> = match args.pool_config.as_deref() {
+        Some(p) => {
+            let content = std::fs::read_to_string(p).unwrap_or_else(|e| {
+                eprintln!("Failed to read pool config '{}': {}", p, e);
+                std::process::exit(1);
+            });
+            Some(serde_json::from_str(&content).unwrap_or_else(|e| {
+                eprintln!("Failed to parse pool config '{}': {}", p, e);
+                std::process::exit(1);
+            }))
+        }
+        None => file_config.as_ref().and_then(|c| c.pool.clone()),
+    };
 
     // Clone client_db for pool sync before it is consumed by GatewayConfig.
     let client_db_for_sync: Option<Arc<ClientDatabase>> =
@@ -578,10 +480,12 @@ async fn main() {
                                 socket_path: socket,
                                 server_pub_key: mgmt_pub_key,
                                 server_addr: mgmt_server_addr,
+                                server_signing_pubkey: mgmt_signing_pubkey,
                                 config_path: mgmt_config_path,
                                 clients_db_path: mgmt_clients_db_path,
                                 mask_dir: mgmt_mask_dir,
                                 audit_log_path: mgmt_audit_log_path,
+                                audit_log: Some(mgmt_audit_log),
                                 bootstrap_descriptors,
                                 mask_operator_pubkey: mgmt_mask_operator_pubkey,
                                 mask_verify_mode: mgmt_mask_verify_mode,
@@ -651,18 +555,26 @@ async fn main() {
                                 exit_node
                             );
                         }
-                        Some(sync_key) => {
-                            if let Some(cf) = aivpn_server::chain_forwarder::ChainForwarder::new(
-                                exit_node,
-                                sync_key,
-                                pool_cfg.node_id.as_deref(),
-                            )
-                            .await
-                            {
+                        Some(sync_key) => match aivpn_server::chain_forwarder::ChainForwarder::new(
+                            exit_node,
+                            sync_key,
+                            pool_cfg.node_id.as_deref(),
+                        )
+                        .await
+                        {
+                            Some(cf) => {
                                 server.set_chain_forwarder(cf);
                                 info!("Multi-hop: chain forwarding to exit node {}", exit_node);
                             }
-                        }
+                            None => {
+                                error!(
+                                    "Multi-hop: chain forwarder FAILED to start \
+                                         (exit_node={}) — multi-hop is disabled; see the \
+                                         preceding warnings for the cause",
+                                    exit_node
+                                );
+                            }
+                        },
                     }
                 }
             }
@@ -839,18 +751,43 @@ fn handle_gen_mask_signing_key(path: &str) {
     let mut seed = [0u8; 32];
     rand::rngs::OsRng.fill_bytes(&mut seed);
     let b64 = base64::engine::general_purpose::STANDARD.encode(seed);
-    if std::path::Path::new(path).exists() {
-        eprintln!("Refusing to overwrite existing key file '{}'", path);
-        std::process::exit(1);
-    }
-    if let Err(e) = std::fs::write(path, &b64) {
-        eprintln!("Failed to write '{}': {}", path, e);
-        std::process::exit(1);
-    }
+    // MEDIUM (server-sec): create the key file atomically with 0600 already
+    // set (O_EXCL + mode in a single open()) instead of write-then-chmod —
+    // the latter leaves a window where the key briefly exists with the
+    // process umask's (often world/group-readable) permissions before the
+    // follow-up chmod lands. `create_new` doubles as the existing
+    // don't-overwrite check, so the separate `exists()` probe is removed
+    // (it was itself a TOCTOU race against this same open()).
     #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    let opened = {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+    };
+    #[cfg(not(unix))]
+    let opened = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path);
+    match opened {
+        Ok(mut f) => {
+            use std::io::Write;
+            if let Err(e) = f.write_all(b64.as_bytes()) {
+                eprintln!("Failed to write '{}': {}", path, e);
+                std::process::exit(1);
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            eprintln!("Refusing to overwrite existing key file '{}'", path);
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("Failed to create '{}': {}", path, e);
+            std::process::exit(1);
+        }
     }
     let pubkey = ed25519_dalek::SigningKey::from_bytes(&seed)
         .verifying_key()
@@ -867,7 +804,11 @@ fn handle_gen_mask_signing_key(path: &str) {
 /// the corpus survives `mask_verify_mode=enforce`. The reverse profile is signed
 /// first because the outer signature covers it.
 fn handle_sign_mask_dir(dir: &str, args: &ServerArgs) {
-    let seed = match resolve_mask_signing_key(args, None) {
+    // Load server.json first so a config-only `mask_signing_key` works here
+    // too (previously only the CLI/env flag was consulted).
+    let config_path = resolve_config_path(args);
+    let file_config = load_server_file_config(config_path.as_deref());
+    let seed = match resolve_mask_signing_key(args, file_config.as_ref()) {
         Some(s) => s,
         None => {
             eprintln!("--sign-mask-dir requires --mask-signing-key (or config mask_signing_key)");
@@ -1504,86 +1445,6 @@ fn resolve_mask_dir(args: &ServerArgs, file_config: Option<&ServerFileConfig>) -
     PathBuf::from(DEFAULT_MASK_DIR)
 }
 
-fn handle_enroll(db: &ClientDatabase, peer_addr: &str, args: &ServerArgs) {
-    use std::io::{Read, Write};
-    use std::net::TcpStream;
-    use std::time::Duration;
-
-    let stream = TcpStream::connect_timeout(
-        &peer_addr.parse().unwrap_or_else(|_| {
-            eprintln!("❌ Invalid peer address: {}", peer_addr);
-            std::process::exit(1);
-        }),
-        Duration::from_secs(10),
-    );
-    let mut stream = match stream {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("❌ Cannot connect to peer {}: {}", peer_addr, e);
-            std::process::exit(1);
-        }
-    };
-
-    // Send enroll probe: our server public key fingerprint
-    let pub_key = load_server_public_key(args);
-    let probe = serde_json::json!({
-        "action": "enroll",
-        "pub_key": pub_key.map(|k| hex::encode(k)).unwrap_or_default(),
-    })
-    .to_string();
-    let len = (probe.len() as u32).to_le_bytes();
-    let _ = stream.write_all(&len);
-    let _ = stream.write_all(probe.as_bytes());
-
-    // Read peer response
-    let mut len_buf = [0u8; 4];
-    if stream.read_exact(&mut len_buf).is_err() {
-        eprintln!("❌ Peer did not respond to enroll probe");
-        std::process::exit(1);
-    }
-    let msg_len = u32::from_le_bytes(len_buf) as usize;
-    let mut msg_buf = vec![0u8; msg_len.min(1 << 20)];
-    if stream.read_exact(&mut msg_buf).is_err() {
-        eprintln!("❌ Failed to read peer response");
-        std::process::exit(1);
-    }
-    let resp: serde_json::Value = serde_json::from_slice(&msg_buf).unwrap_or_default();
-
-    if resp.get("status").and_then(|v| v.as_str()) != Some("ok") {
-        eprintln!(
-            "❌ Peer rejected enroll: {}",
-            resp.get("message")
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown error")
-        );
-        std::process::exit(1);
-    }
-
-    // Push our client database to the peer
-    let clients_json = match db.export_json() {
-        Ok(j) => j,
-        Err(e) => {
-            eprintln!("❌ Failed to export client DB: {}", e);
-            std::process::exit(1);
-        }
-    };
-    let push = serde_json::json!({
-        "action": "push_clients",
-        "clients": serde_json::from_str::<serde_json::Value>(&clients_json).unwrap_or_default(),
-    })
-    .to_string();
-    let len = (push.len() as u32).to_le_bytes();
-    let _ = stream.write_all(&len);
-    let _ = stream.write_all(push.as_bytes());
-
-    println!(
-        "✅ Peer {} enrolled. Clients pushed: {}",
-        peer_addr,
-        db.list_clients().len()
-    );
-    println!("   Add '{}' to your pool config to enable sync.", peer_addr);
-}
-
 fn handle_export(args: &ServerArgs, output_path: &str) {
     let opts = ExportOptions {
         include_clients: true,
@@ -1934,6 +1795,7 @@ fn handle_validate_mask(path: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aivpn_server::server_config::JsonNetworkConfig;
     use base64::Engine;
 
     fn test_args(listen: &str) -> ServerArgs {
@@ -1953,7 +1815,6 @@ mod tests {
             validate_mask: None,
             #[cfg(all(feature = "management-api", unix))]
             management_socket: None,
-            enroll: None,
             pool_config: None,
             export: None,
             import: None,

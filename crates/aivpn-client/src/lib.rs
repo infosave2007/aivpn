@@ -22,6 +22,7 @@ pub mod mask_catalog;
 pub mod mask_feedback_log;
 pub mod proxy;
 pub mod record_cmd;
+pub mod secure_write;
 pub mod server_pool;
 pub mod tunnel;
 

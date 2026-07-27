@@ -221,17 +221,25 @@ proxy.all('/*', requireReadAccess(), async (c) => {
   // memory. Reject early when a declared Content-Length exceeds the limit; the
   // streamed guard in forwardToUnixSocket catches an absent/lying length.
   // SSE responses are unaffected — this limits the request body only.
+  // Backup imports get their own (much larger) cap: real backups exceed the
+  // general-purpose limit by design (the daemon itself accepts up to 50 MB).
+  const maxBodyBytes = canonicalPath === '/api/v1/backup/import'
+    ? config.PROXY_MAX_BACKUP_BODY_BYTES
+    : config.PROXY_MAX_BODY_BYTES
+  const tooLargeMsg = `Payload too large (limit ${maxBodyBytes} bytes; raise ${
+    canonicalPath === '/api/v1/backup/import' ? 'PROXY_MAX_BACKUP_BODY_BYTES' : 'PROXY_MAX_BODY_BYTES'
+  } if this request is legitimate)`
   if (hasBody) {
     const declaredLen = Number(c.req.header('content-length'))
-    if (Number.isFinite(declaredLen) && declaredLen > config.PROXY_MAX_BODY_BYTES) {
-      return c.json({ error: 'Payload too large' }, 413)
+    if (Number.isFinite(declaredLen) && declaredLen > maxBodyBytes) {
+      return c.json({ error: tooLargeMsg }, 413)
     }
   }
 
   const body = hasBody ? c.req.raw.body : null
 
   try {
-    const upstream = await forwardToUnixSocket(method, fullPath, forwardHeaders, body, config.PROXY_MAX_BODY_BYTES)
+    const upstream = await forwardToUnixSocket(method, fullPath, forwardHeaders, body, maxBodyBytes)
 
     // Determine if this is an SSE stream
     const contentType = upstream.headers['content-type'] ?? ''
@@ -283,7 +291,7 @@ proxy.all('/*', requireReadAccess(), async (c) => {
     })
   } catch (err: unknown) {
     if (err instanceof PayloadTooLargeError) {
-      return c.json({ error: 'Payload too large' }, 413)
+      return c.json({ error: tooLargeMsg }, 413)
     }
     const message = err instanceof Error ? err.message : String(err)
     // Common case: aivpn daemon not running

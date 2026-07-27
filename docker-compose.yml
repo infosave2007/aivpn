@@ -6,15 +6,27 @@ services:
       context: .
       dockerfile: ${AIVPN_SERVER_DOCKERFILE:-Dockerfile}
     restart: unless-stopped
+    # host networking is required: the server needs to see real client source
+    # ports/addresses for the UDP data plane and NAT/MASQUERADE setup, which
+    # a bridge network's NAT layer would hide or break. This is the accepted
+    # trade-off for a VPN gateway; capabilities below are minimized instead.
     network_mode: "host"
+    cap_drop:
+      - ALL
     cap_add:
+      # NET_ADMIN only: TUN device management + policy routing. NET_RAW was
+      # dropped — no code path in this repo opens a raw/packet socket.
       - NET_ADMIN
-      - NET_RAW
+    security_opt:
+      - "no-new-privileges:true"
     devices:
       - /dev/net/tun:/dev/net/tun
     tmpfs:
-      - /run:mode=1777,size=64M
-      - /tmp:mode=1777,size=128M
+      # Single-process root container (see Dockerfile) — no other local user
+      # needs access, so /run and /tmp are 0700 rather than the world-writable
+      # sticky-bit default (1777).
+      - /run:mode=0700,size=64M
+      - /tmp:mode=0700,size=128M
     mem_limit: 800m
     memswap_limit: 800m
     cpu_shares: 512
@@ -24,6 +36,10 @@ services:
     volumes:
       - ./deploy/config:/etc/aivpn
       - ./masks:/var/lib/aivpn/masks
+      # Management API socket (management-api feature → /run/aivpn/api.sock).
+      # /run is a tmpfs above, so the socket must be bind-mounted separately
+      # or the web panel on the host cannot attach to it.
+      - /run/aivpn:/run/aivpn
     logging:
       driver: "json-file"
       options:
@@ -31,51 +47,18 @@ services:
         max-file: "3"
     labels:
       - "com.aivpn.service=gateway"
-      - "com.aivpn.version=0.3.0"
+      - "com.aivpn.version=1.0.0"
 
-  # Prometheus (optional monitoring)
-  prometheus:
-    image: prom/prometheus:latest
-    restart: unless-stopped
-    ports:
-      - "9090:9090"
-    volumes:
-      - ./deploy/monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
-      - prometheus_data:/prometheus
-    command:
-      - '--config.file=/etc/prometheus/prometheus.yml'
-      - '--storage.tsdb.path=/prometheus'
-      - '--web.console.libraries=/usr/share/prometheus/console_libraries'
-      - '--web.console.templates=/usr/share/prometheus/consoles'
-    networks:
-      - aivpn
-    profiles:
-      - monitoring
-
-  # Grafana (optional visualization)
-  grafana:
-    image: grafana/grafana:latest
-    restart: unless-stopped
-    ports:
-      - "3000:3000"
-    environment:
-      - GF_SECURITY_ADMIN_PASSWORD=admin
-      - GF_USERS_ALLOW_SIGN_UP=false
-    volumes:
-      - grafana_data:/var/lib/grafana
-      - ./deploy/monitoring/grafana/dashboards:/etc/grafana/provisioning/dashboards
-      - ./deploy/monitoring/grafana/datasources:/etc/grafana/provisioning/datasources
-    networks:
-      - aivpn
-    depends_on:
-      - prometheus
-    profiles:
-      - monitoring
-
-volumes:
-  prometheus_data:
-  grafana_data:
-
-networks:
-  aivpn:
-    driver: bridge
+# Prometheus/Grafana (optional monitoring) live in a SEPARATE compose file —
+# deploy/monitoring/docker-compose.monitoring.yml — not here. Reason: Docker
+# Compose validates ${VAR:?required} interpolation for every service at
+# parse time, regardless of `profiles:`/`--profile` filtering. Grafana's
+# admin password is required-with-no-default (see that file), so keeping it
+# in *this* file would make `docker compose config`/`up` fail for ANY
+# invocation — including a plain `aivpn-server`-only deploy — unless the
+# operator also set a Grafana password they may never use. Splitting the
+# file scopes that requirement to only the operators who opt into
+# monitoring:
+#   docker compose -f docker-compose.yml \
+#     -f deploy/monitoring/docker-compose.monitoring.yml \
+#     --profile monitoring up -d

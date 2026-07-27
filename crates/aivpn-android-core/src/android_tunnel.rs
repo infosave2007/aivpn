@@ -50,6 +50,24 @@ const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(4); // below typical pr
 const KEEPALIVE_NAT_CAP: Duration = Duration::from_secs(25);
 const RX_SILENCE: Duration = Duration::from_secs(120); // absolute net: NOTHING decodes at all (control included)
 const RX_CHECK_INTERVAL: Duration = Duration::from_secs(2);
+// ── Post-freeze/suspend liveness probe ──
+// An OEM background freezer (cgroup freeze) or device suspend stops this
+// process entirely. CLOCK_MONOTONIC (Rust `Instant`) keeps counting through a
+// process freeze but does NOT advance during device suspend (that would be
+// CLOCK_BOOTTIME, which `Instant` does not use on Linux/Android) — so the
+// watchdog measures the tick gap on BOTH `Instant` and `SystemTime` (wall
+// clock, advances through suspend) and takes the larger, making the first
+// tick after either kind of gap see a value far beyond RX_CHECK_INTERVAL.
+// A session whose server-side state died during the gap would otherwise
+// linger dead for up to RX_SILENCE: keepalives resume unanswered, and the
+// data watchdog needs ≥TX_WITHOUT_RX_MIN_BYTES of uplink to condemn. After a
+// gap this large, demand ANY decodable RX within the probe window instead.
+const WAKE_GAP_THRESHOLD: Duration = Duration::from_secs(15);
+/// Probe window bounds: max(2×keepalive interval, MIN) capped at MAX — at
+/// least two keepalives (sent immediately after unfreeze) must have a chance
+/// to be answered before the session is condemned.
+const WAKE_PROBE_WINDOW_MIN: Duration = Duration::from_secs(10);
+const WAKE_PROBE_WINDOW_MAX: Duration = Duration::from_secs(60);
 // Data-plane watchdogs (see `data_watchdog_verdict`): clocked on DATA actually
 // delivered to the TUN, never on "any decode" — keepalive-acks and in-grace
 // KeyRotate retransmits must not mask a dead data downlink. The fast tier's
@@ -958,6 +976,15 @@ pub async fn run_tunnel_android(
             if let Ok(mut g) = BOOTSTRAP_DESCRIPTORS.lock() {
                 g.clear();
             }
+            // §M1: the sticky-mask state is just as server-scoped as the
+            // descriptors — a mask proven to pass DATA against server A (and
+            // its stall / handshake-fail streaks) says nothing about server B.
+            // Leaking it across a profile switch made the first attempts on
+            // the new server reuse the old server's mask instead of resolving
+            // fresh, and let stale streaks trip the fallback/abandon logic.
+            *LAST_GOOD_MASK.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            DATA_STALL_STREAK.store(0, Ordering::Relaxed);
+            HANDSHAKE_FAIL_STREAK.store(0, Ordering::Relaxed);
             *last = Some(server_key);
         }
     }
@@ -1291,6 +1318,14 @@ pub async fn run_tunnel_android(
     // healthy session) from a throttled one (repeated short data stalls).
     let session_established = Instant::now();
     HANDSHAKE_FAIL_STREAK.store(0, Ordering::Relaxed);
+    // H1: a disconnect that raced in while the handshake was completing must
+    // not announce "ready" — the platform's stopVpn() has already rendered
+    // DISCONNECTED and removed the foreground notification, so a late
+    // onTunnelReady would flip the UI back to CONNECTED and re-post a zombie
+    // ongoing notification for a session that is about to unwind.
+    if session.stop_requested.load(Ordering::SeqCst) {
+        return Ok(());
+    }
     notify_tunnel_ready(&vm, &vpn_service, &server_host);
     log::info!("aivpn: handshake + PFS ratchet complete");
 
@@ -1611,6 +1646,13 @@ pub async fn run_tunnel_android(
     // recreated every select! iteration (which would reset the timer).
     let mut rx_check = time::interval(RX_CHECK_INTERVAL);
     rx_check.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
+    // Post-freeze/suspend liveness probe state (see WAKE_GAP_THRESHOLD):
+    // stamp of the previous watchdog tick (both clocks — see the gap
+    // computation in the tick handler), and, when a gap was detected,
+    // (deadline, armed_at, gap) of the pending probe.
+    let mut last_watchdog_tick = Instant::now();
+    let mut last_watchdog_wall = std::time::SystemTime::now();
+    let mut wake_probe: Option<(Instant, Instant, Duration)> = None;
 
     loop {
         tokio::select! {
@@ -2096,26 +2138,66 @@ pub async fn run_tunnel_android(
                                         threshold, interval
                                     );
                                 }
-                                ControlPayload::MaskUpdate { mask_data, .. } => {
-                                    if let Some(mask) = aivpn_common::mimicry::decode_mask_update(&mask_data) {
+                                ControlPayload::MaskUpdate { mask_data, signature } => {
+                                    // Transport-level check: verify the server's ed25519
+                                    // signature over the raw `mask_data` bytes when a signing
+                                    // key is configured — mirrors desktop client.rs's
+                                    // `handle_server_control` (the server signs via
+                                    // `sign_mask()` in session.rs). This authenticates that
+                                    // THIS EXACT payload was pushed by the configured server.
+                                    //
+                                    // `None` = no signing key configured (can't check
+                                    // transport auth either way); `Some(false)` = a key IS
+                                    // configured and the signature failed to verify against
+                                    // it, so the payload is dropped before even being decoded.
+                                    let transport_verified: Option<bool> =
+                                        server_signing_key.map(|signing_key| {
+                                            use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+                                            match VerifyingKey::from_bytes(&signing_key) {
+                                                Ok(vk) => {
+                                                    let sig = Signature::from_bytes(&signature);
+                                                    vk.verify(&mask_data, &sig).is_ok()
+                                                }
+                                                Err(_) => false,
+                                            }
+                                        });
+                                    if transport_verified == Some(false) {
+                                        log::warn!(
+                                            "aivpn: MaskUpdate rejected: invalid ed25519 signature"
+                                        );
+                                    } else if let Some(mask) =
+                                        aivpn_common::mimicry::decode_mask_update(&mask_data)
+                                    {
                                         // R2 Phase B: shared artifact verification hook. The
                                         // operator pubkey is not yet plumbed through the JNI
                                         // config surface, so this runs as (None, warn) — a
                                         // silent no-op today. Once the pubkey/mode params are
                                         // added to the FFI, only these two arguments change and
                                         // Android inherits the same semantics as desktop.
-                                        // Derived variants are exempt (channel-authenticated).
-                                        let artifact_ok = mask.is_derived_variant() || {
-                                            let verdict = aivpn_common::mask::verify_mask_artifact(
-                                                &mask,
-                                                None,
-                                                aivpn_common::mask::MaskVerifyMode::Warn,
-                                            );
-                                            if !verdict.accept {
-                                                log::warn!("aivpn: MaskUpdate '{}' rejected: {:?}", mask.mask_id, verdict.detail);
-                                            }
-                                            verdict.accept
-                                        };
+                                        //
+                                        // SECURITY: derived variants (`polymorphic:`/
+                                        // `bootstrap:` mask_id prefix) are exempt from the
+                                        // artifact check ONLY when the transport-level ed25519
+                                        // signature above has verified THIS EXACT payload —
+                                        // never on the strength of the mask_id prefix string
+                                        // alone, since mask_id is attacker-controlled (server-
+                                        // sourced / MITM-able) content. Without a configured
+                                        // signing key, `transport_verified` can never be
+                                        // `Some(true)`, so every mask — derived or not — falls
+                                        // through to the artifact check.
+                                        let artifact_ok = (mask.is_derived_variant()
+                                            && transport_verified == Some(true))
+                                            || {
+                                                let verdict = aivpn_common::mask::verify_mask_artifact(
+                                                    &mask,
+                                                    None,
+                                                    aivpn_common::mask::MaskVerifyMode::Warn,
+                                                );
+                                                if !verdict.accept {
+                                                    log::warn!("aivpn: MaskUpdate '{}' rejected: {:?}", mask.mask_id, verdict.detail);
+                                                }
+                                                verdict.accept
+                                            };
                                         if artifact_ok {
                                             // Track the new mask's downlink length so subsequent
                                             // server DATA/control packets framed with it decode.
@@ -2187,6 +2269,52 @@ pub async fn run_tunnel_android(
 
             // ── RX silence detector (proper interval, not recreated each iteration) ──
             _ = rx_check.tick() => {
+                // Post-freeze/suspend liveness probe (see WAKE_GAP_THRESHOLD):
+                // a tick gap ≫ RX_CHECK_INTERVAL means the process was frozen
+                // (OEM freezer) or the device suspended. Arm a probe: unless
+                // ANY decodable RX arrives within the window (keepalives fire
+                // immediately after unfreeze), the session is condemned now
+                // instead of lingering dead until RX_SILENCE.
+                let tick_now = Instant::now();
+                let wall_now = std::time::SystemTime::now();
+                // Two clocks, because they miss different gaps: Instant
+                // (CLOCK_MONOTONIC) keeps counting through an OEM process
+                // freeze but STOPS during device suspend, while SystemTime
+                // (wall clock) advances through suspend. Take the larger gap
+                // so both a freeze and a deep-sleep suspend arm the probe.
+                // A negative wall diff (NTP step back) is treated as 0.
+                let mono_gap = tick_now.duration_since(last_watchdog_tick);
+                let wall_gap = wall_now
+                    .duration_since(last_watchdog_wall)
+                    .unwrap_or(Duration::ZERO);
+                let tick_gap = mono_gap.max(wall_gap);
+                last_watchdog_tick = tick_now;
+                last_watchdog_wall = wall_now;
+                if tick_gap > WAKE_GAP_THRESHOLD && wake_probe.is_none() {
+                    let window = Duration::from_millis(keepalive_ms.load(Ordering::Relaxed))
+                        .saturating_mul(2)
+                        .clamp(WAKE_PROBE_WINDOW_MIN, WAKE_PROBE_WINDOW_MAX);
+                    log::info!(
+                        "aivpn: watchdog tick gap {tick_gap:?} (process frozen or device suspended) — \
+                         post-wake liveness probe armed ({window:?})"
+                    );
+                    wake_probe = Some((tick_now + window, tick_now, tick_gap));
+                }
+                if let Some((deadline, armed_at, gap)) = wake_probe {
+                    if last_rx >= armed_at {
+                        // Decodable RX after the wake moment — session alive.
+                        wake_probe = None;
+                    } else if tick_now >= deadline {
+                        tun_reader_task.abort();
+                        upload_sender_task.abort();
+                        return Err(Error::Session(format!(
+                            "post-wake liveness probe: no RX for {:?} after a {:?} \
+                             freeze/suspend gap — reconnecting",
+                            last_rx.elapsed(),
+                            gap,
+                        )));
+                    }
+                }
                 // Data-plane watchdog: clocked on DATA delivered to the TUN,
                 // not on any decode — a downlink where only keepalive-acks /
                 // KeyRotate retransmits still authenticate is DEAD for the

@@ -107,6 +107,11 @@ int64_t aivpn_get_upload_bytes(void);
 /// Total bytes received from the server in the current session.
 int64_t aivpn_get_download_bytes(void);
 
+/// Wall-clock epoch milliseconds at which the current session became
+/// established, or 0 when no session is active. Same session scope as the
+/// byte counters, so the UI stopwatch can never desync from them.
+int64_t aivpn_get_connected_since_ms(void);
+
 /// Current connection quality score (0–100). Returns 0 when no session is active.
 int aivpn_get_quality_score(void);
 
@@ -178,6 +183,23 @@ int aivpn_start_recording(const char *service);
 
 /// Send RecordingStop to the active tunnel.
 void aivpn_stop_recording(void);
+
+/// Seed the process-global consecutive handshake-fail streak from a
+/// platform-persisted value. The streak drives the descriptor→builtin-preset
+/// fallback; it lives in a process-global static, but iOS tears the Network
+/// Extension process down between failed starts, so without re-seeding the
+/// fallback threshold could never be reached and a poisoned cached descriptor
+/// would block connecting until it expires. Call ONCE per extension process,
+/// before the first aivpn_run_tunnel attempt, with the value previously read
+/// via aivpn_get_handshake_fail_streak and persisted per server. Clamped
+/// internally against corrupted persisted values.
+void aivpn_seed_handshake_fail_streak(unsigned int streak);
+
+/// Current consecutive handshake-fail streak (see
+/// aivpn_seed_handshake_fail_streak). Read after each aivpn_run_tunnel return
+/// and persist per server; reset to 0 internally when a session's PFS ratchet
+/// completes and when the server key changes.
+unsigned int aivpn_get_handshake_fail_streak(void);
 
 /// §2 crowdsourced blocking feedback — whether the most recently completed
 /// aivpn_run_tunnel call ever reached a connected (post-handshake, PFS ratchet

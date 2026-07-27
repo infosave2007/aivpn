@@ -1,8 +1,13 @@
 # AIVPN Windows Client Build Dockerfile
-# Uses rust:latest to support libloading 0.9.0 which requires rustc 1.88+
+# Requires rustc 1.88+: wintun-bindings 0.7.39 (pulled in only for the
+# windows target) depends on libloading 0.9.0, whose Cargo.toml pins
+# rust-version = "1.88.0" — verified against the upstream Cargo.toml
+# (github.com/nagisa/rust_libloading, tag 0.9.0) before picking this tag.
+# Pinned to a concrete Debian-slim tag instead of the floating `rust:latest`.
 # Uses clang with Windows GNU target (no MSVC required)
+# TODO(security): pin with @sha256:<digest> once a digest is chosen to track.
 
-FROM rust:latest AS builder
+FROM rust:1.88-slim AS builder
 
 WORKDIR /app
 
@@ -38,5 +43,7 @@ COPY assets/masks assets/masks/
 RUN cargo build --release --target x86_64-pc-windows-gnu --bin aivpn-client
 
 # Stage 2: Extract binary
-FROM alpine:latest
+# Pinned to match the version already used by platforms/mikrotik/Dockerfile.
+# TODO(security): pin with @sha256:<digest> once a digest is chosen to track.
+FROM alpine:3.19
 COPY --from=builder /app/target/x86_64-pc-windows-gnu/release/aivpn-client.exe /aivpn-client.exe

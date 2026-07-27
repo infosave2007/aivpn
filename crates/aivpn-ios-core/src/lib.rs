@@ -12,12 +12,12 @@ use std::sync::atomic::Ordering;
 use aivpn_common::mask::BootstrapDescriptor;
 use aivpn_common::protocol::ControlPayload;
 use ios_tunnel::{
-    clear_pending_stop, get_active_download_bytes, get_active_upload_bytes, run_tunnel_ios,
-    send_control_payload, stop_active_tunnel, OnReadyFn, RecordingFeedback, SendCtx,
-    ACTIVE_ADAPTIVE_LEVEL, ACTIVE_FEEDBACK_INTERVAL, ACTIVE_FEEDBACK_THRESHOLD,
-    ACTIVE_QUALITY_SCORE, ACTIVE_RECORDING_FEEDBACK, ACTIVE_REGIONAL_HINTS_JSON, ASSIGNED_VPN_IP,
-    ATTEMPTED_MASK_FAMILY, EVER_CONNECTED, MASK_FEEDBACK_SENT, RECORDING_FEEDBACK_SEQ,
-    REGIONAL_HINTS_SEQ,
+    clear_pending_stop, get_active_connected_since_ms, get_active_download_bytes,
+    get_active_upload_bytes, run_tunnel_ios, send_control_payload, stop_active_tunnel, OnReadyFn,
+    RecordingFeedback, SendCtx, ACTIVE_ADAPTIVE_LEVEL, ACTIVE_FEEDBACK_INTERVAL,
+    ACTIVE_FEEDBACK_THRESHOLD, ACTIVE_QUALITY_SCORE, ACTIVE_RECORDING_FEEDBACK,
+    ACTIVE_REGIONAL_HINTS_JSON, ASSIGNED_VPN_IP, ATTEMPTED_MASK_FAMILY, EVER_CONNECTED,
+    HANDSHAKE_FAIL_STREAK, MASK_FEEDBACK_SENT, RECORDING_FEEDBACK_SEQ, REGIONAL_HINTS_SEQ,
 };
 
 /// Runs the full VPN tunnel session on the calling thread.
@@ -269,6 +269,14 @@ pub extern "C" fn aivpn_get_download_bytes() -> i64 {
     get_active_download_bytes() as i64
 }
 
+/// Wall-clock epoch milliseconds at which the current session became
+/// established, or 0 when no session is active. Same session scope as the
+/// byte counters, so the UI stopwatch can never desync from them.
+#[no_mangle]
+pub extern "C" fn aivpn_get_connected_since_ms() -> i64 {
+    get_active_connected_since_ms() as i64
+}
+
 /// Current connection quality score (0–100). Returns 0 when no session is active.
 #[no_mangle]
 pub extern "C" fn aivpn_get_quality_score() -> libc::c_int {
@@ -291,6 +299,31 @@ pub extern "C" fn aivpn_get_adaptive_level_hint() -> libc::c_int {
 #[no_mangle]
 pub extern "C" fn aivpn_get_assigned_vpn_ip() -> libc::c_uint {
     ASSIGNED_VPN_IP.load(Ordering::Relaxed) as libc::c_uint
+}
+
+/// Seed the process-global consecutive handshake-fail streak from a
+/// platform-persisted value. The streak drives the descriptor→builtin-preset
+/// fallback at `HANDSHAKE_FALLBACK_THRESHOLD`; it lives in a process-global
+/// static, but iOS tears the Network Extension process down between failed
+/// starts, so without re-seeding it the threshold could never be reached and
+/// a poisoned cached descriptor would block connecting until it expires.
+/// Call ONCE per extension process, before the first `aivpn_run_tunnel`
+/// attempt, with the value previously read via
+/// `aivpn_get_handshake_fail_streak` and persisted per server (App Group).
+/// Clamped to a sane bound so a corrupted persisted value cannot wedge the
+/// counter near overflow.
+#[no_mangle]
+pub extern "C" fn aivpn_seed_handshake_fail_streak(streak: libc::c_uint) {
+    HANDSHAKE_FAIL_STREAK.store(streak.min(1_000), Ordering::Relaxed);
+}
+
+/// Current consecutive handshake-fail streak (see
+/// `aivpn_seed_handshake_fail_streak`). Read after each `aivpn_run_tunnel`
+/// return and persist per server; reset to 0 internally when a session's PFS
+/// ratchet completes and when the server key changes.
+#[no_mangle]
+pub extern "C" fn aivpn_get_handshake_fail_streak() -> libc::c_uint {
+    HANDSHAKE_FAIL_STREAK.load(Ordering::Relaxed)
 }
 
 /// §2 crowdsourced blocking feedback — whether the most recently completed

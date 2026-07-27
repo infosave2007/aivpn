@@ -12,8 +12,8 @@ RUN apt-get update && apt-get install -y \
     libssl-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy workspace
-COPY Cargo.toml ./
+# Copy workspace (Cargo.lock pinned for reproducible release builds)
+COPY Cargo.toml Cargo.lock ./
 COPY crates/aivpn-common crates/aivpn-common/
 COPY crates/aivpn-server crates/aivpn-server/
 COPY crates/aivpn-client crates/aivpn-client/
@@ -23,13 +23,16 @@ COPY crates/aivpn-ios-core crates/aivpn-ios-core/
 COPY crates/aivpn-linux crates/aivpn-linux/
 COPY assets/masks assets/masks/
 
-# Build in release mode (Cargo.lock is auto-generated if missing).
+# Build in release mode with the committed Cargo.lock (--locked → reproducible).
 # Full feature set so the image works with the web panel (management-api →
 # /run/aivpn/api.sock), the metrics dashboard, and neural mask rotation —
 # matching `make server`. Use a custom build for a minimal gateway.
-RUN cargo build --release --bin aivpn-server --features "management-api,metrics,neural"
+RUN cargo build --locked --release --bin aivpn-server --features "management-api,metrics,neural"
 
 # Stage 2: Runtime
+# TODO(security): pin with @sha256:<digest> once a digest is chosen to track
+# (bookworm-slim is a floating tag; a digest pin trades that for a manual
+# bump on every base-image security update).
 FROM debian:bookworm-slim
 
 # Install runtime dependencies
@@ -53,8 +56,8 @@ COPY deploy/docker/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 
 # Create config directory and TUN device node
 RUN mkdir -p /etc/aivpn /dev/net /var/lib/aivpn/bootstrap /var/lib/aivpn/masks && \
-    mknod /dev/net/tun c 10 200 2>/dev/null || true && \
-    chmod 600 /dev/net/tun && \
+    { mknod /dev/net/tun c 10 200 2>/dev/null || true; } && \
+    { [ ! -e /dev/net/tun ] || chmod 600 /dev/net/tun; } && \
     chmod +x /usr/local/bin/docker-entrypoint.sh && \
     mkdir -p /usr/share/aivpn
 

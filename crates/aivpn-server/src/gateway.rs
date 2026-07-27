@@ -222,11 +222,23 @@ impl Default for GatewayConfig {
 pub struct MaskCatalog {
     /// Available masks (mask_id → MaskProfile)
     masks: DashMap<String, MaskProfile>,
-    /// Compromised mask IDs — never reuse
-    compromised: DashMap<String, Instant>,
+    /// Compromised masks, keyed by mask_id, holding the time they were
+    /// compromised AND the profile itself (H1: retained so
+    /// `sweep_expired_compromised` can restore it to `masks` after
+    /// `COMPROMISED_TTL` — a mask flagged compromised is not necessarily
+    /// compromised forever, and an operator running a small/single-mask
+    /// deployment must eventually regain a usable mask rather than being
+    /// permanently locked out of new handshakes).
+    compromised: DashMap<String, (Instant, MaskProfile)>,
     /// Primary mask used for initial handshake parsing.
     primary_mask_id: parking_lot::Mutex<String>,
 }
+
+/// H1: how long a mask stays excluded from rotation after being marked
+/// compromised, before `sweep_expired_compromised` gives it another chance.
+/// Generous — this is a last-resort backstop against total lockout, not a
+/// substitute for the DPI/anomaly detectors' own judgement.
+const COMPROMISED_TTL: Duration = Duration::from_secs(3600);
 
 impl MaskCatalog {
     pub fn new() -> Self {
@@ -249,10 +261,44 @@ impl MaskCatalog {
         }
     }
 
-    /// Mark a mask as compromised — remove from rotation
-    pub fn mark_compromised(&self, mask_id: &str) {
-        self.compromised.insert(mask_id.to_string(), Instant::now());
+    /// H1: mark `mask_id` compromised and hand back the fallback to switch
+    /// to — but ONLY if compromising it actually leaves a usable mask
+    /// behind. `select_fallback` is checked BEFORE any removal happens: the
+    /// old code removed first and checked after, so tripping the last (or
+    /// only) mask emptied the catalog and permanently locked out every
+    /// future handshake (`primary_mask()` → `None`), while existing
+    /// sessions kept working and masked the failure until their next
+    /// reconnect. Refusing the compromise when there is nowhere to fall
+    /// back to trades "one bad mask stays in rotation a bit longer" for
+    /// "the server never goes fully deaf" — `sweep_expired_compromised`
+    /// still gives previously-compromised masks a second chance after
+    /// `COMPROMISED_TTL`, including ones that were skipped here.
+    pub fn mark_compromised_with_fallback(&self, mask_id: &str) -> Option<MaskProfile> {
+        let fallback = self.select_fallback(mask_id)?;
+        if let Some(mask) = self.masks.get(mask_id).map(|e| e.value().clone()) {
+            self.compromised
+                .insert(mask_id.to_string(), (Instant::now(), mask));
+        }
         self.masks.remove(mask_id);
+        Some(fallback)
+    }
+
+    /// H1 TTL backstop: give previously-compromised masks another chance
+    /// after `COMPROMISED_TTL` by moving them back into the live rotation.
+    /// Restoring the actual retained `MaskProfile` (not just clearing the
+    /// compromised flag) means this works even for masks that were never
+    /// reloadable from disk (e.g. neural-unpacked or passively-distributed).
+    pub fn sweep_expired_compromised(&self) {
+        let expired: Vec<(String, MaskProfile)> = self
+            .compromised
+            .iter()
+            .filter(|e| e.value().0.elapsed() >= COMPROMISED_TTL)
+            .map(|e| (e.key().clone(), e.value().1.clone()))
+            .collect();
+        for (mask_id, mask) in expired {
+            self.compromised.remove(&mask_id);
+            self.masks.insert(mask_id, mask);
+        }
     }
 
     /// Remove a mask from live rotation without marking it as compromised.
@@ -970,8 +1016,24 @@ impl Gateway {
         // FIX E: compute the preset masks' distinct tag offsets exactly once,
         // here at construction — never again on the per-packet hot path. See
         // `Gateway::preset_tag_offsets`'s doc comment.
-        let preset_tag_offsets =
-            distinct_tag_offsets_of(aivpn_common::mask::preset_masks::all().iter());
+        //
+        // H6: also fold in `config.bootstrap_masks` — a custom embedded-tag
+        // bootstrap mask configured by the operator. `build_bootstrap_descriptors`
+        // (called just above) embeds these directly into the descriptors it
+        // hands out (`descriptor.embedded_masks`), and `derive_bootstrap_candidate`
+        // never changes a candidate's `tag_offset` from its base mask's (only
+        // `eph_pub_offset` shifts, by PSK-seeded entropy). So a handshake can
+        // succeed on one of these custom masks (pinning the session to it for
+        // life) while its offset was never in the probed set here — every
+        // subsequent DATA packet's tag then sits at an offset this scan never
+        // checks, making the session unroutable immediately after ServerHello.
+        // `config.bootstrap_masks` is fixed at startup (never rotated), so —
+        // like the presets — this is safe to compute exactly once.
+        let preset_tag_offsets = distinct_tag_offsets_of(
+            aivpn_common::mask::preset_masks::all()
+                .iter()
+                .chain(config.bootstrap_masks.iter()),
+        );
 
         // Initialize mask store — loads masks from disk into catalog.
         // R2 Phase B: pass the operator signing key (signs generated masks)
@@ -1367,6 +1429,7 @@ impl Gateway {
             let handshake_locks_cleanup = self.handshake_locks.clone();
             let mask_preference_throttle_cleanup = self.mask_preference_throttle.clone();
             let mask_feedback_throttle_cleanup = self.mask_feedback_throttle.clone();
+            let mask_catalog_cleanup = self.mask_catalog.clone();
             tokio::spawn(async move {
                 loop {
                     tokio::time::sleep(Duration::from_secs(5)).await;
@@ -1416,6 +1479,10 @@ impl Gateway {
                     // Same pruning for the FIX F MaskFeedback throttle map.
                     mask_feedback_throttle_cleanup
                         .retain(|_, v| v.elapsed() < MASK_FEEDBACK_THROTTLE);
+                    // H1: give masks that tripped the neural/DPI/anomaly
+                    // detectors a second chance after COMPROMISED_TTL rather
+                    // than excluding them from rotation forever.
+                    mask_catalog_cleanup.sweep_expired_compromised();
 
                     // Enforce client revocation on ALREADY-ACTIVE sessions. The
                     // handshake scan only checks enabled/expires_at when creating a
@@ -1762,11 +1829,11 @@ impl Gateway {
 
                                     neural_guard.record_rotation(mask_id);
 
-                                    // Mark mask as compromised in catalog
-                                    catalog.mark_compromised(mask_id);
-
-                                    // Select fallback mask
-                                    if let Some(new_mask) = catalog.select_fallback(mask_id) {
+                                    // H1: atomically check-then-mark so a
+                                    // single-mask catalog is never emptied.
+                                    if let Some(new_mask) =
+                                        catalog.mark_compromised_with_fallback(mask_id)
+                                    {
                                         info!(
                                             "Auto-rotating to mask '{}' ({} masks remaining)",
                                             new_mask.mask_id,
@@ -1855,8 +1922,10 @@ impl Gateway {
                                 mask_id, verdict.tunnel_prob
                             );
                             neural_guard.record_rotation(mask_id);
-                            catalog.mark_compromised(mask_id);
-                            if let Some(new_mask) = catalog.select_fallback(mask_id) {
+                            // H1: atomically check-then-mark so a
+                            // single-mask catalog is never emptied.
+                            if let Some(new_mask) = catalog.mark_compromised_with_fallback(mask_id)
+                            {
                                 info!(
                                     "ML-DPI-triggered rotation to mask '{}' ({} masks remaining)",
                                     new_mask.mask_id,
@@ -1892,9 +1961,9 @@ impl Gateway {
                             mask_id
                         );
                         metrics.record_dpi_attack();
-                        catalog.mark_compromised(mask_id);
-
-                        if let Some(new_mask) = catalog.select_fallback(mask_id) {
+                        // H1: atomically check-then-mark so a single-mask
+                        // catalog is never emptied.
+                        if let Some(new_mask) = catalog.mark_compromised_with_fallback(mask_id) {
                             info!("Anomaly-triggered rotation to mask '{}'", new_mask.mask_id);
                             if let Some(session) = sessions.get_session(session_id) {
                                 let client_addr = session.lock().client_addr;
@@ -3077,8 +3146,13 @@ impl Gateway {
                 }
             }
 
-            // Successful handshake — clear cooldown for this IP
-            self.handshake_cooldowns.remove(&client_addr.ip());
+            // CRITICAL (server-sec): do NOT clear the per-IP handshake
+            // cooldown here. A bare tag-valid handshake packet proves
+            // nothing about the sender's ability to receive traffic at
+            // `client_addr` — that address could be a spoofed victim. The
+            // cooldown is now only cleared once return-routability is
+            // proven (see the `is_ratcheted_tag` branch below), which also
+            // gates the bootstrap-descriptor burst.
 
             {
                 let mut sess = session.lock();
@@ -3120,7 +3194,11 @@ impl Gateway {
             }
 
             self.send_server_hello(&session, client_addr).await?;
-            self.send_bootstrap_descriptors(&session).await?;
+            // CRITICAL (server-sec): the bootstrap-descriptor burst (up to 4
+            // extra packets) is intentionally NOT sent here. It is deferred
+            // to the `is_ratcheted_tag` branch below, once the client has
+            // proven receipt of this ServerHello via return-routability.
+            // See the field doc on `Session::bootstrap_descriptors_sent`.
 
             // NOTE: the eager initial runtime-mask auto-switch (added earlier this
             // session to un-inert the neural check) is intentionally NOT performed
@@ -3265,7 +3343,15 @@ impl Gateway {
         // receiving and applying a MaskUpdate from the server.
         // We try both the session mask layout AND the catalog (runtime) layout
         // to handle the transition window.
-        let (session_mdh_len, session_hs_mdh_len, session_tag_offset) = {
+        // `session_data_prefix`/`session_hs_prefix` are the effective tag-prefix
+        // lengths for a DATA-length and a HANDSHAKE-length packet respectively.
+        // They MUST match what the client encoder chose for the same mask+length
+        // (see `MaskProfile::uses_embedded_layout`): an embedded-tag mask whose
+        // tag does not fit a given header length is encoded with the legacy
+        // 8-byte prefix, so a single `tag_prefix_len(tag_offset)` (which ignored
+        // the length) computed the wrong ciphertext offset and failed AEAD on
+        // every uplink packet for such masks.
+        let (session_mdh_len, session_hs_mdh_len, _session_tag_offset, data_prefix, hs_prefix) = {
             let sess = session.lock();
             if sess.is_pool_peer || sess.is_site_peer {
                 // Cluster (pool/site/chain) traffic uses a FIXED, mask-
@@ -3279,37 +3365,44 @@ impl Gateway {
                     crate::pool_sync::CLUSTER_MDH_LEN,
                     crate::pool_sync::CLUSTER_MDH_LEN,
                     u16::MAX,
+                    TAG_SIZE,
+                    TAG_SIZE,
                 )
             } else if let Some(ref mask) = sess.mask {
                 let (p, h, _, _) = packet_layout_for_mask(mask);
-                (p, h, mask.tag_offset)
+                (
+                    p,
+                    h,
+                    mask.tag_offset,
+                    mask.effective_tag_prefix_len(p),
+                    mask.effective_tag_prefix_len(h),
+                )
             } else {
-                (catalog_mdh_len, catalog_hs_mdh_len, catalog_tag_offset)
+                (
+                    catalog_mdh_len,
+                    catalog_hs_mdh_len,
+                    catalog_tag_offset,
+                    tag_prefix_len(catalog_tag_offset),
+                    tag_prefix_len(catalog_tag_offset),
+                )
             }
         };
         let packet_mdh_len = session_mdh_len;
         let handshake_mdh_len = session_hs_mdh_len;
-        // Layout-aware ciphertext start (Variant A). Legacy masks carry an
-        // 8-byte tag prefix before the MDH; embedded masks do not (the tag hides
-        // inside the MDH), so the ciphertext begins `prefix + mdh_len` in.
-        let session_prefix = tag_prefix_len(session_tag_offset);
         // Android retransmits the initial handshake packet with the client
         // eph_pub still embedded inside the MDH. Once a session already exists,
         // those retries validate against the existing tag window, so the
         // ciphertext still starts immediately after the full MDH.
         let is_pre_ratchet_retry = !is_new_session && !is_ratcheted_tag && {
             let sess = session.lock();
-            !sess.is_ratcheted && packet_data.len() >= session_prefix + handshake_mdh_len + 16
+            !sess.is_ratcheted && packet_data.len() >= hs_prefix + handshake_mdh_len + 16
         };
         let mut payload_offsets: Vec<usize> = if is_new_session {
-            vec![session_prefix + handshake_mdh_len]
+            vec![hs_prefix + handshake_mdh_len]
         } else if is_pre_ratchet_retry && handshake_mdh_len != packet_mdh_len {
-            vec![
-                session_prefix + packet_mdh_len,
-                session_prefix + handshake_mdh_len,
-            ]
+            vec![data_prefix + packet_mdh_len, hs_prefix + handshake_mdh_len]
         } else {
-            vec![session_prefix + packet_mdh_len]
+            vec![data_prefix + packet_mdh_len]
         };
         // During mask transition (bootstrap → runtime), also try the catalog
         // (runtime) layout in case the client already applied MaskUpdate — using
@@ -3393,8 +3486,9 @@ impl Gateway {
                     sess.send_counter,
                     sess.counter
                 );
-                let add =
-                    make_kernel_session_add(&sess, catalog_tag_offset, catalog_mdh_len as u16);
+                let (kernel_tag_offset, kernel_mdh_len) =
+                    kernel_wire_layout(&sess, catalog_tag_offset, catalog_mdh_len as u16);
+                let add = make_kernel_session_add(&sess, kernel_tag_offset, kernel_mdh_len);
                 let upd = make_kernel_update_tags(&sess);
                 if let Err(e) = ka.session_add(&add) {
                     warn!("kernel session_add failed: {e}");
@@ -3402,7 +3496,7 @@ impl Gateway {
                     // Record the installed signature so the refresh path only
                     // re-installs once the mask or keys actually change.
                     sess.kernel_install_sig =
-                        kernel_session_sig(&sess, catalog_tag_offset, catalog_mdh_len as u16);
+                        kernel_session_sig(&sess, kernel_tag_offset, kernel_mdh_len);
                 }
                 if let Err(e) = ka.session_update_tags(&upd) {
                     warn!("kernel session_update_tags failed: {e}");
@@ -3422,6 +3516,34 @@ impl Gateway {
                     sess.counter
                 );
             }
+
+            // CRITICAL (server-sec): this packet carrying a ratcheted-key tag
+            // IS the return-routability proof — the client could only have
+            // produced it by actually receiving ServerHello (server_eph_pub)
+            // at its real address, not a spoofed one. Send the (possibly
+            // multi-packet) bootstrap-descriptor burst now, exactly once, and
+            // only now release the per-IP handshake cooldown. `session` is
+            // unlocked before calling out since `send_bootstrap_descriptors`
+            // locks it internally.
+            let needs_descriptors = {
+                let mut sess = session.lock();
+                if sess.bootstrap_descriptors_sent {
+                    false
+                } else {
+                    sess.bootstrap_descriptors_sent = true;
+                    true
+                }
+            };
+            if needs_descriptors {
+                self.handshake_cooldowns.remove(&client_addr.ip());
+                if let Err(e) = self.send_bootstrap_descriptors(&session).await {
+                    warn!(
+                        "Failed to send deferred bootstrap descriptors to {}: {}",
+                        hash_addr(&client_addr),
+                        e
+                    );
+                }
+            }
         }
 
         // Extract pad_len from inside decrypted data and strip padding
@@ -3438,11 +3560,22 @@ impl Gateway {
         let mut client_db_flush: Option<(String, u64, u64)> = None;
         let (session_id, refresh_tags, iat_ms) = {
             let mut sess = session.lock();
-            sess.mark_tag_received(counter);
-            // C-S-2: if this packet matched a pre-ratchet (old-key) tag, mark
-            // it in the pre_ratchet_bitmap to prevent replay within the grace window.
+            // H2: validate_tag() returns the same Some((counter, false)) shape
+            // for both a normal current-epoch match AND a pre-ratchet
+            // (old-key) match during the post-ratchet grace window — the
+            // pre-ratchet counter belongs to the OLD epoch's counter space.
+            // Folding it into mark_tag_received() would fast-forward the
+            // CURRENT epoch's counter/bitmap to that old (often much larger)
+            // value, corrupting the replay window so legitimate new-key
+            // packets with small counters then look "out of window" and get
+            // rejected — a likely root cause of "invalid tag after rekey".
+            // Route pre-ratchet counters exclusively into the dedicated
+            // pre-ratchet replay set (C-S-2) and never advance the main
+            // counter state for them.
             if sess.is_pre_ratchet_counter(counter) {
                 sess.mark_pre_ratchet_received(counter);
+            } else {
+                sess.mark_tag_received(counter);
             }
             // Inter-arrival time = gap since the PREVIOUS validated packet. This
             // MUST be measured before overwriting `last_seen`; the neural and
@@ -3507,11 +3640,12 @@ impl Gateway {
                 // make every kernel decrypt fail silently. session_add is
                 // idempotent (replaces the existing entry). Re-install only when
                 // the relevant state changed, so a steady session pays nothing.
-                let sig = kernel_session_sig(&sess, catalog_tag_offset, catalog_mdh_len as u16);
+                let (kernel_tag_offset, kernel_mdh_len) =
+                    kernel_wire_layout(&sess, catalog_tag_offset, catalog_mdh_len as u16);
+                let sig = kernel_session_sig(&sess, kernel_tag_offset, kernel_mdh_len);
                 let reinstall = sess.kernel_install_sig != sig;
-                let add = reinstall.then(|| {
-                    make_kernel_session_add(&sess, catalog_tag_offset, catalog_mdh_len as u16)
-                });
+                let add = reinstall
+                    .then(|| make_kernel_session_add(&sess, kernel_tag_offset, kernel_mdh_len));
                 let upd = make_kernel_update_tags(&sess);
                 // Refresh the downlink reserved counter block on the same cadence
                 // so its pre-computed resonance tags stay inside the client's
@@ -4191,14 +4325,33 @@ impl Gateway {
                         // C-S-4: Validate that the injected packet's source IP
                         // matches the session's assigned VPN IP to prevent
                         // IP spoofing through the exit-node relay path.
+                        //
+                        // Pool/site peer sessions (chain-forward entry nodes)
+                        // never carry a per-session vpn_ip — they relay
+                        // traffic on behalf of many downstream clients that
+                        // are authenticated by the *entry* node, not by us.
+                        // The AEAD decrypt that got us here already
+                        // authenticated the sender as the registered peer
+                        // under its directional key, so for those sessions
+                        // we only need to confirm the packet's source IP is
+                        // plausibly one of our own VPN clients (i.e. inside
+                        // our configured VPN subnet) rather than requiring
+                        // an exact match against a field that is always
+                        // None. Ordinary (non-peer) client sessions keep the
+                        // strict exact-match check — no relaxation there.
                         let src_ip_ok = {
                             let sess = session.lock();
+                            let is_peer_session = sess.is_pool_peer || sess.is_site_peer;
                             match ip_version {
                                 Some(4) => {
                                     if payload.len() >= 20 {
                                         let src: [u8; 4] = payload[12..16].try_into().unwrap();
                                         let pkt_src = std::net::Ipv4Addr::from(src);
-                                        sess.vpn_ip.map_or(false, |vpn| vpn == pkt_src)
+                                        if is_peer_session {
+                                            self.config.network_config.contains(pkt_src)
+                                        } else {
+                                            sess.vpn_ip.map_or(false, |vpn| vpn == pkt_src)
+                                        }
                                     } else {
                                         false
                                     }
@@ -4846,11 +4999,51 @@ impl Gateway {
     }
 }
 
-/// Build the kernel session-install payload. `tag_offset`/`mdh_len` describe the
-/// wire layout the CLIENT uses for its uplink — the runtime primary mask it
-/// converges to via the MaskCatalog, NOT the session's (possibly still
-/// bootstrap) mask, which can lag with a different MDH length and make the
-/// kernel slice the ciphertext at the wrong offset.
+/// H7 (conservative fix): resolve the wire layout (tag_offset, mdh_len) to
+/// install into the kernel accelerator for `sess`, mirroring EXACTLY the
+/// userspace decode path's own layout resolution (the `session_mdh_len`
+/// block in `Gateway::handle_packet`) instead of unconditionally using the
+/// mask-catalog's PRIMARY mask.
+///
+/// The doc comment `make_kernel_session_add` used to carry here claimed the
+/// client "converges" to the catalog's runtime primary mask shortly after
+/// connect — but the handshake-completion path deliberately does NOT
+/// perform that auto-switch (see the long comment where ServerHello is
+/// sent): a session stays pinned to its bootstrap mask for its entire life.
+/// Installing kernel offsets from "whatever the catalog's primary mask
+/// currently is" therefore diverges from the layout the client actually
+/// speaks whenever the primary differs from the session's own bootstrap
+/// mask (e.g. after a mask rotation, or a custom `config.bootstrap_masks`
+/// entry that never became primary). The kernel fails closed on the
+/// resulting AEAD mismatch (not a spoofing risk), but the session's kernel
+/// fast path silently blackholes until the next re-install recomputes the
+/// (still-wrong) catalog value again.
+fn kernel_wire_layout(
+    sess: &crate::session::Session,
+    catalog_tag_offset: u16,
+    catalog_mdh_len: u16,
+) -> (u16, u16) {
+    if sess.is_pool_peer || sess.is_site_peer {
+        // Cluster (pool/site/chain) traffic uses the fixed, mask-independent
+        // framing described in `pool_sync` — never the catalog primary.
+        (u16::MAX, crate::pool_sync::CLUSTER_MDH_LEN as u16)
+    } else if let Some(ref mask) = sess.mask {
+        let (packet_mdh_len, _handshake_mdh_len, _eph_offset, _eph_len) =
+            packet_layout_for_mask(mask);
+        (mask.tag_offset, packet_mdh_len as u16)
+    } else {
+        // No mask pinned yet (shouldn't normally happen for a session that
+        // has reached the kernel-install call sites) — fall back to the
+        // catalog primary, matching the userspace decode path's own
+        // fallback for this case.
+        (catalog_tag_offset, catalog_mdh_len)
+    }
+}
+
+/// Build the kernel session-install payload. `tag_offset`/`mdh_len` should be
+/// obtained via `kernel_wire_layout` (H7) so they describe the CLIENT's
+/// actual wire layout — the session's own pinned mask, not necessarily the
+/// mask-catalog's primary.
 fn make_kernel_session_add(
     sess: &crate::session::Session,
     tag_offset: u16,
@@ -5389,6 +5582,64 @@ mod tests {
         // session's claim at the same instant.
         assert!(try_claim_mask_preference_slot(&throttle, [1u8; 16], now));
         assert!(try_claim_mask_preference_slot(&throttle, [2u8; 16], now));
+    }
+
+    /// H1 regression: compromising the ONLY mask in the catalog must be
+    /// refused — the old `mark_compromised` removed the mask unconditionally
+    /// and only checked `select_fallback` afterward, so tripping a
+    /// single-mask (or fully-tripped) deployment emptied the catalog and
+    /// permanently locked out every future handshake.
+    #[test]
+    fn mark_compromised_refuses_to_empty_a_single_mask_catalog() {
+        let catalog = MaskCatalog::new();
+        let mask = webrtc_zoom_v3();
+        catalog.register_mask(mask.clone());
+        catalog.set_primary_mask_id(mask.mask_id.clone());
+
+        let result = catalog.mark_compromised_with_fallback(&mask.mask_id);
+        assert!(
+            result.is_none(),
+            "compromising the last mask must be refused, not return no fallback \
+             after already emptying the catalog"
+        );
+        assert_eq!(
+            catalog.available_count(),
+            1,
+            "the mask must remain available — nothing to fall back to"
+        );
+        assert!(
+            catalog.primary_mask().is_some(),
+            "the catalog must never go fully deaf (primary_mask() == None) just \
+             because one mask tripped a detector"
+        );
+    }
+
+    /// H1: with a real fallback available, the compromise DOES go through
+    /// and the compromised mask is actually removed from live rotation.
+    #[test]
+    fn mark_compromised_succeeds_when_a_fallback_exists() {
+        let catalog = MaskCatalog::new();
+        let bad = webrtc_zoom_v3();
+        let good = aivpn_common::mask::preset_masks::quic_https_v2();
+        catalog.register_mask(bad.clone());
+        catalog.register_mask(good.clone());
+        catalog.set_primary_mask_id(bad.mask_id.clone());
+
+        let result = catalog.mark_compromised_with_fallback(&bad.mask_id);
+        assert_eq!(
+            result.map(|m| m.mask_id),
+            Some(good.mask_id),
+            "the surviving mask must be handed back as the fallback"
+        );
+        assert_eq!(catalog.available_count(), 1, "the bad mask must be removed");
+        // A freshly-registered mask with the same id must NOT resurrect the
+        // compromised one within the TTL window.
+        catalog.register_mask(bad.clone());
+        assert_eq!(
+            catalog.available_count(),
+            1,
+            "register_mask must still refuse a still-compromised id"
+        );
     }
 
     #[test]

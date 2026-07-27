@@ -91,7 +91,7 @@ static void aivpn_sk_data_ready(struct sock *sk)
 		struct aivpn_kern_session *session = NULL;
 		u64 counter = 0;
 		unsigned int ct_start = 0;
-		unsigned long offbits;
+		u64 offbits;
 		unsigned int off;
 		/* Enqueue-time charge; skb->truesize may grow later (pull/linearize). */
 		unsigned int rmem_charge = skb->truesize;
@@ -117,9 +117,14 @@ static void aivpn_sk_data_ready(struct sock *sk)
 		 * header, so pull each candidate window in before reading (GFP_ATOMIC,
 		 * non-sleeping — safe under rcu_read_lock).
 		 */
-		offbits = (unsigned long)aivpn_tag_probe_offsets();
+		/* Iterate the probe bitmap as a full u64: for_each_set_bit walks
+		 * unsigned longs, which on a 32-bit kernel would silently drop
+		 * offsets >= 32. */
+		offbits = aivpn_tag_probe_offsets();
 		rcu_read_lock();
-		for_each_set_bit(off, &offbits, BITS_PER_LONG) {
+		for (off = 0; off < 64; off++) {
+			if (!(offbits & (1ULL << off)))
+				continue;
 			if (!pskb_may_pull(skb, off + AIVPN_TAG_SIZE))
 				continue;
 			session = aivpn_tag_lookup(skb->data + off, &counter);
@@ -136,17 +141,23 @@ static void aivpn_sk_data_ready(struct sock *sk)
 		}
 		aivpn_stat_inc(AIVPN_STAT_TAG_HIT);
 		/*
-		 * Acquire session->lock while still inside rcu_read_lock so that
-		 * aivpn_session_remove's synchronize_rcu() cannot complete — and
-		 * therefore cannot free the session — until we release rcu_read_lock.
-		 * After acquiring the spinlock, rcu_read_unlock is safe: the session
-		 * remove path calls spin_lock_bh(s->lock) after synchronize_rcu()
-		 * before freeing, so it will wait for us to unlock.
-		 */
-		spin_lock_bh(&session->lock);
-		rcu_read_unlock();
-
-		/*
+		 * Stay inside rcu_read_lock() for the whole check → decrypt →
+		 * update sequence: aivpn_session_remove() unlinks the tag
+		 * entries and then waits in synchronize_rcu() before freeing
+		 * the session, so the session cannot go away while we are in
+		 * this read-side critical section.  Everything below is
+		 * non-sleeping (GFP_ATOMIC allocations, synchronous AEAD), as
+		 * both softirq context and RCU require.
+		 *
+		 * WireGuard-style lock split: the replay window is CHECKED
+		 * under session->lock, the expensive AEAD decrypt then runs
+		 * with the lock DROPPED (it only touches immutable session
+		 * fields — tfm, nonce_suffix — and a private scratch buffer),
+		 * and the lock is re-acquired to re-validate the counter and
+		 * ADVANCE the window.  Keeping the AEAD out of the spinlock
+		 * keeps the BH-disabled critical section short and lets
+		 * packets of the same session decrypt in parallel.
+		 *
 		 * Anti-replay, WireGuard ordering: CHECK the window here but only
 		 * ADVANCE it after the packet authenticates as Data.  Control/Ack/
 		 * keepalive packets (-ENOMSG) and auth failures (-EBADMSG) are
@@ -161,17 +172,45 @@ static void aivpn_sk_data_ready(struct sock *sk)
 		 * True replays are then rejected there.  Fallback skbs keep their
 		 * rmem charge (recvmsg releases it).
 		 */
+		spin_lock_bh(&session->lock);
 		if (!aivpn_counter_check(session, counter)) {
 			spin_unlock_bh(&session->lock);
+			rcu_read_unlock();
 			aivpn_stat_inc(AIVPN_STAT_REPLAY_DROP);
 			__skb_queue_tail(&fallback_q, skb);
 			continue;
 		}
+		spin_unlock_bh(&session->lock);
 
 		ret = aivpn_decrypt(session, skb, counter, ct_start);
-		if (!ret)
+		if (!ret) {
+			/*
+			 * Re-validate under the lock: another CPU may have
+			 * authenticated the same counter while we were
+			 * decrypting.  If the check fails now the packet is a
+			 * concurrent duplicate — and the skb has already been
+			 * overwritten with plaintext, so it can no longer fall
+			 * back to user-space; drop it.
+			 */
+			spin_lock_bh(&session->lock);
+			if (!aivpn_counter_check(session, counter)) {
+				spin_unlock_bh(&session->lock);
+				rcu_read_unlock();
+				aivpn_stat_inc(AIVPN_STAT_REPLAY_DROP);
+				aivpn_udp_skb_uncharge(sk, rmem_charge);
+				kfree_skb(skb);
+				continue;
+			}
 			aivpn_counter_update(session, counter);
-		spin_unlock_bh(&session->lock);
+			/* Accepted: account RX stats under the same lock hold
+			 * (moved out of aivpn_decrypt, which now runs without
+			 * the session lock).  skb->len is the inner IP length
+			 * after the decrypt commit trimmed the skb. */
+			session->rx_packets++;
+			session->rx_bytes += skb->len;
+			spin_unlock_bh(&session->lock);
+		}
+		rcu_read_unlock();
 
 		if (ret) {
 			/*
@@ -246,6 +285,21 @@ static void __aivpn_udp_hook_teardown(struct sock *sk)
 		hs = sk->sk_user_data;
 		if (hs)
 			sk->sk_data_ready = hs->orig_data_ready;
+		sk->sk_user_data = NULL;
+	} else {
+		/*
+		 * A third party re-hooked sk_data_ready after us (chained on
+		 * top of our callback).  We cannot restore the chain — their
+		 * saved pointer to aivpn_sk_data_ready is unreachable and will
+		 * dangle once the module unloads — so warn loudly.  sk_user_data
+		 * is still our hook state (the install path only ever hooks a
+		 * socket whose sk_user_data was NULL), so reclaim it below
+		 * instead of leaking it.
+		 */
+		WARN_ONCE(1,
+			  "aivpn: sk_data_ready was re-hooked by a third party (%ps); cannot restore the callback chain\n",
+			  sk->sk_data_ready);
+		hs = sk->sk_user_data;
 		sk->sk_user_data = NULL;
 	}
 	release_sock(sk);

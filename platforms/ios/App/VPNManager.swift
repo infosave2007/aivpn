@@ -113,6 +113,15 @@ class VPNManager: ObservableObject {
     private var trafficTimer: Timer?
     private var durationTimer: Timer?
     private var connectionStartDate: Date?
+    // L3: whether THIS process saw the tunnel pass through .connecting /
+    // .reasserting before .connected. An app relaunch over a live tunnel
+    // adopts .connected directly — the "Connected" notification is
+    // suppressed then (see syncStatus).
+    private var observedConnecting = false
+    /// Session start reported by the tunnel core over IPC (same session scope
+    /// as the byte counters). Preferred over NE's connectedDate so the
+    /// stopwatch and the traffic counters can never desync.
+    private var coreConnectedSince: Date?
     private let bundleId = "com.aivpn.client.tunnel"
 
     init() {
@@ -205,15 +214,28 @@ class VPNManager: ObservableObject {
             isConnecting = false
             isDisconnecting = false
             isConnected = true
-            if connectionStartDate == nil {
-                connectionStartDate = Date()
+            // NE owns the connected timestamp: adopt it on EVERY .connected
+            // observation so an app relaunch/jetsam over a live tunnel (or a
+            // stale cached date surviving a session restart) can't reset the
+            // stopwatch while the tunnel-side counters keep running.
+            let firstObservation = connectionStartDate == nil
+            connectionStartDate = connection.connectedDate ?? Date()
+            if firstObservation {
                 startTimers()
-                postConnectionNotification(connected: true)
+                // L3: only announce "Connected" when THIS process actually
+                // observed the connect happening (a .connecting/.reasserting
+                // state). An app relaunch over an already-live tunnel merely
+                // ADOPTS the connected state — notifying then is noise.
+                if observedConnecting {
+                    postConnectionNotification(connected: true)
+                }
             }
+            observedConnecting = false
         case .connecting, .reasserting:
             isConnecting = true
             isDisconnecting = false
             isConnected = false
+            observedConnecting = true
         case .disconnecting:
             isConnecting = false
             isDisconnecting = true
@@ -225,6 +247,7 @@ class VPNManager: ObservableObject {
                 postConnectionNotification(connected: false)
                 stopTimers()
                 connectionStartDate = nil
+                coreConnectedSince = nil
                 bytesSent = 0
                 bytesReceived = 0
                 connectionDuration = 0
@@ -263,16 +286,22 @@ class VPNManager: ObservableObject {
         var providerConfig: [String: Any] = [
             "fullTunnel": fullTunnel,
         ]
-        // Try shared Keychain (app group) first; fall back to passing the secret
-        // directly in providerConfiguration when the entitlement is unavailable.
-        // Capture tokens so orphaned entries can be deleted if saveToPreferences fails.
-        let handoffToken: String?
+        // Hand the secret to the tunnel extension exclusively via a one-time
+        // shared-Keychain token (App Group, kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly).
+        // If that write fails, the connect attempt is HARD-FAILED rather than
+        // falling back to embedding the raw PSK in providerConfiguration: that
+        // dict is persisted by the system NE daemon with no Data Protection
+        // class and is included in device/iTunes backups, which would defeat
+        // the Keychain design entirely under this project's threat model.
+        // Capture the token so it can be deleted if saveToPreferences fails.
+        let handoffToken: String
         if let keyToken = KeychainStorage.shared.storeForTunnel(secret: key.fullKey) {
             providerConfig["keyToken"] = keyToken
             handoffToken = keyToken
         } else {
-            providerConfig["keyDirect"] = key.fullKey
-            handoffToken = nil
+            isConnecting = false
+            lastError = LocalizationManager.shared.t("error_keychain_write_failed")
+            return
         }
         if adaptiveLevel > 0 {
             providerConfig["adaptiveLevel"] = adaptiveLevel
@@ -315,8 +344,13 @@ class VPNManager: ObservableObject {
                 providerConfig["mtlsCertToken"] = certToken
                 certHandoffToken = certToken
             } else {
-                providerConfig["mtlsCertDirect"] = cert
-                certHandoffToken = nil
+                // Same hard-fail rule as the PSK above: never place the raw
+                // mTLS cert in providerConfiguration. Clean up the key token
+                // already written above — it will never be consumed now.
+                KeychainStorage.shared.deleteHandoffToken(handoffToken)
+                isConnecting = false
+                lastError = LocalizationManager.shared.t("error_keychain_write_failed")
+                return
             }
         } else {
             certHandoffToken = nil
@@ -343,7 +377,7 @@ class VPNManager: ObservableObject {
             if let error = error {
                 // Clean up Keychain tokens written before saveToPreferences —
                 // the tunnel will never start, so they would otherwise leak.
-                if let token = handoffToken { KeychainStorage.shared.deleteHandoffToken(token) }
+                KeychainStorage.shared.deleteHandoffToken(handoffToken)
                 if let token = certHandoffToken { KeychainStorage.shared.deleteHandoffToken(token) }
                 DispatchQueue.main.async {
                     self.isConnecting = false
@@ -362,7 +396,7 @@ class VPNManager: ObservableObject {
                     // handoff tokens were never consumed — delete them here too
                     // (not only on saveToPreferences failure) so they don't
                     // accumulate as orphans in the shared Keychain.
-                    if let token = handoffToken { KeychainStorage.shared.deleteHandoffToken(token) }
+                    KeychainStorage.shared.deleteHandoffToken(handoffToken)
                     if let token = certHandoffToken { KeychainStorage.shared.deleteHandoffToken(token) }
                     self.isConnecting = false
                     self.lastError = error.localizedDescription
@@ -424,7 +458,13 @@ class VPNManager: ObservableObject {
             self?.fetchTrafficStats()
         }
         durationTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
-            guard let self = self, let start = self.connectionStartDate else { return }
+            guard let self = self else { return }
+            // Core session start (same scope as the counters) wins; NE's
+            // connectedDate is the system fallback; the stored property is
+            // the last resort (both survive UI relaunch, unlike Date()).
+            guard let start = self.coreConnectedSince
+                ?? self.manager?.connection.connectedDate
+                ?? self.connectionStartDate else { return }
             self.connectionDuration = Date().timeIntervalSince(start)
         }
     }
@@ -439,6 +479,12 @@ class VPNManager: ObservableObject {
             guard let self = self, let r = response else { return }
             if let up = r["upload"] as? Int64 { self.bytesSent = up }
             if let down = r["download"] as? Int64 { self.bytesReceived = down }
+            // Core-owned session start (epoch ms, 0 = not established) —
+            // exact same session scope as upload/download above, delivered in
+            // the same IPC round-trip, so timer and counters can't desync.
+            if let sinceMs = r["connected_since"] as? Int64, sinceMs > 0 {
+                self.coreConnectedSince = Date(timeIntervalSince1970: TimeInterval(sinceMs) / 1000.0)
+            }
             if let q = r["quality_score"] as? Int { self.liveQuality = q }
             if let al = r["adaptive_level"] as? Int { self.serverAdaptiveLevel = al }
             if let catJson = r["mask_catalog"] as? String, !catJson.isEmpty,
@@ -646,7 +692,33 @@ func runBenchPosix(serverAddr: String, completion: (Int, Int) -> Void) {
     sin.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
     sin.sin_family = sa_family_t(AF_INET)
     sin.sin_port = portNum.bigEndian
-    guard inet_pton(AF_INET, host, &sin.sin_addr) == 1 else { completion(0, 0); return }
+    if inet_pton(AF_INET, host, &sin.sin_addr) != 1 {
+        // L4: not an IPv4 literal — a connection key may carry a hostname.
+        // Resolve it via getaddrinfo (IPv4 only: the probe socket is AF_INET),
+        // mirroring BootstrapDiscovery's getaddrinfo usage. Runs on a utility
+        // queue (see runBenchmark), so a blocking resolve is acceptable.
+        var hints = addrinfo(ai_flags: 0, ai_family: AF_INET,
+                             ai_socktype: SOCK_DGRAM, ai_protocol: 0,
+                             ai_addrlen: 0, ai_canonname: nil, ai_addr: nil, ai_next: nil)
+        var list: UnsafeMutablePointer<addrinfo>?
+        guard getaddrinfo(host, nil, &hints, &list) == 0, let first = list else {
+            completion(0, 0); return
+        }
+        defer { freeaddrinfo(first) }
+        var resolved: in_addr?
+        var node: UnsafeMutablePointer<addrinfo>? = first
+        while let cur = node {
+            if cur.pointee.ai_family == AF_INET, let sa = cur.pointee.ai_addr {
+                resolved = sa.withMemoryRebound(to: sockaddr_in.self, capacity: 1) {
+                    $0.pointee.sin_addr
+                }
+                break
+            }
+            node = cur.pointee.ai_next
+        }
+        guard let addr4 = resolved else { completion(0, 0); return }
+        sin.sin_addr = addr4
+    }
 
     let fd = socket(AF_INET, SOCK_DGRAM, 0)
     guard fd >= 0 else { completion(0, 0); return }

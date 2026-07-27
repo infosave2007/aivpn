@@ -167,6 +167,9 @@
     <string name="notification_event_channel">AIVPN Events</string>
     <string name="notification_event_channel_desc">Connection state change notifications</string>
 
+    <!-- Auto-reconnect worker channel (quiet progress stub, API < 31 expedited work) -->
+    <string name="notification_reconnect_channel">AIVPN Auto-reconnect</string>
+
     <!-- Security alerts: unexpected VPN death (traffic no longer protected) -->
     <string name="notification_alert_channel">AIVPN Security Alerts</string>
     <string name="notification_alert_channel_desc">Unexpected VPN shutdown — traffic may be unprotected</string>

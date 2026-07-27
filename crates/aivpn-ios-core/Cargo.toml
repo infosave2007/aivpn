@@ -23,3 +23,6 @@ tokio      = { version = "1.35", features = ["rt", "net", "time", "io-util", "ma
 rand       = "0.8"
 log        = "0.4"
 serde_json.workspace = true
+# MaskUpdate transport-level signature verification (parity with desktop
+# client.rs / aivpn-android-core, which pin the same version).
+ed25519-dalek = "2.0"

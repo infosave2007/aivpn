@@ -33,6 +33,9 @@ winapi = { version = "0.3", features = [
     "jobapi2",
     "handleapi",
     "winnt",
+    "synchapi",
+    "errhandlingapi",
+    "winerror",
 ] }
 winreg = "0.52"
 

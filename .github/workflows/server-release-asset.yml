@@ -24,6 +24,19 @@ jobs:
       - name: Build Linux server asset via Docker
         run: make server-docker
 
+      # Artifact integrity: publish a SHA256SUMS file alongside the binary so
+      # `make deploy` / `make server-deploy` can verify what they downloaded
+      # before chmod +x / running it. No GPG/cosign signing key is available
+      # in this repo's CI yet — a published checksum is the floor, not the
+      # full answer (it proves the download wasn't corrupted/tampered with in
+      # transit from GitHub's CDN, not that the release itself is authentic;
+      # that needs a signing key + verification step as a follow-up).
+      - name: Generate SHA256SUMS
+        run: |
+          cd releases
+          sha256sum aivpn-server-linux-x86_64 > aivpn-server-linux-x86_64.SHA256SUMS
+          cat aivpn-server-linux-x86_64.SHA256SUMS
+
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v4
         with:
@@ -31,12 +44,21 @@ jobs:
           path: releases/aivpn-server-linux-x86_64
           if-no-files-found: error
 
+      - name: Upload SHA256SUMS workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: aivpn-server-linux-x86_64-sha256sums
+          path: releases/aivpn-server-linux-x86_64.SHA256SUMS
+          if-no-files-found: error
+
       - name: Publish asset to GitHub Release
         if: github.event_name == 'release' || github.event.inputs.tag != ''
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.event.release.tag_name || github.event.inputs.tag }}
-          files: releases/aivpn-server-linux-x86_64
+          files: |
+            releases/aivpn-server-linux-x86_64
+            releases/aivpn-server-linux-x86_64.SHA256SUMS
           fail_on_unmatched_files: true
 
   build-macos-release-assets:

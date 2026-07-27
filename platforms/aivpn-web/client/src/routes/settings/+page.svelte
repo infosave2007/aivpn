@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { goto } from '$app/navigation';
   import { createQuery, createMutation, useQueryClient } from '@tanstack/svelte-query';
   import { auth } from '$lib/api';
   import { authStore } from '$lib/stores/auth.svelte';
@@ -11,6 +12,22 @@
   type Tab = 'security' | '2fa' | 'passkeys' | 'sessions';
   let activeTab = $state<Tab>('security');
 
+  /**
+   * The security endpoints (change password, TOTP enable/disable, passkey
+   * add/remove) revoke ALL sessions server-side and answer { logout: true }.
+   * Honour it: clear local auth state and return to the login screen —
+   * otherwise the page keeps a dead session where every next request 401s.
+   * Returns true when a logout redirect happened.
+   */
+  function handleLogoutResponse(res: { logout?: boolean } | void): boolean {
+    if (res && res.logout) {
+      authStore.clearToken();
+      goto('/login?reason=reauth');
+      return true;
+    }
+    return false;
+  }
+
   // Security tab
   let oldPassword = $state('');
   let newPassword = $state('');
@@ -20,7 +37,8 @@
 
   const changePwMut = createMutation({
     mutationFn: () => auth.changePassword(oldPassword, newPassword),
-    onSuccess: () => {
+    onSuccess: (res) => {
+      if (handleLogoutResponse(res)) return;
       pwToast = 'Password changed';
       pwError = false;
       oldPassword = ''; newPassword = ''; confirmPassword = '';
@@ -36,20 +54,36 @@
   let totpQrOpen = $state(false);
   let totpEnabled = $state(false);
 
+  // Seed the 2FA state from the server — it always started as false, so for
+  // a user who already had TOTP enabled the tab offered "Enable 2FA" (which
+  // 409s) and the Disable button was unreachable.
+  const meQuery = createQuery({ queryKey: ['me'], queryFn: () => auth.me() });
+  $effect(() => {
+    if ($meQuery.data) totpEnabled = $meQuery.data.totp_enabled;
+  });
+
   const totpSetupMut = createMutation({
     mutationFn: () => auth.totpSetup(),
     onSuccess: (data) => { totpUri = data.otpauth_url; totpQrOpen = true; },
+    onError: (e: Error) => { totpToast = e.message; setTimeout(() => { totpToast = ''; }, 4000); },
   });
 
   const totpVerifyMut = createMutation({
     mutationFn: () => auth.totpVerify(totpCode),
-    onSuccess: () => { totpEnabled = true; totpUri = ''; totpCode = ''; totpQrOpen = false; totpToast = '2FA enabled'; setTimeout(() => { totpToast = ''; }, 3000); },
+    onSuccess: (res) => {
+      if (handleLogoutResponse(res)) return;
+      totpEnabled = true; totpUri = ''; totpCode = ''; totpQrOpen = false; totpToast = '2FA enabled'; setTimeout(() => { totpToast = ''; }, 3000);
+    },
     onError: (e: Error) => { totpToast = e.message; setTimeout(() => { totpToast = ''; }, 4000); },
   });
 
   const totpDeleteMut = createMutation({
     mutationFn: () => auth.totpDelete(),
-    onSuccess: () => { totpEnabled = false; totpToast = '2FA disabled'; setTimeout(() => { totpToast = ''; }, 3000); },
+    onSuccess: (res) => {
+      if (handleLogoutResponse(res)) return;
+      totpEnabled = false; totpToast = '2FA disabled'; setTimeout(() => { totpToast = ''; }, 3000);
+    },
+    onError: (e: Error) => { totpToast = e.message; setTimeout(() => { totpToast = ''; }, 4000); },
   });
 
   // Passkeys tab
@@ -61,15 +95,22 @@
     mutationFn: async () => {
       const options = await auth.passkeyRegistrationOptions();
       const credential = await startRegistration({ optionsJSON: options as Parameters<typeof startRegistration>[0]['optionsJSON'] });
-      await auth.passkeyRegister(credential, passkeyName);
+      return auth.passkeyRegister(credential, passkeyName);
     },
-    onSuccess: () => { qc.invalidateQueries({ queryKey: ['passkeys'] }); passkeyName = ''; passkeyToast = 'Passkey added'; setTimeout(() => { passkeyToast = ''; }, 3000); },
+    onSuccess: (res) => {
+      if (handleLogoutResponse(res)) return;
+      qc.invalidateQueries({ queryKey: ['passkeys'] }); passkeyName = ''; passkeyToast = 'Passkey added'; setTimeout(() => { passkeyToast = ''; }, 3000);
+    },
     onError: (e: Error) => { passkeyToast = e.message; setTimeout(() => { passkeyToast = ''; }, 4000); },
   });
 
   const passkeyDelMut = createMutation({
     mutationFn: (id: string) => auth.passkeyDelete(id),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ['passkeys'] }),
+    onSuccess: (res) => {
+      if (handleLogoutResponse(res)) return;
+      qc.invalidateQueries({ queryKey: ['passkeys'] });
+    },
+    onError: (e: Error) => { passkeyToast = e.message; setTimeout(() => { passkeyToast = ''; }, 4000); },
   });
 
   // Sessions tab

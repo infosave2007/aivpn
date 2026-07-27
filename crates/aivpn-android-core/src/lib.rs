@@ -450,9 +450,10 @@ pub extern "system" fn Java_com_aivpn_client_AivpnJni_getAssignedVpnIp(
     } else {
         std::net::Ipv4Addr::from(raw).to_string()
     };
-    env.new_string(s)
-        .map(|j| j.into_raw())
-        .unwrap_or(std::ptr::null_mut())
+    // L8: route through make_str so an extreme JNI failure degrades to an
+    // empty string (after clearing the pending exception) instead of handing
+    // a null jstring to a Kotlin `external fun` declared non-null String.
+    make_str(&mut env, &s)
 }
 
 // ──────────────────────────────────────────────────────────

@@ -51,6 +51,40 @@ pub fn note_data_stall_and_maybe_explore(established: Instant) {
 const CACHE_FILE_NAME: &str = "bootstrap_descriptors.json";
 const MAX_CACHED_DESCRIPTORS: usize = 8;
 
+/// Bootstrap descriptor ids excluded from `select_initial_mask` for the
+/// lifetime of this process. `production-secure` builds must never fall back
+/// to an unsigned builtin mask, but without any resilience net a cached
+/// descriptor whose signer rotated its key (or an epoch the server no longer
+/// retains) wedges the client on the same dead handshake forever — selection
+/// is otherwise a deterministic newest-`created_at`-first pick. Excluding a
+/// proven-unmatchable descriptor id (without deleting it from disk — a
+/// multi-epoch server may still accept it later) lets selection advance to
+/// the next-newest still-valid SIGNED descriptor instead. See main.rs's
+/// `#[cfg(feature = "production-secure")]` handshake-fallback block.
+static EXCLUDED_DESCRIPTOR_IDS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// Mark a descriptor id as unmatchable for this run's `select_initial_mask`.
+/// Idempotent. Returns `true` if this was a new exclusion.
+pub fn exclude_descriptor(descriptor_id: &str) -> bool {
+    let mut ids = EXCLUDED_DESCRIPTOR_IDS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if ids.iter().any(|id| id == descriptor_id) {
+        false
+    } else {
+        ids.push(descriptor_id.to_string());
+        true
+    }
+}
+
+fn is_excluded(descriptor_id: &str) -> bool {
+    EXCLUDED_DESCRIPTOR_IDS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .any(|id| id == descriptor_id)
+}
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct BootstrapCacheFile {
     descriptors: Vec<BootstrapDescriptor>,
@@ -86,6 +120,9 @@ pub fn load_descriptors() -> Vec<BootstrapDescriptor> {
 pub fn select_initial_mask(preshared_key: Option<&[u8; 32]>) -> Option<MaskProfile> {
     let now = current_unix_secs();
     for descriptor in load_descriptors() {
+        if is_excluded(&descriptor.descriptor_id) {
+            continue;
+        }
         if !descriptor.is_valid_at(now) {
             continue;
         }
@@ -99,7 +136,50 @@ pub fn select_initial_mask(preshared_key: Option<&[u8; 32]>) -> Option<MaskProfi
     None
 }
 
+/// Advisory file lock guarding `store_descriptor`'s read-modify-write of the
+/// cache file. Without it, two client processes against the same `$HOME`
+/// (two profiles, GUI + manual CLI, or a startup multi-channel refresh
+/// racing a server-pushed `BootstrapDescriptorUpdate`) can both read the
+/// same pre-mutation state and each write back a version missing the
+/// other's newly-fetched descriptor — a silent lost update (the atomic
+/// tmp+rename already prevents outright file corruption, just not this).
+/// Held for the lifetime of the returned guard; released automatically when
+/// the underlying fd is closed on Drop. Unix-only (flock) — best-effort
+/// no-op elsewhere.
+#[cfg(unix)]
+struct CacheFileLock {
+    _file: std::fs::File,
+}
+
+#[cfg(unix)]
+impl CacheFileLock {
+    fn acquire() -> Option<Self> {
+        use std::os::unix::io::AsRawFd;
+        let dir = cache_dir();
+        let _ = fs::create_dir_all(&dir);
+        let lock_path = dir.join("bootstrap_descriptors.lock");
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .open(&lock_path)
+            .ok()?;
+        // SAFETY: flock(2) on a valid, owned fd with a plain integer
+        // operation flag. LOCK_EX blocks until the lock is available, so
+        // concurrent store_descriptor calls serialize their
+        // read-modify-write instead of interleaving. The lock is released
+        // automatically (by the kernel) when this fd is closed, including
+        // on process crash — no stale-lock cleanup needed.
+        let ret = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+        if ret != 0 {
+            return None;
+        }
+        Some(Self { _file: file })
+    }
+}
+
 pub fn store_descriptor(descriptor: BootstrapDescriptor) -> Result<()> {
+    #[cfg(unix)]
+    let _lock = CacheFileLock::acquire();
     let mut cache = load_cache_file();
     cache
         .descriptors

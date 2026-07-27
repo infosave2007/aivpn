@@ -23,7 +23,11 @@
     { key: 'allow_peer_routing', label: 'Allow Peer Routing', type: 'checkbox', hint: 'Route traffic between VPN peers (site-to-site mesh). Disable to isolate peers.' },
   ];
 
-  const ADVANCED_KEYS = ['network_config', 'site_to_site', 'mtls', 'dns'];
+  // Complex sub-objects editable as raw JSON. bootstrap_publish is a valid
+  // server key (management_api.rs CONFIG_KNOWN_KEYS) with no dedicated form
+  // section — without it here it was impossible to edit AND (before the
+  // merge-based apply below) got silently destroyed on every Apply.
+  const ADVANCED_KEYS = ['network_config', 'site_to_site', 'mtls', 'dns', 'bootstrap_publish'];
 
   // Simple field values
   let fv = $state<Record<string, string | number | boolean>>({});
@@ -73,11 +77,19 @@
     }
   });
 
-  function buildConfig(): Record<string, unknown> {
-    const out: Record<string, unknown> = {};
+  /**
+   * Build the config to PUT by merging the form over `base` — the config the
+   * server currently has. PUT /api/v1/config REPLACES the whole file, so any
+   * key the form does not manage (or a key added server-side after this UI
+   * shipped) must round-trip verbatim; the old whitelist-rebuild silently
+   * destroyed such keys (that was the bootstrap_publish wipe) on every Apply.
+   */
+  function buildConfig(base: Record<string, unknown>): Record<string, unknown> {
+    const out: Record<string, unknown> = { ...base };
     for (const f of FIELDS) {
       const v = fv[f.key];
       if (v !== undefined && v !== '') out[f.key] = v;
+      else delete out[f.key];
     }
     if (poolEnabled) {
       const peers = poolPeers.split('\n').map(s => s.trim()).filter(Boolean);
@@ -85,36 +97,41 @@
       if (poolSyncKey.trim()) pool['sync_key'] = poolSyncKey.trim();
       if (poolExitNode.trim()) pool['exit_node'] = poolExitNode.trim();
       out['pool'] = pool;
+    } else {
+      delete out['pool'];
     }
     const masks = bootstrapMasks.split('\n').map(s => s.trim()).filter(Boolean);
     if (masks.length) out['bootstrap_mask_files'] = masks;
-    if (advancedJson.trim() !== '{}') {
-      try {
-        const adv = JSON.parse(advancedJson) as Record<string, unknown>;
-        // Only whitelisted sub-objects may come from the advanced editor —
-        // a stray "listen_addr" pasted in here must not silently override
-        // the corresponding form field above.
-        const unknown = Object.keys(adv).filter((k) => !ADVANCED_KEYS.includes(k));
-        if (unknown.length > 0) {
-          advancedError = `Unsupported key(s) in advanced JSON: ${unknown.join(', ')}. Allowed: ${ADVANCED_KEYS.join(', ')}. Use the form fields above for everything else.`;
-          throw advancedError;
-        }
-        for (const k of ADVANCED_KEYS) {
-          if (adv[k] !== undefined) out[k] = adv[k];
-        }
-        advancedError = '';
-      } catch (e: unknown) {
-        if (typeof e !== 'string') {
-          advancedError = e instanceof Error ? e.message : 'Invalid JSON';
-        }
-        throw advancedError;
+    else delete out['bootstrap_mask_files'];
+    try {
+      const adv = JSON.parse(advancedJson) as Record<string, unknown>;
+      // Only whitelisted sub-objects may come from the advanced editor —
+      // a stray "listen_addr" pasted in here must not silently override
+      // the corresponding form field above.
+      const unknown = Object.keys(adv).filter((k) => !ADVANCED_KEYS.includes(k));
+      if (unknown.length > 0) {
+        advancedError = `Unsupported key(s) in advanced JSON: ${unknown.join(', ')}. Allowed: ${ADVANCED_KEYS.join(', ')}. Use the form fields above for everything else.`;
+        throw new Error(advancedError);
       }
+      for (const k of ADVANCED_KEYS) {
+        if (adv[k] !== undefined) out[k] = adv[k];
+        else delete out[k];
+      }
+      advancedError = '';
+    } catch (e: unknown) {
+      if (!advancedError) {
+        advancedError = e instanceof Error ? e.message : 'Invalid JSON';
+      }
+      // Always an Error object — onError reads .message (a thrown string has none).
+      throw e instanceof Error ? e : new Error(advancedError);
     }
     return out;
   }
 
   const updateMut = createMutation({
-    mutationFn: () => configApi.update(buildConfig()),
+    // Re-fetch the CURRENT server config right before applying, so unknown
+    // keys are merged from fresh state (not a possibly-stale cached query).
+    mutationFn: async () => configApi.update(buildConfig(await configApi.get())),
     onSuccess: () => showToast('Configuration saved'),
     onError: (e: Error) => showToast(e.message, true),
   });
@@ -162,6 +179,14 @@
   {#if $query.isLoading}
     <div class="flex justify-center py-12">
       <div class="w-8 h-8 border-2 border-indigo-500 border-t-transparent rounded-full animate-spin"></div>
+    </div>
+  {:else if $query.error}
+    <!-- Surface access/load errors instead of rendering an empty form a
+         viewer could "Apply" (wiping the config they cannot even read). -->
+    <div class="p-4 bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-800 rounded-xl text-sm text-amber-800 dark:text-amber-300">
+      {($query.error as Error).message.includes('403') || ($query.error as Error).message.toLowerCase().includes('forbidden')
+        ? 'Your role does not have access to the server config (admin only).'
+        : ($query.error as Error).message}
     </div>
   {:else}
 
@@ -297,7 +322,7 @@
   <div class="bg-white dark:bg-gray-800 rounded-xl border border-gray-200 dark:border-gray-700 overflow-hidden">
     <button type="button" onclick={() => { showAdvanced = !showAdvanced; }}
       class="w-full flex items-center justify-between px-4 py-3 text-sm font-medium text-gray-600 dark:text-gray-400 hover:bg-gray-50 dark:hover:bg-gray-700/50 transition-colors">
-      <span>Advanced — raw JSON (<code class="font-mono text-xs">network_config</code>, <code class="font-mono text-xs">dns</code>, <code class="font-mono text-xs">site_to_site</code>, <code class="font-mono text-xs">mtls</code>)</span>
+      <span>Advanced — raw JSON (<code class="font-mono text-xs">network_config</code>, <code class="font-mono text-xs">dns</code>, <code class="font-mono text-xs">site_to_site</code>, <code class="font-mono text-xs">mtls</code>, <code class="font-mono text-xs">bootstrap_publish</code>)</span>
       <span>{showAdvanced ? '▲' : '▼'}</span>
     </button>
     {#if showAdvanced}

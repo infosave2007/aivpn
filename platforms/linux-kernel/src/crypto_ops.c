@@ -133,8 +133,10 @@ int aivpn_decrypt(struct aivpn_kern_session *s, struct sk_buff *skb, u64 counter
 		skb_trim(skb, ip_len);
 		kfree_sensitive(scratch);
 
-		s->rx_packets++;
-		s->rx_bytes += ip_len;
+		/* RX stats (s->rx_packets/rx_bytes) are accounted by the caller
+		 * under session->lock: this function runs WITHOUT the session
+		 * lock (only rcu_read_lock) so the AEAD does not serialize the
+		 * per-session RX path. */
 	}
 	return 0;
 }

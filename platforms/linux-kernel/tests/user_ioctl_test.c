@@ -13,6 +13,30 @@
 /* Pull UAPI definitions */
 #include "../include/uapi/aivpn.h"
 
+/* H1 guard: pin the canonical _IOC encoding (asm-generic/ioctl.h:
+ * dir<<30 | size<<16 | magic<<8 | nr, with _IOC_WRITE=1, _IOC_READ=2).
+ * src/dev.rs and crates/aivpn-common/src/kernel_accel.rs re-derive these
+ * numbers with hand-rolled const fns and carry matching compile-time
+ * anchors; if any side drifts, this file stops compiling (and a live run
+ * fails GET_VERSION) instead of the mismatch silently breaking the ABI. */
+_Static_assert(_IOC_WRITE == 1U && _IOC_READ == 2U,
+	       "kernel _IOC direction convention");
+_Static_assert(sizeof(struct aivpn_session_add) == 192,
+	       "aivpn_session_add ABI size");
+_Static_assert(sizeof(struct aivpn_session_update_tags) == 4116,
+	       "aivpn_session_update_tags ABI size");
+_Static_assert(sizeof(struct aivpn_session_downlink) == 4184,
+	       "aivpn_session_downlink ABI size");
+_Static_assert(AIVPN_IOC_SESSION_ADD ==
+	       ((1U << 30) | (192U << 16) | (0xAEU << 8) | 1U),
+	       "SESSION_ADD ioctl encoding");
+_Static_assert(AIVPN_IOC_GET_VERSION ==
+	       ((2U << 30) | (4U << 16) | (0xAEU << 8) | 7U),
+	       "GET_VERSION ioctl encoding");
+_Static_assert(AIVPN_IOC_SESSION_UPDATE_TAGS ==
+	       ((1U << 30) | (4116U << 16) | (0xAEU << 8) | 8U),
+	       "SESSION_UPDATE_TAGS ioctl encoding");
+
 #define DEV "/dev/aivpn"
 
 static int fd;

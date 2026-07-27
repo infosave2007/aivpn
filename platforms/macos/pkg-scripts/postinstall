@@ -37,12 +37,14 @@ chmod 644 "$PLIST_PATH"
 chown root:wheel "$PLIST_PATH"
 
 # Kill ALL orphaned aivpn-client processes (from old DMG runs etc.)
+# -x = exact process-name match; -f matched argv substrings and could kill
+# unrelated processes whose command line merely mentions aivpn-client.
 echo "Cleaning up old processes..."
-pkill -9 -f "aivpn-client" 2>/dev/null || true
+pkill -9 -x "aivpn-client" 2>/dev/null || true
 sleep 1
 
 # Kill any running helper
-pkill -9 -f "aivpn-helper" 2>/dev/null || true
+pkill -9 -x "aivpn-helper" 2>/dev/null || true
 sleep 1
 
 # Remove stale socket and PID file

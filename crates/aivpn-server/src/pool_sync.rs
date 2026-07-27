@@ -187,6 +187,19 @@ pub struct PeerSyncer {
     /// send loops (which all share `send_counter`) can never race each
     /// other's writes into persisting a smaller value after a larger one.
     persisted_high_water: Mutex<u64>,
+    /// H3: advisory exclusive `flock` held on `<counter_state_path>.lock` for
+    /// the lifetime of this `PeerSyncer`. The persisted high-water mark alone
+    /// only protects against *sequential* restarts — it does nothing to stop
+    /// two overlapping processes (e.g. a crash-restart loop or an operator
+    /// launching a duplicate) from both reading the same on-disk counter,
+    /// then independently advancing `send_counter` from that same start
+    /// value and encrypting with the same static per-peer session key. That
+    /// is a real (key, nonce) reuse — catastrophic for ChaCha20-Poly1305.
+    /// Held here (never explicitly unlocked) so the OS releases it
+    /// automatically on process exit/crash; a second instance's attempt to
+    /// acquire it fails immediately and `new()` refuses to start pool sync
+    /// rather than risk nonce reuse.
+    _counter_lock_file: std::fs::File,
 }
 
 impl PeerSyncer {
@@ -264,6 +277,46 @@ impl PeerSyncer {
         // exists (first run) or it is stale/unreadable.
         let counter_state_path = db.file_path().with_file_name("pool_sync_counter.state");
 
+        // H3: acquire an advisory exclusive flock on a dedicated lock file
+        // BEFORE touching the counter state, and hold it for the process's
+        // lifetime. This is what actually prevents cross-process nonce
+        // reuse: the persisted high-water mark only protects sequential
+        // restarts, not two overlapping processes racing the same read-then-
+        // write. Fail closed — refuse to start pool sync — if the lock is
+        // already held.
+        let lock_path = counter_state_path.with_extension("state.lock");
+        let lock_file = match std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .open(&lock_path)
+        {
+            Ok(f) => f,
+            Err(e) => {
+                warn!(
+                    "pool_sync: failed to open counter lock file {} — pool sync disabled: {}",
+                    lock_path.display(),
+                    e
+                );
+                return None;
+            }
+        };
+        {
+            use std::os::unix::io::AsRawFd;
+            // SAFETY: `lock_file` is a valid, open file descriptor for the
+            // duration of this call; `flock` only inspects/mutates kernel
+            // lock state for that fd and does not touch Rust-owned memory.
+            let rc = unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+            if rc != 0 {
+                warn!(
+                    "pool_sync: another process already holds the counter lock at {} — \
+                     refusing to start a second overlapping pool-sync instance (would risk \
+                     AEAD nonce reuse under the static pool session key)",
+                    lock_path.display()
+                );
+                return None;
+            }
+        }
+
         // Best-effort cleanup of orphaned temp files. `write_counter_file` names
         // its temp `pool_sync_counter.<pid>.tmp`; a process that is killed
         // mid-persist (e.g. the crash-restart loops this survives) leaves its
@@ -313,6 +366,7 @@ impl PeerSyncer {
             send_counter,
             counter_state_path,
             persisted_high_water,
+            _counter_lock_file: lock_file,
         }))
     }
 
@@ -635,6 +689,12 @@ mod tests {
         // "Process 2": a fresh PeerSyncer built right away, against the same
         // clients DB (and therefore the same counter-state file) — the
         // worst case for landing in the same wall-clock bucket as process 1.
+        // Drop process 1's syncer first to release its advisory counter-file
+        // flock (H3) — a real restart closes the old process's fd before the
+        // new one opens, which is exactly what this drop simulates; two
+        // genuinely *overlapping* instances are covered by
+        // `overlapping_instances_are_refused` below.
+        drop(syncer1);
         let syncer2 = PeerSyncer::new(db, &cfg, test_events()).unwrap();
         let resumed_counter = syncer2.send_counter.load(Ordering::Relaxed);
 
@@ -644,6 +704,28 @@ mod tests {
              the same static session key (last used = {last_used_counter}, resumed at \
              = {resumed_counter})"
         );
+    }
+
+    /// H3 regression: two `PeerSyncer`s that are genuinely overlapping (the
+    /// first is still alive, unlike the restart test above which drops it
+    /// first) must not both be able to run against the same counter-state
+    /// file — the second construction must fail closed rather than risk
+    /// reusing a (key, nonce) pair the first instance might already be using.
+    #[test]
+    fn overlapping_instances_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("clients.json");
+        let db = Arc::new(ClientDatabase::load(&db_path, test_network_config()).unwrap());
+        let cfg = test_pool_config();
+
+        let syncer1 = PeerSyncer::new(db.clone(), &cfg, test_events()).unwrap();
+        let syncer2 = PeerSyncer::new(db, &cfg, test_events());
+        assert!(
+            syncer2.is_none(),
+            "a second overlapping PeerSyncer instance must be refused, not silently \
+             allowed to race the first over the same counter state"
+        );
+        drop(syncer1);
     }
 
     /// Build a `PeerSyncer` named `node_id` whose single peer is `peer`,

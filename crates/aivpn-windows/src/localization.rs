@@ -13,7 +13,7 @@ pub enum Lang {
     Ru,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppSettings {
     #[serde(default = "default_lang")]
     pub lang: Lang,
@@ -76,7 +76,40 @@ impl AppSettings {
         let path = settings_path();
         if path.exists() {
             if let Ok(data) = std::fs::read_to_string(&path) {
-                if let Ok(s) = serde_json::from_str::<AppSettings>(&data) {
+                if let Ok(mut s) = serde_json::from_str::<AppSettings>(&data) {
+                    // MEDIUM: the Telegram bootstrap bot token is a real credential
+                    // (grants control of the bootstrap-distribution bot) that used to
+                    // be stored in plaintext here, unlike the connection key — which
+                    // is DPAPI-encrypted in keys.json. Decrypt it the same way,
+                    // transparently migrating any legacy-plaintext value (mirrors
+                    // KeyStorage::load()'s handling of legacy plaintext keys below).
+                    let mut needs_save = false;
+                    if !s.bootstrap_telegram_token.is_empty() {
+                        match crate::key_storage::unprotect_key(&s.bootstrap_telegram_token) {
+                            Ok(decrypted) => {
+                                if decrypted == s.bootstrap_telegram_token {
+                                    // Didn't change → base64 decode failed → legacy
+                                    // plaintext. Re-encrypt on the immediate save below.
+                                    needs_save = true;
+                                } else {
+                                    s.bootstrap_telegram_token = decrypted;
+                                }
+                            }
+                            Err(e) => {
+                                // Corrupted or from a different user/machine — drop it
+                                // rather than risk treating ciphertext as a live token,
+                                // same treatment KeyStorage gives an undecryptable key.
+                                crate::vpn_manager::gui_log(&format!(
+                                    "aivpn: dropping corrupt bootstrap_telegram_token: {e}"
+                                ));
+                                s.bootstrap_telegram_token = String::new();
+                                needs_save = true;
+                            }
+                        }
+                    }
+                    if needs_save {
+                        s.save();
+                    }
                     return s;
                 }
             }
@@ -119,14 +152,33 @@ impl AppSettings {
         if let Some(p) = path.parent() {
             let _ = std::fs::create_dir_all(p);
         }
-        let Ok(json) = serde_json::to_string_pretty(self) else {
+        // Encrypt the Telegram bootstrap token before it touches disk — build a
+        // disk-only copy rather than mutating `self`, so the in-memory value the
+        // rest of the app uses (e.g. passed to aivpn-client.exe via env var)
+        // stays plaintext. Best-effort: if DPAPI is ever unavailable, fall back
+        // to writing it in plaintext (this field's pre-existing behavior) rather
+        // than losing every other setting sharing this file.
+        let mut on_disk = self.clone();
+        if !on_disk.bootstrap_telegram_token.is_empty() {
+            match crate::key_storage::protect_key(&on_disk.bootstrap_telegram_token) {
+                Ok(encrypted) => on_disk.bootstrap_telegram_token = encrypted,
+                Err(e) => {
+                    crate::vpn_manager::gui_log(&format!(
+                        "aivpn: bootstrap_telegram_token DPAPI encryption failed, saving plaintext: {e}"
+                    ));
+                }
+            }
+        }
+        let Ok(json) = serde_json::to_string_pretty(&on_disk) else {
             return;
         };
         // Atomic write: write to .tmp then rename to prevent corrupt settings.json on crash
         let tmp = path.with_extension("json.tmp");
         if std::fs::write(&tmp, &json).is_ok() {
             if let Err(e) = std::fs::rename(&tmp, &path) {
-                eprintln!("AppSettings::save rename {:?} → {:?}: {e}", tmp, path);
+                crate::vpn_manager::gui_log(&format!(
+                    "AppSettings::save rename {tmp:?} → {path:?}: {e}"
+                ));
                 let _ = std::fs::remove_file(&tmp);
             }
         }

@@ -111,7 +111,7 @@
                   {#if mask.generated}
                     <span
                       class="px-1.5 py-0.5 rounded text-[10px] font-medium bg-indigo-100 text-indigo-700 dark:bg-indigo-900/40 dark:text-indigo-300"
-                      title="Auto-generated from a recording">(авто)</span
+                      title="Auto-generated from a recording">(auto)</span
                     >
                   {/if}
                 </div>

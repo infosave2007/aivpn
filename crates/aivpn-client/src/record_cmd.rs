@@ -174,13 +174,12 @@ fn current_timestamp_ms() -> u64 {
 fn write_status(status: &RecordingLocalStatus) {
     if let Ok(json) = serde_json::to_vec(status) {
         for path in recording_status_paths() {
-            if std::fs::write(&path, &json).is_ok() {
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
-                }
-            }
+            // Atomic temp+rename (not plain std::fs::write, which
+            // open+truncate+writes in place) so a CLI `record status` poll
+            // landing mid-write never sees a 0-byte/partial file — and
+            // O_NOFOLLOW/create_new-hardened, since this can fall back to a
+            // predictable world-writable /tmp path (see secure_write.rs).
+            crate::secure_write::write_status_best_effort(&path, &json);
         }
     }
 }

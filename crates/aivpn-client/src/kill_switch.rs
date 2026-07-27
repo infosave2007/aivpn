@@ -370,16 +370,29 @@ impl KillSwitch {
     fn activate_impl(&self) -> Result<()> {
         use std::process::Command;
 
-        // Save current firewall policy so we can restore it on deactivate
-        if let Ok(out) = Command::new("netsh")
-            .args(["advfirewall", "show", "currentprofile", "firewallpolicy"])
-            .output()
-        {
-            let save_path = Self::policy_save_path();
-            if let Some(p) = save_path.parent() {
-                let _ = std::fs::create_dir_all(p);
+        // Save the current firewall policy so we can restore it on deactivate —
+        // but ONLY on the first activation of this process. `tunnel.rs` builds a
+        // brand-new `KillSwitch` (and `main.rs`'s reconnect loop a brand-new
+        // `AivpnClient`) on every reconnect iteration, and kill-switch state is
+        // intentionally left active across reconnect backoffs (deactivate only
+        // runs on clean shutdown). If we re-query+overwrite the save file on
+        // every activation, the second reconnect captures the ALREADY-BLOCKED
+        // "allowinbound,blockoutbound" state as the "restore to" target — so
+        // eventual deactivate() "restores" into a permanently blocked policy
+        // with no allow rules, locking the user off the network. Only write
+        // the save file if one doesn't already exist so the true pre-VPN
+        // policy captured by the first activation always wins.
+        let save_path = Self::policy_save_path();
+        if !save_path.exists() {
+            if let Ok(out) = Command::new("netsh")
+                .args(["advfirewall", "show", "currentprofile", "firewallpolicy"])
+                .output()
+            {
+                if let Some(p) = save_path.parent() {
+                    let _ = std::fs::create_dir_all(p);
+                }
+                let _ = std::fs::write(&save_path, &out.stdout);
             }
-            let _ = std::fs::write(&save_path, &out.stdout);
         }
 
         // Set default outbound to block — allow rules below override this for
@@ -406,6 +419,13 @@ impl KillSwitch {
         // outbound traffic — including to the VPN server itself — stays
         // fully blocked with no way to reconnect. Fail loud and roll back
         // to the pre-activation policy instead of reporting "active".
+        //
+        // Delete any pre-existing rule of the same name first: every reconnect
+        // picks a fresh random tun name (main.rs) and can select a different
+        // pool server, so without this an `add rule` across reconnects leaves
+        // every previous tun-name/server-IP allow rule in place — unbounded
+        // firewall-table growth plus a widening allow-list for the process
+        // lifetime. `delete rule` is a no-op (best-effort) when nothing matches.
         for (name, extra) in &[
             ("AIVPN_KS_ALLOW_VPN", format!("interface={}", self.tun_name)),
             (
@@ -414,6 +434,15 @@ impl KillSwitch {
             ),
             ("AIVPN_KS_ALLOW_LOCAL", "remoteip=127.0.0.0/8".to_string()),
         ] {
+            let _ = Command::new("netsh")
+                .args([
+                    "advfirewall",
+                    "firewall",
+                    "delete",
+                    "rule",
+                    &format!("name={}", name),
+                ])
+                .status();
             let ok = Command::new("netsh")
                 .args([
                     "advfirewall",

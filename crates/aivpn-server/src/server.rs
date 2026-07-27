@@ -90,13 +90,7 @@ pub struct ServerArgs {
     #[arg(long, value_name = "PATH")]
     pub validate_mask: Option<String>,
 
-    // ── Pool / Enroll ──────────────────────────────────────────────────────────
-    /// Enroll a peer server into the pool.
-    /// Verifies that the peer shares the same server.key fingerprint, then
-    /// pushes the full clients.json and adds the peer to the local pool config.
-    #[arg(long, value_name = "PEER_ADDR")]
-    pub enroll: Option<String>,
-
+    // ── Pool ─────────────────────────────────────────────────────────────────
     /// Pool configuration JSON file path.
     /// Contains: {"peers": ["host:port", ...], "sync_port": 444, "sync_key": "hex"}
     #[arg(long, env = "AIVPN_POOL_CONFIG")]

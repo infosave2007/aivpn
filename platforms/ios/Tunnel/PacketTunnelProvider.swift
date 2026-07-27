@@ -1,4 +1,5 @@
 import NetworkExtension
+import Network
 import Darwin
 import Security
 import os.log
@@ -72,11 +73,30 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     private var settingsKillSwitch: Bool = false
     private var rehomeWatch: DispatchSourceTimer?
     private static let vpnIpOverridePrefix = "vpn_ip_override_"
+    // C1/H2: in-extension reconnect support. The Rust core's resilience
+    // statics (HANDSHAKE_FAIL_STREAK, LAST_GOOD_MASK, …) are process-local
+    // and only do their job across MULTIPLE aivpn_run_tunnel calls in the
+    // SAME process — so the extension runs a bounded retry loop (see the
+    // thread body in startTunnel) instead of dying on the first session
+    // error, and persists the handshake-fail streak per server in the App
+    // Group so even a process teardown between failed starts cannot keep the
+    // descriptor→preset fallback threshold forever out of reach.
+    private var failStreakKey: String = PacketTunnelProvider.handshakeFailStreakBaseKey
+    // H2: interface-change watcher — on a meaningful path change the current
+    // Rust session is stopped so the retry loop reconnects on the new path
+    // immediately instead of waiting out the RX-silence watchdogs.
+    private var pathMonitor: NWPathMonitor?
+    private var lastPathSignature: String?
+    // L5: count of inbound (packetFlow → Rust) packets dropped because the
+    // bridge socket buffer was full (write() EAGAIN). Debug visibility only.
+    // Touched exclusively on bridgeQueue.
+    private var inboundDropCount: UInt64 = 0
     private var recordingMaskId: String = ""
     private var recordingFailureReason: String = ""
     private var lastSeenRecordingFeedbackSeq: Int64 = 0
 
-    // Public DNS fallback used alongside the VPN's internal resolver (10.8.0.1) so that
+    // Public DNS fallback used alongside the VPN's internal resolver (the .1 of the
+    // assigned VPN /24 — see buildSettings/slash24Prefix) so that
     // hostnames outside the VPN's own zone still resolve in full-tunnel mode. There is no
     // field for this in the connection key / providerConfiguration today (see
     // ConnectionKey.swift, network_config.rs) — adding one would be a wire-format change
@@ -157,6 +177,9 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         // M1: scope the persisted descriptor blob to THIS server so a profile switch
         // never loads another server's descriptors.
         self.descriptorStoreKey = Self.perServerDescriptorsKey(key.serverKey)
+        // C1: the handshake-fail streak is scoped per server the same way —
+        // server B must not start at server A's fallback threshold.
+        self.failStreakKey = Self.perServerFailStreakKey(key.serverKey)
         // M3: if the connection key carried freshly-discovered descriptors ("bd",
         // written by BootstrapDiscovery) and this server has none cached yet, seed
         // the per-server App-Group blob so the VERY FIRST connect to this server is
@@ -262,6 +285,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                 return
             }
             self.startRehomeWatch()
+            self.startPathMonitor()
 
             let host       = key.serverHost
             let port       = key.serverPort
@@ -294,13 +318,30 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                 .string(forKey: self.descriptorStoreKey)
                 .flatMap { $0.isEmpty || $0 == "[]" ? nil : $0 }
 
-            // Retrieve mTLS cert: prefer shared-Keychain token, fall back to direct embed.
+            // Retrieve mTLS cert — M2: same 3-tier resolution as the connection
+            // key above. The one-time handoff token is consumed on first use, so
+            // a system-initiated restart (reassertion, always-on relaunch) that
+            // replays providerConfiguration would silently drop the cert and the
+            // server would reject the mTLS-required session. Mirror the key's
+            // persistent-Keychain fallback: token (fresh, wins + persists) →
+            // persistent copy (reassertion) → direct embed (fresh, persists).
+            // The persistent copy is only consulted when the profile actually
+            // carries a cert token — a profile WITHOUT mTLS must never pick up
+            // a stale cert from an earlier profile.
             let certBytes: [UInt8]? = {
                 let certStr: String?
                 if let token = cfg["mtlsCertToken"] as? String {
-                    certStr = self.retrieveHandoffSecret(token: token)
+                    if let secret = self.retrieveHandoffSecret(token: token) {
+                        certStr = secret
+                        self.storePersistentCert(secret)
+                    } else {
+                        certStr = self.retrievePersistentCert()
+                    }
+                } else if let direct = cfg["mtlsCertDirect"] as? String, !direct.isEmpty {
+                    certStr = direct
+                    self.storePersistentCert(direct)
                 } else {
-                    certStr = cfg["mtlsCertDirect"] as? String
+                    certStr = nil
                 }
                 return certStr.flatMap {
                     guard let data = Data(base64Encoded: $0), !data.isEmpty else { return nil }
@@ -318,6 +359,33 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             let readyCtx = Unmanaged.passUnretained(readyBox).toOpaque()
 
             let thread = Thread {
+                // C1/H2: bounded in-extension retry loop. aivpn_run_tunnel
+                // handles exactly ONE connection attempt; previously any
+                // session error ended the whole extension process via
+                // cancelTunnelWithError, so the Rust core's cross-attempt
+                // resilience statics (HANDSHAKE_FAIL_STREAK descriptor
+                // fallback, LAST_GOOD_MASK stickiness, DATA_STALL_STREAK
+                // exploration) never saw a second attempt and a poisoned
+                // cached descriptor could block connecting until expiry.
+                // Retrying HERE keeps those statics alive across attempts —
+                // the same shape as Android's in-service reconnect loop.
+                //
+                // Conservative bounds: at most backoffSeconds.count + 1
+                // attempts with growing backoff; a user/OS stop (isStopped)
+                // aborts immediately; a session that established and lived
+                // >60 s resets the attempt budget (long-lived tunnel with an
+                // occasional blip must never exhaust it).
+                let backoffSeconds: [TimeInterval] = [1, 2, 4, 8, 15, 30]
+                var attempt = 0
+                // C1: seed the Rust core's handshake-fail streak from the App
+                // Group so the descriptor→preset fallback threshold survives
+                // extension-process teardown between failed starts.
+                let persistedStreak = self.appGroupDefaults?.integer(forKey: self.failStreakKey) ?? 0
+                if persistedStreak > 0 {
+                    aivpn_seed_handshake_fail_streak(UInt32(clamping: persistedStreak))
+                }
+                while true {
+                let attemptStart = Date()
                 // Run the tunnel; withUnsafeBufferPointer closures end before zeroing.
                 sKeyArr.withUnsafeBufferPointer { sKeyPtr in
                     deviceKey.withUnsafeBufferPointer { dkPtr in
@@ -409,9 +477,56 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                         }
                     }
                 }
+                // C1: persist the updated handshake-fail streak per server —
+                // the core resets it to 0 internally once the PFS ratchet
+                // completes, so this write also CLEARS the persisted value
+                // after a successful connect.
+                let streak = aivpn_get_handshake_fail_streak()
+                self.appGroupDefaults?.set(Int(streak), forKey: self.failStreakKey)
+                // User/OS-initiated stop: exit the loop immediately, no retry.
+                if self.isStopped { break }
+                // A session that established and lived >60 s was healthy —
+                // whatever ended it is a fresh incident, not a continuation of
+                // an earlier failure run. Reset the attempt budget.
+                if aivpn_ever_connected() != 0,
+                   Date().timeIntervalSince(attemptStart) > 60 {
+                    attempt = 0
+                }
+                guard attempt < backoffSeconds.count else {
+                    os_log(.error, "aivpn: tunnel session failed after %d attempts — giving up", Int32(attempt + 1))
+                    break
+                }
+                let backoff = backoffSeconds[attempt]
+                attempt += 1
+                os_log(.info, "aivpn: tunnel session ended — reconnect attempt %d in %.0f s", Int32(attempt), backoff)
+                // Sleep in short slices so a user stop aborts the wait fast.
+                let sleepDeadline = Date().addingTimeInterval(backoff)
+                while Date() < sleepDeadline && !self.isStopped {
+                    Thread.sleep(forTimeInterval: 0.25)
+                }
+                if self.isStopped { break }
+                // H2: a path-change aivpn_stop_tunnel() that landed in the gap
+                // BETWEEN sessions set STOP_PENDING, which would kill the next
+                // session instantly. This retry is an intentional reconnect —
+                // clear it, then re-check isStopped: a USER stop always sets
+                // isStopped BEFORE calling aivpn_stop_tunnel, so the re-check
+                // keeps a raced user stop honored. (Residual: a user stop
+                // landing exactly between this re-check and session start is
+                // torn down moments later when iOS reaps the extension after
+                // stopTunnel returns.)
+                aivpn_clear_pending_stop()
+                if self.isStopped { break }
+                }
                 // Zeroize key material *after* all withUnsafeBufferPointer closures
                 // have returned — calling withUnsafeMutableBufferPointer while the
                 // immutable variant is still on the stack is undefined behaviour.
+                // L2 NOTE: this zeroization is best-effort only — Swift Array is
+                // copy-on-write and the closures above may have left transient
+                // copies (or the optimizer may elide the memset of a
+                // provably-dead buffer), so erasure of every copy is NOT
+                // guaranteed. Kept because it shrinks the window for the
+                // canonical buffers; a guaranteed-erasure design needs
+                // non-COW storage (flagged for a future security pass).
                 sKeyArr.withUnsafeMutableBufferPointer { buf in
                     _ = memset(buf.baseAddress, 0, buf.count * MemoryLayout<UInt8>.size)
                 }
@@ -473,6 +588,8 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         isStopped = true
         aivpn_stop_tunnel()
         bridgeQueue.sync {
+            pathMonitor?.cancel()
+            pathMonitor = nil
             rehomeWatch?.cancel()
             rehomeWatch = nil
             if let source = outboundSource {
@@ -512,9 +629,14 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             let up      = (NSNumber(value: aivpn_get_upload_bytes())).int64Value
             let down    = (NSNumber(value: aivpn_get_download_bytes())).int64Value
             let quality = Int(aivpn_get_quality_score())
+            // Core-owned connected-since (epoch ms, 0 = not established) —
+            // same session scope as the byte counters, so the app's stopwatch
+            // and traffic stats stay in sync across UI relaunch/jetsam.
+            let since = (NSNumber(value: aivpn_get_connected_since_ms())).int64Value
             let resp: [String: Any] = [
                 "upload":          up,
                 "download":        down,
+                "connected_since": since,
                 "can_record":      canRecord,
                 "recording_state": recordingPhase,
                 "service":         recordingServiceName,
@@ -572,7 +694,11 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     // MARK: - Swift <-> Rust bridge
 
     private func startBridge() {
-        let mtu = 1500
+        // L1: read-buffer size for sp[0]. Must cover the LARGEST datagram the
+        // Rust core can write (its BUF_SIZE = 2048 — a decoded downlink payload
+        // can exceed utun MTU + 4); a SOCK_DGRAM read into a smaller buffer
+        // silently TRUNCATES the packet. Keep in sync with ios_tunnel.rs.
+        let readBufSize = 2048
 
         // Outbound: sp[0] → packetFlow.
         // Event-driven: a DispatchSourceRead fires only when sp[0] becomes
@@ -591,9 +717,9 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                                                        queue: bridgeQueue)
             source.setEventHandler { [weak self] in
                 guard let self = self, !self.isStopped else { return }
-                var buf = [UInt8](repeating: 0, count: mtu + 4)
+                var buf = [UInt8](repeating: 0, count: readBufSize)
                 while true {
-                    let n = Darwin.read(swiftFd, &buf, mtu + 4)
+                    let n = Darwin.read(swiftFd, &buf, readBufSize)
                     if n > 0 {
                         let data = Data(buf[0..<n])
                         let af: NSNumber = (buf[0] >> 4 == 6)
@@ -678,7 +804,18 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                         guard !self.isStopped, self.sp[0] == swiftFd else { return true }
                         pkt.withUnsafeBytes { buf in
                             guard let base = buf.baseAddress, buf.count > 0 else { return }
-                            _ = Darwin.write(swiftFd, base, buf.count)
+                            let n = Darwin.write(swiftFd, base, buf.count)
+                            // L5: a full socket buffer (EAGAIN/EWOULDBLOCK)
+                            // silently drops this uplink packet — upper-layer
+                            // protocols retransmit, but count it so sustained
+                            // bridge backpressure is visible in debug logs.
+                            if n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) {
+                                self.inboundDropCount += 1
+                                if self.inboundDropCount == 1 || self.inboundDropCount % 512 == 0 {
+                                    os_log(.debug, "aivpn: inbound bridge full — %llu packets dropped so far",
+                                           self.inboundDropCount)
+                                }
+                            }
                         }
                         return false
                     }
@@ -686,6 +823,41 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                 }
             }
         }
+    }
+
+    // MARK: - Network path monitoring (H2)
+
+    /// Watches for interface changes (WiFi↔cellular, airplane-mode flip, hotspot
+    /// handoff). On a meaningful change the current Rust session is stopped via
+    /// aivpn_stop_tunnel() so the in-extension retry loop (startTunnel's thread)
+    /// reconnects on the NEW path immediately, instead of waiting for the
+    /// RX-silence watchdogs to notice the dead flow on the old one. The handler
+    /// runs on bridgeQueue; lastPathSignature is touched only there.
+    private func startPathMonitor() {
+        pathMonitor?.cancel()
+        let monitor = NWPathMonitor()
+        monitor.pathUpdateHandler = { [weak self] path in
+            guard let self = self, !self.isStopped else { return }
+            var sig = path.status == .satisfied ? "up" : "down"
+            for iface in path.availableInterfaces {
+                sig += "|\(iface.type)#\(iface.name)"
+            }
+            let previous = self.lastPathSignature
+            self.lastPathSignature = sig
+            // The first callback merely reports the current path — never
+            // restart on it.
+            guard let prev = previous, prev != sig else { return }
+            // While the path is down there is nothing to reconnect TO; the
+            // transition back to satisfied fires its own change event.
+            guard path.status == .satisfied else { return }
+            os_log(.info, "aivpn: network path changed (%{public}@ -> %{public}@) — restarting tunnel session",
+                   prev, sig)
+            // Stops ONLY the Rust session: isStopped stays false, so the retry
+            // loop treats the exit as an internal error and reconnects.
+            aivpn_stop_tunnel()
+        }
+        monitor.start(queue: bridgeQueue)
+        pathMonitor = monitor
     }
 
     // MARK: - Pool re-home healing
@@ -740,6 +912,13 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         let settings = NEPacketTunnelNetworkSettings(tunnelRemoteAddress: serverHost)
         settings.mtu = adaptiveLevel >= 2 ? 1200 : (adaptiveLevel == 1 ? 1300 : 1400)
 
+        // M1: derive the VPN /24 from the ACTUAL assigned address instead of
+        // hardcoding 10.8.0.x — an operator running a different pool subnet
+        // (or a pool re-home landing outside 10.8.0.0/24) would otherwise get
+        // a split-tunnel route / DNS resolver pointing at the wrong network.
+        // Falls back to the legacy 10.8.0 prefix only if vpnIP is unparsable.
+        let subnetPrefix = Self.slash24Prefix(of: vpnIP) ?? "10.8.0"
+
         let ipv4 = NEIPv4Settings(addresses: [vpnIP], subnetMasks: ["255.255.255.0"])
         if fullTunnel {
             ipv4.includedRoutes = [NEIPv4Route.default()]
@@ -753,23 +932,26 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                 }
             }
         } else {
-            ipv4.includedRoutes = [NEIPv4Route(destinationAddress: "10.8.0.0",
+            ipv4.includedRoutes = [NEIPv4Route(destinationAddress: "\(subnetPrefix).0",
                                                subnetMask: "255.255.255.0")]
         }
         settings.ipv4Settings = ipv4
 
         // DNS is intentionally only forced through the VPN in full-tunnel mode.
-        // In split-tunnel mode (fullTunnel == false) only the 10.8.0.0/24 VPN subnet is
+        // In split-tunnel mode (fullTunnel == false) only the VPN /24 subnet is
         // routed (see the `else` branch above) — general internet traffic stays on the
         // regular interface, so forcing all system DNS through the VPN's resolver here
-        // would not match where the traffic actually goes (and 10.8.0.1 is not known to
-        // be a general-purpose recursive resolver for arbitrary internet domains, only
-        // for the VPN's own zone). This is the same reason `excludedRoutes` is only
-        // applied in full-tunnel mode just above. This is a deliberate design choice, not
-        // an oversight — changing it needs a product decision plus on-device verification,
-        // since it can't be validated from this sandbox (no Xcode/macOS toolchain here).
+        // would not match where the traffic actually goes (and the .1 gateway is not
+        // known to be a general-purpose recursive resolver for arbitrary internet
+        // domains, only for the VPN's own zone). This is the same reason
+        // `excludedRoutes` is only applied in full-tunnel mode just above. This is a
+        // deliberate design choice, not an oversight — changing it needs a product
+        // decision plus on-device verification, since it can't be validated from this
+        // sandbox (no Xcode/macOS toolchain here).
         if fullTunnel {
-            let dns = NEDNSSettings(servers: ["10.8.0.1", Self.fallbackPublicDNS])
+            // M1: the VPN-side resolver is the .1 of the ACTUAL assigned /24
+            // (the server-side gateway convention), not a hardcoded 10.8.0.1.
+            let dns = NEDNSSettings(servers: ["\(subnetPrefix).1", Self.fallbackPublicDNS])
             // matchDomains = nil routes ALL domains through VPN DNS (full-tunnel DNS behaviour).
             // NEDNSSettings has no matchExcludedDomains — domain-level DNS exclusion is not
             // supported by the iOS NetworkExtension API (confirmed by a real Xcode compile
@@ -783,6 +965,17 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             settings.dnsSettings = dns
         }
         return settings
+    }
+
+    /// M1: first three octets of a dotted-decimal IPv4 (e.g. "10.9.3.7" →
+    /// "10.9.3"), or nil when the string is not a well-formed IPv4 address.
+    /// Used to derive the split-tunnel route ("<prefix>.0"/24) and the VPN
+    /// resolver ("<prefix>.1") from the actually-assigned VPN IP.
+    private static func slash24Prefix(of ip: String) -> String? {
+        let parts = ip.split(separator: ".")
+        guard parts.count == 4,
+              parts.allSatisfy({ UInt8($0) != nil }) else { return nil }
+        return parts.prefix(3).joined(separator: ".")
     }
 
     // MARK: - CIDR helpers
@@ -955,6 +1148,20 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     private static func perServerDescriptorsKey(_ serverKey: [UInt8]) -> String {
         let suffix = serverKey.prefix(16).map { String(format: "%02x", $0) }.joined()
         return "\(bootstrapDescriptorsKey).\(suffix)"
+    }
+
+    /// C1: App Group key (per-server suffixed, like the descriptor blob) for
+    /// the persisted consecutive handshake-fail streak. Seeded back into the
+    /// Rust core via aivpn_seed_handshake_fail_streak() before the first
+    /// attempt of each extension process, so the HANDSHAKE_FALLBACK_THRESHOLD
+    /// descriptor→preset fallback works even though iOS tears the extension
+    /// process down between failed starts. Cleared (0) once a session
+    /// connects.
+    private static let handshakeFailStreakBaseKey = "aivpn.handshake_fail_streak"
+
+    private static func perServerFailStreakKey(_ serverKey: [UInt8]) -> String {
+        let suffix = serverKey.prefix(16).map { String(format: "%02x", $0) }.joined()
+        return "\(handshakeFailStreakBaseKey).\(suffix)"
     }
 
     private static let feedbackOutcomesKey = "aivpn.feedback.outcomes_json"
@@ -1310,6 +1517,52 @@ extension PacketTunnelProvider {
             kSecValueData:       data,
         ]
         SecItemAdd(attrs as CFDictionary, nil)
+    }
+
+    /// M2: writes the base64 mTLS cert to a stable Keychain entry that survives
+    /// tunnel reassertion — the exact mirror of storePersistentKey for the cert,
+    /// so a system-initiated restart (consumed one-time token) keeps its mTLS
+    /// identity instead of silently connecting certless.
+    fileprivate func storePersistentCert(_ certB64: String) {
+        guard let data = certB64.data(using: .utf8) else { return }
+        let service = "com.aivpn.client.tunnel-handoff"
+        let account = "aivpn_persistent_mtls_cert"
+        let del: [CFString: Any] = [
+            kSecClass:           kSecClassGenericPassword,
+            kSecAttrService:     service,
+            kSecAttrAccount:     account,
+            kSecAttrAccessGroup: appGroup,
+        ]
+        SecItemDelete(del as CFDictionary)
+        let attrs: [CFString: Any] = [
+            kSecClass:           kSecClassGenericPassword,
+            kSecAttrService:     service,
+            kSecAttrAccount:     account,
+            kSecAttrAccessGroup: appGroup,
+            kSecAttrAccessible:  kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly,
+            kSecValueData:       data,
+        ]
+        SecItemAdd(attrs as CFDictionary, nil)
+    }
+
+    /// M2: retrieves the persistent mTLS cert written by storePersistentCert.
+    /// Returns nil before any cert has been persisted.
+    fileprivate func retrievePersistentCert() -> String? {
+        let service = "com.aivpn.client.tunnel-handoff"
+        let account = "aivpn_persistent_mtls_cert"
+        let query: [CFString: Any] = [
+            kSecClass:           kSecClassGenericPassword,
+            kSecAttrService:     service,
+            kSecAttrAccount:     account,
+            kSecAttrAccessGroup: appGroup,
+            kSecMatchLimit:      kSecMatchLimitOne,
+            kSecReturnData:      true,
+        ]
+        var result: CFTypeRef?
+        guard SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess,
+              let data = result as? Data,
+              let cert = String(data: data, encoding: .utf8) else { return nil }
+        return cert
     }
 
     /// Retrieves the persistent connection key written by storePersistentKey.
