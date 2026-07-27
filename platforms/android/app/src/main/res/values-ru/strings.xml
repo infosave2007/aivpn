@@ -247,4 +247,25 @@
     <string name="admin_reject_reason_prefix">Отклонено: %s</string>
     <string name="admin_error_generic">Ошибка запроса (%d)</string>
     <string name="admin_error_with_reason">Ошибка запроса (%1$d): %2$s</string>
+    <string name="admin_hint_exit_node">Выходной узел (необязательно, host:port — пусто = глобальный по умолчанию)</string>
+    <string name="admin_exit_node_prefix">Выход: %s</string>
+
+    <!-- Топология пула (Wave B3) -->
+    <string name="pool_title">Топология пула</string>
+    <string name="pool_no_nodes">Нет узлов пула</string>
+    <string name="pool_health_transport">Транспорт: %s</string>
+    <string name="pool_health_nodes">Всего узлов: %d</string>
+    <string name="pool_health_connected">Подключённых пиров: %d</string>
+    <string name="pool_health_converged">Синхронизированных пиров: %d</string>
+    <string name="pool_health_diverged">Часть подключённых пиров рассинхронизирована</string>
+    <string name="pool_warning_partition_conflict">Внимание: конфликт разделов VPN-IP с пиром</string>
+    <string name="pool_warning_subnet_mismatch">Внимание: несовпадение подсети VPN с пиром</string>
+    <string name="pool_node_revoked">Отозван</string>
+    <string name="pool_node_no_address">Нет адреса</string>
+    <string name="pool_node_verified">Подтверждён</string>
+    <string name="pool_node_unverified">Не подтверждён</string>
+    <string name="pool_node_connected">Подключён</string>
+    <string name="pool_node_disconnected">Отключён</string>
+    <string name="pool_node_last_seen">Последний раз виден: %s</string>
+    <string name="pool_node_never">никогда</string>
 </resources>

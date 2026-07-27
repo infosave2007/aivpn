@@ -247,4 +247,25 @@
     <string name="admin_reject_reason_prefix">Rejected: %s</string>
     <string name="admin_error_generic">Request failed (%d)</string>
     <string name="admin_error_with_reason">Request failed (%1$d): %2$s</string>
+    <string name="admin_hint_exit_node">Exit node (optional, host:port — empty = global default)</string>
+    <string name="admin_exit_node_prefix">Exit: %s</string>
+
+    <!-- Pool topology (Wave B3) -->
+    <string name="pool_title">Pool topology</string>
+    <string name="pool_no_nodes">No pool nodes</string>
+    <string name="pool_health_transport">Transport: %s</string>
+    <string name="pool_health_nodes">Total nodes: %d</string>
+    <string name="pool_health_connected">Connected peers: %d</string>
+    <string name="pool_health_converged">Converged peers: %d</string>
+    <string name="pool_health_diverged">Some connected peers are out of sync</string>
+    <string name="pool_warning_partition_conflict">Warning: VPN-IP partition conflict with a peer</string>
+    <string name="pool_warning_subnet_mismatch">Warning: VPN subnet mismatch with a peer</string>
+    <string name="pool_node_revoked">Revoked</string>
+    <string name="pool_node_no_address">No address</string>
+    <string name="pool_node_verified">Verified</string>
+    <string name="pool_node_unverified">Unverified</string>
+    <string name="pool_node_connected">Connected</string>
+    <string name="pool_node_disconnected">Disconnected</string>
+    <string name="pool_node_last_seen">Last seen: %s</string>
+    <string name="pool_node_never">never</string>
 </resources>

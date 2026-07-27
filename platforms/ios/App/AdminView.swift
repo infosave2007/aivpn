@@ -53,6 +53,7 @@ struct AdminView: View {
     @State private var detailClient: AdminClient?
     @State private var revokeTarget: AdminClient?
     @State private var showRevokeConfirm = false
+    @State private var showPool = false
 
     var body: some View {
         NavigationStack {
@@ -117,17 +118,31 @@ struct AdminView: View {
                         Image(systemName: "plus.circle.fill")
                     }
                 }
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Button {
+                        showPool = true
+                    } label: {
+                        Image(systemName: "network")
+                    }
+                    .accessibilityLabel(Text(loc.t("pool_title")))
+                }
                 ToolbarItem(placement: .confirmationAction) {
                     Button(loc.t("done")) { dismiss() }
                 }
             }
         }
         .task { await loadClients() }
+        .sheet(isPresented: $showPool) {
+            PoolView().environmentObject(loc)
+        }
         .sheet(isPresented: $showAddClient) {
-            AdminAddClientView { newClient in
+            AdminAddClientView { newClient, warning in
                 showAddClient = false
                 if let newClient {
                     clients.append(newClient)
+                }
+                if let warning {
+                    errorMessage = warning
                 }
             }
             .environmentObject(loc)
@@ -221,6 +236,14 @@ private struct AdminClientRow: View {
                 Text(client.vpn_ip)
                     .font(.caption)
                     .foregroundColor(.secondary)
+                if let exitNode = client.exit_node, !exitNode.isEmpty {
+                    HStack(spacing: 3) {
+                        Image(systemName: "arrow.triangle.branch")
+                        Text(exitNode)
+                    }
+                    .font(.caption2)
+                    .foregroundColor(.purple)
+                }
             }
             Spacer()
             Circle()
@@ -244,12 +267,18 @@ private struct AdminClientRow: View {
 
 private struct AdminAddClientView: View {
     @EnvironmentObject private var loc: LocalizationManager
-    let onComplete: (AdminClient?) -> Void
+    /// `(createdClient, nonFatalWarning)` — `warning` is set when the
+    /// client itself was created successfully but the follow-up
+    /// exit-node PATCH failed (see `save()`'s doc comment); the caller
+    /// dismisses this sheet either way, so the warning is surfaced via
+    /// the parent `AdminView`'s own error banner instead of here.
+    let onComplete: (AdminClient?, String?) -> Void
 
     @State private var name: String = ""
     @State private var oneTime: Bool = false
     @State private var hasExpiry: Bool = false
     @State private var expiresAt: Date = Date().addingTimeInterval(86400 * 30)
+    @State private var exitNode: String = ""
     @State private var isSaving = false
     @State private var errorMessage: String?
 
@@ -272,6 +301,12 @@ private struct AdminAddClientView: View {
                         )
                     }
                 }
+                Section(footer: Text(loc.t("admin_exit_node_hint"))) {
+                    TextField(loc.t("admin_exit_node"), text: $exitNode)
+                        .autocorrectionDisabled()
+                        .autocapitalization(.none)
+                        .keyboardType(.asciiCapable)
+                }
                 if let errorMessage {
                     Section {
                         Text(errorMessage)
@@ -284,7 +319,7 @@ private struct AdminAddClientView: View {
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
-                    Button(loc.t("cancel")) { onComplete(nil) }
+                    Button(loc.t("cancel")) { onComplete(nil, nil) }
                 }
                 ToolbarItem(placement: .confirmationAction) {
                     if isSaving {
@@ -305,16 +340,37 @@ private struct AdminAddClientView: View {
         isSaving = true
         errorMessage = nil
         let trimmed = name.trimmingCharacters(in: .whitespaces)
+        let trimmedExitNode = exitNode.trimmingCharacters(in: .whitespaces)
         let result = await AdminApi.addClient(
             name: trimmed,
             oneTime: oneTime,
             expiresAt: hasExpiry ? expiresAt : nil
         )
-        isSaving = false
         switch result {
         case .success(let client):
-            onComplete(client)
+            // `TunnelAddClientRequest` (the POST /api/v1/clients wire body)
+            // has no `exit_node` field — see mgmt_service.rs's doc comment
+            // on that type — so a per-client exit node can only be applied
+            // as a follow-up PATCH after creation. If it fails, the client
+            // itself was still created successfully; surface the PATCH
+            // error but still hand the created client back so it shows up
+            // in the list (the operator can retry setting it from the
+            // detail/edit screen).
+            if trimmedExitNode.isEmpty {
+                isSaving = false
+                onComplete(client, nil)
+            } else {
+                let patchResult = await AdminApi.patchClient(id: client.id, exitNode: .set(trimmedExitNode))
+                isSaving = false
+                switch patchResult {
+                case .success(let updated):
+                    onComplete(updated, nil)
+                case .failure(let err):
+                    onComplete(client, err.errorDescription)
+                }
+            }
         case .failure(let err):
+            isSaving = false
             errorMessage = err.errorDescription
         }
     }
@@ -341,6 +397,7 @@ private struct AdminClientDetailView: View {
     @State private var editedOneTime: Bool = false
     @State private var editedHasExpiry: Bool = false
     @State private var editedExpiresAt: Date = Date().addingTimeInterval(86400 * 30)
+    @State private var editedExitNode: String = ""
     @State private var isSavingEdit = false
 
     @State private var connectionKey: String?
@@ -371,6 +428,13 @@ private struct AdminClientDetailView: View {
                             displayedComponents: [.date, .hourAndMinute]
                         )
                     }
+                    TextField(loc.t("admin_exit_node"), text: $editedExitNode)
+                        .autocorrectionDisabled()
+                        .autocapitalization(.none)
+                        .keyboardType(.asciiCapable)
+                    Text(loc.t("admin_exit_node_hint"))
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
                     Button {
                         Task { await saveEdits() }
                     } label: {
@@ -393,6 +457,7 @@ private struct AdminClientDetailView: View {
                     LabeledContent(loc.t("admin_created_at"), value: adminDisplayDate(client.created_at))
                     LabeledContent(loc.t("admin_traffic_in"), value: adminFormatBytes(client.stats.bytes_in))
                     LabeledContent(loc.t("admin_traffic_out"), value: adminFormatBytes(client.stats.bytes_out))
+                    LabeledContent(loc.t("admin_exit_node"), value: exitNodeDisplayValue)
                 }
 
                 Section(header: Text(loc.t("admin_connection_key"))) {
@@ -496,6 +561,13 @@ private struct AdminClientDetailView: View {
         }
     }
 
+    private var exitNodeDisplayValue: String {
+        if let exitNode = client.exit_node, !exitNode.isEmpty {
+            return exitNode
+        }
+        return loc.t("admin_exit_node_global")
+    }
+
     private func resetEditedFields() {
         editedName = client.name
         editedEnabled = client.enabled
@@ -507,6 +579,7 @@ private struct AdminClientDetailView: View {
             editedHasExpiry = false
             editedExpiresAt = Date().addingTimeInterval(86400 * 30)
         }
+        editedExitNode = client.exit_node ?? ""
     }
 
     @MainActor
@@ -515,12 +588,31 @@ private struct AdminClientDetailView: View {
         actionError = nil
         let trimmed = editedName.trimmingCharacters(in: .whitespaces)
         let expiryField: AdminPatchField<Date> = editedHasExpiry ? .set(editedExpiresAt) : .clear
+
+        // Tri-state diff against the original, mirroring how `expiresAt`
+        // decides `.set` vs `.clear` above — but additionally collapses to
+        // `.unchanged` (key omitted entirely) when the trimmed text still
+        // matches what the server last reported, so an edit screen opened
+        // and saved without touching this field never sends a spurious
+        // PATCH that would otherwise just re-set the same value.
+        let trimmedExitNode = editedExitNode.trimmingCharacters(in: .whitespaces)
+        let originalExitNode = client.exit_node ?? ""
+        let exitNodeField: AdminPatchField<String>
+        if trimmedExitNode == originalExitNode {
+            exitNodeField = .unchanged
+        } else if trimmedExitNode.isEmpty {
+            exitNodeField = .clear
+        } else {
+            exitNodeField = .set(trimmedExitNode)
+        }
+
         let result = await AdminApi.patchClient(
             id: client.id,
             name: trimmed == client.name ? nil : trimmed,
             enabled: editedEnabled == client.enabled ? nil : editedEnabled,
             oneTime: editedOneTime == client.one_time ? nil : editedOneTime,
-            expiresAt: expiryField
+            expiresAt: expiryField,
+            exitNode: exitNodeField
         )
         isSavingEdit = false
         switch result {

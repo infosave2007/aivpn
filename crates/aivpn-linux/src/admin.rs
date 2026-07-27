@@ -60,6 +60,11 @@ pub struct ClientRecord {
     /// server-side).
     #[serde(default)]
     pub role: String,
+    /// Wave B3: per-client exit-node override (`host:port`), or `None` to
+    /// fall back to the pool's global default (`pool.exit_node`). Matches
+    /// `mgmt_service::ClientView::exit_node` verbatim.
+    #[serde(default)]
+    pub exit_node: Option<String>,
 }
 
 impl ClientRecord {
@@ -181,6 +186,56 @@ pub async fn list_clients() -> Result<Vec<ClientRecord>, String> {
     parse_json(&body)
 }
 
+/// One row of `GET /api/v1/pool/nodes`. Field names match
+/// `mgmt_service::PoolNodeInfo` verbatim (this crate has no dependency on
+/// `aivpn-server`, so the shape is duplicated rather than shared — same
+/// tolerant-parsing rationale as `ClientRecord`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PoolNode {
+    #[serde(default)]
+    pub node_id: String,
+    #[serde(default)]
+    pub address: Option<String>,
+    #[serde(default)]
+    pub verified: bool,
+    #[serde(default)]
+    pub revoked: bool,
+    #[serde(default)]
+    pub connected: bool,
+    #[serde(default)]
+    pub last_seen_unix: Option<i64>,
+}
+
+/// `GET /api/v1/pool/health`. Field names match `mgmt_service::PoolHealth`
+/// verbatim.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PoolHealth {
+    #[serde(default)]
+    pub transport: String,
+    #[serde(default)]
+    pub total_nodes: usize,
+    #[serde(default)]
+    pub connected_peers: usize,
+    #[serde(default)]
+    pub converged_peers: usize,
+    #[serde(default)]
+    pub diverged: bool,
+    #[serde(default)]
+    pub partition_conflict: bool,
+    #[serde(default)]
+    pub subnet_mismatch: bool,
+}
+
+pub async fn pool_nodes() -> Result<Vec<PoolNode>, String> {
+    let (_, body) = mgmt_call(MgmtMethod::Get, "/api/v1/pool/nodes", None).await?;
+    parse_json(&body)
+}
+
+pub async fn pool_health() -> Result<PoolHealth, String> {
+    let (_, body) = mgmt_call(MgmtMethod::Get, "/api/v1/pool/health", None).await?;
+    parse_json(&body)
+}
+
 pub async fn get_role() -> Result<u8, String> {
     let bin = find_client_binary()?;
     let out = tokio::process::Command::new(&bin)
@@ -200,6 +255,11 @@ pub struct NewClientArgs {
     pub one_time: bool,
     /// RFC3339 timestamp string, or empty for "no expiry".
     pub expires_at: String,
+    /// `host:port`, or empty for "use the pool's global default". Wave B3:
+    /// `POST /api/v1/clients` has no `exit_node` field server-side (see
+    /// `TunnelAddClientRequest`) — a non-empty value here is applied with a
+    /// follow-up `PATCH` right after creation, same as the edit-form path.
+    pub exit_node: String,
 }
 
 pub async fn add_client(args: NewClientArgs) -> Result<ClientRecord, String> {
@@ -212,7 +272,19 @@ pub async fn add_client(args: NewClientArgs) -> Result<ClientRecord, String> {
     }
     let body = serde_json::to_vec(&obj).map_err(|e| e.to_string())?;
     let (_, resp) = mgmt_call(MgmtMethod::Post, "/api/v1/clients", Some(body)).await?;
-    parse_json(&resp)
+    let created: ClientRecord = parse_json(&resp)?;
+    let exit_node = args.exit_node.trim();
+    if exit_node.is_empty() {
+        return Ok(created);
+    }
+    update_client(
+        &created.id,
+        EditClientArgs {
+            exit_node: Some(Some(exit_node.to_string())),
+            ..Default::default()
+        },
+    )
+    .await
 }
 
 #[derive(Debug, Clone, Default)]
@@ -222,6 +294,11 @@ pub struct EditClientArgs {
     /// `Some(Some(ts))` sets expiry, `Some(None)` clears it, `None` leaves
     /// unchanged — matches `PatchClientRequest::expires_at` server-side.
     pub expires_at: Option<Option<String>>,
+    /// Wave B3: `Some(Some(addr))` sets a `host:port` per-client exit-node
+    /// override, `Some(None)` clears it (falls back to the pool's global
+    /// default), `None` leaves it unchanged — matches
+    /// `TunnelPatchClientRequest::exit_node` server-side.
+    pub exit_node: Option<Option<String>>,
 }
 
 pub async fn update_client(id: &str, args: EditClientArgs) -> Result<ClientRecord, String> {
@@ -237,6 +314,15 @@ pub async fn update_client(id: &str, args: EditClientArgs) -> Result<ClientRecor
             "expires_at".into(),
             match expires {
                 Some(ts) => serde_json::Value::String(ts),
+                None => serde_json::Value::Null,
+            },
+        );
+    }
+    if let Some(exit_node) = args.exit_node {
+        obj.insert(
+            "exit_node".into(),
+            match exit_node {
+                Some(addr) => serde_json::Value::String(addr),
                 None => serde_json::Value::Null,
             },
         );

@@ -209,4 +209,19 @@ enum AdminApi {
         guard let reply = sendAdminRequest("\(token):qr:\(textB64)") else { return nil }
         return Data(base64Encoded: reply)
     }
+
+    // MARK: - Pool topology (Wave B3-macOS)
+
+    /// `GET /api/v1/pool/nodes` — thin wrapper over `mgmtRequest`, same raw
+    /// `(status, body)` contract. Decoding into `[AdminPoolNodeView]` happens
+    /// in `AdminStore` (see PoolView.swift), keeping this file transport-only
+    /// per the module doc above.
+    static func poolNodes() -> (status: UInt16, body: Data)? {
+        mgmtRequest(method: 0 /* GET */, path: "/api/v1/pool/nodes")
+    }
+
+    /// `GET /api/v1/pool/health` — same shape as `poolNodes()`.
+    static func poolHealth() -> (status: UInt16, body: Data)? {
+        mgmtRequest(method: 0 /* GET */, path: "/api/v1/pool/health")
+    }
 }

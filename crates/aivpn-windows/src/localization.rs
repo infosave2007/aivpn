@@ -492,6 +492,44 @@ pub fn t(lang: Lang, key: &str) -> &'static str {
             "Это необратимо. Ключ клиента перестанет работать немедленно."
         }
 
+        // Per-client exit node (B3) — Admin edit, shown to Viewer read-only
+        (Lang::En, "admin_exit_node") => "Exit node",
+        (Lang::Ru, "admin_exit_node") => "Узел выхода",
+        (Lang::En, "admin_exit_node_hint") => "Exit node (optional, host:port — empty = global default)",
+        (Lang::Ru, "admin_exit_node_hint") => {
+            "Узел выхода (необязательно, host:port — пусто = глобальный по умолчанию)"
+        }
+
+        // Pool topology view (B3) — Viewer + Admin
+        (Lang::En, "admin_pool_section") => "Pool topology",
+        (Lang::Ru, "admin_pool_section") => "Топология пула",
+        (Lang::En, "admin_pool_transport") => "Transport",
+        (Lang::Ru, "admin_pool_transport") => "Транспорт",
+        (Lang::En, "admin_pool_connected") => "Connected",
+        (Lang::Ru, "admin_pool_connected") => "Подключено",
+        (Lang::En, "admin_pool_converged") => "Converged",
+        (Lang::Ru, "admin_pool_converged") => "Синхронизировано",
+        (Lang::En, "admin_pool_no_nodes") => "No pool nodes",
+        (Lang::Ru, "admin_pool_no_nodes") => "Узлы пула отсутствуют",
+        (Lang::En, "admin_pool_verified") => "verified",
+        (Lang::Ru, "admin_pool_verified") => "подтверждён",
+        (Lang::En, "admin_pool_revoked") => "revoked",
+        (Lang::Ru, "admin_pool_revoked") => "отозван",
+        (Lang::En, "admin_pool_last_seen") => "Last seen",
+        (Lang::Ru, "admin_pool_last_seen") => "Последний раз в сети",
+        (Lang::En, "admin_pool_partition_conflict") => {
+            "⚠ Partition conflict: a peer claims the same VPN-IP partition as this node"
+        }
+        (Lang::Ru, "admin_pool_partition_conflict") => {
+            "⚠ Конфликт партиции: пир заявляет ту же партицию VPN-IP, что и этот узел"
+        }
+        (Lang::En, "admin_pool_subnet_mismatch") => {
+            "⚠ Subnet mismatch: a peer disagrees on the VPN subnet"
+        }
+        (Lang::Ru, "admin_pool_subnet_mismatch") => {
+            "⚠ Несовпадение подсети: пир не согласен с VPN-подсетью"
+        }
+
         // Default fallback
         (_, _) => "???",
     }

@@ -63,6 +63,9 @@ class AdminActivity : AppCompatActivity() {
 
         binding.btnBack.setOnClickListener { finish() }
         binding.btnRefresh.setOnClickListener { loadClients() }
+        binding.btnPool.setOnClickListener {
+            startActivity(Intent(this, PoolActivity::class.java))
+        }
         binding.fabAdd.visibility = if (isAdmin) View.VISIBLE else View.GONE
         binding.fabAdd.setOnClickListener { showAddDialog() }
 
@@ -136,10 +139,23 @@ class AdminActivity : AppCompatActivity() {
             setSingleLine(true)
             textSize = 13f
         }
+        val exitNodeLabel = TextView(dialogCtx).apply {
+            text = getString(R.string.admin_hint_exit_node)
+            textSize = 12f
+            setTextColor(getColor(R.color.text_secondary))
+            setPadding(0, 8.dp, 0, 2.dp)
+        }
+        val exitNodeInput = EditText(dialogCtx).apply {
+            hint = "203.0.113.5:51820"
+            setSingleLine(true)
+            textSize = 13f
+        }
         layout.addView(nameInput)
         layout.addView(oneTimeCheck)
         layout.addView(expiryLabel)
         layout.addView(expiryInput)
+        layout.addView(exitNodeLabel)
+        layout.addView(exitNodeInput)
 
         AlertDialog.Builder(this)
             .setTitle(getString(R.string.admin_dialog_add_title))
@@ -151,8 +167,21 @@ class AdminActivity : AppCompatActivity() {
                     return@setPositiveButton
                 }
                 val expiry = expiryInput.text.toString().trim()
+                val exitNode = exitNodeInput.text.toString().trim()
                 lifecycleScope.launch {
                     val result = AdminApi.addClient(name, oneTimeCheck.isChecked, expiry.ifEmpty { null })
+                    // AddClient's wire body has no exit_node field (server-side
+                    // TunnelAddClientRequest deliberately omits it) — an
+                    // exit-node value entered here is applied with an
+                    // immediate follow-up PATCH against the newly created id.
+                    if (result.ok && exitNode.isNotEmpty()) {
+                        val newId = result.bodyObject()?.optString("id", "") ?: ""
+                        if (newId.isNotEmpty()) {
+                            val patchResult = AdminApi.patchClient(id = newId, exitNode = exitNode)
+                            handleMutationResult(patchResult)
+                            return@launch
+                        }
+                    }
                     handleMutationResult(result)
                 }
             }
@@ -197,11 +226,27 @@ class AdminActivity : AppCompatActivity() {
             setSingleLine(true)
             textSize = 13f
         }
+        val exitNodeLabel = TextView(dialogCtx).apply {
+            text = getString(R.string.admin_hint_exit_node)
+            textSize = 12f
+            setTextColor(getColor(R.color.text_secondary))
+            setPadding(0, 8.dp, 0, 2.dp)
+        }
+        // Empty = fall back to the server's global default (pool.exit_node).
+        val originalExitNode = if (client.isNull("exit_node")) "" else client.optString("exit_node", "")
+        val exitNodeInput = EditText(dialogCtx).apply {
+            hint = "203.0.113.5:51820"
+            setText(originalExitNode)
+            setSingleLine(true)
+            textSize = 13f
+        }
         layout.addView(nameInput)
         layout.addView(enabledCheck)
         layout.addView(oneTimeCheck)
         layout.addView(expiryLabel)
         layout.addView(expiryInput)
+        layout.addView(exitNodeLabel)
+        layout.addView(exitNodeInput)
 
         AlertDialog.Builder(this)
             .setTitle(getString(R.string.admin_dialog_edit_title))
@@ -209,6 +254,11 @@ class AdminActivity : AppCompatActivity() {
             .setPositiveButton(getString(R.string.btn_save)) { _, _ ->
                 val name = nameInput.text.toString().trim()
                 val expiry = expiryInput.text.toString().trim()
+                val exitNodeText = exitNodeInput.text.toString().trim()
+                // Cleared field that previously had a value -> explicit
+                // null (fall back to global default); non-empty -> set;
+                // empty and never had a value -> omit (no-op).
+                val clearExitNode = exitNodeText.isEmpty() && originalExitNode.isNotEmpty()
                 lifecycleScope.launch {
                     val result = AdminApi.patchClient(
                         id = id,
@@ -216,6 +266,8 @@ class AdminActivity : AppCompatActivity() {
                         enabled = enabledCheck.isChecked,
                         oneTime = oneTimeCheck.isChecked,
                         expiresAt = expiry,
+                        exitNode = exitNodeText.ifEmpty { null },
+                        clearExitNode = clearExitNode,
                     )
                     handleMutationResult(result)
                 }
@@ -365,6 +417,7 @@ class AdminActivity : AppCompatActivity() {
             val role: TextView = itemView.findViewById(R.id.textRole)
             val subtitle: TextView = itemView.findViewById(R.id.textSubtitle)
             val reject: TextView = itemView.findViewById(R.id.textReject)
+            val exitNode: TextView = itemView.findViewById(R.id.textExitNode)
             val rowActions: LinearLayout = itemView.findViewById(R.id.rowActions)
             val btnKey: TextView = itemView.findViewById(R.id.btnKey)
             val btnEdit: TextView = itemView.findViewById(R.id.btnEdit)
@@ -409,6 +462,14 @@ class AdminActivity : AppCompatActivity() {
                 holder.reject.visibility = View.VISIBLE
             } else {
                 holder.reject.visibility = View.GONE
+            }
+
+            val exitNode = if (c.isNull("exit_node")) "" else c.optString("exit_node", "")
+            if (exitNode.isNotBlank()) {
+                holder.exitNode.text = getString(R.string.admin_exit_node_prefix, exitNode)
+                holder.exitNode.visibility = View.VISIBLE
+            } else {
+                holder.exitNode.visibility = View.GONE
             }
 
             if (id.isEmpty()) {

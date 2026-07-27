@@ -1,5 +1,19 @@
 name: Server Release Asset
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Full-feature server assets (management-api + metrics + neural — the build
+# a real deployment needs; see `make server` in the Makefile) are published
+# for two architectures. A future deploy/install-server.sh should fetch:
+#   - aivpn-server-linux-x86_64            (+ aivpn-server-linux-x86_64.SHA256SUMS)
+#   - aivpn-server-linux-aarch64           (+ aivpn-server-linux-aarch64.SHA256SUMS)
+# Each SHA256SUMS file is the standard `sha256sum` output format
+# (`<hash>  <filename>`) for the single binary it accompanies — verify with
+# `sha256sum -c aivpn-server-linux-<arch>.SHA256SUMS` after download.
+# (Note: `aivpn-server-linux-aarch64-musl` is a SEPARATE, default-features-only
+# asset published by the build-musl-release-assets matrix job below — not the
+# full-feature aarch64 binary installers should use.)
+# ─────────────────────────────────────────────────────────────────────────────
+
 on:
   release:
     types: [published]
@@ -21,8 +35,16 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Build Linux server asset via Docker
-        run: make server-docker
+      - name: Setup Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      # Full feature set — management-api, metrics, neural — matches what a
+      # real deployment needs (see Makefile `server` target). This replaces
+      # the old default-features-only `make server-docker` build: the web
+      # panel / metrics dashboard / DPI-driven mask rotation would silently
+      # not work against a default-features binary.
+      - name: Build full-feature Linux x86_64 server asset
+        run: make server
 
       # Artifact integrity: publish a SHA256SUMS file alongside the binary so
       # `make deploy` / `make server-deploy` can verify what they downloaded
@@ -59,6 +81,50 @@ jobs:
           files: |
             releases/aivpn-server-linux-x86_64
             releases/aivpn-server-linux-x86_64.SHA256SUMS
+          fail_on_unmatched_files: true
+
+  build-linux-server-aarch64-asset:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # Full feature set (management-api, metrics, neural), musl static
+      # cross-build — see the server-musl-aarch64-full target in the Makefile
+      # for the cross-compile risk note (none of these features are expected
+      # to pull in a C library dependency the musl static link can't handle).
+      - name: Build full-feature Linux aarch64 server asset
+        run: make server-musl-aarch64-full
+
+      - name: Generate SHA256SUMS
+        run: |
+          cd releases
+          sha256sum aivpn-server-linux-aarch64 > aivpn-server-linux-aarch64.SHA256SUMS
+          cat aivpn-server-linux-aarch64.SHA256SUMS
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: aivpn-server-linux-aarch64
+          path: releases/aivpn-server-linux-aarch64
+          if-no-files-found: error
+
+      - name: Upload SHA256SUMS workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: aivpn-server-linux-aarch64-sha256sums
+          path: releases/aivpn-server-linux-aarch64.SHA256SUMS
+          if-no-files-found: error
+
+      - name: Publish asset to GitHub Release
+        if: github.event_name == 'release' || github.event.inputs.tag != ''
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.release.tag_name || github.event.inputs.tag }}
+          files: |
+            releases/aivpn-server-linux-aarch64
+            releases/aivpn-server-linux-aarch64.SHA256SUMS
           fail_on_unmatched_files: true
 
   build-macos-release-assets:

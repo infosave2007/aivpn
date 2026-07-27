@@ -30,6 +30,10 @@ struct AdminClientView: Codable, Identifiable, Equatable {
     let created_at: String
     let expires_at: String?
     let role: String
+    /// Wave B2a/B3-macOS: this client's per-client exit-node override
+    /// (`host:port`), or nil to fall back to the server's global default
+    /// (`pool.exit_node`). Mirrors `mgmt_service::ClientView::exit_node`.
+    let exit_node: String?
 }
 
 /// Mirrors `mgmt_service::StatusView` (`GET /api/v1/status`).
@@ -115,12 +119,16 @@ private func adminAddClientBodyJSON(name: String, oneTime: Bool, expiresAt: Date
     return (try? JSONSerialization.data(withJSONObject: dict)) ?? Data()
 }
 
-/// `name`/`enabled` nil = omit (don't touch). For `expires_at`:
-/// `clearExpiresAt: true` sends an explicit JSON `null` (server clears it);
-/// a non-nil `expiresAt` (with `clearExpiresAt: false`) sends the RFC3339
-/// string; both nil/false omits the key entirely (don't touch).
+/// `name`/`enabled` nil = omit (don't touch). For `expires_at` and
+/// `exit_node` (Wave B3-macOS): `clear*: true` sends an explicit JSON
+/// `null` (server clears it, falling back to the global default for
+/// `exit_node`); a non-nil value (with `clear*: false`) sends it; both
+/// nil/false omits the key entirely (don't touch) — mirrors
+/// `TunnelPatchClientRequest`'s `deserialize_opt_opt` tri-state on the
+/// server (crates/aivpn-server/src/mgmt_service.rs).
 private func adminPatchClientBodyJSON(name: String?, enabled: Bool?,
-                                       expiresAt: Date?, clearExpiresAt: Bool) -> Data {
+                                       expiresAt: Date?, clearExpiresAt: Bool,
+                                       exitNode: String?, clearExitNode: Bool) -> Data {
     var dict: [String: Any] = [:]
     if let name = name { dict["name"] = name }
     if let enabled = enabled { dict["enabled"] = enabled }
@@ -128,6 +136,11 @@ private func adminPatchClientBodyJSON(name: String?, enabled: Bool?,
         dict["expires_at"] = NSNull()
     } else if let expiresAt = expiresAt {
         dict["expires_at"] = AdminDate.format(expiresAt)
+    }
+    if clearExitNode {
+        dict["exit_node"] = NSNull()
+    } else if let exitNode = exitNode {
+        dict["exit_node"] = exitNode
     }
     return (try? JSONSerialization.data(withJSONObject: dict)) ?? Data()
 }
@@ -148,6 +161,16 @@ final class AdminStore: ObservableObject {
     /// non-2xx status from a single action, which callers surface inline
     /// instead of blanking the whole window.
     @Published var channelUnavailable = false
+
+    // MARK: Pool topology (Wave B3-macOS)
+
+    @Published var poolNodes: [AdminPoolNodeView] = []
+    @Published var poolHealth: AdminPoolHealthView?
+    @Published var poolLoading = false
+    /// Same "couldn't reach the daemon at all" meaning as `channelUnavailable`,
+    /// tracked separately so switching to the Pool tab doesn't blank an
+    /// already-loaded Clients tab (and vice versa).
+    @Published var poolChannelUnavailable = false
 
     private func run<T>(_ work: @escaping () -> T, completion: @escaping (T) -> Void) {
         DispatchQueue.global(qos: .userInitiated).async {
@@ -179,28 +202,47 @@ final class AdminStore: ObservableObject {
         }
     }
 
-    func createClient(name: String, oneTime: Bool, expiresAt: Date?,
+    /// `exitNode` (Wave B3-macOS): server-side `POST /api/v1/clients`
+    /// (`TunnelAddClientRequest` in mgmt_service.rs) has no `exit_node`
+    /// field at all — it's silently dropped if sent in the create body, so
+    /// it can only be applied as a follow-up `PATCH` once the new client's
+    /// `id` is known from the create response. That follow-up runs here,
+    /// transparently to the caller, only when `exitNode` is non-nil.
+    func createClient(name: String, oneTime: Bool, expiresAt: Date?, exitNode: String?,
                        completion: @escaping (Bool, UInt16?) -> Void) {
         let body = adminAddClientBodyJSON(name: name, oneTime: oneTime, expiresAt: expiresAt)
         run({ AdminApi.mgmtRequest(method: AdminMethod.post.rawValue, path: "/api/v1/clients", body: body) }) { [weak self] result in
-            guard let (status, _) = result else {
-                completion(false, nil)
+            guard let self = self else { return }
+            guard let (status, body) = result, status == 201 else {
+                completion(false, result?.status)
                 return
             }
-            if status == 201 {
-                self?.refreshClients()
+            guard let exitNode = exitNode,
+                  let created = try? JSONDecoder().decode(AdminClientView.self, from: body) else {
+                self.refreshClients()
                 completion(true, status)
-            } else {
-                completion(false, status)
+                return
+            }
+            self.updateClient(id: created.id, name: nil, enabled: nil,
+                               expiresAt: nil, clearExpiresAt: false,
+                               exitNode: exitNode, clearExitNode: false) { _, _ in
+                // The client was already created successfully; a failure to
+                // apply the exit-node follow-up is surfaced to the caller as
+                // a partial success (still `true`) — refreshClients() below
+                // will show whatever the server actually ended up with.
+                self.refreshClients()
+                completion(true, status)
             }
         }
     }
 
     func updateClient(id: String, name: String?, enabled: Bool?,
                        expiresAt: Date?, clearExpiresAt: Bool,
+                       exitNode: String? = nil, clearExitNode: Bool = false,
                        completion: @escaping (Bool, UInt16?) -> Void) {
         let body = adminPatchClientBodyJSON(name: name, enabled: enabled,
-                                             expiresAt: expiresAt, clearExpiresAt: clearExpiresAt)
+                                             expiresAt: expiresAt, clearExpiresAt: clearExpiresAt,
+                                             exitNode: exitNode, clearExitNode: clearExitNode)
         let path = "/api/v1/clients/\(id)"
         run({ AdminApi.mgmtRequest(method: AdminMethod.patch.rawValue, path: path, body: body) }) { [weak self] result in
             guard let (status, _) = result else {
@@ -263,6 +305,39 @@ final class AdminStore: ObservableObject {
     func fetchQr(text: String, completion: @escaping (Data?) -> Void) {
         run({ AdminApi.qrPngData(text) }, completion: completion)
     }
+
+    // MARK: Pool topology (Wave B3-macOS)
+
+    func refreshPoolNodes() {
+        poolLoading = true
+        run({ AdminApi.poolNodes() }) { [weak self] result in
+            guard let self = self else { return }
+            self.poolLoading = false
+            guard let (status, body) = result, status == 200,
+                  let decoded = try? JSONDecoder().decode([AdminPoolNodeView].self, from: body) else {
+                self.poolChannelUnavailable = (result == nil)
+                return
+            }
+            self.poolChannelUnavailable = false
+            self.poolNodes = decoded
+        }
+    }
+
+    func refreshPoolHealth() {
+        run({ AdminApi.poolHealth() }) { [weak self] result in
+            guard let (status, body) = result, status == 200,
+                  let decoded = try? JSONDecoder().decode(AdminPoolHealthView.self, from: body) else { return }
+            self?.poolHealth = decoded
+        }
+    }
+
+    /// Convenience for the tab-switch/refresh-button call sites in
+    /// `AdminRootView` — both pool endpoints are cheap, read-only GETs, so
+    /// there's no reason to make callers fire them individually.
+    func refreshPool() {
+        refreshPoolNodes()
+        refreshPoolHealth()
+    }
 }
 
 // MARK: - Window controller
@@ -316,11 +391,20 @@ extension Notification.Name {
 
 // MARK: - Root view
 
+/// Which pane `AdminRootView`'s segmented control shows — client CRUD
+/// (Phase A) or the read-only pool topology view (Wave B3-macOS).
+/// `Hashable` is required both by `Picker`'s `selection:` binding and by
+/// `.onChange(of:)` below.
+enum AdminTab: Hashable {
+    case clients, pool
+}
+
 struct AdminRootView: View {
     @EnvironmentObject var loc: LocalizationManager
     @StateObject private var store = AdminStore()
     @State private var showAddSheet = false
     @State private var selectedClient: AdminClientView?
+    @State private var selectedTab: AdminTab = .clients
 
     var body: some View {
         VStack(spacing: 0) {
@@ -329,31 +413,46 @@ struct AdminRootView: View {
                     .font(.title3)
                     .fontWeight(.semibold)
                 Spacer()
-                if let status = store.status {
+                if selectedTab == .clients, let status = store.status {
                     Text("\(status.clients_enabled)/\(status.clients_total)")
                         .font(.caption)
                         .foregroundColor(.secondary)
                 }
-                Button(action: {
-                    store.refreshClients()
-                    store.refreshStatus()
-                }) {
+                Button(action: { refreshActiveTab() }) {
                     Image(systemName: "arrow.clockwise")
                 }
                 .buttonStyle(.plain)
                 .help(loc.t("admin_refresh"))
 
-                Button(action: { showAddSheet = true }) {
-                    Image(systemName: "plus")
+                if selectedTab == .clients {
+                    Button(action: { showAddSheet = true }) {
+                        Image(systemName: "plus")
+                    }
+                    .buttonStyle(.plain)
+                    .help(loc.t("admin_add_client"))
                 }
-                .buttonStyle(.plain)
-                .help(loc.t("admin_add_client"))
             }
             .padding(16)
 
+            Picker("", selection: $selectedTab) {
+                Text(loc.t("admin_tab_clients")).tag(AdminTab.clients)
+                Text(loc.t("admin_tab_pool")).tag(AdminTab.pool)
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .padding(.horizontal, 16)
+            .padding(.bottom, 12)
+            .onChange(of: selectedTab) { newValue in
+                if newValue == .pool { store.refreshPool() }
+            }
+
             Divider()
 
-            content
+            if selectedTab == .clients {
+                content
+            } else {
+                AdminPoolView(store: store)
+            }
         }
         .frame(minWidth: 480, minHeight: 420)
         .onAppear {
@@ -363,6 +462,7 @@ struct AdminRootView: View {
         .onReceive(NotificationCenter.default.publisher(for: .adminWindowDidShow)) { _ in
             store.refreshClients()
             store.refreshStatus()
+            if selectedTab == .pool { store.refreshPool() }
         }
         .sheet(isPresented: $showAddSheet) {
             AdminAddClientSheet(store: store, isPresented: $showAddSheet)
@@ -371,6 +471,16 @@ struct AdminRootView: View {
         .sheet(item: $selectedClient) { client in
             AdminClientDetailSheet(store: store, client: client)
                 .environmentObject(loc)
+        }
+    }
+
+    private func refreshActiveTab() {
+        switch selectedTab {
+        case .clients:
+            store.refreshClients()
+            store.refreshStatus()
+        case .pool:
+            store.refreshPool()
         }
     }
 
@@ -450,6 +560,16 @@ struct AdminClientRow: View {
                 Text(client.vpn_ip)
                     .font(.system(size: 10))
                     .foregroundColor(.secondary)
+                if let exitNode = client.exit_node {
+                    HStack(spacing: 3) {
+                        Image(systemName: "arrow.triangle.branch")
+                            .font(.system(size: 8))
+                        Text(exitNode)
+                            .font(.system(size: 9, design: .monospaced))
+                    }
+                    .foregroundColor(.secondary)
+                    .help(loc.t("admin_exit_node_current") + ": " + exitNode)
+                }
             }
 
             Spacer()
@@ -485,6 +605,10 @@ struct AdminAddClientSheet: View {
     @State private var oneTime = false
     @State private var expiresEnabled = false
     @State private var expiresAt = Date().addingTimeInterval(86400 * 30)
+    /// Wave B3-macOS: `host:port`, empty = use the server's global default
+    /// (`pool.exit_node`). Applied via a follow-up `PATCH` after creation —
+    /// see `AdminStore.createClient`'s doc comment for why.
+    @State private var exitNode = ""
     @State private var isCreating = false
     @State private var errorText: String?
 
@@ -504,6 +628,14 @@ struct AdminAddClientSheet: View {
             if expiresEnabled {
                 DatePicker(loc.t("admin_expires_at"), selection: $expiresAt,
                            displayedComponents: [.date, .hourAndMinute])
+            }
+
+            VStack(alignment: .leading, spacing: 4) {
+                Text(loc.t("admin_exit_node"))
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                TextField(loc.t("admin_exit_node_placeholder"), text: $exitNode)
+                    .textFieldStyle(.roundedBorder)
             }
 
             if let errorText = errorText {
@@ -529,8 +661,10 @@ struct AdminAddClientSheet: View {
     private func createTapped() {
         isCreating = true
         errorText = nil
+        let trimmedExitNode = exitNode.trimmingCharacters(in: .whitespaces)
         store.createClient(name: name, oneTime: oneTime,
-                            expiresAt: expiresEnabled ? expiresAt : nil) { success, status in
+                            expiresAt: expiresEnabled ? expiresAt : nil,
+                            exitNode: trimmedExitNode.isEmpty ? nil : trimmedExitNode) { success, status in
             isCreating = false
             if success {
                 isPresented = false
@@ -554,6 +688,9 @@ struct AdminClientDetailSheet: View {
     @State private var editEnabled: Bool = true
     @State private var editExpiresEnabled: Bool = false
     @State private var editExpiresAt: Date = Date()
+    /// Wave B3-macOS: `host:port`, empty = clear (fall back to the global
+    /// default). Pre-filled from `client.exit_node` in `.onAppear` below.
+    @State private var editExitNode: String = ""
     @State private var isSaving = false
 
     @State private var showRevokeConfirm = false
@@ -605,6 +742,7 @@ struct AdminClientDetailSheet: View {
                 editExpiresEnabled = false
                 editExpiresAt = Date().addingTimeInterval(86400 * 30)
             }
+            editExitNode = client.exit_node ?? ""
         }
         .confirmationDialog(loc.t("admin_revoke_confirm_title"), isPresented: $showRevokeConfirm) {
             Button(loc.t("admin_revoke"), role: .destructive) { revokeTapped() }
@@ -650,6 +788,8 @@ struct AdminClientDetailSheet: View {
             if client.device_bound {
                 infoRow(icon: "lock.fill", text: loc.t("admin_device_bound"))
             }
+            infoRow(icon: "arrow.triangle.branch",
+                     text: "\(loc.t("admin_exit_node_current")): \(client.exit_node ?? loc.t("admin_exit_node_global"))")
 
             Button(loc.t("admin_edit")) { isEditing = true }
                 .buttonStyle(.bordered)
@@ -689,6 +829,13 @@ struct AdminClientDetailSheet: View {
             if editExpiresEnabled {
                 DatePicker(loc.t("admin_expires_at"), selection: $editExpiresAt,
                            displayedComponents: [.date, .hourAndMinute])
+            }
+            VStack(alignment: .leading, spacing: 4) {
+                Text(loc.t("admin_exit_node"))
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                TextField(loc.t("admin_exit_node_placeholder"), text: $editExitNode)
+                    .textFieldStyle(.roundedBorder)
             }
             HStack {
                 Spacer()
@@ -768,8 +915,17 @@ struct AdminClientDetailSheet: View {
         let hadExpires = client.expires_at != nil
         let clear = hadExpires && !editExpiresEnabled
         let sendExpires: Date? = editExpiresEnabled ? editExpiresAt : nil
+        // Wave B3-macOS: same tri-state convention as expires_at above —
+        // empty field clears an existing override (send explicit null);
+        // empty field with no prior override omits the key (no-op); a
+        // non-empty field always (re)sends the value.
+        let trimmedExitNode = editExitNode.trimmingCharacters(in: .whitespaces)
+        let hadExitNode = client.exit_node != nil
+        let clearExitNode = hadExitNode && trimmedExitNode.isEmpty
+        let sendExitNode: String? = trimmedExitNode.isEmpty ? nil : trimmedExitNode
         store.updateClient(id: client.id, name: nameChanged, enabled: enabledChanged,
-                            expiresAt: sendExpires, clearExpiresAt: clear) { success, status in
+                            expiresAt: sendExpires, clearExpiresAt: clear,
+                            exitNode: sendExitNode, clearExitNode: clearExitNode) { success, status in
             isSaving = false
             if success {
                 dismiss()

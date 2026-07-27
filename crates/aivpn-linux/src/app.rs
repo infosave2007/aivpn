@@ -6,7 +6,7 @@ use iced::{Alignment, Background, Border, Color, Element, Length, Subscription, 
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncBufReadExt, BufReader};
 
-use crate::admin::{self, ClientRecord, EditClientArgs, NewClientArgs};
+use crate::admin::{self, ClientRecord, EditClientArgs, NewClientArgs, PoolHealth, PoolNode};
 use crate::key_storage::{ConnectionKey, KeyStorage};
 use crate::settings::{remove_autostart_entry, write_autostart_entry, AppSettings};
 use crate::vpn_manager::{
@@ -711,6 +711,7 @@ pub enum Message {
     AdminNewNameChanged(String),
     AdminNewOneTimeToggled(bool),
     AdminNewExpiresChanged(String),
+    AdminNewExitNodeChanged(String),
     AdminAddClient,
     AdminAddClientResult(Result<ClientRecord, String>),
     AdminToggleEnabled(String, bool),
@@ -718,6 +719,7 @@ pub enum Message {
     AdminStartEdit(String),
     AdminEditNameChanged(String),
     AdminEditExpiresChanged(String),
+    AdminEditExitNodeChanged(String),
     AdminEditSave,
     AdminEditCancel,
     AdminEditResult(Result<ClientRecord, String>),
@@ -737,6 +739,11 @@ pub enum Message {
     AdminQrLoaded(String, Result<Vec<u8>, String>),
     AdminSaveQrToFile,
     AdminSaveQrPathChosen(Option<std::path::PathBuf>),
+    // ── Pool topology panel (B3: pool nodes + health, admin-role gated) ────
+    TogglePoolPanel,
+    PoolRefresh,
+    PoolNodesLoaded(Result<Vec<PoolNode>, String>),
+    PoolHealthLoaded(Result<PoolHealth, String>),
     // Misc
     Noop,
 }
@@ -1106,6 +1113,24 @@ fn t<'a>(lang: &str, key: &'a str) -> &'a str {
         "Close" => "Закрыть",
         "Generating QR..." => "Генерация QR...",
         "Save QR" => "Сохранить QR",
+        "Exit node (optional)" => "Узел выхода (необязательно)",
+        "Exit" => "Выход",
+        // Pool topology panel (Wave B3)
+        "Pool Topology" => "Топология пула",
+        "Transport" => "Транспорт",
+        "Connected" => "Подключено",
+        "Converged" => "Синхронизировано",
+        "Partition conflict detected" => "Обнаружен конфликт разделов",
+        "Subnet mismatch detected" => "Обнаружено несоответствие подсети",
+        "Some peers diverged" => "Некоторые узлы рассинхронизированы",
+        "No pool nodes" => "Нет узлов пула",
+        "verified" => "проверен",
+        "unverified" => "не проверен",
+        "connected" => "подключён",
+        "offline" => "офлайн",
+        "revoked" => "отозван",
+        "Last seen" => "Последняя активность",
+        "never" => "никогда",
         _ => key,
     }
 }
@@ -1165,9 +1190,14 @@ pub struct App {
     admin_new_name: String,
     admin_new_one_time: bool,
     admin_new_expires: String,
+    /// Wave B3: `host:port`, empty = use the pool's global default.
+    admin_new_exit_node: String,
     admin_edit_id: Option<String>,
     admin_edit_name: String,
     admin_edit_expires: String,
+    /// Wave B3: `host:port`, empty = use the pool's global default (clears
+    /// any existing per-client override on save).
+    admin_edit_exit_node: String,
     /// Two-step revoke: first press stores the target id here and the view
     /// renders a "Confirm revoke? [Yes][No]" row for just that client;
     /// nothing is revoked until `Message::AdminRevokeConfirm` on the same id.
@@ -1175,6 +1205,14 @@ pub struct App {
     admin_key_view: Option<(String, String)>,
     admin_qr: Option<(String, image::Handle)>,
     admin_qr_loading: Option<String>,
+    // ── Pool topology panel (B3) ────────────────────────────────────────
+    /// Panel disclosure toggle; same admin-role gate as `admin_open` (see
+    /// `view_main`).
+    pool_open: bool,
+    pool_nodes: Vec<PoolNode>,
+    pool_health: Option<PoolHealth>,
+    pool_loading: bool,
+    pool_error: Option<String>,
 }
 
 impl App {
@@ -1231,13 +1269,20 @@ impl App {
                 admin_new_name: String::new(),
                 admin_new_one_time: false,
                 admin_new_expires: String::new(),
+                admin_new_exit_node: String::new(),
                 admin_edit_id: None,
                 admin_edit_name: String::new(),
                 admin_edit_expires: String::new(),
+                admin_edit_exit_node: String::new(),
                 admin_pending_revoke: None,
                 admin_key_view: None,
                 admin_qr: None,
                 admin_qr_loading: None,
+                pool_open: false,
+                pool_nodes: Vec::new(),
+                pool_health: None,
+                pool_loading: false,
+                pool_error: None,
             },
             Task::none(),
         )
@@ -1915,6 +1960,7 @@ impl App {
             Message::AdminNewNameChanged(s) => self.admin_new_name = s,
             Message::AdminNewOneTimeToggled(b) => self.admin_new_one_time = b,
             Message::AdminNewExpiresChanged(s) => self.admin_new_expires = s,
+            Message::AdminNewExitNodeChanged(s) => self.admin_new_exit_node = s,
             Message::AdminAddClient => {
                 let name = self.admin_new_name.trim().to_string();
                 if name.is_empty() || self.admin_busy_id.is_some() {
@@ -1926,6 +1972,7 @@ impl App {
                     name,
                     one_time: self.admin_new_one_time,
                     expires_at: self.admin_new_expires.trim().to_string(),
+                    exit_node: self.admin_new_exit_node.trim().to_string(),
                 };
                 return Task::perform(admin::add_client(args), Message::AdminAddClientResult);
             }
@@ -1937,6 +1984,7 @@ impl App {
                         self.admin_new_name.clear();
                         self.admin_new_one_time = false;
                         self.admin_new_expires.clear();
+                        self.admin_new_exit_node.clear();
                         self.admin_error = None;
                     }
                     Err(e) => self.admin_error = Some(e),
@@ -1974,14 +2022,17 @@ impl App {
                     self.admin_edit_id = Some(id);
                     self.admin_edit_name = c.name.clone();
                     self.admin_edit_expires = c.expires_at.clone().unwrap_or_default();
+                    self.admin_edit_exit_node = c.exit_node.clone().unwrap_or_default();
                 }
             }
             Message::AdminEditNameChanged(s) => self.admin_edit_name = s,
             Message::AdminEditExpiresChanged(s) => self.admin_edit_expires = s,
+            Message::AdminEditExitNodeChanged(s) => self.admin_edit_exit_node = s,
             Message::AdminEditCancel => {
                 self.admin_edit_id = None;
                 self.admin_edit_name.clear();
                 self.admin_edit_expires.clear();
+                self.admin_edit_exit_node.clear();
             }
             Message::AdminEditSave => {
                 if self.admin_busy_id.is_some() {
@@ -1990,6 +2041,7 @@ impl App {
                 if let Some(id) = self.admin_edit_id.clone() {
                     self.admin_busy_id = Some(id.clone());
                     let expires = self.admin_edit_expires.trim().to_string();
+                    let exit_node = self.admin_edit_exit_node.trim().to_string();
                     let args = EditClientArgs {
                         name: Some(self.admin_edit_name.trim().to_string()),
                         enabled: None,
@@ -1997,6 +2049,11 @@ impl App {
                             None
                         } else {
                             Some(expires)
+                        }),
+                        exit_node: Some(if exit_node.is_empty() {
+                            None
+                        } else {
+                            Some(exit_node)
                         }),
                     };
                     return Task::perform(
@@ -2016,6 +2073,7 @@ impl App {
                         self.admin_edit_id = None;
                         self.admin_edit_name.clear();
                         self.admin_edit_expires.clear();
+                        self.admin_edit_exit_node.clear();
                         self.admin_error = None;
                     }
                     Err(e) => self.admin_error = Some(e),
@@ -2178,6 +2236,44 @@ impl App {
                     }
                 }
             }
+
+            // ── Pool topology panel (B3) ────────────────────────────────
+            Message::TogglePoolPanel => {
+                self.pool_open = !self.pool_open;
+                if self.pool_open && self.pool_nodes.is_empty() && !self.pool_loading {
+                    self.pool_loading = true;
+                    self.pool_error = None;
+                    return Task::batch([
+                        Task::perform(admin::pool_nodes(), Message::PoolNodesLoaded),
+                        Task::perform(admin::pool_health(), Message::PoolHealthLoaded),
+                    ]);
+                }
+            }
+            Message::PoolRefresh => {
+                self.pool_loading = true;
+                self.pool_error = None;
+                return Task::batch([
+                    Task::perform(admin::pool_nodes(), Message::PoolNodesLoaded),
+                    Task::perform(admin::pool_health(), Message::PoolHealthLoaded),
+                ]);
+            }
+            Message::PoolNodesLoaded(result) => {
+                self.pool_loading = false;
+                match result {
+                    Ok(nodes) => {
+                        self.pool_nodes = nodes;
+                        self.pool_error = None;
+                    }
+                    Err(e) => self.pool_error = Some(e),
+                }
+            }
+            Message::PoolHealthLoaded(result) => match result {
+                Ok(health) => {
+                    self.pool_health = Some(health);
+                    self.pool_error = None;
+                }
+                Err(e) => self.pool_error = Some(e),
+            },
 
             Message::Noop => {}
         }
@@ -2890,6 +2986,14 @@ impl App {
         } else {
             Space::with_height(0).into()
         };
+        // Pool topology panel (B3): same connected+Admin gate as the
+        // client-management panel above — pool node/health data is just as
+        // sensitive as the client list.
+        let pool_section: Element<Message> = if admin_is_connected && self.admin_role == Some(2) {
+            self.view_pool_section()
+        } else {
+            Space::with_height(0).into()
+        };
 
         // Wrap everything in a scrollable so settings + log are reachable
         // in windows smaller than the full content height.
@@ -2938,6 +3042,8 @@ impl App {
                     recording_block,
                     Space::with_height(6),
                     admin_section,
+                    Space::with_height(6),
+                    pool_section,
                     Space::with_height(6),
                     bootstrap_header,
                     bootstrap_box,
@@ -3014,6 +3120,9 @@ impl App {
             text_input("expires (RFC3339, optional)", &self.admin_new_expires)
                 .on_input(Message::AdminNewExpiresChanged)
                 .width(Length::FillPortion(2)),
+            text_input(t(lang, "Exit node (optional)"), &self.admin_new_exit_node)
+                .on_input(Message::AdminNewExitNodeChanged)
+                .width(Length::FillPortion(2)),
             button(text(if adding {
                 t(lang, "Adding...")
             } else {
@@ -3052,6 +3161,13 @@ impl App {
                 } else {
                     text("").size(11)
                 },
+                if let Some(exit) = &c.exit_node {
+                    text(format!("{}: {}", t(lang, "Exit"), exit))
+                        .size(11)
+                        .color(muted)
+                } else {
+                    text("").size(11)
+                },
             ]
             .spacing(8)
             .align_y(Alignment::Center);
@@ -3080,6 +3196,9 @@ impl App {
                             .width(Length::FillPortion(2)),
                         text_input("expires (RFC3339)", &self.admin_edit_expires)
                             .on_input(Message::AdminEditExpiresChanged)
+                            .width(Length::FillPortion(2)),
+                        text_input("host:port", &self.admin_edit_exit_node)
+                            .on_input(Message::AdminEditExitNodeChanged)
                             .width(Length::FillPortion(2)),
                         button(t(lang, "Save"))
                             .on_press_maybe((!busy).then_some(Message::AdminEditSave)),
@@ -3163,6 +3282,151 @@ impl App {
             }
 
             body = body.push(container(card).padding(8).width(Length::Fill).style(
+                move |_: &Theme| container::Style {
+                    background: Some(Background::Color(if is_dark {
+                        Color::from_rgb(0.24, 0.25, 0.30)
+                    } else {
+                        Color::from_rgb(0.95, 0.95, 0.97)
+                    })),
+                    border: Border {
+                        radius: 6.0.into(),
+                        width: 1.0,
+                        color: if is_dark {
+                            Color::from_rgba(1.0, 1.0, 1.0, 0.08)
+                        } else {
+                            Color::from_rgba(0.0, 0.0, 0.0, 0.06)
+                        },
+                    },
+                    ..Default::default()
+                },
+            ));
+        }
+
+        column![header, body].spacing(6).into()
+    }
+
+    /// Pool topology panel body (Wave B3): node list + health summary.
+    /// Same gating discipline as `view_admin_section` — only ever called
+    /// from `view_main` behind `is_connected && admin_role == Some(2)`.
+    fn view_pool_section(&self) -> Element<'_, Message> {
+        let lang = self.settings.lang.as_str();
+        let is_dark = self.settings.dark_mode;
+        let muted = if is_dark {
+            Color::from_rgb(0.62, 0.64, 0.70)
+        } else {
+            Color::from_rgb(0.43, 0.45, 0.50)
+        };
+        let danger = Color::from_rgb(0.95, 0.28, 0.18);
+        let good = Color::from_rgb(0.20, 0.70, 0.35);
+
+        let toggle_label = if self.pool_open {
+            format!("[-] {}", t(lang, "Pool Topology"))
+        } else {
+            format!("[+] {}", t(lang, "Pool Topology"))
+        };
+        let header = row![
+            button(text(toggle_label))
+                .on_press(Message::TogglePoolPanel)
+                .style(button::text),
+            Space::with_width(Length::Fill),
+            if self.pool_open {
+                button(t(lang, "Refresh"))
+                    .on_press(Message::PoolRefresh)
+                    .style(button::text)
+                    .into()
+            } else {
+                Element::from(Space::with_width(0))
+            },
+        ]
+        .align_y(Alignment::Center);
+
+        if !self.pool_open {
+            return column![header].into();
+        }
+
+        let mut body = column![].spacing(6);
+
+        if let Some(err) = &self.pool_error {
+            body = body.push(text(err).size(12).color(danger));
+        }
+
+        if let Some(h) = &self.pool_health {
+            let health_row = row![
+                text(format!("{}: {}", t(lang, "Transport"), h.transport)).size(12),
+                text(format!(
+                    "{}: {}/{}",
+                    t(lang, "Connected"),
+                    h.connected_peers,
+                    h.total_nodes
+                ))
+                .size(12),
+                text(format!("{}: {}", t(lang, "Converged"), h.converged_peers)).size(12),
+            ]
+            .spacing(12);
+            body = body.push(health_row);
+
+            if h.partition_conflict || h.subnet_mismatch {
+                let mut warn = String::new();
+                if h.partition_conflict {
+                    warn.push_str(t(lang, "Partition conflict detected"));
+                }
+                if h.subnet_mismatch {
+                    if !warn.is_empty() {
+                        warn.push_str(" \u{b7} ");
+                    }
+                    warn.push_str(t(lang, "Subnet mismatch detected"));
+                }
+                body = body.push(text(warn).size(12).color(danger));
+            } else if h.diverged {
+                body = body.push(text(t(lang, "Some peers diverged")).size(12).color(muted));
+            }
+        }
+
+        if self.pool_loading {
+            body = body.push(text(t(lang, "Loading...")).size(12).color(muted));
+        } else if self.pool_nodes.is_empty() {
+            body = body.push(text(t(lang, "No pool nodes")).size(12).color(muted));
+        }
+
+        for n in &self.pool_nodes {
+            let last_seen = n
+                .last_seen_unix
+                .map(|ts| ts.to_string())
+                .unwrap_or_else(|| t(lang, "never").to_string());
+            let node_row = row![
+                text(n.node_id.clone())
+                    .size(12)
+                    .width(Length::FillPortion(2)),
+                text(n.address.clone().unwrap_or_else(|| "-".to_string()))
+                    .size(12)
+                    .width(Length::FillPortion(2)),
+                text(if n.verified {
+                    t(lang, "verified")
+                } else {
+                    t(lang, "unverified")
+                })
+                .size(11)
+                .color(if n.verified { good } else { muted }),
+                text(if n.connected {
+                    t(lang, "connected")
+                } else {
+                    t(lang, "offline")
+                })
+                .size(11)
+                .color(if n.connected { good } else { muted }),
+                if n.revoked {
+                    text(t(lang, "revoked")).size(11).color(danger)
+                } else {
+                    text("").size(11)
+                },
+                text(format!("{}: {}", t(lang, "Last seen"), last_seen))
+                    .size(11)
+                    .color(muted),
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center);
+
+            body = body.push(container(node_row).padding(6).width(Length::Fill).style(
                 move |_: &Theme| container::Style {
                     background: Some(Background::Color(if is_dark {
                         Color::from_rgb(0.24, 0.25, 0.30)

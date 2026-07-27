@@ -41,6 +41,16 @@
                 android:paddingStart="4dp" />
 
             <ImageButton
+                android:id="@+id/btnPool"
+                android:layout_width="40dp"
+                android:layout_height="40dp"
+                android:src="@android:drawable/ic_menu_mapmode"
+                android:background="?attr/selectableItemBackgroundBorderless"
+                android:contentDescription="@string/pool_title"
+                android:scaleType="centerInside"
+                app:tint="@color/text_primary" />
+
+            <ImageButton
                 android:id="@+id/btnRefresh"
                 android:layout_width="40dp"
                 android:layout_height="40dp"

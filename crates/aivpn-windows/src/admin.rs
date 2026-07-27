@@ -44,6 +44,11 @@ const ADMIN_SOCKET_ADDR: &str = "127.0.0.1:44301";
 pub const PATH_CLIENTS: &str = "/api/v1/clients";
 pub const PATH_STATUS: &str = "/api/v1/status";
 pub const PATH_AUDIT_LOG: &str = "/api/v1/audit-log";
+/// B3: `GET /api/v1/pool/nodes` — read-only pool topology, Viewer+Admin
+/// (`mgmt_service.rs`'s `authorize`: role 1 is GET-only, role 2 is full).
+pub const PATH_POOL_NODES: &str = "/api/v1/pool/nodes";
+/// B3: `GET /api/v1/pool/health` — aggregate pool-sync health summary.
+pub const PATH_POOL_HEALTH: &str = "/api/v1/pool/health";
 
 pub fn path_client(id: &str) -> String {
     format!("/api/v1/clients/{id}")
@@ -81,6 +86,12 @@ pub struct AdminClient {
     pub expires_at: Option<String>,
     pub bytes_in: u64,
     pub bytes_out: u64,
+    /// B3: this client's per-client exit-node routing override
+    /// (`host:port`), or `None` to fall back to the server's global
+    /// default (`pool.exit_node`) — mirrors `ClientView::exit_node`
+    /// (mgmt_service.rs). Settable only via `PATCH /api/v1/clients/:id`,
+    /// never on create — see `TunnelAddClientRequest`'s doc comment.
+    pub exit_node: Option<String>,
 }
 
 impl AdminClient {
@@ -122,6 +133,10 @@ impl AdminClient {
                 .and_then(|s| s.get("bytes_out"))
                 .and_then(|x| x.as_u64())
                 .unwrap_or(0),
+            exit_node: v
+                .get("exit_node")
+                .and_then(|x| x.as_str())
+                .map(|s| s.to_string()),
         })
     }
 }
@@ -222,6 +237,91 @@ fn parse_status(body: &[u8]) -> Result<AdminStatus, String> {
     })
 }
 
+// ── Pool topology view models (B3) ──────────────────────────────────────
+//
+// Mirror `mgmt_service.rs`'s `PoolNodeInfo`/`PoolHealth` — parsed
+// defensively via `serde_json::Value` for the same reason as `AdminClient`
+// above (this crate never shares the server's types).
+
+#[derive(Debug, Clone)]
+pub struct PoolNode {
+    pub node_id: String,
+    pub address: Option<String>,
+    pub verified: bool,
+    pub revoked: bool,
+    pub connected: bool,
+    pub last_seen_unix: Option<i64>,
+}
+
+impl PoolNode {
+    fn from_value(v: &serde_json::Value) -> Option<Self> {
+        Some(Self {
+            node_id: v.get("node_id")?.as_str()?.to_string(),
+            address: v
+                .get("address")
+                .and_then(|x| x.as_str())
+                .map(|s| s.to_string()),
+            verified: v.get("verified").and_then(|x| x.as_bool()).unwrap_or(false),
+            revoked: v.get("revoked").and_then(|x| x.as_bool()).unwrap_or(false),
+            connected: v
+                .get("connected")
+                .and_then(|x| x.as_bool())
+                .unwrap_or(false),
+            last_seen_unix: v.get("last_seen_unix").and_then(|x| x.as_i64()),
+        })
+    }
+}
+
+fn parse_pool_nodes(body: &[u8]) -> Result<Vec<PoolNode>, String> {
+    let v: serde_json::Value =
+        serde_json::from_slice(body).map_err(|e| format!("Bad JSON from server: {e}"))?;
+    let arr = v
+        .as_array()
+        .ok_or_else(|| "Expected a JSON array of pool nodes".to_string())?;
+    Ok(arr.iter().filter_map(PoolNode::from_value).collect())
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct PoolHealth {
+    pub transport: String,
+    pub total_nodes: u64,
+    pub connected_peers: u64,
+    pub converged_peers: u64,
+    pub diverged: bool,
+    pub partition_conflict: bool,
+    pub subnet_mismatch: bool,
+}
+
+fn parse_pool_health(body: &[u8]) -> Result<PoolHealth, String> {
+    let v: serde_json::Value =
+        serde_json::from_slice(body).map_err(|e| format!("Bad JSON from server: {e}"))?;
+    Ok(PoolHealth {
+        transport: v
+            .get("transport")
+            .and_then(|x| x.as_str())
+            .unwrap_or("none")
+            .to_string(),
+        total_nodes: v.get("total_nodes").and_then(|x| x.as_u64()).unwrap_or(0),
+        connected_peers: v
+            .get("connected_peers")
+            .and_then(|x| x.as_u64())
+            .unwrap_or(0),
+        converged_peers: v
+            .get("converged_peers")
+            .and_then(|x| x.as_u64())
+            .unwrap_or(0),
+        diverged: v.get("diverged").and_then(|x| x.as_bool()).unwrap_or(false),
+        partition_conflict: v
+            .get("partition_conflict")
+            .and_then(|x| x.as_bool())
+            .unwrap_or(false),
+        subnet_mismatch: v
+            .get("subnet_mismatch")
+            .and_then(|x| x.as_bool())
+            .unwrap_or(false),
+    })
+}
+
 // ── Add/Edit form payloads ─────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Default)]
@@ -230,6 +330,11 @@ pub struct NewClientForm {
     pub one_time: bool,
     /// RFC3339 timestamp, e.g. "2026-08-01T00:00:00Z". Empty = no expiry.
     pub expires_at: String,
+    /// B3: `host:port`, or empty to use the server's global default. Not
+    /// part of `TunnelAddClientRequest` on the wire — `add_client` below
+    /// issues a follow-up `PATCH` after creation when this is non-empty,
+    /// since the tunnel's create route has no `exit_node` field.
+    pub exit_node: String,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -239,6 +344,10 @@ pub struct EditClientForm {
     pub enabled: bool,
     /// RFC3339 timestamp, or empty to clear/leave-without expiry.
     pub expires_at: String,
+    /// B3: `host:port`, or empty to clear the override (fall back to the
+    /// server's global default). Always sent explicitly, same tri-state
+    /// convention as `expires_at` above.
+    pub exit_node: String,
 }
 
 // ── Requests / responses ────────────────────────────────────────────────
@@ -267,6 +376,10 @@ pub enum AdminRequest {
     },
     Status,
     AuditLog,
+    /// B3: `GET /api/v1/pool/nodes` — Viewer+Admin.
+    PoolNodes,
+    /// B3: `GET /api/v1/pool/health` — Viewer+Admin.
+    PoolHealth,
 }
 
 pub enum AdminResponse {
@@ -298,6 +411,10 @@ pub enum AdminResponse {
     },
     Status(Result<AdminStatus, String>),
     AuditLog(Result<Vec<AuditEntry>, String>),
+    /// B3: response to `AdminRequest::PoolNodes`.
+    PoolNodes(Result<Vec<PoolNode>, String>),
+    /// B3: response to `AdminRequest::PoolHealth`.
+    PoolHealth(Result<PoolHealth, String>),
 }
 
 /// Run one admin operation on a background thread and send exactly one
@@ -336,6 +453,8 @@ pub fn spawn(client_binary: PathBuf, req: AdminRequest, tx: Sender<AdminResponse
             },
             AdminRequest::Status => AdminResponse::Status(get_status(&client_binary)),
             AdminRequest::AuditLog => AdminResponse::AuditLog(get_audit_log(&client_binary)),
+            AdminRequest::PoolNodes => AdminResponse::PoolNodes(list_pool_nodes(&client_binary)),
+            AdminRequest::PoolHealth => AdminResponse::PoolHealth(get_pool_health(&client_binary)),
         };
         let _ = tx.send(resp);
     });
@@ -446,7 +565,9 @@ fn add_client(client_binary: &Path, form: &NewClientForm) -> Result<AdminClient,
     // (required), one_time (defaults false if omitted), expires_at
     // (plain `Option<DateTime<Utc>>` — omitting the key deserializes as
     // `None`, same as leaving it blank in the form). No `role` field: role
-    // assignment is not exposed over this path.
+    // assignment is not exposed over this path. `exit_node` is likewise
+    // absent from `TunnelAddClientRequest` — see `NewClientForm::
+    // exit_node`'s doc comment for the follow-up `PATCH` below.
     let mut json = serde_json::json!({
         "name": form.name,
         "one_time": form.one_time,
@@ -457,15 +578,38 @@ fn add_client(client_binary: &Path, form: &NewClientForm) -> Result<AdminClient,
     let bytes = serde_json::to_vec(&json).map_err(|e| format!("Failed to encode request: {e}"))?;
     let (status, body) = mgmt_call(client_binary, "POST", PATH_CLIENTS, &bytes)?;
     check_status(status, &body)?;
-    parse_client(&body)
+    let created = parse_client(&body)?;
+
+    let exit_node = form.exit_node.trim();
+    if exit_node.is_empty() {
+        return Ok(created);
+    }
+    // The create route can't set `exit_node`, so apply it as a second
+    // in-tunnel call against the client id the server just handed back. If
+    // this fails the client still exists (with no exit-node override) —
+    // surface that half-applied state as an error rather than silently
+    // dropping the field the caller asked for.
+    let patch_form = EditClientForm {
+        id: created.id.clone(),
+        name: created.name.clone(),
+        enabled: created.enabled,
+        expires_at: created.expires_at.clone().unwrap_or_default(),
+        exit_node: exit_node.to_string(),
+    };
+    edit_client(client_binary, &patch_form).map_err(|e| {
+        format!(
+            "Client \"{}\" was created, but setting its exit node failed: {e}",
+            created.name
+        )
+    })
 }
 
 fn edit_client(client_binary: &Path, form: &EditClientForm) -> Result<AdminClient, String> {
-    // Matches `TunnelPatchClientRequest`: `expires_at` uses the
-    // absent/null/value tri-state (`deserialize_opt_opt`) — omit the key to
-    // leave unchanged, `null` to clear, a string to set. This panel always
-    // reflects the form's current expiry, so the key is always sent
-    // explicitly (null when the field was cleared).
+    // Matches `TunnelPatchClientRequest`: `expires_at`/`exit_node` both use
+    // the absent/null/value tri-state (`deserialize_opt_opt`) — omit the
+    // key to leave unchanged, `null` to clear, a string to set. This panel
+    // always reflects the form's current values, so both keys are always
+    // sent explicitly (null when the field was cleared).
     let mut json = serde_json::json!({
         "name": form.name,
         "enabled": form.enabled,
@@ -475,10 +619,27 @@ fn edit_client(client_binary: &Path, form: &EditClientForm) -> Result<AdminClien
     } else {
         serde_json::Value::String(form.expires_at.trim().to_string())
     };
+    json["exit_node"] = if form.exit_node.trim().is_empty() {
+        serde_json::Value::Null
+    } else {
+        serde_json::Value::String(form.exit_node.trim().to_string())
+    };
     let bytes = serde_json::to_vec(&json).map_err(|e| format!("Failed to encode request: {e}"))?;
     let (status, body) = mgmt_call(client_binary, "PATCH", &path_client(&form.id), &bytes)?;
     check_status(status, &body)?;
     parse_client(&body)
+}
+
+fn list_pool_nodes(client_binary: &Path) -> Result<Vec<PoolNode>, String> {
+    let (status, body) = mgmt_call(client_binary, "GET", PATH_POOL_NODES, &[])?;
+    check_status(status, &body)?;
+    parse_pool_nodes(&body)
+}
+
+fn get_pool_health(client_binary: &Path) -> Result<PoolHealth, String> {
+    let (status, body) = mgmt_call(client_binary, "GET", PATH_POOL_HEALTH, &[])?;
+    check_status(status, &body)?;
+    parse_pool_health(&body)
 }
 
 fn connection_key(client_binary: &Path, id: &str) -> Result<String, String> {

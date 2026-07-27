@@ -27,6 +27,7 @@ SWIFT_SOURCES=(
     "$SCRIPT_DIR/LaunchAgentManager.swift"
     "$SCRIPT_DIR/AdminApi.swift"
     "$SCRIPT_DIR/AdminView.swift"
+    "$SCRIPT_DIR/PoolView.swift"
 )
 
 HELPER_SOURCES=(

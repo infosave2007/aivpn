@@ -240,6 +240,38 @@ class LocalizationManager: ObservableObject {
             "en": "Permanently revoke and disconnect this client. This cannot be undone.",
             "ru": "Клиент будет безвозвратно отозван и отключён. Это действие нельзя отменить.",
         ],
+
+        // MARK: Per-client exit node (Wave B2a/B3-iOS)
+        "admin_exit_node":        ["en": "Exit node (optional)", "ru": "Узел выхода (необязательно)"],
+        "admin_exit_node_hint": [
+            "en": "host:port — leave empty to use the server's global exit node.",
+            "ru": "host:port — оставьте пустым, чтобы использовать глобальный узел выхода сервера.",
+        ],
+        "admin_exit_node_global": ["en": "Global (default)", "ru": "Глобальный (по умолчанию)"],
+
+        // MARK: Pool topology view (Wave B1/B3-iOS)
+        "pool_title":              ["en": "Pool Topology", "ru": "Топология пула"],
+        "pool_health_section":     ["en": "Pool Health", "ru": "Состояние пула"],
+        "pool_nodes_section":      ["en": "Nodes", "ru": "Узлы"],
+        "pool_links_section":      ["en": "Links", "ru": "Связи"],
+        "pool_no_nodes":           ["en": "No pool nodes", "ru": "Нет узлов пула"],
+        "pool_transport":          ["en": "Transport", "ru": "Транспорт"],
+        "pool_transport_masked":   ["en": "Masked", "ru": "Маскированный"],
+        "pool_transport_legacy":   ["en": "Legacy", "ru": "Устаревший"],
+        "pool_transport_none":     ["en": "Not configured", "ru": "Не настроен"],
+        "pool_total_nodes":        ["en": "Total nodes", "ru": "Всего узлов"],
+        "pool_connected_peers":    ["en": "Connected peers", "ru": "Подключено пиров"],
+        "pool_converged_peers":    ["en": "Converged peers", "ru": "Синхронизировано пиров"],
+        "pool_diverged":           ["en": "Diverged", "ru": "Есть расхождение"],
+        "pool_revoked":            ["en": "Revoked", "ru": "Отозван"],
+        "pool_last_seen":          ["en": "Last seen", "ru": "Последний раз в сети"],
+        "pool_last_converged":     ["en": "Last converged", "ru": "Последняя синхронизация"],
+        "pool_conflict_warning": [
+            "en": "Pool partition or subnet conflict detected — check node configuration.",
+            "ru": "Обнаружен конфликт партиции или подсети пула — проверьте настройки узлов.",
+        ],
+        "pool_partition_conflict": ["en": "Partition conflict", "ru": "Конфликт партиции"],
+        "pool_subnet_mismatch":    ["en": "Subnet mismatch", "ru": "Несовпадение подсети"],
     ]
 
     init() {

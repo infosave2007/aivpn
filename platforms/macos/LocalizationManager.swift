@@ -608,6 +608,106 @@ class LocalizationManager: ObservableObject {
             "en": "Created",
             "ru": "Создан"
         ],
+
+        // MARK: - Admin: pool topology (Wave B3-macOS)
+        "admin_tab_clients": [
+            "en": "Clients",
+            "ru": "Клиенты"
+        ],
+        "admin_tab_pool": [
+            "en": "Pool",
+            "ru": "Пул"
+        ],
+        "admin_pool_title": [
+            "en": "Pool Nodes",
+            "ru": "Узлы пула"
+        ],
+        "admin_pool_no_nodes": [
+            "en": "No pool nodes.",
+            "ru": "Узлов пула нет."
+        ],
+        "admin_pool_health": [
+            "en": "Pool Health",
+            "ru": "Состояние пула"
+        ],
+        "admin_pool_transport": [
+            "en": "Transport",
+            "ru": "Транспорт"
+        ],
+        "admin_pool_total_nodes": [
+            "en": "Total nodes",
+            "ru": "Всего узлов"
+        ],
+        "admin_pool_connected_peers": [
+            "en": "Connected peers",
+            "ru": "Подключённые узлы"
+        ],
+        "admin_pool_converged_peers": [
+            "en": "Converged peers",
+            "ru": "Синхронизированные узлы"
+        ],
+        "admin_pool_diverged_warning": [
+            "en": "Some peers are currently out of sync.",
+            "ru": "Некоторые узлы сейчас рассинхронизированы."
+        ],
+        "admin_pool_partition_conflict_warning": [
+            "en": "Partition conflict detected: two or more nodes are claiming the same VPN-IP partition.",
+            "ru": "Обнаружен конфликт разделов: два или более узла используют один и тот же раздел VPN-IP."
+        ],
+        "admin_pool_subnet_mismatch_warning": [
+            "en": "Subnet mismatch detected: a peer reports a different VPN subnet.",
+            "ru": "Обнаружено несовпадение подсети: один из узлов сообщает другую VPN-подсеть."
+        ],
+        "admin_pool_node_verified": [
+            "en": "Verified",
+            "ru": "Подтверждён"
+        ],
+        "admin_pool_node_unverified": [
+            "en": "Unverified",
+            "ru": "Не подтверждён"
+        ],
+        "admin_pool_node_revoked": [
+            "en": "Revoked",
+            "ru": "Отозван"
+        ],
+        "admin_pool_node_connected": [
+            "en": "Connected",
+            "ru": "Подключён"
+        ],
+        "admin_pool_node_disconnected": [
+            "en": "Disconnected",
+            "ru": "Отключён"
+        ],
+        "admin_pool_last_seen": [
+            "en": "Last seen",
+            "ru": "Последний раз в сети"
+        ],
+        "admin_pool_never_seen": [
+            "en": "Never",
+            "ru": "Никогда"
+        ],
+        "admin_pool_no_address": [
+            "en": "No dial address",
+            "ru": "Нет адреса подключения"
+        ],
+
+        // MARK: - Admin: per-client exit node (Wave B3-macOS)
+        "admin_exit_node": [
+            "en": "Exit node (optional)",
+            "ru": "Узел выхода (опционально)"
+        ],
+        "admin_exit_node_placeholder": [
+            "en": "host:port — leave empty for global default",
+            "ru": "host:port — оставьте пустым для значения по умолчанию"
+        ],
+        "admin_exit_node_current": [
+            "en": "Exit node",
+            "ru": "Узел выхода"
+        ],
+        "admin_exit_node_global": [
+            "en": "Global default",
+            "ru": "Глобальный по умолчанию"
+        ],
     ]
 
     init() {

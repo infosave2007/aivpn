@@ -55,6 +55,12 @@
             android:exported="false"
             android:parentActivityName=".MainActivity" />
 
+        <!-- In-app admin: pool topology view (Admin/Viewer role gated, read-only) -->
+        <activity
+            android:name=".PoolActivity"
+            android:exported="false"
+            android:parentActivityName=".AdminActivity" />
+
         <service
             android:name=".AivpnService"
             android:permission="android.permission.BIND_VPN_SERVICE"

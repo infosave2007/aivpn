@@ -246,6 +246,28 @@ fn app_icon() -> std::sync::Arc<eframe::egui::IconData> {
     })
 }
 
+/// Coarse "Xs/Xm/Xh/Xd" relative-age string for a `last_seen_unix` field
+/// from `GET /api/v1/pool/nodes` — the pool section (B3) has no on-disk
+/// clock skew guard, so a slightly-negative delta (peer clock ahead of
+/// ours) is just clamped to zero rather than shown as "-Ns".
+#[cfg(windows)]
+fn format_unix_ago(ts: i64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let secs = (now - ts).max(0);
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m", secs / 60)
+    } else if secs < 86400 {
+        format!("{}h", secs / 3600)
+    } else {
+        format!("{}d", secs / 86400)
+    }
+}
+
 #[cfg(windows)]
 fn tray_icon_base() -> &'static (Vec<u8>, u32, u32) {
     static BASE: std::sync::OnceLock<(Vec<u8>, u32, u32)> = std::sync::OnceLock::new();
@@ -570,7 +592,9 @@ struct AivpnApp {
     admin_rx: std::sync::mpsc::Receiver<AdminResponse>,
     /// Server-assigned role cached for the CURRENT session (0/1/2). `None`
     /// until the `role` query answers; the panel only ever shows once this
-    /// is `Some(2)` — fails closed (never shown) on a query error.
+    /// is `Some(1)` (Viewer — pool topology, read-only) or `Some(2)`
+    /// (Admin — pool topology + full client management) — fails closed
+    /// (never shown) on a query error or plain `User` role.
     admin_role: Option<u8>,
     admin_clients_loaded: bool,
     admin_clients: Vec<admin::AdminClient>,
@@ -589,6 +613,8 @@ struct AivpnApp {
     admin_add_name: String,
     admin_add_one_time: bool,
     admin_add_expiry: String,
+    /// B3: `host:port`, empty = use the server's global default.
+    admin_add_exit_node: String,
     admin_add_error: Option<String>,
     admin_add_busy: bool,
 
@@ -596,8 +622,19 @@ struct AivpnApp {
     admin_edit_name: String,
     admin_edit_enabled: bool,
     admin_edit_expiry: String,
+    /// B3: `host:port`, empty = clear the per-client override.
+    admin_edit_exit_node: String,
     admin_edit_error: Option<String>,
     admin_edit_busy: bool,
+
+    // ── Pool topology view (B3) — Viewer + Admin ────────────────────────
+    /// `true` once the pool nodes/health have been kicked off for the
+    /// current session (mirrors `admin_clients_loaded`'s one-shot gate).
+    admin_pool_loaded: bool,
+    admin_pool_nodes: Vec<admin::PoolNode>,
+    admin_pool_nodes_loading: bool,
+    admin_pool_nodes_error: Option<String>,
+    admin_pool_health: Option<admin::PoolHealth>,
 
     // Connection-key / QR viewer window
     admin_key_id: Option<String>,
@@ -641,14 +678,21 @@ impl AivpnApp {
             admin_add_name: String::new(),
             admin_add_one_time: false,
             admin_add_expiry: String::new(),
+            admin_add_exit_node: String::new(),
             admin_add_error: None,
             admin_add_busy: false,
             admin_edit_id: None,
             admin_edit_name: String::new(),
             admin_edit_enabled: true,
             admin_edit_expiry: String::new(),
+            admin_edit_exit_node: String::new(),
             admin_edit_error: None,
             admin_edit_busy: false,
+            admin_pool_loaded: false,
+            admin_pool_nodes: Vec::new(),
+            admin_pool_nodes_loading: false,
+            admin_pool_nodes_error: None,
+            admin_pool_health: None,
             admin_key_id: None,
             admin_key_name: String::new(),
             admin_key_value: None,
@@ -901,6 +945,12 @@ impl AivpnApp {
                             self.admin_clients_loaded = true;
                             self.refresh_admin_clients();
                         }
+                        // B3: pool topology is Viewer(1)+Admin(2) readable —
+                        // see `mgmt_service.rs`'s `authorize`.
+                        if role >= 1 && !self.admin_pool_loaded {
+                            self.admin_pool_loaded = true;
+                            self.refresh_admin_pool();
+                        }
                     }
                     Err(_) => {
                         // Fails closed: an unreadable/unknown role never
@@ -1003,8 +1053,42 @@ impl AivpnApp {
                         Err(e) => self.admin_audit_error = Some(e),
                     }
                 }
+                AdminResponse::PoolNodes(r) => {
+                    self.admin_pool_nodes_loading = false;
+                    match r {
+                        Ok(list) => {
+                            self.admin_pool_nodes = list;
+                            self.admin_pool_nodes_error = None;
+                        }
+                        Err(e) => self.admin_pool_nodes_error = Some(e),
+                    }
+                }
+                AdminResponse::PoolHealth(r) => {
+                    // Best-effort: a failed health fetch leaves the last
+                    // known summary on screen rather than blanking it —
+                    // `admin_pool_nodes_error` above already surfaces a
+                    // pool-unreachable condition from the paired call.
+                    if let Ok(h) = r {
+                        self.admin_pool_health = Some(h);
+                    }
+                }
             }
         }
+    }
+
+    fn refresh_admin_pool(&mut self) {
+        self.admin_pool_nodes_loading = true;
+        self.admin_pool_nodes_error = None;
+        admin::spawn(
+            self.vpn.client_binary.clone(),
+            AdminRequest::PoolNodes,
+            self.admin_tx.clone(),
+        );
+        admin::spawn(
+            self.vpn.client_binary.clone(),
+            AdminRequest::PoolHealth,
+            self.admin_tx.clone(),
+        );
     }
 
     fn refresh_admin_clients(&mut self) {
@@ -1035,9 +1119,16 @@ impl AivpnApp {
         self.admin_show_add = false;
         self.admin_add_error = None;
         self.admin_add_busy = false;
+        self.admin_add_exit_node.clear();
         self.admin_edit_id = None;
         self.admin_edit_error = None;
         self.admin_edit_busy = false;
+        self.admin_edit_exit_node.clear();
+        self.admin_pool_loaded = false;
+        self.admin_pool_nodes.clear();
+        self.admin_pool_nodes_loading = false;
+        self.admin_pool_nodes_error = None;
+        self.admin_pool_health = None;
         self.admin_key_id = None;
         self.admin_key_value = None;
         self.admin_key_loading = false;
@@ -1096,11 +1187,31 @@ impl AivpnApp {
         }
     }
 
-    /// Client-list + add/edit forms — drawn inline inside the main scroll
-    /// area (see call site in `update()`), following the same pattern as
-    /// the Recording/Diagnostics sections above it. Only ever called while
-    /// `admin_role == Some(2)`.
+    /// Client-list + add/edit forms + pool topology — drawn inline inside
+    /// the main scroll area (see call site in `update()`), following the
+    /// same pattern as the Recording/Diagnostics sections above it. Called
+    /// for both `admin_role == Some(1)` (Viewer — pool topology only) and
+    /// `Some(2)` (Admin — everything); client management (list/add/edit/
+    /// revoke/reset-device/status/audit) is gated internally on `is_admin`
+    /// so a Viewer session never even builds those widgets.
     fn draw_admin_panel(&mut self, ui: &mut eframe::egui::Ui, lang: Lang) {
+        use eframe::egui;
+
+        let is_admin = self.admin_role == Some(2);
+
+        if is_admin {
+            self.draw_admin_clients_section(ui, lang);
+        }
+
+        // ── Pool topology (B3) — Viewer + Admin ─────────────────────────
+        self.draw_admin_pool_section(ui, lang);
+    }
+
+    /// Client list + add/edit forms + status/audit — Admin role only. Split
+    /// out of `draw_admin_panel` so the Viewer-visible pool section above
+    /// stays reachable without building any of this UI for a non-Admin
+    /// session.
+    fn draw_admin_clients_section(&mut self, ui: &mut eframe::egui::Ui, lang: Lang) {
         use eframe::egui;
 
         ui.horizontal(|ui| {
@@ -1115,6 +1226,7 @@ impl AivpnApp {
                     self.admin_add_name.clear();
                     self.admin_add_one_time = false;
                     self.admin_add_expiry.clear();
+                    self.admin_add_exit_node.clear();
                     self.admin_add_error = None;
                 }
             });
@@ -1180,6 +1292,16 @@ impl AivpnApp {
                                     .weak(),
                                 );
                             }
+                            if let Some(exit) = &c.exit_node {
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "{}: {exit}",
+                                        t(lang, "admin_exit_node")
+                                    ))
+                                    .size(10.0)
+                                    .weak(),
+                                );
+                            }
                             ui.horizontal(|ui| {
                                 if ui
                                     .add_enabled(!busy, egui::Button::new(t(lang, "admin_key_qr")))
@@ -1211,6 +1333,8 @@ impl AivpnApp {
                                     self.admin_edit_enabled = c.enabled;
                                     self.admin_edit_expiry =
                                         c.expires_at.clone().unwrap_or_default();
+                                    self.admin_edit_exit_node =
+                                        c.exit_node.clone().unwrap_or_default();
                                     self.admin_edit_error = None;
                                 }
                                 if ui
@@ -1258,6 +1382,12 @@ impl AivpnApp {
                     .desired_width(f32::INFINITY)
                     .hint_text("2026-08-01T00:00:00Z"),
             );
+            ui.label(t(lang, "admin_exit_node_hint"));
+            ui.add(
+                egui::TextEdit::singleline(&mut self.admin_add_exit_node)
+                    .desired_width(f32::INFINITY)
+                    .hint_text("exit.example.com:51820"),
+            );
             if let Some(err) = &self.admin_add_error {
                 ui.colored_label(egui::Color32::from_rgb(0xEF, 0x53, 0x50), err);
             }
@@ -1273,6 +1403,7 @@ impl AivpnApp {
                         name: self.admin_add_name.trim().to_string(),
                         one_time: self.admin_add_one_time,
                         expires_at: self.admin_add_expiry.trim().to_string(),
+                        exit_node: self.admin_add_exit_node.trim().to_string(),
                     };
                     admin::spawn(
                         self.vpn.client_binary.clone(),
@@ -1309,6 +1440,12 @@ impl AivpnApp {
                     .desired_width(f32::INFINITY)
                     .hint_text("2026-08-01T00:00:00Z"),
             );
+            ui.label(t(lang, "admin_exit_node_hint"));
+            ui.add(
+                egui::TextEdit::singleline(&mut self.admin_edit_exit_node)
+                    .desired_width(f32::INFINITY)
+                    .hint_text("exit.example.com:51820"),
+            );
             if let Some(err) = &self.admin_edit_error {
                 ui.colored_label(egui::Color32::from_rgb(0xEF, 0x53, 0x50), err);
             }
@@ -1325,6 +1462,7 @@ impl AivpnApp {
                         name: self.admin_edit_name.trim().to_string(),
                         enabled: self.admin_edit_enabled,
                         expires_at: self.admin_edit_expiry.trim().to_string(),
+                        exit_node: self.admin_edit_exit_node.trim().to_string(),
                     };
                     admin::spawn(
                         self.vpn.client_binary.clone(),
@@ -1390,6 +1528,114 @@ impl AivpnApp {
                     }
                 });
         });
+    }
+
+    /// Pool topology view (B3) — node list + health summary, read-only.
+    /// Viewer(1)+Admin(2) both reach this (see `draw_admin_panel`'s doc
+    /// comment); it never issues a mutating call, matching the server's
+    /// `authorize()` treating `pool/*` as GET-only for every role that can
+    /// reach it at all.
+    fn draw_admin_pool_section(&mut self, ui: &mut eframe::egui::Ui, lang: Lang) {
+        use eframe::egui;
+
+        egui::CollapsingHeader::new(t(lang, "admin_pool_section"))
+            .default_open(false)
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    if ui.small_button(t(lang, "admin_refresh")).clicked() {
+                        self.refresh_admin_pool();
+                    }
+                });
+
+                if self.admin_pool_nodes_loading {
+                    ui.weak(t(lang, "admin_loading"));
+                }
+                if let Some(err) = &self.admin_pool_nodes_error {
+                    ui.colored_label(egui::Color32::from_rgb(0xEF, 0x53, 0x50), err);
+                }
+
+                if let Some(h) = &self.admin_pool_health {
+                    ui.label(format!(
+                        "{}: {}   {}: {}/{}   {}: {}/{}",
+                        t(lang, "admin_pool_transport"),
+                        h.transport,
+                        t(lang, "admin_pool_connected"),
+                        h.connected_peers,
+                        h.total_nodes,
+                        t(lang, "admin_pool_converged"),
+                        h.converged_peers,
+                        h.total_nodes,
+                    ));
+                    if h.partition_conflict {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(0xFF, 0xA7, 0x26),
+                            t(lang, "admin_pool_partition_conflict"),
+                        );
+                    }
+                    if h.subnet_mismatch {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(0xFF, 0xA7, 0x26),
+                            t(lang, "admin_pool_subnet_mismatch"),
+                        );
+                    }
+                }
+
+                let frame = egui::Frame::group(ui.style())
+                    .inner_margin(egui::Margin::same(4i8))
+                    .corner_radius(egui::CornerRadius::same(4));
+                frame.show(ui, |ui| {
+                    ui.set_min_width(ui.available_width());
+                    egui::ScrollArea::vertical()
+                        .id_salt("admin_pool_nodes")
+                        .max_height(180.0)
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            if self.admin_pool_nodes.is_empty() && !self.admin_pool_nodes_loading {
+                                ui.weak(t(lang, "admin_pool_no_nodes"));
+                            }
+                            for n in &self.admin_pool_nodes {
+                                ui.group(|ui| {
+                                    ui.set_width(ui.available_width());
+                                    ui.horizontal(|ui| {
+                                        let status_color = if n.connected {
+                                            egui::Color32::from_rgb(0x4C, 0xAF, 0x50)
+                                        } else {
+                                            egui::Color32::from_rgb(0x78, 0x78, 0x78)
+                                        };
+                                        ui.colored_label(status_color, "●");
+                                        ui.label(egui::RichText::new(&n.node_id).strong());
+                                        if n.revoked {
+                                            ui.colored_label(
+                                                egui::Color32::from_rgb(0xEF, 0x53, 0x50),
+                                                t(lang, "admin_pool_revoked"),
+                                            );
+                                        } else if n.verified {
+                                            ui.label(
+                                                egui::RichText::new(t(lang, "admin_pool_verified"))
+                                                    .size(10.0)
+                                                    .weak(),
+                                            );
+                                        }
+                                    });
+                                    if let Some(addr) = &n.address {
+                                        ui.label(egui::RichText::new(addr).size(11.0).weak());
+                                    }
+                                    if let Some(ts) = n.last_seen_unix {
+                                        ui.label(
+                                            egui::RichText::new(format!(
+                                                "{}: {}",
+                                                t(lang, "admin_pool_last_seen"),
+                                                format_unix_ago(ts)
+                                            ))
+                                            .size(10.0)
+                                            .weak(),
+                                        );
+                                    }
+                                });
+                            }
+                        });
+                });
+            });
     }
 
     /// Connection-key / QR viewer window and the revoke-confirmation modal —
@@ -2226,8 +2472,9 @@ impl eframe::App for AivpnApp {
                         ui.separator();
                     }
 
-                    // ── Admin panel (P3.4) — Admin role only ────────────────────────
-                    if is_connected && self.admin_role == Some(2) {
+                    // ── Admin panel (P3.4) — Viewer(1) sees pool topology only, ─────
+                    // ── Admin(2) sees pool topology + full client management ────────
+                    if is_connected && matches!(self.admin_role, Some(1) | Some(2)) {
                         self.draw_admin_panel(ui, lang);
                         ui.separator();
                     }

@@ -56,6 +56,10 @@ struct AdminClient: Identifiable, Codable, Equatable {
     /// `ClientRole` is `#[serde(rename_all = "lowercase")]` server-side:
     /// "user" | "viewer" | "admin".
     let role: String
+    /// Wave B2a: this client's per-client exit-node override (`host:port`),
+    /// or `nil` to fall back to the server's global default
+    /// (`pool.exit_node`). Mirrors `ClientView::exit_node`.
+    let exit_node: String?
 
     static func == (lhs: AdminClient, rhs: AdminClient) -> Bool { lhs.id == rhs.id }
 }
@@ -65,6 +69,48 @@ struct AdminStatus: Codable {
     let clients_total: Int
     let clients_enabled: Int
     let kernel_module: Bool
+}
+
+// MARK: - Pool topology models (Wave B1, mirror mgmt_service.rs's
+// `PoolNodeInfo`/`PoolLinkInfo`/`PoolHealth`, returned by
+// `GET /api/v1/pool/{nodes,health,links}`).
+
+/// Mirrors `mgmt_service::PoolNodeInfo`. `node_id` is always populated
+/// (falling back server-side to the address string when no crypto
+/// identity is bound) so it's safe to use as `Identifiable`'s `id`.
+struct AdminPoolNode: Identifiable, Codable {
+    let node_id: String
+    let address: String?
+    let verified: Bool
+    let revoked: Bool
+    let connected: Bool
+    let last_seen_unix: Int64?
+
+    var id: String { node_id }
+}
+
+/// Mirrors `mgmt_service::PoolLinkInfo`.
+struct AdminPoolLink: Identifiable, Codable {
+    let peer: String
+    let connected: Bool
+    let converged: Bool
+    let last_converged_unix: Int64?
+    let partition_conflict: Bool
+    let subnet_mismatch: Bool
+
+    var id: String { peer }
+}
+
+/// Mirrors `mgmt_service::PoolHealth`. `transport` is `"masked"` |
+/// `"legacy"` | `"none"` — see that field's doc comment server-side.
+struct AdminPoolHealth: Codable {
+    let transport: String
+    let total_nodes: Int
+    let connected_peers: Int
+    let converged_peers: Int
+    let diverged: Bool
+    let partition_conflict: Bool
+    let subnet_mismatch: Bool
 }
 
 /// Mirrors `audit_log::AuditEntry`. `actor` has no `#[serde(rename_all)]`
@@ -301,12 +347,18 @@ enum AdminApi {
     /// JSON `null` to clear the expiry. `role` is never settable over the
     /// tunnel (server-side `TunnelPatchClientRequest` has no `role` field
     /// at all) — there is intentionally no parameter for it here.
+    /// `exitNode: .clear` sends an explicit JSON `null` to fall back to
+    /// the server's global default (`pool.exit_node`); UNLIKE `role`,
+    /// `exit_node` IS settable over the tunnel (Wave B2a — see
+    /// `TunnelPatchClientRequest::exit_node`'s doc comment server-side: a
+    /// routing preference, not a privilege escalation).
     static func patchClient(
         id: String,
         name: String? = nil,
         enabled: Bool? = nil,
         oneTime: Bool? = nil,
-        expiresAt: AdminPatchField<Date> = .unchanged
+        expiresAt: AdminPatchField<Date> = .unchanged,
+        exitNode: AdminPatchField<String> = .unchanged
     ) async -> Result<AdminClient, AdminApiError> {
         var dict: [String: Any] = [:]
         if let name { dict["name"] = name }
@@ -319,6 +371,14 @@ enum AdminApi {
             dict["expires_at"] = NSNull()
         case .set(let date):
             dict["expires_at"] = iso8601.string(from: date)
+        }
+        switch exitNode {
+        case .unchanged:
+            break
+        case .clear:
+            dict["exit_node"] = NSNull()
+        case .set(let addr):
+            dict["exit_node"] = addr
         }
         return await sendJSON(method: 2, path: "/api/v1/clients/\(id.pathEncoded)", body: jsonBody(dict))
     }
@@ -356,6 +416,28 @@ enum AdminApi {
 
     static func status() async -> Result<AdminStatus, AdminApiError> {
         await getJSON("/api/v1/status")
+    }
+
+    // MARK: Pool topology (Wave B1 — `GET /api/v1/pool/{nodes,health,links}`)
+
+    /// `GET /api/v1/pool/nodes` — always `200` with an empty array when
+    /// pool sync isn't configured on this node (never an error condition,
+    /// see `mgmt_service.rs`'s `Route::PoolNodes` doc comment).
+    static func poolNodes() async -> Result<[AdminPoolNode], AdminApiError> {
+        await getJSON("/api/v1/pool/nodes")
+    }
+
+    /// `GET /api/v1/pool/health` — degrades to `transport: "none"` (all
+    /// counts zero) rather than erroring when pool sync isn't configured.
+    static func poolHealth() async -> Result<AdminPoolHealth, AdminApiError> {
+        await getJSON("/api/v1/pool/health")
+    }
+
+    /// `GET /api/v1/pool/links` — one entry per dialed peer this node has
+    /// ever observed sync state for; always `200` with an empty array when
+    /// there's no live `PoolDialer`.
+    static func poolLinks() async -> Result<[AdminPoolLink], AdminApiError> {
+        await getJSON("/api/v1/pool/links")
     }
 
     /// `GET /api/v1/audit-log?limit=N` (server clamps to

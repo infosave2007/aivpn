@@ -66,18 +66,34 @@ object AdminApi {
     suspend fun getClient(id: String): MgmtResult =
         request(METHOD_GET, "/api/v1/clients/${encode(id)}")
 
+    /**
+     * [exitNode] set with [clearExitNode] `false` writes that value as this
+     * client's per-client exit-node override (`host:port`). [clearExitNode]
+     * `true` sends an explicit JSON `null` for `exit_node`, which clears the
+     * override so the client falls back to the server's global default —
+     * see `TunnelPatchClientRequest::exit_node`'s doc comment on the server
+     * for the double-Option wire semantics this mirrors (omit key = leave
+     * unchanged, `null` = clear, string = set).
+     */
     suspend fun patchClient(
         id: String,
         name: String? = null,
         enabled: Boolean? = null,
         oneTime: Boolean? = null,
         expiresAt: String? = null,
+        exitNode: String? = null,
+        clearExitNode: Boolean = false,
     ): MgmtResult {
         val json = JSONObject().apply {
             if (name != null) put("name", name)
             if (enabled != null) put("enabled", enabled)
             if (oneTime != null) put("one_time", oneTime)
             if (expiresAt != null) put("expires_at", expiresAt)
+            if (clearExitNode) {
+                put("exit_node", JSONObject.NULL)
+            } else if (!exitNode.isNullOrBlank()) {
+                put("exit_node", exitNode)
+            }
         }
         return request(METHOD_PATCH, "/api/v1/clients/${encode(id)}", json.toString().toByteArray(Charsets.UTF_8))
     }
@@ -97,6 +113,15 @@ object AdminApi {
     suspend fun status(): MgmtResult = request(METHOD_GET, "/api/v1/status")
 
     suspend fun auditLog(): MgmtResult = request(METHOD_GET, "/api/v1/audit-log")
+
+    // ──────────── Pool topology (Wave B3) ────────────
+    // Read-only, available to both Viewer and Admin roles — see PoolActivity.
+
+    suspend fun poolNodes(): MgmtResult = request(METHOD_GET, "/api/v1/pool/nodes")
+
+    suspend fun poolHealth(): MgmtResult = request(METHOD_GET, "/api/v1/pool/health")
+
+    suspend fun poolLinks(): MgmtResult = request(METHOD_GET, "/api/v1/pool/links")
 
     private fun encode(id: String): String =
         java.net.URLEncoder.encode(id, "UTF-8")

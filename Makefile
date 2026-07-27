@@ -36,7 +36,7 @@ REMOTE ?= /opt/aivpn
 .PHONY: help setup check test clippy fmt mask-gate \
         server server-tiny client server-docker \
         server-arm64 client-arm64 \
-        server-musl-armv7 server-musl-mipsel server-musl-aarch64 \
+        server-musl-armv7 server-musl-mipsel server-musl-aarch64 server-musl-aarch64-full \
         client-musl-armv7 client-musl-mipsel client-musl-aarch64 \
         windows windows-docker ios macos linux-appimage \
         kernel kernel-install \
@@ -69,6 +69,7 @@ help:
 	@printf "    %-40s %s\n" "make server-musl-armv7"   "musl static armv7"
 	@printf "    %-40s %s\n" "make server-musl-mipsel"  "musl static mipsel"
 	@printf "    %-40s %s\n" "make server-musl-aarch64" "musl static aarch64"
+	@printf "    %-40s %s\n" "make server-musl-aarch64-full" "musl static aarch64 [management-api,metrics,neural]"
 	@printf "    %-40s %s\n" "make client-musl-armv7"   "musl static armv7"
 	@printf "    %-40s %s\n" "make client-musl-mipsel"  "musl static mipsel"
 	@printf "    %-40s %s\n" "make client-musl-aarch64" "musl static aarch64"
@@ -214,7 +215,10 @@ client-arm64: releases/
 
 # ─────────────────────────────────────────────────────────────────────────────
 # MUSL static builds
-# Internal macro — $(call _musl,server|client,image-tag,target-triple,artifact-suffix)
+# Internal macro — $(call _musl,server|client,image-tag,target-triple,artifact-suffix[,cargo-features])
+# The 5th arg is optional: a comma-separated cargo --features list. Pass it via
+# a variable reference (e.g. $(FULL_SERVER_FEATURES)) rather than a literal
+# comma-containing string, since $(call ...) itself splits arguments on commas.
 # ─────────────────────────────────────────────────────────────────────────────
 define _musl
 	@mkdir -p releases
@@ -222,11 +226,12 @@ define _musl
 	CRATE="aivpn-$(1)"; \
 	IMAGE="aivpn-$(1)-$(3):musl"; \
 	ARTIFACT="releases/aivpn-$(1)-linux-$(4)"; \
+	FEATURES="$(5)"; \
 	CTR="aivpn-$(1)-$$(echo $$RANDOM)"; \
 	TMPDF="$$(mktemp /tmp/Dockerfile.musl.XXXXXX)"; \
 	{ printf 'ARG MUSL_IMAGE_TAG\n'; \
 	  printf 'FROM messense/rust-musl-cross:$${MUSL_IMAGE_TAG} AS builder\n'; \
-	  printf 'ARG TARGET_TRIPLE CRATE_NAME BINARY_NAME\n'; \
+	  printf 'ARG TARGET_TRIPLE CRATE_NAME BINARY_NAME BUILD_FEATURES\n'; \
 	  printf 'WORKDIR /app\n'; \
 	  printf 'COPY Cargo.toml ./\n'; \
 	  printf 'COPY crates/aivpn-common crates/aivpn-common/\n'; \
@@ -237,7 +242,7 @@ define _musl
 	  printf 'COPY crates/aivpn-android-core crates/aivpn-android-core/\n'; \
 	  printf 'COPY crates/aivpn-ios-core crates/aivpn-ios-core/\n'; \
 	  printf 'COPY assets/masks assets/masks/\n'; \
-	  printf 'RUN cargo build --release --target "$$TARGET_TRIPLE" -p "$$CRATE_NAME" --bin "$$BINARY_NAME"\n'; \
+	  printf 'RUN if [ -n "$$BUILD_FEATURES" ]; then cargo build --release --target "$$TARGET_TRIPLE" -p "$$CRATE_NAME" --bin "$$BINARY_NAME" --features "$$BUILD_FEATURES"; else cargo build --release --target "$$TARGET_TRIPLE" -p "$$CRATE_NAME" --bin "$$BINARY_NAME"; fi\n'; \
 	} > "$$TMPDF"; \
 	trap "rm -f $$TMPDF; docker rm -f $$CTR >/dev/null 2>&1 || true" EXIT; \
 	docker build \
@@ -245,6 +250,7 @@ define _musl
 	  --build-arg TARGET_TRIPLE="$(3)" \
 	  --build-arg CRATE_NAME="$$CRATE" \
 	  --build-arg BINARY_NAME="$$CRATE" \
+	  --build-arg BUILD_FEATURES="$$FEATURES" \
 	  -t "$$IMAGE" -f "$$TMPDF" .; \
 	docker create --name "$$CTR" "$$IMAGE" >/dev/null; \
 	docker cp "$$CTR:/app/target/$(3)/release/$$CRATE" "$$ARTIFACT"; \
@@ -260,6 +266,28 @@ server-musl-mipsel:
 
 server-musl-aarch64:
 	$(call _musl,server,aarch64-musl,aarch64-unknown-linux-musl,aarch64-musl)
+
+# Full-feature aarch64 server (musl static, same feature set as `make server`:
+# management-api + metrics + neural). Produces releases/aivpn-server-linux-aarch64
+# — this is the release asset name a future deploy/install-server.sh downloads
+# for aarch64 hosts (paired with x86_64's releases/aivpn-server-linux-x86_64).
+#
+# Cross-compile risk note (checked against Cargo.toml, 2026-07-23): management-api
+# pulls axum/tower/hyper/hyper-util/tokio-stream/anyhow, metrics pulls prometheus
+# (its protobuf encoding dep is the pure-Rust `protobuf` crate — no protoc/cmake
+# needed), neural pulls aivpn-common's dpi-gate (dashmap only). None of these add
+# a C library dependency beyond what the existing default-feature
+# server-musl-aarch64 target already links, so this musl static build is
+# expected to succeed the same way. If a future dependency bump pulls a C lib
+# (openssl, onnxruntime, etc.) into any of these features, the musl static
+# link will start failing here; the fallback is a glibc build via the
+# server-arm64 Docker/Debian path (add --features to that target's cargo
+# invocation) since glibc dynamic linking tolerates C deps musl static
+# linking does not.
+FULL_SERVER_FEATURES := management-api,metrics,neural
+
+server-musl-aarch64-full:
+	$(call _musl,server,aarch64-musl,aarch64-unknown-linux-musl,aarch64,$(FULL_SERVER_FEATURES))
 
 client-musl-armv7:
 	$(call _musl,client,armv7-musleabihf,armv7-unknown-linux-musleabihf,armv7-musleabihf)

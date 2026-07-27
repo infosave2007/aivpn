@@ -67,6 +67,15 @@
             android:paddingTop="2dp"
             android:visibility="gone" />
 
+        <TextView
+            android:id="@+id/textExitNode"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:textSize="12sp"
+            android:textColor="@color/text_secondary"
+            android:paddingTop="2dp"
+            android:visibility="gone" />
+
         <LinearLayout
             android:id="@+id/rowActions"
             android:layout_width="match_parent"
