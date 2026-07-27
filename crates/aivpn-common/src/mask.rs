@@ -375,6 +375,27 @@ pub fn accept_persisted_descriptors(
 /// (validity is the caller's responsibility). Pass an empty slice when the
 /// core has no descriptor store yet — behaviour then matches the legacy
 /// preset/PSK path exactly, with no regression.
+/// Collapse a per-session mask id to its base protocol-family preset id for
+/// §2 crowdsourced feedback. `bootstrap:{desc}:{base}:{slot}:{seed}` and
+/// `polymorphic:{base}:{hex}` both carry per-session/PSK-derived entropy that
+/// would leak a quasi-identifier and fragment the server's k-anonymity buckets;
+/// only the stable `{base}` family is meaningful (and safe) to report.
+///
+/// Single shared implementation for the desktop client and both mobile cores
+/// (previously three manually-kept-in-sync copies in `aivpn-client::client`,
+/// `aivpn-ios-core::ios_tunnel`, and `aivpn-android-core::android_tunnel`).
+pub fn base_mask_family(mask_id: &str) -> String {
+    if let Some(rest) = mask_id.strip_prefix("bootstrap:") {
+        // desc:base:slot:seed → the base is the 2nd colon-delimited field.
+        rest.split(':').nth(1).unwrap_or(rest).to_string()
+    } else if let Some(rest) = mask_id.strip_prefix("polymorphic:") {
+        // base:hex → the base is the 1st field.
+        rest.split(':').next().unwrap_or(rest).to_string()
+    } else {
+        mask_id.to_string()
+    }
+}
+
 pub fn resolve_handshake_mask(
     preferred: Option<&str>,
     descriptors: &[BootstrapDescriptor],

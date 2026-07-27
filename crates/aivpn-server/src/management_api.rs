@@ -30,6 +30,7 @@ use tower::util::ServiceExt;
 use crate::audit_log::{AuditActor, AuditLogger};
 use crate::client_db::{ClientDatabase, ClientRole};
 use crate::mgmt_service::{self, ClientView as ClientResponse, HeavySetting, MgmtCtx, MgmtError};
+use crate::mgmt_wire_common::{deserialize_opt_opt, kernel_loaded};
 use crate::pending_config::PendingConfigManager;
 
 // ── Config passed by main ────────────────────────────────────────────────────
@@ -301,15 +302,6 @@ struct PatchClientRequest {
     exit_node: Option<Option<String>>,
 }
 
-/// Deserialises a field that can be absent (don't touch), null (clear), or a value (set).
-fn deserialize_opt_opt<'de, D, T>(de: D) -> Result<Option<Option<T>>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-    T: serde::Deserialize<'de>,
-{
-    Ok(Some(Option::<T>::deserialize(de)?))
-}
-
 #[derive(Serialize)]
 struct StatusResponse {
     version: &'static str,
@@ -373,10 +365,6 @@ fn err(msg: impl ToString) -> Json<ErrorResponse> {
     Json(ErrorResponse {
         error: msg.to_string(),
     })
-}
-
-fn kernel_loaded() -> bool {
-    std::path::Path::new("/dev/aivpn").exists()
 }
 
 /// Audit-log a mutating API action (no-op when no logger was wired up,

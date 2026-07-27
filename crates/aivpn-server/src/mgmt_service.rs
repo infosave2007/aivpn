@@ -24,6 +24,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::audit_log::{AuditActor, AuditEntry, AuditLogger};
 use crate::client_db::{ClientConfig, ClientDatabase, ClientRole, ClientStats, UpdateClientParams};
+use crate::mgmt_wire_common::{deserialize_opt_opt, kernel_loaded};
 use crate::pending_config::{PendingConfig, PendingConfigManager, PENDING_CONFIG_TIMEOUT};
 
 // ── Context ──────────────────────────────────────────────────────────────
@@ -191,10 +192,6 @@ pub struct StatusView {
     pub clients_total: usize,
     pub clients_enabled: usize,
     pub kernel_module: bool,
-}
-
-fn kernel_loaded() -> bool {
-    std::path::Path::new("/dev/aivpn").exists()
 }
 
 // ── Pool topology views (Wave B1) ───────────────────────────────────────
@@ -1287,20 +1284,6 @@ fn json_response<T: Serialize>(status: u16, value: &T) -> (u16, Vec<u8>) {
 
 fn err_response(e: MgmtError) -> (u16, Vec<u8>) {
     (mgmt_error_status(&e), Vec::new())
-}
-
-/// Deserializes a field that can be absent (don't touch), null (clear), or
-/// a value (set) — same three-state shape as `management_api.rs`'s
-/// private helper of the same name, duplicated here rather than shared
-/// because this module must stay free of that module's
-/// `#[cfg(feature = "management-api", unix)]` gate (see the module-level
-/// doc comment).
-fn deserialize_opt_opt<'de, D, T>(de: D) -> Result<Option<Option<T>>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-    T: serde::Deserialize<'de>,
-{
-    Ok(Some(Option::<T>::deserialize(de)?))
 }
 
 /// Wire body for `POST /api/v1/clients` over the tunnel. Deliberately has

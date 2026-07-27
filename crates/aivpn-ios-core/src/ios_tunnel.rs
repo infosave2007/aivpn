@@ -527,24 +527,9 @@ pub static ACTIVE_MASK_CATALOG_JSON: Mutex<Option<String>> = Mutex::new(None);
 /// list rather than re-reading a stale one on every poll tick.
 pub static MASK_CATALOG_SEQ: AtomicU64 = AtomicU64::new(0);
 
-/// §2 crowdsourced feedback. `bootstrap:{desc}:{base}:{slot}:{seed}` and
-/// `polymorphic:{base}:{hex}` both carry per-session/PSK-derived entropy that
-/// would leak a quasi-identifier and fragment the server's k-anonymity
-/// buckets; only the stable `{base}` family is meaningful (and safe) to
-/// report. Duplicated from desktop's `client.rs::base_mask_family` — the iOS
-/// core is a standalone crate with no dependency on aivpn-client, so this
-/// must be kept in sync manually if the desktop format ever changes.
-pub fn base_mask_family(mask_id: &str) -> String {
-    if let Some(rest) = mask_id.strip_prefix("bootstrap:") {
-        // desc:base:slot:seed → the base is the 2nd colon-delimited field.
-        rest.split(':').nth(1).unwrap_or(rest).to_string()
-    } else if let Some(rest) = mask_id.strip_prefix("polymorphic:") {
-        // base:hex → the base is the 1st field.
-        rest.split(':').next().unwrap_or(rest).to_string()
-    } else {
-        mask_id.to_string()
-    }
-}
+/// §2 crowdsourced feedback base-mask-family collapse — shared implementation,
+/// see `aivpn_common::mask::base_mask_family` (previously duplicated here).
+pub use aivpn_common::mask::base_mask_family;
 
 /// Parse a platform-supplied JSON array of prior (unreported) mask outcomes,
 /// e.g. `[{"mask_id":"quic_https","success":2,"fail":1}]`. Best-effort:
@@ -2422,7 +2407,42 @@ pub async fn run_tunnel_ios(
                                     );
                                     active_mgmt().on_mgmt_response(req_id, status, body);
                                 }
-                                _ => {}
+                                aivpn_common::protocol::ControlPayload::TimeSync { .. }
+                                | aivpn_common::protocol::ControlPayload::PoolSync { .. }
+                                | aivpn_common::protocol::ControlPayload::PoolStateDigest { .. }
+                                | aivpn_common::protocol::ControlPayload::PoolBucketDigests { .. }
+                                | aivpn_common::protocol::ControlPayload::RouteSync { .. }
+                                | aivpn_common::protocol::ControlPayload::ChainForward { .. }
+                                | aivpn_common::protocol::ControlPayload::PartitionAnnounce { .. }
+                                | aivpn_common::protocol::ControlPayload::NodeEnrollment { .. }
+                                | aivpn_common::protocol::ControlPayload::MgmtRequest { .. }
+                                | aivpn_common::protocol::ControlPayload::RecordingStatusRequest
+                                | aivpn_common::protocol::ControlPayload::RecordingStart { .. }
+                                | aivpn_common::protocol::ControlPayload::RecordingStop { .. } => {
+                                    // Intentionally ignored on the iOS core: pool-sync/
+                                    // node-enrollment/mgmt-request/recording-admin family
+                                    // this mobile core never participates in at all (not a
+                                    // pool node or dialer, and admin-initiated recording is
+                                    // desktop-only) — never sent NOR received here.
+                                }
+                                aivpn_common::protocol::ControlPayload::Keepalive { .. }
+                                | aivpn_common::protocol::ControlPayload::ClientCert { .. }
+                                | aivpn_common::protocol::ControlPayload::DeviceEnrollment { .. }
+                                | aivpn_common::protocol::ControlPayload::QualityReport { .. }
+                                | aivpn_common::protocol::ControlPayload::MaskPreference { .. }
+                                | aivpn_common::protocol::ControlPayload::MaskFeedback { .. } => {
+                                    // Intentionally ignored on the iOS core: this core only
+                                    // ever SENDS these to the server; there is no inbound
+                                    // handling because the server never sends them back.
+                                }
+                                aivpn_common::protocol::ControlPayload::TelemetryRequest { .. }
+                                | aivpn_common::protocol::ControlPayload::TelemetryResponse { .. }
+                                | aivpn_common::protocol::ControlPayload::ControlAck { .. } => {
+                                    // Intentionally ignored on the iOS core: reserved
+                                    // telemetry-request/ack subtypes only the server side
+                                    // (`aivpn-server/src/gateway.rs`) currently exercises;
+                                    // this mobile core neither sends nor needs to act on them.
+                                }
                             }
                         }
                     }

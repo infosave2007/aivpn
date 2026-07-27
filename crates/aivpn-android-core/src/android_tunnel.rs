@@ -496,24 +496,9 @@ pub static MASK_CATALOG_SEQ: AtomicU64 = AtomicU64::new(0);
 /// `mask_feedback_log.rs`.
 const DEFAULT_REPORT_INTERVAL_SECS: u32 = 3600;
 
-/// §2 crowdsourced feedback. `bootstrap:{desc}:{base}:{slot}:{seed}` and
-/// `polymorphic:{base}:{hex}` both carry per-session/PSK-derived entropy that
-/// would leak a quasi-identifier and fragment the server's k-anonymity
-/// buckets; only the stable `{base}` family is meaningful (and safe) to
-/// report. Duplicated from desktop's `client.rs::base_mask_family` — the
-/// Android core is a standalone crate with no dependency on aivpn-client, so
-/// this must be kept in sync manually if the desktop format ever changes.
-pub fn base_mask_family(mask_id: &str) -> String {
-    if let Some(rest) = mask_id.strip_prefix("bootstrap:") {
-        // desc:base:slot:seed → the base is the 2nd colon-delimited field.
-        rest.split(':').nth(1).unwrap_or(rest).to_string()
-    } else if let Some(rest) = mask_id.strip_prefix("polymorphic:") {
-        // base:hex → the base is the 1st field.
-        rest.split(':').next().unwrap_or(rest).to_string()
-    } else {
-        mask_id.to_string()
-    }
-}
+/// §2 crowdsourced feedback base-mask-family collapse — shared implementation,
+/// see `aivpn_common::mask::base_mask_family` (previously duplicated here).
+pub use aivpn_common::mask::base_mask_family;
 
 /// Parse a platform-supplied JSON array of prior (unreported) mask outcomes,
 /// e.g. `[{"mask_id":"quic_https","success":2,"fail":1}]`. Best-effort:
@@ -2597,7 +2582,43 @@ pub async fn run_tunnel_android(
                                     );
                                     active_mgmt().on_mgmt_response(req_id, status, body);
                                 }
-                                _ => {}
+                                ControlPayload::TimeSync { .. }
+                                | ControlPayload::PoolSync { .. }
+                                | ControlPayload::PoolStateDigest { .. }
+                                | ControlPayload::PoolBucketDigests { .. }
+                                | ControlPayload::RouteSync { .. }
+                                | ControlPayload::ChainForward { .. }
+                                | ControlPayload::PartitionAnnounce { .. }
+                                | ControlPayload::NodeEnrollment { .. }
+                                | ControlPayload::MgmtRequest { .. }
+                                | ControlPayload::RecordingStatusRequest
+                                | ControlPayload::RecordingStart { .. }
+                                | ControlPayload::RecordingStop { .. } => {
+                                    // Intentionally ignored on the Android core: pool-sync/
+                                    // node-enrollment/mgmt-request/recording-admin family
+                                    // this mobile core never participates in at all (not a
+                                    // pool node or dialer, and admin-initiated recording is
+                                    // desktop-only) — never sent NOR received here.
+                                }
+                                ControlPayload::Keepalive { .. }
+                                | ControlPayload::ClientCert { .. }
+                                | ControlPayload::DeviceEnrollment { .. }
+                                | ControlPayload::QualityReport { .. }
+                                | ControlPayload::MaskPreference { .. }
+                                | ControlPayload::MaskFeedback { .. } => {
+                                    // Intentionally ignored on the Android core: this core
+                                    // only ever SENDS these to the server; there is no
+                                    // inbound handling because the server never sends them
+                                    // back.
+                                }
+                                ControlPayload::TelemetryRequest { .. }
+                                | ControlPayload::TelemetryResponse { .. }
+                                | ControlPayload::ControlAck { .. } => {
+                                    // Intentionally ignored on the Android core: reserved
+                                    // telemetry-request/ack subtypes only the server side
+                                    // (`aivpn-server/src/gateway.rs`) currently exercises;
+                                    // this mobile core neither sends nor needs to act on them.
+                                }
                             }
                         }
                     }

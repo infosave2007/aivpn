@@ -16,6 +16,7 @@ pub mod batch_io;
 pub mod client_db;
 pub mod gateway;
 pub mod mgmt_service;
+pub mod mgmt_wire_common;
 pub mod nat;
 pub mod node_registry;
 pub mod pending_config;

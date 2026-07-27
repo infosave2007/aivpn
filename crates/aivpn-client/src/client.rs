@@ -310,21 +310,11 @@ fn probe_underlying_source_ip(server: SocketAddr) -> Option<std::net::IpAddr> {
 }
 
 /// Collapse a per-session mask id to its base protocol-family preset id for
-/// §2 crowdsourced feedback. `bootstrap:{desc}:{base}:{slot}:{seed}` and
-/// `polymorphic:{base}:{hex}` both carry per-session/PSK-derived entropy that
-/// would leak a quasi-identifier and fragment the server's k-anonymity buckets;
-/// only the stable `{base}` family is meaningful (and safe) to report.
-pub fn base_mask_family(mask_id: &str) -> String {
-    if let Some(rest) = mask_id.strip_prefix("bootstrap:") {
-        // desc:base:slot:seed → the base is the 2nd colon-delimited field.
-        rest.split(':').nth(1).unwrap_or(rest).to_string()
-    } else if let Some(rest) = mask_id.strip_prefix("polymorphic:") {
-        // base:hex → the base is the 1st field.
-        rest.split(':').next().unwrap_or(rest).to_string()
-    } else {
-        mask_id.to_string()
-    }
-}
+/// §2 crowdsourced feedback. See `aivpn_common::mask::base_mask_family` for
+/// the shared implementation (single source of truth for the desktop client
+/// and both mobile cores). Re-exported here so existing callers/tests that
+/// use `aivpn_client::client::base_mask_family` keep working unchanged.
+pub use aivpn_common::mask::base_mask_family;
 
 fn packet_mdh_len_for_mask(mask: &MaskProfile) -> usize {
     mask.header_spec
@@ -3621,7 +3611,30 @@ impl AivpnClient {
             } => {
                 self.mgmt.on_mgmt_response(req_id, status, body);
             }
-            _ => {}
+            ControlPayload::NodeEnrollment { .. }
+            | ControlPayload::MaskFeedback { .. }
+            | ControlPayload::MgmtRequest { .. }
+            | ControlPayload::RecordingStart { .. }
+            | ControlPayload::RecordingStop { .. }
+            | ControlPayload::RecordingStatusRequest
+            | ControlPayload::ClientCert { .. }
+            | ControlPayload::DeviceEnrollment { .. }
+            | ControlPayload::QualityReport { .. }
+            | ControlPayload::MaskPreference { .. } => {
+                // Intentionally ignored on the desktop client: these are
+                // messages THIS client only ever SENDS (to the server, or to
+                // a pool peer for `NodeEnrollment`) — the server is the only
+                // side that ever receives and acts on them, so there is no
+                // inbound handling here.
+            }
+            ControlPayload::TelemetryRequest { .. }
+            | ControlPayload::TelemetryResponse { .. }
+            | ControlPayload::ControlAck { .. } => {
+                // Intentionally ignored on the desktop client: reserved
+                // telemetry-request/ack subtypes that only the server side
+                // (`aivpn-server/src/gateway.rs`) currently exercises; the
+                // desktop client neither sends nor needs to act on them.
+            }
         }
         Ok(())
     }
@@ -5454,7 +5467,7 @@ mod tests {
         let server_dh_rekey = server_rekey_kp
             .compute_shared(&client_new_eph_pub)
             .expect("server DH must succeed");
-        let mut server_new_keys = crypto::derive_session_keys(
+        let server_new_keys = crypto::derive_session_keys(
             &server_dh_rekey,
             Some(&old_keys.session_key),
             &client_new_eph_pub,

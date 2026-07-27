@@ -25,6 +25,7 @@ import {
   verifyAuthentication,
   newPasskeyId,
 } from '../auth/passkey'
+import type { RegistrationResponseJSON, AuthenticationResponseJSON } from '@simplewebauthn/server'
 import { requireAuth, requireAdmin } from '../auth/middleware'
 import { writeAudit } from '../audit'
 import { checkRateLimit, isRateLimited, recordRateLimitEvent } from '../ratelimit'
@@ -606,7 +607,10 @@ auth.post('/passkey/register', requireAuth(), zValidator('json', PasskeyRegister
 
   let verification
   try {
-    verification = await verifyRegistration(u.id, body.response)
+    // body.response is intentionally loosely typed (z.record) at the schema
+    // level — verifyRegistrationResponse() does the real structural/crypto
+    // validation of the WebAuthn response internally.
+    verification = await verifyRegistration(u.id, body.response as unknown as RegistrationResponseJSON)
   } catch (err: any) {
     await writeAudit(db, u.id, 'passkey_register', null, 'fail', ip)
     return c.json({ error: err.message ?? 'Registration failed' }, 400)
@@ -702,7 +706,10 @@ auth.post('/passkey/authenticate', zValidator('json', PasskeyAuthSchema), async 
 
   let verification
   try {
-    verification = await verifyAuthentication(serverUserKey, body.response, {
+    // body.response is intentionally loosely typed (z.object({id}).passthrough())
+    // at the schema level — verifyAuthenticationResponse() does the real
+    // structural/crypto validation of the WebAuthn response internally.
+    verification = await verifyAuthentication(serverUserKey, body.response as unknown as AuthenticationResponseJSON, {
       credential_id: pk.credential_id,
       public_key: pk.public_key,
       counter: pk.counter,

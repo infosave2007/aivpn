@@ -87,7 +87,7 @@ export function isViewerAllowed(method: string, path: string): boolean {
  * resolve `.`/`..` segments, collapse repeated slashes, drop the trailing
  * slash (except root) and lowercase.
  */
-export function canonicalizeForAuthz(pathname: string): string | null {
+function canonicalizeForAuthz(pathname: string): string | null {
   let decoded: string
   try {
     decoded = decodeURIComponent(pathname)

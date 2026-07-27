@@ -148,7 +148,7 @@ export interface Client {
 /** One line of the management daemon's audit log (audit_log.rs AuditEntry).
  *  `result` values actually emitted by the server: "ok", "fail", "accepted",
  *  "rejected", "denied" — there is no id/detail field. */
-export interface AuditLogEntry {
+interface AuditLogEntry {
   ts: string;
   actor: 'cli' | 'api' | 'system';
   action: string;
@@ -410,7 +410,7 @@ export const masks = {
  *  server-side and `verified` reports whether every entry's hash correctly
  *  links to the previous one. `broken_at` is the (0-based) index of the first
  *  entry where the chain no longer verifies, or null when `verified` is true. */
-export interface AuditVerifyResponse {
+interface AuditVerifyResponse {
   entries: AuditLogEntry[];
   verified: boolean;
   broken_at: number | null;
