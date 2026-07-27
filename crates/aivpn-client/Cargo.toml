@@ -26,7 +26,7 @@ production-secure = []
 client-dpi-gate = ["aivpn-common/client-dpi-gate"]
 
 [dependencies]
-aivpn-common = { path = "../aivpn-common", version = "*", features = ["client-upload"] }
+aivpn-common = { path = "../aivpn-common", version = "*", features = ["client-upload", "qr"] }
 
 # Crypto
 chacha20poly1305.workspace = true

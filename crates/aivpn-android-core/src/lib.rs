@@ -12,16 +12,17 @@ mod android_tunnel;
 use aivpn_common::client_wire::DEFAULT_MDH_LEN;
 use aivpn_common::protocol::ControlPayload;
 use android_tunnel::{
-    bootstrap_descriptors_json, clear_pending_stop, get_active_download_bytes,
-    get_active_upload_bytes, run_tunnel_android, send_control_payload, stop_active_tunnel,
-    take_recording_feedback_json, ACTIVE_ADAPTIVE_LEVEL, ACTIVE_FEEDBACK_INTERVAL,
-    ACTIVE_FEEDBACK_THRESHOLD, ACTIVE_MASK_CATALOG_JSON, ACTIVE_QUALITY_SCORE,
-    ACTIVE_REGIONAL_HINTS_JSON, ASSIGNED_VPN_IP, ATTEMPTED_MASK_FAMILY, CERT_REJECTED,
-    EVER_CONNECTED, HANDSHAKE_REJECTED, HANDSHAKE_REJECT_REASON, MASK_CATALOG_SEQ,
+    active_control_tx, active_mgmt, bootstrap_descriptors_json, clear_pending_stop,
+    get_active_download_bytes, get_active_upload_bytes, run_tunnel_android, send_control_payload,
+    stop_active_tunnel, take_recording_feedback_json, ACTIVE_ADAPTIVE_LEVEL,
+    ACTIVE_FEEDBACK_INTERVAL, ACTIVE_FEEDBACK_THRESHOLD, ACTIVE_MASK_CATALOG_JSON,
+    ACTIVE_QUALITY_SCORE, ACTIVE_REGIONAL_HINTS_JSON, ASSIGNED_VPN_IP, ATTEMPTED_MASK_FAMILY,
+    CERT_REJECTED, EVER_CONNECTED, HANDSHAKE_REJECTED, HANDSHAKE_REJECT_REASON, MASK_CATALOG_SEQ,
     MASK_FEEDBACK_SENT, REGIONAL_HINTS_SEQ,
 };
 
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 
 use jni::objects::{JByteArray, JClass, JObject, JString};
 use jni::sys::{jint, jlong, jstring};
@@ -772,6 +773,128 @@ pub extern "system" fn Java_com_aivpn_client_AivpnJni_getBootstrapDescriptorsJso
 }
 
 // ──────────────────────────────────────────────────────────
+// In-tunnel management API (P2.3-Android)
+// ──────────────────────────────────────────────────────────
+
+/// Returns the server-assigned management role cached from the last
+/// `Capabilities` control message: 0=User, 1=Viewer, 2=Admin. Defaults to 0
+/// until one arrives (or for a server build that predates in-app admin).
+#[no_mangle]
+pub extern "system" fn Java_com_aivpn_client_AivpnJni_getRole(
+    _env: JNIEnv,
+    _class: JClass,
+) -> jint {
+    active_mgmt().cached_role() as jint
+}
+
+/// Issues an in-tunnel management-API call over the active session's control
+/// channel and blocks the calling (JNI) thread until the correlated
+/// `MgmtResponse` arrives or a 10s timeout elapses.
+///
+/// Parameters (Kotlin):
+/// ```kotlin
+/// external fun mgmtRequest(
+///     method: Int,     // 0=GET, 1=POST, 2=PATCH, 3=DELETE, 4=PUT
+///     path: String,     // curated REST-shaped path, e.g. "/api/v1/clients"
+///     body: ByteArray?, // optional JSON request body, or null for none
+/// ): ByteArray
+/// ```
+///
+/// Return layout: a 2-byte big-endian status-code prefix followed by the
+/// response body, i.e. `[status_hi, status_lo, ...body]`. An empty array
+/// (`byte[0]`) signals "no active session", "send failed", or "timed out" —
+/// the caller cannot distinguish those three from the empty array alone, but
+/// a genuine server response always carries at least the 2-byte prefix, so
+/// `response.size < 2` is the reliable "call did not complete" check on the
+/// Kotlin side.
+///
+/// Sync-JNI-over-async: `MgmtClient::mgmt_call`'s `oneshot::Receiver` is
+/// resolved from the *tunnel task's* runtime thread when the matching
+/// `MgmtResponse` control message arrives there (see the `active_mgmt()`
+/// arm wired into the inbound control match in `android_tunnel.rs`). This
+/// function runs on an arbitrary JNI caller thread with no tunnel-runtime
+/// handle of its own, so it spins up a throwaway
+/// `current_thread` runtime just to block on that receiver — the
+/// `mpsc::Sender` clone (enqueueing the outbound `MgmtRequest`) and the
+/// `oneshot::Receiver` (awaiting the reply) both cross runtimes freely;
+/// only the receiver's `.await` needs an executor, and it doesn't need to be
+/// the same one that resolves it.
+#[no_mangle]
+pub extern "system" fn Java_com_aivpn_client_AivpnJni_mgmtRequest<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    method: jint,
+    path: JString<'local>,
+    body: JObject<'local>, // nullable JByteArray
+) -> jni::sys::jbyteArray {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let path_str = match env.get_string(&path) {
+            Ok(s) => String::from(s),
+            Err(_) => return Vec::new(),
+        };
+
+        let body_vec: Vec<u8> = if body.is_null() {
+            Vec::new()
+        } else {
+            let arr: JByteArray<'local> = unsafe { JByteArray::from_raw(body.as_raw()) };
+            env.convert_byte_array(&arr).unwrap_or_default()
+        };
+
+        let control_tx = match active_control_tx() {
+            Some(tx) => tx,
+            None => return Vec::new(),
+        };
+
+        let rt = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(rt) => rt,
+            Err(_) => return Vec::new(),
+        };
+
+        match rt.block_on(active_mgmt().mgmt_call(
+            &control_tx,
+            method as u8,
+            &path_str,
+            body_vec,
+            Duration::from_secs(10),
+        )) {
+            Ok((status, resp_body)) => {
+                let mut out = Vec::with_capacity(2 + resp_body.len());
+                out.push((status >> 8) as u8);
+                out.push((status & 0xff) as u8);
+                out.extend_from_slice(&resp_body);
+                out
+            }
+            Err(_) => Vec::new(),
+        }
+    }))
+    .unwrap_or_default();
+    make_bytes(&mut env, &result)
+}
+
+/// Renders `text` (a connection key / enrollment URI) as a PNG QR code via
+/// `aivpn_common::qr::png_for`, for the in-app "show admin invite" flow.
+/// Returns an empty array on encode failure.
+#[no_mangle]
+pub extern "system" fn Java_com_aivpn_client_AivpnJni_qrPng<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    text: JString<'local>,
+) -> jni::sys::jbyteArray {
+    let png = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let text_str = match env.get_string(&text) {
+            Ok(s) => String::from(s),
+            Err(_) => return Vec::new(),
+        };
+        aivpn_common::qr::png_for(&text_str).unwrap_or_default()
+    }))
+    .unwrap_or_default();
+    make_bytes(&mut env, &png)
+}
+
+// ──────────────────────────────────────────────────────────
 // verifyBootstrapDescriptor — bootstrap descriptor discovery
 // ──────────────────────────────────────────────────────────
 
@@ -852,5 +975,18 @@ fn make_str(env: &mut JNIEnv, s: &str) -> jstring {
     let _ = env.exception_clear();
     env.new_string("")
         .map(|js| js.into_raw())
+        .unwrap_or(std::ptr::null_mut())
+}
+
+/// Builds a Java `byte[]` from `bytes`, mirroring `make_str`'s
+/// never-panic-across-FFI contract: a pending JVM exception is cleared and
+/// retried as an empty array rather than calling `.expect()`.
+fn make_bytes(env: &mut JNIEnv, bytes: &[u8]) -> jni::sys::jbyteArray {
+    if let Ok(arr) = env.byte_array_from_slice(bytes) {
+        return arr.into_raw();
+    }
+    let _ = env.exception_clear();
+    env.byte_array_from_slice(&[])
+        .map(|arr| arr.into_raw())
         .unwrap_or(std::ptr::null_mut())
 }

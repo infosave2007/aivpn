@@ -20,10 +20,16 @@ pub mod recording;
 pub mod dpi_gate;
 
 #[cfg(feature = "client-upload")]
+pub mod mgmt;
+
+#[cfg(feature = "client-upload")]
 pub mod mimicry;
 
 #[cfg(feature = "client-upload")]
 pub mod upload_pipeline;
+
+#[cfg(feature = "qr")]
+pub mod qr;
 
 #[cfg(unix)]
 pub mod kernel_accel;

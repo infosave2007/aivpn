@@ -36,6 +36,7 @@ use aivpn_common::mask::{
     current_unix_secs, decode_bootstrap_descriptor, resolve_handshake_mask_resilient,
     BootstrapDescriptor, MaskProfile, HANDSHAKE_FALLBACK_THRESHOLD,
 };
+use aivpn_common::mgmt::MgmtClient;
 use aivpn_common::mimicry::MimicryEncryptor;
 use aivpn_common::protocol::{ControlPayload, InnerType};
 use aivpn_common::quality::{AdaptiveLevel, QualityTracker};
@@ -322,6 +323,36 @@ pub static ACTIVE_ADAPTIVE_LEVEL: AtomicU8 = AtomicU8::new(0);
 /// and re-applies tunnel network settings with the server's address.
 pub static ASSIGNED_VPN_IP: AtomicU32 = AtomicU32::new(0);
 static ACTIVE_CONTROL_TX: Mutex<Option<mpsc::Sender<ControlPayload>>> = Mutex::new(None);
+
+// In-tunnel management-API client (P2.3-iOS): correlates outbound
+// `MgmtRequest`s issued from FFI with their inbound `MgmtResponse`, and
+// caches the server-assigned role from `Capabilities`. `MgmtClient` is
+// cheaply `Clone` (all fields `Arc`-wrapped internally), so a single
+// process-global instance behind `OnceLock` — read via `active_mgmt()` —
+// is shared between the session loop (feeds it inbound Capabilities /
+// MgmtResponse control messages below) and the FFI layer in `lib.rs`
+// (calls `mgmt_call` from a synchronous Swift-driven thread). Reset at the
+// start of every `run_tunnel_ios` attempt alongside the other per-session
+// statics so a reconnect starts with no stale pending requests or role.
+static ACTIVE_MGMT_CELL: std::sync::OnceLock<MgmtClient> = std::sync::OnceLock::new();
+
+/// The shared in-tunnel management-API client instance (see
+/// `ACTIVE_MGMT_CELL`). Lazily created on first use; reset (not
+/// recreated) at the start of each session.
+pub fn active_mgmt() -> &'static MgmtClient {
+    ACTIVE_MGMT_CELL.get_or_init(MgmtClient::new)
+}
+
+/// Clone of the active session's outbound control channel sender, or `None`
+/// if no tunnel session is currently active. Used by the FFI layer to issue
+/// `mgmt_call`s without exposing `ACTIVE_CONTROL_TX` itself outside this
+/// module (mirrors `send_control_payload`'s lock-clone-drop pattern).
+pub fn active_control_tx() -> Option<mpsc::Sender<ControlPayload>> {
+    ACTIVE_CONTROL_TX
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
 
 // §2 crowdsourced blocking feedback — process-global state polled by Swift via
 // the FFI getters in `lib.rs`, following the same reset-at-session-start /
@@ -875,6 +906,12 @@ pub async fn run_tunnel_ios(
     *ACTIVE_MASK_CATALOG_JSON
         .lock()
         .unwrap_or_else(|e| e.into_inner()) = None;
+    // In-tunnel management-API client (P2.3-iOS): clear any pending
+    // MgmtRequest correlation state and the cached role from a previous
+    // session — a reconnect must re-learn the role from a fresh
+    // Capabilities push, and stale pending req_ids can never be resolved
+    // by the new session's MgmtResponses.
+    active_mgmt().reset();
 
     let level = AdaptiveLevel::from_u8(adaptive_level);
 
@@ -2364,6 +2401,26 @@ pub async fn run_tunnel_ios(
                                             descriptor_data.len()
                                         );
                                     }
+                                }
+                                aivpn_common::protocol::ControlPayload::Capabilities {
+                                    role,
+                                    ..
+                                } => {
+                                    log::debug!("aivpn: Capabilities role={}", role);
+                                    active_mgmt().on_capabilities(role);
+                                }
+                                aivpn_common::protocol::ControlPayload::MgmtResponse {
+                                    req_id,
+                                    status,
+                                    body,
+                                } => {
+                                    log::debug!(
+                                        "aivpn: MgmtResponse req_id={} status={} body_len={}",
+                                        req_id,
+                                        status,
+                                        body.len()
+                                    );
+                                    active_mgmt().on_mgmt_response(req_id, status, body);
                                 }
                                 _ => {}
                             }

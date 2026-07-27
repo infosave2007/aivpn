@@ -44,8 +44,26 @@ tokio = { workspace = true, optional = true }
 # Concurrency — optional, only pulled in by the inline ML-DPI gate (dpi-gate).
 dashmap = { workspace = true, optional = true }
 
+# QR-code rendering (optional — only pulled in by the `qr` feature). Local
+# rendering of `aivpn://...` connection keys, shared by all client
+# implementations (desktop + mobile FFI). `qrcode`'s own `image` integration
+# is used to avoid hand-rolled pixel-buffer code; both crates pin
+# `image = "0.25"` with default features disabled so Cargo unifies to a
+# single image build with only the `png` codec compiled in (kept light on
+# purpose — this crate compiles into mobile targets).
+qrcode = { version = "0.14", default-features = false, features = ["image"], optional = true }
+image = { version = "0.25", default-features = false, features = ["png"], optional = true }
+anyhow = { version = "1", optional = true }
+
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+[dev-dependencies]
+# `test-util` is not part of the workspace `tokio` "full" feature set — needed
+# by mgmt.rs tests that pause/advance virtual time to deterministically
+# exercise `MgmtClient::mgmt_call`'s timeout without a real 10s sleep
+# (mirrors aivpn-client's dev-dependency of the same shape).
+tokio = { workspace = true, features = ["test-util"] }
 
 [features]
 default = []
@@ -56,3 +74,6 @@ dpi-gate = ["dep:dashmap"]
 # Client-side inline self-detection gate: the `ClientSelfGate` outbound inspector
 # wired into `run_upload_loop`. Needs the pipeline + tokio (control-plane types).
 client-dpi-gate = ["dpi-gate", "client-upload"]
+# Local QR-code PNG rendering for `aivpn://...` connection keys (P2.R), shared
+# by every client implementation (desktop + mobile FFI).
+qr = ["dep:qrcode", "dep:image", "dep:anyhow"]

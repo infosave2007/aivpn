@@ -26,6 +26,7 @@ use aivpn_common::client_wire::{
 use aivpn_common::crypto::{self, KeyPair, SessionKeys, X25519_PUBLIC_KEY_SIZE};
 use aivpn_common::error::{Error, Result};
 use aivpn_common::mask::{current_unix_secs, BootstrapDescriptor, MaskProfile};
+use aivpn_common::mgmt::MgmtClient;
 use aivpn_common::network_config::ClientNetworkConfig;
 use aivpn_common::protocol::{
     ControlPayload, InnerType, MaskOutcome, MAX_PACKET_SIZE, UDP_RECV_BUF_SIZE,
@@ -713,6 +714,16 @@ pub struct AivpnClient {
     /// Interface on which the XDP early-filter was attached (Linux only).
     #[cfg(target_os = "linux")]
     xdp_iface: Option<String>,
+    /// P2.1/P2.R: in-tunnel mgmt client (`MgmtRequest`/`MgmtResponse`
+    /// correlation + cached server-assigned role). Hoisted into
+    /// `aivpn_common::mgmt::MgmtClient` so mobile FFI cores
+    /// (`aivpn-ios-core`, `aivpn-android-core`), which depend on
+    /// `aivpn-common` but not on this crate, share the identical
+    /// implementation instead of re-implementing it. Cheaply cloneable
+    /// (internally `Arc`-wrapped) so `mgmt_call`/`cached_role` can take
+    /// `&self` and still be called concurrently from multiple embedders
+    /// (FFI, admin-socket bridge).
+    mgmt: MgmtClient,
 }
 
 impl AivpnClient {
@@ -804,6 +815,7 @@ impl AivpnClient {
             polymorphic_confirmed: Arc::new(AtomicBool::new(false)),
             terminal_rejected: false,
             reject_reason: 0,
+            mgmt: MgmtClient::new(),
         })
     }
 
@@ -1523,6 +1535,22 @@ impl AivpnClient {
         // the orphaned task keeps 127.0.0.1:44301 bound across reconnect iterations,
         // causing the next run() call to fail with "Address already in use".
         let admin_token = crate::record_cmd::ensure_admin_token();
+        // P2.3-desktop: the admin socket now also bridges in-tunnel `mgmt`
+        // calls (`AdminCommand::Mgmt`/`Role`/`Qr`) for the Windows egui /
+        // Linux iced GUIs, which shell out to this binary rather than
+        // embedding the crate — they drive the running daemon's tunnel over
+        // this same loopback socket via `aivpn-client mgmt`/`role`.
+        //
+        // `mgmt_call` is `&self` on `AivpnClient` and needs only two pieces
+        // of state, both cheaply `Clone`: `self.mgmt` (`MgmtClient`, an
+        // `Arc`-wrapped correlation table shared with `run()`'s inbound
+        // `MgmtResponse`/`Capabilities` handling) and the outbound
+        // `control_tx` sender already constructed above. Cloning those two
+        // into the admin task — rather than threading a full
+        // `Arc<AivpnClient>` through — avoids taking `&mut self` away from
+        // `run()`'s exclusive session loop for the task's lifetime.
+        let admin_mgmt = self.mgmt.clone();
+        let admin_control_tx = control_tx.clone();
         // Headless control-only mode (server-embedded pool-peer dialer): never
         // bind the admin IPC socket. This is the hard blocker for running N
         // dialers in one process — `admin_tx` is intentionally left un-moved
@@ -1534,16 +1562,103 @@ impl AivpnClient {
             AbortOnDrop(tokio::spawn(async move {
                 match tokio::net::UdpSocket::bind("127.0.0.1:44301").await {
                     Ok(socket) => {
-                        let mut buf = [0u8; 1024];
+                        let socket = Arc::new(socket);
+                        let mut buf = [0u8; 65536];
                         loop {
-                            if let Ok((len, _addr)) = socket.recv_from(&mut buf).await {
+                            if let Ok((len, addr)) = socket.recv_from(&mut buf).await {
                                 if let Ok(raw) = std::str::from_utf8(&buf[..len]) {
                                     match raw.split_once(':').and_then(|(tok, rest)| {
                                         crate::record_cmd::tokens_match(tok, &admin_token)
                                             .then(|| rest.to_string())
                                     }) {
-                                        Some(cmd) => {
-                                            let _ = admin_tx.send(cmd).await;
+                                        Some(rest) => {
+                                            match crate::record_cmd::parse_admin_command(&rest) {
+                                                Some(
+                                                    cmd @ (crate::record_cmd::AdminCommand::RecordStart(_)
+                                                    | crate::record_cmd::AdminCommand::RecordStop
+                                                    | crate::record_cmd::AdminCommand::RecordStatus),
+                                                ) => {
+                                                    // Preserve pre-existing behavior exactly:
+                                                    // forward the raw command string to the main
+                                                    // select loop (`admin_rx`), which owns the
+                                                    // recording session state and its own
+                                                    // fire-and-forget (no socket reply) handling.
+                                                    let forwarded = match cmd {
+                                                        crate::record_cmd::AdminCommand::RecordStart(service) => {
+                                                            format!("record_start:{service}")
+                                                        }
+                                                        crate::record_cmd::AdminCommand::RecordStop => {
+                                                            "record_stop".to_string()
+                                                        }
+                                                        crate::record_cmd::AdminCommand::RecordStatus => {
+                                                            "record_status".to_string()
+                                                        }
+                                                        _ => unreachable!(),
+                                                    };
+                                                    let _ = admin_tx.send(forwarded).await;
+                                                }
+                                                Some(crate::record_cmd::AdminCommand::Role) => {
+                                                    let reply = admin_mgmt.cached_role().to_string();
+                                                    let _ = socket.send_to(reply.as_bytes(), addr).await;
+                                                }
+                                                Some(crate::record_cmd::AdminCommand::Qr(text)) => {
+                                                    match crate::qr::png_for(&text) {
+                                                        Ok(png) => {
+                                                            let reply = crate::record_cmd::encode_body_b64(&png);
+                                                            let _ = socket.send_to(reply.as_bytes(), addr).await;
+                                                        }
+                                                        Err(e) => {
+                                                            warn!("admin qr command failed: {e}");
+                                                        }
+                                                    }
+                                                }
+                                                Some(crate::record_cmd::AdminCommand::Mgmt {
+                                                    method,
+                                                    path,
+                                                    body,
+                                                }) => {
+                                                    // Spawned so a slow/timed-out mgmt call (up to
+                                                    // 10s, see `MgmtClient::mgmt_call`) never blocks
+                                                    // this loop from servicing other admin-socket
+                                                    // commands (record_*, other mgmt calls) meanwhile.
+                                                    let mgmt = admin_mgmt.clone();
+                                                    let control_tx = admin_control_tx.clone();
+                                                    let socket = socket.clone();
+                                                    tokio::spawn(async move {
+                                                        let reply = match mgmt
+                                                            .mgmt_call(
+                                                                &control_tx,
+                                                                method,
+                                                                &path,
+                                                                body,
+                                                                Duration::from_secs(10),
+                                                            )
+                                                            .await
+                                                        {
+                                                            Ok((status, resp_body)) => {
+                                                                crate::record_cmd::format_mgmt_reply(status, &resp_body)
+                                                            }
+                                                            Err(e) => {
+                                                                warn!("admin mgmt command failed: {e}");
+                                                                // Status 0 is a synthetic sentinel (no
+                                                                // real HTTP-style status is ever < 100)
+                                                                // meaning the call itself failed locally
+                                                                // — control_tx closed, or no
+                                                                // `MgmtResponse` within the 10s
+                                                                // `mgmt_call` timeout — as opposed to a
+                                                                // real server-returned status. The CLI
+                                                                // (`aivpn-client mgmt`) treats 0 as a
+                                                                // hard failure (non-zero exit).
+                                                                crate::record_cmd::format_mgmt_reply(0, &[])
+                                                            }
+                                                        };
+                                                        let _ = socket.send_to(reply.as_bytes(), addr).await;
+                                                    });
+                                                }
+                                                None => {
+                                                    warn!("Rejected admin command: unparseable command");
+                                                }
+                                            }
                                         }
                                         None => {
                                             warn!(
@@ -3452,6 +3567,22 @@ impl AivpnClient {
                     }
                 }
             }
+            ControlPayload::Capabilities { role, features } => {
+                // P2.1: server-assigned role, sent once per session after
+                // ratchet. `features` is reserved (always 0 today).
+                info!(
+                    "Capabilities from server: role={} features={}",
+                    role, features
+                );
+                self.mgmt.on_capabilities(role);
+            }
+            ControlPayload::MgmtResponse {
+                req_id,
+                status,
+                body,
+            } => {
+                self.mgmt.on_mgmt_response(req_id, status, body);
+            }
             _ => {}
         }
         Ok(())
@@ -3501,6 +3632,47 @@ impl AivpnClient {
         } else {
             Err(Error::Session("control_tx not initialized".into()))
         }
+    }
+
+    /// Current server-assigned role (0=User, 1=Viewer, 2=Admin), cached from
+    /// the last `Capabilities` control message. Defaults to 0 (User) until
+    /// one arrives (i.e. before the post-ratchet `Capabilities` push, or for
+    /// a server build that predates it). Delegates to the shared
+    /// `aivpn_common::mgmt::MgmtClient` (P2.R).
+    pub fn cached_role(&self) -> u8 {
+        self.mgmt.cached_role()
+    }
+
+    /// P2.1/P2.R: issue an in-tunnel management API call and await the
+    /// correlated `MgmtResponse`. `method`: 0=GET, 1=POST, 2=PATCH, 3=DELETE,
+    /// 4=PUT (see `ControlPayload::MgmtRequest`). `path` is a curated
+    /// REST-shaped path (e.g. "/api/v1/clients"); `body` is an optional JSON
+    /// payload.
+    ///
+    /// Takes `&self` (not `&mut self`) so it can be called concurrently and
+    /// from an embedder holding only a shared reference (FFI, admin-socket
+    /// bridge) while `run()` holds the exclusive `&mut self` borrow for the
+    /// session loop — this is exactly why the outbound sender
+    /// (`control_tx`, a plain cloneable `mpsc::Sender`) and the correlation
+    /// state (`self.mgmt`, an `aivpn_common::mgmt::MgmtClient`) are
+    /// `Arc`-wrapped / cheaply cloneable rather than requiring exclusive
+    /// access. Works on a normal (non-`control_only`) session: it uses the
+    /// same `control_tx` that `run()`'s upload task drains for every other
+    /// outbound control payload (keepalives, MaskFeedback, ...), so
+    /// `MgmtRequest` rides the identical encrypted path.
+    ///
+    /// Resolves to `(status, body)` on a timely response. Returns an error
+    /// if the outbound control channel isn't initialized yet, the channel is
+    /// closed, or no response arrives within 10s — on timeout the pending
+    /// entry is removed so a very late/duplicate response is dropped by
+    /// `MgmtClient::on_mgmt_response` instead of being misdelivered.
+    pub async fn mgmt_call(&self, method: u8, path: &str, body: Vec<u8>) -> Result<(u16, Vec<u8>)> {
+        let Some(tx) = self.control_tx.as_ref() else {
+            return Err(Error::Session("control_tx not initialized".into()));
+        };
+        self.mgmt
+            .mgmt_call(tx, method, path, body, Duration::from_secs(10))
+            .await
     }
 
     /// Update mask profile
@@ -3982,6 +4154,111 @@ mod tests {
         let config = make_test_config();
         let client = AivpnClient::new(config).expect("new() must not fail");
         assert_eq!(client.bytes_received(), 0);
+    }
+
+    // ── P2.1/P2.R: in-tunnel mgmt client (MgmtRequest/Response correlation) ────
+    // Low-level correlation behavior (pending-map insert/remove, timeout
+    // race, unknown req_id) is exercised directly against
+    // `aivpn_common::mgmt::MgmtClient` in `aivpn-common/src/mgmt.rs`'s own
+    // tests now that P2.R hoisted the implementation there. These tests stay
+    // to prove `AivpnClient` still delegates correctly end-to-end.
+
+    #[test]
+    fn cached_role_defaults_to_user_before_any_capabilities_message() {
+        let config = make_test_config();
+        let client = AivpnClient::new(config).expect("new() must not fail");
+        assert_eq!(client.cached_role(), 0);
+    }
+
+    #[tokio::test]
+    async fn capabilities_control_message_updates_cached_role() {
+        let config = make_test_config();
+        let mut client = AivpnClient::new(config).expect("new() must not fail");
+        assert_eq!(client.cached_role(), 0);
+
+        client
+            .handle_server_control(ControlPayload::Capabilities {
+                role: 2,
+                features: 0,
+            })
+            .await
+            .expect("handle_server_control must not fail on Capabilities");
+
+        assert_eq!(client.cached_role(), 2);
+    }
+
+    #[tokio::test]
+    async fn mgmt_call_sends_request_and_resolves_on_matching_response() {
+        let config = make_test_config();
+        let mut client = AivpnClient::new(config).expect("new() must not fail");
+        let (control_tx, mut control_rx) = mpsc::channel::<ControlPayload>(4);
+        client.control_tx = Some(control_tx);
+
+        // Stand in for the server: receive the MgmtRequest and immediately
+        // hand a MgmtResponse back through the same shared `MgmtClient`
+        // (cloned — internally `Arc`-wrapped) that `handle_server_control`
+        // would deliver a real inbound `MgmtResponse` through.
+        let mgmt = client.mgmt.clone();
+        let responder = tokio::spawn(async move {
+            let sent = control_rx.recv().await.expect("MgmtRequest must be sent");
+            match sent {
+                ControlPayload::MgmtRequest {
+                    req_id,
+                    method,
+                    path,
+                    body,
+                } => {
+                    assert_eq!(method, 0);
+                    assert_eq!(path, "/api/v1/clients");
+                    assert!(body.is_empty());
+                    mgmt.on_mgmt_response(req_id, 200, b"[]".to_vec());
+                }
+                other => panic!("expected MgmtRequest, got {:?}", other),
+            }
+        });
+
+        let (status, body) = client
+            .mgmt_call(0, "/api/v1/clients", vec![])
+            .await
+            .expect("mgmt_call must resolve once the response is delivered");
+
+        responder.await.expect("responder task must not panic");
+        assert_eq!(status, 200);
+        assert_eq!(body, b"[]".to_vec());
+    }
+
+    #[tokio::test]
+    async fn mgmt_call_times_out_when_no_response_arrives() {
+        // Paused virtual time: `mgmt_call`'s internal 10s
+        // `tokio::time::timeout` auto-advances past its deadline as soon as
+        // the runtime is idle, instead of the test waiting 10 real seconds
+        // (same pattern used by the mask-feedback jitter tests above).
+        tokio::time::pause();
+        let config = make_test_config();
+        let mut client = AivpnClient::new(config).expect("new() must not fail");
+        let (control_tx, mut control_rx) = mpsc::channel::<ControlPayload>(4);
+        client.control_tx = Some(control_tx);
+        // Drain the outbound MgmtRequest so the bounded channel never fills,
+        // but never send a MgmtResponse back.
+        let _drainer = tokio::spawn(async move {
+            let _ = control_rx.recv().await;
+        });
+
+        let result = client.mgmt_call(0, "/api/v1/clients", vec![]).await;
+
+        assert!(
+            result.is_err(),
+            "mgmt_call must return an error when no MgmtResponse arrives within the timeout"
+        );
+    }
+
+    #[tokio::test]
+    async fn mgmt_call_errors_immediately_without_control_tx() {
+        let config = make_test_config();
+        let client = AivpnClient::new(config).expect("new() must not fail");
+        // control_tx is None until control_handle()/run() sets it.
+        let result = client.mgmt_call(0, "/api/v1/clients", vec![]).await;
+        assert!(result.is_err());
     }
 
     // ── packet_mdh_len_for_mask ───────────────────────────────────────────────

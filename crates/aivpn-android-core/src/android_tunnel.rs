@@ -551,6 +551,36 @@ fn merge_mask_outcomes(prior: Vec<MaskOutcome>, current_mask_id: &str) -> Vec<Ma
 /// JNI uses this to inject RecordingStart / RecordingStop without a reconnect.
 static ACTIVE_CONTROL_TX: Mutex<Option<mpsc::Sender<ControlPayload>>> = Mutex::new(None);
 
+/// In-tunnel management-API correlation state (P2.3-Android), shared between
+/// the session loop (feeds it inbound `Capabilities` / `MgmtResponse` control
+/// messages) and `lib.rs`'s `mgmtRequest`/`getRole` JNI exports (issue calls,
+/// read the cached role). `aivpn_common::mgmt::MgmtClient` is internally
+/// `Arc`-wrapped and cheaply `Clone`, but a process-global static is used here
+/// (mirroring `ACTIVE_CONTROL_TX` / `ACTIVE_QUALITY_SCORE` above) because JNI
+/// calls arrive on arbitrary Java threads with no handle into the tunnel
+/// task's local variables. `Mutex` only guards construction; reads/writes
+/// after `get_or_init` go through `MgmtClient`'s own interior `Arc<Mutex<_>>`
+/// / atomics, so this is never held across an `.await`.
+static ACTIVE_MGMT: std::sync::OnceLock<aivpn_common::mgmt::MgmtClient> =
+    std::sync::OnceLock::new();
+
+/// Returns the process-global `MgmtClient`, creating it on first use.
+pub fn active_mgmt() -> &'static aivpn_common::mgmt::MgmtClient {
+    ACTIVE_MGMT.get_or_init(aivpn_common::mgmt::MgmtClient::new)
+}
+
+/// Clone of the active session's outbound control-channel sender, for JNI
+/// callers (`mgmtRequest`) that need to pass it directly into
+/// `MgmtClient::mgmt_call` rather than routing through the fire-and-forget
+/// `send_control_payload`. Returns `None` when no tunnel session is active
+/// (mirrors `send_control_payload`'s no-session handling).
+pub fn active_control_tx() -> Option<mpsc::Sender<ControlPayload>> {
+    ACTIVE_CONTROL_TX
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
 /// Snapshot of the most recent recording-related control message received
 /// from the server (`RecordingAck` / `RecordingComplete` / `RecordingFailed` /
 /// `RecordingStatus`). Exposed to JNI via `take_recording_feedback_json()` so
@@ -1003,6 +1033,9 @@ pub async fn run_tunnel_android(
     *ACTIVE_REGIONAL_HINTS_JSON
         .lock()
         .unwrap_or_else(|e| e.into_inner()) = None;
+    // P2.3-Android: clear in-flight mgmt-API correlation state and the
+    // cached role from any prior session before this attempt's handshake.
+    active_mgmt().reset();
 
     // §M2 per-server descriptor isolation: if the user switched to a DIFFERENT
     // server/profile since the last session, clear the process-global descriptor
@@ -2541,6 +2574,28 @@ pub async fn run_tunnel_android(
                                         "aivpn: mTLS: server rejected the certificate — re-provision required"
                                     );
                                     CERT_REJECTED.store(true, Ordering::Relaxed);
+                                }
+                                ControlPayload::Capabilities { role, features } => {
+                                    // P2.3-Android: server-assigned role, sent once per
+                                    // session after ratchet. `features` is reserved
+                                    // (always 0 today) — mirrors desktop client.rs and
+                                    // aivpn_common::mgmt::MgmtClient's own doc comment.
+                                    log::debug!(
+                                        "aivpn: Capabilities from server: role={} features={}",
+                                        role, features
+                                    );
+                                    active_mgmt().on_capabilities(role);
+                                }
+                                ControlPayload::MgmtResponse {
+                                    req_id,
+                                    status,
+                                    body,
+                                } => {
+                                    log::debug!(
+                                        "aivpn: MgmtResponse req_id={} status={} body_len={}",
+                                        req_id, status, body.len()
+                                    );
+                                    active_mgmt().on_mgmt_response(req_id, status, body);
                                 }
                                 _ => {}
                             }

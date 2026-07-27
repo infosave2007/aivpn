@@ -206,6 +206,83 @@ pub enum ClientCommand {
         #[arg(long)]
         json: bool,
     },
+    /// P2.3-desktop: issue an in-tunnel management API call against the
+    /// running client daemon, bridged over its local admin socket. This is
+    /// the surface the Windows egui / Linux iced GUIs (which shell out to
+    /// this binary rather than embedding the crate) use to drive in-tunnel
+    /// admin/pool management. Prints the numeric HTTP-style status to
+    /// stderr and the raw response body to stdout, so it composes cleanly
+    /// with `jq`/pipelines.
+    Mgmt {
+        /// HTTP-style method the server-side management API expects.
+        #[arg(long, value_enum)]
+        method: MgmtMethod,
+        /// Curated REST-shaped API path, e.g. /api/v1/clients
+        #[arg(long)]
+        path: String,
+        /// File containing the raw request body (JSON, typically). Omit for
+        /// an empty body.
+        #[arg(long, value_name = "FILE")]
+        body_file: Option<std::path::PathBuf>,
+        /// Admin-socket auth token. Defaults to reading the token the
+        /// running daemon wrote for this OS user (same file `record`
+        /// commands use).
+        #[arg(long)]
+        token: Option<String>,
+        /// Admin-socket address of the running client daemon.
+        #[arg(long, default_value = "127.0.0.1:44301")]
+        socket: String,
+    },
+    /// P2.3-desktop: report the server-assigned role (0=User, 1=Viewer,
+    /// 2=Admin) cached by the running client daemon.
+    Role {
+        /// Admin-socket auth token (see `mgmt --token`).
+        #[arg(long)]
+        token: Option<String>,
+        /// Admin-socket address of the running client daemon.
+        #[arg(long, default_value = "127.0.0.1:44301")]
+        socket: String,
+    },
+}
+
+#[derive(clap::ValueEnum, Clone, Copy, Debug)]
+#[value(rename_all = "UPPER")]
+pub enum MgmtMethod {
+    Get,
+    Post,
+    Patch,
+    Delete,
+    Put,
+}
+
+impl MgmtMethod {
+    /// Wire encoding used by `ControlPayload::MgmtRequest` / the admin-socket
+    /// `mgmt:` command: 0=GET, 1=POST, 2=PATCH, 3=DELETE, 4=PUT.
+    fn as_u8(self) -> u8 {
+        match self {
+            MgmtMethod::Get => 0,
+            MgmtMethod::Post => 1,
+            MgmtMethod::Patch => 2,
+            MgmtMethod::Delete => 3,
+            MgmtMethod::Put => 4,
+        }
+    }
+}
+
+/// Send a `"{token}:{command}"` datagram to the running daemon's admin
+/// socket and wait (bounded) for a reply datagram. Shared by the `mgmt` and
+/// `role` CLI subcommands, which — unlike the pre-existing `record`
+/// subcommand (fire-and-forget, polls a status file) — need the daemon's
+/// direct reply.
+fn send_admin_request(socket_addr: &str, line: &str) -> Option<String> {
+    let socket = std::net::UdpSocket::bind("127.0.0.1:0").ok()?;
+    socket
+        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+        .ok()?;
+    socket.send_to(line.as_bytes(), socket_addr).ok()?;
+    let mut buf = [0u8; 65536];
+    let (len, _addr) = socket.recv_from(&mut buf).ok()?;
+    std::str::from_utf8(&buf[..len]).ok().map(|s| s.to_string())
 }
 
 #[derive(clap::Subcommand, Debug)]
@@ -503,6 +580,61 @@ async fn main() {
                         "Quality:     {} ({})",
                         result.quality_score, result.quality_label
                     );
+                }
+                return;
+            }
+            ClientCommand::Mgmt {
+                method,
+                path,
+                body_file,
+                token,
+                socket,
+            } => {
+                let body = match body_file {
+                    Some(f) => std::fs::read(&f).unwrap_or_else(|e| {
+                        eprintln!("Failed to read --body-file {}: {e}", f.display());
+                        std::process::exit(1);
+                    }),
+                    None => Vec::new(),
+                };
+                let token = token
+                    .or_else(aivpn_client::record_cmd::read_admin_token)
+                    .unwrap_or_default();
+                let body_b64 = aivpn_client::record_cmd::encode_body_b64(&body);
+                let line = format!("{token}:mgmt:{}:{path}:{body_b64}", method.as_u8());
+                match send_admin_request(&socket, &line) {
+                    Some(reply) => match aivpn_client::record_cmd::parse_mgmt_reply(&reply) {
+                        Some((status, resp_body)) => {
+                            eprintln!("{status}");
+                            use std::io::Write;
+                            let _ = std::io::stdout().write_all(&resp_body);
+                            if status == 0 {
+                                std::process::exit(1);
+                            }
+                        }
+                        None => {
+                            eprintln!("Malformed reply from daemon: {reply}");
+                            std::process::exit(1);
+                        }
+                    },
+                    None => {
+                        eprintln!("No reply from daemon at {socket} (is aivpn-client running?)");
+                        std::process::exit(1);
+                    }
+                }
+                return;
+            }
+            ClientCommand::Role { token, socket } => {
+                let token = token
+                    .or_else(aivpn_client::record_cmd::read_admin_token)
+                    .unwrap_or_default();
+                let line = format!("{token}:role");
+                match send_admin_request(&socket, &line) {
+                    Some(reply) => println!("{reply}"),
+                    None => {
+                        eprintln!("No reply from daemon at {socket} (is aivpn-client running?)");
+                        std::process::exit(1);
+                    }
                 }
                 return;
             }

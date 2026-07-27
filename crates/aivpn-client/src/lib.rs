@@ -28,5 +28,9 @@ pub mod server_pool;
 pub mod tunnel;
 
 pub use aivpn_common::mimicry::MimicryEngine;
+// P2.R: QR generation lives in aivpn-common (shared with the mobile FFI
+// cores) — re-exported here so existing `crate::qr::...` / `aivpn_client::qr`
+// callers keep working unchanged.
+pub use aivpn_common::qr;
 pub use client::AivpnClient;
 pub use tunnel::Tunnel;

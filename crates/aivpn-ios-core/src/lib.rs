@@ -859,6 +859,172 @@ pub unsafe extern "C" fn aivpn_verify_bootstrap_descriptor(
     }
 }
 
+/// Current server-assigned role (0=User, 1=Viewer, 2=Admin) cached from the
+/// most recent `Capabilities` control message this session, or 0 (User)
+/// before one has arrived. Backed by the shared `MgmtClient` in
+/// `ios_tunnel`, reset at the start of each `aivpn_run_tunnel` attempt.
+#[no_mangle]
+pub extern "C" fn aivpn_get_role() -> u8 {
+    crate::ios_tunnel::active_mgmt().cached_role()
+}
+
+/// Issue an in-tunnel management API call (Phase A in-app admin) and block
+/// until the correlated response arrives or `path` — a curated REST-shaped
+/// path (e.g. "/api/v1/clients") — this call times out (10s).
+///
+/// `method`: 0=GET, 1=POST, 2=PATCH, 3=DELETE, 4=PUT. `body`/`body_len` is an
+/// optional JSON request payload (pass NULL/0 for none).
+///
+/// Blocking convention: the async `MgmtClient::mgmt_call` response is
+/// awaited by spinning up a private single-thread Tokio runtime local to
+/// this call and calling `block_on` on it — NOT the tunnel's own runtime.
+/// The `MgmtRequest` is sent over the tunnel's control channel and the
+/// matching `MgmtResponse` resolves the shared `MgmtClient`'s oneshot from
+/// the tunnel's own task; this call's private runtime only drives the
+/// `mgmt_call` future itself (the timeout timer + awaiting that oneshot),
+/// so blocking a synchronous FFI thread here never blocks the tunnel.
+///
+/// Response-buffer convention (shared with `aivpn_qr_png`): on success,
+/// `*out_status` receives the response status code and the return value is
+/// the number of response-body bytes written into `out_buf`. If the
+/// response body is larger than `out_cap`, `out_buf` is left untouched and
+/// the return value is the *needed* length instead — always `> out_cap` in
+/// that case, so the caller distinguishes "written N bytes" from "need a
+/// bigger buffer" by comparing the return value against the `out_cap` it
+/// passed in, then retries with a buffer of at least that size. Returns -1
+/// on any error: NULL/invalid `path`, no active tunnel session, the control
+/// channel is closed, or the call times out awaiting a response.
+///
+/// # Safety
+/// `path` must be a NUL-terminated, valid-UTF-8 C string. `body` (if
+/// non-NULL) must point to at least `body_len` readable bytes. `out_status`
+/// must point to a writable `u16`. `out_buf` must point to at least
+/// `out_cap` writable bytes (may be NULL only if `out_cap` is 0).
+#[no_mangle]
+pub unsafe extern "C" fn aivpn_mgmt_request(
+    method: u8,
+    path: *const libc::c_char,
+    body: *const u8,
+    body_len: usize,
+    out_status: *mut u16,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    if path.is_null() || out_status.is_null() {
+        return -1;
+    }
+    // SAFETY: caller guarantees `path` is a NUL-terminated C string valid for
+    // the duration of this call.
+    let path_str = match unsafe { std::ffi::CStr::from_ptr(path) }.to_str() {
+        Ok(s) => s,
+        Err(_) => return -1,
+    };
+    // SAFETY: caller guarantees `body` points to `body_len` readable bytes
+    // when non-NULL; copied into an owned Vec immediately.
+    let body_vec: Vec<u8> = if body.is_null() || body_len == 0 {
+        Vec::new()
+    } else {
+        unsafe { std::slice::from_raw_parts(body, body_len) }.to_vec()
+    };
+
+    let Some(control_tx) = crate::ios_tunnel::active_control_tx() else {
+        return -1; // not connected
+    };
+
+    let rt = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(_) => return -1,
+    };
+
+    let result = rt.block_on(crate::ios_tunnel::active_mgmt().mgmt_call(
+        &control_tx,
+        method,
+        path_str,
+        body_vec,
+        std::time::Duration::from_secs(10),
+    ));
+
+    match result {
+        Ok((status, resp_body)) => {
+            // SAFETY: caller guarantees out_status points to a writable u16.
+            unsafe {
+                *out_status = status;
+            }
+            unsafe { copy_bytes_getter(&resp_body, out_buf, out_cap) }
+        }
+        Err(_) => -1,
+    }
+}
+
+/// Render `text` (typically an `aivpn://...` connection key) as a QR code
+/// PNG and copy the encoded bytes into `out_buf`.
+///
+/// Uses the same written-len-or-needed-len buffer convention as
+/// `aivpn_mgmt_request` (see its doc comment): the return value is the
+/// number of PNG bytes written when `out_cap` was large enough, or the
+/// needed length (always `> out_cap`, `out_buf` left untouched) otherwise.
+/// Returns -1 if `text` is NULL/not valid UTF-8/empty, or PNG encoding
+/// fails.
+///
+/// # Safety
+/// `text` must be a NUL-terminated, valid-UTF-8 C string. `out_buf` must
+/// point to at least `out_cap` writable bytes (may be NULL only if
+/// `out_cap` is 0).
+#[no_mangle]
+pub unsafe extern "C" fn aivpn_qr_png(
+    text: *const libc::c_char,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    if text.is_null() {
+        return -1;
+    }
+    // SAFETY: caller guarantees `text` is a NUL-terminated C string valid for
+    // the duration of this call.
+    let text_str = match unsafe { std::ffi::CStr::from_ptr(text) }.to_str() {
+        Ok(s) => s,
+        Err(_) => return -1,
+    };
+    match aivpn_common::qr::png_for(text_str) {
+        Ok(bytes) => unsafe { copy_bytes_getter(&bytes, out_buf, out_cap) },
+        Err(_) => -1,
+    }
+}
+
+/// Shared helper for raw-byte FFI getters that use the
+/// written-len-or-needed-len convention (see `aivpn_mgmt_request` /
+/// `aivpn_qr_png` doc comments): if `data` fits in `out_cap` bytes, copies
+/// it into `out_buf` and returns `data.len()` (always `<= out_cap`, so
+/// unambiguous "bytes written"); otherwise leaves `out_buf` untouched and
+/// returns `data.len()` anyway (in this branch always `> out_cap`, so the
+/// caller recognizes it as "needed length, retry with a bigger buffer").
+/// Never returns a negative value; NULL `out_buf` is only tolerated when
+/// nothing needs to be written (`out_cap` too small, or `data` empty).
+///
+/// # Safety
+/// `out_buf` must point to at least `out_cap` writable bytes whenever a
+/// non-empty copy is about to happen (i.e. whenever this returns a value
+/// `<= out_cap` and `data` is non-empty).
+unsafe fn copy_bytes_getter(data: &[u8], out_buf: *mut u8, out_cap: usize) -> isize {
+    if data.len() > out_cap {
+        return data.len() as isize;
+    }
+    if !data.is_empty() {
+        if out_buf.is_null() {
+            return -1;
+        }
+        // SAFETY: caller guarantees out_buf points to out_cap writable bytes
+        // when a copy is needed; data.len() <= out_cap was just checked.
+        unsafe {
+            std::ptr::copy_nonoverlapping(data.as_ptr(), out_buf, data.len());
+        }
+    }
+    data.len() as isize
+}
+
 /// Pure, allocation-owning verification helper with no raw pointers, so it's
 /// trivially testable and `UnwindSafe`. Parses `json` as a single
 /// `BootstrapDescriptor`, rejects it if expired/not-yet-valid, then checks

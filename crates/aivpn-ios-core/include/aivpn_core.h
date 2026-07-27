@@ -354,6 +354,64 @@ int aivpn_verify_bootstrap_descriptor(
     const uint8_t *signing_pubkey
 );
 
+/// Current server-assigned role (0=User, 1=Viewer, 2=Admin) cached from the
+/// most recent Capabilities control message this session, or 0 (User)
+/// before one has arrived. Reset at the start of each aivpn_run_tunnel
+/// attempt.
+uint8_t aivpn_get_role(void);
+
+/// Issue an in-tunnel management API call (Phase A in-app admin) and block
+/// until the correlated response arrives or the call times out (10s).
+///
+/// @param method      0=GET, 1=POST, 2=PATCH, 3=DELETE, 4=PUT.
+/// @param path         NUL-terminated, curated REST-shaped path (e.g.
+///                     "/api/v1/clients").
+/// @param body         Optional JSON request payload, or NULL for none.
+/// @param body_len     Length of body in bytes (0 if body is NULL).
+/// @param out_status   Receives the response status code on success. Must
+///                     point to a writable uint16_t.
+/// @param out_buf      Buffer to receive the response body bytes (NOT
+///                     NUL-terminated — it is arbitrary JSON, not a C
+///                     string). May be NULL only if out_cap is 0.
+/// @param out_cap      Size of out_buf in bytes.
+/// @return Buffer convention shared with aivpn_qr_png: if the response body
+///         fits in out_cap, it is copied into out_buf and the number of
+///         bytes written is returned (always <= out_cap). If it does not
+///         fit, out_buf is left untouched and the needed length is
+///         returned instead (always > out_cap) — the caller distinguishes
+///         the two cases by comparing the return value against the
+///         out_cap it passed in, then retries with a buffer of at least
+///         that size. Returns -1 on any error: NULL/invalid path, no
+///         active tunnel session, the control channel is closed, or the
+///         call times out awaiting a response.
+intptr_t aivpn_mgmt_request(
+    uint8_t method,
+    const char *path,
+    const uint8_t *body,
+    size_t body_len,
+    uint16_t *out_status,
+    uint8_t *out_buf,
+    size_t out_cap
+);
+
+/// Render `text` (typically an aivpn://... connection key) as a QR code PNG
+/// and copy the encoded bytes into out_buf.
+///
+/// @param text     NUL-terminated, valid-UTF-8 string to encode.
+/// @param out_buf  Buffer to receive the PNG bytes. May be NULL only if
+///                 out_cap is 0.
+/// @param out_cap  Size of out_buf in bytes.
+/// @return Same written-len-or-needed-len convention as
+///         aivpn_mgmt_request: the number of PNG bytes written when out_cap
+///         was large enough, or the needed length (out_buf left untouched)
+///         otherwise. Returns -1 if text is NULL/not valid UTF-8/empty, or
+///         PNG encoding fails.
+intptr_t aivpn_qr_png(
+    const char *text,
+    uint8_t *out_buf,
+    size_t out_cap
+);
+
 #ifdef __cplusplus
 }
 #endif
