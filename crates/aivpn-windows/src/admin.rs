@@ -49,6 +49,13 @@ pub const PATH_AUDIT_LOG: &str = "/api/v1/audit-log";
 pub const PATH_POOL_NODES: &str = "/api/v1/pool/nodes";
 /// B3: `GET /api/v1/pool/health` — aggregate pool-sync health summary.
 pub const PATH_POOL_HEALTH: &str = "/api/v1/pool/health";
+/// C3: `GET /api/v1/backup/export` — full config backup blob, used by the
+/// migration wizard's export step. Same route the web panel's backup page
+/// already drives (`platforms/aivpn-web/client/src/routes/backup`).
+pub const PATH_BACKUP_EXPORT: &str = "/api/v1/backup/export";
+/// C3: `POST /api/v1/backup/import` — restores a backup blob (the exported
+/// file's raw bytes as the request body) onto a freshly-installed server.
+pub const PATH_BACKUP_IMPORT: &str = "/api/v1/backup/import";
 
 pub fn path_client(id: &str) -> String {
     format!("/api/v1/clients/{id}")
@@ -380,6 +387,13 @@ pub enum AdminRequest {
     PoolNodes,
     /// B3: `GET /api/v1/pool/health` — Viewer+Admin.
     PoolHealth,
+    /// C3: `GET /api/v1/backup/export` — migration wizard export step.
+    BackupExport,
+    /// C3: `POST /api/v1/backup/import` — migration wizard import step;
+    /// `body` is the exported blob's raw bytes, read verbatim from disk.
+    BackupImport {
+        body: Vec<u8>,
+    },
 }
 
 pub enum AdminResponse {
@@ -415,6 +429,10 @@ pub enum AdminResponse {
     PoolNodes(Result<Vec<PoolNode>, String>),
     /// B3: response to `AdminRequest::PoolHealth`.
     PoolHealth(Result<PoolHealth, String>),
+    /// C3: raw backup JSON blob from `GET /api/v1/backup/export`.
+    BackupExported(Result<Vec<u8>, String>),
+    /// C3: result of `POST /api/v1/backup/import`.
+    BackupImported(Result<(), String>),
 }
 
 /// Run one admin operation on a background thread and send exactly one
@@ -455,6 +473,12 @@ pub fn spawn(client_binary: PathBuf, req: AdminRequest, tx: Sender<AdminResponse
             AdminRequest::AuditLog => AdminResponse::AuditLog(get_audit_log(&client_binary)),
             AdminRequest::PoolNodes => AdminResponse::PoolNodes(list_pool_nodes(&client_binary)),
             AdminRequest::PoolHealth => AdminResponse::PoolHealth(get_pool_health(&client_binary)),
+            AdminRequest::BackupExport => {
+                AdminResponse::BackupExported(backup_export(&client_binary))
+            }
+            AdminRequest::BackupImport { body } => {
+                AdminResponse::BackupImported(backup_import(&client_binary, &body))
+            }
         };
         let _ = tx.send(resp);
     });
@@ -668,6 +692,22 @@ fn get_audit_log(client_binary: &Path) -> Result<Vec<AuditEntry>, String> {
     let (status, body) = mgmt_call(client_binary, "GET", PATH_AUDIT_LOG, &[])?;
     check_status(status, &body)?;
     parse_audit_log(&body)
+}
+
+/// C3 migration wizard, export step: fetch the full backup blob. Returned
+/// as raw bytes (not parsed) — the caller writes it straight to a file, the
+/// same opaque JSON blob the web panel's backup page downloads.
+fn backup_export(client_binary: &Path) -> Result<Vec<u8>, String> {
+    let (status, body) = mgmt_call(client_binary, "GET", PATH_BACKUP_EXPORT, &[])?;
+    check_status(status, &body)?;
+    Ok(body)
+}
+
+/// C3 migration wizard, import step: POST a previously-exported blob (read
+/// verbatim from disk by the caller) to the freshly-installed server.
+fn backup_import(client_binary: &Path, body: &[u8]) -> Result<(), String> {
+    let (status, resp_body) = mgmt_call(client_binary, "POST", PATH_BACKUP_IMPORT, body)?;
+    check_status(status, &resp_body)
 }
 
 /// Run `aivpn-client role` and parse the bare decimal digit it prints to

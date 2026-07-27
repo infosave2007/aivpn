@@ -321,4 +321,61 @@ object AivpnJni {
      * Decode with [android.graphics.BitmapFactory.decodeByteArray].
      */
     external fun qrPng(text: String): ByteArray
+
+    // ──────────── C2b: in-app SSH server installer (ssh-install feature) ────────────
+    //
+    // Backed by `aivpn-common::ssh_install` via the JNI bridge in
+    // `aivpn-android-core/src/lib.rs` (`ssh-install` is a default feature of
+    // that crate, so it ships in the standard .so build). These calls are
+    // completely independent of the tunnel session used by [mgmtRequest] —
+    // they open their own outbound SSH connection to the target host.
+
+    /**
+     * Connects to `host:port` as `user`, completes just enough of the SSH
+     * handshake to read the server's host key, and returns its fingerprint
+     * for TOFU confirmation before [sshInstallStart] is called with it.
+     * Blocks the calling thread (spins up a throwaway single-thread tokio
+     * runtime) — call off the UI thread.
+     *
+     * @return `"SHA256:..."` fingerprint, or `null` on any error (DNS/TCP/
+     *         protocol failure, invalid port, bad UTF-8 in `host`/`user`).
+     */
+    external fun sshProbeHostkey(host: String, port: Int, user: String): String?
+
+    /** SHA256 (hex) of the embedded `install-server.sh`, for display before running it. */
+    external fun sshInstallScriptSha256(): String
+
+    /** Full text of the embedded `install-server.sh`. */
+    external fun sshInstallScript(): String
+
+    /**
+     * Parses `paramsJson` (host/port/user/auth/fingerprint/binary/mode/...
+     * — see [AdminApi]/[InstallServerActivity] callers for the exact shape)
+     * and, if valid, spawns a background thread that runs the installer,
+     * returning immediately with a job handle to poll via [sshInstallPoll].
+     *
+     * @return job handle (>=1), or `-1` if `paramsJson` is malformed —
+     *         in that case no job is created; nothing to poll or free.
+     */
+    external fun sshInstallStart(paramsJson: String): Long
+
+    /**
+     * Pops the next queued progress event for `handle` (JSON, one of the
+     * `InstallEvent` shapes: `connected`/`uploading`/`line`/`marker`/`finished`).
+     *
+     * - An event is queued -> that event's JSON string.
+     * - No event queued, job still running -> `null` — poll again later (~300ms).
+     * - No event queued, job finished, OR `handle` unknown -> `""` — safe to
+     *   call [sshInstallFree].
+     */
+    external fun sshInstallPoll(handle: Long): String?
+
+    /**
+     * Forgets `handle`, freeing its queued-events storage. Does NOT cancel an
+     * in-flight install — if the background thread is still running it keeps
+     * going, just becomes unobservable.
+     *
+     * @return `0` if a job was removed, `-1` if `handle` was already unknown.
+     */
+    external fun sshInstallFree(handle: Long): Int
 }

@@ -121,6 +121,73 @@ pub unsafe extern "C" fn aivpn_ssh_probe_hostkey(
     }
 }
 
+/// Decodes `privkey_b64` (32 raw bytes, base64 STANDARD) as an X25519 device static
+/// private key and returns its public key, base64 STANDARD-encoded.
+///
+/// This is the mobile counterpart of desktop's
+/// `aivpn_client::ssh_install_cmd::local_device_pubkey_b64` — but desktop reads its
+/// 32-byte private key straight off disk (`~/.config/aivpn/device.key`), while this core
+/// never persists the device key itself (there is no on-disk `device.key` on iOS/Android):
+/// the app owns that secret (Keychain / Keystore) and already hands the raw 32 bytes to
+/// `aivpn_run_tunnel`'s `static_privkey` parameter for JIT enrollment on every session, so
+/// the getter mirrors that same input contract instead of inventing a new storage
+/// location. Same `KeyPair::from_private_key` → `public_key_bytes()` derivation as
+/// desktop, so a device produces the identical pubkey through either path.
+///
+/// Returns `None` if `privkey_b64` is not valid base64, or does not decode to exactly 32
+/// bytes. Never panics.
+pub(crate) fn device_pubkey_b64_from_privkey_b64(privkey_b64: &str) -> Option<String> {
+    use base64::Engine;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(privkey_b64.trim())
+        .ok()?;
+    if bytes.len() != 32 {
+        return None;
+    }
+    let mut arr = [0u8; 32];
+    arr.copy_from_slice(&bytes);
+    let kp = aivpn_common::crypto::KeyPair::from_private_key(arr);
+    Some(base64::engine::general_purpose::STANDARD.encode(kp.public_key_bytes()))
+}
+
+/// Copies the device's X25519 public key — derived from the caller-supplied
+/// `privkey_b64` (same 32-byte device static private key passed as `static_privkey` into
+/// `aivpn_run_tunnel`), base64 STANDARD-encoded — into `out_buf`. Lets the in-app SSH
+/// install wizard populate `install_params_from_json`'s `device_pubkey_b64` field to
+/// request a device-bound (admin-capable) client at add time (mirrors desktop's
+/// `--device-pubkey` flow), without the app needing to reimplement X25519 key derivation
+/// or link a general-purpose crypto crate itself.
+///
+/// See `device_pubkey_b64_from_privkey_b64` for the pure derivation this wraps.
+///
+/// Buffer contract shared with `aivpn_ssh_probe_hostkey` (see its doc comment): returns
+/// the number of bytes written when `out_cap` was large enough (always `<= out_cap`), or
+/// the needed length (`out_buf` left untouched, always `> out_cap`) otherwise. Returns -1
+/// if `privkey_b64` is NULL/not valid UTF-8/not valid base64/not exactly 32 decoded bytes.
+///
+/// # Safety
+/// `privkey_b64` must be a NUL-terminated, valid-UTF-8 C string. `out_buf` must point to
+/// at least `out_cap` writable bytes (may be NULL only if `out_cap` is 0).
+#[no_mangle]
+pub unsafe extern "C" fn aivpn_device_pubkey_from_privkey(
+    privkey_b64: *const c_char,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    if privkey_b64.is_null() {
+        return -1;
+    }
+    // SAFETY: privkey_b64 is a NUL-terminated C string from Swift; null-checked above.
+    let privkey_str = match unsafe { CStr::from_ptr(privkey_b64) }.to_str() {
+        Ok(s) => s,
+        Err(_) => return -1,
+    };
+    match device_pubkey_b64_from_privkey_b64(privkey_str) {
+        Some(pubkey) => unsafe { copy_str_getter(&pubkey, out_buf, out_cap) },
+        None => -1,
+    }
+}
+
 /// Copies the SHA256 (hex, 64 chars) of the embedded installer script into `out_buf` — lets
 /// the UI show the user what will run on their VPS before they confirm, ahead of starting
 /// the install (mirrors `install-server.sh --print-sha256` /
@@ -323,6 +390,46 @@ pub extern "C" fn aivpn_ssh_install_free(handle: i64) -> c_int {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn device_pubkey_known_vector() {
+        // Fixed 32-byte privkey (bytes 0x01..=0x20) -> known pubkey, computed once via
+        // the same KeyPair::from_private_key/public_key_bytes derivation this function
+        // wraps (see device_pubkey_b64_from_privkey_b64's doc comment for why: same
+        // desktop KeyPair API, just fed the app-supplied bytes instead of a device.key
+        // file). Pins the derivation so a future accidental change (e.g. dropping X25519
+        // clamping) is caught.
+        let privkey_b64 = "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA=";
+        let pubkey = device_pubkey_b64_from_privkey_b64(privkey_b64).expect("valid 32-byte key");
+        assert_eq!(pubkey, "B6N8vBQgk8i3VdwbEOhstCY3StFqqFPtC9/AsrhtHHw=");
+    }
+
+    #[test]
+    fn device_pubkey_roundtrips_against_keypair_generate() {
+        // Cross-checks against a freshly generated KeyPair so this doesn't just pin a
+        // magic constant: any random device key exported via export_private_key() must
+        // decode back to the same public_key_bytes() through the FFI-facing helper.
+        use base64::Engine;
+        let kp = aivpn_common::crypto::KeyPair::generate();
+        let privkey_b64 = base64::engine::general_purpose::STANDARD.encode(kp.export_private_key());
+        let expected_pubkey_b64 =
+            base64::engine::general_purpose::STANDARD.encode(kp.public_key_bytes());
+        assert_eq!(
+            device_pubkey_b64_from_privkey_b64(&privkey_b64),
+            Some(expected_pubkey_b64)
+        );
+    }
+
+    #[test]
+    fn device_pubkey_rejects_garbage_input() {
+        assert_eq!(device_pubkey_b64_from_privkey_b64(""), None);
+        assert_eq!(device_pubkey_b64_from_privkey_b64("not base64!!!"), None);
+        // valid base64 but wrong decoded length (16 bytes, not 32)
+        assert_eq!(
+            device_pubkey_b64_from_privkey_b64("AQIDBAUGBwgJCgsMDQ4PEA=="),
+            None
+        );
+    }
 
     #[test]
     fn install_params_from_json_rejects_malformed_input_without_raw_pointers() {

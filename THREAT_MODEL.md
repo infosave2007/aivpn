@@ -79,7 +79,7 @@ Outbound packets are shaped to match a selected traffic profile (`MaskProfile`):
 
 ### 4.2 Neural Resonance (automated mask rotation)
 
-A per-mask MLP (~66 KB, deterministically derived from the mask signature vector) monitors live traffic statistics. When the reconstruction error (MSE) exceeds `compromised_threshold = 0.35`, the server triggers a mask rotation and pushes the new mask to connected clients.
+A per-mask MLP (~66 KB, deterministically derived from the mask signature vector) monitors live traffic statistics. When the reconstruction error (MSE) exceeds `compromised_threshold = 0.50`, the server triggers a mask rotation and pushes the new mask to connected clients.
 
 Features monitored: packet size distribution, IAT statistics, entropy, burst patterns, packet direction ratio, and IAT periodicity.
 
@@ -93,7 +93,89 @@ Features monitored: packet size distribution, IAT statistics, entropy, burst pat
 
 ---
 
-## 5. Kill-Switch & Leak Protection
+## 5. Machine Learning Components
+
+AIVPN ships two small, self-contained ML components that defend the masks described in Section 4. Neither is an LLM and neither needs a GPU — both are baked into the binary as constant weights and run in microseconds. They answer two different questions:
+
+| Component | Question it answers | Family | Where |
+|---|---|---|---|
+| **Neural Resonance** | "Does the *live* traffic still look like this mask's fingerprint?" | Fully-connected MLP **autoencoder** (anomaly detection) | `crates/aivpn-server/src/neural.rs` |
+| **ML-DPI gate** | "Does a masked flow *read as a tunnel* rather than the target protocol?" | **GBDT** (gradient-boosted decision trees) | `crates/aivpn-server/src/dpi_gate.rs` *(R2 Phase D)* |
+
+Both feed the same action: **rotate the mask** when it looks compromised.
+
+### 5.1 Neural Resonance — the reconstruction autoencoder
+
+#### What kind of network
+
+A **feed-forward, fully-connected multilayer perceptron (MLP)** used as an **autoencoder** — *not* convolutional, *not* recurrent, *not* a transformer.
+
+```
+input (64) ──▶ Linear(64→128) ──▶ ReLU ──▶ Linear(128→64) ──▶ output (64)
+                                                                    │
+              reconstruction error  MSE(input, output)  ◀──────────┘
+```
+
+- **Input**: a 64-dimensional feature vector summarising the session's recent traffic — a packet-size histogram (16 bins from 0 to ≥1280 B), byte entropy, packets/sec, bytes/sec, and inter-arrival-time statistics — normalised through a saturating transform (`saturate()`) so heavy tails don't blow up the scale.
+- **Output**: a 64-dimensional *reconstruction* of that same vector.
+- **Score**: `MSE(input, output)` — the mean-squared reconstruction error, aka the **resonance score**.
+
+Because input and output share the same 64 dimensions and the model is trained (here: *baked*) to reproduce the mask's "normal" fingerprint, it behaves as a classic **unsupervised novelty detector**:
+
+- **Low MSE** → live traffic matches the mask → healthy.
+- **High MSE** → live traffic has drifted from the mask's signature → the mask is likely fingerprinted by DPI → **rotate**.
+
+#### What makes it unusual: weights are *derived*, not *trained*
+
+The distinctive design choice: the MLP's weights are **not learned by backpropagation**. They are **deterministically baked** from the mask's own 64-float `signature_vector` — each weight is seeded from a BLAKE3 hash of the signature (`MaskNet::from_signature`). Consequences:
+
+- Every mask induces its **own** network — a per-mask "resonance chamber."
+- No training data, no gradient descent, no model files: the network is a pure function of the mask, so client and server derive the identical net.
+- Conceptually this is closer to a **random-projection / Extreme-Learning-Machine (ELM)-style** fixed-weight autoencoder than to a conventionally trained one. Reconstruction works because the fixed projection is *tuned to that mask's* fingerprint, so on-fingerprint input reconstructs well and off-fingerprint input does not.
+
+#### Thresholds & rotation logic
+
+- Defaults (`NeuralConfig`): `warning_threshold = 0.35`, `compromised_threshold = 0.50`, check every `30 s`, rotation cooldown `60 s`. Calibrated against the realcap2 real-capture corpora replayed through every bundled mask (healthy-traffic MSE: overall p99 ≈ 0.26, max ≈ 0.26; live stand observed up to ≈ 0.31) — see `crates/aivpn-server/examples/neural_calib.rs`.
+- These fixed defaults only gate the **warm-up window**. After `MIN_CALIBRATION_SAMPLES`, a **per-mask adaptive calibration** takes over: the thresholds become `mean + 1.5σ` (warning) and `mean + 3σ` (compromised) of that mask's own observed MSE distribution — so each mask is judged against its own baseline rather than a global constant.
+- Crossing `compromised_threshold` (subject to cooldown) triggers **mask rotation** in the gateway.
+
+> Patent-pending. The point is O(1), stateless, per-mask anomaly detection that needs no labelled attack data — it detects *deviation from self*, so it reacts to novel DPI fingerprinting it has never seen.
+
+### 5.2 The ML-DPI gate — GBDT "reads-as-tunnel" classifier (R2 Phase D)
+
+#### What kind of model
+
+A **gradient-boosted decision-tree ensemble (GBDT)** — an ensemble of shallow trees whose additive votes produce a probability. **Not a neural network at all**; a different ML family, chosen because it is cheap, needs no matrix math, and handles the mixed size/entropy/header features well.
+
+#### What it does
+
+Full deep-packet-inspection (running nDPI) is far too heavy for the live data path. The GBDT is a **cheap inline approximation** of a DPI verdict: given a window of a session's packets it outputs the probability that the flow **reads as an obfuscated tunnel** rather than as its declared target protocol.
+
+- **Features (23, all cheap, no deep payload parsing)**: packet-size moments and histogram, first-16-byte entropy, and a few protocol-structure checks (STUN message-type / magic-cookie / length-consistency, QUIC long-header form). Inter-arrival time was deliberately **excluded** — it proved leaky/unstable in the offline study.
+- **Training** (offline, `research/mask-generation/r2/`): a teacher/student setup — nDPI labels the synthetic + real captures, the GBDT learns to reproduce the verdict. Honest **grouped** cross-validation (split by mask, so no leakage): **93.3 %** masked-domain accuracy, and the binary "reads-as-tunnel" gate reached **precision + recall = 1.000** — it never rejected a genuine masked flow and caught every broken one.
+- **Deployment**: the trained tree ensemble is exported to **constant weights embedded in the server binary** (the same idea as the baked MLP), traversed in place — no model file, no allocation on the hot path. Gated behind the `neural` Cargo feature.
+
+#### How it composes with Neural Resonance
+
+The GBDT verdict is a **sibling signal**, not a replacement. Both feed the same gateway rotate decision:
+
+- **Neural Resonance** watches for *drift from self* (this mask stopped looking like itself).
+- **ML-DPI gate** watches for *reads-as-tunnel* (this mask looks like obfuscation to a DPI-style classifier).
+
+Either crossing its threshold ⇒ the mask is considered compromised ⇒ rotate. Two independent detectors of different families make the trigger robust: a DPI technique that fools one is unlikely to fool both.
+
+### 5.3 Related offline ML (not on the data path)
+
+The same GBDT/discriminator also powers **offline** tooling, so it never costs runtime latency there:
+
+- **CI DPI gate** (R2 Phase A): every published mask is nDPI-classified before it can be merged.
+- **Adversarial mask-repair** (R2 Phase C, `aivpn-mask-repair`): a mask that fails the DPI gate is automatically *repaired* by a bounded hill-climb scored by the real nDPI discriminator until it classifies as its target protocol.
+
+Design details: `docs/R2_DESIGN.md`, `docs/R2_PHASE_{A,C,D}.md`.
+
+---
+
+## 6. Kill-Switch & Leak Protection
 
 When `--kill-switch` is active, the client installs firewall rules that drop all outbound traffic except:
 - Traffic on the VPN TUN interface.
@@ -113,7 +195,7 @@ Rules persist across unexpected process death (SIGKILL) by design — the user r
 
 ---
 
-## 6. XDP Early Filter
+## 7. XDP Early Filter
 
 When `xdp_prog.o` is installed, the client attaches an XDP BPF program to the physical NIC (the default-route interface). The filter runs at NIC RX level, before socket buffer allocation:
 
@@ -127,7 +209,7 @@ When `xdp_prog.o` is installed, the client attaches an XDP BPF program to the ph
 
 ---
 
-## 7. Known Limitations
+## 8. Known Limitations
 
 | Limitation | Notes |
 |-----------|-------|
@@ -138,15 +220,3 @@ When `xdp_prog.o` is installed, the client attaches an XDP BPF program to the ph
 | **PSK distribution** | The PSK embedded in the connection key must be distributed securely. Compromise of the connection key string allows impersonation. |
 | **Kill-switch on SIGKILL only persists until reboot** | The firewall rules are loaded in the running kernel/firewall; they do not survive a reboot. This is intentional — a rebooted system starts clean. |
 
----
-
-## 8. Reporting Security Issues
-
-Please report security vulnerabilities by email to **vladislav@minakov.pro** with subject `[AIVPN SECURITY]`. Do not open a public GitHub issue for vulnerability reports.
-
-Include:
-- Affected version / commit hash.
-- A description of the vulnerability and potential impact.
-- Reproduction steps or proof-of-concept if available.
-
-We aim to respond within 72 hours and provide a fix within 14 days for critical issues.

@@ -474,6 +474,33 @@ intptr_t aivpn_ssh_install_bundle_sha256(
     size_t out_cap
 );
 
+/// Decodes privkey_b64 (32 raw bytes, base64 STANDARD) as the device's
+/// X25519 static private key — the same 32 bytes the app already owns and
+/// passes as aivpn_run_tunnel's static_privkey parameter for JIT enrollment;
+/// this core does NOT persist a device key of its own — and copies its
+/// derived public key, base64 STANDARD-encoded, into out_buf. Lets the
+/// in-app SSH install wizard populate install_params_from_json's
+/// "device_pubkey_b64" field to request a device-bound (admin-capable)
+/// client at add time (mirrors desktop's `aivpn ssh-install run
+/// --device-pubkey` flow), without the app linking its own X25519 crate.
+///
+/// Buffer contract: same written-len-or-needed-len convention as
+/// aivpn_ssh_probe_hostkey.
+///
+/// @param privkey_b64  NUL-terminated base64 STANDARD encoding of the
+///                     device's 32-byte X25519 static private key.
+/// @param out_buf      Buffer to receive the base64 pubkey bytes. May be
+///                     NULL only if out_cap is 0.
+/// @param out_cap      Size of out_buf in bytes.
+/// @return Number of bytes written / needed length per the shared buffer
+///         contract, or -1 if privkey_b64 is NULL, not valid UTF-8, not
+///         valid base64, or does not decode to exactly 32 bytes.
+intptr_t aivpn_device_pubkey_from_privkey(
+    const char *privkey_b64,
+    uint8_t *out_buf,
+    size_t out_cap
+);
+
 /// Copies the embedded installer script's own text
 /// (deploy/install-server.sh, typically ~20 KB) into out_buf, for display
 /// before the user confirms an install.

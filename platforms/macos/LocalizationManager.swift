@@ -708,6 +708,465 @@ class LocalizationManager: ObservableObject {
             "en": "Global default",
             "ru": "Глобальный по умолчанию"
         ],
+
+        // MARK: - Entry buttons (Wave C3-macOS)
+        "install_wizard_button": [
+            "en": "Install server via SSH",
+            "ru": "Установить сервер по SSH"
+        ],
+        "migrate_wizard_button": [
+            "en": "Migrate server",
+            "ru": "Миграция сервера"
+        ],
+
+        // MARK: - SSH server install wizard (Wave C3-macOS)
+        "install_wizard_title": [
+            "en": "Install Server via SSH",
+            "ru": "Установка сервера по SSH"
+        ],
+        "install_step_target_title": [
+            "en": "Where to install",
+            "ru": "Куда устанавливаем"
+        ],
+        "install_host": [
+            "en": "Host (IP or domain)",
+            "ru": "Хост (IP или домен)"
+        ],
+        "install_port": [
+            "en": "SSH port",
+            "ru": "SSH-порт"
+        ],
+        "install_user": [
+            "en": "SSH user",
+            "ru": "Пользователь SSH"
+        ],
+        "install_auth_title": [
+            "en": "Authentication",
+            "ru": "Аутентификация"
+        ],
+        "install_auth_password": [
+            "en": "Password",
+            "ru": "Пароль"
+        ],
+        "install_auth_key_file": [
+            "en": "SSH key file",
+            "ru": "Файл SSH-ключа"
+        ],
+        "install_password_placeholder": [
+            "en": "SSH password",
+            "ru": "Пароль SSH"
+        ],
+        "install_key_file_path": [
+            "en": "Private key file (PEM)",
+            "ru": "Файл приватного ключа (PEM)"
+        ],
+        "install_browse": [
+            "en": "Choose…",
+            "ru": "Выбрать…"
+        ],
+        "install_key_passphrase": [
+            "en": "Key passphrase (optional)",
+            "ru": "Пароль ключа (опционально)"
+        ],
+        "install_server_ip": [
+            "en": "Server public IP (optional, auto-detected if empty)",
+            "ru": "Публичный IP сервера (опционально, авто-определение)"
+        ],
+        "install_server_port": [
+            "en": "Server VPN port (optional)",
+            "ru": "VPN-порт сервера (опционально)"
+        ],
+        "install_mode": [
+            "en": "Install mode",
+            "ru": "Режим установки"
+        ],
+        "install_mode_systemd": [
+            "en": "systemd",
+            "ru": "systemd"
+        ],
+        "install_mode_docker": [
+            "en": "Docker",
+            "ru": "Docker"
+        ],
+        "install_bind_device": [
+            "en": "Bind admin client to this device",
+            "ru": "Привязать admin-клиент к этому устройству"
+        ],
+        "install_bind_device_help": [
+            "en": "On: uses this Mac's device key (or creates one on the server). Off: creates an unbound admin client.",
+            "ru": "Вкл.: используется ключ устройства этого Mac (или создаётся на сервере). Выкл.: создаётся непривязанный admin-клиент."
+        ],
+        "install_advanced": [
+            "en": "Advanced",
+            "ru": "Дополнительно"
+        ],
+        "install_binary_source": [
+            "en": "aivpn-server binary source",
+            "ru": "Источник бинарника aivpn-server"
+        ],
+        "install_binary_source_releases": [
+            "en": "GitHub Releases (default)",
+            "ru": "GitHub Releases (по умолчанию)"
+        ],
+        "install_binary_source_file": [
+            "en": "Local file",
+            "ru": "Локальный файл"
+        ],
+        "install_binary_source_url": [
+            "en": "URL",
+            "ru": "URL"
+        ],
+        "install_binary_file_path": [
+            "en": "Local aivpn-server binary path",
+            "ru": "Путь к локальному бинарнику aivpn-server"
+        ],
+        "install_binary_url": [
+            "en": "Download URL",
+            "ru": "URL для загрузки"
+        ],
+        "install_probing": [
+            "en": "Checking host key…",
+            "ru": "Проверка отпечатка хоста…"
+        ],
+        "install_next_probe": [
+            "en": "Next: check host fingerprint",
+            "ru": "Далее: проверить отпечаток"
+        ],
+        "install_tofu_title": [
+            "en": "Confirm host identity",
+            "ru": "Подтвердите личность хоста"
+        ],
+        "install_tofu_message": [
+            "en": "This is the SSH host key fingerprint the server presented. Verify it out-of-band if possible, then trust it to continue.",
+            "ru": "Это отпечаток SSH-ключа хоста, который предъявил сервер. По возможности сверьте его отдельным каналом, затем подтвердите доверие для продолжения."
+        ],
+        "install_show_script": [
+            "en": "Show install script",
+            "ru": "Показать скрипт установки"
+        ],
+        "install_cancel": [
+            "en": "Cancel",
+            "ru": "Отмена"
+        ],
+        "install_trust_and_install": [
+            "en": "Trust & Install",
+            "ru": "Доверяю, установить"
+        ],
+        "install_script_title": [
+            "en": "install-server.sh",
+            "ru": "install-server.sh"
+        ],
+        "install_script_sha256": [
+            "en": "SHA256",
+            "ru": "SHA256"
+        ],
+        "install_close": [
+            "en": "Close",
+            "ru": "Закрыть"
+        ],
+        "install_installing_title": [
+            "en": "Installing…",
+            "ru": "Установка…"
+        ],
+        "install_success_title": [
+            "en": "Installation complete",
+            "ru": "Установка завершена"
+        ],
+        "install_failure_title": [
+            "en": "Installation failed",
+            "ru": "Установка не удалась"
+        ],
+        "install_exit_code": [
+            "en": "exit code",
+            "ru": "код завершения"
+        ],
+        "install_profile_name": [
+            "en": "Profile name",
+            "ru": "Имя профиля"
+        ],
+        "install_import_profile": [
+            "en": "Import profile",
+            "ru": "Импортировать профиль"
+        ],
+        "install_imported": [
+            "en": "Profile imported.",
+            "ru": "Профиль импортирован."
+        ],
+        "install_no_connection_key": [
+            "en": "No connection key was returned over this channel (device binding was likely off) — check the admin panel or server logs to fetch one manually.",
+            "ru": "По этому каналу ключ подключения не получен (вероятно, привязка устройства была выключена) — получите его вручную через панель администрирования или логи сервера."
+        ],
+        "install_start_over": [
+            "en": "New install",
+            "ru": "Новая установка"
+        ],
+
+        // Known ##AIVPN marker steps (install-server.sh + ssh-install run) —
+        // mirrors the step list documented on ssh_install_cmd.rs.
+        "install_step_ssh_connect": [
+            "en": "Connecting over SSH",
+            "ru": "Подключение по SSH"
+        ],
+        "install_step_upload": [
+            "en": "Uploading",
+            "ru": "Загрузка файлов"
+        ],
+        "install_step_start": [
+            "en": "Starting installer",
+            "ru": "Запуск установщика"
+        ],
+        "install_step_detect_env": [
+            "en": "Detecting environment",
+            "ru": "Определение окружения"
+        ],
+        "install_step_port_check": [
+            "en": "Checking VPN port",
+            "ru": "Проверка VPN-порта"
+        ],
+        "install_step_install_deps": [
+            "en": "Installing dependencies",
+            "ru": "Установка зависимостей"
+        ],
+        "install_step_tun_device": [
+            "en": "Configuring TUN device",
+            "ru": "Настройка TUN-устройства"
+        ],
+        "install_step_create_dirs": [
+            "en": "Creating directories",
+            "ru": "Создание директорий"
+        ],
+        "install_step_fetch_binary": [
+            "en": "Fetching aivpn-server binary",
+            "ru": "Загрузка бинарника aivpn-server"
+        ],
+        "install_step_verify_binary": [
+            "en": "Verifying binary",
+            "ru": "Проверка бинарника"
+        ],
+        "install_step_install_binary": [
+            "en": "Installing binary",
+            "ru": "Установка бинарника"
+        ],
+        "install_step_seed_config": [
+            "en": "Writing server config",
+            "ru": "Запись конфигурации сервера"
+        ],
+        "install_step_gen_key": [
+            "en": "Generating server keys",
+            "ru": "Генерация ключей сервера"
+        ],
+        "install_step_seed_masks": [
+            "en": "Seeding masks",
+            "ru": "Загрузка масок"
+        ],
+        "install_step_install_systemd_unit": [
+            "en": "Installing systemd unit",
+            "ru": "Установка systemd-юнита"
+        ],
+        "install_step_ip_forward": [
+            "en": "Enabling IP forwarding",
+            "ru": "Включение IP-форвардинга"
+        ],
+        "install_step_firewall": [
+            "en": "Configuring firewall",
+            "ru": "Настройка файервола"
+        ],
+        "install_step_start_service": [
+            "en": "Starting service",
+            "ru": "Запуск сервиса"
+        ],
+        "install_step_create_admin_client": [
+            "en": "Creating admin client",
+            "ru": "Создание admin-клиента"
+        ],
+        "install_step_health_check": [
+            "en": "Health check",
+            "ru": "Проверка работоспособности"
+        ],
+        "install_step_done": [
+            "en": "Done",
+            "ru": "Готово"
+        ],
+        "install_step_client_done": [
+            "en": "Installer finished",
+            "ru": "Установщик завершил работу"
+        ],
+        "install_step_device_pubkey": [
+            "en": "Device binding",
+            "ru": "Привязка устройства"
+        ],
+        "install_step_preflight": [
+            "en": "Preflight checks",
+            "ru": "Предварительные проверки"
+        ],
+        "install_step_docker_mode": [
+            "en": "Docker setup",
+            "ru": "Настройка Docker"
+        ],
+
+        // Known ##AIVPN marker codes.
+        "install_code_port_free": [
+            "en": "port free",
+            "ru": "порт свободен"
+        ],
+        "install_code_upgrade": [
+            "en": "upgrading existing install",
+            "ru": "обновление существующей установки"
+        ],
+        "install_code_port_busy": [
+            "en": "port busy",
+            "ru": "порт занят"
+        ],
+        "install_code_created": [
+            "en": "created",
+            "ru": "создано"
+        ],
+        "install_code_exists": [
+            "en": "already exists",
+            "ru": "уже существует"
+        ],
+        "install_code_template_missing": [
+            "en": "template missing",
+            "ru": "шаблон отсутствует"
+        ],
+        "install_code_no_local_device_key": [
+            "en": "no local device key",
+            "ru": "нет локального ключа устройства"
+        ],
+        "install_code_fingerprint_mismatch": [
+            "en": "fingerprint mismatch",
+            "ru": "отпечаток не совпадает"
+        ],
+        "install_code_auth_failed": [
+            "en": "authentication failed",
+            "ru": "ошибка аутентификации"
+        ],
+        "install_code_connect_failed": [
+            "en": "connection failed",
+            "ru": "ошибка подключения"
+        ],
+        "install_code_binary_missing": [
+            "en": "aivpn-client not found",
+            "ru": "aivpn-client не найден"
+        ],
+        "install_code_spawn_failed": [
+            "en": "failed to start process",
+            "ru": "не удалось запустить процесс"
+        ],
+
+        // MARK: - Migration wizard (Wave C3-macOS)
+        "migrate_wizard_title": [
+            "en": "Server Migration",
+            "ru": "Миграция сервера"
+        ],
+        "migrate_step_export": [
+            "en": "1. Export",
+            "ru": "1. Экспорт"
+        ],
+        "migrate_step_install": [
+            "en": "2. Install",
+            "ru": "2. Установка"
+        ],
+        "migrate_step_import": [
+            "en": "3. Import",
+            "ru": "3. Импорт"
+        ],
+        "migrate_export_title": [
+            "en": "Export from the current server",
+            "ru": "Экспорт с текущего сервера"
+        ],
+        "migrate_export_intro": [
+            "en": "Connect to the OLD server as Admin, then export its backup. This calls the running daemon's admin channel for real.",
+            "ru": "Подключитесь к СТАРОМУ серверу с ролью Admin, затем экспортируйте его резервную копию. Вызов идёт через реальный admin-канал работающего демона."
+        ],
+        "migrate_not_connected": [
+            "en": "Not connected — connect to a server first.",
+            "ru": "Нет подключения — сначала подключитесь к серверу."
+        ],
+        "migrate_exporting": [
+            "en": "Exporting…",
+            "ru": "Экспорт…"
+        ],
+        "migrate_run_export": [
+            "en": "Export current server",
+            "ru": "Экспортировать текущий сервер"
+        ],
+        "migrate_export_success": [
+            "en": "Export succeeded",
+            "ru": "Экспорт выполнен успешно"
+        ],
+        "migrate_bytes": [
+            "en": "bytes",
+            "ru": "байт"
+        ],
+        "migrate_export_rejected": [
+            "en": "Server rejected the request",
+            "ru": "Сервер отклонил запрос"
+        ],
+        "migrate_export_rejected_note": [
+            "en": "backup/export and backup/import are not exposed over the VPN tunnel by design (security restriction) — see mgmt_service.rs::classify_route. Export/import a backup on the server itself (SSH/CLI) instead.",
+            "ru": "backup/export и backup/import намеренно не доступны через VPN-туннель (ограничение безопасности) — см. mgmt_service.rs::classify_route. Экспортируйте/импортируйте резервную копию непосредственно на сервере (через SSH/CLI)."
+        ],
+        "migrate_channel_unavailable": [
+            "en": "Admin channel unavailable — no reply from the running daemon.",
+            "ru": "Admin-канал недоступен — нет ответа от работающего демона."
+        ],
+        "migrate_next": [
+            "en": "Next",
+            "ru": "Далее"
+        ],
+        "migrate_back": [
+            "en": "Back",
+            "ru": "Назад"
+        ],
+        "migrate_install_title": [
+            "en": "Install the new server",
+            "ru": "Установите новый сервер"
+        ],
+        "migrate_install_intro": [
+            "en": "Open the SSH install wizard to set up the new server, then import its connection key.",
+            "ru": "Откройте мастер установки по SSH, чтобы настроить новый сервер, затем импортируйте его ключ подключения."
+        ],
+        "migrate_open_install_wizard": [
+            "en": "Open install wizard",
+            "ru": "Открыть мастер установки"
+        ],
+        "migrate_install_note": [
+            "en": "Once installed, connect to the new server with the imported key before continuing to Import.",
+            "ru": "После установки подключитесь к новому серверу с импортированным ключом, прежде чем переходить к импорту."
+        ],
+        "migrate_import_title": [
+            "en": "Import into the new server",
+            "ru": "Импорт на новый сервер"
+        ],
+        "migrate_import_intro": [
+            "en": "Connect to the NEW server as Admin, then import the backup exported in step 1.",
+            "ru": "Подключитесь к НОВОМУ серверу с ролью Admin, затем импортируйте резервную копию из шага 1."
+        ],
+        "migrate_no_export_body": [
+            "en": "No successfully exported backup yet — go back to step 1.",
+            "ru": "Пока нет успешно экспортированной копии — вернитесь к шагу 1."
+        ],
+        "migrate_importing": [
+            "en": "Importing…",
+            "ru": "Импорт…"
+        ],
+        "migrate_run_import": [
+            "en": "Import backup into new server",
+            "ru": "Импортировать бэкап на новый сервер"
+        ],
+        "migrate_import_success": [
+            "en": "Import succeeded",
+            "ru": "Импорт выполнен успешно"
+        ],
+        "migrate_import_rejected": [
+            "en": "Server rejected the request",
+            "ru": "Сервер отклонил запрос"
+        ],
+        "migrate_close": [
+            "en": "Close",
+            "ru": "Закрыть"
+        ],
     ]
 
     init() {

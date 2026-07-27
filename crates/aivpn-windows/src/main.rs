@@ -1,6 +1,7 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
 mod admin;
+mod install_wizard;
 mod key_storage;
 mod localization;
 mod vpn_manager;
@@ -221,6 +222,12 @@ fn mask_choices_from_catalog(lang: localization::Lang) -> Option<Vec<(String, St
 /// Decode a PNG into (rgba_bytes, width, height). Panics on decode failure
 /// — both callers pass a bundled, known-good asset, so a failure here means
 /// the build is broken, not a runtime condition to recover from.
+///
+/// `png`/`eframe` are `cfg(windows)`-only dependencies (see Cargo.toml), so
+/// this — and `app_icon` below — must stay gated the same way for the crate
+/// to remain host-buildable on Linux (`cargo test -p aivpn-windows`), same
+/// as every other egui-touching item in this file.
+#[cfg(windows)]
 fn decode_png_rgba(bytes: &[u8]) -> (Vec<u8>, u32, u32) {
     let decoder = png::Decoder::new(std::io::Cursor::new(bytes));
     let mut reader = decoder.read_info().expect("bundled brand PNG must decode");
@@ -237,6 +244,18 @@ fn decode_png_rgba(bytes: &[u8]) -> (Vec<u8>, u32, u32) {
     (rgba, info.width, info.height)
 }
 
+/// Seconds since the Unix epoch, used only to make exported backup file
+/// names unique — never sent anywhere, so a `0` fallback on a broken clock
+/// is harmless (just risks a filename collision on that one machine).
+#[cfg(windows)]
+fn current_unix_timestamp() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+#[cfg(windows)]
 fn app_icon() -> std::sync::Arc<eframe::egui::IconData> {
     let (rgba, width, height) = decode_png_rgba(APP_ICON_PNG);
     std::sync::Arc::new(eframe::egui::IconData {
@@ -652,12 +671,86 @@ struct AivpnApp {
     // Revoke confirmation modal
     admin_revoke_id: Option<String>,
     admin_revoke_name: String,
+
+    // ── SSH server-install wizard (C3) — shells out to `aivpn-client
+    // ssh-install {script,probe,run}`, see `install_wizard.rs`'s module
+    // doc. Entry point sits next to `draw_admin_panel`, Admin-only. ──────
+    ssh_wizard_open: bool,
+    ssh_wizard_stage: SshWizardStage,
+    ssh_host: String,
+    ssh_port: String,
+    ssh_user: String,
+    /// `false` = password auth, `true` = private-key file auth.
+    ssh_auth_key_mode: bool,
+    ssh_password: String,
+    ssh_key_path: String,
+    ssh_key_passphrase: String,
+    ssh_mode_docker: bool,
+    ssh_server_ip: String,
+    ssh_server_port: String,
+    ssh_bind_device: bool,
+
+    ssh_probe_busy: bool,
+    ssh_probe_error: Option<String>,
+    ssh_probe_rx: Option<std::sync::mpsc::Receiver<Result<String, String>>>,
+    /// TOFU fingerprint returned by `ssh-install probe`, shown to the user
+    /// for confirmation before `ssh_trusted` is set.
+    ssh_fingerprint: Option<String>,
+    ssh_trusted: bool,
+
+    ssh_show_script: bool,
+    ssh_script_loading: bool,
+    ssh_script_rx: Option<std::sync::mpsc::Receiver<Result<(String, String), String>>>,
+    ssh_script_text: Option<String>,
+    ssh_script_sha256: Option<String>,
+    ssh_script_error: Option<String>,
+
+    ssh_install_tx: std::sync::mpsc::Sender<install_wizard::InstallLine>,
+    ssh_install_rx: std::sync::mpsc::Receiver<install_wizard::InstallLine>,
+    ssh_install_running: bool,
+    ssh_install_log: Vec<install_wizard::InstallLine>,
+    ssh_install_connection_key: Option<String>,
+    /// `Some(true)` once a terminal ok marker (the synthetic `gui_process`
+    /// exit-status marker `install_wizard::spawn_install` always sends) has
+    /// been seen; `Some(false)` on a terminal error; `None` while running.
+    ssh_install_done_ok: Option<bool>,
+    /// Set once `import_ssh_install_key` has successfully added the
+    /// finished install's connection key to `keys`.
+    ssh_import_done: bool,
+
+    // ── Server migration wizard (C3) — export/import via the same
+    // `aivpn-client mgmt` bridge `admin.rs` already uses. ────────────────
+    migration_open: bool,
+    migration_export_busy: bool,
+    migration_export_error: Option<String>,
+    migration_export_saved_path: Option<String>,
+    /// Path to the previously-exported backup file — typed/pasted by the
+    /// user (this crate ships no file-picker, see
+    /// `save_admin_key_to_file`'s doc comment for the same rationale).
+    migration_import_path: String,
+    migration_import_busy: bool,
+    migration_import_error: Option<String>,
+    migration_import_done: bool,
+}
+
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SshWizardStage {
+    /// Target host/auth/options form, not yet probed.
+    Form,
+    /// Fingerprint confirmed ("I trust this host") — ready to install.
+    Confirmed,
+    /// `spawn_install` running, streaming `ssh_install_log`.
+    Installing,
+    /// Terminal state reached (`ssh_install_done_ok` is `Some`).
+    Done,
 }
 
 #[cfg(windows)]
 impl AivpnApp {
     fn new(settings: AppSettings, ctx: &eframe::egui::Context) -> Self {
         let (admin_tx, admin_rx) = std::sync::mpsc::channel();
+        let (ssh_install_tx, ssh_install_rx) = std::sync::mpsc::channel();
         let mut app = Self {
             settings,
             vpn: VpnManager::new(),
@@ -706,6 +799,45 @@ impl AivpnApp {
             admin_qr_saved_msg: None,
             admin_revoke_id: None,
             admin_revoke_name: String::new(),
+            ssh_wizard_open: false,
+            ssh_wizard_stage: SshWizardStage::Form,
+            ssh_host: String::new(),
+            ssh_port: "22".to_string(),
+            ssh_user: "root".to_string(),
+            ssh_auth_key_mode: false,
+            ssh_password: String::new(),
+            ssh_key_path: String::new(),
+            ssh_key_passphrase: String::new(),
+            ssh_mode_docker: false,
+            ssh_server_ip: String::new(),
+            ssh_server_port: String::new(),
+            ssh_bind_device: true,
+            ssh_probe_busy: false,
+            ssh_probe_error: None,
+            ssh_probe_rx: None,
+            ssh_fingerprint: None,
+            ssh_trusted: false,
+            ssh_show_script: false,
+            ssh_script_loading: false,
+            ssh_script_rx: None,
+            ssh_script_text: None,
+            ssh_script_sha256: None,
+            ssh_script_error: None,
+            ssh_install_tx,
+            ssh_install_rx,
+            ssh_install_running: false,
+            ssh_install_log: Vec::new(),
+            ssh_install_connection_key: None,
+            ssh_install_done_ok: None,
+            ssh_import_done: false,
+            migration_open: false,
+            migration_export_busy: false,
+            migration_export_error: None,
+            migration_export_saved_path: None,
+            migration_import_path: String::new(),
+            migration_import_busy: false,
+            migration_import_error: None,
+            migration_import_done: false,
             connected_since: None,
             last_conn_state: ConnectionState::Disconnected,
             error_msg: None,
@@ -917,6 +1049,7 @@ impl AivpnApp {
             self.last_conn_state = cur;
         }
         self.poll_admin();
+        self.poll_ssh_install();
         if let Some(at) = self.error_at {
             if at.elapsed().as_secs() > 8 {
                 self.error_msg = None;
@@ -1072,8 +1205,283 @@ impl AivpnApp {
                         self.admin_pool_health = Some(h);
                     }
                 }
+                AdminResponse::BackupExported(r) => {
+                    self.migration_export_busy = false;
+                    match r {
+                        Ok(bytes) => {
+                            let dir = dirs::download_dir()
+                                .or_else(dirs::home_dir)
+                                .unwrap_or_else(|| std::path::PathBuf::from("."));
+                            let path =
+                                dir.join(format!("aivpn-backup-{}.json", current_unix_timestamp()));
+                            match std::fs::write(&path, &bytes) {
+                                Ok(()) => {
+                                    self.migration_export_saved_path =
+                                        Some(path.display().to_string());
+                                    self.migration_export_error = None;
+                                }
+                                Err(e) => {
+                                    self.migration_export_error =
+                                        Some(format!("Failed to save backup file: {e}"))
+                                }
+                            }
+                        }
+                        Err(e) => self.migration_export_error = Some(e),
+                    }
+                }
+                AdminResponse::BackupImported(r) => {
+                    self.migration_import_busy = false;
+                    match r {
+                        Ok(()) => {
+                            self.migration_import_done = true;
+                            self.migration_import_error = None;
+                        }
+                        Err(e) => self.migration_import_error = Some(e),
+                    }
+                }
             }
         }
+    }
+
+    // ── SSH server-install wizard (C3) ──────────────────────────────────
+
+    /// Drain every pending streamed `InstallLine` plus the one-shot probe/
+    /// script results, and apply them to wizard UI state. Called once per
+    /// `tick()`, mirroring `poll_admin`.
+    fn poll_ssh_install(&mut self) {
+        while let Ok(line) = self.ssh_install_rx.try_recv() {
+            if let install_wizard::InstallLine::Marker {
+                step,
+                status,
+                connection_key,
+                ..
+            } = &line
+            {
+                if let Some(key) = connection_key {
+                    self.ssh_install_connection_key = Some(key.clone());
+                }
+                // `gui_process` is spawn_install's own synthetic marker,
+                // always sent exactly once when the child exits (see
+                // install_wizard.rs's doc comment) — the one reliable
+                // "the subprocess is done" signal, regardless of whether
+                // the remote script/CLI got far enough to emit its own
+                // `done`/`client_done` markers.
+                if step == "gui_process" {
+                    self.ssh_install_running = false;
+                    self.ssh_install_done_ok = Some(status == "ok");
+                    self.ssh_wizard_stage = SshWizardStage::Done;
+                }
+            }
+            self.ssh_install_log.push(line);
+        }
+
+        if let Some(rx) = &self.ssh_probe_rx {
+            match rx.try_recv() {
+                Ok(Ok(fingerprint)) => {
+                    self.ssh_fingerprint = Some(fingerprint);
+                    self.ssh_probe_busy = false;
+                    self.ssh_probe_error = None;
+                    self.ssh_probe_rx = None;
+                }
+                Ok(Err(e)) => {
+                    self.ssh_probe_error = Some(e);
+                    self.ssh_probe_busy = false;
+                    self.ssh_probe_rx = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.ssh_probe_busy = false;
+                    self.ssh_probe_rx = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
+        }
+
+        if let Some(rx) = &self.ssh_script_rx {
+            match rx.try_recv() {
+                Ok(Ok((sha256, script))) => {
+                    self.ssh_script_sha256 = Some(sha256);
+                    self.ssh_script_text = Some(script);
+                    self.ssh_script_loading = false;
+                    self.ssh_script_error = None;
+                    self.ssh_script_rx = None;
+                }
+                Ok(Err(e)) => {
+                    self.ssh_script_error = Some(e);
+                    self.ssh_script_loading = false;
+                    self.ssh_script_rx = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.ssh_script_loading = false;
+                    self.ssh_script_rx = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
+        }
+    }
+
+    /// `ssh-install probe` (TOFU step 1) on a background thread — see
+    /// `install_wizard::probe`'s doc comment.
+    fn start_ssh_probe(&mut self) {
+        let host = self.ssh_host.trim().to_string();
+        if host.is_empty() {
+            self.ssh_probe_error = Some("Host is required".to_string());
+            return;
+        }
+        let port: u16 = match self.ssh_port.trim().parse() {
+            Ok(p) => p,
+            Err(_) => {
+                self.ssh_probe_error = Some("Invalid port".to_string());
+                return;
+            }
+        };
+        let user = if self.ssh_user.trim().is_empty() {
+            "root".to_string()
+        } else {
+            self.ssh_user.trim().to_string()
+        };
+
+        self.ssh_probe_busy = true;
+        self.ssh_probe_error = None;
+        self.ssh_fingerprint = None;
+        self.ssh_trusted = false;
+
+        let client_binary = self.vpn.client_binary.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.ssh_probe_rx = Some(rx);
+        std::thread::spawn(move || {
+            let result = install_wizard::probe(&client_binary, &host, port, &user);
+            let _ = tx.send(result);
+        });
+    }
+
+    /// `ssh-install script` + `--sha256-only` (paranoid-mode review) on a
+    /// background thread — see `install_wizard::fetch_script`'s doc
+    /// comment.
+    fn start_fetch_script(&mut self) {
+        if self.ssh_script_loading {
+            return;
+        }
+        self.ssh_script_loading = true;
+        self.ssh_script_error = None;
+        let client_binary = self.vpn.client_binary.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.ssh_script_rx = Some(rx);
+        std::thread::spawn(move || {
+            let result = install_wizard::fetch_script(&client_binary);
+            let _ = tx.send(result);
+        });
+    }
+
+    /// Builds an `InstallTarget` from the wizard's form fields and starts
+    /// `install_wizard::spawn_install` streaming into `ssh_install_rx`.
+    /// Requires [`Self::ssh_fingerprint`] to already be `Some` (TOFU step 1
+    /// must have completed) — the caller-side "Install" button is disabled
+    /// otherwise, so this is an invariant, not a user-facing error path.
+    fn start_ssh_install(&mut self) {
+        let fingerprint = match &self.ssh_fingerprint {
+            Some(f) => f.clone(),
+            None => return,
+        };
+        let port: u16 = self.ssh_port.trim().parse().unwrap_or(22);
+        let user = if self.ssh_user.trim().is_empty() {
+            "root".to_string()
+        } else {
+            self.ssh_user.trim().to_string()
+        };
+
+        let (auth, secret) = if self.ssh_auth_key_mode {
+            let has_passphrase = !self.ssh_key_passphrase.is_empty();
+            (
+                install_wizard::InstallAuth::KeyFile {
+                    path: std::path::PathBuf::from(self.ssh_key_path.trim()),
+                    has_passphrase,
+                },
+                has_passphrase.then(|| self.ssh_key_passphrase.clone()),
+            )
+        } else {
+            (
+                install_wizard::InstallAuth::Password,
+                Some(self.ssh_password.clone()),
+            )
+        };
+
+        let target = install_wizard::InstallTarget {
+            host: self.ssh_host.trim().to_string(),
+            port,
+            user,
+            fingerprint,
+            auth,
+            mode: if self.ssh_mode_docker {
+                install_wizard::InstallModeChoice::Docker
+            } else {
+                install_wizard::InstallModeChoice::Systemd
+            },
+            server_ip: (!self.ssh_server_ip.trim().is_empty())
+                .then(|| self.ssh_server_ip.trim().to_string()),
+            server_port: self.ssh_server_port.trim().parse().ok(),
+            bind_device: self.ssh_bind_device,
+        };
+
+        self.ssh_install_running = true;
+        self.ssh_install_log.clear();
+        self.ssh_install_connection_key = None;
+        self.ssh_install_done_ok = None;
+        self.ssh_import_done = false;
+        self.ssh_wizard_stage = SshWizardStage::Installing;
+
+        install_wizard::spawn_install(
+            self.vpn.client_binary.clone(),
+            target,
+            secret,
+            self.ssh_install_tx.clone(),
+        );
+    }
+
+    /// Adds the finished install's `connection_key` to `keys` under an
+    /// auto-generated name, same validation path as the manual "Add key"
+    /// dialog (`KeyStorage::add_key`).
+    fn import_ssh_install_key(&mut self) {
+        let Some(key) = self.ssh_install_connection_key.clone() else {
+            return;
+        };
+        let name = if self.ssh_host.trim().is_empty() {
+            "SSH install".to_string()
+        } else {
+            format!("SSH install ({})", self.ssh_host.trim())
+        };
+        match self
+            .keys
+            .add_key(&name, &key, false, None, None, Vec::new(), Vec::new())
+        {
+            Ok(()) => self.ssh_import_done = true,
+            Err(e) => self.show_error(format!("Failed to import profile: {e}")),
+        }
+    }
+
+    /// Closes the wizard and clears every per-run field (but not the
+    /// host/port/user/mode/options form fields — left in place so
+    /// reopening after a finished/failed run doesn't force retyping them).
+    fn close_ssh_wizard(&mut self) {
+        self.ssh_wizard_open = false;
+        self.ssh_wizard_stage = SshWizardStage::Form;
+        self.ssh_password.clear();
+        self.ssh_key_passphrase.clear();
+        self.ssh_probe_busy = false;
+        self.ssh_probe_error = None;
+        self.ssh_probe_rx = None;
+        self.ssh_fingerprint = None;
+        self.ssh_trusted = false;
+        self.ssh_show_script = false;
+        self.ssh_script_loading = false;
+        self.ssh_script_rx = None;
+        self.ssh_script_text = None;
+        self.ssh_script_sha256 = None;
+        self.ssh_script_error = None;
+        self.ssh_install_running = false;
+        self.ssh_install_log.clear();
+        self.ssh_install_connection_key = None;
+        self.ssh_install_done_ok = None;
+        self.ssh_import_done = false;
     }
 
     fn refresh_admin_pool(&mut self) {
@@ -1200,6 +1608,17 @@ impl AivpnApp {
         let is_admin = self.admin_role == Some(2);
 
         if is_admin {
+            // ── C3 wizard entry points — SSH server install + migration,
+            // Admin-only, next to the client-management section. ─────────
+            ui.horizontal(|ui| {
+                if ui.small_button(t(lang, "ssh_wizard_open_btn")).clicked() {
+                    self.ssh_wizard_open = true;
+                }
+                if ui.small_button(t(lang, "migration_open_btn")).clicked() {
+                    self.migration_open = true;
+                }
+            });
+
             self.draw_admin_clients_section(ui, lang);
         }
 
@@ -1786,6 +2205,405 @@ impl AivpnApp {
             if resp.should_close() {
                 self.admin_revoke_id = None;
             }
+        }
+    }
+
+    // ── SSH server-install wizard (C3) — separate top-level window, same
+    // rationale as `draw_admin_extras`'s viewport dialogs. ────────────────
+
+    fn draw_ssh_install_window(&mut self, ctx: &eframe::egui::Context, lang: Lang) {
+        use eframe::egui;
+
+        if !self.ssh_wizard_open {
+            return;
+        }
+        let mut open = true;
+        egui::Window::new(t(lang, "ssh_wizard_title"))
+            .id(egui::Id::new("ssh_install_wizard"))
+            .collapsible(false)
+            .resizable(true)
+            .default_width(440.0)
+            .open(&mut open)
+            .show(ctx, |ui| match self.ssh_wizard_stage {
+                SshWizardStage::Form | SshWizardStage::Confirmed => {
+                    self.draw_ssh_wizard_form(ui, lang)
+                }
+                SshWizardStage::Installing | SshWizardStage::Done => {
+                    self.draw_ssh_wizard_progress(ui, lang)
+                }
+            });
+        if !open {
+            self.close_ssh_wizard();
+        }
+
+        if self.ssh_show_script {
+            self.draw_ssh_script_window(ctx, lang);
+        }
+    }
+
+    fn draw_ssh_wizard_form(&mut self, ui: &mut eframe::egui::Ui, lang: Lang) {
+        use eframe::egui;
+
+        egui::Grid::new("ssh_wizard_target_grid")
+            .num_columns(2)
+            .spacing([8.0, 4.0])
+            .show(ui, |ui| {
+                ui.label(t(lang, "ssh_host"));
+                ui.text_edit_singleline(&mut self.ssh_host);
+                ui.end_row();
+                ui.label(t(lang, "ssh_port"));
+                ui.text_edit_singleline(&mut self.ssh_port);
+                ui.end_row();
+                ui.label(t(lang, "ssh_user"));
+                ui.text_edit_singleline(&mut self.ssh_user);
+                ui.end_row();
+            });
+
+        ui.separator();
+        ui.horizontal(|ui| {
+            ui.radio_value(
+                &mut self.ssh_auth_key_mode,
+                false,
+                t(lang, "ssh_auth_password"),
+            );
+            ui.radio_value(&mut self.ssh_auth_key_mode, true, t(lang, "ssh_auth_key"));
+        });
+        if self.ssh_auth_key_mode {
+            ui.horizontal(|ui| {
+                ui.label(t(lang, "ssh_key_path"));
+                ui.text_edit_singleline(&mut self.ssh_key_path);
+            });
+            ui.horizontal(|ui| {
+                ui.label(t(lang, "ssh_key_passphrase"));
+                ui.add(egui::TextEdit::singleline(&mut self.ssh_key_passphrase).password(true));
+            });
+        } else {
+            ui.horizontal(|ui| {
+                ui.label(t(lang, "ssh_password"));
+                ui.add(egui::TextEdit::singleline(&mut self.ssh_password).password(true));
+            });
+        }
+
+        ui.separator();
+        ui.checkbox(&mut self.ssh_mode_docker, t(lang, "ssh_mode_docker"));
+        ui.horizontal(|ui| {
+            ui.label(t(lang, "ssh_server_ip"));
+            ui.text_edit_singleline(&mut self.ssh_server_ip);
+        });
+        ui.horizontal(|ui| {
+            ui.label(t(lang, "ssh_server_port"));
+            ui.text_edit_singleline(&mut self.ssh_server_port);
+        });
+        ui.checkbox(&mut self.ssh_bind_device, t(lang, "ssh_bind_device"));
+
+        ui.separator();
+        ui.horizontal(|ui| {
+            if ui.button(t(lang, "ssh_show_script_btn")).clicked() {
+                self.ssh_show_script = true;
+                if self.ssh_script_text.is_none() && !self.ssh_script_loading {
+                    self.start_fetch_script();
+                }
+            }
+            let probe_enabled = !self.ssh_probe_busy && !self.ssh_host.trim().is_empty();
+            if ui
+                .add_enabled(probe_enabled, egui::Button::new(t(lang, "ssh_probe_btn")))
+                .clicked()
+            {
+                self.start_ssh_probe();
+            }
+        });
+        if self.ssh_probe_busy {
+            ui.weak(t(lang, "admin_loading"));
+        }
+        if let Some(err) = &self.ssh_probe_error {
+            ui.colored_label(egui::Color32::from_rgb(0xEF, 0x53, 0x50), err);
+        }
+
+        if let Some(fp) = self.ssh_fingerprint.clone() {
+            ui.separator();
+            ui.label(egui::RichText::new(t(lang, "ssh_fingerprint_label")).strong());
+            ui.label(egui::RichText::new(&fp).font(egui::TextStyle::Monospace));
+            ui.checkbox(&mut self.ssh_trusted, t(lang, "ssh_trust_checkbox"));
+
+            let auth_ready = if self.ssh_auth_key_mode {
+                !self.ssh_key_path.trim().is_empty()
+            } else {
+                !self.ssh_password.is_empty()
+            };
+            let install_enabled = self.ssh_trusted && auth_ready;
+            if ui
+                .add_enabled(
+                    install_enabled,
+                    egui::Button::new(t(lang, "ssh_install_btn")),
+                )
+                .clicked()
+            {
+                self.start_ssh_install();
+            }
+        }
+    }
+
+    fn draw_ssh_wizard_progress(&mut self, ui: &mut eframe::egui::Ui, lang: Lang) {
+        use eframe::egui;
+
+        if self.ssh_install_running {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(t(lang, "ssh_installing"));
+            });
+        }
+
+        egui::Frame::group(ui.style())
+            .inner_margin(egui::Margin::same(4i8))
+            .show(ui, |ui| {
+                ui.set_min_width(ui.available_width());
+                egui::ScrollArea::vertical()
+                    .id_salt("ssh_install_log")
+                    .max_height(260.0)
+                    .stick_to_bottom(true)
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        for line in &self.ssh_install_log {
+                            match line {
+                                install_wizard::InstallLine::Raw(s) => {
+                                    ui.label(
+                                        egui::RichText::new(s)
+                                            .font(egui::TextStyle::Monospace)
+                                            .size(11.0),
+                                    );
+                                }
+                                install_wizard::InstallLine::Marker {
+                                    step,
+                                    status,
+                                    code,
+                                    msg,
+                                    ..
+                                } => {
+                                    // Internal-only synthetic marker — see
+                                    // gui_process_exit_line's doc comment in
+                                    // install_wizard.rs; never shown raw.
+                                    if step == "gui_process" {
+                                        continue;
+                                    }
+                                    let color = match status.as_str() {
+                                        "ok" => egui::Color32::from_rgb(0x4C, 0xAF, 0x50),
+                                        "error" => egui::Color32::from_rgb(0xEF, 0x53, 0x50),
+                                        _ => egui::Color32::from_rgb(0xFF, 0xA7, 0x26),
+                                    };
+                                    let mut text = format!("[{step}] {status}");
+                                    if let Some(c) = code {
+                                        text.push_str(&format!(" ({c})"));
+                                    }
+                                    if let Some(m) = msg {
+                                        text.push_str(&format!(": {m}"));
+                                    }
+                                    ui.colored_label(color, egui::RichText::new(text).size(11.0));
+                                }
+                            }
+                        }
+                    });
+            });
+
+        if let Some(ok) = self.ssh_install_done_ok {
+            ui.separator();
+            if ok {
+                ui.colored_label(
+                    egui::Color32::from_rgb(0x4C, 0xAF, 0x50),
+                    t(lang, "ssh_install_done_ok"),
+                );
+            } else {
+                ui.colored_label(
+                    egui::Color32::from_rgb(0xEF, 0x53, 0x50),
+                    t(lang, "ssh_install_done_error"),
+                );
+            }
+            if self.ssh_install_connection_key.is_some() {
+                ui.horizontal(|ui| {
+                    if !self.ssh_import_done {
+                        if ui.button(t(lang, "ssh_import_profile_btn")).clicked() {
+                            self.import_ssh_install_key();
+                        }
+                    } else {
+                        ui.label(t(lang, "ssh_import_profile_done"));
+                    }
+                });
+            }
+            if ui.button(t(lang, "ssh_wizard_close_btn")).clicked() {
+                self.close_ssh_wizard();
+            }
+        }
+    }
+
+    /// "Show script" review window — text + sha256, independent of the
+    /// main wizard window's open/close state so it can stay open while the
+    /// form behind it is edited.
+    fn draw_ssh_script_window(&mut self, ctx: &eframe::egui::Context, lang: Lang) {
+        use eframe::egui;
+
+        let mut open = true;
+        egui::Window::new(t(lang, "ssh_script_title"))
+            .id(egui::Id::new("ssh_install_script_window"))
+            .collapsible(false)
+            .resizable(true)
+            .default_width(560.0)
+            .default_height(420.0)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                if self.ssh_script_loading {
+                    ui.weak(t(lang, "admin_loading"));
+                }
+                if let Some(err) = &self.ssh_script_error {
+                    ui.colored_label(egui::Color32::from_rgb(0xEF, 0x53, 0x50), err);
+                }
+                if let Some(sha256) = &self.ssh_script_sha256 {
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new(t(lang, "ssh_script_sha256")).strong());
+                        ui.label(egui::RichText::new(sha256).font(egui::TextStyle::Monospace));
+                        if ui.small_button(t(lang, "copy")).clicked() {
+                            ctx.copy_text(sha256.clone());
+                        }
+                    });
+                }
+                if let Some(script) = self.ssh_script_text.clone() {
+                    let mut display = script;
+                    egui::ScrollArea::vertical()
+                        .id_salt("ssh_script_text")
+                        .max_height(320.0)
+                        .show(ui, |ui| {
+                            ui.add(
+                                egui::TextEdit::multiline(&mut display)
+                                    .desired_width(f32::INFINITY)
+                                    .font(egui::TextStyle::Monospace)
+                                    .interactive(false),
+                            );
+                        });
+                }
+            });
+        if !open {
+            self.ssh_show_script = false;
+        }
+    }
+
+    // ── Server migration wizard (C3) ────────────────────────────────────
+
+    fn start_migration_export(&mut self) {
+        self.migration_export_busy = true;
+        self.migration_export_error = None;
+        self.migration_export_saved_path = None;
+        admin::spawn(
+            self.vpn.client_binary.clone(),
+            AdminRequest::BackupExport,
+            self.admin_tx.clone(),
+        );
+    }
+
+    fn start_migration_import(&mut self) {
+        let path = self.migration_import_path.trim();
+        if path.is_empty() {
+            self.migration_import_error =
+                Some(t(self.settings.lang, "migration_import_path_required").to_string());
+            return;
+        }
+        let bytes = match std::fs::read(path) {
+            Ok(b) => b,
+            Err(e) => {
+                self.migration_import_error = Some(format!("Failed to read backup file: {e}"));
+                return;
+            }
+        };
+        self.migration_import_busy = true;
+        self.migration_import_error = None;
+        self.migration_import_done = false;
+        admin::spawn(
+            self.vpn.client_binary.clone(),
+            AdminRequest::BackupImport { body: bytes },
+            self.admin_tx.clone(),
+        );
+    }
+
+    fn draw_migration_window(&mut self, ctx: &eframe::egui::Context, lang: Lang) {
+        use eframe::egui;
+
+        if !self.migration_open {
+            return;
+        }
+        let mut open = true;
+        egui::Window::new(t(lang, "migration_title"))
+            .id(egui::Id::new("migration_wizard"))
+            .collapsible(false)
+            .resizable(true)
+            .default_width(460.0)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.label(egui::RichText::new(t(lang, "migration_step_export")).strong());
+                ui.label(
+                    egui::RichText::new(t(lang, "migration_export_hint"))
+                        .size(11.0)
+                        .weak(),
+                );
+                if ui
+                    .add_enabled(
+                        !self.migration_export_busy,
+                        egui::Button::new(t(lang, "migration_export_btn")),
+                    )
+                    .clicked()
+                {
+                    self.start_migration_export();
+                }
+                if self.migration_export_busy {
+                    ui.weak(t(lang, "admin_loading"));
+                }
+                if let Some(err) = &self.migration_export_error {
+                    ui.colored_label(egui::Color32::from_rgb(0xEF, 0x53, 0x50), err);
+                }
+                if let Some(path) = &self.migration_export_saved_path {
+                    ui.label(
+                        egui::RichText::new(format!("{}: {path}", t(lang, "admin_saved_to")))
+                            .size(11.0),
+                    );
+                }
+
+                ui.separator();
+                ui.label(
+                    egui::RichText::new(t(lang, "migration_step_install"))
+                        .size(11.0)
+                        .weak(),
+                );
+
+                ui.separator();
+                ui.label(egui::RichText::new(t(lang, "migration_step_import")).strong());
+                ui.horizontal(|ui| {
+                    ui.label(t(lang, "migration_import_path_label"));
+                    ui.text_edit_singleline(&mut self.migration_import_path);
+                });
+                if ui
+                    .add_enabled(
+                        !self.migration_import_busy,
+                        egui::Button::new(t(lang, "migration_import_btn")),
+                    )
+                    .clicked()
+                {
+                    self.start_migration_import();
+                }
+                if self.migration_import_busy {
+                    ui.weak(t(lang, "admin_loading"));
+                }
+                if let Some(err) = &self.migration_import_error {
+                    ui.colored_label(egui::Color32::from_rgb(0xEF, 0x53, 0x50), err);
+                }
+                if self.migration_import_done {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(0x4C, 0xAF, 0x50),
+                        t(lang, "migration_import_done"),
+                    );
+                }
+            });
+        if !open {
+            self.migration_open = false;
+            self.migration_export_error = None;
+            self.migration_export_saved_path = None;
+            self.migration_import_error = None;
+            self.migration_import_done = false;
         }
     }
 
@@ -2757,6 +3575,12 @@ impl eframe::App for AivpnApp {
         // stops being drawn, e.g. a disconnect mid-dialog — reset_admin_state()
         // clears both, but only on the NEXT tick(), not synchronously here).
         self.draw_admin_extras(ctx, lang);
+
+        // C3: SSH install + migration wizard windows — same "always drawn,
+        // independent of draw_admin_panel this frame" rationale as
+        // draw_admin_extras above (open flags gate their own visibility).
+        self.draw_ssh_install_window(ctx, lang);
+        self.draw_migration_window(ctx, lang);
 
         // ── Add / Edit dialog — separate OS window (can go outside main window) ──
         if self.show_dialog {

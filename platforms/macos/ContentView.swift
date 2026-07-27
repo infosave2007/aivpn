@@ -815,6 +815,42 @@ struct ContentView: View {
                 .padding(.horizontal, 16)
                 .padding(.vertical, 8)
 
+                // Wave C3-macOS: SSH server install + migration wizards.
+                // Same admin-only gate as "Manage clients" above — both
+                // open their own standalone window (InstallServerWindowController /
+                // MigrationWindowController), mirroring AdminWindowController.
+                Button(action: { InstallServerWindowController.shared.show() }) {
+                    HStack {
+                        Image(systemName: "server.rack")
+                            .font(.caption)
+                        Text(loc.t("install_wizard_button"))
+                            .font(.caption)
+                        Spacer()
+                        Image(systemName: "chevron.right")
+                            .font(.caption2)
+                            .foregroundColor(.secondary)
+                    }
+                }
+                .buttonStyle(.plain)
+                .padding(.horizontal, 16)
+                .padding(.vertical, 8)
+
+                Button(action: { MigrationWindowController.shared.show() }) {
+                    HStack {
+                        Image(systemName: "arrow.triangle.2.circlepath")
+                            .font(.caption)
+                        Text(loc.t("migrate_wizard_button"))
+                            .font(.caption)
+                        Spacer()
+                        Image(systemName: "chevron.right")
+                            .font(.caption2)
+                            .foregroundColor(.secondary)
+                    }
+                }
+                .buttonStyle(.plain)
+                .padding(.horizontal, 16)
+                .padding(.vertical, 8)
+
                 Divider()
             }
 

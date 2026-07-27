@@ -61,6 +61,18 @@
             android:exported="false"
             android:parentActivityName=".AdminActivity" />
 
+        <!-- C3: SSH server-install wizard (Admin role gated, independent of tunnel state) -->
+        <activity
+            android:name=".InstallServerActivity"
+            android:exported="false"
+            android:parentActivityName=".MainActivity" />
+
+        <!-- C3: server-migration guide (export/install/import) (Admin role gated) -->
+        <activity
+            android:name=".MigrationActivity"
+            android:exported="false"
+            android:parentActivityName=".MainActivity" />
+
         <service
             android:name=".AivpnService"
             android:permission="android.permission.BIND_VPN_SERVICE"

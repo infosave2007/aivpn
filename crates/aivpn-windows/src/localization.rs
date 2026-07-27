@@ -530,6 +530,96 @@ pub fn t(lang: Lang, key: &str) -> &'static str {
             "⚠ Несовпадение подсети: пир не согласен с VPN-подсетью"
         }
 
+        // C3: SSH server-install wizard — entry point + form + progress
+        (Lang::En, "ssh_wizard_open_btn") => "Install server via SSH",
+        (Lang::Ru, "ssh_wizard_open_btn") => "Установить сервер по SSH",
+        (Lang::En, "ssh_wizard_title") => "SSH server install",
+        (Lang::Ru, "ssh_wizard_title") => "Установка сервера по SSH",
+        (Lang::En, "ssh_host") => "Host",
+        (Lang::Ru, "ssh_host") => "Хост",
+        (Lang::En, "ssh_port") => "Port",
+        (Lang::Ru, "ssh_port") => "Порт",
+        (Lang::En, "ssh_user") => "User",
+        (Lang::Ru, "ssh_user") => "Пользователь",
+        (Lang::En, "ssh_auth_password") => "Password",
+        (Lang::Ru, "ssh_auth_password") => "Пароль",
+        (Lang::En, "ssh_auth_key") => "Private key",
+        (Lang::Ru, "ssh_auth_key") => "Приватный ключ",
+        (Lang::En, "ssh_password") => "SSH password",
+        (Lang::Ru, "ssh_password") => "Пароль SSH",
+        (Lang::En, "ssh_key_path") => "Key file path",
+        (Lang::Ru, "ssh_key_path") => "Путь к файлу ключа",
+        (Lang::En, "ssh_key_passphrase") => "Key passphrase (optional)",
+        (Lang::Ru, "ssh_key_passphrase") => "Пароль ключа (необязательно)",
+        (Lang::En, "ssh_mode_docker") => "Install via Docker (default: systemd)",
+        (Lang::Ru, "ssh_mode_docker") => "Установить через Docker (по умолчанию: systemd)",
+        (Lang::En, "ssh_server_ip") => "Server public IP (optional)",
+        (Lang::Ru, "ssh_server_ip") => "Публичный IP сервера (необязательно)",
+        (Lang::En, "ssh_server_port") => "Server port (optional)",
+        (Lang::Ru, "ssh_server_port") => "Порт сервера (необязательно)",
+        (Lang::En, "ssh_bind_device") => "Bind this device (create an admin client for it)",
+        (Lang::Ru, "ssh_bind_device") => "Привязать это устройство (создать для него admin-клиента)",
+        (Lang::En, "ssh_show_script_btn") => "Show script",
+        (Lang::Ru, "ssh_show_script_btn") => "Показать скрипт",
+        (Lang::En, "ssh_probe_btn") => "Connect & get fingerprint",
+        (Lang::Ru, "ssh_probe_btn") => "Подключиться и получить отпечаток",
+        (Lang::En, "ssh_fingerprint_label") => "Host key fingerprint:",
+        (Lang::Ru, "ssh_fingerprint_label") => "Отпечаток ключа хоста:",
+        (Lang::En, "ssh_trust_checkbox") => "I trust this fingerprint",
+        (Lang::Ru, "ssh_trust_checkbox") => "Доверяю этому отпечатку",
+        (Lang::En, "ssh_install_btn") => "Install",
+        (Lang::Ru, "ssh_install_btn") => "Установить",
+        (Lang::En, "ssh_installing") => "Installing…",
+        (Lang::Ru, "ssh_installing") => "Установка…",
+        (Lang::En, "ssh_install_done_ok") => "Install finished successfully.",
+        (Lang::Ru, "ssh_install_done_ok") => "Установка успешно завершена.",
+        (Lang::En, "ssh_install_done_error") => "Install failed — see the log above.",
+        (Lang::Ru, "ssh_install_done_error") => "Установка завершилась с ошибкой — см. журнал выше.",
+        (Lang::En, "ssh_import_profile_btn") => "Import profile",
+        (Lang::Ru, "ssh_import_profile_btn") => "Импортировать профиль",
+        (Lang::En, "ssh_import_profile_done") => "Profile imported.",
+        (Lang::Ru, "ssh_import_profile_done") => "Профиль импортирован.",
+        (Lang::En, "ssh_wizard_close_btn") => "Close",
+        (Lang::Ru, "ssh_wizard_close_btn") => "Закрыть",
+        (Lang::En, "ssh_script_title") => "install-server.sh",
+        (Lang::Ru, "ssh_script_title") => "install-server.sh",
+        (Lang::En, "ssh_script_sha256") => "SHA256:",
+        (Lang::Ru, "ssh_script_sha256") => "SHA256:",
+
+        // C3: server migration wizard (export → new server → import)
+        (Lang::En, "migration_open_btn") => "Migrate server",
+        (Lang::Ru, "migration_open_btn") => "Миграция сервера",
+        (Lang::En, "migration_title") => "Server migration",
+        (Lang::Ru, "migration_title") => "Миграция сервера",
+        (Lang::En, "migration_step_export") => "1. Export current server config",
+        (Lang::Ru, "migration_step_export") => "1. Экспорт конфигурации текущего сервера",
+        (Lang::En, "migration_export_hint") => {
+            "Downloads a full backup of clients, masks and settings to a file."
+        }
+        (Lang::Ru, "migration_export_hint") => {
+            "Скачивает полную резервную копию клиентов, масок и настроек в файл."
+        }
+        (Lang::En, "migration_export_btn") => "Export backup",
+        (Lang::Ru, "migration_export_btn") => "Экспортировать резервную копию",
+        (Lang::En, "migration_step_install") => {
+            "2. Install the new server via SSH (use \"Install server via SSH\" above)."
+        }
+        (Lang::Ru, "migration_step_install") => {
+            "2. Установите новый сервер по SSH (кнопка «Установить сервер по SSH» выше)."
+        }
+        (Lang::En, "migration_step_import") => "3. Import backup into the new server",
+        (Lang::Ru, "migration_step_import") => "3. Импорт резервной копии на новый сервер",
+        (Lang::En, "migration_import_path_label") => "Backup file path",
+        (Lang::Ru, "migration_import_path_label") => "Путь к файлу резервной копии",
+        (Lang::En, "migration_import_path_required") => "Specify the exported backup file path",
+        (Lang::Ru, "migration_import_path_required") => {
+            "Укажите путь к файлу экспортированной резервной копии"
+        }
+        (Lang::En, "migration_import_btn") => "Import backup",
+        (Lang::Ru, "migration_import_btn") => "Импортировать резервную копию",
+        (Lang::En, "migration_import_done") => "Backup imported.",
+        (Lang::Ru, "migration_import_done") => "Резервная копия импортирована.",
+
         // Default fallback
         (_, _) => "???",
     }

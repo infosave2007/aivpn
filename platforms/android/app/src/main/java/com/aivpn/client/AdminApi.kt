@@ -123,6 +123,55 @@ object AdminApi {
 
     suspend fun poolLinks(): MgmtResult = request(METHOD_GET, "/api/v1/pool/links")
 
+    // ──────────── Backup export/import (Migration wizard, C3) ────────────
+    //
+    // `export_backup` returns `application/gzip` bytes (a tar.gz archive —
+    // see `aivpn-server/src/backup.rs`), NOT UTF-8 text, so these two go
+    // straight to raw `AivpnJni.mgmtRequest` bytes rather than through
+    // [request]/[MgmtResult] above, which lossily decodes the body as a
+    // UTF-8 `String` (fine for the JSON bodies every other curated route
+    // returns, but would corrupt a binary archive).
+    //
+    // IMPORTANT: as of this writing, `/api/v1/backup/export` and
+    // `/api/v1/backup/import` are NOT in the server's curated in-tunnel
+    // allowlist (`mgmt_service.rs::classify_route` — see its doc comment:
+    // "no `backup/import`... off the tunnel", by design, on both routes).
+    // These calls are real (not mocked) and will reach the gateway, but
+    // `authorize`/`classify_route` currently reject them for every role,
+    // so expect a non-2xx/empty result until the server-side dispatch
+    // table is extended to cover backup export/import. [MigrationActivity]
+    // surfaces whatever the server actually returns rather than assuming
+    // success.
+
+    private const val PATH_BACKUP_EXPORT = "/api/v1/backup/export"
+    private const val PATH_BACKUP_IMPORT = "/api/v1/backup/import"
+
+    /**
+     * @return `(status, bodyBytes)`. `status` is `0` when [AivpnJni.mgmtRequest]
+     *         did not complete at all (no active tunnel / timeout / throw) —
+     *         same convention as [MgmtResult.notConnected].
+     */
+    suspend fun exportBackupRaw(): Pair<Int, ByteArray> = rawRequest(METHOD_GET, PATH_BACKUP_EXPORT, ByteArray(0))
+
+    /** @return `(status, bodyBytes)` — see [exportBackupRaw]. */
+    suspend fun importBackupRaw(archiveBytes: ByteArray): Pair<Int, ByteArray> =
+        rawRequest(METHOD_POST, PATH_BACKUP_IMPORT, archiveBytes)
+
+    private suspend fun rawRequest(method: Int, path: String, body: ByteArray): Pair<Int, ByteArray> =
+        withContext(Dispatchers.IO) {
+            if (!AivpnJni.isAvailable) return@withContext 0 to ByteArray(0)
+            val raw = try {
+                AivpnJni.mgmtRequest(method, path, body)
+            } catch (t: Throwable) {
+                android.util.Log.e("AdminApi", "mgmtRequest($path) threw", t)
+                return@withContext 0 to ByteArray(0)
+            }
+            if (raw.size < 2) return@withContext 0 to ByteArray(0)
+            val status = ((raw[0].toInt() and 0xFF) shl 8) or (raw[1].toInt() and 0xFF)
+            val bodyBytes = if (raw.size > 2) raw.copyOfRange(2, raw.size) else ByteArray(0)
+            status to bodyBytes
+        }
+
     private fun encode(id: String): String =
         java.net.URLEncoder.encode(id, "UTF-8")
 }

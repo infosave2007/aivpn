@@ -1,5 +1,6 @@
 mod admin;
 mod app;
+mod install_wizard;
 mod key_storage;
 mod settings;
 mod tray;

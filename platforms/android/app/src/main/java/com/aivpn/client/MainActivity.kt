@@ -785,6 +785,12 @@ class MainActivity : AppCompatActivity() {
         if (mgmtRole == 1 || mgmtRole == 2) {
             items.add(Item(getString(R.string.admin_menu_title), getString(R.string.desc_admin_menu), MENU_ADMIN))
         }
+        // Provisioning a new server / migrating one is a full-admin action —
+        // unlike the read-heavy AdminActivity, Viewer (1) does not get this.
+        if (mgmtRole == 2) {
+            items.add(Item(getString(R.string.install_menu_title), getString(R.string.desc_install_menu), MENU_INSTALL_SERVER))
+            items.add(Item(getString(R.string.migrate_menu_title), getString(R.string.desc_migrate_menu), MENU_MIGRATION))
+        }
 
         val dialogCtx = android.view.ContextThemeWrapper(this, R.style.Theme_AIVPN_Dialog)
         val container = LinearLayout(dialogCtx).apply {
@@ -873,6 +879,8 @@ class MainActivity : AppCompatActivity() {
             MENU_BOOTSTRAP_DISCOVERY -> showBootstrapDiscoveryDialog()
             MENU_MASK_PRIVACY -> showMaskPrivacyDialog()
             MENU_ADMIN -> startActivity(Intent(this, AdminActivity::class.java))
+            MENU_INSTALL_SERVER -> startActivity(Intent(this, InstallServerActivity::class.java))
+            MENU_MIGRATION -> startActivity(Intent(this, MigrationActivity::class.java))
         }
     }
 
@@ -1412,6 +1420,8 @@ class MainActivity : AppCompatActivity() {
         private const val MENU_BOOTSTRAP_DISCOVERY = 1007
         private const val MENU_MASK_PRIVACY = 1008
         private const val MENU_ADMIN = 1009
+        private const val MENU_INSTALL_SERVER = 1010
+        private const val MENU_MIGRATION = 1011
 
         val MASK_OPTIONS = arrayOf(
             "auto",
