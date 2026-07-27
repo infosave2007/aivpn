@@ -286,13 +286,24 @@
     <string name="install_hint_password">SSH password</string>
     <string name="install_hint_key_pem">Private key (PEM)</string>
     <string name="install_hint_key_passphrase">Key passphrase (optional)</string>
+    <string name="install_hint_binary_source">Server binary</string>
+    <string name="install_binary_default">Default (GitHub Releases)</string>
+    <string name="install_binary_url">Custom URL</string>
+    <string name="install_binary_file">Local file</string>
+    <string name="install_hint_binary_url">https://.../aivpn-server</string>
+    <string name="install_pick_binary_file">Pick file…</string>
+    <string name="install_no_file_selected">No file selected</string>
+    <string name="install_error_need_binary_url">Enter the binary URL</string>
+    <string name="install_error_need_binary_file">Pick a local aivpn-server binary file</string>
+    <string name="install_error_file_read_failed">Could not read the selected file</string>
     <string name="install_hint_mode">Install mode</string>
     <string name="install_mode_systemd">systemd</string>
     <string name="install_mode_docker">Docker</string>
     <string name="install_hint_server_ip">Public server IP (optional — for auto-admin client)</string>
     <string name="install_hint_server_port">Public server port (optional)</string>
     <string name="install_device_binding">Bind admin client to this device</string>
-    <string name="install_device_binding_warning">Not available on Android yet — this device has no local admin key to bind to, so the client created will NOT be device-bound.</string>
+    <string name="install_device_binding_hint">This device\'s enrollment key will be sent to the server so it creates a device-bound admin client — only this device will be able to use it.</string>
+    <string name="install_device_binding_failed">Could not derive this device\'s public key for binding — install aborted. Uncheck \"Bind admin client to this device\" and try again to install without binding.</string>
     <string name="install_error_bad_port">Enter a valid SSH port (1–65535)</string>
     <string name="install_error_need_password">Enter the SSH password</string>
     <string name="install_error_need_key">Paste the private key (PEM)</string>
@@ -333,26 +344,4 @@
     <string name="install_marker_docker_missing">Docker is not installed on the target</string>
     <string name="install_marker_compose_missing">docker compose is not available on the target</string>
     <string name="install_marker_container_not_running">aivpn-server container did not report as running</string>
-
-    <!-- Migration wizard (C3) -->
-    <string name="migrate_menu_title">Migrate server</string>
-    <string name="desc_migrate_menu">Move config to a new server via backup export/import</string>
-    <string name="migrate_title">Migrate server</string>
-    <string name="migrate_step_next">Next</string>
-    <string name="migrate_finish">Done</string>
-    <string name="migrate_working">Working…</string>
-    <string name="migrate_step1_title">1. Export backup</string>
-    <string name="migrate_step1_body">While connected to the OLD server\'s management tunnel, export its configuration backup (clients, config, masks). You\'ll be prompted to save or share the resulting archive.</string>
-    <string name="migrate_export_backup">Export backup</string>
-    <string name="migrate_export_ok">Backup exported (%d bytes)</string>
-    <string name="migrate_export_failed">Export failed (%d) — the server may not support backup export over the tunnel yet</string>
-    <string name="migrate_step2_title">2. Install new server</string>
-    <string name="migrate_step2_body">Install aivpn-server on the new host over SSH.</string>
-    <string name="migrate_open_install_wizard">Open install wizard</string>
-    <string name="migrate_step3_title">3. Import backup</string>
-    <string name="migrate_step3_body">Once connected to the NEW server\'s management tunnel, pick the exported backup file to import it.</string>
-    <string name="migrate_pick_backup_file">Pick backup file</string>
-    <string name="migrate_import_read_failed">Could not read the selected file</string>
-    <string name="migrate_import_ok">Backup imported successfully</string>
-    <string name="migrate_import_failed">Import failed (%d) — the server may not support backup import over the tunnel yet</string>
 </resources>

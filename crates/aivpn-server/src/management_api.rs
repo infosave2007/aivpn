@@ -125,6 +125,25 @@ pub struct ServeConfig {
     pub pool_dialer_slot: Option<
         std::sync::Arc<parking_lot::Mutex<Option<std::sync::Arc<crate::pool_dialer::PoolDialer>>>>,
     >,
+    /// B2b (per-client exit routing) parity fix: the SAME
+    /// `exit_route_cache` handle the gateway's in-tunnel
+    /// `dispatch_mgmt_request` clears after every mutating mgmt call (see
+    /// `Gateway::exit_route_cache`'s doc comment) — via
+    /// `AivpnServer::exit_route_cache()`, the same accessor `main.rs`'s
+    /// SIGHUP handler already uses. Without this, a client's `exit_node`
+    /// set/cleared over THIS (REST/Unix-socket, i.e. web-panel/CLI)
+    /// transport would silently never take effect on a live gateway: the
+    /// gateway process shares the SAME `ClientDatabase` (so the write
+    /// itself lands fine) but has its own separate per-IP exit-resolution
+    /// cache that nothing on this path ever invalidated, so it would keep
+    /// routing to the stale exit (or stale "no exit") indefinitely —
+    /// until a pool-sync merge happened to clear it, or the process
+    /// restarted. `None` only for a `ServeConfig` built without a live
+    /// gateway to share with (e.g. a unit test) — `patch_client` simply
+    /// skips invalidation in that case, same degrade-gracefully pattern as
+    /// `pool_dialer_slot`/`pool_registry_slot` above.
+    pub exit_route_cache:
+        Option<std::sync::Arc<dashmap::DashMap<std::net::Ipv4Addr, Option<String>>>>,
 }
 
 // ── Shared handler state ─────────────────────────────────────────────────────
@@ -152,6 +171,7 @@ struct ApiState {
     pool_registry_slot:
         Option<Arc<parking_lot::Mutex<Option<Arc<crate::node_registry::NodeRegistry>>>>>,
     pool_dialer_slot: Option<Arc<parking_lot::Mutex<Option<Arc<crate::pool_dialer::PoolDialer>>>>>,
+    exit_route_cache: Option<Arc<dashmap::DashMap<std::net::Ipv4Addr, Option<String>>>>,
 }
 
 impl ApiState {
@@ -424,6 +444,21 @@ async fn patch_client(
     Path(id): Path<String>,
     Json(body): Json<PatchClientRequest>,
 ) -> impl IntoResponse {
+    // B2b/B2c parity fix: this REST/Unix-socket transport shares the SAME
+    // live `ClientDatabase` as the gateway (see `ServeConfig::db`'s call
+    // site in `main.rs`), so the write below lands correctly either way —
+    // but the gateway keeps its OWN per-IP exit-resolution cache
+    // (`Gateway::exit_route_cache`) that only `dispatch_mgmt_request` (the
+    // in-tunnel path) and a pool-sync merge used to invalidate. Without
+    // wiring this too, a client's `exit_node` set/cleared from the web
+    // panel / CLI over THIS transport would silently never take effect on
+    // a live gateway — see `ServeConfig::exit_route_cache`'s doc comment.
+    // Capture what's needed BEFORE `state`/`body` are moved into the
+    // blocking closure below.
+    let touches_exit_node = body.exit_node.is_some();
+    let exit_route_cache = state.exit_route_cache.clone();
+    let pool_dialer_slot = state.pool_dialer_slot.clone();
+    let db_for_dial = state.db.clone();
     let args = mgmt_service::UpdateClientArgs {
         name: body.name,
         enabled: body.enabled,
@@ -437,6 +472,26 @@ async fn patch_client(
         mgmt_service::update_client(&state.mgmt_ctx(), &id, args)
     })
     .await;
+    if touches_exit_node && matches!(result, Ok(Ok(_))) {
+        // Mirrors `Gateway::dispatch_mgmt_request`'s B2b (cache
+        // invalidation) + B2c (runtime dial add-peer) handling for the
+        // in-tunnel path — see those doc comments.
+        if let Some(cache) = &exit_route_cache {
+            cache.clear();
+        }
+        if let Some(slot) = &pool_dialer_slot {
+            let dialer = slot.lock().clone();
+            if let Some(dialer) = dialer {
+                let already: std::collections::HashSet<String> =
+                    dialer.dialed_peer_addrs().into_iter().collect();
+                for addr in
+                    crate::gateway::exits_needing_dial(&db_for_dial.list_clients(), &already)
+                {
+                    dialer.add_peer(addr);
+                }
+            }
+        }
+    }
     match result {
         Ok(Ok(c)) => Json(c).into_response(),
         Ok(Err(e)) => {
@@ -1550,6 +1605,7 @@ pub async fn serve(cfg: ServeConfig) {
         pool_configured: cfg.pool_configured,
         pool_registry_slot: cfg.pool_registry_slot,
         pool_dialer_slot: cfg.pool_dialer_slot,
+        exit_route_cache: cfg.exit_route_cache,
     };
     let app = router(state);
 

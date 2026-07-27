@@ -1,4 +1,5 @@
 import Foundation
+import Security
 
 // Swift wrapper around the in-app SSH server-installer FFI surface exposed
 // by aivpn-ios-core's `ssh-install` feature (crates/aivpn-ios-core/include/
@@ -214,5 +215,74 @@ enum SshInstallApi {
     @discardableResult
     static func installFree(handle: Int64) -> Bool {
         aivpn_ssh_install_free(handle) == 0
+    }
+
+    // MARK: Device pubkey (G4/C3-iOS — device-binding toggle)
+
+    /// Derives this device's X25519 static public key, for
+    /// `install_params_from_json`'s `device_pubkey_b64` field (requests a
+    /// device-bound admin client at install time — server echoes back a
+    /// ready-to-use `aivpn://` key in the `finished` event's
+    /// `connection_key`, redeemable only by this device).
+    ///
+    /// The underlying 32-byte private key is NOT generated here and this
+    /// core does not persist one of its own (see
+    /// `aivpn_device_pubkey_from_privkey`'s doc comment in aivpn_core.h) —
+    /// it is the SAME key the Tunnel extension already owns and passes as
+    /// `aivpn_run_tunnel`'s `static_privkey` for JIT enrollment
+    /// (`loadOrCreateDeviceKey()` in PacketTunnelProvider.swift), read here
+    /// from the Keychain item that function shares with this App target via
+    /// the `group.com.aivpn.client` access group.
+    ///
+    /// Returns `nil` if that Keychain item doesn't exist yet — which means
+    /// the Tunnel extension has never run on this device (no VPN connection
+    /// has ever been established with ANY key), since that's the only code
+    /// path that creates it. Callers MUST NOT fall back to generating an ad
+    /// hoc keypair here instead: it would not match what the tunnel
+    /// actually presents on connect, silently breaking device binding.
+    static func devicePubkeyBase64() -> String? {
+        guard let privBytes = readDevicePrivkeyFromKeychain() else { return nil }
+        let privB64 = Data(privBytes).base64EncodedString()
+        return devicePubkeyFromPrivkeyBlocking(privkeyB64: privB64)
+    }
+
+    private static func readDevicePrivkeyFromKeychain() -> [UInt8]? {
+        // Account/service/access-group must match PacketTunnelProvider.swift's
+        // loadOrCreateDeviceKey() exactly — this is a READ of the tunnel's
+        // own Keychain item, not a separate store.
+        let query: [String: Any] = [
+            kSecClass as String:           kSecClassGenericPassword,
+            kSecAttrAccount as String:      "aivpn_device_privkey_v1",
+            kSecAttrService as String:      "com.aivpn.client",
+            kSecAttrAccessGroup as String:  "group.com.aivpn.client",
+            kSecReturnData as String:       true,
+            kSecMatchLimit as String:       kSecMatchLimitOne,
+        ]
+        var result: AnyObject?
+        guard SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess,
+              let data = result as? Data, data.count == 32 else {
+            return nil
+        }
+        return Array(data)
+    }
+
+    private static func devicePubkeyFromPrivkeyBlocking(privkeyB64: String) -> String? {
+        var cap = 128
+        // Same written-len-or-needed-len retry convention as the other
+        // functions in this file.
+        for _ in 0..<2 {
+            var outBuf = [UInt8](repeating: 0, count: cap)
+            let written: Int = privkeyB64.withCString { privPtr in
+                outBuf.withUnsafeMutableBufferPointer { outBufPtr in
+                    aivpn_device_pubkey_from_privkey(privPtr, outBufPtr.baseAddress, outBufPtr.count)
+                }
+            }
+            if written < 0 { return nil }
+            if written <= cap {
+                return String(decoding: outBuf.prefix(written), as: UTF8.self)
+            }
+            cap = written
+        }
+        return nil
     }
 }

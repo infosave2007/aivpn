@@ -1086,6 +1086,20 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
 
     /// Loads the 32-byte device private key from Keychain, generating and saving it
     /// if this is the first run. Uses SecRandomCopyBytes for cryptographic randomness.
+    ///
+    /// G4/C3-iOS: stored under `appGroup`'s Keychain access group (the same
+    /// group ConnectionKey.swift's `storeForTunnel`/this file's tunnel-handoff
+    /// helpers already share between the App and Tunnel targets) rather than
+    /// this target's own implicit access group, so InstallServerView's
+    /// device-binding toggle (SshInstallApi.devicePubkeyBase64(), App target)
+    /// can read the SAME 32 bytes passed below as `static_privkey` — it must
+    /// stay the same key, or a device-bound admin client created via the
+    /// wizard wouldn't match what this tunnel actually presents on connect.
+    /// One-time consequence: a device that already has a key stored under
+    /// the OLD (pre-G4, non-shared) access group won't find it here and will
+    /// generate + save a fresh one under the shared group instead — any
+    /// admin client previously bound to that old device pubkey will need to
+    /// be re-bound.
     private func loadOrCreateDeviceKey() -> [UInt8] {
         let account = "aivpn_device_privkey_v1"
         let service = "com.aivpn.client"
@@ -1094,6 +1108,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             kSecClass as String:       kSecClassGenericPassword,
             kSecAttrAccount as String: account,
             kSecAttrService as String: service,
+            kSecAttrAccessGroup as String: appGroup,
             kSecReturnData as String:  true,
             kSecMatchLimit as String:  kSecMatchLimitOne,
         ]
@@ -1114,6 +1129,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             kSecClass as String:       kSecClassGenericPassword,
             kSecAttrAccount as String: account,
             kSecAttrService as String: service,
+            kSecAttrAccessGroup as String: appGroup,
         ]
         SecItemDelete(deleteQuery as CFDictionary)
 
@@ -1121,6 +1137,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             kSecClass as String:            kSecClassGenericPassword,
             kSecAttrAccount as String:      account,
             kSecAttrService as String:      service,
+            kSecAttrAccessGroup as String:  appGroup,
             kSecValueData as String:        keyData,
             // ThisDeviceOnly: this is the per-DEVICE enrollment identity. Without
             // it the item is eligible for iCloud Keychain sync and encrypted

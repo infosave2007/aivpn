@@ -714,10 +714,6 @@ class LocalizationManager: ObservableObject {
             "en": "Install server via SSH",
             "ru": "Установить сервер по SSH"
         ],
-        "migrate_wizard_button": [
-            "en": "Migrate server",
-            "ru": "Миграция сервера"
-        ],
 
         // MARK: - SSH server install wizard (Wave C3-macOS)
         "install_wizard_title": [
@@ -1052,120 +1048,6 @@ class LocalizationManager: ObservableObject {
         "install_code_spawn_failed": [
             "en": "failed to start process",
             "ru": "не удалось запустить процесс"
-        ],
-
-        // MARK: - Migration wizard (Wave C3-macOS)
-        "migrate_wizard_title": [
-            "en": "Server Migration",
-            "ru": "Миграция сервера"
-        ],
-        "migrate_step_export": [
-            "en": "1. Export",
-            "ru": "1. Экспорт"
-        ],
-        "migrate_step_install": [
-            "en": "2. Install",
-            "ru": "2. Установка"
-        ],
-        "migrate_step_import": [
-            "en": "3. Import",
-            "ru": "3. Импорт"
-        ],
-        "migrate_export_title": [
-            "en": "Export from the current server",
-            "ru": "Экспорт с текущего сервера"
-        ],
-        "migrate_export_intro": [
-            "en": "Connect to the OLD server as Admin, then export its backup. This calls the running daemon's admin channel for real.",
-            "ru": "Подключитесь к СТАРОМУ серверу с ролью Admin, затем экспортируйте его резервную копию. Вызов идёт через реальный admin-канал работающего демона."
-        ],
-        "migrate_not_connected": [
-            "en": "Not connected — connect to a server first.",
-            "ru": "Нет подключения — сначала подключитесь к серверу."
-        ],
-        "migrate_exporting": [
-            "en": "Exporting…",
-            "ru": "Экспорт…"
-        ],
-        "migrate_run_export": [
-            "en": "Export current server",
-            "ru": "Экспортировать текущий сервер"
-        ],
-        "migrate_export_success": [
-            "en": "Export succeeded",
-            "ru": "Экспорт выполнен успешно"
-        ],
-        "migrate_bytes": [
-            "en": "bytes",
-            "ru": "байт"
-        ],
-        "migrate_export_rejected": [
-            "en": "Server rejected the request",
-            "ru": "Сервер отклонил запрос"
-        ],
-        "migrate_export_rejected_note": [
-            "en": "backup/export and backup/import are not exposed over the VPN tunnel by design (security restriction) — see mgmt_service.rs::classify_route. Export/import a backup on the server itself (SSH/CLI) instead.",
-            "ru": "backup/export и backup/import намеренно не доступны через VPN-туннель (ограничение безопасности) — см. mgmt_service.rs::classify_route. Экспортируйте/импортируйте резервную копию непосредственно на сервере (через SSH/CLI)."
-        ],
-        "migrate_channel_unavailable": [
-            "en": "Admin channel unavailable — no reply from the running daemon.",
-            "ru": "Admin-канал недоступен — нет ответа от работающего демона."
-        ],
-        "migrate_next": [
-            "en": "Next",
-            "ru": "Далее"
-        ],
-        "migrate_back": [
-            "en": "Back",
-            "ru": "Назад"
-        ],
-        "migrate_install_title": [
-            "en": "Install the new server",
-            "ru": "Установите новый сервер"
-        ],
-        "migrate_install_intro": [
-            "en": "Open the SSH install wizard to set up the new server, then import its connection key.",
-            "ru": "Откройте мастер установки по SSH, чтобы настроить новый сервер, затем импортируйте его ключ подключения."
-        ],
-        "migrate_open_install_wizard": [
-            "en": "Open install wizard",
-            "ru": "Открыть мастер установки"
-        ],
-        "migrate_install_note": [
-            "en": "Once installed, connect to the new server with the imported key before continuing to Import.",
-            "ru": "После установки подключитесь к новому серверу с импортированным ключом, прежде чем переходить к импорту."
-        ],
-        "migrate_import_title": [
-            "en": "Import into the new server",
-            "ru": "Импорт на новый сервер"
-        ],
-        "migrate_import_intro": [
-            "en": "Connect to the NEW server as Admin, then import the backup exported in step 1.",
-            "ru": "Подключитесь к НОВОМУ серверу с ролью Admin, затем импортируйте резервную копию из шага 1."
-        ],
-        "migrate_no_export_body": [
-            "en": "No successfully exported backup yet — go back to step 1.",
-            "ru": "Пока нет успешно экспортированной копии — вернитесь к шагу 1."
-        ],
-        "migrate_importing": [
-            "en": "Importing…",
-            "ru": "Импорт…"
-        ],
-        "migrate_run_import": [
-            "en": "Import backup into new server",
-            "ru": "Импортировать бэкап на новый сервер"
-        ],
-        "migrate_import_success": [
-            "en": "Import succeeded",
-            "ru": "Импорт выполнен успешно"
-        ],
-        "migrate_import_rejected": [
-            "en": "Server rejected the request",
-            "ru": "Сервер отклонил запрос"
-        ],
-        "migrate_close": [
-            "en": "Close",
-            "ru": "Закрыть"
         ],
     ]
 

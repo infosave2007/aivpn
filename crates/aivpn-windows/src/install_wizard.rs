@@ -68,6 +68,26 @@ impl InstallModeChoice {
     }
 }
 
+/// Which `aivpn-server` binary the remote install script should run — maps
+/// 1:1 onto `ssh_install_cmd.rs`'s mutually-exclusive `--binary-file` /
+/// `--binary-url` flags (`RunArgs`). Previously the wizard always left this
+/// at `Default` with no UI to change it (see the removed comment this
+/// replaces); now exposed so the wizard matches the CLI's full flag surface.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum BinarySource {
+    /// Neither flag passed — the remote script fetches its own built-in
+    /// default build (GitHub Releases).
+    #[default]
+    Default,
+    /// `--binary-url URL` — remote script downloads from this URL instead
+    /// of GitHub Releases. A blank/whitespace-only URL is treated the same
+    /// as `Default` (mirrors `InstallTarget::server_ip`'s blank handling).
+    Url(String),
+    /// `--binary-file PATH` — upload this local file instead of letting
+    /// the remote script download anything.
+    LocalFile(PathBuf),
+}
+
 /// Everything `build_run_args` needs to build the argv for `ssh-install
 /// run` — the wizard's UI state maps onto this 1:1.
 #[derive(Debug, Clone)]
@@ -81,6 +101,9 @@ pub struct InstallTarget {
     pub fingerprint: String,
     pub auth: InstallAuth,
     pub mode: InstallModeChoice,
+    /// Which `aivpn-server` binary the remote script should use — see
+    /// [`BinarySource`].
+    pub binary_source: BinarySource,
     /// `--server-ip`, or `None`/empty to omit (remote script's own default).
     pub server_ip: Option<String>,
     /// `--server-port`, or `None` to omit.
@@ -129,9 +152,20 @@ pub fn build_run_args(target: &InstallTarget) -> Vec<String> {
         }
     }
 
-    // Binary source deliberately omitted here (no --binary-file/--binary-url):
-    // the wizard always lets the remote script fetch the default aivpn-server
-    // build from GitHub Releases, same as passing neither flag on the CLI.
+    match &target.binary_source {
+        BinarySource::Default => {}
+        BinarySource::Url(url) => {
+            let url = url.trim();
+            if !url.is_empty() {
+                args.push("--binary-url".to_string());
+                args.push(url.to_string());
+            }
+        }
+        BinarySource::LocalFile(path) => {
+            args.push("--binary-file".to_string());
+            args.push(path.to_string_lossy().into_owned());
+        }
+    }
 
     if let Some(ip) = target.server_ip.as_deref() {
         let ip = ip.trim();
@@ -419,6 +453,7 @@ mod tests {
             fingerprint: "SHA256:abc".to_string(),
             auth: InstallAuth::Password,
             mode: InstallModeChoice::Systemd,
+            binary_source: BinarySource::Default,
             server_ip: None,
             server_port: None,
             bind_device: true,
@@ -527,11 +562,39 @@ mod tests {
     }
 
     #[test]
-    fn build_run_args_never_passes_binary_source_flags() {
-        // The wizard always defaults to GitHub Releases (no --binary-file /
-        // --binary-url) — see build_run_args's doc comment.
+    fn build_run_args_default_binary_source_omits_both_flags() {
+        // BinarySource::Default (the wizard's own default) lets the remote
+        // script fetch its own built-in GitHub-Releases build.
         let args = build_run_args(&base_target());
         assert!(!args.iter().any(|a| a == "--binary-file"));
+        assert!(!args.iter().any(|a| a == "--binary-url"));
+    }
+
+    #[test]
+    fn build_run_args_binary_url_included_when_set() {
+        let mut target = base_target();
+        target.binary_source = BinarySource::Url("https://example.com/aivpn-server".to_string());
+        let args = build_run_args(&target);
+        let idx = args.iter().position(|a| a == "--binary-url").unwrap();
+        assert_eq!(args[idx + 1], "https://example.com/aivpn-server");
+        assert!(!args.iter().any(|a| a == "--binary-file"));
+    }
+
+    #[test]
+    fn build_run_args_blank_binary_url_is_omitted() {
+        let mut target = base_target();
+        target.binary_source = BinarySource::Url("   ".to_string());
+        let args = build_run_args(&target);
+        assert!(!args.iter().any(|a| a == "--binary-url"));
+    }
+
+    #[test]
+    fn build_run_args_binary_file_included_when_set() {
+        let mut target = base_target();
+        target.binary_source = BinarySource::LocalFile(PathBuf::from("/local/aivpn-server"));
+        let args = build_run_args(&target);
+        let idx = args.iter().position(|a| a == "--binary-file").unwrap();
+        assert_eq!(args[idx + 1], "/local/aivpn-server");
         assert!(!args.iter().any(|a| a == "--binary-url"));
     }
 

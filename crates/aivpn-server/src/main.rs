@@ -578,6 +578,14 @@ async fn main() {
                 // cleanup task sweeps — see `AivpnServer::pending_config`'s
                 // doc comment.
                 let mgmt_pending_config = Some(server.pending_config());
+                // B2b parity fix: share the SAME exit-resolution cache the
+                // gateway's in-tunnel `dispatch_mgmt_request` clears after
+                // every mutating mgmt call (mirrors `bootstrap_descriptors`/
+                // `pending_config` above) — without this, a REST/Unix-socket
+                // (web-panel/CLI) `exit_node` change would silently never
+                // take effect on the live gateway. See
+                // `ServeConfig::exit_route_cache`'s doc comment.
+                let mgmt_exit_route_cache = Some(server.exit_route_cache());
                 #[cfg(feature = "metrics")]
                 let mgmt_metrics = Some(server.metrics());
                 if mgmt_socket.is_some() {
@@ -615,6 +623,7 @@ async fn main() {
                                 pool_configured: pool_configured_for_api,
                                 pool_registry_slot: Some(pool_registry_slot_for_api),
                                 pool_dialer_slot: Some(pool_dialer_slot_for_api),
+                                exit_route_cache: mgmt_exit_route_cache,
                             },
                         )
                         .await;

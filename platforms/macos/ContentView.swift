@@ -306,6 +306,32 @@ struct ContentView: View {
 
             Divider()
 
+            // Install a server via SSH — the basic "spin up my first server"
+            // scenario, so unlike "Manage clients"/AdminWindowController
+            // above (gated on vpn.isConnected && adminRole == roleAdmin,
+            // which by definition can never be true before any server
+            // exists) this entry point is ALWAYS available: no connection,
+            // no admin role required. Only the install flow itself needs
+            // this; migration is web-only (see MIGRATION.md-equivalent —
+            // the native wizard was removed, use the web admin panel).
+            Button(action: { InstallServerWindowController.shared.show() }) {
+                HStack {
+                    Image(systemName: "server.rack")
+                        .font(.caption)
+                    Text(loc.t("install_wizard_button"))
+                        .font(.caption)
+                    Spacer()
+                    Image(systemName: "chevron.right")
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                }
+            }
+            .buttonStyle(.plain)
+            .padding(.horizontal, 16)
+            .padding(.vertical, 8)
+
+            Divider()
+
             // Add Key Form (shown when adding new key)
             if showKeyInput {
                 VStack(spacing: 8) {
@@ -804,42 +830,6 @@ struct ContentView: View {
                         Image(systemName: "person.2.badge.gearshape")
                             .font(.caption)
                         Text(loc.t("admin_panel_button"))
-                            .font(.caption)
-                        Spacer()
-                        Image(systemName: "chevron.right")
-                            .font(.caption2)
-                            .foregroundColor(.secondary)
-                    }
-                }
-                .buttonStyle(.plain)
-                .padding(.horizontal, 16)
-                .padding(.vertical, 8)
-
-                // Wave C3-macOS: SSH server install + migration wizards.
-                // Same admin-only gate as "Manage clients" above — both
-                // open their own standalone window (InstallServerWindowController /
-                // MigrationWindowController), mirroring AdminWindowController.
-                Button(action: { InstallServerWindowController.shared.show() }) {
-                    HStack {
-                        Image(systemName: "server.rack")
-                            .font(.caption)
-                        Text(loc.t("install_wizard_button"))
-                            .font(.caption)
-                        Spacer()
-                        Image(systemName: "chevron.right")
-                            .font(.caption2)
-                            .foregroundColor(.secondary)
-                    }
-                }
-                .buttonStyle(.plain)
-                .padding(.horizontal, 16)
-                .padding(.vertical, 8)
-
-                Button(action: { MigrationWindowController.shared.show() }) {
-                    HStack {
-                        Image(systemName: "arrow.triangle.2.circlepath")
-                            .font(.caption)
-                        Text(loc.t("migrate_wizard_button"))
                             .font(.caption)
                         Spacer()
                         Image(systemName: "chevron.right")

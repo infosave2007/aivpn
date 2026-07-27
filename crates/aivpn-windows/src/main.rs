@@ -244,17 +244,6 @@ fn decode_png_rgba(bytes: &[u8]) -> (Vec<u8>, u32, u32) {
     (rgba, info.width, info.height)
 }
 
-/// Seconds since the Unix epoch, used only to make exported backup file
-/// names unique — never sent anywhere, so a `0` fallback on a broken clock
-/// is harmless (just risks a filename collision on that one machine).
-#[cfg(windows)]
-fn current_unix_timestamp() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
 #[cfg(windows)]
 fn app_icon() -> std::sync::Arc<eframe::egui::IconData> {
     let (rgba, width, height) = decode_png_rgba(APP_ICON_PNG);
@@ -674,7 +663,11 @@ struct AivpnApp {
 
     // ── SSH server-install wizard (C3) — shells out to `aivpn-client
     // ssh-install {script,probe,run}`, see `install_wizard.rs`'s module
-    // doc. Entry point sits next to `draw_admin_panel`, Admin-only. ──────
+    // doc. GAP-G2: entry point is a top-level, always-visible button on the
+    // main screen (see `update()`'s header area) — reachable with no
+    // connection and no admin role, since installing a brand-new server is
+    // the base "first server from scratch" scenario, not a management
+    // action against an already-running one. ─────────────────────────────
     ssh_wizard_open: bool,
     ssh_wizard_stage: SshWizardStage,
     ssh_host: String,
@@ -705,8 +698,12 @@ struct AivpnApp {
     ssh_script_sha256: Option<String>,
     ssh_script_error: Option<String>,
 
-    ssh_install_tx: std::sync::mpsc::Sender<install_wizard::InstallLine>,
-    ssh_install_rx: std::sync::mpsc::Receiver<install_wizard::InstallLine>,
+    /// Fresh per install run (see `start_ssh_install`), not created once in
+    /// `new()` — so closing the wizard mid-install (`close_ssh_wizard`) can
+    /// drop the receiver and stop this session from consuming a still-
+    /// running background thread's output/markers, which would otherwise
+    /// bleed into a later, unrelated install run sharing the same channel.
+    ssh_install_rx: Option<std::sync::mpsc::Receiver<install_wizard::InstallLine>>,
     ssh_install_running: bool,
     ssh_install_log: Vec<install_wizard::InstallLine>,
     ssh_install_connection_key: Option<String>,
@@ -718,19 +715,12 @@ struct AivpnApp {
     /// finished install's connection key to `keys`.
     ssh_import_done: bool,
 
-    // ── Server migration wizard (C3) — export/import via the same
-    // `aivpn-client mgmt` bridge `admin.rs` already uses. ────────────────
-    migration_open: bool,
-    migration_export_busy: bool,
-    migration_export_error: Option<String>,
-    migration_export_saved_path: Option<String>,
-    /// Path to the previously-exported backup file — typed/pasted by the
-    /// user (this crate ships no file-picker, see
-    /// `save_admin_key_to_file`'s doc comment for the same rationale).
-    migration_import_path: String,
-    migration_import_busy: bool,
-    migration_import_error: Option<String>,
-    migration_import_done: bool,
+    // ── GAP-G3: server binary source — default GitHub Releases / custom
+    // URL / local file upload, mirrors `ssh_install_cmd.rs`'s RunArgs
+    // --binary-file/--binary-url flags via `install_wizard::BinarySource`.
+    ssh_binary_source_choice: SshBinarySourceChoice,
+    ssh_binary_url: String,
+    ssh_binary_file_path: String,
 }
 
 #[cfg(windows)]
@@ -746,11 +736,23 @@ enum SshWizardStage {
     Done,
 }
 
+/// GAP-G3: which `aivpn-server` binary the wizard tells the remote script to
+/// use — UI-facing mirror of `install_wizard::BinarySource`, kept separate
+/// so the URL/file text fields can stay populated even while `Default` is
+/// selected (matches the existing `ssh_auth_key_mode` pattern for auth).
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum SshBinarySourceChoice {
+    #[default]
+    Default,
+    Url,
+    LocalFile,
+}
+
 #[cfg(windows)]
 impl AivpnApp {
     fn new(settings: AppSettings, ctx: &eframe::egui::Context) -> Self {
         let (admin_tx, admin_rx) = std::sync::mpsc::channel();
-        let (ssh_install_tx, ssh_install_rx) = std::sync::mpsc::channel();
         let mut app = Self {
             settings,
             vpn: VpnManager::new(),
@@ -823,21 +825,15 @@ impl AivpnApp {
             ssh_script_text: None,
             ssh_script_sha256: None,
             ssh_script_error: None,
-            ssh_install_tx,
-            ssh_install_rx,
+            ssh_install_rx: None,
             ssh_install_running: false,
             ssh_install_log: Vec::new(),
             ssh_install_connection_key: None,
             ssh_install_done_ok: None,
             ssh_import_done: false,
-            migration_open: false,
-            migration_export_busy: false,
-            migration_export_error: None,
-            migration_export_saved_path: None,
-            migration_import_path: String::new(),
-            migration_import_busy: false,
-            migration_import_error: None,
-            migration_import_done: false,
+            ssh_binary_source_choice: SshBinarySourceChoice::default(),
+            ssh_binary_url: String::new(),
+            ssh_binary_file_path: String::new(),
             connected_since: None,
             last_conn_state: ConnectionState::Disconnected,
             error_msg: None,
@@ -1205,40 +1201,6 @@ impl AivpnApp {
                         self.admin_pool_health = Some(h);
                     }
                 }
-                AdminResponse::BackupExported(r) => {
-                    self.migration_export_busy = false;
-                    match r {
-                        Ok(bytes) => {
-                            let dir = dirs::download_dir()
-                                .or_else(dirs::home_dir)
-                                .unwrap_or_else(|| std::path::PathBuf::from("."));
-                            let path =
-                                dir.join(format!("aivpn-backup-{}.json", current_unix_timestamp()));
-                            match std::fs::write(&path, &bytes) {
-                                Ok(()) => {
-                                    self.migration_export_saved_path =
-                                        Some(path.display().to_string());
-                                    self.migration_export_error = None;
-                                }
-                                Err(e) => {
-                                    self.migration_export_error =
-                                        Some(format!("Failed to save backup file: {e}"))
-                                }
-                            }
-                        }
-                        Err(e) => self.migration_export_error = Some(e),
-                    }
-                }
-                AdminResponse::BackupImported(r) => {
-                    self.migration_import_busy = false;
-                    match r {
-                        Ok(()) => {
-                            self.migration_import_done = true;
-                            self.migration_import_error = None;
-                        }
-                        Err(e) => self.migration_import_error = Some(e),
-                    }
-                }
             }
         }
     }
@@ -1249,30 +1211,68 @@ impl AivpnApp {
     /// script results, and apply them to wizard UI state. Called once per
     /// `tick()`, mirroring `poll_admin`.
     fn poll_ssh_install(&mut self) {
-        while let Ok(line) = self.ssh_install_rx.try_recv() {
-            if let install_wizard::InstallLine::Marker {
-                step,
-                status,
-                connection_key,
-                ..
-            } = &line
-            {
-                if let Some(key) = connection_key {
-                    self.ssh_install_connection_key = Some(key.clone());
-                }
-                // `gui_process` is spawn_install's own synthetic marker,
-                // always sent exactly once when the child exits (see
-                // install_wizard.rs's doc comment) — the one reliable
-                // "the subprocess is done" signal, regardless of whether
-                // the remote script/CLI got far enough to emit its own
-                // `done`/`client_done` markers.
-                if step == "gui_process" {
-                    self.ssh_install_running = false;
-                    self.ssh_install_done_ok = Some(status == "ok");
-                    self.ssh_wizard_stage = SshWizardStage::Done;
+        // BUG FIX (review): `ssh_install_rx` is a fresh channel per install
+        // run (see `start_ssh_install`), not a single app-lifetime pair —
+        // that was the original bug. A single shared Sender/Receiver never
+        // dropped for the app's whole lifetime meant closing the wizard
+        // mid-install (the window's native ✕, handled by `close_ssh_wizard`)
+        // left the background `spawn_install` thread still writing into the
+        // same channel; if the user then reopened the wizard and started a
+        // SECOND install, both threads' lines/markers interleaved into one
+        // `ssh_install_log`, and whichever thread's `gui_process` terminal
+        // marker arrived first could silently end the WRONG run's progress
+        // display. Recreating the channel per run, and dropping it in
+        // `close_ssh_wizard`, isolates each run: an abandoned thread's
+        // `tx.send` starts failing (it already handles that — see
+        // `spawn_install`'s doc comment) instead of polluting a later run.
+        let mut rx_disconnected = false;
+        if let Some(rx) = &self.ssh_install_rx {
+            loop {
+                match rx.try_recv() {
+                    Ok(line) => {
+                        if let install_wizard::InstallLine::Marker {
+                            step,
+                            status,
+                            connection_key,
+                            ..
+                        } = &line
+                        {
+                            if let Some(key) = connection_key {
+                                self.ssh_install_connection_key = Some(key.clone());
+                            }
+                            // `gui_process` is spawn_install's own synthetic
+                            // marker, always sent exactly once when the
+                            // child exits (see install_wizard.rs's doc
+                            // comment) — the one reliable "the subprocess is
+                            // done" signal, regardless of whether the remote
+                            // script/CLI got far enough to emit its own
+                            // `done`/`client_done` markers.
+                            if step == "gui_process" {
+                                self.ssh_install_running = false;
+                                self.ssh_install_done_ok = Some(status == "ok");
+                                self.ssh_wizard_stage = SshWizardStage::Done;
+                            }
+                        }
+                        self.ssh_install_log.push(line);
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        rx_disconnected = true;
+                        break;
+                    }
                 }
             }
-            self.ssh_install_log.push(line);
+        }
+        if rx_disconnected {
+            self.ssh_install_rx = None;
+            // The sender thread is gone without ever sending its terminal
+            // `gui_process` marker (e.g. it panicked) — don't leave the UI
+            // stuck showing "Installing…" forever.
+            if self.ssh_install_running {
+                self.ssh_install_running = false;
+                self.ssh_install_done_ok = Some(false);
+                self.ssh_wizard_stage = SshWizardStage::Done;
+            }
         }
 
         if let Some(rx) = &self.ssh_probe_rx {
@@ -1405,6 +1405,22 @@ impl AivpnApp {
             )
         };
 
+        // GAP-G3: default/URL/local-file — see `SshBinarySourceChoice`'s doc
+        // comment. A blank URL/path silently falls back to `Default`
+        // (`install_wizard::build_run_args` already trims+skips a blank
+        // URL; a blank file path is passed through as-is, same as every
+        // other path field in this wizard — `ssh-install run` itself is the
+        // one that will reject an empty/missing `--binary-file`).
+        let binary_source = match self.ssh_binary_source_choice {
+            SshBinarySourceChoice::Default => install_wizard::BinarySource::Default,
+            SshBinarySourceChoice::Url => {
+                install_wizard::BinarySource::Url(self.ssh_binary_url.trim().to_string())
+            }
+            SshBinarySourceChoice::LocalFile => install_wizard::BinarySource::LocalFile(
+                std::path::PathBuf::from(self.ssh_binary_file_path.trim()),
+            ),
+        };
+
         let target = install_wizard::InstallTarget {
             host: self.ssh_host.trim().to_string(),
             port,
@@ -1416,6 +1432,7 @@ impl AivpnApp {
             } else {
                 install_wizard::InstallModeChoice::Systemd
             },
+            binary_source,
             server_ip: (!self.ssh_server_ip.trim().is_empty())
                 .then(|| self.ssh_server_ip.trim().to_string()),
             server_port: self.ssh_server_port.trim().parse().ok(),
@@ -1429,12 +1446,11 @@ impl AivpnApp {
         self.ssh_import_done = false;
         self.ssh_wizard_stage = SshWizardStage::Installing;
 
-        install_wizard::spawn_install(
-            self.vpn.client_binary.clone(),
-            target,
-            secret,
-            self.ssh_install_tx.clone(),
-        );
+        // Fresh channel per run — see `ssh_install_rx`'s doc comment (review
+        // bug fix) for why this must not be a single app-lifetime pair.
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.ssh_install_rx = Some(rx);
+        install_wizard::spawn_install(self.vpn.client_binary.clone(), target, secret, tx);
     }
 
     /// Adds the finished install's `connection_key` to `keys` under an
@@ -1482,6 +1498,13 @@ impl AivpnApp {
         self.ssh_install_connection_key = None;
         self.ssh_install_done_ok = None;
         self.ssh_import_done = false;
+        // Review bug fix: drop the receiver so a still-running background
+        // install thread's `tx.send` starts failing (it already handles
+        // that gracefully) instead of continuing to feed a NEW run's state
+        // if the user reopens the wizard and starts another install before
+        // this one's remote script has finished — see `ssh_install_rx`'s
+        // and `poll_ssh_install`'s doc comments.
+        self.ssh_install_rx = None;
     }
 
     fn refresh_admin_pool(&mut self) {
@@ -1607,18 +1630,12 @@ impl AivpnApp {
 
         let is_admin = self.admin_role == Some(2);
 
+        // GAP-G2/G1: the SSH-install wizard's entry point moved to the main
+        // screen (always visible, no connection/admin role required — see
+        // `update()`'s header area); the migration wizard was removed
+        // entirely (web-only per GAP-G1). Nothing wizard-related belongs
+        // here anymore.
         if is_admin {
-            // ── C3 wizard entry points — SSH server install + migration,
-            // Admin-only, next to the client-management section. ─────────
-            ui.horizontal(|ui| {
-                if ui.small_button(t(lang, "ssh_wizard_open_btn")).clicked() {
-                    self.ssh_wizard_open = true;
-                }
-                if ui.small_button(t(lang, "migration_open_btn")).clicked() {
-                    self.migration_open = true;
-                }
-            });
-
             self.draw_admin_clients_section(ui, lang);
         }
 
@@ -2284,6 +2301,45 @@ impl AivpnApp {
             });
         }
 
+        // GAP-G3: server binary source — default(GitHub Releases)/URL/local
+        // file, mirrors ssh_install_cmd.rs's RunArgs --binary-file/
+        // --binary-url flags via install_wizard::BinarySource (see
+        // start_ssh_install's mapping).
+        ui.separator();
+        ui.label(egui::RichText::new(t(lang, "ssh_binary_source_label")).strong());
+        ui.horizontal(|ui| {
+            ui.radio_value(
+                &mut self.ssh_binary_source_choice,
+                SshBinarySourceChoice::Default,
+                t(lang, "ssh_binary_source_default"),
+            );
+            ui.radio_value(
+                &mut self.ssh_binary_source_choice,
+                SshBinarySourceChoice::Url,
+                t(lang, "ssh_binary_source_url"),
+            );
+            ui.radio_value(
+                &mut self.ssh_binary_source_choice,
+                SshBinarySourceChoice::LocalFile,
+                t(lang, "ssh_binary_source_file"),
+            );
+        });
+        match self.ssh_binary_source_choice {
+            SshBinarySourceChoice::Default => {}
+            SshBinarySourceChoice::Url => {
+                ui.horizontal(|ui| {
+                    ui.label(t(lang, "ssh_binary_url_label"));
+                    ui.text_edit_singleline(&mut self.ssh_binary_url);
+                });
+            }
+            SshBinarySourceChoice::LocalFile => {
+                ui.horizontal(|ui| {
+                    ui.label(t(lang, "ssh_binary_file_label"));
+                    ui.text_edit_singleline(&mut self.ssh_binary_file_path);
+                });
+            }
+        }
+
         ui.separator();
         ui.checkbox(&mut self.ssh_mode_docker, t(lang, "ssh_mode_docker"));
         ui.horizontal(|ui| {
@@ -2481,129 +2537,6 @@ impl AivpnApp {
             });
         if !open {
             self.ssh_show_script = false;
-        }
-    }
-
-    // ── Server migration wizard (C3) ────────────────────────────────────
-
-    fn start_migration_export(&mut self) {
-        self.migration_export_busy = true;
-        self.migration_export_error = None;
-        self.migration_export_saved_path = None;
-        admin::spawn(
-            self.vpn.client_binary.clone(),
-            AdminRequest::BackupExport,
-            self.admin_tx.clone(),
-        );
-    }
-
-    fn start_migration_import(&mut self) {
-        let path = self.migration_import_path.trim();
-        if path.is_empty() {
-            self.migration_import_error =
-                Some(t(self.settings.lang, "migration_import_path_required").to_string());
-            return;
-        }
-        let bytes = match std::fs::read(path) {
-            Ok(b) => b,
-            Err(e) => {
-                self.migration_import_error = Some(format!("Failed to read backup file: {e}"));
-                return;
-            }
-        };
-        self.migration_import_busy = true;
-        self.migration_import_error = None;
-        self.migration_import_done = false;
-        admin::spawn(
-            self.vpn.client_binary.clone(),
-            AdminRequest::BackupImport { body: bytes },
-            self.admin_tx.clone(),
-        );
-    }
-
-    fn draw_migration_window(&mut self, ctx: &eframe::egui::Context, lang: Lang) {
-        use eframe::egui;
-
-        if !self.migration_open {
-            return;
-        }
-        let mut open = true;
-        egui::Window::new(t(lang, "migration_title"))
-            .id(egui::Id::new("migration_wizard"))
-            .collapsible(false)
-            .resizable(true)
-            .default_width(460.0)
-            .open(&mut open)
-            .show(ctx, |ui| {
-                ui.label(egui::RichText::new(t(lang, "migration_step_export")).strong());
-                ui.label(
-                    egui::RichText::new(t(lang, "migration_export_hint"))
-                        .size(11.0)
-                        .weak(),
-                );
-                if ui
-                    .add_enabled(
-                        !self.migration_export_busy,
-                        egui::Button::new(t(lang, "migration_export_btn")),
-                    )
-                    .clicked()
-                {
-                    self.start_migration_export();
-                }
-                if self.migration_export_busy {
-                    ui.weak(t(lang, "admin_loading"));
-                }
-                if let Some(err) = &self.migration_export_error {
-                    ui.colored_label(egui::Color32::from_rgb(0xEF, 0x53, 0x50), err);
-                }
-                if let Some(path) = &self.migration_export_saved_path {
-                    ui.label(
-                        egui::RichText::new(format!("{}: {path}", t(lang, "admin_saved_to")))
-                            .size(11.0),
-                    );
-                }
-
-                ui.separator();
-                ui.label(
-                    egui::RichText::new(t(lang, "migration_step_install"))
-                        .size(11.0)
-                        .weak(),
-                );
-
-                ui.separator();
-                ui.label(egui::RichText::new(t(lang, "migration_step_import")).strong());
-                ui.horizontal(|ui| {
-                    ui.label(t(lang, "migration_import_path_label"));
-                    ui.text_edit_singleline(&mut self.migration_import_path);
-                });
-                if ui
-                    .add_enabled(
-                        !self.migration_import_busy,
-                        egui::Button::new(t(lang, "migration_import_btn")),
-                    )
-                    .clicked()
-                {
-                    self.start_migration_import();
-                }
-                if self.migration_import_busy {
-                    ui.weak(t(lang, "admin_loading"));
-                }
-                if let Some(err) = &self.migration_import_error {
-                    ui.colored_label(egui::Color32::from_rgb(0xEF, 0x53, 0x50), err);
-                }
-                if self.migration_import_done {
-                    ui.colored_label(
-                        egui::Color32::from_rgb(0x4C, 0xAF, 0x50),
-                        t(lang, "migration_import_done"),
-                    );
-                }
-            });
-        if !open {
-            self.migration_open = false;
-            self.migration_export_error = None;
-            self.migration_export_saved_path = None;
-            self.migration_import_error = None;
-            self.migration_import_done = false;
         }
     }
 
@@ -3019,6 +2952,21 @@ impl eframe::App for AivpnApp {
                                 self.do_connect();
                             }
                         });
+
+                    ui.add_space(4.0);
+                    ui.separator();
+
+                    // ── GAP-G2: SSH server-install wizard entry point ────────────────
+                    // Always visible on the main screen — no connection and no admin
+                    // role required, since installing a brand-new server ("first
+                    // server from scratch") is a base scenario, not a management
+                    // action on an already-running one (that flow, e.g. client
+                    // management, stays gated behind draw_admin_panel/is_admin).
+                    ui.horizontal(|ui| {
+                        if ui.small_button(t(lang, "ssh_wizard_open_btn")).clicked() {
+                            self.ssh_wizard_open = true;
+                        }
+                    });
 
                     ui.add_space(4.0);
                     ui.separator();
@@ -3576,11 +3524,12 @@ impl eframe::App for AivpnApp {
         // clears both, but only on the NEXT tick(), not synchronously here).
         self.draw_admin_extras(ctx, lang);
 
-        // C3: SSH install + migration wizard windows — same "always drawn,
-        // independent of draw_admin_panel this frame" rationale as
-        // draw_admin_extras above (open flags gate their own visibility).
+        // C3: SSH install wizard window — same "always drawn, independent
+        // of draw_admin_panel this frame" rationale as draw_admin_extras
+        // above (its own `ssh_wizard_open` flag gates visibility). GAP-G1:
+        // the migration wizard (export/import via the tunnel mgmt bridge)
+        // was removed — migration is a web-panel-only feature.
         self.draw_ssh_install_window(ctx, lang);
-        self.draw_migration_window(ctx, lang);
 
         // ── Add / Edit dialog — separate OS window (can go outside main window) ──
         if self.show_dialog {

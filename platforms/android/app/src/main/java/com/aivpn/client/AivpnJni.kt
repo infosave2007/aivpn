@@ -378,4 +378,20 @@ object AivpnJni {
      * @return `0` if a job was removed, `-1` if `handle` was already unknown.
      */
     external fun sshInstallFree(handle: Long): Int
+
+    /**
+     * Derives this device's X25519 public key from `privkeyB64` — the same 32-byte
+     * device static private key ([SecureStorage.loadDeviceKey], base64 STANDARD-encoded
+     * by the caller) already passed as `staticPrivkey` into [runTunnel] for JIT device
+     * enrollment. Used by [InstallServerActivity] to populate `sshInstallStart`'s params
+     * JSON `device_pubkey_b64` field when the user opts into device-bound admin install
+     * (mirrors the desktop CLI's `--device-pubkey`).
+     *
+     * @param privkeyB64 32 raw bytes, base64 STANDARD (NOT `android.util.Base64.DEFAULT`,
+     *                   which may insert newlines — re-encode if the source used a
+     *                   different variant).
+     * @return the base64 STANDARD-encoded public key, or `null` if `privkeyB64` is not
+     *         valid base64 or does not decode to exactly 32 bytes. Never throws.
+     */
+    external fun devicePubkey(privkeyB64: String): String?
 }

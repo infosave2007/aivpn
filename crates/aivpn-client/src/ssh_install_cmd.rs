@@ -373,6 +373,37 @@ fn connect_error_marker_line(err: &ssh_install::SshInstallError) -> String {
     client_marker_line("ssh_connect", "error", Some(code), Some(&msg), None)
 }
 
+/// `##AIVPN {"step":"install","status":"error",...}` for a failure that
+/// happens *after* the SSH connection already succeeded — an SFTP upload or
+/// remote-exec I/O error, surfaced as the same [`ssh_install::SshInstallError`]
+/// type `run_install` uses for its pre-connect failures too (`?` on
+/// `upload_file`/`run_streaming` inside `run_install` propagates the same
+/// error enum). Deliberately a *different* step/code than
+/// [`connect_error_marker_line`]: by the time this can fire, an
+/// `{"step":"ssh_connect","status":"ok",...}` marker (from
+/// [`InstallEvent::Connected`]) has already been printed, so reusing
+/// `"ssh_connect"`/`"connect_failed"` here would contradict that earlier
+/// "ok" and mislead a GUI (and the user) into re-checking the host
+/// key/password instead of e.g. disk space or network stability on the
+/// remote mid-upload.
+fn post_connect_error_marker_line(err: &ssh_install::SshInstallError) -> String {
+    let code = match err {
+        ssh_install::SshInstallError::Io(_) => "io_error",
+        ssh_install::SshInstallError::Sftp(_) => "sftp_error",
+        ssh_install::SshInstallError::Ssh(_) => "ssh_error",
+        ssh_install::SshInstallError::Key(_) => "key_error",
+        ssh_install::SshInstallError::Json(_) => "json_error",
+        // Unreachable in practice post-Connected (these only ever occur
+        // during the initial `connect()` handshake), but matched explicitly
+        // rather than falling into a catch-all so this stays exhaustive if
+        // `SshInstallError` grows a variant.
+        ssh_install::SshInstallError::AuthFailed => "auth_failed",
+        ssh_install::SshInstallError::HostKeyMismatch { .. } => "fingerprint_mismatch",
+    };
+    let msg = err.to_string();
+    client_marker_line("install", "error", Some(code), Some(&msg), None)
+}
+
 /// Reads the local device X25519 keypair from `~/.config/aivpn/device.key`
 /// (same file/format `load_or_generate_static_keypair` in
 /// `crates/aivpn-client/src/client.rs:3933` uses for VPN device binding) and
@@ -525,7 +556,17 @@ async fn run_install_cmd(args: RunArgs) -> i32 {
         }
     };
 
+    // Tracks whether `InstallEvent::Connected` has already fired, so a later
+    // `Err` from `run_install` (upload/exec I/O failure) is reported as a
+    // post-connect failure rather than mislabeled as a connect failure — see
+    // `post_connect_error_marker_line`'s doc comment. `run_install` and this
+    // closure both run on the same task (no `tokio::spawn` in between), so a
+    // plain `Cell` is enough.
+    let connected = std::cell::Cell::new(false);
     match ssh_install::run_install(params, |ev| {
+        if matches!(ev, InstallEvent::Connected { .. }) {
+            connected.set(true);
+        }
         if let Some(line) = event_to_line(&ev) {
             println!("{line}");
         }
@@ -535,7 +576,12 @@ async fn run_install_cmd(args: RunArgs) -> i32 {
         Ok(exit_code) => exit_code,
         Err(e) => {
             eprintln!("ssh-install run failed: {e}");
-            println!("{}", connect_error_marker_line(&e));
+            let line = if connected.get() {
+                post_connect_error_marker_line(&e)
+            } else {
+                connect_error_marker_line(&e)
+            };
+            println!("{line}");
             1
         }
     }
@@ -844,6 +890,25 @@ mod tests {
         let line = connect_error_marker_line(&err);
         let marker = ssh_install::parse_marker_line(&line).expect("must parse as a marker");
         assert_eq!(marker.code.as_deref(), Some("auth_failed"));
+    }
+
+    #[test]
+    fn post_connect_error_marker_line_uses_install_step_not_ssh_connect() {
+        // Regression: a failure after the SSH connection already succeeded
+        // (e.g. an SFTP upload dropping mid-transfer) must not be reported
+        // under the same "ssh_connect" step as a real connect/auth/
+        // fingerprint failure — a GUI would already have printed
+        // {"step":"ssh_connect","status":"ok",...} for `Connected`, and a
+        // second, contradictory ssh_connect error would send the user
+        // chasing the wrong problem (host key/password instead of e.g. disk
+        // space on the remote).
+        let err = ssh_install::SshInstallError::Io(std::io::Error::other("disk full"));
+        let line = post_connect_error_marker_line(&err);
+        let marker = ssh_install::parse_marker_line(&line).expect("must parse as a marker");
+        assert_eq!(marker.step, "install");
+        assert_ne!(marker.step, "ssh_connect");
+        assert_eq!(marker.status, "error");
+        assert_eq!(marker.code.as_deref(), Some("io_error"));
     }
 
     // --- local_device_pubkey_b64 ------------------------------------------------

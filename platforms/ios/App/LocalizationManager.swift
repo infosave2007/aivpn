@@ -298,8 +298,8 @@ class LocalizationManager: ObservableObject {
         "install_server_port":        ["en": "VPN port", "ru": "Порт VPN"],
         "install_device_binding_toggle": ["en": "Device binding (auto-create admin client)", "ru": "Привязка к устройству (авто-создание admin-клиента)"],
         "install_device_binding_hint": [
-            "en": "Unavailable on iOS: this app has no way to read its own device public key over the current FFI, so an admin client can't be auto-created during install. You'll need to create one manually afterwards (server CLI, web panel, or another device) and add its connection key with the + button.",
-            "ru": "Недоступно на iOS: у приложения нет способа прочитать публичный ключ своего устройства через текущий FFI, поэтому admin-клиент не может быть создан автоматически при установке. Создайте его вручную после установки (CLI сервера, веб-панель или другое устройство) и добавьте ключ подключения кнопкой «+».",
+            "en": "Uses this device's own key to auto-create a device-bound admin client during install — the server will hand back a ready-to-use connection key that only this device can redeem.",
+            "ru": "Использует собственный ключ этого устройства для автоматического создания привязанного к устройству admin-клиента при установке — сервер вернёт готовый ключ подключения, который сможет активировать только это устройство.",
         ],
         "install_next":               ["en": "Next", "ru": "Далее"],
         "install_back":               ["en": "Back", "ru": "Назад"],
@@ -328,11 +328,33 @@ class LocalizationManager: ObservableObject {
         "install_import_button":      ["en": "Import Connection Key", "ru": "Импортировать ключ подключения"],
         "install_import_title":       ["en": "Import Key", "ru": "Импорт ключа"],
         "install_no_key_hint": [
-            "en": "No connection key was auto-created (device binding is unavailable on iOS). Create an admin client manually — via the server CLI, web panel, or another device — then add its key here with the + button.",
-            "ru": "Ключ подключения не был создан автоматически (привязка устройства недоступна на iOS). Создайте admin-клиента вручную — через CLI сервера, веб-панель или другое устройство — и добавьте его ключ здесь кнопкой «+».",
+            "en": "No connection key was auto-created (enable Device binding above before installing to get one automatically). Create an admin client manually — via the server CLI, web panel, or another device — then add its key here with the + button.",
+            "ru": "Ключ подключения не был создан автоматически (включите «Привязка к устройству» выше перед установкой, чтобы получить его автоматически). Создайте admin-клиента вручную — через CLI сервера, веб-панель или другое устройство — и добавьте его ключ здесь кнопкой «+».",
         ],
         "install_close":              ["en": "Close", "ru": "Закрыть"],
         "install_bad_params":         ["en": "Invalid install parameters", "ru": "Некорректные параметры установки"],
+        "install_wizard_hint": [
+            "en": "Provision a brand-new aivpn server on a fresh VPS over SSH — no existing connection needed.",
+            "ru": "Разверните новый сервер aivpn на чистом VPS по SSH — существующее подключение не требуется.",
+        ],
+
+        // MARK: Binary source picker (G3)
+        "install_binary_section":     ["en": "Server binary", "ru": "Бинарник сервера"],
+        "install_binary_default":     ["en": "GitHub Releases", "ru": "GitHub Releases"],
+        "install_binary_url":         ["en": "URL", "ru": "URL"],
+        "install_binary_file":        ["en": "Local file", "ru": "Локальный файл"],
+        "install_binary_url_field":   ["en": "Binary download URL", "ru": "URL для скачивания бинарника"],
+        "install_binary_choose_file": ["en": "Choose File…", "ru": "Выбрать файл…"],
+        "install_binary_file_none":   ["en": "No file selected", "ru": "Файл не выбран"],
+        "install_binary_file_error": [
+            "en": "Could not read the selected file", "ru": "Не удалось прочитать выбранный файл",
+        ],
+
+        // MARK: Device binding (G4)
+        "install_device_binding_unavailable_hint": [
+            "en": "This device has no key yet — connect to any aivpn server at least once (with any connection key) so the app can create one, then reopen this wizard.",
+            "ru": "У этого устройства ещё нет ключа — подключитесь хотя бы раз к любому серверу aivpn (с любым ключом подключения), чтобы приложение создало ключ устройства, затем откройте мастер заново.",
+        ],
 
         // Marker codes from deploy/install-server.sh's `emit_marker` calls
         // (##AIVPN {"step","status","code","msg"} lines) — only the
@@ -382,42 +404,6 @@ class LocalizationManager: ObservableObject {
         "install_code_ready":                 ["en": "Ready", "ru": "Готово"],
         "install_code_restarted":             ["en": "Restarted", "ru": "Перезапущено"],
         "install_code_present":               ["en": "Present", "ru": "Присутствует"],
-
-        // MARK: Migration guide (C3-iOS, MigrationView.swift)
-        "migrate_title":               ["en": "Server Migration", "ru": "Миграция сервера"],
-        "migrate_step1_title":         ["en": "1. Export from current server", "ru": "1. Экспорт с текущего сервера"],
-        "migrate_step1_hint": [
-            "en": "Requires an active connection to the OLD server as an Admin. The server may refuse this request — see the note below.",
-            "ru": "Требуется активное подключение к СТАРОМУ серверу с ролью Admin. Сервер может отклонить этот запрос — см. примечание ниже.",
-        ],
-        "migrate_not_connected":       ["en": "Not connected", "ru": "Нет подключения"],
-        "migrate_export_button":       ["en": "Export Server Data", "ru": "Экспортировать данные сервера"],
-        "migrate_export_size":         ["en": "Exported: {bytes} bytes", "ru": "Экспортировано: {bytes} байт"],
-        "migrate_export_file_write_failed": [
-            "en": "Export succeeded, but saving it to a shareable file failed.",
-            "ru": "Экспорт выполнен, но не удалось сохранить его в файл для отправки.",
-        ],
-        "migrate_step2_title":         ["en": "2. Install the new server", "ru": "2. Установка нового сервера"],
-        "migrate_step2_hint": [
-            "en": "Opens the SSH install wizard for a fresh VPS. Does not require the current tunnel connection.",
-            "ru": "Открывает мастер установки по SSH на новом VPS. Не требует текущего подключения по туннелю.",
-        ],
-        "migrate_open_install":        ["en": "Open Install Wizard", "ru": "Открыть мастер установки"],
-        "migrate_step3_title":         ["en": "3. Import into the new server", "ru": "3. Импорт на новый сервер"],
-        "migrate_step3_hint": [
-            "en": "Switch your active connection key to the NEW server first (see Saved Keys), then run this step while connected to it.",
-            "ru": "Сначала переключите активный ключ подключения на НОВЫЙ сервер (см. «Сохранённые ключи»), затем выполните этот шаг, будучи подключённым к нему.",
-        ],
-        "migrate_import_button":       ["en": "Import Into New Server", "ru": "Импортировать на новый сервер"],
-        "migrate_import_success":      ["en": "Import succeeded", "ru": "Импорт выполнен успешно"],
-        "migrate_transport_error": [
-            "en": "Not connected, or the request timed out",
-            "ru": "Нет подключения, или истекло время ожидания запроса",
-        ],
-        "migrate_server_rejected": [
-            "en": "The server rejected this request (status {status}). Backup export/import is currently not exposed over the in-tunnel management channel — see this file's source comment for details.",
-            "ru": "Сервер отклонил запрос (статус {status}). Экспорт/импорт резервной копии пока не доступен через внутритуннельный канал управления — подробности в комментарии к исходному коду этого экрана.",
-        ],
     ]
 
     init() {

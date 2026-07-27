@@ -45,6 +45,14 @@ const VIEWER_ALLOWED: Array<{ method: string; pattern: RegExp }> = [
   { method: 'GET', pattern: /^\/api\/v1\/kernel$/ },
   // Realtime dashboard event stream (SSE) — read-only status/traffic events.
   { method: 'GET', pattern: /^\/api\/v1\/events$/ },
+  // Pool topology (nodes/links/health) — node IDs, addresses, sync/connected
+  // state; no keys or credentials. Sidebar.svelte marks Pool `adminOnly:
+  // false` on this same assumption ("plain GET proxied route, allowed for
+  // viewers too") — these three entries were missing here, which silently
+  // 403'd every viewer's Pool page despite the nav link being shown to them.
+  { method: 'GET', pattern: /^\/api\/v1\/pool\/nodes$/ },
+  { method: 'GET', pattern: /^\/api\/v1\/pool\/links$/ },
+  { method: 'GET', pattern: /^\/api\/v1\/pool\/health$/ },
 ]
 
 /**

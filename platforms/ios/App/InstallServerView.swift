@@ -1,6 +1,7 @@
 import Foundation
 import SwiftUI
 import Combine
+import UniformTypeIdentifiers
 
 // In-app SSH server installer (C3-iOS): 3-step wizard — Target (connection
 // details) → TOFU (host-key confirmation) → Install (live progress) — on
@@ -184,13 +185,25 @@ struct InstallServerView: View {
     @State private var serverIp: String = ""
     @State private var hasServerPort: Bool = false
     @State private var serverPortText: String = ""
-    /// Always stays `false` — see the footer text on this toggle and the
-    /// `device_pubkey_b64` comment in `buildParamsJson()` for why: iOS has
-    /// no FFI getter for its own device static public key, so device
-    /// binding can never actually be requested from this wizard. Kept as a
-    /// (disabled) Toggle rather than removed outright so the limitation is
-    /// visible in the UI instead of silently absent.
+
+    // MARK: Binary source (G3)
+    private enum BinaryKind: String { case defaultSource = "default", url, file }
+    @State private var binaryKind: BinaryKind = .defaultSource
+    @State private var binaryUrl: String = ""
+    @State private var binaryFilePath: String? = nil
+    @State private var binaryFileName: String? = nil
+    @State private var showBinaryFileImporter = false
+    @State private var binaryFileError: String?
+
+    // MARK: Device binding (G4) — see SshInstallApi.devicePubkeyBase64()'s
+    // doc comment for where the underlying key comes from. `devicePubkeyB64`
+    // is populated (or the toggle is bounced back off + a hint shown) the
+    // moment the user turns this on, in `onChange(of: deviceBindingRequested)`
+    // below — never silently left stale if the toggle is left on across an
+    // unrelated form edit.
     @State private var deviceBindingRequested: Bool = false
+    @State private var devicePubkeyB64: String?
+    @State private var deviceBindingUnavailable = false
 
     // MARK: TOFU
     @State private var isProbing = false
@@ -300,6 +313,34 @@ struct InstallServerView: View {
                 .labelsHidden()
             }
 
+            Section(header: Text(loc.t("install_binary_section"))) {
+                Picker(loc.t("install_binary_section"), selection: $binaryKind) {
+                    Text(loc.t("install_binary_default")).tag(BinaryKind.defaultSource)
+                    Text(loc.t("install_binary_url")).tag(BinaryKind.url)
+                    Text(loc.t("install_binary_file")).tag(BinaryKind.file)
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+
+                if binaryKind == .url {
+                    TextField(loc.t("install_binary_url_field"), text: $binaryUrl)
+                        .autocorrectionDisabled()
+                        .textInputAutocapitalization(.never)
+                        .keyboardType(.URL)
+                } else if binaryKind == .file {
+                    Button(loc.t("install_binary_choose_file")) {
+                        showBinaryFileImporter = true
+                    }
+                    .buttonStyle(.bordered)
+                    Text(binaryFileName ?? loc.t("install_binary_file_none"))
+                        .font(.caption)
+                        .foregroundColor(binaryFileName == nil ? .secondary : .primary)
+                    if let binaryFileError {
+                        Text(binaryFileError).font(.caption).foregroundColor(.red)
+                    }
+                }
+            }
+
             Section(footer: Text(loc.t("install_server_ip_hint"))) {
                 Toggle(loc.t("install_server_ip_toggle"), isOn: $hasServerIp.animation())
                 if hasServerIp {
@@ -315,15 +356,55 @@ struct InstallServerView: View {
                 }
             }
 
-            Section(footer: Text(loc.t("install_device_binding_hint"))) {
+            Section(footer: Text(deviceBindingUnavailable
+                ? loc.t("install_device_binding_unavailable_hint")
+                : loc.t("install_device_binding_hint"))) {
                 Toggle(loc.t("install_device_binding_toggle"), isOn: $deviceBindingRequested)
-                    .disabled(true)
             }
 
             if let probeError, step == .target {
                 Section {
                     Text(probeError).font(.caption).foregroundColor(.red)
                 }
+            }
+        }
+        .onChange(of: deviceBindingRequested) { newValue in
+            guard newValue else {
+                devicePubkeyB64 = nil
+                return
+            }
+            if let pk = SshInstallApi.devicePubkeyBase64() {
+                devicePubkeyB64 = pk
+                deviceBindingUnavailable = false
+            } else {
+                devicePubkeyB64 = nil
+                deviceBindingUnavailable = true
+                deviceBindingRequested = false
+            }
+        }
+        .fileImporter(isPresented: $showBinaryFileImporter, allowedContentTypes: [.item], allowsMultipleSelection: false) { result in
+            switch result {
+            case .success(let urls):
+                guard let url = urls.first else { return }
+                binaryFileError = nil
+                let accessed = url.startAccessingSecurityScopedResource()
+                defer { if accessed { url.stopAccessingSecurityScopedResource() } }
+                let dest = FileManager.default.temporaryDirectory
+                    .appendingPathComponent("aivpn-server-upload-\(UUID().uuidString)")
+                do {
+                    if FileManager.default.fileExists(atPath: dest.path) {
+                        try FileManager.default.removeItem(at: dest)
+                    }
+                    try FileManager.default.copyItem(at: url, to: dest)
+                    binaryFilePath = dest.path
+                    binaryFileName = url.lastPathComponent
+                } catch {
+                    binaryFilePath = nil
+                    binaryFileName = nil
+                    binaryFileError = loc.t("install_binary_file_error")
+                }
+            case .failure:
+                binaryFileError = loc.t("install_binary_file_error")
             }
         }
         .toolbar {
@@ -345,9 +426,19 @@ struct InstallServerView: View {
             return false
         }
         switch authKind {
-        case .password: return !password.isEmpty
-        case .keyPem: return !pem.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        case .password:
+            if password.isEmpty { return false }
+        case .keyPem:
+            if pem.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return false }
         }
+        switch binaryKind {
+        case .defaultSource: break
+        case .url:
+            if binaryUrl.trimmingCharacters(in: .whitespaces).isEmpty { return false }
+        case .file:
+            if binaryFilePath == nil { return false }
+        }
+        return true
     }
 
     // MARK: - Step 2: TOFU
@@ -563,32 +654,42 @@ struct InstallServerView: View {
             authDict = d
         }
 
+        let binaryDict: [String: Any]
+        switch binaryKind {
+        case .defaultSource:
+            binaryDict = ["type": "default"]
+        case .url:
+            binaryDict = ["type": "url", "url": binaryUrl.trimmingCharacters(in: .whitespaces)]
+        case .file:
+            // Local path inside this App's own sandbox (copied there by the
+            // .fileImporter callback in `targetForm`) — install_params_from_json
+            // treats this as a path on the SAME machine running the install
+            // (here: in-process, since aivpn-ios-core is a statically linked
+            // library, not a separate host), which it then SFTP-uploads to
+            // the target server. `targetIsValid` guarantees this is non-nil
+            // before the Next button that gets here is even enabled.
+            binaryDict = ["type": "file", "path": binaryFilePath ?? ""]
+        }
+
         var dict: [String: Any] = [
             "host": host.trimmingCharacters(in: .whitespaces),
             "port": Int(portText.trimmingCharacters(in: .whitespaces)) ?? 22,
             "user": user.trimmingCharacters(in: .whitespaces),
             "auth": authDict,
             "fingerprint": fingerprint ?? "",
-            "binary": ["type": "default"],
+            "binary": binaryDict,
             "mode": modeKind.rawValue,
-            // device_pubkey_b64: always null on iOS. grep-confirmed: there
-            // is no `aivpn_get_device_pubkey`-equivalent export in
-            // aivpn_core.h — the only device static keypair material
-            // touching this FFI surface is `static_privkey`, consumed
-            // internally by aivpn_run_tunnel for JIT enrollment, never
-            // exposed back out as a public key the app could read. Without
-            // it, deploy/install-server.sh's create_admin_client step is
-            // skipped server-side (see its "no --device-pubkey supplied,
-            // skipping auto-admin client creation" marker) — so
-            // `finished.connection_key` will always be null for an
-            // iOS-driven install. TODO(iOS device-binding-for-SSH-install):
-            // add an aivpn_core.h getter for the device's own static
-            // public key if/when device-bound auto-admin creation from
-            // this wizard is wanted on iOS — do NOT add ad hoc FFI here
-            // without going through that header (task constraint).
+            // device_pubkey_b64: null unless the user opted into device
+            // binding AND SshInstallApi.devicePubkeyBase64() actually
+            // produced a key — see the `onChange(of: deviceBindingRequested)`
+            // handler in `targetForm`, which is the only place
+            // `devicePubkeyB64` is ever set (never invented here).
             "device_pubkey_b64": NSNull(),
             "extra_args": [],
         ]
+        if deviceBindingRequested, let pk = devicePubkeyB64 {
+            dict["device_pubkey_b64"] = pk
+        }
         if hasServerIp {
             let trimmed = serverIp.trimmingCharacters(in: .whitespaces)
             if !trimmed.isEmpty { dict["server_ip"] = trimmed }

@@ -61,15 +61,9 @@
             android:exported="false"
             android:parentActivityName=".AdminActivity" />
 
-        <!-- C3: SSH server-install wizard (Admin role gated, independent of tunnel state) -->
+        <!-- C3: SSH server-install wizard (always reachable — no tunnel/role required) -->
         <activity
             android:name=".InstallServerActivity"
-            android:exported="false"
-            android:parentActivityName=".MainActivity" />
-
-        <!-- C3: server-migration guide (export/install/import) (Admin role gated) -->
-        <activity
-            android:name=".MigrationActivity"
             android:exported="false"
             android:parentActivityName=".MainActivity" />
 

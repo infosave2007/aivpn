@@ -98,6 +98,7 @@ async fn spawn_server_with_key(
             pool_configured: false,
             pool_registry_slot: None,
             pool_dialer_slot: None,
+            exit_route_cache: None,
         })
         .await;
     });

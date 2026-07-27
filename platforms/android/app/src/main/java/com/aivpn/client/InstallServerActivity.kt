@@ -1,5 +1,6 @@
 package com.aivpn.client
 
+import android.net.Uri
 import android.os.Bundle
 import android.text.InputType
 import android.view.Gravity
@@ -13,6 +14,7 @@ import android.widget.RadioGroup
 import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.lifecycle.lifecycleScope
@@ -33,9 +35,13 @@ import java.util.UUID
  *
  * Unlike [AdminActivity]/[PoolActivity], this does NOT talk to the active
  * tunnel session at all — it opens its own outbound SSH connection to
- * whatever host the user enters, entirely independent of VPN state. The
- * entry point is still gated to full Admin (role==2) from [MainActivity]'s
- * menu, matching the rest of the in-app admin section.
+ * whatever host the user enters, entirely independent of VPN state. Unlike
+ * [MainActivity]'s other in-app admin entries (which need role==1/2, i.e. an
+ * already-connected, already-admin-enrolled profile), the options-menu entry
+ * for this Activity is ALWAYS shown, including with zero saved profiles and
+ * zero connections — provisioning your first server from scratch is the base
+ * scenario, and nothing here exposes admin-only client-management
+ * functionality (that stays behind [AdminActivity]/[MENU_ADMIN]).
  *
  * Three steps, each a plain [LinearLayout] built in Kotlin and swapped into
  * `contentContainer` (same "build views in code, no per-dialog XML" style
@@ -44,13 +50,14 @@ import java.util.UUID
  *  2. TOFU     — [AivpnJni.sshProbeHostkey] result, trust/cancel, "show script"
  *  3. INSTALL  — [AivpnJni.sshInstallStart]/[AivpnJni.sshInstallPoll] progress log
  *
- * **Device binding**: there is currently no JNI getter for this device's
- * mgmt-admin public key on Android (unlike the desktop CLI's
- * `--device-pubkey`), so `device_pubkey_b64` is always sent as `null` here —
- * the created admin client is NOT bound to this device. See the checkbox's
- * warning copy and the TODO on [buildParamsJson] below. Adding that getter
- * is separate work (would need a new JNI export + Rust-side key access), not
- * something to improvise here.
+ * **Device binding**: when the checkbox is on, [devicePubkeyBase64] reads this
+ * device's JIT-enrollment private key ([SecureStorage.loadDeviceKey] — the same
+ * 32-byte X25519 scalar already passed as `staticPrivkey` into every
+ * [AivpnJni.runTunnel] call, generating and persisting one first if this device
+ * has never run a tunnel session yet), re-encodes it base64 STANDARD, and derives
+ * the matching public key via [AivpnJni.devicePubkey]. That public key is sent as
+ * `device_pubkey_b64` so the server creates a device-bound (admin-capable) client
+ * at install time (mirrors the desktop CLI's `--device-pubkey`).
  */
 class InstallServerActivity : AppCompatActivity() {
 
@@ -71,6 +78,20 @@ class InstallServerActivity : AppCompatActivity() {
     private var serverIp = ""
     private var serverPort = ""
     private var deviceBinding = false
+
+    // ── Step 1 binary-source state (G3: default / URL / local file via SAF) ──
+    private enum class BinarySource { DEFAULT, URL, FILE }
+    private var binarySource = BinarySource.DEFAULT
+    private var binaryUrl = ""
+    /** Absolute path of the copy in [cacheDir] after [pickBinaryFile] resolves — see
+     *  [copyPickedBinaryToCache]'s doc comment for why a SAF `content://` Uri can't be
+     *  passed to the Rust side directly. */
+    private var binaryFilePath: String? = null
+    private var binaryFileName: String = ""
+
+    private val pickBinaryFile = registerForActivityResult(ActivityResultContracts.GetContent()) { uri: Uri? ->
+        if (uri != null) onBinaryFilePicked(uri)
+    }
 
     // ── Step 2 (TOFU) state ──
     private sealed class TofuState {
@@ -107,6 +128,16 @@ class InstallServerActivity : AppCompatActivity() {
         val h = installHandle
         if (h >= 1L && AivpnJni.isAvailable) {
             try { AivpnJni.sshInstallFree(h) } catch (_: Throwable) { }
+        }
+        // Best-effort cleanup of the cached binary copy (see copyPickedBinaryToCache).
+        // Only when installFinished: if a job is still running/uploading, run_ssh_install_job
+        // owns the read of this path on its own background thread independent of this
+        // Activity's lifecycle (same "no cancellation" caveat as sshInstallFree above) —
+        // deleting it out from under an in-flight upload would corrupt that upload.
+        if (installFinished) {
+            binaryFilePath?.let { path ->
+                try { java.io.File(path).delete() } catch (_: Throwable) { }
+            }
         }
     }
 
@@ -230,6 +261,63 @@ class InstallServerActivity : AppCompatActivity() {
         layout.addView(keyPemInput)
         layout.addView(passphraseInput)
 
+        layout.addView(label(R.string.install_hint_binary_source))
+        val binaryGroup = RadioGroup(ctx).apply { orientation = RadioGroup.HORIZONTAL }
+        val rbBinaryDefault = RadioButton(ctx).apply { id = View.generateViewId(); text = getString(R.string.install_binary_default) }
+        val rbBinaryUrl = RadioButton(ctx).apply { id = View.generateViewId(); text = getString(R.string.install_binary_url) }
+        val rbBinaryFile = RadioButton(ctx).apply { id = View.generateViewId(); text = getString(R.string.install_binary_file) }
+        binaryGroup.addView(rbBinaryDefault)
+        binaryGroup.addView(rbBinaryUrl)
+        binaryGroup.addView(rbBinaryFile)
+        binaryGroup.check(
+            when (binarySource) {
+                BinarySource.DEFAULT -> rbBinaryDefault.id
+                BinarySource.URL -> rbBinaryUrl.id
+                BinarySource.FILE -> rbBinaryFile.id
+            }
+        )
+        layout.addView(binaryGroup)
+
+        val binaryUrlInput = EditText(ctx).apply {
+            hint = getString(R.string.install_hint_binary_url)
+            setText(binaryUrl)
+            setSingleLine(true)
+            visibility = if (binarySource == BinarySource.URL) View.VISIBLE else View.GONE
+        }
+        val binaryFileRow = LinearLayout(ctx).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            visibility = if (binarySource == BinarySource.FILE) View.VISIBLE else View.GONE
+        }
+        val binaryFileLabel = TextView(ctx).apply {
+            text = binaryFileName.ifEmpty { getString(R.string.install_no_file_selected) }
+            textSize = 12f
+            setTextColor(getColor(R.color.text_secondary))
+            setPadding(12.dp, 0, 0, 0)
+        }
+        val pickFileBtn = android.widget.Button(ctx).apply { text = getString(R.string.install_pick_binary_file) }
+        pickFileBtn.setOnClickListener {
+            // Sync whatever the user has typed so far before backgrounding into the
+            // system file picker — onBinaryFilePicked() re-renders this step on return,
+            // which would otherwise silently drop unsaved field edits (see
+            // syncTargetFieldsFromViews()'s doc comment).
+            syncTargetFieldsFromViews()
+            pickBinaryFile.launch("*/*")
+        }
+        binaryFileRow.addView(pickFileBtn)
+        binaryFileRow.addView(binaryFileLabel)
+        binaryGroup.setOnCheckedChangeListener { _, checkedId ->
+            binarySource = when (checkedId) {
+                rbBinaryUrl.id -> BinarySource.URL
+                rbBinaryFile.id -> BinarySource.FILE
+                else -> BinarySource.DEFAULT
+            }
+            binaryUrlInput.visibility = if (binarySource == BinarySource.URL) View.VISIBLE else View.GONE
+            binaryFileRow.visibility = if (binarySource == BinarySource.FILE) View.VISIBLE else View.GONE
+        }
+        layout.addView(binaryUrlInput)
+        layout.addView(binaryFileRow)
+
         layout.addView(label(R.string.install_hint_mode))
         val modeGroup = RadioGroup(ctx).apply { orientation = RadioGroup.HORIZONTAL }
         val rbSystemd = RadioButton(ctx).apply { id = View.generateViewId(); text = getString(R.string.install_mode_systemd) }
@@ -252,25 +340,27 @@ class InstallServerActivity : AppCompatActivity() {
             isChecked = deviceBinding
             setPadding(0, 14.dp, 0, 0)
         }
-        val bindingWarning = TextView(ctx).apply {
-            text = getString(R.string.install_device_binding_warning)
+        val bindingHint = TextView(ctx).apply {
+            text = getString(R.string.install_device_binding_hint)
             textSize = 11f
-            setTextColor(getColor(R.color.accent_lemon))
+            setTextColor(getColor(R.color.text_secondary))
             setPadding(0, 2.dp, 0, 0)
             visibility = if (deviceBinding) View.VISIBLE else View.GONE
         }
         bindingCheck.setOnCheckedChangeListener { _, checked ->
             deviceBinding = checked
-            bindingWarning.visibility = if (checked) View.VISIBLE else View.GONE
+            bindingHint.visibility = if (checked) View.VISIBLE else View.GONE
         }
         layout.addView(bindingCheck)
-        layout.addView(bindingWarning)
+        layout.addView(bindingHint)
 
-        // Stash the live views on the layout tag so onTargetNext() can read
-        // final values without redeclaring every field.
+        // Stash the live views on the layout tag so onTargetNext() /
+        // syncTargetFieldsFromViews() can read final values without redeclaring
+        // every field.
         layout.tag = TargetViews(
             hostInput, portInput, userInput, rbPassword, passwordInput,
             keyPemInput, passphraseInput, rbDocker, serverIpInput, serverPortInput,
+            binaryUrlInput,
         )
         return layout
     }
@@ -280,9 +370,19 @@ class InstallServerActivity : AppCompatActivity() {
         val rbPassword: RadioButton, val password: EditText,
         val keyPem: EditText, val passphrase: EditText,
         val rbDocker: RadioButton, val serverIp: EditText, val serverPort: EditText,
+        val binaryUrl: EditText,
     )
 
-    private fun onTargetNext() {
+    /**
+     * Copies the currently-displayed Step 1 widget values into the instance fields
+     * WITHOUT validating or navigating — used before backgrounding into the system file
+     * picker ([pickBinaryFile]) so [onBinaryFilePicked]'s `renderStep()` rebuilds the
+     * form from up-to-date state instead of silently reverting every other field the
+     * user had already typed back to whatever [buildTargetStep] was last called with.
+     * [onTargetNext] duplicates this read (plus validation) rather than calling through,
+     * since it must not silently accept a still-invalid form.
+     */
+    private fun syncTargetFieldsFromViews() {
         val v = binding.contentContainer.getChildAt(0).tag as? TargetViews ?: return
         host = v.host.text.toString().trim()
         port = v.port.text.toString().trim().ifEmpty { "22" }
@@ -294,6 +394,11 @@ class InstallServerActivity : AppCompatActivity() {
         modeIsDocker = v.rbDocker.isChecked
         serverIp = v.serverIp.text.toString().trim()
         serverPort = v.serverPort.text.toString().trim()
+        binaryUrl = v.binaryUrl.text.toString().trim()
+    }
+
+    private fun onTargetNext() {
+        syncTargetFieldsFromViews()
 
         if (host.isEmpty()) {
             Toast.makeText(this, getString(R.string.install_hint_host), Toast.LENGTH_SHORT).show()
@@ -316,6 +421,14 @@ class InstallServerActivity : AppCompatActivity() {
             Toast.makeText(this, getString(R.string.install_error_need_key), Toast.LENGTH_SHORT).show()
             return
         }
+        if (binarySource == BinarySource.URL && binaryUrl.isEmpty()) {
+            Toast.makeText(this, getString(R.string.install_error_need_binary_url), Toast.LENGTH_SHORT).show()
+            return
+        }
+        if (binarySource == BinarySource.FILE && binaryFilePath == null) {
+            Toast.makeText(this, getString(R.string.install_error_need_binary_file), Toast.LENGTH_SHORT).show()
+            return
+        }
         if (!AivpnJni.isAvailable) {
             Toast.makeText(this, getString(R.string.install_error_core_unavailable), Toast.LENGTH_LONG).show()
             return
@@ -324,6 +437,62 @@ class InstallServerActivity : AppCompatActivity() {
         step = Step.TOFU
         tofuState = TofuState.Loading
         renderStep()
+    }
+
+    /**
+     * Handles the SAF [pickBinaryFile] result: copies the picked content into
+     * [cacheDir] under a private, process-visible path, since the Rust installer
+     * (`tokio::fs::read` in `aivpn-common::ssh_install::run_install`) needs a real
+     * filesystem path to open — a `content://` Uri from [ActivityResultContracts.GetContent]
+     * is not guaranteed to resolve to one (e.g. a cloud-backed document provider), so it
+     * cannot be handed to the JNI layer directly.
+     */
+    private fun onBinaryFilePicked(uri: Uri) {
+        lifecycleScope.launch {
+            val (path, name) = withContext(Dispatchers.IO) { copyPickedBinaryToCache(uri) }
+            if (path != null) {
+                // Drop the previous copy (if the user picked a file more than once) so
+                // repeated picks don't silently accumulate full binary copies in cache.
+                val previous = binaryFilePath
+                binaryFilePath = path
+                binaryFileName = name
+                if (previous != null && previous != path) {
+                    withContext(Dispatchers.IO) { try { java.io.File(previous).delete() } catch (_: Throwable) { } }
+                }
+            } else {
+                Toast.makeText(this@InstallServerActivity, getString(R.string.install_error_file_read_failed), Toast.LENGTH_SHORT).show()
+            }
+            if (step == Step.TARGET) renderStep()
+        }
+    }
+
+    private fun copyPickedBinaryToCache(uri: Uri): Pair<String?, String> {
+        val name = queryDisplayName(uri) ?: "aivpn-server"
+        return try {
+            val dest = java.io.File(cacheDir, "ssh-install-binary-${UUID.randomUUID()}")
+            val copied = contentResolver.openInputStream(uri)?.use { input ->
+                dest.outputStream().use { output -> input.copyTo(output) }
+                true
+            } ?: false
+            if (copied) dest.absolutePath to name else null to name
+        } catch (t: Throwable) {
+            android.util.Log.e("InstallServerActivity", "failed to copy picked binary", t)
+            null to name
+        }
+    }
+
+    private fun queryDisplayName(uri: Uri): String? = try {
+        contentResolver.query(uri, arrayOf(android.provider.OpenableColumns.DISPLAY_NAME), null, null, null)?.use { cursor ->
+            if (cursor.moveToFirst()) {
+                val idx = cursor.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME)
+                if (idx >= 0) cursor.getString(idx) else null
+            } else {
+                null
+            }
+        }
+    } catch (t: Throwable) {
+        android.util.Log.e("InstallServerActivity", "failed to query display name", t)
+        null
     }
 
     // ──────────── Step 2: TOFU ────────────
@@ -516,8 +685,25 @@ class InstallServerActivity : AppCompatActivity() {
             renderStep()
             return
         }
-        val paramsJson = buildParamsJson(fingerprint)
         pollJob = lifecycleScope.launch {
+            // Derive the device pubkey (if binding is requested) off the main thread —
+            // see [devicePubkeyBase64]'s doc comment for why this can't just be null.
+            val devicePubkeyB64: String? = if (deviceBinding) {
+                withContext(Dispatchers.IO) { devicePubkeyBase64() }
+            } else {
+                null
+            }
+            if (deviceBinding && devicePubkeyB64 == null) {
+                // Honest failure rather than silently installing an unbound admin
+                // client while the user believes binding is on (see G4 in the task —
+                // no fabricated fallback).
+                appendLog(getString(R.string.install_device_binding_failed))
+                installFinished = true
+                finishedExitCode = -1
+                renderStep()
+                return@launch
+            }
+            val paramsJson = buildParamsJson(fingerprint, devicePubkeyB64)
             val handle = withContext(Dispatchers.IO) {
                 try { AivpnJni.sshInstallStart(paramsJson) } catch (t: Throwable) {
                     android.util.Log.e("InstallServerActivity", "sshInstallStart failed", t); -1L
@@ -614,19 +800,42 @@ class InstallServerActivity : AppCompatActivity() {
     }
 
     /**
+     * Reads this device's JIT-enrollment private key ([SecureStorage.loadDeviceKey]),
+     * generating and persisting one first if this device has never run a tunnel session
+     * yet (mirrors [AivpnService]'s lazy-generate — see its `runTunnel` call site — so
+     * the SAME key is reused later for the actual JIT enrollment DH regardless of
+     * whether install-wizard binding or a real VPN connect happens first), then derives
+     * the matching X25519 public key via [AivpnJni.devicePubkey].
+     *
+     * @return base64 STANDARD-encoded public key, or `null` if the core is unavailable
+     *         or [AivpnJni.devicePubkey] itself fails (should not normally happen since
+     *         this always feeds it a well-formed 32-byte key). Never throws.
+     */
+    private fun devicePubkeyBase64(): String? {
+        if (!AivpnJni.isAvailable) return null
+        val privkey = SecureStorage.loadDeviceKey(this) ?: ByteArray(32).also { bytes ->
+            java.security.SecureRandom().nextBytes(bytes)
+            SecureStorage.saveDeviceKey(this, bytes)
+        }
+        val privkeyB64 = android.util.Base64.encodeToString(privkey, android.util.Base64.NO_WRAP)
+        return try {
+            AivpnJni.devicePubkey(privkeyB64)
+        } catch (t: Throwable) {
+            android.util.Log.e("InstallServerActivity", "devicePubkey failed", t)
+            null
+        }
+    }
+
+    /**
      * Wire contract shared with `aivpn_common::ssh_install::install_params_from_json`
      * (see that function's doc comment / crates/aivpn-common/src/ssh_install.rs).
      *
-     * TODO(device-binding): `device_pubkey_b64` is always `null` — Android has
-     * no JNI export to read this device's mgmt-admin public key (unlike the
-     * desktop CLI's `--device-pubkey`). Adding one is separate work: a new
-     * `Java_com_aivpn_client_AivpnJni_get*` export plus whatever Rust-side
-     * key store the mobile core would need to expose it from. Until then, an
-     * admin client created via this wizard is never device-bound, regardless
-     * of [deviceBinding] (surfaced to the user via
-     * `install_device_binding_warning`).
+     * @param devicePubkeyB64 result of [devicePubkeyBase64], or `null` when the user did
+     *                        not opt into device binding — either way sent through as-is
+     *                        (`null` becomes JSON `null`, matching the field's optional
+     *                        wire contract).
      */
-    private fun buildParamsJson(fingerprint: String): String {
+    private fun buildParamsJson(fingerprint: String, devicePubkeyB64: String?): String {
         val root = JSONObject()
         root.put("host", host)
         root.put("port", port.toIntOrNull() ?: 22)
@@ -644,11 +853,19 @@ class InstallServerActivity : AppCompatActivity() {
         root.put("auth", auth)
 
         root.put("fingerprint", fingerprint)
-        root.put("binary", JSONObject().put("type", "default"))
+        val binaryObj = when (binarySource) {
+            BinarySource.DEFAULT -> JSONObject().put("type", "default")
+            BinarySource.URL -> JSONObject().put("type", "url").put("url", binaryUrl)
+            // binaryFilePath is validated non-null in onTargetNext() before this step
+            // is ever reachable — see the wire contract in
+            // aivpn_common::ssh_install::install_params_from_json.
+            BinarySource.FILE -> JSONObject().put("type", "file").put("path", binaryFilePath)
+        }
+        root.put("binary", binaryObj)
         if (serverIp.isNotEmpty()) root.put("server_ip", serverIp)
         serverPort.toIntOrNull()?.let { root.put("server_port", it) }
         root.put("mode", if (modeIsDocker) "docker" else "systemd")
-        root.put("device_pubkey_b64", JSONObject.NULL)
+        root.put("device_pubkey_b64", devicePubkeyB64 ?: JSONObject.NULL)
         root.put("extra_args", JSONArray())
         return root.toString()
     }

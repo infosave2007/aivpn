@@ -230,7 +230,7 @@ fn choose_exit(
 /// addresses are new" gets a deterministic order — the caller doesn't
 /// otherwise care about ordering, since `PoolDialer::add_peer` is
 /// idempotent per-address regardless of call order.
-fn exits_needing_dial(
+pub(crate) fn exits_needing_dial(
     clients: &[ClientConfig],
     already: &std::collections::HashSet<String>,
 ) -> Vec<String> {

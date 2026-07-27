@@ -316,11 +316,12 @@ struct ContentView: View {
     @State private var showSplitTunnel: Bool = false
     @State private var showBootstrapDiscovery: Bool = false
     @State private var showAdmin: Bool = false
-    // C3-iOS: SSH server-install wizard + migration guide, gated the same
-    // way as showAdmin (server-assigned Admin role only) — see
-    // InstallServerView.swift / MigrationView.swift.
+    // C3-iOS: SSH server-install wizard. Entry point is intentionally NOT
+    // gated on vpn.isConnected/AdminApi.role() — installing a brand-new
+    // first server is the base case, and there is nothing to be "admin of"
+    // yet at that point (see the "Advanced" DisclosureGroup in keysCard,
+    // where the ungated button lives). See InstallServerView.swift.
     @State private var showInstallWizard: Bool = false
-    @State private var showMigration: Bool = false
 
     var body: some View {
         NavigationStack {
@@ -390,28 +391,6 @@ struct ContentView: View {
                             Image(systemName: "person.badge.key.fill")
                         }
                     }
-                    // C3-iOS: SSH server install + migration wizards, same
-                    // admin-only gate as the button above. Grouped under one
-                    // Menu rather than two more standalone toolbar icons to
-                    // avoid nav-bar overflow next to the language/split-tunnel/
-                    // admin buttons already there.
-                    ToolbarItem(placement: .navigationBarTrailing) {
-                        Menu {
-                            Button {
-                                showInstallWizard = true
-                            } label: {
-                                Label(loc.t("install_wizard_title"), systemImage: "server.rack")
-                            }
-                            Button {
-                                showMigration = true
-                            } label: {
-                                Label(loc.t("migrate_title"), systemImage: "shippingbox")
-                            }
-                        } label: {
-                            Image(systemName: "wrench.and.screwdriver")
-                        }
-                        .accessibilityLabel(Text(loc.t("install_wizard_title")))
-                    }
                 }
             }
             .toolbarBackground(Color(.secondarySystemBackground), for: .navigationBar)
@@ -479,11 +458,6 @@ struct ContentView: View {
         }
         .sheet(isPresented: $showInstallWizard) {
             InstallServerView()
-                .environmentObject(vpn)
-                .environmentObject(loc)
-        }
-        .sheet(isPresented: $showMigration) {
-            MigrationView()
                 .environmentObject(vpn)
                 .environmentObject(loc)
         }
@@ -678,6 +652,27 @@ struct ContentView: View {
                         .foregroundColor(.secondary)
                     Button(loc.t("bootstrap_open_discovery")) {
                         showBootstrapDiscovery = true
+                    }
+                    .buttonStyle(.bordered)
+
+                    Divider()
+
+                    // C3-iOS / G2: setting up a brand-new server from
+                    // scratch is the base case — no existing connection or
+                    // admin role to gate on. Deliberately NOT wrapped in
+                    // the `vpn.isConnected && AdminApi.role() == 2` check
+                    // used for the client-management (showAdmin) entry
+                    // point above; that gate stays as-is because managing
+                    // an EXISTING server's clients does require being an
+                    // authenticated admin of it, but installing a fresh
+                    // server over SSH does not.
+                    Text(loc.t("install_wizard_hint"))
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                    Button {
+                        showInstallWizard = true
+                    } label: {
+                        Label(loc.t("install_wizard_title"), systemImage: "server.rack")
                     }
                     .buttonStyle(.bordered)
                 }

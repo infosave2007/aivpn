@@ -46,6 +46,16 @@ impl InstallModeOpt {
     }
 }
 
+/// Mirrors `ssh_install_cmd::RunArgs`' `--binary-file`/`--binary-url` pair
+/// (mutually exclusive, `Default` = pass neither so the remote script
+/// downloads its own built-in default from GitHub Releases).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BinarySourceOpt {
+    Default,
+    Url(String),
+    LocalFile(String),
+}
+
 /// Exactly one of the two `ssh-install run` auth methods this wizard offers
 /// (`--password-env` / `--key-file`). `--password-stdin` isn't exposed here —
 /// piping a password over the GUI's own stdin has no natural UI equivalent,
@@ -70,6 +80,7 @@ pub struct InstallTarget {
     pub user: String,
     pub fingerprint: String,
     pub auth: InstallAuth,
+    pub binary: BinarySourceOpt,
     pub mode: InstallModeOpt,
     pub server_ip: Option<String>,
     pub server_port: Option<u16>,
@@ -109,6 +120,21 @@ pub fn build_run_args(target: &InstallTarget) -> Vec<String> {
             if passphrase.is_some() {
                 args.push("--key-passphrase-env".to_string());
                 args.push(KEY_PASSPHRASE_ENV_VAR.to_string());
+            }
+        }
+    }
+    match &target.binary {
+        BinarySourceOpt::Default => {}
+        BinarySourceOpt::Url(url) => {
+            if !url.is_empty() {
+                args.push("--binary-url".to_string());
+                args.push(url.clone());
+            }
+        }
+        BinarySourceOpt::LocalFile(path) => {
+            if !path.is_empty() {
+                args.push("--binary-file".to_string());
+                args.push(path.clone());
             }
         }
     }
@@ -524,6 +550,7 @@ mod tests {
             user: "root".to_string(),
             fingerprint: "SHA256:abc".to_string(),
             auth: InstallAuth::Password("hunter2".to_string()),
+            binary: BinarySourceOpt::Default,
             mode: InstallModeOpt::Systemd,
             server_ip: None,
             server_port: None,
@@ -632,6 +659,41 @@ mod tests {
         // `aivpn-client ssh-install run` fall back to the local device key.
         let args = build_run_args(&base_target());
         assert!(!args.iter().any(|a| a.contains("device-pubkey")));
+    }
+
+    #[test]
+    fn build_run_args_binary_url() {
+        let mut target = base_target();
+        target.binary = BinarySourceOpt::Url("https://example.com/aivpn-server".to_string());
+        let args = build_run_args(&target);
+        let idx = args
+            .iter()
+            .position(|a| a == "--binary-url")
+            .expect("--binary-url must be present");
+        assert_eq!(args[idx + 1], "https://example.com/aivpn-server");
+        assert!(!args.contains(&"--binary-file".to_string()));
+    }
+
+    #[test]
+    fn build_run_args_binary_local_file() {
+        let mut target = base_target();
+        target.binary = BinarySourceOpt::LocalFile("/tmp/aivpn-server".to_string());
+        let args = build_run_args(&target);
+        let idx = args
+            .iter()
+            .position(|a| a == "--binary-file")
+            .expect("--binary-file must be present");
+        assert_eq!(args[idx + 1], "/tmp/aivpn-server");
+        assert!(!args.contains(&"--binary-url".to_string()));
+    }
+
+    #[test]
+    fn build_run_args_binary_default_omits_both_flags() {
+        // base_target() has binary: Default — matches the ssh_install_cmd.rs
+        // contract: omitting both --binary-file and --binary-url lets the
+        // remote script download its own built-in default.
+        let args = build_run_args(&base_target());
+        assert!(!args.iter().any(|a| a.contains("binary-")));
     }
 
     // --- parse_install_line -------------------------------------------------

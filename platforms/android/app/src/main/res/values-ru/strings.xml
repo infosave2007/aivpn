@@ -286,13 +286,24 @@
     <string name="install_hint_password">Пароль SSH</string>
     <string name="install_hint_key_pem">Приватный ключ (PEM)</string>
     <string name="install_hint_key_passphrase">Пароль ключа (опционально)</string>
+    <string name="install_hint_binary_source">Бинарник сервера</string>
+    <string name="install_binary_default">По умолчанию (GitHub Releases)</string>
+    <string name="install_binary_url">Произвольный URL</string>
+    <string name="install_binary_file">Локальный файл</string>
+    <string name="install_hint_binary_url">https://.../aivpn-server</string>
+    <string name="install_pick_binary_file">Выбрать файл…</string>
+    <string name="install_no_file_selected">Файл не выбран</string>
+    <string name="install_error_need_binary_url">Укажите URL бинарника</string>
+    <string name="install_error_need_binary_file">Выберите локальный файл бинарника aivpn-server</string>
+    <string name="install_error_file_read_failed">Не удалось прочитать выбранный файл</string>
     <string name="install_hint_mode">Режим установки</string>
     <string name="install_mode_systemd">systemd</string>
     <string name="install_mode_docker">Docker</string>
     <string name="install_hint_server_ip">Публичный IP сервера (опционально — для авто-создания admin-клиента)</string>
     <string name="install_hint_server_port">Публичный порт сервера (опционально)</string>
     <string name="install_device_binding">Привязать admin-клиента к этому устройству</string>
-    <string name="install_device_binding_warning">Пока недоступно на Android — у устройства нет локального admin-ключа для привязки, созданный клиент НЕ будет привязан к устройству.</string>
+    <string name="install_device_binding_hint">Ключ регистрации этого устройства будет отправлен на сервер, чтобы он создал admin-клиента, привязанного к устройству — использовать его сможет только это устройство.</string>
+    <string name="install_device_binding_failed">Не удалось получить публичный ключ устройства для привязки — установка прервана. Снимите галочку «Привязать admin-клиента к этому устройству» и повторите попытку без привязки.</string>
     <string name="install_error_bad_port">Укажите корректный порт SSH (1–65535)</string>
     <string name="install_error_need_password">Введите пароль SSH</string>
     <string name="install_error_need_key">Вставьте приватный ключ (PEM)</string>
@@ -333,26 +344,4 @@
     <string name="install_marker_docker_missing">Docker не установлен на целевом хосте</string>
     <string name="install_marker_compose_missing">docker compose недоступен на целевом хосте</string>
     <string name="install_marker_container_not_running">Контейнер aivpn-server не сообщил о запуске</string>
-
-    <!-- Мастер миграции сервера (C3) -->
-    <string name="migrate_menu_title">Миграция сервера</string>
-    <string name="desc_migrate_menu">Перенос конфигурации на новый сервер через экспорт/импорт бэкапа</string>
-    <string name="migrate_title">Миграция сервера</string>
-    <string name="migrate_step_next">Далее</string>
-    <string name="migrate_finish">Готово</string>
-    <string name="migrate_working">Выполняется…</string>
-    <string name="migrate_step1_title">1. Экспорт бэкапа</string>
-    <string name="migrate_step1_body">Подключившись к управляющему туннелю СТАРОГО сервера, экспортируйте резервную копию конфигурации (клиенты, конфиг, маски). Будет предложено сохранить или отправить полученный архив.</string>
-    <string name="migrate_export_backup">Экспортировать бэкап</string>
-    <string name="migrate_export_ok">Бэкап экспортирован (%d байт)</string>
-    <string name="migrate_export_failed">Ошибка экспорта (%d) — возможно, сервер пока не поддерживает экспорт бэкапа через туннель</string>
-    <string name="migrate_step2_title">2. Установка нового сервера</string>
-    <string name="migrate_step2_body">Установите aivpn-server на новом хосте по SSH.</string>
-    <string name="migrate_open_install_wizard">Открыть мастер установки</string>
-    <string name="migrate_step3_title">3. Импорт бэкапа</string>
-    <string name="migrate_step3_body">Подключившись к управляющему туннелю НОВОГО сервера, выберите файл экспортированного бэкапа для импорта.</string>
-    <string name="migrate_pick_backup_file">Выбрать файл бэкапа</string>
-    <string name="migrate_import_read_failed">Не удалось прочитать выбранный файл</string>
-    <string name="migrate_import_ok">Бэкап успешно импортирован</string>
-    <string name="migrate_import_failed">Ошибка импорта (%d) — возможно, сервер пока не поддерживает импорт бэкапа через туннель</string>
 </resources>

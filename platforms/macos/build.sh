@@ -30,7 +30,6 @@ SWIFT_SOURCES=(
     "$SCRIPT_DIR/PoolView.swift"
     "$SCRIPT_DIR/SshInstaller.swift"
     "$SCRIPT_DIR/InstallServerView.swift"
-    "$SCRIPT_DIR/MigrationView.swift"
 )
 
 HELPER_SOURCES=(

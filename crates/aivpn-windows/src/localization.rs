@@ -586,39 +586,21 @@ pub fn t(lang: Lang, key: &str) -> &'static str {
         (Lang::En, "ssh_script_sha256") => "SHA256:",
         (Lang::Ru, "ssh_script_sha256") => "SHA256:",
 
-        // C3: server migration wizard (export → new server → import)
-        (Lang::En, "migration_open_btn") => "Migrate server",
-        (Lang::Ru, "migration_open_btn") => "Миграция сервера",
-        (Lang::En, "migration_title") => "Server migration",
-        (Lang::Ru, "migration_title") => "Миграция сервера",
-        (Lang::En, "migration_step_export") => "1. Export current server config",
-        (Lang::Ru, "migration_step_export") => "1. Экспорт конфигурации текущего сервера",
-        (Lang::En, "migration_export_hint") => {
-            "Downloads a full backup of clients, masks and settings to a file."
-        }
-        (Lang::Ru, "migration_export_hint") => {
-            "Скачивает полную резервную копию клиентов, масок и настроек в файл."
-        }
-        (Lang::En, "migration_export_btn") => "Export backup",
-        (Lang::Ru, "migration_export_btn") => "Экспортировать резервную копию",
-        (Lang::En, "migration_step_install") => {
-            "2. Install the new server via SSH (use \"Install server via SSH\" above)."
-        }
-        (Lang::Ru, "migration_step_install") => {
-            "2. Установите новый сервер по SSH (кнопка «Установить сервер по SSH» выше)."
-        }
-        (Lang::En, "migration_step_import") => "3. Import backup into the new server",
-        (Lang::Ru, "migration_step_import") => "3. Импорт резервной копии на новый сервер",
-        (Lang::En, "migration_import_path_label") => "Backup file path",
-        (Lang::Ru, "migration_import_path_label") => "Путь к файлу резервной копии",
-        (Lang::En, "migration_import_path_required") => "Specify the exported backup file path",
-        (Lang::Ru, "migration_import_path_required") => {
-            "Укажите путь к файлу экспортированной резервной копии"
-        }
-        (Lang::En, "migration_import_btn") => "Import backup",
-        (Lang::Ru, "migration_import_btn") => "Импортировать резервную копию",
-        (Lang::En, "migration_import_done") => "Backup imported.",
-        (Lang::Ru, "migration_import_done") => "Резервная копия импортирована.",
+        // C3/GAP-G3: server binary source (default GitHub Releases / custom
+        // URL / local file) — mirrors ssh_install_cmd.rs's RunArgs
+        // --binary-file/--binary-url flags.
+        (Lang::En, "ssh_binary_source_label") => "Server binary",
+        (Lang::Ru, "ssh_binary_source_label") => "Бинарь сервера",
+        (Lang::En, "ssh_binary_source_default") => "Default (GitHub Releases)",
+        (Lang::Ru, "ssh_binary_source_default") => "По умолчанию (GitHub Releases)",
+        (Lang::En, "ssh_binary_source_url") => "Custom URL",
+        (Lang::Ru, "ssh_binary_source_url") => "Произвольный URL",
+        (Lang::En, "ssh_binary_source_file") => "Local file",
+        (Lang::Ru, "ssh_binary_source_file") => "Локальный файл",
+        (Lang::En, "ssh_binary_url_label") => "Binary URL",
+        (Lang::Ru, "ssh_binary_url_label") => "URL бинаря",
+        (Lang::En, "ssh_binary_file_label") => "Local binary path",
+        (Lang::Ru, "ssh_binary_file_label") => "Путь к локальному бинарю",
 
         // Default fallback
         (_, _) => "???",

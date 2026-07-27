@@ -128,10 +128,44 @@ impl PendingConfigManager {
         }
     }
 
-    /// Register a newly-applied heavy change. Overwrites any prior entry
-    /// with the same token (tokens are expected to be unique per call —
-    /// see `mgmt_service::apply_heavy`'s token generation).
-    pub fn begin(&self, pending: PendingConfig) {
+    /// Register a newly-applied heavy change.
+    ///
+    /// **Supersedes any existing unconfirmed entry for the SAME
+    /// `target_path`.** Without this, two chained applies to one file
+    /// before either is confirmed (e.g. active-mask A, then active-mask B
+    /// before confirming A) would track two independent `PendingConfig`s
+    /// against the same path. If the admin then confirms only the newer
+    /// one, the OLDER entry is still sitting in the map — when ITS
+    /// deadline passes, the sweep task (`gateway.rs`'s cleanup task) would
+    /// blindly restore ITS `prior` (an intermediate value, not even the
+    /// true original), silently clobbering the change the admin already
+    /// confirmed. Superseding instead carries the OLDER entry's `prior`
+    /// forward onto the new one (so rollback always restores the TRUE
+    /// pre-chain original, not an intermediate step) and drops the older
+    /// token entirely, so there is only ever one live token — and one
+    /// correct rollback value — per `target_path`.
+    pub fn begin(&self, mut pending: PendingConfig) {
+        // Deliberately NOT `if let Some(tok) = self.inner.iter().find(...) {
+        // self.inner.remove(&tok) }` — under Rust 2021's temporary-lifetime
+        // rules, a temporary created in an `if let` scrutinee (here,
+        // `DashMap::iter()`'s internal shard guard) lives until the END of
+        // the `if let` body, not just the condition. `.remove()` on the SAME
+        // shard inside that body would then deadlock waiting for a write
+        // lock the still-alive read guard from `.iter()` never releases
+        // (the classic DashMap `if let`/`match` deadlock footgun). Binding
+        // to an owned `let` first forces the iterator (and its shard guard)
+        // to drop at the end of THIS statement, before `.remove()` ever
+        // runs.
+        let superseded_token: Option<String> = self
+            .inner
+            .iter()
+            .find(|e| e.value().target_path == pending.target_path)
+            .map(|e| e.key().clone());
+        if let Some(token) = superseded_token {
+            if let Some((_, superseded)) = self.inner.remove(&token) {
+                pending.prior = superseded.prior;
+            }
+        }
         self.inner.insert(pending.token.clone(), pending);
     }
 
@@ -276,6 +310,90 @@ mod tests {
     fn manager_confirm_unknown_token_returns_false() {
         let mgr = PendingConfigManager::new();
         assert!(!mgr.confirm("does-not-exist"));
+    }
+
+    #[test]
+    fn manager_begin_supersedes_earlier_unconfirmed_entry_for_the_same_path() {
+        // Regression for a real double-apply/rollback-timeout bug: applying
+        // mask A, then (before confirming) applying mask B to the SAME
+        // target_path, then confirming ONLY the second apply, must leave
+        // NOTHING pending for that path — in particular the first apply's
+        // token must not survive to roll back over the confirmed change
+        // once ITS OWN deadline (measured from the first apply) passes.
+        let start = Instant::now();
+        let mgr = PendingConfigManager::new();
+        let path = PathBuf::from("/tmp/aivpn-test-supersede.mask");
+
+        mgr.begin(PendingConfig::begin(
+            "tok-a".into(),
+            path.clone(),
+            Some(b"original".to_vec()),
+            "active mask alice -> maskA".into(),
+            start,
+            Duration::from_secs(120),
+        ));
+        mgr.begin(PendingConfig::begin(
+            "tok-b".into(),
+            path.clone(),
+            Some(b"maskA".to_vec()), // what the caller re-read after apply A
+            "active mask alice -> maskB".into(),
+            start + Duration::from_secs(10),
+            Duration::from_secs(120),
+        ));
+
+        assert_eq!(
+            mgr.len(),
+            1,
+            "superseded tok-a must be dropped, not stacked"
+        );
+        assert!(!mgr.confirm("tok-a"), "tok-a must no longer be trackable");
+        assert!(mgr.confirm("tok-b"), "tok-b (the live entry) must confirm");
+        assert!(mgr.is_empty());
+
+        // Ticking well past tok-a's ORIGINAL deadline (start + 120s) must
+        // return nothing — there is nothing left to roll back, confirmed
+        // or superseded.
+        let expired = mgr.tick(start + Duration::from_secs(200));
+        assert!(
+            expired.is_empty(),
+            "a superseded-then-confirmed change must never resurface via tick()"
+        );
+    }
+
+    #[test]
+    fn manager_begin_supersede_carries_forward_the_true_original_prior() {
+        // If the SECOND (superseding) apply is left unconfirmed and expires,
+        // rollback must restore the ORIGINAL value from before the first
+        // apply — not the intermediate value the first apply produced.
+        let start = Instant::now();
+        let mgr = PendingConfigManager::new();
+        let path = PathBuf::from("/tmp/aivpn-test-supersede2.mask");
+
+        mgr.begin(PendingConfig::begin(
+            "tok-a".into(),
+            path.clone(),
+            Some(b"original".to_vec()),
+            "active mask alice -> maskA".into(),
+            start,
+            Duration::from_secs(120),
+        ));
+        mgr.begin(PendingConfig::begin(
+            "tok-b".into(),
+            path.clone(),
+            Some(b"maskA".to_vec()),
+            "active mask alice -> maskB".into(),
+            start + Duration::from_secs(10),
+            Duration::from_secs(120),
+        ));
+
+        let expired = mgr.tick(start + Duration::from_secs(300));
+        assert_eq!(expired.len(), 1);
+        assert_eq!(expired[0].token(), "tok-b");
+        assert_eq!(
+            expired[0].rollback_value(),
+            Some(b"original".as_slice()),
+            "rollback must restore the TRUE original, not the intermediate maskA value"
+        );
     }
 
     #[test]

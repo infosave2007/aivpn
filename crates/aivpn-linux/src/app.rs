@@ -7,7 +7,9 @@ use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncBufReadExt, BufReader};
 
 use crate::admin::{self, ClientRecord, EditClientArgs, NewClientArgs, PoolHealth, PoolNode};
-use crate::install_wizard::{self, InstallAuth, InstallLine, InstallModeOpt, InstallTarget};
+use crate::install_wizard::{
+    self, BinarySourceOpt, InstallAuth, InstallLine, InstallModeOpt, InstallTarget,
+};
 use crate::key_storage::{ConnectionKey, KeyStorage};
 use crate::settings::{remove_autostart_entry, write_autostart_entry, AppSettings};
 use crate::vpn_manager::{
@@ -754,6 +756,11 @@ pub enum Message {
     InstallPasswordChanged(String),
     InstallKeyFileChanged(String),
     InstallKeyPassphraseChanged(String),
+    InstallBinarySourceChanged(InstallBinarySourceKind),
+    InstallBinaryUrlChanged(String),
+    InstallBinaryFileChanged(String),
+    InstallBinaryFileBrowse,
+    InstallBinaryFilePicked(Option<std::path::PathBuf>),
     InstallServerIpChanged(String),
     InstallServerPortChanged(String),
     InstallModeToggled(bool),
@@ -771,14 +778,6 @@ pub enum Message {
     InstallWizardSpawnError(String),
     InstallReset,
     InstallImportProfile,
-    // ── C3: server migration wizard (export/install/import) ────────────
-    ToggleMigrationWizard,
-    MigrationExport,
-    MigrationExportResult(Result<Vec<u8>, String>),
-    MigrationExportPathChosen(Option<std::path::PathBuf>),
-    MigrationImportPick,
-    MigrationImportFileChosen(Option<std::path::PathBuf>),
-    MigrationImportResult(Result<(), String>),
     // Misc
     Noop,
 }
@@ -949,6 +948,39 @@ impl MaskOption {
 impl std::fmt::Display for MaskOption {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.label())
+    }
+}
+
+/// C3: which `install_wizard::BinarySourceOpt` variant the install wizard's
+/// binary-source picker currently has selected. Kept separate from
+/// `BinarySourceOpt` itself (rather than storing that enum directly in
+/// `App`) so switching the picker back and forth doesn't discard whatever
+/// the user already typed into the URL/path fields.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstallBinarySourceKind {
+    Default,
+    Url,
+    LocalFile,
+}
+
+impl InstallBinarySourceKind {
+    fn all() -> &'static [InstallBinarySourceKind] {
+        &[
+            InstallBinarySourceKind::Default,
+            InstallBinarySourceKind::Url,
+            InstallBinarySourceKind::LocalFile,
+        ]
+    }
+}
+
+impl std::fmt::Display for InstallBinarySourceKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            InstallBinarySourceKind::Default => "Server default (GitHub Releases)",
+            InstallBinarySourceKind::Url => "Custom URL",
+            InstallBinarySourceKind::LocalFile => "Local file",
+        };
+        write!(f, "{s}")
     }
 }
 
@@ -1172,13 +1204,20 @@ fn t<'a>(lang: &str, key: &'a str) -> &'a str {
         "Private key path" => "Путь к приватному ключу",
         "Key passphrase (optional)" => "Пароль ключа (необязательно)",
         "SSH password" => "Пароль SSH",
+        "Binary source" => "Источник бинарника",
+        "Binary URL" => "URL бинарника",
+        "Binary file path" => "Путь к бинарнику",
+        "Browse..." => "Обзор...",
         "Server IP (optional)" => "IP сервера (необязательно)",
         "Server port (optional)" => "Порт сервера (необязательно)",
         "Bind this device (admin access)" => "Привязать это устройство (доступ администратора)",
         "Show script" => "Показать скрипт",
         "Host key fingerprint" => "Отпечаток ключа хоста",
-        "Confirm this is the correct server's key" => "Подтвердите, что это правильный ключ сервера",
+        "Confirm this is the correct server's key" => {
+            "Подтвердите, что это правильный ключ сервера"
+        }
         "I trust this key" => "Я доверяю этому ключу",
+        "Install" => "Установить",
         "Don't trust" => "Не доверять",
         "Connect & verify host key" => "Подключиться и проверить ключ хоста",
         "Start over" => "Начать заново",
@@ -1186,16 +1225,6 @@ fn t<'a>(lang: &str, key: &'a str) -> &'a str {
         "Install finished successfully" => "Установка успешно завершена",
         "Install failed" => "Установка не удалась",
         "Installing..." => "Установка...",
-        // C3: migration wizard
-        "Server Migration" => "Миграция сервера",
-        "Migration guide: 1) export from the old server while connected as admin, 2) install the new server via SSH above, 3) reconnect using the new server's admin profile and import." => {
-            "Гид по миграции: 1) экспорт со старого сервера, подключившись как admin; 2) установка нового сервера по SSH выше; 3) переключитесь на admin-профиль нового сервера и импортируйте данные."
-        }
-        "Export backup from current server" => "Экспортировать резервную копию с текущего сервера",
-        "Import backup into current server" => "Импортировать резервную копию на текущий сервер",
-        "Install the new server using the wizard above, then reconnect using its admin profile." => {
-            "Установите новый сервер через мастер выше, затем переподключитесь под его admin-профилем."
-        }
         _ => key,
     }
 }
@@ -1288,6 +1317,12 @@ pub struct App {
     install_password: String,
     install_key_file: String,
     install_key_passphrase: String,
+    /// Which of `Default`/`Url`/`LocalFile` the picker has selected; the
+    /// URL/path text fields below are kept independently so toggling this
+    /// never discards what the user already typed into the other one.
+    install_binary_source_kind: InstallBinarySourceKind,
+    install_binary_url: String,
+    install_binary_file: String,
     install_server_ip: String,
     install_server_port: String,
     /// `false` = systemd (default), `true` = docker.
@@ -1323,14 +1358,6 @@ pub struct App {
     /// `ssh_install_cmd.rs`'s `Finished` event).
     install_connection_key: Option<String>,
     install_exit_code: Option<i32>,
-    // ── C3: server migration wizard (export → install → import) ────────
-    migration_open: bool,
-    migration_busy: bool,
-    migration_error: Option<String>,
-    migration_status: String,
-    /// Export bytes fetched via `mgmt_call`, held only until the save-file
-    /// dialog resolves (or is cancelled, in which case it's just dropped).
-    migration_export_bytes: Option<Vec<u8>>,
 }
 
 impl App {
@@ -1409,6 +1436,9 @@ impl App {
                 install_password: String::new(),
                 install_key_file: String::new(),
                 install_key_passphrase: String::new(),
+                install_binary_source_kind: InstallBinarySourceKind::Default,
+                install_binary_url: String::new(),
+                install_binary_file: String::new(),
                 install_server_ip: String::new(),
                 install_server_port: String::new(),
                 install_mode_docker: false,
@@ -1424,11 +1454,6 @@ impl App {
                 install_log: Vec::new(),
                 install_connection_key: None,
                 install_exit_code: None,
-                migration_open: false,
-                migration_busy: false,
-                migration_error: None,
-                migration_status: String::new(),
-                migration_export_bytes: None,
             },
             Task::none(),
         )
@@ -2444,6 +2469,25 @@ impl App {
             Message::InstallPasswordChanged(s) => self.install_password = s,
             Message::InstallKeyFileChanged(s) => self.install_key_file = s,
             Message::InstallKeyPassphraseChanged(s) => self.install_key_passphrase = s,
+            Message::InstallBinarySourceChanged(kind) => self.install_binary_source_kind = kind,
+            Message::InstallBinaryUrlChanged(s) => self.install_binary_url = s,
+            Message::InstallBinaryFileChanged(s) => self.install_binary_file = s,
+            Message::InstallBinaryFileBrowse => {
+                return Task::perform(
+                    async {
+                        rfd::AsyncFileDialog::new()
+                            .pick_file()
+                            .await
+                            .map(|h| h.path().to_path_buf())
+                    },
+                    Message::InstallBinaryFilePicked,
+                );
+            }
+            Message::InstallBinaryFilePicked(path) => {
+                if let Some(path) = path {
+                    self.install_binary_file = path.display().to_string();
+                }
+            }
             Message::InstallServerIpChanged(s) => self.install_server_ip = s,
             Message::InstallServerPortChanged(s) => self.install_server_port = s,
             Message::InstallModeToggled(v) => self.install_mode_docker = v,
@@ -2537,6 +2581,25 @@ impl App {
                     }
                     InstallAuth::Password(self.install_password.clone())
                 };
+                let binary = match self.install_binary_source_kind {
+                    InstallBinarySourceKind::Default => BinarySourceOpt::Default,
+                    InstallBinarySourceKind::Url => {
+                        let url = self.install_binary_url.trim().to_string();
+                        if url.is_empty() {
+                            self.install_error = Some("Binary URL required".to_string());
+                            return Task::none();
+                        }
+                        BinarySourceOpt::Url(url)
+                    }
+                    InstallBinarySourceKind::LocalFile => {
+                        let path = self.install_binary_file.trim().to_string();
+                        if path.is_empty() {
+                            self.install_error = Some("Binary file path required".to_string());
+                            return Task::none();
+                        }
+                        BinarySourceOpt::LocalFile(path)
+                    }
+                };
                 let server_ip = {
                     let s = self.install_server_ip.trim();
                     if s.is_empty() {
@@ -2564,6 +2627,7 @@ impl App {
                     user,
                     fingerprint,
                     auth,
+                    binary,
                     mode,
                     server_ip,
                     server_port,
@@ -2621,6 +2685,9 @@ impl App {
                 self.install_password.clear();
                 self.install_key_file.clear();
                 self.install_key_passphrase.clear();
+                self.install_binary_source_kind = InstallBinarySourceKind::Default;
+                self.install_binary_url.clear();
+                self.install_binary_file.clear();
                 self.install_server_ip.clear();
                 self.install_server_port.clear();
                 self.install_mode_docker = false;
@@ -2654,106 +2721,6 @@ impl App {
                         }
                         Err(e) => self.install_error = Some(e),
                     }
-                }
-            }
-
-            // ── C3: server migration wizard (export → install → import) ──
-            Message::ToggleMigrationWizard => {
-                self.migration_open = !self.migration_open;
-            }
-            Message::MigrationExport => {
-                if self.migration_busy {
-                    return Task::none();
-                }
-                self.migration_busy = true;
-                self.migration_error = None;
-                return Task::perform(
-                    async {
-                        admin::mgmt_call(admin::MgmtMethod::Get, "/api/v1/backup/export", None)
-                            .await
-                    },
-                    |r| Message::MigrationExportResult(r.map(|(_, body)| body)),
-                );
-            }
-            Message::MigrationExportResult(result) => {
-                self.migration_busy = false;
-                match result {
-                    Ok(bytes) => {
-                        self.migration_export_bytes = Some(bytes);
-                        self.migration_error = None;
-                        return Task::perform(
-                            async {
-                                rfd::AsyncFileDialog::new()
-                                    .set_file_name("aivpn-backup.json")
-                                    .save_file()
-                                    .await
-                                    .map(|h| h.path().to_path_buf())
-                            },
-                            Message::MigrationExportPathChosen,
-                        );
-                    }
-                    Err(e) => self.migration_error = Some(e),
-                }
-            }
-            Message::MigrationExportPathChosen(path) => {
-                let bytes = self.migration_export_bytes.take();
-                if let (Some(path), Some(bytes)) = (path, bytes) {
-                    match std::fs::write(&path, &bytes) {
-                        Ok(()) => {
-                            self.migration_status = format!("Exported to {}", path.display());
-                            self.migration_error = None;
-                        }
-                        Err(e) => self.migration_error = Some(format!("Failed to write file: {e}")),
-                    }
-                }
-            }
-            Message::MigrationImportPick => {
-                if self.migration_busy {
-                    return Task::none();
-                }
-                return Task::perform(
-                    async {
-                        rfd::AsyncFileDialog::new()
-                            .pick_file()
-                            .await
-                            .map(|h| h.path().to_path_buf())
-                    },
-                    Message::MigrationImportFileChosen,
-                );
-            }
-            Message::MigrationImportFileChosen(path) => {
-                let Some(path) = path else {
-                    return Task::none();
-                };
-                let bytes = match std::fs::read(&path) {
-                    Ok(b) => b,
-                    Err(e) => {
-                        self.migration_error = Some(format!("Failed to read file: {e}"));
-                        return Task::none();
-                    }
-                };
-                self.migration_busy = true;
-                self.migration_error = None;
-                return Task::perform(
-                    async move {
-                        admin::mgmt_call(
-                            admin::MgmtMethod::Post,
-                            "/api/v1/backup/import",
-                            Some(bytes),
-                        )
-                        .await
-                    },
-                    |r| Message::MigrationImportResult(r.map(|_| ())),
-                );
-            }
-            Message::MigrationImportResult(result) => {
-                self.migration_busy = false;
-                match result {
-                    Ok(()) => {
-                        self.migration_status = "Import successful".to_string();
-                        self.migration_error = None;
-                    }
-                    Err(e) => self.migration_error = Some(e),
                 }
             }
 
@@ -3477,15 +3444,14 @@ impl App {
             Space::with_height(0).into()
         };
 
-        // C3: SSH server install + migration wizards. Deliberately NOT
-        // gated behind `admin_is_connected` like the panels above — these
-        // install/migrate a server the GUI isn't (yet) connected to at all,
-        // so they must be reachable before any VPN session exists. Each
-        // real call they make (mgmt_call for migration, ssh-install for
-        // install) surfaces its own "not connected" error if attempted at
-        // the wrong time.
+        // C3: SSH server install wizard. Deliberately NOT gated behind
+        // `admin_is_connected` like the panels above — this installs a
+        // server the GUI isn't (yet) connected to at all (the base "first
+        // server from scratch" scenario), so it must be reachable before
+        // any VPN session or admin role exists. The one real call it makes
+        // (ssh-install, run as a subprocess) surfaces its own "not
+        // connected"/error state if attempted at the wrong time.
         let install_wizard_section = self.view_install_wizard_section();
-        let migration_section = self.view_migration_section();
 
         // Wrap everything in a scrollable so settings + log are reachable
         // in windows smaller than the full content height.
@@ -3538,8 +3504,6 @@ impl App {
                     pool_section,
                     Space::with_height(6),
                     install_wizard_section,
-                    Space::with_height(6),
-                    migration_section,
                     Space::with_height(6),
                     bootstrap_header,
                     bootstrap_box,
@@ -4073,6 +4037,35 @@ impl App {
             );
         }
 
+        body = body.push(text(t(lang, "Binary source")).size(12).color(muted));
+        body = body.push(pick_list(
+            InstallBinarySourceKind::all(),
+            Some(self.install_binary_source_kind),
+            Message::InstallBinarySourceChanged,
+        ));
+        match self.install_binary_source_kind {
+            InstallBinarySourceKind::Default => {}
+            InstallBinarySourceKind::Url => {
+                body = body.push(
+                    text_input(t(lang, "Binary URL"), &self.install_binary_url)
+                        .on_input(Message::InstallBinaryUrlChanged),
+                );
+            }
+            InstallBinarySourceKind::LocalFile => {
+                body = body.push(
+                    row![
+                        text_input(t(lang, "Binary file path"), &self.install_binary_file)
+                            .on_input(Message::InstallBinaryFileChanged)
+                            .width(Length::Fill),
+                        button(t(lang, "Browse..."))
+                            .on_press(Message::InstallBinaryFileBrowse)
+                            .style(button::secondary),
+                    ]
+                    .spacing(6),
+                );
+            }
+        }
+
         body = body.push(
             row![
                 text_input(t(lang, "Server IP (optional)"), &self.install_server_ip)
@@ -4119,11 +4112,19 @@ impl App {
         if let Some(fp) = &self.install_fingerprint {
             body = body.push(text(format!("{}: {fp}", t(lang, "Host key fingerprint"))).size(12));
             if self.install_trusted {
-                let can_start = if self.install_auth_is_key {
+                let auth_ok = if self.install_auth_is_key {
                     !self.install_key_file.trim().is_empty()
                 } else {
                     !self.install_password.is_empty()
                 };
+                let binary_ok = match self.install_binary_source_kind {
+                    InstallBinarySourceKind::Default => true,
+                    InstallBinarySourceKind::Url => !self.install_binary_url.trim().is_empty(),
+                    InstallBinarySourceKind::LocalFile => {
+                        !self.install_binary_file.trim().is_empty()
+                    }
+                };
+                let can_start = auth_ok && binary_ok;
                 body = body.push(
                     row![
                         button(t(lang, "Install"))
@@ -4161,94 +4162,6 @@ impl App {
                 .on_press_maybe(can_probe.then_some(Message::InstallProbe)),
             );
         }
-
-        column![header, body].spacing(6).into()
-    }
-
-    /// C3: server migration wizard body — a 3-step real-call guide
-    /// (export from the currently-connected old server's admin session →
-    /// install the new server via the wizard above → import into the
-    /// currently-connected new server's admin session after the user
-    /// switches profiles). Reuses `admin::mgmt_call` (same backup
-    /// export/import endpoints the web panel already exposes) rather than
-    /// adding any new transport.
-    fn view_migration_section(&self) -> Element<'_, Message> {
-        let lang = self.settings.lang.as_str();
-        let is_dark = self.settings.dark_mode;
-        let muted = if is_dark {
-            Color::from_rgb(0.62, 0.64, 0.70)
-        } else {
-            Color::from_rgb(0.43, 0.45, 0.50)
-        };
-        let danger = Color::from_rgb(0.95, 0.28, 0.18);
-
-        let toggle_label = if self.migration_open {
-            format!("[-] {}", t(lang, "Server Migration"))
-        } else {
-            format!("[+] {}", t(lang, "Server Migration"))
-        };
-        let header = row![
-            button(text(toggle_label))
-                .on_press(Message::ToggleMigrationWizard)
-                .style(button::text),
-            Space::with_width(Length::Fill),
-        ]
-        .align_y(Alignment::Center);
-
-        if !self.migration_open {
-            return column![header].into();
-        }
-
-        let mut body = column![].spacing(8);
-        body = body.push(
-            text(t(
-                lang,
-                "Migration guide: 1) export from the old server while connected as admin, 2) install the new server via SSH above, 3) reconnect using the new server's admin profile and import.",
-            ))
-            .size(12)
-            .color(muted),
-        );
-
-        if let Some(err) = &self.migration_error {
-            body = body.push(text(err).size(12).color(danger));
-        }
-        if !self.migration_status.is_empty() {
-            body = body.push(text(self.migration_status.clone()).size(12));
-        }
-
-        body = body.push(
-            row![
-                text("1.").size(13),
-                button(t(lang, "Export backup from current server"))
-                    .on_press_maybe((!self.migration_busy).then_some(Message::MigrationExport)),
-            ]
-            .spacing(6)
-            .align_y(Alignment::Center),
-        );
-
-        body = body.push(
-            row![
-                text("2.").size(13),
-                text(t(
-                    lang,
-                    "Install the new server using the wizard above, then reconnect using its admin profile.",
-                ))
-                .size(12)
-                .color(muted),
-            ]
-            .spacing(6)
-            .align_y(Alignment::Center),
-        );
-
-        body = body.push(
-            row![
-                text("3.").size(13),
-                button(t(lang, "Import backup into current server"))
-                    .on_press_maybe((!self.migration_busy).then_some(Message::MigrationImportPick)),
-            ]
-            .spacing(6)
-            .align_y(Alignment::Center),
-        );
 
         column![header, body].spacing(6).into()
     }
