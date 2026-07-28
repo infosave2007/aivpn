@@ -868,6 +868,13 @@ impl super::Gateway {
             }
         }
 
+        // Set when the packet only authenticated under the retained
+        // pre-ratchet keys, i.e. it is a genuine old-epoch straggler. This is
+        // the ONLY sound epoch discriminator: the counter spaces of the two
+        // epochs overlap after a ratchet (see `pre_ratchet_keys_in_grace`), so
+        // AEAD authentication — which cannot succeed under the wrong key — is
+        // what tells them apart. Drives the replay bookkeeping below.
+        let mut decrypted_with_pre_ratchet = false;
         let (payload_offset, padded_plaintext) = {
             let sess = session.lock();
             let nonce = self.compute_nonce(counter);
@@ -889,7 +896,8 @@ impl super::Gateway {
 
             let mut decrypted = None;
             let mut last_error = None;
-            for payload_offset in payload_offsets {
+            for payload_offset in &payload_offsets {
+                let payload_offset = *payload_offset;
                 if packet_data.len() <= payload_offset {
                     continue;
                 }
@@ -900,6 +908,31 @@ impl super::Gateway {
                         break;
                     }
                     Err(err) => last_error = Some(err),
+                }
+            }
+
+            // Grace-window retry: a packet the client sent just before it
+            // switched keys authenticates only under the retained old keys.
+            // Trying them only AFTER the current key failed keeps current-epoch
+            // traffic on the single-attempt fast path, and cannot mis-attribute
+            // a current-epoch packet — forging one that authenticates under the
+            // old key requires that key.
+            if decrypted.is_none() {
+                if let Some(old_keys) = sess.pre_ratchet_keys_in_grace() {
+                    for payload_offset in &payload_offsets {
+                        let payload_offset = *payload_offset;
+                        if packet_data.len() <= payload_offset {
+                            continue;
+                        }
+                        let encrypted_payload = &packet_data[payload_offset..];
+                        if let Ok(padded_plaintext) =
+                            decrypt_payload(&old_keys.session_key, &nonce, encrypted_payload)
+                        {
+                            decrypted = Some((payload_offset, padded_plaintext));
+                            decrypted_with_pre_ratchet = true;
+                            break;
+                        }
+                    }
                 }
             }
 
@@ -1014,7 +1047,16 @@ impl super::Gateway {
             // Route pre-ratchet counters exclusively into the dedicated
             // pre-ratchet replay set (C-S-2) and never advance the main
             // counter state for them.
-            if sess.is_pre_ratchet_counter(counter) {
+            //
+            // The discriminator is which key AUTHENTICATED the packet, not
+            // counter membership: `complete_ratchet` resets counter to 0 and
+            // both tag sets then cover 0..512, so the old membership test
+            // classified nearly every EARLY CURRENT-epoch packet as
+            // pre-ratchet. That skipped mark_tag_received() entirely, pinning
+            // `counter` at 0 and leaving the replay bitmap empty — and since
+            // is_replay() only rejects counters at or below `counter`, the
+            // same packet could then be replayed for the rest of the window.
+            if decrypted_with_pre_ratchet {
                 sess.mark_pre_ratchet_received(counter);
             } else {
                 sess.mark_tag_received(counter);

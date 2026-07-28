@@ -176,6 +176,14 @@ pub struct Session {
     /// keyed by counter cannot alias; it is cleared each ratchet and bounded by
     /// the ~2s grace window, so it stays small.
     pub pre_ratchet_received: std::collections::HashSet<u64>,
+    /// The AEAD keys those `pre_ratchet_tags` were minted under, retained for
+    /// the same grace window. Without these the grace mechanism was inert:
+    /// the tag resolved, the packet passed anti-replay, and then decryption
+    /// used the freshly installed CURRENT key — so every in-flight old-key
+    /// packet failed authentication and was dropped anyway, which is exactly
+    /// what the grace window exists to prevent (worst on the high-RTT links
+    /// `rekey_grace` scales for). Cleared with the tags in `cleanup_expired`.
+    pub pre_ratchet_keys: Option<crypto::SessionKeys>,
 
     /// mTLS certificate gate — true means the client is cleared to send Data.
     /// Defaults to true (non-mTLS deployments are unaffected). When the
@@ -442,6 +450,7 @@ impl Session {
             pre_ratchet_tags: HashMap::new(),
             pre_ratchet_expire: None,
             pre_ratchet_received: std::collections::HashSet::new(),
+            pre_ratchet_keys: None,
             mtls_ok: true,
             is_site_peer: false,
             is_pool_peer: false,
@@ -678,10 +687,25 @@ impl Session {
         }
     }
 
-    /// Returns true if the given counter belongs to the pre-ratchet tag set
-    /// (i.e. the tag matched old keys during the grace window).
-    pub fn is_pre_ratchet_counter(&self, counter: u64) -> bool {
-        self.pre_ratchet_tags.contains_key(&counter)
+    /// Pre-ratchet keys, but only while the grace window is still open.
+    ///
+    /// Deliberately replaces the old `is_pre_ratchet_counter(counter)` helper:
+    /// counter membership CANNOT identify the epoch. `complete_ratchet` resets
+    /// `counter` to 0 and the ratcheted tag window is minted for 0..512, while
+    /// `pre_ratchet_tags` (an old window built by `update_tag_window`, whose
+    /// start is `saturating_sub`bed to 0 for the small counters seen at the
+    /// post-handshake ratchet) also covers 0..512 — so the two counter spaces
+    /// overlap almost entirely. Only which key actually authenticates the
+    /// packet can tell the epochs apart.
+    pub fn pre_ratchet_keys_in_grace(&self) -> Option<&crypto::SessionKeys> {
+        let live = self
+            .pre_ratchet_expire
+            .is_some_and(|expire| Instant::now() < expire);
+        if live {
+            self.pre_ratchet_keys.as_ref()
+        } else {
+            None
+        }
     }
 
     /// Mark a pre-ratchet counter as received so it cannot be replayed (C-S-2).
@@ -772,7 +796,9 @@ impl Session {
             self.pre_ratchet_expire = Some(Instant::now() + grace);
             self.pre_ratchet_received.clear();
 
-            self.keys = ratcheted_keys;
+            // Retain the keys those tags belong to for the same window, or the
+            // grace is inert (see `pre_ratchet_keys`).
+            self.pre_ratchet_keys = Some(std::mem::replace(&mut self.keys, ratcheted_keys));
             self.counter = 0;
             self.send_counter = 0;
             self.tag_window_base = self.counter;
@@ -1797,6 +1823,7 @@ impl SessionManager {
                 sess.pre_ratchet_tags.clear();
                 sess.pre_ratchet_received.clear();
                 sess.pre_ratchet_expire = None;
+                sess.pre_ratchet_keys = None;
             }
         }
 
@@ -2196,8 +2223,10 @@ impl SessionManager {
         sess.pre_ratchet_expire = Some(Instant::now() + grace);
         sess.pre_ratchet_received.clear();
 
-        // Install new keys.
-        sess.keys = new_keys;
+        // Install new keys, retaining the outgoing ones for the grace window so
+        // in-flight old-key packets can actually be decrypted (see
+        // `pre_ratchet_keys`) — preserving only their tags is not enough.
+        sess.pre_ratchet_keys = Some(std::mem::replace(&mut sess.keys, new_keys));
         // BOTH counters stay MONOTONIC across the inline rekey. The AEAD key
         // changes here (new tag_secret / session_key_s2c / session_key_c2s), so
         // continuing the counters never reuses a (key, nonce) pair.
@@ -2858,6 +2887,74 @@ mod tests {
         assert!(
             sm.get_session(&client_id).is_some(),
             "an ordinary client session on the SAME IP must survive"
+        );
+    }
+
+    // ── Pre-ratchet grace: keys must outlive the tags ─────────────────────────
+
+    #[test]
+    fn complete_ratchet_retains_pre_ratchet_keys_for_the_grace_window() {
+        let mut s = make_session();
+        let old_session_key = s.keys.session_key;
+        s.ratcheted_keys = Some(make_keys(9));
+        s.update_ratcheted_tag_window();
+
+        s.complete_ratchet();
+
+        // The new epoch is installed...
+        assert_eq!(s.keys.session_key, [9u8; CHACHA20_KEY_SIZE]);
+        // ...and the OLD AEAD key is still reachable while the grace is open.
+        // Retaining only `pre_ratchet_tags` made the whole grace mechanism
+        // inert: the tag resolved but the packet could never be decrypted.
+        let retained = s
+            .pre_ratchet_keys_in_grace()
+            .expect("pre-ratchet keys must be retained for the grace window");
+        assert_eq!(retained.session_key, old_session_key);
+    }
+
+    #[test]
+    fn pre_ratchet_keys_are_not_offered_once_the_grace_expires() {
+        let mut s = make_session();
+        s.ratcheted_keys = Some(make_keys(9));
+        s.update_ratcheted_tag_window();
+        s.complete_ratchet();
+
+        // Force the deadline into the past.
+        s.pre_ratchet_expire = Some(Instant::now() - Duration::from_secs(1));
+        assert!(
+            s.pre_ratchet_keys_in_grace().is_none(),
+            "expired grace must not keep offering the old keys"
+        );
+    }
+
+    #[test]
+    fn post_ratchet_counter_spaces_overlap_so_counters_cannot_identify_the_epoch() {
+        // Guards the reason the epoch discriminator is "which key decrypted"
+        // rather than "is this counter in pre_ratchet_tags". `complete_ratchet`
+        // resets counter to 0 and the ratcheted window is minted for 0..512,
+        // while the outgoing window (built around a small post-handshake
+        // counter, start saturating_sub'd to 0) also covers 0..512 — so a
+        // membership test classifies early CURRENT-epoch packets as
+        // pre-ratchet, skipping mark_tag_received() and leaving the replay
+        // bitmap empty.
+        let mut s = make_session();
+        s.counter = 3; // realistic: the ratchet fires right after the handshake
+        s.update_tag_window();
+        s.ratcheted_keys = Some(make_keys(9));
+        s.update_ratcheted_tag_window();
+
+        s.complete_ratchet();
+
+        assert_eq!(s.counter, 0, "ratchet restarts the counter space");
+        let overlap = s
+            .expected_tags
+            .keys()
+            .filter(|c| s.pre_ratchet_tags.contains_key(c))
+            .count();
+        assert!(
+            overlap > 0,
+            "counter spaces must be shown to overlap — this is why membership \
+             cannot identify the epoch (overlap was {overlap})"
         );
     }
 }
