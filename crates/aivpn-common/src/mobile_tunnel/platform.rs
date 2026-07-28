@@ -15,7 +15,11 @@ use crate::error::Result;
 /// The per-platform hooks the shared run loop needs. One implementation per
 /// mobile core (`AndroidPlatform` / `IosPlatform`); everything else about the
 /// session is platform-independent.
-pub trait PlatformIo: Send + Sync + 'static {
+// `Send + 'static` only — deliberately NOT `Sync`. The platform is owned by the
+// single tunnel task and every hook is called from it; requiring `Sync` would
+// force iOS to promise its raw Swift context pointer is safe to alias across
+// threads, which nothing synchronises.
+pub trait PlatformIo: Send + 'static {
     /// Exempt the freshly created UDP socket from the VPN so its own packets
     /// are not routed back into the tunnel. Android calls
     /// `VpnService.protect(int)`; iOS needs nothing (default impl).

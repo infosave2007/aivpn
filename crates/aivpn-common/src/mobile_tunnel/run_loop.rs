@@ -981,7 +981,16 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
                         upload_sender_task.abort();
                         return Ok(());
                     }
-                    Err(e) => return Err(Error::Io(e)),
+                    Err(e) => {
+                        // Abort both spawned tasks like every other exit path:
+                        // `upload_sender_task` owns tun_rx/ctrl_rx and a socket
+                        // clone, `tun_reader_task` a dup()'d TUN fd, so leaving
+                        // them detached leaks a task + fd per failed session
+                        // while the platform immediately reconnects.
+                        tun_reader_task.abort();
+                        upload_sender_task.abort();
+                        return Err(Error::Io(e));
+                    }
                 };
                 log::debug!("aivpn: udp.recv() → {} bytes", n);
                 if transition_recv_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
@@ -1030,7 +1039,15 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
                     log::debug!("aivpn: decoded inner_type={:?} payload={} bytes",
                         decoded.header.inner_type, decoded.payload.len());
                     if decoded.header.inner_type == InnerType::Data && !decoded.payload.is_empty() {
-                        tun_async_write(&tun, &decoded.payload).await?;
+                        // Same reasoning as the UDP-recv error path: abort both
+                        // tasks before propagating, or a TUN write failure
+                        // (EIO/ENOBUFS from a torn-down VpnService /
+                        // NEPacketTunnelProvider) leaks them across reconnects.
+                        if let Err(e) = tun_async_write(&tun, &decoded.payload).await {
+                            tun_reader_task.abort();
+                            upload_sender_task.abort();
+                            return Err(e.into());
+                        }
                         session
                             .download_bytes
                             .fetch_add(decoded.payload.len() as u64, Ordering::Relaxed);

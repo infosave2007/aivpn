@@ -71,10 +71,6 @@ impl PlatformIo for IosPlatform {
     }
 }
 
-// `SendCtx` is only ever moved into the platform struct and dereferenced on
-// the tunnel task, exactly as the raw pointer was before this refactor.
-unsafe impl Sync for SendCtx {}
-
 // ──────────── Entry point ────────────
 
 #[allow(clippy::too_many_arguments)]

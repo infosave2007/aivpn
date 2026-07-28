@@ -22,7 +22,11 @@ use super::state::{SessionRuntime, LAST_LOCAL_PORT};
 pub fn create_udp_socket(
     dest: SocketAddr,
     session: &Arc<SessionRuntime>,
-    protect: &(dyn Fn(RawFd) -> Result<()> + Sync),
+    // No `Sync` bound: this is invoked synchronously on the calling task and is
+    // never stored or sent elsewhere. Requiring `Sync` here would force it up
+    // through `PlatformIo`, obliging iOS to make its raw Swift context pointer
+    // `Sync` — a promise nothing in the call graph needs or can honour.
+    protect: &dyn Fn(RawFd) -> Result<()>,
 ) -> Result<RawFd> {
     let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
     if fd < 0 {
