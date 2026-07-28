@@ -1,5 +1,4 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
   import QRCode from 'qrcode';
   import { X } from 'lucide-svelte';
 
@@ -13,12 +12,22 @@
   let qrDataUrl = $state('');
   let error = $state('');
 
+  // Re-render from scratch whenever the payload changes or the modal closes.
+  // Keeping the previous data URL around painted client A's code while B was
+  // still encoding (a phone could enroll against the wrong key — and this
+  // modal also shows the TOTP otpauth_url, a different secret class than the
+  // caption claims), and a single failure left `error` set forever, poisoning
+  // every later open until a page reload. The stale-response guard drops a
+  // slow encode whose payload has since been replaced.
   $effect(() => {
-    if (open && data) {
-      QRCode.toDataURL(data, { width: 256, margin: 2 })
-        .then((url) => { qrDataUrl = url; })
-        .catch((e: Error) => { error = e.message; });
-    }
+    qrDataUrl = '';
+    error = '';
+    if (!open || !data) return;
+    let current = true;
+    QRCode.toDataURL(data, { width: 256, margin: 2 })
+      .then((url) => { if (current) qrDataUrl = url; })
+      .catch((e: Error) => { if (current) error = e.message; });
+    return () => { current = false; };
   });
 </script>
 

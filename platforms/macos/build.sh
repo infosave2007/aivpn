@@ -214,14 +214,41 @@ cat > "$RESOURCES/Assets.xcassets/Contents.json" << 'EOF'
 EOF
 
 # ──────────────────────────────────────────────
-# Sign app (ad-hoc, required for macOS Sequoia)
+# Sign app + helper
 # ──────────────────────────────────────────────
+# The privileged helper pins socket peers to a Team ID and FAILS CLOSED when it
+# has none (see EFFECTIVE_PEER_TEAM_ID in aivpn-helper/main.swift). An ad-hoc
+# signature carries no Team ID, so an ad-hoc build produces a helper that
+# rejects every GUI connection — the app shows a permanent "Service
+# unavailable" with Connect disabled. Sign both with a real identity when one
+# is supplied, and warn loudly when falling back to ad-hoc instead of shipping
+# a silently non-functional bundle.
+AIVPN_CODESIGN_IDENTITY="${AIVPN_CODESIGN_IDENTITY:-}"
 echo "🔐 Signing app..."
 SIGNED_APP_BUNDLE="$(mktemp -d /tmp/aivpn-signed.XXXXXX)/Aivpn.app"
 ditto "$APP_BUNDLE" "$SIGNED_APP_BUNDLE"
 xattr -cr "$SIGNED_APP_BUNDLE" 2>/dev/null
-codesign --force --deep --sign - "$SIGNED_APP_BUNDLE" 2>/dev/null
-echo "  ✅ Signed ($(du -sh "$SIGNED_APP_BUNDLE" | cut -f1))"
+if [ -n "$AIVPN_CODESIGN_IDENTITY" ]; then
+    codesign --force --deep --options runtime --sign "$AIVPN_CODESIGN_IDENTITY" "$SIGNED_APP_BUNDLE"
+    # The helper must carry the SAME Team ID the app does, or the peer check
+    # has no identity to pin against.
+    codesign --force --options runtime --sign "$AIVPN_CODESIGN_IDENTITY" \
+        "$PKG_ROOT/Library/PrivilegedHelperTools/aivpn-helper"
+    echo "  ✅ Signed app + helper with '$AIVPN_CODESIGN_IDENTITY' ($(du -sh "$SIGNED_APP_BUNDLE" | cut -f1))"
+else
+    codesign --force --deep --sign - "$SIGNED_APP_BUNDLE" 2>/dev/null
+    echo "  ✅ Signed ad-hoc ($(du -sh "$SIGNED_APP_BUNDLE" | cut -f1))"
+    echo ""
+    echo "  ⚠️  AD-HOC BUILD — THE PRIVILEGED HELPER WILL REJECT THE APP."
+    echo "     Ad-hoc signatures carry no Team ID, and the helper fails closed"
+    echo "     without one, so the GUI will report 'Service unavailable' and"
+    echo "     Connect will stay disabled. This build is usable for everything"
+    echo "     that does NOT need the helper (no full-tunnel / privileged ops)."
+    echo "     For a working helper, re-run with:"
+    echo "       AIVPN_CODESIGN_IDENTITY=\"Developer ID Application: … (TEAMID)\" $0"
+    echo "     (or set REQUIRED_PEER_TEAM_ID in aivpn-helper/main.swift)."
+    echo ""
+fi
 
 # ──────────────────────────────────────────────
 # Copy app into PKG root + aivpn-client to system path

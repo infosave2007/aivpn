@@ -64,6 +64,12 @@
   let advancedJson = $state('{}');
   let advancedError = $state('');
   let showAdvanced = $state(false);
+  // Advanced keys that were actually present when the textarea was seeded.
+  // Only these may be DELETED by an Apply: the textarea is seeded once (see
+  // `initialized`), so a key added server-side afterwards (CLI, installer)
+  // was never in it — its absence is not an operator removal and must not
+  // wipe the key.
+  let advancedSeededKeys = $state<string[]>([]);
 
   // UI
   let toast = $state('');
@@ -105,7 +111,8 @@
       if (Array.isArray(bm)) bootstrapMasks = bm.join('\n');
       const adv: Record<string, unknown> = {};
       for (const k of ADVANCED_KEYS) if (cfg[k] !== undefined) adv[k] = cfg[k];
-      if (Object.keys(adv).length > 0) advancedJson = JSON.stringify(adv, null, 2);
+      advancedSeededKeys = Object.keys(adv);
+      if (advancedSeededKeys.length > 0) advancedJson = JSON.stringify(adv, null, 2);
     }
   });
 
@@ -158,7 +165,11 @@
       }
       for (const k of ADVANCED_KEYS) {
         if (adv[k] !== undefined) out[k] = adv[k];
-        else delete out[k];
+        // A key missing from the textarea is only a deletion when it was
+        // there to begin with. Deleting unconditionally wiped keys that
+        // appeared server-side while this page was open (the textarea is
+        // seeded once) — reported as a successful Apply.
+        else if (advancedSeededKeys.includes(k)) delete out[k];
       }
       advancedError = '';
     } catch (e: unknown) {
@@ -271,7 +282,14 @@
         {:else if f.type === 'number'}
           <input id={f.key} type="number"
             value={fv[f.key] as number ?? ''}
-            oninput={(e) => { fv[f.key] = Number((e.target as HTMLInputElement).value); }}
+            oninput={(e) => {
+              // An empty field must OMIT the key (buildConfig deletes it),
+              // not store Number('') === 0 — clearing TUN MTU to restore the
+              // default used to write `tun_mtu: 0` and break the data path.
+              const raw = (e.target as HTMLInputElement).value;
+              if (raw === '') delete fv[f.key];
+              else fv[f.key] = Number(raw);
+            }}
             class="w-36 px-3 py-1.5 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-white text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500" />
         {:else}
           <input id={f.key} type="text"

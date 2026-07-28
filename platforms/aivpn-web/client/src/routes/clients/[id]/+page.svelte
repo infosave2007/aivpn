@@ -1,6 +1,7 @@
 <script lang="ts">
   import { page } from '$app/stores';
   import { goto } from '$app/navigation';
+  import { toStore } from 'svelte/store';
   import { createQuery, createMutation, useQueryClient } from '@tanstack/svelte-query';
   import { clients as clientsApi, masks as masksApi } from '$lib/api';
   import type { Client, ClientQos, ClientRole } from '$lib/api';
@@ -21,10 +22,16 @@
   const id = $derived($page.params.id as string);
   const qc = useQueryClient();
 
-  const query = createQuery({
+  // The options object MUST be a store: createQuery wraps a plain value in
+  // `readable(...)` (createBaseQuery.ts), which never re-emits, so the key
+  // would stay pinned to the id this component first mounted with. On a
+  // same-route param change that page then DISPLAYS the old client while the
+  // mutations below (which read the current `id` at call time) act on the new
+  // one — "Revoke Client" would tombstone the wrong client.
+  const query = createQuery(toStore(() => ({
     queryKey: ['client', id],
     queryFn: () => clientsApi.get(id),
-  });
+  })));
 
   let form = $state<Partial<Client> & { qos: ClientQos }>({ qos: {} });
   // Exit-node override is edited as plain text (empty = clear to global
@@ -35,10 +42,20 @@
   let toast = $state('');
   let toastError = $state(false);
 
+  // Seed the form ONCE per client (same idea as `initialized` on the config
+  // page). It used to re-seed on EVERY refetch, and with staleTime 30s plus
+  // the default refetchOnWindowFocus that silently reverted the operator's
+  // unsaved edits as soon as they alt-tabbed back. Tracking the seeded id
+  // rather than a plain boolean keeps the form correct when the [id] route
+  // param changes while this component stays mounted.
+  let seededId = $state<string | null>(null);
+
   $effect(() => {
-    if ($query.data) {
-      form = { ...$query.data, qos: { ...($query.data.qos ?? {}) } };
-      exitNodeInput = $query.data.exit_node ?? '';
+    const data = $query.data;
+    if (data && data.id !== seededId) {
+      seededId = data.id;
+      form = { ...data, qos: { ...(data.qos ?? {}) } };
+      exitNodeInput = data.exit_node ?? '';
     }
   });
 

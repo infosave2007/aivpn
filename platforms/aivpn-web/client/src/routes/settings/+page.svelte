@@ -115,15 +115,21 @@
 
   // Sessions tab
   const sessionsQuery = createQuery({ queryKey: ['sessions'], queryFn: () => auth.sessions() });
+  // Revoking a session is a security action: a failure that shows nothing
+  // reads as success, leaving the operator believing an attacker's session
+  // is gone when it is still live. Report it like every other mutation here.
+  let sessionToast = $state('');
 
   const sessionDelMut = createMutation({
     mutationFn: (id: string) => auth.sessionDelete(id),
     onSuccess: () => qc.invalidateQueries({ queryKey: ['sessions'] }),
+    onError: (e: Error) => { sessionToast = e.message; setTimeout(() => { sessionToast = ''; }, 4000); },
   });
 
   const sessionsDelAllMut = createMutation({
     mutationFn: () => auth.sessionsDeleteAll(),
     onSuccess: () => qc.invalidateQueries({ queryKey: ['sessions'] }),
+    onError: (e: Error) => { sessionToast = e.message; setTimeout(() => { sessionToast = ''; }, 4000); },
   });
 
   const tabs: Array<{ id: Tab; label: string }> = [
@@ -281,6 +287,9 @@
           Revoke all others
         </button>
       </div>
+      {#if sessionToast}
+        <div class="p-3 rounded-lg text-sm bg-red-50 dark:bg-red-900/20 text-red-700 dark:text-red-400 border border-red-200 dark:border-red-800">{sessionToast}</div>
+      {/if}
       {#if $sessionsQuery.data}
         <ul class="space-y-2">
           {#each $sessionsQuery.data as session (session.id)}

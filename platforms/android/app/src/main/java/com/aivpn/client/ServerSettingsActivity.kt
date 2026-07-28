@@ -138,8 +138,15 @@ class ServerSettingsActivity : AppCompatActivity() {
         // Only cancels the LOCAL countdown UI — the server-side rollback deadline
         // this mirrors is independent and keeps running whether or not this
         // activity (or its timers) are alive to observe it.
-        maskSection.cancelTimer()
-        exitSection.cancelTimer()
+        //
+        // The sections are assigned after the role guard above, and finish()
+        // inside onCreate does NOT skip onDestroy — so on the guard's own path
+        // (stale task restored with no live session, or a rotation after the
+        // VPN dropped) these are still uninitialised and touching them threw
+        // UninitializedPropertyAccessException, turning a graceful "not
+        // connected" bounce into an app crash.
+        if (::maskSection.isInitialized) maskSection.cancelTimer()
+        if (::exitSection.isInitialized) exitSection.cancelTimer()
     }
 
     // ──────────── Mask options (spinner data source) ────────────
