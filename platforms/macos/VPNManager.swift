@@ -419,6 +419,14 @@ class VPNManager: ObservableObject {
     /// Удалить ключ
     func deleteKey(id: String) {
         KeychainStorage.shared.deleteKey(id: id)
+        // `keys` is a computed passthrough to KeychainStorage, not an
+        // @Published property, so mutating the store publishes nothing on its
+        // own. Only the `selectedKeyId == id` branch below touches @Published
+        // state — without this explicit send, deleting a NON-selected key
+        // leaves its row on screen until something else happens to refresh
+        // the view. iOS's VPNManager does exactly the same after every
+        // add/delete/update.
+        objectWillChange.send()
         if selectedKeyId == id {
             selectedKeyId = KeychainStorage.shared.selectedKeyId
             savedKey = KeychainStorage.shared.selectedKey?.keyValue ?? ""
@@ -428,6 +436,9 @@ class VPNManager: ObservableObject {
     /// Обновить имя ключа
     func updateKeyName(id: String, newName: String) {
         KeychainStorage.shared.updateKeyName(id: id, newName: newName)
+        // Same reason as deleteKey above: renaming a non-selected key changes
+        // only the computed `keys` passthrough, which publishes nothing.
+        objectWillChange.send()
     }
     
     /// Обновить ключ полностью
@@ -445,6 +456,8 @@ class VPNManager: ObservableObject {
            let key = KeychainStorage.shared.keys.first(where: { $0.id == id }) {
             savedKey = key.keyValue
         }
+        // Same reason as deleteKey above.
+        if updated { objectWillChange.send() }
         return updated
     }
 

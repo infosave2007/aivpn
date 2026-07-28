@@ -230,6 +230,11 @@ struct InstallServerView: View {
     // it without re-doing the import.
     @State private var autoImported = false
     @State private var importedKeyId: String?
+    /// Why the auto-import produced no `importedKeyId`, already localized —
+    /// a malformed key from the remote script vs a REFUSED Keychain write
+    /// (the phone locking itself during the ~2-minute install yields
+    /// errSecInteractionNotAllowed). `nil` when the import succeeded.
+    @State private var importFailureMessage: String?
 
     var body: some View {
         NavigationStack {
@@ -265,6 +270,7 @@ struct InstallServerView: View {
             InstallImportKeySheet(
                 connectionKey: runner.finishedConnectionKey ?? "",
                 keyId: importedKeyId,
+                failureMessage: importFailureMessage,
                 suggestedName: autoImportName(),
                 onDone: { showImportSheet = false }
             )
@@ -295,6 +301,7 @@ struct InstallServerView: View {
             // below) so the raw text is visible/copyable even though
             // `importedKeyId` stays nil (see InstallImportKeySheet's
             // "not imported" branch).
+            importFailureMessage = loc.t("error_invalid_key")
             showImportSheet = true
             return
         }
@@ -306,13 +313,19 @@ struct InstallServerView: View {
             // `addKey` itself returns a plain `Bool`, not the record.
             importedKeyId = vpn.selectedKeyId
         } else {
-            // `addKey` only fails on an exact keyValue duplicate (same
-            // server key already saved from a prior install/import) — find
-            // that existing record instead of treating this as an error,
-            // so the confirmation sheet still has something to rename.
+            // `addKey` fails for TWO reasons (KeychainStorage.addKey,
+            // ConnectionKey.swift): an exact keyValue duplicate (same server
+            // key already saved from a prior install/import), or a REFUSED
+            // Keychain write. Only the first is benign — find that existing
+            // record so the confirmation sheet still has something to
+            // rename. If no such record exists the write itself failed, and
+            // the operator must be told THAT, not "duplicate/invalid key".
             let norm = key.trimmingCharacters(in: .whitespacesAndNewlines)
                 .replacingOccurrences(of: "aivpn://", with: "")
             importedKeyId = vpn.keys.first(where: { $0.keyValue == norm })?.id
+            if importedKeyId == nil {
+                importFailureMessage = loc.t("key_save_failed")
+            }
         }
         showImportSheet = true
     }
@@ -807,8 +820,13 @@ private struct InstallImportKeySheet: View {
     /// marker.
     let connectionKey: String
     /// Keychain id of the already-imported record, or `nil` if
-    /// `autoImportIfNeeded()` couldn't import it (malformed key).
+    /// `autoImportIfNeeded()` couldn't import it (malformed key, or a
+    /// refused Keychain write).
     let keyId: String?
+    /// Already-localized reason the import produced no `keyId` — shown next
+    /// to the generic "not imported" label so a Keychain failure is never
+    /// mistaken for a malformed key. `nil` when `keyId != nil`.
+    let failureMessage: String?
     let suggestedName: String
     let onDone: () -> Void
 
@@ -817,9 +835,11 @@ private struct InstallImportKeySheet: View {
     @State private var name: String
     @State private var error: String?
 
-    init(connectionKey: String, keyId: String?, suggestedName: String, onDone: @escaping () -> Void) {
+    init(connectionKey: String, keyId: String?, failureMessage: String?,
+         suggestedName: String, onDone: @escaping () -> Void) {
         self.connectionKey = connectionKey
         self.keyId = keyId
+        self.failureMessage = failureMessage
         self.suggestedName = suggestedName
         self.onDone = onDone
         _name = State(initialValue: suggestedName)
@@ -835,6 +855,11 @@ private struct InstallImportKeySheet: View {
                     } else {
                         Label(loc.t("install_auto_import_failed"), systemImage: "exclamationmark.triangle.fill")
                             .foregroundColor(.orange)
+                        if let failureMessage {
+                            Text(failureMessage)
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
                     }
                 }
                 Section {

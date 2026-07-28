@@ -955,6 +955,9 @@ struct AdminClientDetailSheet: View {
     @State private var qrImage: NSImage?
     @State private var isLoadingQr = false
     @State private var copiedFeedback = false
+    /// Result of the last "save to file" action (already localized), shown
+    /// under the buttons — nil before the first attempt.
+    @State private var saveFileFeedback: String?
 
     var body: some View {
         ScrollView {
@@ -1139,6 +1142,12 @@ struct AdminClientDetailSheet: View {
                 }
                 .buttonStyle(.bordered)
                 .font(.caption)
+
+                if let saveFileFeedback = saveFileFeedback {
+                    Text(saveFileFeedback)
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
             } else if isLoadingKey {
                 ProgressView(loc.t("admin_loading"))
             } else {
@@ -1259,7 +1268,20 @@ struct AdminClientDetailSheet: View {
         panel.allowedContentTypes = [.plainText]
         panel.begin { response in
             guard response == .OK, let url = panel.url else { return }
-            try? key.data(using: .utf8)?.write(to: url)
+            // `try?` used to swallow every write failure with no feedback in
+            // either direction — and for a `one_time` client the key cannot be
+            // re-issued, so an operator who believed the file was written
+            // could lose it for good. Report both outcomes.
+            guard let data = key.data(using: .utf8) else {
+                saveFileFeedback = loc.t("admin_key_save_failed")
+                return
+            }
+            do {
+                try data.write(to: url)
+                saveFileFeedback = loc.t("admin_key_saved")
+            } catch {
+                saveFileFeedback = "\(loc.t("admin_key_save_failed")): \(error.localizedDescription)"
+            }
         }
     }
 }

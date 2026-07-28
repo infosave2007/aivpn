@@ -427,6 +427,13 @@ class KeychainStorage: ObservableObject {
             kSecAttrAccessible: kSecAttrAccessibleWhenUnlockedThisDeviceOnly,
             kSecValueData:      data,
         ]
-        SecItemAdd(attrs as CFDictionary, nil)
+        // Unlike keychainAdd/keychainUpdate above, this status used to be
+        // discarded entirely: a refused write (device locked mid-write)
+        // silently loses the selection, and the app then quietly falls back
+        // to another key on next launch. Log it instead of dropping it.
+        let status = SecItemAdd(attrs as CFDictionary, nil)
+        if status != errSecSuccess {
+            NSLog("AIVPN: failed to persist selected key id to Keychain (OSStatus %d)", status)
+        }
     }
 }

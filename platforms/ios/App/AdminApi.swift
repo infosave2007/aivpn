@@ -303,12 +303,37 @@ enum AdminApi {
             // VPNManager's IPC surface is main-thread-only (it precondition-
             // checks the main queue); hop there before touching it.
             DispatchQueue.main.async {
+                // NE gives NO guarantee that sendProviderMessage's reply
+                // handler is ever invoked — if the extension is jetsammed or
+                // killed mid-call it simply never fires, and without this
+                // watchdog the continuation would never resume: `loadClients()`
+                // spins forever and `AdminAddClientView.save()` leaves
+                // `isSaving = true`, making the filled-in form unrecoverable.
+                // Whichever of the two paths runs first wins; `resumed` needs
+                // no locking because BOTH always run on the main queue (see
+                // VPNManager.sendMessage, which hops its completion back to
+                // main on every path).
+                var resumed = false
+                let finish: (RawResponse?) -> Void = { resp in
+                    guard !resumed else { return }
+                    resumed = true
+                    continuation.resume(returning: resp)
+                }
                 VPNManager.shared.mgmtRequest(method: method, path: path, body: body) { resp in
-                    continuation.resume(returning: resp.map { RawResponse(status: $0.status, body: $0.body) })
+                    finish(resp.map { RawResponse(status: $0.status, body: $0.body) })
+                }
+                DispatchQueue.main.asyncAfter(deadline: .now() + requestTimeoutSeconds) {
+                    finish(nil)
                 }
             }
         }
     }
+
+    /// Watchdog for the IPC round trip above. The extension side already
+    /// bounds the call by the FFI's own 10s timeout (aivpn_core.h), so this
+    /// only has to be comfortably longer than that — it fires solely when the
+    /// extension never answers at all.
+    private static let requestTimeoutSeconds: Double = 15
 
     // MARK: JSON helpers
 

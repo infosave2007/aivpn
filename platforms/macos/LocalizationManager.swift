@@ -881,6 +881,10 @@ class LocalizationManager: ObservableObject {
             "en": "Server VPN port (optional)",
             "ru": "VPN-порт сервера (опционально)"
         ],
+        "install_server_port_invalid": [
+            "en": "Port must be a number from 1 to 65535 (or empty for the default)",
+            "ru": "Порт должен быть числом от 1 до 65535 (или пустым для значения по умолчанию)"
+        ],
         "install_mode": [
             "en": "Install mode",
             "ru": "Режим установки"
@@ -1244,6 +1248,18 @@ class LocalizationManager: ObservableObject {
         "server_settings_exit_none": [
             "en": "(none)",
             "ru": "(нет)"
+        ],
+        "server_settings_exit_unknown": [
+            "en": "(keep current — server does not report it)",
+            "ru": "(оставить текущее — сервер его не сообщает)"
+        ],
+        "admin_key_saved": [
+            "en": "Saved to file",
+            "ru": "Сохранено в файл"
+        ],
+        "admin_key_save_failed": [
+            "en": "Could not write the file",
+            "ru": "Не удалось записать файл"
         ],
     ]
 

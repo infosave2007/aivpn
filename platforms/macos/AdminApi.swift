@@ -131,24 +131,31 @@ enum AdminApi {
         addr.sin_port = socketPort.bigEndian
         addr.sin_addr.s_addr = inet_addr(socketHost)
 
+        // CONNECT the datagram socket to the daemon's address before sending.
+        // An unconnected UDP socket accepts a reply from ANY sender, so any
+        // other process on this host could race the daemon and answer first —
+        // returning "2" to `role()` (unlocking the Admin panel for a Viewer)
+        // or an attacker-chosen `aivpn://…` to `fetchConnectionKey`, which the
+        // operator would then hand to a user. connect() makes the kernel drop
+        // every datagram whose source isn't 127.0.0.1:44301, and also picks a
+        // fixed local port so the daemon's reply is delivered here.
+        // NOTE: on BSD/macOS `sendto` with an explicit destination on a
+        // connected socket fails with EISCONN — use send/recv from here on.
+        let connected = withUnsafePointer(to: &addr) { addrPtr -> Int32 in
+            addrPtr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockPtr in
+                connect(fd, sockPtr, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+        guard connected == 0 else { return nil }
+
         let lineBytes = Array(line.utf8)
         let sent = lineBytes.withUnsafeBufferPointer { buf -> Int in
-            withUnsafePointer(to: &addr) { addrPtr -> Int in
-                addrPtr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockPtr in
-                    sendto(fd, buf.baseAddress, buf.count, 0, sockPtr, socklen_t(MemoryLayout<sockaddr_in>.size))
-                }
-            }
+            send(fd, buf.baseAddress, buf.count, 0)
         }
         guard sent == lineBytes.count else { return nil }
 
         var recvBuf = [UInt8](repeating: 0, count: 65536)
-        var fromAddr = sockaddr_in()
-        var fromLen = socklen_t(MemoryLayout<sockaddr_in>.size)
-        let received = withUnsafeMutablePointer(to: &fromAddr) { fromPtr -> Int in
-            fromPtr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockPtr in
-                recvfrom(fd, &recvBuf, recvBuf.count, 0, sockPtr, &fromLen)
-            }
-        }
+        let received = recv(fd, &recvBuf, recvBuf.count, 0)
         guard received > 0 else { return nil }
         return String(bytes: recvBuf[0..<received], encoding: .utf8)
     }

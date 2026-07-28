@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 import NetworkExtension
 
 // MARK: - Helpers
@@ -409,7 +410,17 @@ struct ContentView: View {
                     }
                     guard vpn.addKey(name: name, keyValue: val, mtlsCert: cert,
                                      serverSigningKey: signingKey) else {
-                        return loc.t("duplicate_key")
+                        // KeychainStorage.addKey returns nil for TWO distinct
+                        // reasons (ConnectionKey.swift): an exact duplicate
+                        // keyValue, or a REFUSED Keychain write (e.g.
+                        // errSecInteractionNotAllowed because the phone locked
+                        // itself mid-flow). Reporting the latter as "duplicate"
+                        // sends the user hunting for a problem with the key.
+                        let norm = val.trimmingCharacters(in: .whitespacesAndNewlines)
+                            .replacingOccurrences(of: "aivpn://", with: "")
+                        return vpn.keys.contains(where: { $0.keyValue == norm })
+                            ? loc.t("duplicate_key")
+                            : loc.t("key_save_failed")
                     }
                     showAddKey = false
                     return nil
@@ -531,7 +542,15 @@ struct ContentView: View {
                     .controlSize(.small)
 
                     Button {
-                        if let url = URL(string: "prefs:root=VPN") { openURL(url) }
+                        // `prefs:root=VPN` is a PRIVATE URL scheme: modern iOS
+                        // does not honor it from third-party apps (and shipping
+                        // it is an App Store rejection trigger), so the button
+                        // did nothing — openURL has no completion handler, so
+                        // the failure was silent, exactly when the user had
+                        // just denied the VPN permission. `openSettingsURLString`
+                        // is the public API and lands on this app's own
+                        // Settings page, where the VPN prompt can be retried.
+                        if let url = URL(string: UIApplication.openSettingsURLString) { openURL(url) }
                     } label: {
                         Label(loc.t("open_settings"), systemImage: "gear")
                             .font(.caption)

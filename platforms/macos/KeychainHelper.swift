@@ -40,8 +40,21 @@ class KeychainHelper {
         return .failure(status)
     }
 
-    func save(key: String, value: String) {
-        guard let data = value.data(using: .utf8) else { return }
+    /// Writes (delete + add) one Keychain item. Returns false when the item
+    /// was NOT written — encoding failed, or SecItemAdd was refused (e.g.
+    /// errSecAuthFailed / errSecInteractionNotAllowed while the machine is
+    /// locked or after an ad-hoc re-sign changed our code identity).
+    ///
+    /// The result MUST NOT be ignored by slot-indexed callers (`ck_0`,
+    /// `ck_1`, …): the delete above has already happened by then, so a
+    /// discarded failure leaves a HOLE in the slot sequence, and
+    /// `loadKeys()` treats the first missing slot as end-of-list — every
+    /// key after it disappears from the app for good. See
+    /// `KeychainStorage.saveKeys()`, which aborts the whole sequence on a
+    /// false return instead of writing past the hole.
+    @discardableResult
+    func save(key: String, value: String) -> Bool {
+        guard let data = value.data(using: .utf8) else { return false }
 
         // Delete existing
         let deleteQuery: [String: Any] = [
@@ -59,7 +72,12 @@ class KeychainHelper {
             kSecValueData as String: data,
             kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
         ]
-        _ = SecItemAdd(addQuery as CFDictionary, nil)
+        let status = SecItemAdd(addQuery as CFDictionary, nil)
+        if status != errSecSuccess {
+            NSLog("AIVPN: Keychain refused to write item (OSStatus %d)", status)
+            return false
+        }
+        return true
     }
 
     func load(key: String) -> String? {

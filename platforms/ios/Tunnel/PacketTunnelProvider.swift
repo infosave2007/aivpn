@@ -732,10 +732,25 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                 var cap = 64 * 1024
                 var bodyBytes = [UInt8](body)
                 var responseBody: Data?
+                // Hard ceiling on the retry allocation. `written` is a length
+                // the SERVER declares, and this is a Network Extension with a
+                // ~50MB jetsam budget: allocating it unbounded lets one
+                // oversized (or malicious) reply kill the extension, which
+                // drops the VPN with no diagnostic. 4MB is far above any
+                // legitimate curated reply — the largest is
+                // `GET /api/v1/audit-log?limit=1000` (MAX_AUDIT_LIMIT in
+                // crates/aivpn-server/src/mgmt_service/tunnel_router.rs),
+                // i.e. ~1000 entries of a few hundred bytes each.
+                let maxResponseBytes = 4 * 1024 * 1024
                 // Written-len-or-needed-len convention (aivpn_core.h): one
                 // retry with the reported needed length, same as AdminApi's
-                // old in-process loop.
-                for _ in 0..<2 {
+                // old in-process loop. The retry RE-ISSUES the whole request,
+                // so it is restricted to GET (method 0) — re-issuing a
+                // POST/PATCH/DELETE would execute the mutation a second time
+                // server-side (two audit-log entries, two revokes, ...). An
+                // over-64KB reply to a non-GET is reported as a transport
+                // failure instead of being fetched twice.
+                for attempt in 0..<2 {
                     var outBuf = [UInt8](repeating: 0, count: cap)
                     let written: Int = path.withCString { pathPtr in
                         bodyBytes.withUnsafeMutableBufferPointer { bodyPtr in
@@ -755,6 +770,12 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                     if written < 0 { break }
                     if written <= cap {
                         responseBody = Data(outBuf.prefix(written))
+                        break
+                    }
+                    guard attempt == 0, methodRaw == 0, written <= maxResponseBytes else {
+                        os_log(.error,
+                               "mgmt_request: response of %d bytes not retried (method=%d, cap=%d)",
+                               Int32(clamping: written), Int32(methodRaw), Int32(clamping: cap))
                         break
                     }
                     cap = written
@@ -1681,7 +1702,13 @@ extension PacketTunnelProvider {
             kSecAttrAccessible:  kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly,
             kSecValueData:       data,
         ]
-        SecItemAdd(attrs as CFDictionary, nil)
+        // A discarded failure here is invisible until the NEXT reassertion,
+        // which then finds no persistent key and cannot reconnect — log it
+        // (same shape as the device-key write above).
+        let status = SecItemAdd(attrs as CFDictionary, nil)
+        if status != errSecSuccess {
+            os_log(.error, "Failed to persist connection key to Keychain: %d", status)
+        }
     }
 
     /// M2: writes the base64 mTLS cert to a stable Keychain entry that survives
@@ -1707,7 +1734,12 @@ extension PacketTunnelProvider {
             kSecAttrAccessible:  kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly,
             kSecValueData:       data,
         ]
-        SecItemAdd(attrs as CFDictionary, nil)
+        // As in storePersistentKey: a silently dropped write only surfaces
+        // later, as a reassertion that connects certless.
+        let status = SecItemAdd(attrs as CFDictionary, nil)
+        if status != errSecSuccess {
+            os_log(.error, "Failed to persist mTLS cert to Keychain: %d", status)
+        }
     }
 
     /// M2: retrieves the persistent mTLS cert written by storePersistentCert.

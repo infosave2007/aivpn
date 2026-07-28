@@ -144,8 +144,23 @@ final class InstallServerStore: ObservableObject {
     var canProbe: Bool {
         !host.trimmingCharacters(in: .whitespaces).isEmpty
             && Int(port) != nil
+            && serverPortValid
             && !user.trimmingCharacters(in: .whitespaces).isEmpty
             && (authMode == .password ? !password.isEmpty : !keyFilePath.isEmpty)
+    }
+
+    /// The optional aivpn listen port. Empty means "leave the server's
+    /// default" (`startInstall` then omits `--server-port` entirely), but any
+    /// NON-empty value must be a real TCP port: an unvalidated "44a3" made
+    /// `Int(serverPort)` nil, which omitted the flag just the same — so the
+    /// server installed on the DEFAULT port while the wizard reported success
+    /// and the generated connection key pointed at the port the operator
+    /// typed.
+    var serverPortValid: Bool {
+        let trimmed = serverPort.trimmingCharacters(in: .whitespaces)
+        if trimmed.isEmpty { return true }
+        guard let value = Int(trimmed) else { return false }
+        return (1...65535).contains(value)
     }
 
     func resetForNewInstall() {
@@ -226,7 +241,9 @@ final class InstallServerStore: ObservableObject {
         case .url: source = .url(binaryUrl)
         }
         let portNum = Int(port) ?? 22
-        let serverPortNum = Int(serverPort)
+        // Trimmed to match `serverPortValid`, which gates this whole step —
+        // otherwise " 8443" would validate there and be dropped here.
+        let serverPortNum = Int(serverPort.trimmingCharacters(in: .whitespaces))
         let targetHost = host
         let targetUser = user
         let targetFingerprint = fingerprint
@@ -372,6 +389,11 @@ struct InstallServerRootView: View {
                     .textFieldStyle(.roundedBorder)
                 TextField(loc.t("install_server_port"), text: $store.serverPort)
                     .textFieldStyle(.roundedBorder)
+                if !store.serverPortValid {
+                    Text(loc.t("install_server_port_invalid"))
+                        .font(.caption)
+                        .foregroundColor(.red)
+                }
 
                 Picker(loc.t("install_mode"), selection: $store.mode) {
                     Text(loc.t("install_mode_systemd")).tag(SshInstaller.Mode.systemd)

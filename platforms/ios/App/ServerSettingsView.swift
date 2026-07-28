@@ -101,6 +101,17 @@ private struct ServerSettingsConfirmBanner: View {
 /// "defer to the global default" option HERE, because this picker IS the
 /// global default).
 private enum ServerSettingsExitChoice: Hashable {
+    /// Initial selection. The curated tunnel allowlist exposes NO getter for
+    /// the server's global `pool.exit_node` (verified in
+    /// crates/aivpn-server/src/mgmt_service/tunnel_router.rs's
+    /// `classify_route`: only status/clients*/audit-log/config apply+confirm/
+    /// pool nodes+health+links/masks), so this screen cannot know the current
+    /// value. Starting on `.none` would have made "Apply" send
+    /// `{"exit_node": null}` — silently WIPING a configured global exit for an
+    /// admin who came here to change the mask and tapped the wrong Apply. So
+    /// the picker starts here and Apply is disabled until the operator picks
+    /// something explicitly.
+    case unknown
     case none
     case node(String)
     case custom
@@ -157,7 +168,7 @@ struct ServerSettingsView: View {
 
     // MARK: Global exit-node section state
     @State private var poolNodeAddresses: [String] = []
-    @State private var exitChoice: ServerSettingsExitChoice = .none
+    @State private var exitChoice: ServerSettingsExitChoice = .unknown
     @State private var customExitAddr: String = ""
     @State private var exitError: String?
     @State private var exitResultMessage: String?
@@ -310,6 +321,7 @@ struct ServerSettingsView: View {
             footer: Text(loc.t("server_settings_exit_hint"))
         ) {
             Picker(loc.t("admin_exit_node"), selection: $exitChoice) {
+                Text(loc.t("server_settings_exit_unknown")).tag(ServerSettingsExitChoice.unknown)
                 Text(loc.t("server_settings_exit_none")).tag(ServerSettingsExitChoice.none)
                 ForEach(poolNodeAddresses, id: \.self) { addr in
                     Text(addr).tag(ServerSettingsExitChoice.node(addr))
@@ -341,7 +353,9 @@ struct ServerSettingsView: View {
                         Text(loc.t("server_settings_apply"))
                     }
                 }
-                .disabled(isApplyingExit || (exitChoice == .custom && customExitAddr.trimmingCharacters(in: .whitespaces).isEmpty))
+                .disabled(isApplyingExit
+                          || exitChoice == .unknown
+                          || (exitChoice == .custom && customExitAddr.trimmingCharacters(in: .whitespaces).isEmpty))
             }
 
             if let exitError {
@@ -355,7 +369,7 @@ struct ServerSettingsView: View {
 
     private var effectiveExitAddr: String? {
         switch exitChoice {
-        case .none:
+        case .unknown, .none:
             return nil
         case .node(let addr):
             return addr
@@ -367,6 +381,10 @@ struct ServerSettingsView: View {
 
     @MainActor
     private func applyExit() async {
+        // Belt and braces alongside the disabled Apply button: never send
+        // `{"exit_node": null}` from the initial "current value unknown"
+        // state — that would clear a global exit nobody asked to clear.
+        guard exitChoice != .unknown else { return }
         isApplyingExit = true
         exitError = nil
         exitResultMessage = nil

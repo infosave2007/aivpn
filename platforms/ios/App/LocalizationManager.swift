@@ -297,6 +297,8 @@ class LocalizationManager: ObservableObject {
             "ru": "Задаёт pool.exit_node в server.json — применяется только после ПЕРЕЗАПУСКА сервера, в отличие от переопределения для отдельного клиента.",
         ],
         "server_settings_exit_none":     ["en": "(none)", "ru": "(нет)"],
+        "server_settings_exit_unknown":  ["en": "(keep current — server does not report it)",
+                                          "ru": "(оставить текущее — сервер его не сообщает)"],
         "server_settings_apply":         ["en": "Apply", "ru": "Применить"],
         "server_settings_confirm":       ["en": "Confirm", "ru": "Подтвердить"],
         "server_settings_pending_prefix": ["en": "Confirm within", "ru": "Подтвердите в течение"],

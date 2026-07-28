@@ -623,7 +623,20 @@ private struct AdminClientDetailView: View {
                         }
                         HStack {
                             Button {
-                                UIPasteboard.general.string = connectionKey
+                                // A live, redeemable connection key. `.string`
+                                // would leave it on the general pasteboard
+                                // indefinitely — readable by every app the user
+                                // next foregrounds and mirrored to other devices
+                                // via Universal Clipboard. `.localOnly` keeps it
+                                // on this device and `.expirationDate` has the
+                                // system drop it after the paste window.
+                                UIPasteboard.general.setItems(
+                                    [["public.utf8-plain-text": connectionKey]],
+                                    options: [
+                                        .localOnly: true,
+                                        .expirationDate: Date().addingTimeInterval(120),
+                                    ]
+                                )
                             } label: {
                                 Label(loc.t("admin_copy"), systemImage: "doc.on.doc")
                             }

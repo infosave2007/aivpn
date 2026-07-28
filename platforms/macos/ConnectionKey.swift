@@ -285,10 +285,26 @@ class KeychainStorage: ObservableObject {
             NSLog("AIVPN: key store is locked (Keychain access error at load) — refusing to save")
             return
         }
+        // A failed write must ABORT the whole sequence, never continue past
+        // it: `keychain.save` deletes before it adds, so a refused add
+        // (locked machine / denied ACL) leaves slot `i` missing, and
+        // loadKeys() stops at the first missing slot — writing ck_{i+1}…
+        // and then running the trailing-slot cleanup below would strand or
+        // destroy every key after the hole. Aborting leaves the remaining
+        // slots holding their PREVIOUS values, and marks the store locked
+        // so no later save in this session can compound the damage (a
+        // relaunch re-evaluates accessibility in loadKeys).
         for (i, key) in keys.enumerated() {
-            if let encoded = try? JSONEncoder().encode(key),
-               let json = String(data: encoded, encoding: .utf8) {
-                keychain.save(key: "ck_\(i)", value: json)
+            guard let encoded = try? JSONEncoder().encode(key),
+                  let json = String(data: encoded, encoding: .utf8) else {
+                NSLog("AIVPN: failed to encode key for slot ck_%d — aborting save", i)
+                storeAccessFailed = true
+                return
+            }
+            guard keychain.save(key: "ck_\(i)", value: json) else {
+                NSLog("AIVPN: Keychain write failed for slot ck_%d — aborting save to avoid losing later keys", i)
+                storeAccessFailed = true
+                return
             }
         }
         // Remove any leftover entries beyond current count (handles deletions)
