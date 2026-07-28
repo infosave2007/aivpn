@@ -53,17 +53,30 @@ class SplitTunnelActivity : AppCompatActivity() {
         binding = ActivitySplitTunnelBinding.inflate(layoutInflater)
         setContentView(binding.root)
 
-        allowedPackages.addAll(SecureStorage.loadAllowedApps(this))
-        excludedDomains.addAll(SecureStorage.loadExcludedDomains(this))
-
-        setupTabs()
-        setupAppsPage()
-        setupSitesPage()
-
         binding.btnBack.setOnClickListener { finish() }
 
-        updateCounter()
-        loadApps()
+        // A5: SecureStorage is EncryptedSharedPreferences — Keystore + real disk
+        // I/O, hundreds of ms cold — which onCreate must not block on (the same
+        // cost BootReceiver moves off its calling thread with goAsync()).
+        // Everything below the load stays inside the coroutine on purpose:
+        // setupAppsPage/setupSitesPage wire listeners whose handlers persist the
+        // in-memory sets, so wiring them over a not-yet-loaded (empty) selection
+        // would let one early tap overwrite the stored one.
+        lifecycleScope.launch {
+            val stored = withContext(Dispatchers.IO) {
+                SecureStorage.loadAllowedApps(this@SplitTunnelActivity) to
+                    SecureStorage.loadExcludedDomains(this@SplitTunnelActivity)
+            }
+            allowedPackages.addAll(stored.first)
+            excludedDomains.addAll(stored.second)
+
+            setupTabs()
+            setupAppsPage()
+            setupSitesPage()
+
+            updateCounter()
+            loadApps()
+        }
     }
 
     // ──────────── Tabs ────────────

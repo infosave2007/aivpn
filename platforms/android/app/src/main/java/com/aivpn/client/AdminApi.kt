@@ -46,7 +46,11 @@ object AdminApi {
                 android.util.Log.e("AdminApi", "mgmtRequest($path) threw", t)
                 return@withContext MgmtResult(0, "")
             }
-            if (raw.size < 2) return@withContext MgmtResult(0, "")
+            // `raw` is nullable (the Rust side returns a null jbyteArray instead
+            // of panicking across the FFI boundary) and this check sits OUTSIDE
+            // the try above — an NPE here would escape withContext, not be
+            // reported as "not connected".
+            if (raw == null || raw.size < 2) return@withContext MgmtResult(0, "")
             val status = ((raw[0].toInt() and 0xFF) shl 8) or (raw[1].toInt() and 0xFF)
             val bodyBytes = if (raw.size > 2) raw.copyOfRange(2, raw.size) else ByteArray(0)
             MgmtResult(status, String(bodyBytes, Charsets.UTF_8))

@@ -53,6 +53,13 @@ class MainActivity : AppCompatActivity() {
     private var profiles = mutableListOf<SecureStorage.ConnectionProfile>()
     private var activeProfileId: String? = null
 
+    /**
+     * False until onCreate's asynchronous SecureStorage load (A5) has populated
+     * [profiles] / [activeProfileId]. Guards every path that PERSISTS the list:
+     * saving the not-yet-loaded (empty) list would overwrite every stored profile.
+     */
+    private var profilesLoaded = false
+
     private val vpnPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult()
     ) { result ->
@@ -144,30 +151,61 @@ class MainActivity : AppCompatActivity() {
         binding.profileList.layoutManager = LinearLayoutManager(this)
         binding.profileList.adapter = profilesAdapter
 
-        // Migrate legacy single connection key to profiles
-        migrateLegacyKey()
+        // A5: the legacy-key migration, the profile list and the saved language
+        // all live in EncryptedSharedPreferences — Keystore + real disk I/O,
+        // hundreds of ms on a cold start — which BootReceiver already refuses to
+        // run on its calling thread (see its goAsync() comment). Load them on
+        // Dispatchers.IO and apply the result here on the main thread; until it
+        // lands [profilesLoaded] keeps the persisting paths (connect, profile
+        // dialog) from writing the still-empty list back over stored profiles.
+        lifecycleScope.launch {
+            data class LoadResult(
+                val profiles: MutableList<SecureStorage.ConnectionProfile>,
+                val activeId: String?,
+                val legacyKey: String,
+                val language: String?,
+            )
 
-        // Load profiles
-        profiles = SecureStorage.loadProfiles(this).toMutableList()
-        activeProfileId = SecureStorage.loadActiveProfileId(this)
+            val loaded = withContext(Dispatchers.IO) {
+                // Migrate legacy single connection key to profiles
+                migrateLegacyKey()
+                val list = SecureStorage.loadProfiles(this@MainActivity).toMutableList()
+                LoadResult(
+                    profiles = list,
+                    activeId = SecureStorage.loadActiveProfileId(this@MainActivity),
+                    // Only read for the no-profiles fallback below.
+                    legacyKey = if (list.isEmpty()) SecureStorage.loadConnectionKey(this@MainActivity) else "",
+                    language = SecureStorage.loadLanguage(this@MainActivity),
+                )
+            }
+            profiles = loaded.profiles
+            activeProfileId = loaded.activeId
+            profilesLoaded = true
 
-        // If we have an active profile, load its key into the field
-        val active = profiles.find { it.id == activeProfileId }
-        if (active != null) {
-            binding.editConnectionKey.setText(active.key)
-        } else if (profiles.isNotEmpty()) {
-            activeProfileId = profiles[0].id
-            binding.editConnectionKey.setText(profiles[0].key)
-            SecureStorage.saveActiveProfileId(this, profiles[0].id)
-        } else {
-            // Fallback: try legacy key
-            binding.editConnectionKey.setText(SecureStorage.loadConnectionKey(this))
+            // If we have an active profile, load its key into the field
+            val active = profiles.find { it.id == activeProfileId }
+            if (active != null) {
+                binding.editConnectionKey.setText(active.key)
+            } else if (profiles.isNotEmpty()) {
+                activeProfileId = profiles[0].id
+                binding.editConnectionKey.setText(profiles[0].key)
+                withContext(Dispatchers.IO) {
+                    SecureStorage.saveActiveProfileId(this@MainActivity, profiles[0].id)
+                }
+            } else {
+                // Fallback: try legacy key
+                binding.editConnectionKey.setText(loaded.legacyKey)
+            }
+
+            renderProfiles()
+
+            // Update language button label
+            updateLanguageButton(loaded.language)
+
+            // The Connect label carries the active profile name, which was still
+            // unknown when the resync at the end of onCreate rendered the state.
+            resyncFromService()
         }
-
-        renderProfiles()
-
-        // Update language button label
-        updateLanguageButton()
 
         binding.btnConnect.setOnClickListener {
             if (AivpnService.isServiceActive) disconnect() else connect()
@@ -268,6 +306,9 @@ class MainActivity : AppCompatActivity() {
 
     private fun showProfileDialog(existing: SecureStorage.ConnectionProfile?) {
         if (isConnected) return
+        // Saving from this dialog persists the whole list — not before it loaded
+        // (see [profilesLoaded]).
+        if (!profilesLoaded) return
 
         // Use the dialog's theme context so EditText fields inherit proper colours
         // (white text, grey hints) instead of defaulting to the dark-on-dark activity theme.
@@ -477,15 +518,23 @@ class MainActivity : AppCompatActivity() {
     private val Int.dp: Int get() = (this * resources.displayMetrics.density).toInt()
 
     private fun updateSplitTunnelHint() {
-        val appCount = SecureStorage.loadAllowedApps(this).size
-        val siteCount = SecureStorage.loadExcludedDomains(this).size
-        binding.textSplitTunnelHint.text = when {
-            appCount > 0 && siteCount > 0 -> getString(R.string.split_tunnel_hint_combined,
-                getString(R.string.split_tunnel_hint_apps, appCount),
-                getString(R.string.split_tunnel_hint_sites, siteCount))
-            appCount > 0 -> getString(R.string.split_tunnel_vpn_count, appCount)
-            siteCount > 0 -> getString(R.string.split_tunnel_bypass_count, siteCount)
-            else -> getString(R.string.split_tunnel_desc)
+        // A5: same Keystore-backed store as the onCreate load — and this one runs
+        // again on EVERY onResume, so it must not block the main thread either.
+        // Purely a label, so applying it a frame late is invisible.
+        lifecycleScope.launch {
+            val counts = withContext(Dispatchers.IO) {
+                SecureStorage.loadAllowedApps(this@MainActivity).size to
+                    SecureStorage.loadExcludedDomains(this@MainActivity).size
+            }
+            val (appCount, siteCount) = counts
+            binding.textSplitTunnelHint.text = when {
+                appCount > 0 && siteCount > 0 -> getString(R.string.split_tunnel_hint_combined,
+                    getString(R.string.split_tunnel_hint_apps, appCount),
+                    getString(R.string.split_tunnel_hint_sites, siteCount))
+                appCount > 0 -> getString(R.string.split_tunnel_vpn_count, appCount)
+                siteCount > 0 -> getString(R.string.split_tunnel_bypass_count, siteCount)
+                else -> getString(R.string.split_tunnel_desc)
+            }
         }
     }
 
@@ -564,6 +613,12 @@ class MainActivity : AppCompatActivity() {
     private fun parseConnectionKey(key: String): ParsedConnectionKey? = ConnectionKeyParser.parse(key)
 
     private fun connect() {
+        // The profile list is still loading (onCreate, off the main thread): the
+        // in-memory list is empty, so the saveProfiles() below would wipe every
+        // stored profile. A no-op is safe — the window is a few milliseconds and
+        // the next tap goes through.
+        if (!profilesLoaded) return
+
         val connectionKey = binding.editConnectionKey.text.toString().trim()
         if (connectionKey.isEmpty()) {
             Toast.makeText(this, getString(R.string.error_fill_fields), Toast.LENGTH_SHORT).show()
@@ -725,9 +780,9 @@ class MainActivity : AppCompatActivity() {
         recreate()
     }
 
-    private fun updateLanguageButton() {
+    /** [savedLang] comes from onCreate's off-main-thread SecureStorage load (A5). */
+    private fun updateLanguageButton(savedLang: String?) {
         // Apply saved language on startup
-        val savedLang = SecureStorage.loadLanguage(this)
         if (savedLang != null && savedLang != "en") {
             val localeList = LocaleListCompat.forLanguageTags(savedLang)
             AppCompatDelegate.setApplicationLocales(localeList)

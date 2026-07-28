@@ -2,6 +2,8 @@ package com.aivpn.client
 
 import android.content.Intent
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import android.service.quicksettings.Tile
 import android.service.quicksettings.TileService
 import android.util.Log
@@ -20,8 +22,9 @@ import android.util.Log
  * clickable so a stuck retry can be cancelled from the shade), INACTIVE while
  * disconnected.
  *
- * Connect flow: loads the active profile from SecureStorage, parses the
- * connection key, then fires AivpnService.ACTION_CONNECT. If VPN permission
+ * Connect flow: loads the active profile from SecureStorage (on a background
+ * lane — onClick is the main thread and that store is Keystore-backed), then
+ * fires AivpnService.ACTION_CONNECT from [startConnect]. If VPN permission
  * has not been granted yet, opens MainActivity to let the user grant it.
  * On Android 12+ a ForegroundServiceStartNotAllowedException is caught and
  * also falls back to opening MainActivity.
@@ -30,17 +33,32 @@ class AivpnTileService : TileService() {
 
     companion object {
         private const val TAG = "AivpnTileService"
+
+        /** Single background lane for the Keystore-backed profile lookup (A5). */
+        private val EXECUTOR = java.util.concurrent.Executors.newSingleThreadExecutor()
     }
+
+    private val mainHandler = Handler(Looper.getMainLooper())
+
+    /**
+     * This instance's registration in [AivpnService.tileCallback]. Kept as a
+     * stable reference so [onStopListening] only clears OUR registration: the
+     * service no longer nulls the callback on its own death, so a stale instance
+     * must not unregister a newer one that has already started listening.
+     */
+    private val tileSync: () -> Unit = { syncTileState() }
 
     override fun onStartListening() {
         super.onStartListening()
-        AivpnService.tileCallback = { syncTileState() }
+        AivpnService.tileCallback = tileSync
         syncTileState()
     }
 
     override fun onStopListening() {
         super.onStopListening()
-        AivpnService.tileCallback = null
+        if (AivpnService.tileCallback === tileSync) {
+            AivpnService.tileCallback = null
+        }
     }
 
     override fun onClick() {
@@ -108,10 +126,29 @@ class AivpnTileService : TileService() {
             return
         }
 
-        val profileId = SecureStorage.loadActiveProfileId(this)
-        val profile = SecureStorage.loadProfiles(this)
-            .let { list -> list.find { it.id == profileId } ?: list.firstOrNull() }
+        // A5: SecureStorage is EncryptedSharedPreferences — Keystore + real disk
+        // I/O, hundreds of ms cold — and TileService.onClick runs on the MAIN
+        // thread. Same cost BootReceiver refuses to pay on its calling thread
+        // (see its goAsync() comment); a TileService has no goAsync(), so the
+        // lookup goes to a background lane and everything touching qsTile /
+        // startActivity comes back through mainHandler.
+        EXECUTOR.execute {
+            val profile = try {
+                val profileId = SecureStorage.loadActiveProfileId(this)
+                SecureStorage.loadProfiles(this)
+                    .let { list -> list.find { it.id == profileId } ?: list.firstOrNull() }
+            } catch (e: Exception) {
+                Log.e(TAG, "Profile lookup failed: ${e.message}", e)
+                null
+            }
+            // Still well inside the ~10 s allowlist a tile click grants for a
+            // background foreground-service start.
+            mainHandler.post { startConnect(profile) }
+        }
+    }
 
+    /** Main-thread tail of [connectVpn] — runs once the profile lookup lands. */
+    private fun startConnect(profile: SecureStorage.ConnectionProfile?) {
         if (profile == null) {
             Log.w(TAG, "No profile configured — opening MainActivity")
             qsTile?.let { it.state = Tile.STATE_UNAVAILABLE; it.updateTile() }

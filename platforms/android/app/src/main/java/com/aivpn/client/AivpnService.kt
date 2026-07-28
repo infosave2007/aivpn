@@ -144,7 +144,15 @@ class AivpnService : VpnService() {
 
     // TUN interface wrapper kept open across reconnects so Android does not tear down
     // the device-level VPN interface between Rust tunnel restarts.
-    private var vpnInterface: ParcelFileDescriptor? = null
+    // @Volatile like [currentTunMtu] / [currentTunAddress] below, which describe
+    // this very field: it is established from the connect coroutine
+    // (Dispatchers.IO) but closed from the main/binder threads (stopVpn /
+    // onDestroy / onRevoke). Unsynchronised, each side could keep reading its own
+    // cached value — a disconnect writing null over a just-established descriptor
+    // leaks that ParcelFileDescriptor, and the mirror case reads a stale non-null
+    // fd, takes the matching-MTU fast path below and hands an already-closed fd to
+    // AivpnJni.runTunnel.
+    @Volatile private var vpnInterface: ParcelFileDescriptor? = null
     /** MTU the current [vpnInterface] was built with; 0 when no interface exists. */
     @Volatile private var currentTunMtu: Int = 0
     // Address the live TUN was established with; a pool re-home changes the
@@ -1421,7 +1429,10 @@ class AivpnService : VpnService() {
         lastStatusText = getString(R.string.status_disconnected)
         uiState = UiState.DISCONNECTED
         postStatusCallback(false, lastStatusText)
-        val ticb1 = tileCallback; ticb1?.invoke()
+        // Marshalled, never invoked inline: stopVpn() also runs from onRevoke(),
+        // which the framework may deliver on a binder thread — and qsTile /
+        // Tile.updateTile() are main-thread-only, same rule as onTunnelReady.
+        fireTileCallback()
         if (wasEstablished) {
             postEventNotification(getString(R.string.status_disconnected))
         }
@@ -1470,8 +1481,6 @@ class AivpnService : VpnService() {
         serviceJob?.cancel()
         serviceJob = null
         if (unexpectedStop) {
-            // Must run BEFORE tileCallback is nulled below (fireTileCallback
-            // captures the reference synchronously).
             notifyTerminalStop(getString(R.string.status_disconnected))
             // The user still wants the VPN up (intent persisted at connect):
             // schedule an expedited one-shot to re-send ACTION_CONNECT.
@@ -1490,7 +1499,14 @@ class AivpnService : VpnService() {
         closeTunnel()
         isRunning = false
         serviceScope.cancel()
-        tileCallback = null
+        // [tileCallback] is deliberately NOT nulled here: it belongs to
+        // AivpnTileService for its whole listening window (registered in
+        // onStartListening, cleared in onStopListening). Dropping it on service
+        // death unregistered a tile that is still on screen — tap-to-disconnect
+        // (service destroyed) followed by tap-to-reconnect with the shade still
+        // open left the tile stuck on "Disconnected" for the entire next session,
+        // because nothing re-registers until the shade is reopened. A stale
+        // callback is harmless: syncTileState() bails on a null qsTile.
         instance = null
         super.onDestroy()
     }
@@ -1514,9 +1530,11 @@ class AivpnService : VpnService() {
     }
 
     /**
-     * Invokes the QS-tile refresh callback on the main thread. Captures the
-     * reference synchronously so a caller that nulls [tileCallback] right after
-     * (onDestroy) cannot lose the final refresh.
+     * Invokes the QS-tile refresh callback on the main thread — qsTile and
+     * Tile.updateTile() are main-thread-only, and callers reach this from the
+     * Rust JNI thread, from a binder thread (onRevoke) and from the main thread
+     * alike. Captures the reference synchronously so a caller that clears
+     * [tileCallback] right after cannot lose the final refresh.
      */
     private fun fireTileCallback() {
         val tcb = tileCallback ?: return

@@ -461,7 +461,8 @@ class AdminActivity : AppCompatActivity() {
                 try {
                     if (!AivpnJni.isAvailable) return@withContext null
                     val png = AivpnJni.qrPng(key)
-                    if (png.isEmpty()) null else BitmapFactory.decodeByteArray(png, 0, png.size)
+                    if (png == null || png.isEmpty()) null
+                    else BitmapFactory.decodeByteArray(png, 0, png.size)
                 } catch (t: Throwable) {
                     android.util.Log.e("AdminActivity", "qrPng failed", t)
                     null

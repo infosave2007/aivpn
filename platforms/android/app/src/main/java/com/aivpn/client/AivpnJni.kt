@@ -311,16 +311,20 @@ object AivpnJni {
      *               big-endian HTTP status prefix followed by the response
      *               body bytes. An EMPTY array means the call did not
      *               complete (not connected / timed out) — callers must
-     *               check `size < 2` before indexing.
+     *               check `size < 2` before indexing. NULLABLE like the
+     *               `String?` getters above: the Rust `make_bytes` helper
+     *               returns a null jbyteArray rather than panicking across
+     *               the FFI boundary when the JVM cannot allocate the array.
      */
-    external fun mgmtRequest(method: Int, path: String, body: ByteArray): ByteArray
+    external fun mgmtRequest(method: Int, path: String, body: ByteArray): ByteArray?
 
     /**
      * Renders `text` (typically an `aivpn://...` connection key) as a PNG QR
-     * code and returns the raw PNG bytes, or an empty array on failure.
+     * code and returns the raw PNG bytes, or an empty array on failure (null
+     * if the JVM array allocation itself failed — see [mgmtRequest]).
      * Decode with [android.graphics.BitmapFactory.decodeByteArray].
      */
-    external fun qrPng(text: String): ByteArray
+    external fun qrPng(text: String): ByteArray?
 
     // ──────────── C2b: in-app SSH server installer (ssh-install feature) ────────────
     //
