@@ -33,7 +33,7 @@ RUSER  ?= root
 endif
 REMOTE ?= /opt/aivpn
 
-.PHONY: help setup check test clippy fmt mask-gate \
+.PHONY: help setup check test clippy fmt mask-gate swift-parse \
         server server-tiny client server-docker \
         server-arm64 client-arm64 \
         server-musl-armv7 server-musl-mipsel server-musl-aarch64 server-musl-aarch64-full \
@@ -58,6 +58,7 @@ help:
 	@printf "    %-40s %s\n" "make clippy"              "cargo clippy --all-targets"
 	@printf "    %-40s %s\n" "make fmt"                 "cargo fmt --all"
 	@printf "    %-40s %s\n" "make mask-gate"           "nDPI-gate every assets/masks/*.json (R2 Phase A)"
+	@printf "    %-40s %s\n" "make swift-parse"         "Syntax-check platforms/ios + platforms/macos (no Xcode needed)"
 	@printf "\n  Server / Client — Linux x86_64\n"
 	@printf "    %-40s %s\n" "make server"              "Full server [management-api,metrics,neural]"
 	@printf "    %-40s %s\n" "make server-tiny"         "Minimal server (bare VPN gateway)"
@@ -133,6 +134,14 @@ fmt:
 # without it are not blocked. See docs/R2_PHASE_A.md.
 mask-gate:
 	scripts/ci-mask-gate.sh
+
+# Syntax gate for the Apple sources. They can only be BUILT on macOS, so edits
+# to platforms/ios and platforms/macos otherwise go in unverified until the
+# operator builds on a Mac. `swiftc -parse` needs no Apple SDK, so it runs on
+# Linux and catches truncated/malformed edits (not type errors). Gracefully
+# SKIPS when no Swift toolchain is installed. See docs in the script.
+swift-parse:
+	scripts/ci-swift-parse.sh
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Server / Client — Linux x86_64
