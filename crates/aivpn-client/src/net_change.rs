@@ -25,6 +25,26 @@
 use std::sync::Arc;
 use tokio::sync::Notify;
 
+/// Tell the listener which interface index belongs to the client's own TUN
+/// device, so its own tunnel setup is not mistaken for the network moving.
+///
+/// Call with the fresh index every time a TUN is created, and with `0` when it
+/// is torn down. Cheap (one relaxed atomic store) and safe to call when no
+/// listener is running or on platforms that have none.
+///
+/// Only the Linux listener consumes this today. The Windows
+/// `NotifyIpInterfaceChange` callback receives a `MIB_IPINTERFACE_ROW` it
+/// currently ignores; filtering there would mean committing to that struct's
+/// binary layout, which the FFI block below is already flagged as unable to
+/// verify in this environment — so Windows keeps relying on the
+/// `last_rx`-based guard in `client::session` plus the poll-based watchdogs.
+pub fn set_own_tun_ifindex(ifindex: u32) {
+    #[cfg(target_os = "linux")]
+    linux_impl::set_own_tun_ifindex(ifindex);
+    #[cfg(not(target_os = "linux"))]
+    let _ = ifindex;
+}
+
 /// Start the best-effort native network-change listener for this platform.
 /// Returns `None` when no listener is implemented for this platform, or the
 /// platform-specific setup failed (logged at `debug`/`warn`, never fatal).
@@ -47,6 +67,7 @@ pub fn spawn() -> Option<Arc<Notify>> {
 mod linux_impl {
     use super::*;
     use std::mem::size_of;
+    use std::sync::atomic::{AtomicU32, Ordering};
 
     // Multicast groups on the NETLINK_ROUTE family. Values from
     // linux/rtnetlink.h — not exposed by the `libc` crate, so declared
@@ -55,6 +76,102 @@ mod linux_impl {
     const RTMGRP_LINK: u32 = 0x1; // interface up/down/added/removed
     const RTMGRP_IPV4_IFADDR: u32 = 0x10; // IPv4 address add/remove (DHCP renew, roam)
     const RTMGRP_IPV6_IFADDR: u32 = 0x100; // IPv6 address add/remove
+
+    // rtnetlink message types delivered on the groups above (linux/rtnetlink.h).
+    // These are the only ones whose payload starts with a struct carrying an
+    // interface index, so they are the only ones that can be attributed to a
+    // specific device.
+    const RTM_NEWLINK: u16 = 16;
+    const RTM_DELLINK: u16 = 17;
+    const RTM_NEWADDR: u16 = 20;
+    const RTM_DELADDR: u16 = 21;
+
+    /// `struct nlmsghdr`: u32 len + u16 type + u16 flags + u32 seq + u32 pid.
+    const NLMSG_HDR_LEN: usize = 16;
+
+    /// Interface index of the TUN device this client currently owns, or 0 when
+    /// no tunnel is up.
+    ///
+    /// Set by `Tunnel` on every create/close (see `set_own_tun_ifindex`).
+    /// Process-wide because the netlink listener is a process-wide singleton
+    /// spawned once by `spawn()`, while the TUN itself is recreated — under a
+    /// fresh random name, hence a fresh index — on every reconnect.
+    static OWN_TUN_IFINDEX: AtomicU32 = AtomicU32::new(0);
+
+    pub fn set_own_tun_ifindex(ifindex: u32) {
+        OWN_TUN_IFINDEX.store(ifindex, Ordering::Relaxed);
+    }
+
+    /// Round up to the 4-byte alignment rtnetlink pads every message to
+    /// (`NLMSG_ALIGN` in linux/netlink.h).
+    fn nlmsg_align(len: usize) -> usize {
+        (len + 3) & !3
+    }
+
+    /// Does this netlink datagram describe a change to an interface *other*
+    /// than `own_ifindex`?
+    ///
+    /// The client generates LINK/IFADDR events itself on every connect: the
+    /// TUN is created, `ip addr replace` runs during `configure_linux()`, and
+    /// runs a SECOND time from `apply_network_config()` once the server's
+    /// ServerHello confirms the network config. Treating those as "the network
+    /// moved" tore the session down microseconds after it came up, and the
+    /// retry re-emitted them — a reconnect loop that never established.
+    ///
+    /// Every one of those self-inflicted events lands on the client's own TUN
+    /// (`configure_linux` touches nothing else, and the Linux IPv6 blackhole
+    /// is a *route*, whose group is not subscribed here), so filtering by
+    /// interface index removes the whole class deterministically — no timing
+    /// window, no heuristic.
+    ///
+    /// Anything that cannot be attributed with certainty — an unknown message
+    /// type, a truncated datagram, an empty read, or `own_ifindex == 0`
+    /// meaning no tunnel is up — counts as foreign, preserving the original
+    /// "any datagram is the signal" behavior wherever the filter cannot prove
+    /// the event is ours.
+    fn has_foreign_event(buf: &[u8], own_ifindex: u32) -> bool {
+        let mut offset = 0usize;
+        let mut attributed_any = false;
+
+        while offset + NLMSG_HDR_LEN <= buf.len() {
+            // Both fields are native-endian, as the kernel writes them.
+            let len = u32::from_ne_bytes(buf[offset..offset + 4].try_into().unwrap()) as usize;
+            let msg_type = u16::from_ne_bytes(buf[offset + 4..offset + 6].try_into().unwrap());
+
+            // A length that is nonsensical or runs past what we read means the
+            // datagram was truncated (the 4096-byte buffer in the listener) or
+            // malformed — we cannot rule out a foreign event in the remainder.
+            if len < NLMSG_HDR_LEN || offset + len > buf.len() {
+                return true;
+            }
+
+            match msg_type {
+                RTM_NEWLINK | RTM_DELLINK | RTM_NEWADDR | RTM_DELADDR => {
+                    // `ifinfomsg.ifi_index` (family/pad/type = 4 bytes ahead)
+                    // and `ifaddrmsg.ifa_index` (family/prefixlen/flags/scope =
+                    // 4 bytes ahead) both sit at payload offset 4 and are both
+                    // 4 bytes wide, so one read serves both message families.
+                    let idx_at = offset + NLMSG_HDR_LEN + 4;
+                    if idx_at + 4 > offset + len {
+                        return true; // header promised a body it did not carry
+                    }
+                    let ifindex = u32::from_ne_bytes(buf[idx_at..idx_at + 4].try_into().unwrap());
+                    if own_ifindex == 0 || ifindex != own_ifindex {
+                        return true;
+                    }
+                    attributed_any = true;
+                }
+                // Not attributable to an interface — treat as a real change.
+                _ => return true,
+            }
+
+            offset += nlmsg_align(len);
+        }
+
+        // Trailing bytes too short to hold another header, or an empty read:
+        // only safe to stay quiet if everything we DID parse was our own TUN.
+        !attributed_any || offset != buf.len()
+    }
 
     #[repr(C)]
     struct sockaddr_nl {
@@ -127,10 +244,15 @@ mod linux_impl {
                         // still cover reconnection).
                         break;
                     }
-                    // Any datagram on this multicast group is itself the
-                    // signal (link up/down or address add/remove) — no need
-                    // to parse the nlmsghdr payload to decide to reconnect.
-                    notify_for_thread.notify_one();
+                    // Signal only for events on interfaces OTHER than our own
+                    // TUN. The client reconfigures that device itself on every
+                    // connect, and those self-inflicted events are otherwise
+                    // indistinguishable from a real interface handover — see
+                    // `has_foreign_event`.
+                    let own = OWN_TUN_IFINDEX.load(Ordering::Relaxed);
+                    if has_foreign_event(&buf[..n as usize], own) {
+                        notify_for_thread.notify_one();
+                    }
                 }
                 unsafe { libc::close(fd) };
             });
@@ -145,6 +267,92 @@ mod linux_impl {
                 unsafe { libc::close(fd) };
                 None
             }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// Build one rtnetlink message: a 16-byte `nlmsghdr` followed by the
+        /// first 8 bytes of `ifinfomsg`/`ifaddrmsg` — enough to carry the
+        /// interface index, which both structs place at payload offset 4.
+        fn msg(ty: u16, ifindex: u32) -> Vec<u8> {
+            let mut v = Vec::new();
+            v.extend_from_slice(&((NLMSG_HDR_LEN + 8) as u32).to_ne_bytes());
+            v.extend_from_slice(&ty.to_ne_bytes());
+            v.extend_from_slice(&0u16.to_ne_bytes()); // nlmsg_flags
+            v.extend_from_slice(&0u32.to_ne_bytes()); // nlmsg_seq
+            v.extend_from_slice(&0u32.to_ne_bytes()); // nlmsg_pid
+            v.extend_from_slice(&0u32.to_ne_bytes()); // family/pad/type (or family..scope)
+            v.extend_from_slice(&ifindex.to_ne_bytes());
+            v
+        }
+
+        #[test]
+        fn own_tun_address_event_is_not_a_network_change() {
+            // The exact event `configure_linux()`'s `ip addr replace` emits on
+            // the client's own TUN — the one that used to kill every session.
+            assert!(!has_foreign_event(&msg(RTM_NEWADDR, 7), 7));
+        }
+
+        #[test]
+        fn own_tun_link_event_is_not_a_network_change() {
+            assert!(!has_foreign_event(&msg(RTM_NEWLINK, 7), 7));
+        }
+
+        #[test]
+        fn event_on_another_interface_is_a_network_change() {
+            assert!(has_foreign_event(&msg(RTM_NEWADDR, 3), 7));
+        }
+
+        #[test]
+        fn batch_of_only_own_tun_events_is_not_a_network_change() {
+            let mut buf = msg(RTM_NEWADDR, 7);
+            buf.extend_from_slice(&msg(RTM_NEWLINK, 7));
+            assert!(!has_foreign_event(&buf, 7));
+        }
+
+        #[test]
+        fn batch_mixing_own_tun_and_foreign_interface_is_a_network_change() {
+            let mut buf = msg(RTM_NEWADDR, 7);
+            buf.extend_from_slice(&msg(RTM_DELLINK, 3));
+            assert!(has_foreign_event(&buf, 7));
+        }
+
+        #[test]
+        fn with_no_tun_registered_every_event_is_a_network_change() {
+            // ifindex 0 == "no tunnel up", so nothing may be filtered — this
+            // preserves the pre-filter behavior outside a live session.
+            assert!(has_foreign_event(&msg(RTM_NEWADDR, 3), 0));
+            assert!(has_foreign_event(&msg(RTM_DELADDR, 7), 0));
+        }
+
+        #[test]
+        fn unknown_message_type_is_treated_as_a_network_change() {
+            // Conservative: only LINK/ADDR messages can be attributed to an
+            // interface here, so anything else must not be silently dropped.
+            assert!(has_foreign_event(&msg(9999, 7), 7));
+        }
+
+        #[test]
+        fn truncated_message_is_treated_as_a_network_change() {
+            let mut buf = msg(RTM_NEWADDR, 7);
+            // Claim a length past the end of the buffer.
+            buf[0..4].copy_from_slice(&4096u32.to_ne_bytes());
+            assert!(has_foreign_event(&buf, 7));
+        }
+
+        #[test]
+        fn empty_datagram_is_treated_as_a_network_change() {
+            assert!(has_foreign_event(&[], 7));
+        }
+
+        #[test]
+        fn trailing_garbage_shorter_than_a_header_is_treated_as_a_network_change() {
+            let mut buf = msg(RTM_NEWADDR, 7);
+            buf.extend_from_slice(&[0u8; 3]);
+            assert!(has_foreign_event(&buf, 7));
         }
     }
 }

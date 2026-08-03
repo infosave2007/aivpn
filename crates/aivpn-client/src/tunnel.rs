@@ -430,6 +430,36 @@ impl Tunnel {
             self.config.tun_name, self.config.tun_addr, self.config.tun_netmask
         );
 
+        // Claim this device with the native network-change listener BEFORE any
+        // configuration below touches it. Everything `configure_linux()` and
+        // the later `apply_network_config()` do emits netlink LINK/IFADDR
+        // events on exactly this interface; without the claim the listener
+        // reports them as "the network moved" and the session is torn down
+        // moments after it establishes. Registering first closes the window in
+        // which our own setup events could still be misread.
+        //
+        // Resolution failure is non-fatal: index 0 means "nothing registered",
+        // so the listener falls back to reporting every event — the pre-filter
+        // behavior — rather than going silent.
+        //
+        // Linux-only: `if_nametoindex` is not part of the Windows libc surface,
+        // and Linux is the only platform whose listener consumes the index (see
+        // `net_change::set_own_tun_ifindex`).
+        #[cfg(target_os = "linux")]
+        {
+            let ifindex = std::ffi::CString::new(self.config.tun_name.as_str())
+                .map(|c| unsafe { libc::if_nametoindex(c.as_ptr()) })
+                .unwrap_or(0);
+            if ifindex == 0 {
+                debug!(
+                    "net_change: could not resolve ifindex for {} — network-change \
+                     events will not be filtered for this session",
+                    self.config.tun_name
+                );
+            }
+            crate::net_change::set_own_tun_ifindex(ifindex);
+        }
+
         // Platform-specific post-creation configuration
         #[cfg(target_os = "macos")]
         self.configure_macos().await?;
@@ -2143,6 +2173,12 @@ impl Drop for Tunnel {
         if self.writer.is_some() || self.reader.is_some() {
             info!("Closing TUN device: {}", self.config.tun_name);
         }
+
+        // Release the claim: the next connect creates a TUN under a fresh
+        // random name and index, and a stale index left registered here could
+        // suppress a genuine event on whatever device the kernel later assigns
+        // that index to.
+        crate::net_change::set_own_tun_ifindex(0);
     }
 }
 
