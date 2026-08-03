@@ -2,7 +2,11 @@
 target/
 **/target/
 *.rs.bk
-Cargo.lock
+# Cargo.lock is deliberately NOT ignored. This workspace ships binaries, not
+# libraries, and the release images build with `cargo build --locked`, which
+# needs the lock file present in the build context — with it ignored, a clean
+# clone could not build Dockerfile at all ("/Cargo.lock: not found"), and the
+# "reproducible release builds" the Dockerfile claims were never reproducible.
 
 # ── Build output ─────────────────────────────────────────────────────────────
 /releases/

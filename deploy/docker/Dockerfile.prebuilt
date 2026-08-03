@@ -1,5 +1,12 @@
+# debian:trixie-slim — Debian 13, the current stable release. The binary copied
+# in below is the glibc-linked `releases/aivpn-server-linux-x86_64` produced by
+# `make server` / `make server-docker`. glibc is backward-compatible, so an
+# artifact built against an older glibc (bookworm's 2.36, or the CI host's)
+# runs unchanged on trixie's 2.41 — verified by running --version in this
+# image. The reverse is not true: do not build the artifact on a base newer
+# than the deployment target.
 # TODO(security): pin with @sha256:<digest> once a digest is chosen to track.
-FROM debian:bookworm-slim
+FROM debian:trixie-slim
 
 # Install runtime dependencies
 RUN apt-get update && apt-get install -y \

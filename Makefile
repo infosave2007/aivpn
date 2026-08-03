@@ -186,6 +186,14 @@ server-docker: releases/
 
 # ─────────────────────────────────────────────────────────────────────────────
 # ARM64 cross-compile (Docker, glibc)
+#
+# Deliberately still on debian:bookworm while the container images have moved
+# to trixie: these two targets emit *distributable* binaries into releases/,
+# and a glibc-linked binary only runs on a glibc at least as new as the one it
+# was built against. Building on trixie (glibc 2.41) would drop support for
+# Debian 12 and Ubuntu 22.04/24.04 hosts. Bookworm (glibc 2.36) keeps the
+# floor low and is supported until 2028; the Rust toolchain is installed via
+# rustup stable, so the compiler here is current regardless of the base image.
 # ─────────────────────────────────────────────────────────────────────────────
 server-arm64: releases/
 	docker run --rm -v "$$(pwd)":/aivpn -w /aivpn \
@@ -242,16 +250,10 @@ define _musl
 	  printf 'FROM messense/rust-musl-cross:$${MUSL_IMAGE_TAG} AS builder\n'; \
 	  printf 'ARG TARGET_TRIPLE CRATE_NAME BINARY_NAME BUILD_FEATURES\n'; \
 	  printf 'WORKDIR /app\n'; \
-	  printf 'COPY Cargo.toml ./\n'; \
-	  printf 'COPY crates/aivpn-common crates/aivpn-common/\n'; \
-	  printf 'COPY crates/aivpn-server crates/aivpn-server/\n'; \
-	  printf 'COPY crates/aivpn-client crates/aivpn-client/\n'; \
-	  printf 'COPY crates/aivpn-windows crates/aivpn-windows/\n'; \
-	  printf 'COPY crates/aivpn-linux crates/aivpn-linux/\n'; \
-	  printf 'COPY crates/aivpn-android-core crates/aivpn-android-core/\n'; \
-	  printf 'COPY crates/aivpn-ios-core crates/aivpn-ios-core/\n'; \
+	  printf 'COPY Cargo.toml Cargo.lock ./\n'; \
+	  printf 'COPY crates crates/\n'; \
 	  printf 'COPY assets/masks assets/masks/\n'; \
-	  printf 'RUN if [ -n "$$BUILD_FEATURES" ]; then cargo build --release --target "$$TARGET_TRIPLE" -p "$$CRATE_NAME" --bin "$$BINARY_NAME" --features "$$BUILD_FEATURES"; else cargo build --release --target "$$TARGET_TRIPLE" -p "$$CRATE_NAME" --bin "$$BINARY_NAME"; fi\n'; \
+	  printf 'RUN if [ -n "$$BUILD_FEATURES" ]; then cargo build --locked --release --target "$$TARGET_TRIPLE" -p "$$CRATE_NAME" --bin "$$BINARY_NAME" --features "$$BUILD_FEATURES"; else cargo build --locked --release --target "$$TARGET_TRIPLE" -p "$$CRATE_NAME" --bin "$$BINARY_NAME"; fi\n'; \
 	} > "$$TMPDF"; \
 	trap "rm -f $$TMPDF; docker rm -f $$CTR >/dev/null 2>&1 || true" EXIT; \
 	docker build \

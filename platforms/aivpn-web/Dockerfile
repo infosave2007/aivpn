@@ -1,5 +1,7 @@
 # Stage 1: builder
-FROM oven/bun:1 AS builder
+# Pinned to a concrete Bun release rather than the floating `1` major tag, so
+# the SPA build and the runtime stage below always agree on the interpreter.
+FROM oven/bun:1.3.14 AS builder
 
 WORKDIR /app
 
@@ -23,15 +25,16 @@ RUN bun run --cwd client build
 # Bun resolve the native addon from node_modules normally, so the image boots.
 
 # Stage 2: runtime
+# Same Bun release as the builder stage above.
 # TODO(security): pin with @sha256:<digest> once a digest is chosen to track
-# (oven/bun:1-alpine is a floating tag; a digest pin trades that for a
-# manual bump on every base-image update).
-FROM oven/bun:1-alpine AS runtime
+# (the version tag still floats across base-OS rebuilds; a digest pin trades
+# that for a manual bump on every base-image update).
+FROM oven/bun:1.3.14-alpine AS runtime
 
 WORKDIR /app
 
 # Copy production deps + server source + package manifest + built SPA,
-# owned by the non-root `bun` user (uid=gid=1000 in oven/bun:1-alpine) that
+# owned by the non-root `bun` user (uid=gid=1000 in oven/bun:1.3.14-alpine) that
 # this image runs as below — root-owned files under /app would otherwise be
 # unwritable/unreadable at runtime once USER drops privileges.
 COPY --from=builder --chown=bun:bun /app/node_modules ./node_modules
@@ -60,7 +63,8 @@ ENV CLIENT_BUILD_DIR=../client/build
 # management socket group:
 #
 # This container runs as the built-in `bun` user (uid=1000, gid=1000 in
-# oven/bun:1-alpine — verified via `docker run oven/bun:1-alpine id bun`).
+# oven/bun:1.3.14-alpine — verified via
+# `docker run --rm oven/bun:1.3.14-alpine id bun`).
 # The panel proxies every /api/v1 request over aivpn-server's management
 # Unix socket (UNIX_SOCK, default /run/aivpn/api.sock, bind-mounted from the
 # host — see docker-compose.yml). For uid 1000 inside this container to open

@@ -68,7 +68,7 @@ docker compose -f docker-compose.yml -f platforms/aivpn-web/docker-compose.yml u
 ```
 
 > **Non-root container / management socket group:** this image runs as the
-> non-root `bun` user (uid=gid=1000, built into `oven/bun:1-alpine`) so it
+> non-root `bun` user (uid=gid=1000, built into `oven/bun:1.3.14-alpine`) so it
 > can open aivpn-server's management Unix socket (`UNIX_SOCK`, default
 > `/run/aivpn/api.sock`), the operator MUST configure aivpn-server with
 > `management_socket_group=1000` (server.json / CLI flag) so the server

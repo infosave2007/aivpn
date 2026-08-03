@@ -12,21 +12,19 @@ FROM --platform=linux/amd64 messense/rust-musl-cross:${MUSL_IMAGE_TAG} AS builde
 ARG TARGET_TRIPLE
 
 WORKDIR /app
-COPY Cargo.toml ./
-COPY crates/aivpn-common crates/aivpn-common/
-COPY crates/aivpn-client crates/aivpn-client/
-COPY crates/aivpn-server crates/aivpn-server/
-COPY crates/aivpn-android-core crates/aivpn-android-core/
-COPY crates/aivpn-ios-core crates/aivpn-ios-core/
-COPY crates/aivpn-windows crates/aivpn-windows/
-COPY crates/aivpn-linux crates/aivpn-linux/
+# Cargo.lock is copied and --locked is passed so the router image is built from
+# the same pinned dependency graph as the server image. The whole crates/ tree
+# is copied rather than an explicit per-crate list: cargo needs every member
+# listed in Cargo.toml to be present to resolve the workspace at all.
+COPY Cargo.toml Cargo.lock ./
+COPY crates crates/
 COPY assets/masks assets/masks/
 
-RUN cargo build --release --target "${TARGET_TRIPLE}" -p aivpn-client --bin aivpn-client \
+RUN cargo build --locked --release --target "${TARGET_TRIPLE}" -p aivpn-client --bin aivpn-client \
     && cp "target/${TARGET_TRIPLE}/release/aivpn-client" /aivpn-client
 
 # Stage 2: minimal runtime image with iproute2 for ip commands
-FROM alpine:3.19
+FROM alpine:3.24
 RUN apk add --no-cache iproute2 ca-certificates \
     && rm -rf /var/cache/apk/*
 

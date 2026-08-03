@@ -1,6 +1,19 @@
+# `node_modules` alone only matches the top-level directory — Docker ignore
+# patterns without a slash are NOT recursive. Without the `**/` forms below,
+# a developer's locally installed `client/node_modules` / `server/node_modules`
+# leak into the build context and get COPYed *over* the ones `bun install`
+# just produced in the builder stage. Bun's per-workspace node_modules are
+# symlinks into the root store (`node_modules/.bun/<pkg>@<ver>+<hash>`), so the
+# host copies land as symlinks to store paths that do not exist in the image
+# and the build dies with `vite: command not found`.
 node_modules
+**/node_modules
 .git
 *.log
 data/
 dist/
+**/dist/
 .env
+# Stale SPA output from a host-side `bun run build`; the builder stage
+# regenerates it into the same path.
+client/build
