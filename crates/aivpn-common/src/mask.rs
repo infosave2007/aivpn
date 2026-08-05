@@ -475,44 +475,6 @@ pub fn resolve_handshake_mask(
 /// client's `HANDSHAKE_FALLBACK_THRESHOLD` (main.rs) for the mobile cores.
 pub const HANDSHAKE_FALLBACK_THRESHOLD: u32 = 3;
 
-/// `tag_offset` value that selects the tag-PREFIX wire layout: an 8-byte
-/// resonance tag at packet offset 0, then the MDH, then the ephemeral key.
-/// Also the value [`default_tag_offset`] yields for a mask that omits the
-/// field, so this alone says nothing about the peer's age — see
-/// [`use_legacy_layout`].
-pub const LEGACY_TAG_OFFSET: u16 = u16::MAX;
-
-/// Consecutive never-connected handshakes after which the client starts also
-/// TRYING the pre-embedded-tag wire layout.
-///
-/// A server older than the embedded-tag layout reads the tag at packet offset 0
-/// and the ephemeral key `TAG_SIZE` bytes into the MDH. Every embedded-tag
-/// handshake therefore yields a wrong ephemeral key, wrong session keys and a
-/// tag mismatch, for EVERY mask — the covert→preset rung above cannot help
-/// because presets are embedded-tag too, so an app updated past that change can
-/// otherwise never reach an older server.
-///
-/// Set above [`HANDSHAKE_FALLBACK_THRESHOLD`] so the cheaper covert→preset rung
-/// is exhausted first; the streak resets on the first completed ratchet.
-pub const LEGACY_LAYOUT_THRESHOLD: u32 = 6;
-
-/// Whether attempt number `fail_streak` should be framed in the pre-embedded-tag
-/// layout (and, at the caller, use that era's single non-directional session
-/// key).
-///
-/// Deliberately ALTERNATING rather than a one-way latch. A streak is not proof
-/// that the peer is old: six consecutive failures is barely eighty seconds and
-/// any ordinary outage — a server restart, a captive portal, a carrier drop —
-/// reaches it. Latching would then leave the client speaking only the legacy
-/// layout to a modern server that cannot answer it, with no way back except a
-/// successful handshake it can no longer make; on iOS, where the streak is
-/// persisted per server, that state survives app restarts. Alternating costs a
-/// genuinely-old server one extra retry per success and keeps a modern server
-/// reachable on every other attempt.
-pub fn use_legacy_layout(fail_streak: u32) -> bool {
-    fail_streak >= LEGACY_LAYOUT_THRESHOLD && (fail_streak - LEGACY_LAYOUT_THRESHOLD) % 2 == 0
-}
-
 /// `resolve_handshake_mask` with the desktop client's resilience net: once
 /// `fail_streak` reaches `HANDSHAKE_FALLBACK_THRESHOLD`, resolve as if no
 /// descriptor were held, so the handshake uses a builtin preset every server
@@ -527,18 +489,11 @@ pub fn resolve_handshake_mask_resilient(
     preshared_key: Option<&[u8; 32]>,
     fail_streak: u32,
 ) -> MaskProfile {
-    let mut mask = if fail_streak >= HANDSHAKE_FALLBACK_THRESHOLD {
+    if fail_streak >= HANDSHAKE_FALLBACK_THRESHOLD {
         resolve_handshake_mask(preferred, &[], preshared_key)
     } else {
         resolve_handshake_mask(preferred, descriptors, preshared_key)
-    };
-    // Third rung: a peer that predates the embedded-tag layout. Callers must
-    // read the SAME predicate for the key scheme (see `use_legacy_layout`), so
-    // the wire layout and the key derivation can never disagree mid-setup.
-    if use_legacy_layout(fail_streak) {
-        mask.tag_offset = LEGACY_TAG_OFFSET;
     }
-    mask
 }
 
 /// BLAKE3 derive-key context for polymorphic-mask perturbation seeds.
@@ -2095,49 +2050,6 @@ pub mod preset_masks {
 
 #[cfg(test)]
 mod tests {
-
-    /// The legacy rung must ALTERNATE, never latch. Six consecutive failures is
-    /// barely eighty seconds — any ordinary outage reaches it — so a one-way
-    /// latch would leave a client speaking only the pre-embedded-tag layout to a
-    /// modern server that cannot answer it, with no path back (the streak only
-    /// resets on a handshake it can no longer complete). Alternating keeps a
-    /// modern server reachable on every other attempt.
-    #[test]
-    fn legacy_layout_alternates_and_never_latches() {
-        for streak in 0..LEGACY_LAYOUT_THRESHOLD {
-            assert!(
-                !use_legacy_layout(streak),
-                "streak {streak} must stay on the modern layout"
-            );
-        }
-        assert!(use_legacy_layout(LEGACY_LAYOUT_THRESHOLD));
-        assert!(!use_legacy_layout(LEGACY_LAYOUT_THRESHOLD + 1));
-        assert!(use_legacy_layout(LEGACY_LAYOUT_THRESHOLD + 2));
-        // However long the outage, a modern attempt is never more than one
-        // retry away.
-        for streak in LEGACY_LAYOUT_THRESHOLD..LEGACY_LAYOUT_THRESHOLD + 200 {
-            assert!(
-                !use_legacy_layout(streak) || !use_legacy_layout(streak + 1),
-                "streak {streak} and {} are both legacy — the client has latched",
-                streak + 1
-            );
-        }
-    }
-
-    /// The resolver must pin the tag-prefix layout on exactly the attempts
-    /// `use_legacy_layout` selects, so the wire layout and the key scheme (which
-    /// the caller derives from the same predicate) can never disagree.
-    #[test]
-    fn resolver_pins_legacy_layout_on_legacy_attempts_only() {
-        let psk = [0x17u8; 32];
-        let modern = resolve_handshake_mask_resilient(None, &[], Some(&psk), 0);
-        let legacy =
-            resolve_handshake_mask_resilient(None, &[], Some(&psk), LEGACY_LAYOUT_THRESHOLD);
-        let back_to_modern =
-            resolve_handshake_mask_resilient(None, &[], Some(&psk), LEGACY_LAYOUT_THRESHOLD + 1);
-        assert_eq!(legacy.tag_offset, LEGACY_TAG_OFFSET);
-        assert_eq!(back_to_modern.tag_offset, modern.tag_offset);
-    }
     use super::*;
     use rand::rngs::StdRng;
     use rand::SeedableRng;

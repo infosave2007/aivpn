@@ -23,7 +23,6 @@ use aivpn_common::fec::FecRepair;
 use aivpn_common::kernel_accel::KernelAccel;
 use aivpn_common::mask::{
     current_unix_secs, derive_bootstrap_candidates, BootstrapDescriptor, MaskProfile,
-    LEGACY_TAG_OFFSET,
 };
 use aivpn_common::protocol::{ControlPayload, InnerHeader, InnerType, MAX_PACKET_SIZE};
 use libc;

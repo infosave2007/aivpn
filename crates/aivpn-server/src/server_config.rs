@@ -125,12 +125,6 @@ pub struct PolymorphicFileConfig {
 /// write path, via `unknown_top_level_keys`.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct ServerFileConfig {
-    /// Accept handshakes framed in the pre-embedded-tag wire layout (and serve
-    /// such peers with that era's single non-directional session key). Off
-    /// unless explicitly set — see `GatewayConfig::legacy_client_compat` for
-    /// what it costs.
-    #[serde(default)]
-    pub legacy_client_compat: Option<bool>,
     pub listen_addr: Option<String>,
     pub tun_name: Option<String>,
     pub tun_addr: Option<Ipv4Addr>,
