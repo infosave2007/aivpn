@@ -96,7 +96,23 @@ jobs:
           rustup target add aarch64-linux-android armv7-linux-androideabi
           echo "ANDROID_NDK_HOME=$ANDROID_SDK_ROOT/ndk/27.2.12479018" >> "$GITHUB_ENV"
 
+      # Release signing material. Without these the build FAILS instead of
+      # silently shipping a debug APK: a debug build is `android:debuggable`,
+      # so anyone with adb access could attach to the VPN process and read
+      # session keys out of its memory, and it is signed with the public
+      # Android debug key, which proves nothing about who built it.
+      # Set these as repository secrets to publish a real Android asset.
+      - name: Decode release keystore
+        if: ${{ secrets.ANDROID_KEYSTORE_BASE64 != '' }}
+        run: |
+          echo "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" | base64 -d > "$RUNNER_TEMP/release.jks"
+          echo "AIVPN_UPLOAD_STORE_FILE=$RUNNER_TEMP/release.jks" >> "$GITHUB_ENV"
+
       - name: Build Android release APK
+        env:
+          AIVPN_UPLOAD_STORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          AIVPN_UPLOAD_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          AIVPN_UPLOAD_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
         run: make android ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT ANDROID_NDK_ROOT=$ANDROID_NDK_HOME
 
       - name: Upload Android workflow artifact
