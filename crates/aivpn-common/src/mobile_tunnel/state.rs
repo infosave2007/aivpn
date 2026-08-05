@@ -325,6 +325,20 @@ pub fn mark_descriptors_distrusted() {
     DESCRIPTORS_DISTRUSTED.store(true, Ordering::Relaxed);
 }
 
+/// Drop the distrust verdict when the session targets a DIFFERENT server.
+///
+/// The verdict is deliberately sticky for the whole process (see
+/// [`condemn_descriptor_mask_after_watchdog`]) but it is a statement about ONE
+/// server's descriptors. Carrying it across a profile switch would pin every
+/// later server in this process to public presets — the exact covertness loss
+/// descriptors exist to avoid. The per-server verdict survives regardless: the
+/// platform re-supplies it as [`DESCRIPTORS_DISTRUSTED_SENTINEL`] when the user
+/// switches back.
+pub fn clear_descriptor_distrust() {
+    DESCRIPTORS_DISTRUSTED.store(false, Ordering::Relaxed);
+    DISCARD_PERSISTED_DESCRIPTORS.store(false, Ordering::Relaxed);
+}
+
 /// Snapshot the currently-valid stored descriptors, newest first.
 pub fn current_bootstrap_descriptors() -> Vec<BootstrapDescriptor> {
     // Once a descriptor mask has been condemned, hide the whole store for the

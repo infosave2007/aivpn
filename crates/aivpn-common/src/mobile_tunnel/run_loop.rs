@@ -167,6 +167,14 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
             *LAST_GOOD_MASK.lock().unwrap_or_else(|e| e.into_inner()) = None;
             DATA_STALL_STREAK.store(0, Ordering::Relaxed);
             HANDSHAKE_FAIL_STREAK.store(0, Ordering::Relaxed);
+            // The descriptor verdict is server-scoped for exactly the same
+            // reason. It is sticky for the whole PROCESS by design (the server
+            // re-pushes descriptors every session, so a one-shot clear would be
+            // refilled), but "server A's descriptors are unusable" says nothing
+            // about server B — leaving it set would silently pin every later
+            // profile in this process to public presets, which is the covertness
+            // loss the descriptors exist to avoid.
+            clear_descriptor_distrust();
             *last = Some(server_key);
         }
     }
