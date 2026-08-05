@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.0.2] - 2026-08-05
+
+### Fixed
+
+- **Android: tunnel connected but carried no traffic, only a reinstall helped (#71, #70)** — the Rust core duplicates the Android TUN descriptor, and those duplicates outlived the interface: Kotlin closes its `ParcelFileDescriptor` on disconnect and gives the native call 3 s to unwind, so a slower unwind left the tun device alive as a zombie still holding the VPN address. The next session established a *second* tun with the same address, app packets were routed into the dead one nobody reads, and the tunnel reported "connected" while the server saw keepalives and not one data packet. Caught on a device as `tun0` DOWN holding the VPN address next to a live `tun1`. The session now owns both duplicates (the `AsyncFd`s only borrow them), so stopping the tunnel destroys the device immediately; both closers take the descriptor with `swap(-1)`, so it is closed exactly once. After a disconnect the process holds zero tun descriptors and the device zero tun interfaces.
+- **Android: a cached bootstrap descriptor could strand the data plane** — a session that completes the handshake but never receives a single downlink data packet now discards its cached descriptors (in-process and app-persisted, the verdict surviving an app restart) and pins the next attempt to a builtin preset. Narrowly scoped: a healthy covert session that merely stalls on a network change keeps its descriptors and just reconnects.
+- **Server: an uplink packet that failed to decrypt could wedge the packet loop** — the diagnostic path re-locked the session mutex already held by the enclosing block (`parking_lot` is not reentrant), deadlocking the worker and, with the lock never released, every other session with it.
+
+### Added
+
+- **Interoperability with servers and clients from before the embedded-tag layout** — an app updated past that change could not reach an older server at all, and an upgraded server could not serve an older app; both sides retried forever. Clients now fall back to the legacy tag-prefix layout (and its single, non-directional session key) after repeated failed handshakes, and servers accept that layout in a second handshake pass that runs only when the modern pass finds nothing. Upgrade order no longer matters — see "Version Compatibility" in the README.
+
 ## [1.0.1] - 2026-07-09
 
 ### Fixed

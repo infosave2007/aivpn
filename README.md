@@ -395,6 +395,26 @@ aivpn-server --show-client "Name" --key-file /etc/aivpn/server.key \
 
 ---
 
+## Version Compatibility
+
+Clients and servers interoperate across the wire-layout change introduced in 1.0.0
+(the resonance tag moved from a fixed 8-byte prefix into the mimicked protocol
+header), so **the upgrade order does not matter**:
+
+- A current client that cannot complete a handshake falls back to the older
+  tag-prefix layout — and to the single, non-directional session key that goes
+  with it — after a few failed attempts (about a minute). Nothing to configure;
+  the client logs `retrying with the pre-Variant-A wire layout` when it happens.
+- A current server accepts both layouts. The older layout is tried only in a
+  second handshake pass that runs when no current-layout candidate matches, so
+  a current client's handshake costs exactly what it did before, and upgrading a
+  server does not lock out users who are still on an older app.
+
+Connection keys are unaffected: the server's key material does not change with an
+upgrade, so existing `aivpn://` keys keep working.
+
+---
+
 ## Server Configuration Reference
 
 Default config path: `config/server.json` (local) or `/etc/aivpn/server.json`. CLI flags override file values.
