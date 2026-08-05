@@ -586,9 +586,7 @@ impl AivpnClient {
             proxy_handle: None,
             active_recording_session: None,
             keepalive_interval: initial_keepalive,
-            keepalive_interval_ms: Arc::new(AtomicU64::new(
-                initial_keepalive.as_millis() as u64,
-            )),
+            keepalive_interval_ms: Arc::new(AtomicU64::new(initial_keepalive.as_millis() as u64)),
             last_local_port: None,
             static_keypair,
             quality_tracker: QualityTracker::new(),

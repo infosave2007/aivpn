@@ -107,6 +107,18 @@ object AivpnJni {
     external fun getBootstrapDescriptorsJson(): String
 
     /**
+     * `true` when the last session proved its cached bootstrap descriptors are
+     * unusable against this server: the handshake was accepted but not a single
+     * downlink DATA packet ever arrived. The persisted blob for that server must
+     * then be deleted, otherwise the next cold start reloads the same descriptor
+     * and reconnects into the same dead data plane (issue #71 — today only
+     * clearing app data breaks the loop, and only for one connection).
+     *
+     * Poll once after [runTunnel] returns; reading clears the flag.
+     */
+    external fun getDiscardPersistedDescriptors(): Boolean
+
+    /**
      * Closes the protected UDP socket so the tunnel loop exits immediately.
      * Safe to call from any thread, including the NetworkCallback.
      */

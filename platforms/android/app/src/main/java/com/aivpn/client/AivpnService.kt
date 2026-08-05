@@ -89,6 +89,12 @@ class AivpnService : VpnService() {
         // 15s covers even slow devices without delaying genuine network-switch detection.
         private const val TAG = "AivpnService"
 
+        /** Stored in place of a descriptor blob once this server's bootstrap
+         * descriptors have been condemned; the native core recognises it and
+         * keeps resolving builtin preset masks. Must match
+         * `DESCRIPTORS_DISTRUSTED_SENTINEL` in android_tunnel.rs. */
+        private const val DESCRIPTORS_DISTRUSTED = "distrusted"
+
         @Volatile var statusCallback:  ((Boolean, String) -> Unit)? = null
         @Volatile var trafficCallback: ((Long, Long) -> Unit)?      = null
         @Volatile var tileCallback:    (() -> Unit)?                = null
@@ -568,6 +574,21 @@ class AivpnService : VpnService() {
                 }
             } catch (e: CancellationException) {
                 Log.d(TAG, "Service job cancelled")
+                // The cancel may have landed while runTunnel() was still inside
+                // ensureVpnInterface(): stopVpn()/onDestroy() run closeTunnel()
+                // BEFORE establish() returns, so the freshly-established fd is
+                // assigned to vpnInterface afterwards with no owner left. The
+                // kernel then keeps that zombie tun device alive on the orphaned
+                // fd; the NEXT session establishes a second tun with the same
+                // address and downlink silently dies until the process is killed
+                // (issue #71). By this point the canceller has finished its own
+                // cleanup, so a non-null vpnInterface on a manual-stop/destroy
+                // path can only be our orphan — close it. The sessionId guard
+                // keeps a superseded session (restart path) from touching the
+                // interface the new session may already be using.
+                if (mySessionId == sessionId && (manualDisconnect || !isServiceActive)) {
+                    closeTunnel()
+                }
             } finally {
                 // Only update shared service state if this session is still the active one.
                 // A superseded session (cancelAndJoin timeout) must not clobber serviceJob,
@@ -766,10 +787,28 @@ class AivpnService : VpnService() {
                     // a storage failure never breaks the tunnel. Blank/"[]" is filtered so
                     // a session that pushed nothing never clears this server's cache.
                     try {
-                        val descriptorsJson = AivpnJni.getBootstrapDescriptorsJson()
-                        if (descriptorsJson.isNotBlank() && descriptorsJson != "[]") {
+                        // A session that handshaked with a cached descriptor but never
+                        // carried downlink DATA condemns that descriptor: keeping it
+                        // persisted makes every later connect (including a cold start)
+                        // reconnect into the same dead data plane. Deleting it wins back
+                        // the working preset path on the next attempt — the effect users
+                        // get today only by clearing app data (issue #71).
+                        if (AivpnJni.getDiscardPersistedDescriptors()) {
+                            Log.w(TAG, "Discarding persisted bootstrap descriptors — " +
+                                "handshake succeeded but the data plane never carried traffic")
+                            // Store the verdict, not an empty blob: the descriptor store
+                            // also fills from the server's in-session pushes, so a plain
+                            // delete would let the next app RUN adopt a fresh descriptor
+                            // and break its first reconnect all over again. The core reads
+                            // this sentinel back through cachedDescriptorsJson.
                             SecureStorage.saveBootstrapDescriptors(
-                                this@AivpnService, descriptorsJson, snapServerKey)
+                                this@AivpnService, DESCRIPTORS_DISTRUSTED, snapServerKey)
+                        } else {
+                            val descriptorsJson = AivpnJni.getBootstrapDescriptorsJson()
+                            if (descriptorsJson.isNotBlank() && descriptorsJson != "[]") {
+                                SecureStorage.saveBootstrapDescriptors(
+                                    this@AivpnService, descriptorsJson, snapServerKey)
+                            }
                         }
                     } catch (e: Exception) {
                         Log.w(TAG, "Persisting bootstrap descriptors failed: ${e.message}")

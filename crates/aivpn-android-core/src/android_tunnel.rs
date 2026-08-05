@@ -215,8 +215,43 @@ static LAST_SERVER_KEY: Mutex<Option<[u8; 32]>> = Mutex::new(None);
 /// Cap on retained pushed descriptors (a handful of epochs is plenty).
 const MAX_BOOTSTRAP_DESCRIPTORS: usize = 8;
 
+/// Whether a descriptor-derived covert mask may steer the handshake.
+///
+/// TEMPORARILY DISABLED. Against a current server, a handshake shaped with a
+/// descriptor-derived mask is ACCEPTED (tag validates, PFS ratchet completes,
+/// keepalives flow both ways) but the two sides then disagree on the DATA-plane
+/// framing: the server drops every uplink DATA packet with
+/// `Crypto error: aead::Error` while the fixed-length control plane keeps
+/// working. The tunnel reports "connected" and carries no traffic.
+///
+/// Reproduced on device against a local server built from this tree: the first
+/// connect after an install (no descriptor cached yet) uses a PSK preset and
+/// works; every later connect preloads a descriptor, shapes the handshake with
+/// it, and is dead — which is exactly issue #71 (and the reconnect storm in
+/// #70), including the reporters' observation that clearing app data restores
+/// traffic for precisely one connection.
+///
+/// Presets are unaffected, so forcing this path keeps every connect working.
+/// The watchdog machinery below (condemn → discard → preset) stays in place as
+/// the safety net for a server whose descriptors stop matching. Flip this back
+/// to `true` once client and server agree on the DATA framing for derived
+/// masks — the covert cold-start handshake is a real anti-DPI win.
+const USE_COVERT_DESCRIPTOR_MASKS: bool = false;
+
 /// Snapshot the currently-valid stored descriptors, newest first.
 fn current_bootstrap_descriptors() -> Vec<BootstrapDescriptor> {
+    if !USE_COVERT_DESCRIPTOR_MASKS {
+        return Vec::new();
+    }
+    // Once a descriptor mask has been condemned, hide the whole store for the
+    // rest of the process. Clearing it at condemn time is not enough: the server
+    // re-pushes descriptors during EVERY session, including the preset-mask one
+    // that recovers the tunnel, so the next connect would resolve a covert mask
+    // again and break again. This is the single read path used both for mask
+    // resolution and for the platform's persistence export.
+    if DESCRIPTORS_DISTRUSTED.load(Ordering::Relaxed) {
+        return Vec::new();
+    }
     let now = current_unix_secs();
     let mut out: Vec<BootstrapDescriptor> = BOOTSTRAP_DESCRIPTORS
         .lock()
@@ -252,9 +287,30 @@ fn store_bootstrap_descriptor(descriptor: BootstrapDescriptor) {
 /// next COLD START can shape its first handshake with a COVERT rotated
 /// descriptor mask instead of a public preset.
 pub fn bootstrap_descriptors_json() -> String {
+    // Once a descriptor mask has been condemned (see
+    // `condemn_descriptor_mask_after_watchdog`), stop handing descriptors back
+    // for persistence for the rest of the process. The server re-pushes fresh
+    // ones on every session, so without this the preset-mask session that
+    // recovers the tunnel immediately re-persists a descriptor and the NEXT
+    // connect breaks again — a working/broken ping-pong instead of a fix.
+    if DESCRIPTORS_DISTRUSTED.load(Ordering::Relaxed) {
+        return "[]".to_string();
+    }
     let descriptors = current_bootstrap_descriptors();
     serde_json::to_string(&descriptors).unwrap_or_else(|_| "[]".to_string())
 }
+
+/// Sentinel the platform passes as `cachedDescriptorsJson` instead of a blob to
+/// say "this server's descriptors were condemned in an earlier RUN of the app"
+/// (see [`condemn_descriptor_mask_after_watchdog`]). A plain empty blob cannot
+/// carry that: the store also fills from the server's in-session pushes, so
+/// without a sticky verdict every app restart would break its first reconnect
+/// again and heal ~50 s later, forever.
+///
+/// Passed through the existing parameter deliberately — the JNI signature is
+/// shared with the iOS core and a new argument would be a wider change than the
+/// verdict warrants.
+pub const DESCRIPTORS_DISTRUSTED_SENTINEL: &str = "distrusted";
 
 /// Re-populate the in-process descriptor store from app-persisted JSON BEFORE
 /// the first handshake. Descriptors are signature-verified (when a trusted
@@ -263,6 +319,19 @@ pub fn bootstrap_descriptors_json() -> String {
 /// rejected and the handshake simply falls back to the preset — never worse
 /// than today. Returns how many descriptors were accepted into the store.
 fn preload_persisted_descriptors(json: &str, trusted_key: Option<&[u8; 32]>) -> usize {
+    // Sticky verdict from an earlier run: adopt it before anything can consult
+    // the store, so this process never resolves a descriptor mask either.
+    if json.trim() == DESCRIPTORS_DISTRUSTED_SENTINEL {
+        DESCRIPTORS_DISTRUSTED.store(true, Ordering::Relaxed);
+        return 0;
+    }
+    // A condemned descriptor must not come back through the platform's cached
+    // blob: the delete is asynchronous (the platform performs it only after
+    // `run_tunnel_android` returns), so an immediate retry would otherwise
+    // re-preload the very descriptor that just killed the data plane.
+    if DESCRIPTORS_DISTRUSTED.load(Ordering::Relaxed) {
+        return 0;
+    }
     let accepted = aivpn_common::mask::accept_persisted_descriptors(json, trusted_key);
     let mut stored = 0usize;
     for descriptor in accepted {
@@ -318,6 +387,18 @@ pub static EVER_CONNECTED: AtomicBool = AtomicBool::new(false);
 /// the same net via its local `handshake_fail_streak`). Reset when the PFS
 /// ratchet completes.
 pub static HANDSHAKE_FAIL_STREAK: AtomicU32 = AtomicU32::new(0);
+/// Set when a session that COMPLETED the handshake never carried a single
+/// downlink DATA packet while handshaking with a descriptor-derived covert
+/// mask. Polled by the platform (`getDiscardPersistedDescriptors`) so the
+/// app-persisted descriptor blob is dropped too — clearing only the in-process
+/// store would let the next COLD START reload the same unusable descriptor.
+pub static DISCARD_PERSISTED_DESCRIPTORS: AtomicBool = AtomicBool::new(false);
+/// Sticky for the process once a descriptor mask has been condemned. The
+/// platform CONSUMES `DISCARD_PERSISTED_DESCRIPTORS` (one delete), so a second
+/// flag is needed to keep suppressing descriptor use afterwards — the server
+/// re-pushes descriptors every session, and re-adopting them would break the
+/// very next connect again.
+static DESCRIPTORS_DISTRUSTED: AtomicBool = AtomicBool::new(false);
 /// Server-pushed `FeedbackConfig.report_failure_threshold` for this session,
 /// coerced to >=1 on receipt. `0` means no `FeedbackConfig` was received this
 /// session — the platform should keep its previously persisted value.
@@ -621,6 +702,52 @@ pub fn stop_active_tunnel() {
             libc::close(udp_fd);
         };
     }
+}
+
+/// A watchdog firing on a session that handshaked with a descriptor-derived
+/// covert mask indicts that mask. A cached descriptor the server still ACCEPTS
+/// for the handshake (the tag validates, the PFS ratchet completes, keepalives
+/// flow) but disagrees with on the data plane leaves the tunnel permanently
+/// "connected" with a dead data path: the server drops every uplink DATA packet
+/// with an AEAD failure, the watchdog reconnects, and the next attempt resolves
+/// the very same descriptor mask — forever. That is the shape behind issue #71,
+/// where clearing app data (which drops the persisted descriptors) restores
+/// traffic for exactly one connection.
+///
+/// The existing `HANDSHAKE_FAIL_STREAK` net only covers handshakes that never
+/// complete, so it never fires here. Condemn the descriptor explicitly instead:
+/// clear the in-process store, tell the platform to drop its persisted copy, and
+/// pin the streak at the fallback threshold so the next attempt resolves a
+/// builtin preset every server reproduces.
+///
+/// Deliberately NOT gated on "no downlink DATA at all": the observed failure
+/// still delivers a trickle of downlink (control acks and a few DATA packets)
+/// while the uplink is entirely dropped, so a `data_plane_proven` gate would
+/// never fire. A healthy covert session does not reach either watchdog, so
+/// trying a preset next is strictly better than repeating a mask that just
+/// failed. The availability-over-covertness trade matches the handshake net
+/// above and is bounded: the streak resets on the next completed ratchet.
+fn condemn_descriptor_mask_after_watchdog(mask_id: &str, reason: &str) {
+    if !mask_id.starts_with("bootstrap:") {
+        return;
+    }
+    log::warn!(
+        "aivpn: {reason} on a session handshaked with covert descriptor mask '{mask_id}' — \
+         discarding cached descriptors and falling back to a builtin preset for the next attempt"
+    );
+    if let Ok(mut g) = BOOTSTRAP_DESCRIPTORS.lock() {
+        g.clear();
+    }
+    DISCARD_PERSISTED_DESCRIPTORS.store(true, Ordering::Relaxed);
+    DESCRIPTORS_DISTRUSTED.store(true, Ordering::Relaxed);
+    HANDSHAKE_FAIL_STREAK.store(HANDSHAKE_FALLBACK_THRESHOLD, Ordering::Relaxed);
+}
+
+/// Polled by the platform after `run_tunnel_android` returns: `true` means the
+/// app-persisted bootstrap descriptor blob for this server must be deleted (see
+/// [`condemn_mask_if_data_plane_never_proven`]). Reading it clears the flag.
+pub fn take_discard_persisted_descriptors() -> bool {
+    DISCARD_PERSISTED_DESCRIPTORS.swap(false, Ordering::Relaxed)
 }
 
 /// Called by the Kotlin restartJob after cancelAndJoin() — clears any pending
@@ -1133,7 +1260,9 @@ pub async fn run_tunnel_android(
     // initial interval above; the AdaptiveHint handler updates it live so a
     // server-hinted level change actually re-times keepalives without a reconnect
     // — parity with desktop client.rs's `keepalive_interval_ms` atomic.
-    let keepalive_ms = Arc::new(portable_atomic::AtomicU64::new(keepalive_interval.as_millis() as u64));
+    let keepalive_ms = Arc::new(portable_atomic::AtomicU64::new(
+        keepalive_interval.as_millis() as u64,
+    ));
     let mut transition_recv_keys: Option<SessionKeys> = Some(derive_session_keys(
         &dh,
         psk.as_ref(),
@@ -2092,6 +2221,7 @@ pub async fn run_tunnel_android(
                 let verdict = data_watchdog_verdict(stalled_for, data_up_since);
                 let stall_pending = verdict.is_some();
                 if let Some(reason) = data_stall_confirmed(&mut data_stall_strikes, verdict) {
+                    condemn_descriptor_mask_after_watchdog(&handshake_mask.mask_id, reason);
                     tun_reader_task.abort();
                     upload_sender_task.abort();
                     return Err(Error::Session(format!(
@@ -2119,6 +2249,7 @@ pub async fn run_tunnel_android(
                 // Absolute net: nothing decodable AT ALL (control included).
                 let silence = last_rx.elapsed();
                 if silence > RX_SILENCE {
+                    condemn_descriptor_mask_after_watchdog(&handshake_mask.mask_id, "RX silence");
                     tun_reader_task.abort();
                     upload_sender_task.abort();
                     return Err(Error::Session(

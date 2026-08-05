@@ -14,10 +14,10 @@ use aivpn_common::protocol::ControlPayload;
 use android_tunnel::{
     bootstrap_descriptors_json, clear_pending_stop, get_active_download_bytes,
     get_active_upload_bytes, run_tunnel_android, send_control_payload, stop_active_tunnel,
-    take_recording_feedback_json, ACTIVE_ADAPTIVE_LEVEL, ACTIVE_FEEDBACK_INTERVAL,
-    ACTIVE_FEEDBACK_THRESHOLD, ACTIVE_MASK_CATALOG_JSON, ACTIVE_QUALITY_SCORE,
-    ACTIVE_REGIONAL_HINTS_JSON, ATTEMPTED_MASK_FAMILY, EVER_CONNECTED, MASK_CATALOG_SEQ,
-    MASK_FEEDBACK_SENT, REGIONAL_HINTS_SEQ,
+    take_discard_persisted_descriptors, take_recording_feedback_json, ACTIVE_ADAPTIVE_LEVEL,
+    ACTIVE_FEEDBACK_INTERVAL, ACTIVE_FEEDBACK_THRESHOLD, ACTIVE_MASK_CATALOG_JSON,
+    ACTIVE_QUALITY_SCORE, ACTIVE_REGIONAL_HINTS_JSON, ATTEMPTED_MASK_FAMILY, EVER_CONNECTED,
+    MASK_CATALOG_SEQ, MASK_FEEDBACK_SENT, REGIONAL_HINTS_SEQ,
 };
 
 use std::sync::atomic::Ordering;
@@ -648,6 +648,22 @@ pub extern "system" fn Java_com_aivpn_client_AivpnJni_getBootstrapDescriptorsJso
     // across the FFI boundary (LOW-2); degrade to "" on panic.
     let json = std::panic::catch_unwind(bootstrap_descriptors_json).unwrap_or_default();
     make_str(&mut env, &json)
+}
+
+/// `true` when the last session proved its cached bootstrap descriptors are
+/// unusable against this server (handshake accepted, data plane never carried a
+/// single downlink DATA packet). The platform must then DELETE the persisted
+/// descriptor blob for this server, otherwise the next cold start reloads the
+/// same descriptor and the tunnel connects with a dead data path again — the
+/// issue #71 loop, which today only ends when the user clears app data.
+///
+/// Poll once after `runTunnel` returns; reading clears the flag.
+#[no_mangle]
+pub extern "system" fn Java_com_aivpn_client_AivpnJni_getDiscardPersistedDescriptors(
+    _env: JNIEnv,
+    _class: JClass,
+) -> jni::sys::jboolean {
+    u8::from(std::panic::catch_unwind(take_discard_persisted_descriptors).unwrap_or(false))
 }
 
 // ──────────────────────────────────────────────────────────
