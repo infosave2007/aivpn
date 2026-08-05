@@ -63,6 +63,7 @@ pub(crate) fn chain_reverse_route_insert(
     src_ip: Ipv4Addr,
     session_id: [u8; 16],
     now: Instant,
+    incumbent_is_live: impl Fn(&[u8; 16]) -> bool,
 ) {
     match routes.entry(src_ip) {
         dashmap::mapref::entry::Entry::Vacant(v) => {
@@ -71,10 +72,20 @@ pub(crate) fn chain_reverse_route_insert(
         dashmap::mapref::entry::Entry::Occupied(mut o) => {
             let (existing_session_id, last_seen) = *o.get();
             let expired = now.duration_since(last_seen) >= CHAIN_REVERSE_ROUTE_TTL;
-            if existing_session_id == session_id || expired {
+            // An entry whose session no longer exists protects nobody and
+            // blocks everybody. `chain_reverse_route_lookup`'s caller already
+            // has to drop the packet when the recorded session is gone, so
+            // until the TTL expires such an entry is a pure blackhole: a peer
+            // that merely RECONNECTED (new session id after a network blip)
+            // could not re-claim its own clients' IPs for up to
+            // `CHAIN_REVERSE_ROUTE_TTL`, and every downlink reply to them was
+            // dropped for that whole window. Treat a dead incumbent exactly
+            // like an expired one.
+            let dead = !incumbent_is_live(&existing_session_id);
+            if existing_session_id == session_id || expired || dead {
                 o.insert((session_id, now));
             }
-            // else: a LIVE entry for a different session owns this IP —
+            // else: a LIVE entry for a different LIVE session owns this IP —
             // refuse to overwrite it (BUG C1).
         }
     }
@@ -115,11 +126,59 @@ mod tests {
         let session_id = [9u8; 16];
         let now = Instant::now();
 
-        chain_reverse_route_insert(&routes, &counter, src_ip, session_id, now);
+        chain_reverse_route_insert(&routes, &counter, src_ip, session_id, now, |_| true);
 
         assert_eq!(
             chain_reverse_route_lookup(&routes, &src_ip, now),
             Some(session_id)
+        );
+    }
+
+    /// A peer that merely RECONNECTED must be able to re-claim its own
+    /// clients' reverse routes immediately. The incumbent entry is live by
+    /// TTL but its session is gone, so it can never route anything — leaving
+    /// it in place blackholed every downlink reply to those clients for the
+    /// full `CHAIN_REVERSE_ROUTE_TTL` (ten minutes) after any peer blip.
+    #[test]
+    fn dead_incumbent_session_does_not_block_a_reconnected_peer() {
+        let routes: DashMap<Ipv4Addr, ([u8; 16], Instant)> = DashMap::new();
+        let counter = std::sync::atomic::AtomicUsize::new(0);
+        let src_ip = Ipv4Addr::new(10, 0, 0, 7);
+        let old_session = [1u8; 16];
+        let reconnected_session = [2u8; 16];
+        let t0 = Instant::now();
+
+        chain_reverse_route_insert(&routes, &counter, src_ip, old_session, t0, |_| true);
+        // Same peer, new session id after a reconnect; the old session no
+        // longer exists in the session manager.
+        chain_reverse_route_insert(&routes, &counter, src_ip, reconnected_session, t0, |sid| {
+            *sid != old_session
+        });
+
+        assert_eq!(
+            chain_reverse_route_lookup(&routes, &src_ip, t0),
+            Some(reconnected_session),
+            "a route pointing at a dead session must not outlive it"
+        );
+    }
+
+    /// The dead-incumbent rule must not reopen BUG C1: a LIVE incumbent still
+    /// wins against a different session claiming the same IP.
+    #[test]
+    fn live_incumbent_still_wins_against_a_foreign_claim() {
+        let routes: DashMap<Ipv4Addr, ([u8; 16], Instant)> = DashMap::new();
+        let counter = std::sync::atomic::AtomicUsize::new(0);
+        let src_ip = Ipv4Addr::new(10, 0, 0, 8);
+        let legit = [3u8; 16];
+        let attacker = [4u8; 16];
+        let t0 = Instant::now();
+
+        chain_reverse_route_insert(&routes, &counter, src_ip, legit, t0, |_| true);
+        chain_reverse_route_insert(&routes, &counter, src_ip, attacker, t0, |_| true);
+
+        assert_eq!(
+            chain_reverse_route_lookup(&routes, &src_ip, t0),
+            Some(legit)
         );
     }
 
@@ -146,7 +205,7 @@ mod tests {
         let src_ip = Ipv4Addr::new(10, 0, 0, 3);
         let session_id = [3u8; 16];
         let inserted_at = Instant::now();
-        chain_reverse_route_insert(&routes, &counter, src_ip, session_id, inserted_at);
+        chain_reverse_route_insert(&routes, &counter, src_ip, session_id, inserted_at, |_| true);
 
         let just_before_ttl = inserted_at + CHAIN_REVERSE_ROUTE_TTL - Duration::from_millis(1);
         assert_eq!(
@@ -175,9 +234,9 @@ mod tests {
         let session_id = [1u8; 16];
         let t0 = Instant::now();
 
-        chain_reverse_route_insert(&routes, &counter, src_ip, session_id, t0);
+        chain_reverse_route_insert(&routes, &counter, src_ip, session_id, t0, |_| true);
         let t1 = t0 + Duration::from_secs(1);
-        chain_reverse_route_insert(&routes, &counter, src_ip, session_id, t1);
+        chain_reverse_route_insert(&routes, &counter, src_ip, session_id, t1, |_| true);
 
         assert_eq!(
             chain_reverse_route_lookup(&routes, &src_ip, t1),
@@ -201,11 +260,11 @@ mod tests {
         let attacker_session = [2u8; 16];
         let t0 = Instant::now();
 
-        chain_reverse_route_insert(&routes, &counter, src_ip, legit_session, t0);
+        chain_reverse_route_insert(&routes, &counter, src_ip, legit_session, t0, |_| true);
         let t1 = t0 + Duration::from_secs(1);
         // An unrelated peer forges a ChainForward claiming the same inner
         // source IP while the legitimate route is still live.
-        chain_reverse_route_insert(&routes, &counter, src_ip, attacker_session, t1);
+        chain_reverse_route_insert(&routes, &counter, src_ip, attacker_session, t1, |_| true);
 
         assert_eq!(
             chain_reverse_route_lookup(&routes, &src_ip, t1),
@@ -228,9 +287,9 @@ mod tests {
         let new_session = [2u8; 16];
         let t0 = Instant::now();
 
-        chain_reverse_route_insert(&routes, &counter, src_ip, old_session, t0);
+        chain_reverse_route_insert(&routes, &counter, src_ip, old_session, t0, |_| true);
         let t1 = t0 + CHAIN_REVERSE_ROUTE_TTL;
-        chain_reverse_route_insert(&routes, &counter, src_ip, new_session, t1);
+        chain_reverse_route_insert(&routes, &counter, src_ip, new_session, t1, |_| true);
 
         assert_eq!(
             chain_reverse_route_lookup(&routes, &src_ip, t1),
@@ -259,12 +318,12 @@ mod tests {
 
         // A route recorded long enough ago to already be past the TTL by
         // the time the sweep runs below.
-        chain_reverse_route_insert(&routes, &counter, stale_ip, [1u8; 16], t0);
+        chain_reverse_route_insert(&routes, &counter, stale_ip, [1u8; 16], t0, |_| true);
 
         let sweep_now = t0 + CHAIN_REVERSE_ROUTE_TTL + Duration::from_secs(1);
 
         // A route recorded fresh (at `sweep_now`) — must survive the sweep.
-        chain_reverse_route_insert(&routes, &counter, fresh_ip, [2u8; 16], sweep_now);
+        chain_reverse_route_insert(&routes, &counter, fresh_ip, [2u8; 16], sweep_now, |_| true);
 
         // Drive enough additional inserts (distinct throwaway IPs) at
         // `sweep_now` to land exactly on an `insert_count %
@@ -274,7 +333,9 @@ mod tests {
         while counter.load(std::sync::atomic::Ordering::Relaxed) % CHAIN_REVERSE_SWEEP_EVERY != 0 {
             let filler_ip = Ipv4Addr::from(0x0A00_0000u32 + next_octet);
             next_octet += 1;
-            chain_reverse_route_insert(&routes, &counter, filler_ip, [0u8; 16], sweep_now);
+            chain_reverse_route_insert(&routes, &counter, filler_ip, [0u8; 16], sweep_now, |_| {
+                true
+            });
         }
 
         assert!(
@@ -303,16 +364,30 @@ mod tests {
         let churn_session = [7u8; 16];
         let t0 = Instant::now();
 
-        chain_reverse_route_insert(&routes, &counter, stale_ip, [1u8; 16], t0);
+        chain_reverse_route_insert(&routes, &counter, stale_ip, [1u8; 16], t0, |_| true);
         let sweep_now = t0 + CHAIN_REVERSE_ROUTE_TTL + Duration::from_secs(1);
-        chain_reverse_route_insert(&routes, &counter, churn_ip, churn_session, sweep_now);
+        chain_reverse_route_insert(
+            &routes,
+            &counter,
+            churn_ip,
+            churn_session,
+            sweep_now,
+            |_| true,
+        );
 
         // `routes.len()` is now 2 and never grows again — only same-session
         // refreshes for `churn_ip` follow, exactly the low-host-count
         // scenario BUG C3 fixes.
         assert_eq!(routes.len(), 2);
         while counter.load(std::sync::atomic::Ordering::Relaxed) % CHAIN_REVERSE_SWEEP_EVERY != 0 {
-            chain_reverse_route_insert(&routes, &counter, churn_ip, churn_session, sweep_now);
+            chain_reverse_route_insert(
+                &routes,
+                &counter,
+                churn_ip,
+                churn_session,
+                sweep_now,
+                |_| true,
+            );
         }
 
         assert!(

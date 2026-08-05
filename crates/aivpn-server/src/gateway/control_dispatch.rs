@@ -630,6 +630,7 @@ impl super::Gateway {
                                 src_ip,
                                 session_id,
                                 Instant::now(),
+                                |sid| self.session_manager.get_session(sid).is_some(),
                             );
                         }
                     }
