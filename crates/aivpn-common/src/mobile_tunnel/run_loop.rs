@@ -27,13 +27,15 @@ use crate::client_wire::{
 };
 use crate::crypto::{derive_session_keys, device_enrollment_proof, KeyPair, SessionKeys};
 use crate::error::{Error, Result};
-use crate::mask::{decode_bootstrap_descriptor, MaskProfile, HANDSHAKE_FALLBACK_THRESHOLD};
+use crate::mask::{
+    decode_bootstrap_descriptor, use_legacy_layout, MaskProfile, HANDSHAKE_FALLBACK_THRESHOLD,
+};
 use crate::mimicry::MimicryEncryptor;
 use crate::protocol::{ControlPayload, InnerType};
 use crate::quality::{AdaptiveLevel, QualityTracker};
 use crate::upload_pipeline::{self, UploadConfig};
 
-use super::encryptor::{MobileEncryptor, RekeyAckQueue, RekeyResendSlot};
+use super::encryptor::{apply_legacy_key_scheme, MobileEncryptor, RekeyAckQueue, RekeyResendSlot};
 use super::io::{
     create_stop_signal, create_udp_socket, tun_async_read, tun_async_write, wait_for_stop,
 };
@@ -187,10 +189,27 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
         }
     }
 
+    // Snapshot the streak ONCE, before anything derives from it: it selects the
+    // handshake mask, the wire layout AND the key scheme, and those three must
+    // not disagree mid-setup.
+    let handshake_fail_streak = HANDSHAKE_FAIL_STREAK.load(Ordering::Relaxed);
+    // Past the legacy threshold this attempt targets a peer that predates the
+    // embedded-tag layout: tag-prefix framing (applied by
+    // `resolve_handshake_mask_resilient`) AND a single, non-directional session
+    // key. Alternating, not latching — see `use_legacy_layout`.
+    let legacy_wire = use_legacy_layout(handshake_fail_streak);
+    if legacy_wire {
+        log::warn!(
+            "aivpn: {} handshakes never connected — this attempt uses the pre-embedded-tag wire layout",
+            handshake_fail_streak
+        );
+    }
+
     // ── 1. Ephemeral keypair + initial session keys ──
     let mut keypair = KeyPair::generate();
     let mut dh = keypair.compute_shared(&server_key)?;
     let mut keys = derive_session_keys(&dh, psk.as_ref(), &keypair.public_key_bytes());
+    apply_legacy_key_scheme(&mut keys, legacy_wire);
 
     // ── 2. Create stop signal immediately — before DNS — so a disconnect press
     //    during a slow/hung cellular DNS is handled instantly, not after a 5 s wait.
@@ -245,9 +264,13 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
         unsafe { libc::close(owned_tun_fd) };
         return Err(Error::Io(std::io::Error::last_os_error()));
     }
-    // SAFETY: this is Rust's private duplicate of the Android-owned TUN fd.
-    let owned_tun = unsafe { OwnedFd::from_raw_fd(owned_tun_fd) };
-    let tun = AsyncFd::new(owned_tun)?;
+    // Hand this duplicate to the SESSION, not to the `AsyncFd`: a disconnect
+    // must be able to drop the tun reference immediately instead of waiting for
+    // the tokio tasks that hold a view of it to be dropped (see
+    // `SessionRuntime::tun_write_fd`). The session guard is already active, so
+    // every `return Err` below still releases it.
+    session.tun_write_fd.store(owned_tun_fd, Ordering::SeqCst);
+    let tun = AsyncFd::new(TunFd(owned_tun_fd))?;
 
     // Convert the owned UDP fd to a tokio UdpSocket (already connected to server).
     let std_udp = std::net::UdpSocket::from(owned_udp);
@@ -284,8 +307,8 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
     // Resilience net: after HANDSHAKE_FALLBACK_THRESHOLD consecutive handshake
     // timeouts, resolve WITHOUT the (possibly unmatchable) cached descriptors so
     // the attempt uses a builtin preset every server matches. Snapshot the
-    // streak once so `initial_mask` below resolves identically.
-    let handshake_fail_streak = HANDSHAKE_FAIL_STREAK.load(Ordering::Relaxed);
+    // streak once so `initial_mask` below resolves identically (snapshotted at
+    // the top of this function, alongside `legacy_wire`).
     if handshake_fail_streak >= HANDSHAKE_FALLBACK_THRESHOLD {
         log::warn!(
             "aivpn: {} consecutive handshakes never connected — falling back to a builtin preset mask (a cached bootstrap descriptor may be unmatchable by this server)",
@@ -455,6 +478,7 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
                     keypair = KeyPair::generate();
                     dh = keypair.compute_shared(&server_key)?;
                     keys = derive_session_keys(&dh, psk.as_ref(), &keypair.public_key_bytes());
+                    apply_legacy_key_scheme(&mut keys, legacy_wire);
                     send_counter = 0;
                     send_seq = 0;
                     // Counters recorded from any pre-rotation datagram no longer
@@ -504,11 +528,11 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
     let keepalive_ms = Arc::new(portable_atomic::AtomicU64::new(
         keepalive_interval.as_millis() as u64,
     ));
-    let mut transition_recv_keys: Option<SessionKeys> = Some(derive_session_keys(
-        &dh,
-        psk.as_ref(),
-        &keypair.public_key_bytes(),
-    ));
+    let mut transition_recv_keys: Option<SessionKeys> = Some({
+        let mut pre_ratchet = derive_session_keys(&dh, psk.as_ref(), &keypair.public_key_bytes());
+        apply_legacy_key_scheme(&mut pre_ratchet, legacy_wire);
+        pre_ratchet
+    });
     let mut transition_recv_deadline = Some(Instant::now() + Duration::from_secs(2));
     let mut transition_recv_win = std::mem::take(&mut recv_win);
     // Hard ceiling on rekey-grace re-arms (see REKEY_TRANSITION_HARD_CAP).
@@ -680,8 +704,10 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
     if read_fd < 0 {
         return Err(Error::Io(std::io::Error::last_os_error()));
     }
-    let owned_tun_read = unsafe { OwnedFd::from_raw_fd(read_fd) };
-    let tun_read = AsyncFd::new(owned_tun_read)?;
+    // Session-owned for the same reason as the write duplicate above; the
+    // reader task only borrows it.
+    session.tun_read_fd.store(read_fd, Ordering::SeqCst);
+    let tun_read = AsyncFd::new(TunFd(read_fd))?;
 
     let tun_reader_task = tokio::spawn(async move {
         let mut tun_buf = vec![0u8; BUF_SIZE];
@@ -1171,11 +1197,15 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
                                     }
                                     let rekey_kp = KeyPair::generate();
                                     if let Ok(dh) = rekey_kp.compute_shared(&new_eph_pub) {
-                                        let new_keys = derive_session_keys(
-                                            &dh,
-                                            Some(&keys.session_key),
-                                            &rekey_kp.public_key_bytes(),
-                                        );
+                                        let new_keys = {
+                                            let mut k = derive_session_keys(
+                                                &dh,
+                                                Some(&keys.session_key),
+                                                &rekey_kp.public_key_bytes(),
+                                            );
+                                            apply_legacy_key_scheme(&mut k, legacy_wire);
+                                            k
+                                        };
                                         // Route the KeyRotate response through the upload task's
                                         // single encryptor instead of building it here with the
                                         // receive loop's separate `send_counter`. Two counters
@@ -1676,11 +1706,15 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
                                         );
                                         match keypair.compute_shared(&server_eph_pub) {
                                             Ok(dh2) => {
-                                                let ratcheted = derive_session_keys(
-                                                    &dh2,
-                                                    Some(&keys.session_key),
-                                                    &keypair.public_key_bytes(),
-                                                );
+                                                let ratcheted = {
+                                                    let mut k = derive_session_keys(
+                                                        &dh2,
+                                                        Some(&keys.session_key),
+                                                        &keypair.public_key_bytes(),
+                                                    );
+                                                    apply_legacy_key_scheme(&mut k, legacy_wire);
+                                                    k
+                                                };
                                                 // Keep accepting old inbound keys until the server
                                                 // proves it has switched too. Same transition
                                                 // parameters as the inline-KeyRotate rekey path
@@ -1911,6 +1945,11 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
                 let verdict = data_watchdog_verdict(stalled_for, data_up_since);
                 let stall_pending = verdict.is_some();
                 if let Some(reason) = data_stall_confirmed(&mut data_stall_strikes, verdict) {
+                    condemn_descriptor_mask_after_watchdog(
+                        &handshake_mask.mask_id,
+                        reason,
+                        data_plane_proven,
+                    );
                     tun_reader_task.abort();
                     upload_sender_task.abort();
                     // Liveness: a sticky mask that keeps stalling quickly gets
@@ -1941,6 +1980,11 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
                 // Absolute net: nothing decodable AT ALL (control included).
                 let silence = last_rx.elapsed();
                 if silence > RX_SILENCE {
+                    condemn_descriptor_mask_after_watchdog(
+                        &handshake_mask.mask_id,
+                        "RX silence",
+                        data_plane_proven,
+                    );
                     tun_reader_task.abort();
                     upload_sender_task.abort();
                     return Err(Error::Session(

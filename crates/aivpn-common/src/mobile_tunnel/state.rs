@@ -3,6 +3,7 @@
 //! `aivpn-android-core`. Hoisted verbatim from `android_tunnel.rs` (the base
 //! text with the latest fixes); iOS-only additions are noted inline.
 
+use std::os::fd::{AsRawFd, RawFd};
 use std::sync::atomic::{
     AtomicBool, AtomicI32, AtomicU16, AtomicU32, AtomicU64, AtomicU8, Ordering,
 };
@@ -172,6 +173,25 @@ pub fn data_stall_confirmed(
 pub struct SessionRuntime {
     pub udp_control_fd: AtomicI32,
     pub stop_signal_fd: AtomicI32,
+    /// Rust's private duplicates of the platform-owned TUN fd — one for writing
+    /// downlink, one for the reader task.
+    ///
+    /// The session OWNS them (the `AsyncFd`s only borrow via [`TunFd`]) because
+    /// the kernel destroys a tun device only when its LAST fd closes. Android's
+    /// Kotlin layer closes its `ParcelFileDescriptor` on disconnect and gives
+    /// the native call ~3 s to unwind; a slower unwind used to leave these
+    /// duplicates alive past the interface, keeping a zombie tun that still
+    /// carried the VPN address. The next session then established a SECOND tun
+    /// with the same address, the app's packets were routed into the dead one
+    /// nobody reads, and the tunnel was "connected" with no traffic — only a
+    /// process kill (force-stop / clear-data) broke the loop.
+    ///
+    /// Released in two phases, see [`neutralize_session_fd`] and
+    /// [`close_session_fd`]: `stop_active_tunnel` drops the *tun reference*
+    /// immediately, session teardown releases the fd *number* once nothing
+    /// polls it any more.
+    pub tun_write_fd: AtomicI32,
+    pub tun_read_fd: AtomicI32,
     pub upload_bytes: AtomicU64,
     pub download_bytes: AtomicU64,
     // Wall-clock epoch ms at which this session completed its handshake, 0
@@ -189,6 +209,8 @@ impl SessionRuntime {
         Self {
             udp_control_fd: AtomicI32::new(-1),
             stop_signal_fd: AtomicI32::new(-1),
+            tun_write_fd: AtomicI32::new(-1),
+            tun_read_fd: AtomicI32::new(-1),
             upload_bytes: AtomicU64::new(0),
             download_bytes: AtomicU64::new(0),
             connected_at_unix_ms: AtomicU64::new(0),
@@ -224,8 +246,96 @@ pub static LAST_SERVER_KEY: Mutex<Option<[u8; 32]>> = Mutex::new(None);
 /// Cap on retained pushed descriptors (a handful of epochs is plenty).
 pub const MAX_BOOTSTRAP_DESCRIPTORS: usize = 8;
 
+/// Set when a session that COMPLETED the handshake never carried a single
+/// downlink DATA packet while handshaking with a descriptor-derived covert
+/// mask. Polled by the platform (Android `getDiscardPersistedDescriptors`, iOS
+/// `aivpn_take_discard_persisted_descriptors`) so the app-persisted descriptor
+/// blob is dropped too — clearing only the in-process store would let the next
+/// COLD START reload the same unusable descriptor.
+pub static DISCARD_PERSISTED_DESCRIPTORS: AtomicBool = AtomicBool::new(false);
+
+/// Sticky for the process once a descriptor mask has been condemned. The
+/// platform CONSUMES `DISCARD_PERSISTED_DESCRIPTORS` (one delete), so a second
+/// flag is needed to keep suppressing descriptor use afterwards — the server
+/// re-pushes descriptors every session, and re-adopting them would break the
+/// very next connect again.
+static DESCRIPTORS_DISTRUSTED: AtomicBool = AtomicBool::new(false);
+
+/// Sentinel the platform passes instead of a cached-descriptor blob to say
+/// "this server's descriptors were condemned in an earlier RUN of the app" (see
+/// [`condemn_descriptor_mask_after_watchdog`]). An empty blob cannot carry that
+/// verdict: the store also fills from the server's in-session pushes, so without
+/// a sticky marker every app restart would break its first reconnect again and
+/// heal ~50 s later, forever.
+pub const DESCRIPTORS_DISTRUSTED_SENTINEL: &str = "distrusted";
+
+/// A watchdog firing on a session that handshaked with a descriptor-derived
+/// covert mask indicts that mask. A cached descriptor the server still ACCEPTS
+/// for the handshake (the tag validates, the PFS ratchet completes, keepalives
+/// flow) but disagrees with on the data plane leaves the tunnel permanently
+/// "connected" with a dead data path: the server drops every uplink DATA packet
+/// with an AEAD failure, the watchdog reconnects, and the next attempt resolves
+/// the very same descriptor mask — forever. Clearing app data (which drops the
+/// persisted descriptors) restores traffic for exactly one connection, which is
+/// the reporter-visible signature of this loop.
+///
+/// The existing `HANDSHAKE_FAIL_STREAK` net only covers handshakes that never
+/// complete, so it never fires here. Condemn the descriptor explicitly instead:
+/// clear the in-process store, tell the platform to drop its persisted copy, and
+/// pin the streak at the fallback threshold so the next attempt resolves a
+/// builtin preset every server reproduces.
+///
+/// Scoped tightly so a HEALTHY covert session is never punished: descriptor
+/// masks do work, and a watchdog can also fire for ordinary reasons (the phone
+/// moved between networks, the carrier dropped the flow). Only a session that
+/// carried NO downlink DATA at all — handshake and keepalives fine, data plane
+/// never once alive — indicts the mask. A session that ran and then stalled
+/// keeps its descriptors and simply reconnects, as before.
+pub fn condemn_descriptor_mask_after_watchdog(
+    mask_id: &str,
+    reason: &str,
+    data_plane_proven: bool,
+) {
+    if data_plane_proven || !mask_id.starts_with("bootstrap:") {
+        return;
+    }
+    log::warn!(
+        "aivpn: {reason} on a session handshaked with covert descriptor mask '{mask_id}' — \
+         discarding cached descriptors and falling back to a builtin preset for the next attempt"
+    );
+    if let Ok(mut g) = BOOTSTRAP_DESCRIPTORS.lock() {
+        g.clear();
+    }
+    DISCARD_PERSISTED_DESCRIPTORS.store(true, Ordering::Relaxed);
+    DESCRIPTORS_DISTRUSTED.store(true, Ordering::Relaxed);
+    HANDSHAKE_FAIL_STREAK.store(HANDSHAKE_FALLBACK_THRESHOLD, Ordering::Relaxed);
+}
+
+/// Polled by the platform after the tunnel call returns: `true` means the
+/// app-persisted bootstrap descriptor blob for this server must be deleted (see
+/// [`condemn_descriptor_mask_after_watchdog`]). Reading it clears the flag.
+pub fn take_discard_persisted_descriptors() -> bool {
+    DISCARD_PERSISTED_DESCRIPTORS.swap(false, Ordering::Relaxed)
+}
+
+/// Mark this server's descriptors as condemned by a PREVIOUS run of the app,
+/// from the platform's persisted verdict. See
+/// [`DESCRIPTORS_DISTRUSTED_SENTINEL`].
+pub fn mark_descriptors_distrusted() {
+    DESCRIPTORS_DISTRUSTED.store(true, Ordering::Relaxed);
+}
+
 /// Snapshot the currently-valid stored descriptors, newest first.
 pub fn current_bootstrap_descriptors() -> Vec<BootstrapDescriptor> {
+    // Once a descriptor mask has been condemned, hide the whole store for the
+    // rest of the process. Clearing it at condemn time is not enough: the server
+    // re-pushes descriptors during EVERY session, including the preset-mask one
+    // that recovers the tunnel, so the next connect would resolve a covert mask
+    // again and break again. This is the single read path used both for mask
+    // resolution and for the platform's persistence export.
+    if DESCRIPTORS_DISTRUSTED.load(Ordering::Relaxed) {
+        return Vec::new();
+    }
     let now = current_unix_secs();
     let mut out: Vec<BootstrapDescriptor> = BOOTSTRAP_DESCRIPTORS
         .lock()
@@ -261,6 +371,13 @@ pub fn store_bootstrap_descriptor(descriptor: BootstrapDescriptor) {
 /// next COLD START can shape its first handshake with a COVERT rotated
 /// descriptor mask instead of a public preset.
 pub fn bootstrap_descriptors_json() -> String {
+    // Once condemned, stop handing descriptors back for persistence for the rest
+    // of the process (`current_bootstrap_descriptors` already hides them, this
+    // is the explicit statement of intent for the export path). The server
+    // re-pushes fresh ones on every session, so without the distrust gate the
+    // preset-mask session that recovers the tunnel would immediately re-persist
+    // a descriptor and the NEXT connect would break again — a working/broken
+    // ping-pong instead of a fix.
     let descriptors = current_bootstrap_descriptors();
     serde_json::to_string(&descriptors).unwrap_or_else(|_| "[]".to_string())
 }
@@ -272,6 +389,18 @@ pub fn bootstrap_descriptors_json() -> String {
 /// rejected and the handshake simply falls back to the preset — never worse
 /// than today. Returns how many descriptors were accepted into the store.
 pub fn preload_persisted_descriptors(json: &str, trusted_key: Option<&[u8; 32]>) -> usize {
+    // The platform's sticky verdict from an earlier RUN of the app.
+    if json.trim() == DESCRIPTORS_DISTRUSTED_SENTINEL {
+        mark_descriptors_distrusted();
+        return 0;
+    }
+    // A condemned descriptor must not come back through the platform's cached
+    // blob: the delete is asynchronous (the platform performs it only after the
+    // tunnel call returns), so an immediate retry would otherwise re-preload the
+    // very descriptor that just killed the data plane.
+    if DESCRIPTORS_DISTRUSTED.load(Ordering::Relaxed) {
+        return 0;
+    }
     let accepted = crate::mask::accept_persisted_descriptors(json, trusted_key);
     let mut stored = 0usize;
     for descriptor in accepted {
@@ -568,6 +697,71 @@ pub fn send_control_payload(payload: ControlPayload) -> bool {
     }
 }
 
+/// A TUN fd that an `AsyncFd` may poll but must never close: ownership lives in
+/// [`SessionRuntime`] so a disconnect can drop the tun device immediately,
+/// without waiting for the tokio tasks holding these views to be dropped.
+pub struct TunFd(pub RawFd);
+
+impl AsRawFd for TunFd {
+    fn as_raw_fd(&self) -> RawFd {
+        self.0
+    }
+}
+
+/// Phase 1 of releasing a session-owned TUN fd: drop the *reference to the tun
+/// device* while keeping the fd NUMBER reserved.
+///
+/// Plain `close()` here would be a use-after-close hazard rather than a fix.
+/// The reader task may still be parked on this fd, and the number is freed the
+/// instant we close it — on Android the platform reconnects within
+/// milliseconds, so the very next session can be handed the SAME number for its
+/// own tun. The stale task would then read the NEW session's uplink packets and
+/// push them into the OLD session's (dead) channel: the same "connected, no
+/// traffic" symptom this whole path exists to prevent, just one reconnect later.
+///
+/// `dup2()` avoids that entirely. It atomically closes the old file description
+/// — releasing the tun reference, so the device dies as soon as the platform
+/// closes its own fd — and rebinds the number to `/dev/null`. Anything still
+/// polling sees a valid fd: reads fail with `EBADF` (it is write-only) and the
+/// task exits on its own, writes are discarded. The number cannot be recycled
+/// behind our back because we still hold it.
+///
+/// Idempotent. Falls back to a plain close only if `/dev/null` cannot be opened,
+/// which on Android/iOS means the process is already out of descriptors.
+pub fn neutralize_session_fd(slot: &AtomicI32) {
+    let fd = slot.load(Ordering::SeqCst);
+    if fd < 0 {
+        return;
+    }
+    let devnull = unsafe {
+        libc::open(
+            b"/dev/null\0".as_ptr() as *const libc::c_char,
+            libc::O_WRONLY | libc::O_CLOEXEC,
+        )
+    };
+    if devnull < 0 {
+        if slot.swap(-1, Ordering::SeqCst) >= 0 {
+            unsafe { libc::close(fd) };
+        }
+        return;
+    }
+    unsafe {
+        libc::dup2(devnull, fd);
+        libc::close(devnull);
+    }
+}
+
+/// Phase 2: release the fd number itself, once the session is over and nothing
+/// polls it any more. `swap(-1)` makes the caller the sole closer, so the number
+/// can never be closed twice (and thus never closed after the OS handed it to an
+/// unrelated `open`).
+pub fn close_session_fd(slot: &AtomicI32) {
+    let fd = slot.swap(-1, Ordering::SeqCst);
+    if fd >= 0 {
+        unsafe { libc::close(fd) };
+    }
+}
+
 pub struct ActiveSessionGuard {
     session: Arc<SessionRuntime>,
 }
@@ -585,6 +779,12 @@ impl Drop for ActiveSessionGuard {
         }
 
         let mut guard = ACTIVE_SESSION.lock().unwrap_or_else(|e| e.into_inner());
+        // Normal end of a session: the run loop has returned, so both TUN views
+        // are dead and the numbers can finally be given back. Taken under the
+        // ACTIVE_SESSION lock so this can never interleave with a concurrent
+        // `stop_active_tunnel` neutralising the same slots.
+        close_session_fd(&self.session.tun_read_fd);
+        close_session_fd(&self.session.tun_write_fd);
         if let Some(current) = guard.as_ref() {
             if Arc::ptr_eq(current, &self.session) {
                 *guard = None;
@@ -628,6 +828,16 @@ pub fn stop_active_tunnel() {
                 // Set the flag FIRST so early init phases (DNS lookup, socket
                 // creation) see it before the eventfd/UDP fd are available.
                 s.stop_requested.store(true, Ordering::SeqCst);
+                // Drop the tun references NOW, not whenever the native call
+                // finishes unwinding. Android's Kotlin layer closes its
+                // ParcelFileDescriptor on disconnect and waits only ~3 s for
+                // that unwind; anything still holding a duplicate past that
+                // point keeps the tun device alive with the VPN address on it,
+                // and the next session's interface then competes with a zombie
+                // for the app's packets. The fd numbers stay ours until the
+                // session guard drops — see `neutralize_session_fd`.
+                neutralize_session_fd(&s.tun_read_fd);
+                neutralize_session_fd(&s.tun_write_fd);
                 (
                     s.udp_control_fd.swap(-1, Ordering::SeqCst),
                     // swap(-1) takes OWNERSHIP of the eventfd, so a concurrent

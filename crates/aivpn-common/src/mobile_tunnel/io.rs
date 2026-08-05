@@ -274,7 +274,10 @@ pub fn to_sockaddr_in(addr: &SocketAddrV4) -> libc::sockaddr_in {
 
 // ──────────── Async TUN I/O ────────────
 
-pub async fn tun_async_read(tun: &AsyncFd<OwnedFd>, buf: &mut [u8]) -> std::io::Result<usize> {
+pub async fn tun_async_read<T: AsRawFd>(
+    tun: &AsyncFd<T>,
+    buf: &mut [u8],
+) -> std::io::Result<usize> {
     loop {
         let mut guard = tun.readable().await?;
         match guard.try_io(|inner| {
@@ -297,7 +300,7 @@ pub async fn tun_async_read(tun: &AsyncFd<OwnedFd>, buf: &mut [u8]) -> std::io::
     }
 }
 
-pub async fn tun_async_write(tun: &AsyncFd<OwnedFd>, data: &[u8]) -> std::io::Result<()> {
+pub async fn tun_async_write<T: AsRawFd>(tun: &AsyncFd<T>, data: &[u8]) -> std::io::Result<()> {
     let mut written = 0usize;
     while written < data.len() {
         let mut guard = tun.writable().await?;
