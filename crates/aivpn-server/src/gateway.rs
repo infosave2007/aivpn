@@ -3371,7 +3371,30 @@ impl Gateway {
             match decrypted {
                 Some(result) => result,
                 None => {
-                    return Err(last_error.unwrap_or_else(|| Error::InvalidPacket("Invalid length")))
+                    // A tag that validated pins the counter (and with it the
+                    // nonce and key), so reaching here means every candidate
+                    // ciphertext offset was wrong — a client/server disagreement
+                    // about how this session's mask frames the packet. Name the
+                    // mask and the offsets: the failure is otherwise a bare
+                    // "aead::Error" repeated thousands of times.
+                    // `sess` above still holds the session lock for this whole
+                    // block — `session.lock()` here would deadlock the worker
+                    // (parking_lot mutexes are not reentrant) and, with the lock
+                    // never released, wedge the packet loop for every session.
+                    debug!(
+                        "uplink decrypt failed for {}: mask={:?} packet_len={} counter={} \
+                         ratcheted={} session_offset={} catalog_offset={}",
+                        hash_addr(&client_addr),
+                        sess.mask.as_ref().map(|m| m.mask_id.as_str()),
+                        packet_data.len(),
+                        counter,
+                        is_ratcheted_tag,
+                        session_prefix + packet_mdh_len,
+                        tag_prefix_len(catalog_tag_offset) + catalog_mdh_len,
+                    );
+                    return Err(
+                        last_error.unwrap_or_else(|| Error::InvalidPacket("Invalid length"))
+                    );
                 }
             }
         };

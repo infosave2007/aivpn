@@ -169,6 +169,24 @@ fn data_stall_confirmed(strikes: &mut u32, verdict: Option<&'static str>) -> Opt
 pub struct SessionRuntime {
     udp_control_fd: AtomicI32,
     stop_event_fd: AtomicI32,
+    /// Rust's private duplicates of the Android-owned TUN fd — one for writing
+    /// downlink, one for the reader task.
+    ///
+    /// The session OWNS them (the `AsyncFd`s below only borrow), because the
+    /// kernel destroys a tun device only when its LAST fd closes. Kotlin closes
+    /// its `ParcelFileDescriptor` on disconnect and gives the native call 3 s to
+    /// unwind; if that call is slow to return, these duplicates outlive the
+    /// interface and keep it alive as a zombie that still carries the VPN
+    /// address. The next session then establishes a SECOND tun with the same
+    /// address, app packets are routed into the dead one nobody reads, and the
+    /// tunnel is "connected" with no traffic — issue #71, which is why only a
+    /// process kill (force-stop, reinstall, clear-data) restored it.
+    ///
+    /// Closed by whichever of `stop_active_tunnel` / `ActiveSessionGuard::drop`
+    /// runs first; both take ownership with `swap(-1)` so exactly one close
+    /// happens and the fd number can never be closed twice.
+    tun_write_fd: AtomicI32,
+    tun_read_fd: AtomicI32,
     upload_bytes: AtomicU64,
     download_bytes: AtomicU64,
     // Set by stop_active_tunnel() before eventfd/socket are ready so that early
@@ -181,6 +199,8 @@ impl SessionRuntime {
         Self {
             udp_control_fd: AtomicI32::new(-1),
             stop_event_fd: AtomicI32::new(-1),
+            tun_write_fd: AtomicI32::new(-1),
+            tun_read_fd: AtomicI32::new(-1),
             upload_bytes: AtomicU64::new(0),
             download_bytes: AtomicU64::new(0),
             stop_requested: AtomicBool::new(false),
@@ -215,34 +235,8 @@ static LAST_SERVER_KEY: Mutex<Option<[u8; 32]>> = Mutex::new(None);
 /// Cap on retained pushed descriptors (a handful of epochs is plenty).
 const MAX_BOOTSTRAP_DESCRIPTORS: usize = 8;
 
-/// Whether a descriptor-derived covert mask may steer the handshake.
-///
-/// TEMPORARILY DISABLED. Against a current server, a handshake shaped with a
-/// descriptor-derived mask is ACCEPTED (tag validates, PFS ratchet completes,
-/// keepalives flow both ways) but the two sides then disagree on the DATA-plane
-/// framing: the server drops every uplink DATA packet with
-/// `Crypto error: aead::Error` while the fixed-length control plane keeps
-/// working. The tunnel reports "connected" and carries no traffic.
-///
-/// Reproduced on device against a local server built from this tree: the first
-/// connect after an install (no descriptor cached yet) uses a PSK preset and
-/// works; every later connect preloads a descriptor, shapes the handshake with
-/// it, and is dead — which is exactly issue #71 (and the reconnect storm in
-/// #70), including the reporters' observation that clearing app data restores
-/// traffic for precisely one connection.
-///
-/// Presets are unaffected, so forcing this path keeps every connect working.
-/// The watchdog machinery below (condemn → discard → preset) stays in place as
-/// the safety net for a server whose descriptors stop matching. Flip this back
-/// to `true` once client and server agree on the DATA framing for derived
-/// masks — the covert cold-start handshake is a real anti-DPI win.
-const USE_COVERT_DESCRIPTOR_MASKS: bool = false;
-
 /// Snapshot the currently-valid stored descriptors, newest first.
 fn current_bootstrap_descriptors() -> Vec<BootstrapDescriptor> {
-    if !USE_COVERT_DESCRIPTOR_MASKS {
-        return Vec::new();
-    }
     // Once a descriptor mask has been condemned, hide the whole store for the
     // rest of the process. Clearing it at condemn time is not enough: the server
     // re-pushes descriptors during EVERY session, including the preset-mask one
@@ -594,6 +588,27 @@ pub fn send_control_payload(payload: ControlPayload) -> bool {
     }
 }
 
+/// A TUN fd that `AsyncFd` may poll but must never close. Ownership lives in
+/// [`SessionRuntime`] so a disconnect can destroy the tun device immediately,
+/// without waiting for the tokio tasks holding these views to be dropped.
+struct TunFd(RawFd);
+
+impl AsRawFd for TunFd {
+    fn as_raw_fd(&self) -> RawFd {
+        self.0
+    }
+}
+
+/// Close a session-owned fd exactly once. `swap(-1)` makes the winner the sole
+/// closer, so the number can never be closed twice (and thus never closed after
+/// the OS handed it to an unrelated open).
+fn close_session_fd(slot: &AtomicI32) {
+    let fd = slot.swap(-1, Ordering::SeqCst);
+    if fd >= 0 {
+        unsafe { libc::close(fd) };
+    }
+}
+
 struct ActiveSessionGuard {
     session: Arc<SessionRuntime>,
 }
@@ -609,6 +624,11 @@ impl Drop for ActiveSessionGuard {
         if stop_fd >= 0 {
             unsafe { libc::close(stop_fd) };
         }
+
+        // Normal end of a session: release the TUN duplicates here if a
+        // concurrent stop_active_tunnel() did not already take them.
+        close_session_fd(&self.session.tun_read_fd);
+        close_session_fd(&self.session.tun_write_fd);
 
         let mut guard = ACTIVE_SESSION.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(current) = guard.as_ref() {
@@ -651,6 +671,14 @@ pub fn stop_active_tunnel() {
         guard
             .as_ref()
             .map(|s| {
+                // Release the TUN duplicates NOW, not whenever the native call
+                // finishes unwinding. Kotlin closes its ParcelFileDescriptor on
+                // disconnect and waits only 3 s for that unwind; anything still
+                // holding a duplicate past that point keeps the tun device alive
+                // with the VPN address on it, and the next session's interface
+                // then competes with a zombie for the app's packets (issue #71).
+                close_session_fd(&s.tun_read_fd);
+                close_session_fd(&s.tun_write_fd);
                 // Set the flag FIRST so early init phases (DNS lookup, socket
                 // creation) see it before the eventfd/UDP fd are available.
                 s.stop_requested.store(true, Ordering::SeqCst);
@@ -720,15 +748,14 @@ pub fn stop_active_tunnel() {
 /// pin the streak at the fallback threshold so the next attempt resolves a
 /// builtin preset every server reproduces.
 ///
-/// Deliberately NOT gated on "no downlink DATA at all": the observed failure
-/// still delivers a trickle of downlink (control acks and a few DATA packets)
-/// while the uplink is entirely dropped, so a `data_plane_proven` gate would
-/// never fire. A healthy covert session does not reach either watchdog, so
-/// trying a preset next is strictly better than repeating a mask that just
-/// failed. The availability-over-covertness trade matches the handshake net
-/// above and is bounded: the streak resets on the next completed ratchet.
-fn condemn_descriptor_mask_after_watchdog(mask_id: &str, reason: &str) {
-    if !mask_id.starts_with("bootstrap:") {
+/// Scoped tightly so a HEALTHY covert session is never punished: descriptor
+/// masks do work, and a watchdog can also fire for ordinary reasons (the phone
+/// moved between networks, the carrier dropped the flow). Only a session that
+/// carried NO downlink DATA at all — handshake and keepalives fine, data plane
+/// never once alive — indicts the mask. A session that ran and then stalled
+/// keeps its descriptors and simply reconnects, as before.
+fn condemn_descriptor_mask_after_watchdog(mask_id: &str, reason: &str, data_plane_proven: bool) {
+    if data_plane_proven || !mask_id.starts_with("bootstrap:") {
         return;
     }
     log::warn!(
@@ -745,7 +772,7 @@ fn condemn_descriptor_mask_after_watchdog(mask_id: &str, reason: &str) {
 
 /// Polled by the platform after `run_tunnel_android` returns: `true` means the
 /// app-persisted bootstrap descriptor blob for this server must be deleted (see
-/// [`condemn_mask_if_data_plane_never_proven`]). Reading it clears the flag.
+/// [`condemn_descriptor_mask_after_watchdog`]). Reading it clears the flag.
 pub fn take_discard_persisted_descriptors() -> bool {
     DISCARD_PERSISTED_DESCRIPTORS.swap(false, Ordering::Relaxed)
 }
@@ -1067,9 +1094,16 @@ pub async fn run_tunnel_android(
         unsafe { libc::close(owned_tun_fd) };
         return Err(Error::Io(std::io::Error::last_os_error()));
     }
-    // SAFETY: this is Rust's private duplicate of the Android-owned TUN fd.
-    let owned_tun = unsafe { OwnedFd::from_raw_fd(owned_tun_fd) };
-    let tun = AsyncFd::new(owned_tun)?;
+    // Hand the duplicate to the session, which owns it from here on; `tun` only
+    // borrows it (see `TunFd`) so a disconnect can close it immediately.
+    session.tun_write_fd.store(owned_tun_fd, Ordering::SeqCst);
+    let tun = match AsyncFd::new(TunFd(owned_tun_fd)) {
+        Ok(tun) => tun,
+        Err(e) => {
+            close_session_fd(&session.tun_write_fd);
+            return Err(Error::Io(e));
+        }
+    };
 
     // Convert the owned UDP fd to a tokio UdpSocket (already connected to server).
     let std_udp = std::net::UdpSocket::from(owned_udp);
@@ -1400,8 +1434,14 @@ pub async fn run_tunnel_android(
     if read_fd < 0 {
         return Err(Error::Io(std::io::Error::last_os_error()));
     }
-    let owned_tun_read = unsafe { OwnedFd::from_raw_fd(read_fd) };
-    let tun_read = AsyncFd::new(owned_tun_read)?;
+    session.tun_read_fd.store(read_fd, Ordering::SeqCst);
+    let tun_read = match AsyncFd::new(TunFd(read_fd)) {
+        Ok(tun_read) => tun_read,
+        Err(e) => {
+            close_session_fd(&session.tun_read_fd);
+            return Err(Error::Io(e));
+        }
+    };
 
     let tun_reader_task = tokio::spawn(async move {
         let mut tun_buf = vec![0u8; BUF_SIZE];
@@ -2221,7 +2261,11 @@ pub async fn run_tunnel_android(
                 let verdict = data_watchdog_verdict(stalled_for, data_up_since);
                 let stall_pending = verdict.is_some();
                 if let Some(reason) = data_stall_confirmed(&mut data_stall_strikes, verdict) {
-                    condemn_descriptor_mask_after_watchdog(&handshake_mask.mask_id, reason);
+                    condemn_descriptor_mask_after_watchdog(
+                        &handshake_mask.mask_id,
+                        reason,
+                        data_plane_proven,
+                    );
                     tun_reader_task.abort();
                     upload_sender_task.abort();
                     return Err(Error::Session(format!(
@@ -2249,7 +2293,11 @@ pub async fn run_tunnel_android(
                 // Absolute net: nothing decodable AT ALL (control included).
                 let silence = last_rx.elapsed();
                 if silence > RX_SILENCE {
-                    condemn_descriptor_mask_after_watchdog(&handshake_mask.mask_id, "RX silence");
+                    condemn_descriptor_mask_after_watchdog(
+                        &handshake_mask.mask_id,
+                        "RX silence",
+                        data_plane_proven,
+                    );
                     tun_reader_task.abort();
                     upload_sender_task.abort();
                     return Err(Error::Session(
@@ -2564,7 +2612,7 @@ fn to_sockaddr_in(addr: &SocketAddrV4) -> libc::sockaddr_in {
 
 // ──────────── Async TUN I/O ────────────
 
-async fn tun_async_read(tun: &AsyncFd<OwnedFd>, buf: &mut [u8]) -> std::io::Result<usize> {
+async fn tun_async_read(tun: &AsyncFd<TunFd>, buf: &mut [u8]) -> std::io::Result<usize> {
     loop {
         let mut guard = tun.readable().await?;
         match guard.try_io(|inner| {
@@ -2587,7 +2635,7 @@ async fn tun_async_read(tun: &AsyncFd<OwnedFd>, buf: &mut [u8]) -> std::io::Resu
     }
 }
 
-async fn tun_async_write(tun: &AsyncFd<OwnedFd>, data: &[u8]) -> std::io::Result<()> {
+async fn tun_async_write(tun: &AsyncFd<TunFd>, data: &[u8]) -> std::io::Result<()> {
     let mut written = 0usize;
     while written < data.len() {
         let mut guard = tun.writable().await?;
