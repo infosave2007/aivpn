@@ -89,6 +89,14 @@ class AivpnService : VpnService() {
         // 15s covers even slow devices without delaying genuine network-switch detection.
         private const val TAG = "AivpnService"
 
+        /**
+         * Sentinel stored in place of a descriptor blob once the core has
+         * condemned this server's descriptors, and passed straight back as
+         * `cachedDescriptorsJson`. Must match
+         * `mobile_tunnel::state::DESCRIPTORS_DISTRUSTED_SENTINEL`.
+         */
+        private const val DESCRIPTORS_DISTRUSTED = "distrusted"
+
         @Volatile var statusCallback:  ((Boolean, String) -> Unit)? = null
         @Volatile var trafficCallback: ((Long, Long) -> Unit)?      = null
         @Volatile var tileCallback:    (() -> Unit)?                = null
@@ -961,10 +969,25 @@ class AivpnService : VpnService() {
                     // a storage failure never breaks the tunnel. Blank/"[]" is filtered so
                     // a session that pushed nothing never clears this server's cache.
                     try {
-                        val descriptorsJson = AivpnJni.getBootstrapDescriptorsJson()
-                        if (descriptorsJson.isNotBlank() && descriptorsJson != "[]") {
+                        if (AivpnJni.getDiscardPersistedDescriptors()) {
+                            // The core condemned this server's descriptors: the
+                            // handshake was accepted and the data plane never
+                            // carried a single downlink packet. Persist the
+                            // verdict rather than just deleting the blob — the
+                            // server re-pushes descriptors during every session,
+                            // including the preset-mask one that recovers the
+                            // tunnel, so a plain delete would be re-filled and
+                            // the next connect would break again.
                             SecureStorage.saveBootstrapDescriptors(
-                                this@AivpnService, descriptorsJson, snapServerKey)
+                                this@AivpnService, DESCRIPTORS_DISTRUSTED, snapServerKey)
+                            Log.w(TAG, "Bootstrap descriptors condemned for this server; " +
+                                "pinning presets until the app is reinstalled or the server changes")
+                        } else {
+                            val descriptorsJson = AivpnJni.getBootstrapDescriptorsJson()
+                            if (descriptorsJson.isNotBlank() && descriptorsJson != "[]") {
+                                SecureStorage.saveBootstrapDescriptors(
+                                    this@AivpnService, descriptorsJson, snapServerKey)
+                            }
                         }
                     } catch (e: Exception) {
                         Log.w(TAG, "Persisting bootstrap descriptors failed: ${e.message}")

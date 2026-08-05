@@ -578,6 +578,23 @@ pub unsafe extern "C" fn aivpn_get_bootstrap_descriptors_json(
     copy_string_getter(Some(json.as_str()), buf, buf_len)
 }
 
+/// `true` when the last session proved its cached bootstrap descriptors are
+/// unusable against this server: the handshake was accepted but not a single
+/// downlink DATA packet ever arrived. Swift must then delete the App Group blob
+/// for that server, otherwise the next cold start reloads the same descriptor
+/// and reconnects into the same dead data plane.
+///
+/// The verdict must ALSO be remembered: pass the literal `"distrusted"` as
+/// `cached_descriptors_json` on subsequent connects to this server, or an
+/// extension restart re-adopts the server's freshly pushed descriptors and
+/// breaks its first reconnect again.
+///
+/// Poll once after `aivpn_run_tunnel` returns; reading clears the flag.
+#[no_mangle]
+pub extern "C" fn aivpn_take_discard_persisted_descriptors() -> bool {
+    aivpn_common::mobile_tunnel::take_discard_persisted_descriptors()
+}
+
 /// Shared helper for the `Option<String>`-backed string getters above:
 /// copies `value` (if any) into `buf` as a NUL-terminated UTF-8 string,
 /// truncated to fit. Returns the number of bytes written excluding the NUL

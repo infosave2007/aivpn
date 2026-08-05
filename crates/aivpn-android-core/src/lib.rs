@@ -16,11 +16,11 @@ use aivpn_common::protocol::ControlPayload;
 use android_tunnel::{
     active_control_tx, active_mgmt, bootstrap_descriptors_json, clear_pending_stop,
     get_active_download_bytes, get_active_upload_bytes, run_tunnel_android, send_control_payload,
-    stop_active_tunnel, take_recording_feedback_json, ACTIVE_ADAPTIVE_LEVEL,
-    ACTIVE_FEEDBACK_INTERVAL, ACTIVE_FEEDBACK_THRESHOLD, ACTIVE_MASK_CATALOG_JSON,
-    ACTIVE_QUALITY_SCORE, ACTIVE_REGIONAL_HINTS_JSON, ASSIGNED_VPN_IP, ATTEMPTED_MASK_FAMILY,
-    CERT_REJECTED, EVER_CONNECTED, HANDSHAKE_REJECTED, HANDSHAKE_REJECT_REASON, MASK_CATALOG_SEQ,
-    MASK_FEEDBACK_SENT, REGIONAL_HINTS_SEQ,
+    stop_active_tunnel, take_discard_persisted_descriptors, take_recording_feedback_json,
+    ACTIVE_ADAPTIVE_LEVEL, ACTIVE_FEEDBACK_INTERVAL, ACTIVE_FEEDBACK_THRESHOLD,
+    ACTIVE_MASK_CATALOG_JSON, ACTIVE_QUALITY_SCORE, ACTIVE_REGIONAL_HINTS_JSON, ASSIGNED_VPN_IP,
+    ATTEMPTED_MASK_FAMILY, CERT_REJECTED, EVER_CONNECTED, HANDSHAKE_REJECTED,
+    HANDSHAKE_REJECT_REASON, MASK_CATALOG_SEQ, MASK_FEEDBACK_SENT, REGIONAL_HINTS_SEQ,
 };
 
 use std::sync::atomic::Ordering;
@@ -772,6 +772,27 @@ pub extern "system" fn Java_com_aivpn_client_AivpnJni_getBootstrapDescriptorsJso
     // across the FFI boundary (LOW-2); degrade to "" on panic.
     let json = std::panic::catch_unwind(bootstrap_descriptors_json).unwrap_or_default();
     make_str(&mut env, &json)
+}
+
+/// `true` when the last session proved its cached bootstrap descriptors are
+/// unusable against this server: the handshake was accepted but not a single
+/// downlink DATA packet ever arrived. The persisted blob for that server must
+/// then be deleted, otherwise the next cold start reloads the same descriptor
+/// and reconnects into the same dead data plane — the loop that today only
+/// clearing app data breaks, and only for one connection.
+///
+/// The app must ALSO remember the verdict and pass
+/// `DESCRIPTORS_DISTRUSTED_SENTINEL` ("distrusted") as `cachedDescriptorsJson`
+/// on subsequent connects, or an app restart re-adopts the server's freshly
+/// pushed descriptors and breaks its first reconnect again.
+///
+/// Poll once after `runTunnel` returns; reading clears the flag.
+#[no_mangle]
+pub extern "system" fn Java_com_aivpn_client_AivpnJni_getDiscardPersistedDescriptors(
+    _env: JNIEnv,
+    _class: JClass,
+) -> jni::sys::jboolean {
+    u8::from(std::panic::catch_unwind(take_discard_persisted_descriptors).unwrap_or(false))
 }
 
 // ──────────────────────────────────────────────────────────
