@@ -197,6 +197,9 @@ impl ClientNetworkConfig {
     /// rejects mismatched versions — a v2 client refuses to negotiate with a v1
     /// server (and vice versa) rather than silently failing every packet.
     const WIRE_VERSION: u8 = 2;
+    /// Oldest wire version a client still accepts from a server. See
+    /// `decode_wire`: v1 carries the same fields minus `keepalive_secs`.
+    const MIN_WIRE_VERSION: u8 = 1;
 
     pub fn validate(&self) -> Result<()> {
         VpnNetworkConfig {
@@ -241,7 +244,21 @@ impl ClientNetworkConfig {
                 "Client network config has invalid wire length",
             ));
         }
-        if data[0] != Self::WIRE_VERSION {
+        // Wire v1 is byte-identical to v2 over the first 12 bytes; v2 only
+        // appended the keepalive field, whose absence the length check above
+        // already tolerates. Accepting v1 is what lets a current client finish a
+        // handshake with a server that predates it — otherwise the ServerHello
+        // authenticates, parses, and is thrown away here, and the app reconnects
+        // forever against an older deployment.
+        //
+        // This does NOT weaken the refusal the version bump was introduced for.
+        // v2 exists because of the mask-defined tag offset: a v1 peer assumes
+        // tag@0. Reaching this point at all means the handshake already
+        // validated, which against a v1 server only happens once the client has
+        // fallen back to the tag@0 layout (`use_legacy_layout`). A client still
+        // using an embedded-tag mask can never get a v1 ServerHello to
+        // authenticate, so it can never accept a peer it cannot talk to.
+        if !(Self::MIN_WIRE_VERSION..=Self::WIRE_VERSION).contains(&data[0]) {
             return Err(Error::InvalidPacket(
                 "Unsupported client network config wire version",
             ));
@@ -308,6 +325,40 @@ fn ipv4_to_u32(ip: Ipv4Addr) -> u32 {
 
 #[cfg(test)]
 mod tests {
+
+    /// A server that predates the keepalive field sends wire v1. It must decode
+    /// — otherwise its ServerHello authenticates, parses and is thrown away, and
+    /// the client reconnects forever against an older deployment. v0 and v3 must
+    /// still be refused: accepting v1 is a compatibility rung, not the removal
+    /// of version checking.
+    #[test]
+    fn decodes_wire_v1_and_still_refuses_unknown_versions() {
+        let cfg = ClientNetworkConfig {
+            prefix_len: 24,
+            mtu: 1400,
+            server_vpn_ip: Ipv4Addr::new(10, 0, 0, 1),
+            client_ip: Ipv4Addr::new(10, 0, 0, 3),
+            mdh_len: default_mdh_len(),
+            keepalive_secs: None,
+            ipv6_address: None,
+        };
+        let mut v1 = cfg.encode_wire()[..12].to_vec();
+        v1[0] = 1;
+        let decoded = ClientNetworkConfig::decode_wire(&v1).expect("wire v1 must decode");
+        assert_eq!(decoded.client_ip, cfg.client_ip);
+        assert_eq!(decoded.server_vpn_ip, cfg.server_vpn_ip);
+        assert_eq!(decoded.mtu, cfg.mtu);
+        assert_eq!(decoded.keepalive_secs, None);
+
+        for bad in [0u8, 3, 255] {
+            let mut wire = cfg.encode_wire().to_vec();
+            wire[0] = bad;
+            assert!(
+                ClientNetworkConfig::decode_wire(&wire).is_err(),
+                "wire version {bad} must be refused"
+            );
+        }
+    }
     use super::*;
 
     #[test]

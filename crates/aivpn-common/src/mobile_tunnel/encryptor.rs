@@ -16,6 +16,21 @@ use crate::upload_pipeline::PacketEncryptor;
 
 use super::state::SessionRuntime;
 
+/// Servers older than the directional-key split derive ONE session key and use
+/// it in BOTH directions; `session_key_s2c` did not exist yet, so their downlink
+/// is encrypted with `session_key`. Collapsing the split reproduces that
+/// contract exactly, so every existing decode path works unchanged.
+///
+/// Applied ONLY on an attempt that has fallen back to the legacy wire layout
+/// (see [`crate::mask::use_legacy_layout`]). Modern sessions keep strict
+/// directional separation, so a reflected uplink packet still cannot
+/// authenticate as downlink.
+pub fn apply_legacy_key_scheme(keys: &mut SessionKeys, legacy_wire: bool) {
+    if legacy_wire {
+        keys.session_key_s2c = keys.session_key;
+    }
+}
+
 // ──────────── Upload-task packet encryptor ────────────
 
 /// FIFO of one-shot acknowledgements for in-flight `KeyRotate` responses.

@@ -146,6 +146,19 @@ pub struct GatewayConfig {
     /// Defaults to `false` (opt-in per-client `MaskPreference` remains the
     /// only way to get a polymorphic mask).
     pub polymorphic_all_sessions: bool,
+    /// Accept handshakes framed in the pre-embedded-tag wire layout, and serve
+    /// such a peer with the single non-directional session key that era used.
+    ///
+    /// Off by default, and deliberately so. It is what lets clients that have
+    /// not been updated past the embedded-tag change keep connecting after a
+    /// server upgrade — but a peer chooses which layout to speak, so leaving it
+    /// on gives any peer a reachable path to a session whose downlink key equals
+    /// its uplink key. That weakens the property that a reflected uplink packet
+    /// cannot authenticate as downlink, and it doubles the candidate scan for
+    /// handshakes no modern mask explains. Turn it on while an un-upgraded
+    /// client population actually exists, and off again once it does not.
+    /// Sourced from `"legacy_client_compat"` in server.json.
+    pub legacy_client_compat: bool,
     /// §3 F policy base mask preset id (e.g. `"webrtc_zoom_v3"`) used as the
     /// input to `MaskProfile::to_polymorphic` when `polymorphic_all_sessions`
     /// is enabled. `None` means "use the session's own current mask as the
@@ -282,6 +295,7 @@ impl Default for GatewayConfig {
             feedback_report_failure_threshold: DEFAULT_FEEDBACK_FAILURE_THRESHOLD,
             feedback_report_interval_secs: DEFAULT_FEEDBACK_REPORT_INTERVAL_SECS,
             polymorphic_all_sessions: false,
+            legacy_client_compat: false,
             polymorphic_base_mask: None,
             downlink_shaping: ShapingLevel::Full,
             mask_signing_key: None,

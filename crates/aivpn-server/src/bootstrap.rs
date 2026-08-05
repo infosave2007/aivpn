@@ -347,6 +347,10 @@ pub async fn run_server(
             .and_then(|c| c.polymorphic.as_ref())
             .map(|p| p.all_sessions)
             .unwrap_or(false),
+        legacy_client_compat: file_config
+            .as_ref()
+            .and_then(|c| c.legacy_client_compat)
+            .unwrap_or(false),
         polymorphic_base_mask: file_config
             .as_ref()
             .and_then(|c| c.polymorphic.as_ref())
