@@ -28,6 +28,7 @@ use aivpn_common::kernel_accel::{
 };
 use aivpn_common::mask::{
     current_unix_secs, derive_bootstrap_candidates, BootstrapDescriptor, MaskProfile,
+    LEGACY_TAG_OFFSET,
 };
 use aivpn_common::network_config::VpnNetworkConfig;
 use aivpn_common::protocol::{ControlPayload, InnerHeader, InnerType, MAX_PACKET_SIZE};
@@ -2822,94 +2823,123 @@ impl Gateway {
             {
                 let clients = db.list_clients();
                 let mut found = None;
-                'bootstrap: for client_cfg in &clients {
-                    if !client_cfg.enabled {
-                        continue;
-                    }
-                    if client_cfg
-                        .expires_at
-                        .is_some_and(|t| t <= chrono::Utc::now())
-                    {
-                        continue;
-                    }
-
-                    let psk = client_cfg.psk;
-                    let candidate_masks = self
-                        .bootstrap_descriptors
-                        .read()
-                        .iter()
-                        .flat_map(|descriptor| derive_bootstrap_candidates(descriptor, Some(&psk)))
-                        .chain(builtin_bootstrap_masks.clone().into_iter())
-                        .collect::<Vec<_>>();
-
-                    for bootstrap_mask in candidate_masks {
-                        let (
-                            _,
-                            candidate_handshake_mdh_len,
-                            candidate_eph_offset,
-                            candidate_eph_len,
-                        ) = packet_layout_for_mask(&bootstrap_mask);
-                        // Layout-aware handshake parse: an embedded mask has NO
-                        // tag prefix, so the eph and tag live at their raw MDH
-                        // offsets; a legacy mask keeps the TAG_SIZE prefix.
-                        // Client and server agree per mask (both key off
-                        // `mask.tag_offset`), so a wrong layout simply yields a
-                        // wrong eph → wrong keys → tag mismatch → rollback.
-                        let prefix = tag_prefix_len(bootstrap_mask.tag_offset);
-                        if packet_data.len() < prefix + candidate_handshake_mdh_len {
+                // Two passes over the same candidates. The first speaks the
+                // current embedded-tag layout; the second re-reads the packet in
+                // the pre-Variant-A layout (8-byte tag PREFIX at offset 0, then
+                // the MDH, then the ephemeral key), which is all a client older
+                // than that change can send. Without the second pass, upgrading
+                // a server silently locks out every user who has not updated
+                // their app — their handshakes look like noise and the app
+                // reconnects forever.
+                //
+                // Ordering matters for cost: a current client still matches in
+                // pass 1, so its handshake does exactly the work it did before.
+                // Only a handshake that no modern candidate explains — already
+                // rate-limited by the per-IP cooldown — pays for the second pass.
+                'bootstrap: for legacy_framing in [false, true] {
+                    for client_cfg in &clients {
+                        if !client_cfg.enabled {
                             continue;
                         }
-                        let eph_start = prefix + candidate_eph_offset;
-                        if packet_data.len() < eph_start + candidate_eph_len {
+                        if client_cfg
+                            .expires_at
+                            .is_some_and(|t| t <= chrono::Utc::now())
+                        {
                             continue;
                         }
-                        let cand_tag =
-                            match extract_tag_for_layout(packet_data, bootstrap_mask.tag_offset) {
-                                Some(t) => t,
-                                None => continue,
+
+                        let psk = client_cfg.psk;
+                        let candidate_masks = self
+                            .bootstrap_descriptors
+                            .read()
+                            .iter()
+                            .flat_map(|descriptor| {
+                                derive_bootstrap_candidates(descriptor, Some(&psk))
+                            })
+                            .chain(builtin_bootstrap_masks.clone().into_iter())
+                            .collect::<Vec<_>>();
+
+                        for bootstrap_mask in candidate_masks {
+                            let (
+                                _,
+                                candidate_handshake_mdh_len,
+                                candidate_eph_offset,
+                                candidate_eph_len,
+                            ) = packet_layout_for_mask(&bootstrap_mask);
+                            // Layout-aware handshake parse: an embedded mask has NO
+                            // tag prefix, so the eph and tag live at their raw MDH
+                            // offsets; a legacy mask keeps the TAG_SIZE prefix.
+                            // Client and server agree per mask (both key off
+                            // `mask.tag_offset`), so a wrong layout simply yields a
+                            // wrong eph → wrong keys → tag mismatch → rollback.
+                            //
+                            // In the legacy pass every candidate is re-read in the
+                            // tag-prefix layout regardless of what its profile says.
+                            // A mask that is already legacy was fully covered by
+                            // pass 1, so skip it instead of testing it twice.
+                            let cand_tag_offset = if legacy_framing {
+                                LEGACY_TAG_OFFSET
+                            } else {
+                                bootstrap_mask.tag_offset
                             };
+                            if legacy_framing && bootstrap_mask.tag_offset == LEGACY_TAG_OFFSET {
+                                continue;
+                            }
+                            let prefix = tag_prefix_len(cand_tag_offset);
+                            if packet_data.len() < prefix + candidate_handshake_mdh_len {
+                                continue;
+                            }
+                            let eph_start = prefix + candidate_eph_offset;
+                            if packet_data.len() < eph_start + candidate_eph_len {
+                                continue;
+                            }
+                            let cand_tag =
+                                match extract_tag_for_layout(packet_data, cand_tag_offset) {
+                                    Some(t) => t,
+                                    None => continue,
+                                };
 
-                        let mut eph_pub = [0u8; 32];
-                        eph_pub.copy_from_slice(
-                            &packet_data[eph_start..eph_start + candidate_eph_len],
-                        );
-                        crypto::obfuscate_eph_pub(
-                            &mut eph_pub,
-                            &self.session_manager.server_public_key(),
-                        );
+                            let mut eph_pub = [0u8; 32];
+                            eph_pub.copy_from_slice(
+                                &packet_data[eph_start..eph_start + candidate_eph_len],
+                            );
+                            crypto::obfuscate_eph_pub(
+                                &mut eph_pub,
+                                &self.session_manager.server_public_key(),
+                            );
 
-                        // DoS hardening: cheaply reject non-matching (client, mask)
-                        // candidates BEFORE the expensive create_session (2 DH +
-                        // Ed25519 sign + full tag windows + session-table scans).
-                        // Only a genuine match proceeds to session creation.
-                        if !self.session_manager.handshake_tag_precheck(
-                            &eph_pub,
-                            Some(psk),
-                            &cand_tag,
-                        ) {
-                            continue;
-                        }
+                            // DoS hardening: cheaply reject non-matching (client, mask)
+                            // candidates BEFORE the expensive create_session (2 DH +
+                            // Ed25519 sign + full tag windows + session-table scans).
+                            // Only a genuine match proceeds to session creation.
+                            if !self.session_manager.handshake_tag_precheck(
+                                &eph_pub,
+                                Some(psk),
+                                &cand_tag,
+                            ) {
+                                continue;
+                            }
 
-                        match self.session_manager.create_session(
-                            client_addr,
-                            eph_pub,
-                            Some(psk),
-                            Some(client_cfg.vpn_ip),
-                        ) {
-                            Ok(sess) => {
-                                let validation = sess.lock().validate_handshake_tag(&cand_tag);
-                                if validation.is_some() {
-                                    // `mask_id` is `bootstrap:epoch-<N>:<base>:<slot>:<hex>`
-                                    // for a covert descriptor mask, or a bare preset
-                                    // name for the public-preset fallback. Surfacing
-                                    // which one matched (and thus which epoch, or that
-                                    // it fell through to a preset) makes epoch-skew
-                                    // diagnosable from the server log alone.
-                                    let matched_epoch = bootstrap_mask
-                                        .mask_id
-                                        .strip_prefix("bootstrap:epoch-")
-                                        .and_then(|rest| rest.split(':').next());
-                                    match matched_epoch {
+                            match self.session_manager.create_session(
+                                client_addr,
+                                eph_pub,
+                                Some(psk),
+                                Some(client_cfg.vpn_ip),
+                            ) {
+                                Ok(sess) => {
+                                    let validation = sess.lock().validate_handshake_tag(&cand_tag);
+                                    if validation.is_some() {
+                                        // `mask_id` is `bootstrap:epoch-<N>:<base>:<slot>:<hex>`
+                                        // for a covert descriptor mask, or a bare preset
+                                        // name for the public-preset fallback. Surfacing
+                                        // which one matched (and thus which epoch, or that
+                                        // it fell through to a preset) makes epoch-skew
+                                        // diagnosable from the server log alone.
+                                        let matched_epoch = bootstrap_mask
+                                            .mask_id
+                                            .strip_prefix("bootstrap:epoch-")
+                                            .and_then(|rest| rest.split(':').next());
+                                        match matched_epoch {
                                         Some(ep) => debug!(
                                             "Tag validation SUCCESS for client {} via covert descriptor mask {} (epoch {}, current {})",
                                             client_cfg.id,
@@ -2922,17 +2952,46 @@ impl Gateway {
                                             client_cfg.id, bootstrap_mask.mask_id
                                         ),
                                     }
-                                    tag = cand_tag;
-                                    found =
-                                        Some((sess, Some(client_cfg.id.clone()), bootstrap_mask));
-                                    break 'bootstrap;
+                                        tag = cand_tag;
+                                        // A peer that only speaks the legacy layout
+                                        // also predates the directional key split:
+                                        // it derives ONE session key and expects the
+                                        // downlink encrypted with it. Collapse the
+                                        // split for this session so the existing
+                                        // downlink path (which always uses the S2C
+                                        // key) produces what that client can read.
+                                        // Modern sessions are untouched and keep the
+                                        // separation that stops a reflected uplink
+                                        // packet from authenticating as downlink.
+                                        //
+                                        // The session mask is pinned to the legacy
+                                        // layout too, so the DATA plane reads the
+                                        // ciphertext after the tag prefix.
+                                        let mut session_mask = bootstrap_mask;
+                                        if legacy_framing {
+                                            session_mask.tag_offset = LEGACY_TAG_OFFSET;
+                                            let mut s = sess.lock();
+                                            s.keys.session_key_s2c = s.keys.session_key;
+                                            if let Some(rk) = s.ratcheted_keys.as_mut() {
+                                                rk.session_key_s2c = rk.session_key;
+                                            }
+                                            debug!(
+                                            "Client {} handshaked with the pre-Variant-A layout — \
+                                             serving it in legacy compatibility mode",
+                                            client_cfg.id
+                                        );
+                                        }
+                                        found =
+                                            Some((sess, Some(client_cfg.id.clone()), session_mask));
+                                        break 'bootstrap;
+                                    }
+                                    let sid = sess.lock().session_id;
+                                    self.session_manager.rollback_failed_session(&sid);
                                 }
-                                let sid = sess.lock().session_id;
-                                self.session_manager.rollback_failed_session(&sid);
-                            }
-                            Err(e) => {
-                                debug!("create_session failed: {}", e);
-                                continue;
+                                Err(e) => {
+                                    debug!("create_session failed: {}", e);
+                                    continue;
+                                }
                             }
                         }
                     }

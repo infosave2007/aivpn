@@ -468,12 +468,38 @@ pub fn resolve_handshake_mask_resilient(
     preshared_key: Option<&[u8; 32]>,
     fail_streak: u32,
 ) -> MaskProfile {
-    if fail_streak >= HANDSHAKE_FALLBACK_THRESHOLD {
+    let mut mask = if fail_streak >= HANDSHAKE_FALLBACK_THRESHOLD {
         resolve_handshake_mask(preferred, &[], preshared_key)
     } else {
         resolve_handshake_mask(preferred, descriptors, preshared_key)
+    };
+    if fail_streak >= LEGACY_LAYOUT_THRESHOLD {
+        mask.tag_offset = LEGACY_TAG_OFFSET;
     }
+    mask
 }
+
+/// `tag_offset` value that selects the pre-Variant-A wire layout: an 8-byte
+/// resonance tag PREFIX at packet offset 0, then the MDH, then the ephemeral
+/// key. Every builder and decoder in the crate already keys off this sentinel.
+pub const LEGACY_TAG_OFFSET: u16 = u16::MAX;
+
+/// Consecutive never-connected handshakes after which the client abandons the
+/// embedded-tag wire layout for [`LEGACY_TAG_OFFSET`].
+///
+/// A server older than the embedded-tag layout ("Variant A") reads the tag at
+/// packet offset 0 and the ephemeral key `TAG_SIZE` bytes into the MDH. Every
+/// modern handshake therefore yields a wrong ephemeral key, wrong session keys
+/// and a tag mismatch, for EVERY mask — the covert→preset rung above cannot
+/// help because presets are embedded-tag too. Without this rung an app updated
+/// past that change can never reach an older server, which is the endless
+/// reconnect in issues #70 and #68. Measured against a live pre-Variant-A
+/// server: all five presets and all descriptor candidates are rejected in the
+/// embedded layout and accepted in this one.
+///
+/// Set above [`HANDSHAKE_FALLBACK_THRESHOLD`] so the cheaper covert→preset rung
+/// is exhausted first; the streak resets on the first completed ratchet.
+pub const LEGACY_LAYOUT_THRESHOLD: u32 = 6;
 
 /// BLAKE3 derive-key context for polymorphic-mask perturbation seeds.
 const POLYMORPHIC_SEED_CONTEXT: &str = "aivpn-polymorphic-mask-v1";

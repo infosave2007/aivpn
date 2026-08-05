@@ -33,7 +33,7 @@ use aivpn_common::crypto::{derive_session_keys, KeyPair, SessionKeys};
 use aivpn_common::error::{Error, Result};
 use aivpn_common::mask::{
     current_unix_secs, decode_bootstrap_descriptor, resolve_handshake_mask_resilient,
-    BootstrapDescriptor, MaskProfile, HANDSHAKE_FALLBACK_THRESHOLD,
+    BootstrapDescriptor, MaskProfile, HANDSHAKE_FALLBACK_THRESHOLD, LEGACY_LAYOUT_THRESHOLD,
 };
 use aivpn_common::mimicry::MimicryEncryptor;
 use aivpn_common::protocol::{ControlPayload, InnerType};
@@ -591,6 +591,20 @@ unsafe impl Send for SendCtx {}
 
 // ──────────── Entry point ────────────
 
+/// Servers older than the directional-key split derive ONE session key and use
+/// it in BOTH directions; `session_key_s2c` did not exist yet, so their downlink
+/// is encrypted with `session_key`. Collapsing the split reproduces that
+/// contract exactly, so every existing decode path works unchanged.
+///
+/// Applied ONLY once the handshake has fallen back to the legacy layout (see
+/// `LEGACY_LAYOUT_THRESHOLD`) — modern sessions keep strict directional
+/// separation. Mirrors `apply_legacy_key_scheme` in android_tunnel.rs.
+fn apply_legacy_key_scheme(keys: &mut SessionKeys, legacy_wire: bool) {
+    if legacy_wire {
+        keys.session_key_s2c = keys.session_key;
+    }
+}
+
 pub async fn run_tunnel_ios(
     tun_fd: RawFd,
     server_host: String,
@@ -705,10 +719,18 @@ pub async fn run_tunnel_ios(
 
     let level = AdaptiveLevel::from_u8(adaptive_level);
 
+    // Snapshot the streak ONCE: it selects both the handshake mask (below) and
+    // the wire layout, and the two must not disagree mid-setup.
+    let handshake_fail_streak = HANDSHAKE_FAIL_STREAK.load(Ordering::Relaxed);
+    // Past LEGACY_LAYOUT_THRESHOLD we are talking to a pre-Variant-A server:
+    // tag-prefix framing AND a single, non-directional session key.
+    let legacy_wire = handshake_fail_streak >= LEGACY_LAYOUT_THRESHOLD;
+
     // 1. Ephemeral keypair + Zero-RTT session keys
     let mut keypair = KeyPair::generate();
     let mut dh = keypair.compute_shared(&server_key)?;
     let mut keys = derive_session_keys(&dh, psk.as_ref(), &keypair.public_key_bytes());
+    apply_legacy_key_scheme(&mut keys, legacy_wire);
 
     // 2. Create the stop signal immediately — BEFORE DNS — so a disconnect
     //    press during a slow/hung cellular DNS is handled instantly, and race
@@ -773,7 +795,6 @@ pub async fn run_tunnel_ios(
     // timeouts, resolve WITHOUT the (possibly unmatchable) cached descriptors so
     // the attempt uses a builtin preset every server matches. Snapshot the
     // streak once so `initial_mask` below resolves identically.
-    let handshake_fail_streak = HANDSHAKE_FAIL_STREAK.load(Ordering::Relaxed);
     if handshake_fail_streak >= HANDSHAKE_FALLBACK_THRESHOLD {
         log::warn!(
             "aivpn: {} consecutive handshakes never connected — falling back to a builtin preset mask (a cached bootstrap descriptor may be unmatchable by this server)",
@@ -903,6 +924,7 @@ pub async fn run_tunnel_ios(
                     keypair = KeyPair::generate();
                     dh = keypair.compute_shared(&server_key)?;
                     keys = derive_session_keys(&dh, psk.as_ref(), &keypair.public_key_bytes());
+                    apply_legacy_key_scheme(&mut keys, legacy_wire);
                     send_counter = 0;
                     send_seq = 0;
                     // Counters recorded from any pre-rotation datagram no longer
@@ -940,11 +962,11 @@ pub async fn run_tunnel_ios(
     let keepalive_ms = Arc::new(portable_atomic::AtomicU64::new(
         keepalive_interval.as_millis() as u64,
     ));
-    let mut tr_keys: Option<SessionKeys> = Some(derive_session_keys(
-        &dh,
-        psk.as_ref(),
-        &keypair.public_key_bytes(),
-    ));
+    let mut tr_keys: Option<SessionKeys> = Some({
+        let mut pre_ratchet = derive_session_keys(&dh, psk.as_ref(), &keypair.public_key_bytes());
+        apply_legacy_key_scheme(&mut pre_ratchet, legacy_wire);
+        pre_ratchet
+    });
     let mut tr_deadline = Some(Instant::now() + Duration::from_secs(2));
     let mut tr_win = std::mem::take(&mut recv_win);
     // Hard ceiling on rekey-grace re-arms (see REKEY_TRANSITION_HARD_CAP).
@@ -1601,11 +1623,15 @@ pub async fn run_tunnel_ios(
                                     let client_rekey_pub = client_rekey_kp.public_key_bytes();
                                     if let Ok(dh_rekey) = client_rekey_kp.compute_shared(&new_eph_pub) {
                                         let current_key = keys.session_key;
-                                        let new_keys = aivpn_common::crypto::derive_session_keys(
-                                            &dh_rekey,
-                                            Some(&current_key),
-                                            &client_rekey_pub,
-                                        );
+                                        let new_keys = {
+                                            let mut k = aivpn_common::crypto::derive_session_keys(
+                                                &dh_rekey,
+                                                Some(&current_key),
+                                                &client_rekey_pub,
+                                            );
+                                            apply_legacy_key_scheme(&mut k, legacy_wire);
+                                            k
+                                        };
                                         let response_payload = aivpn_common::protocol::ControlPayload::KeyRotate {
                                             new_eph_pub: client_rekey_pub,
                                         };

@@ -30,7 +30,7 @@ use aivpn_common::crypto::{derive_session_keys, KeyPair, SessionKeys};
 use aivpn_common::error::{Error, Result};
 use aivpn_common::mask::{
     current_unix_secs, decode_bootstrap_descriptor, resolve_handshake_mask_resilient,
-    BootstrapDescriptor, MaskProfile, HANDSHAKE_FALLBACK_THRESHOLD,
+    BootstrapDescriptor, MaskProfile, HANDSHAKE_FALLBACK_THRESHOLD, LEGACY_LAYOUT_THRESHOLD,
 };
 use aivpn_common::mimicry::MimicryEncryptor;
 use aivpn_common::protocol::{ControlPayload, InnerType, MaskOutcome};
@@ -588,6 +588,23 @@ pub fn send_control_payload(payload: ControlPayload) -> bool {
     }
 }
 
+/// Servers older than the directional-key split derive ONE session key and use
+/// it in BOTH directions; `session_key_s2c` did not exist yet, so their downlink
+/// is encrypted with `session_key`. Collapsing the split reproduces that
+/// contract exactly, which lets every existing decode path work unchanged
+/// instead of threading a mode flag through the wire API.
+///
+/// Applied ONLY once the handshake has fallen back to the legacy layout (see
+/// `LEGACY_LAYOUT_THRESHOLD`), i.e. only for a peer that cannot speak the modern
+/// protocol at all. Modern sessions keep strict directional separation, so the
+/// property it buys — a reflected uplink packet can never authenticate as
+/// downlink — is untouched for everyone else.
+fn apply_legacy_key_scheme(keys: &mut SessionKeys, legacy_wire: bool) {
+    if legacy_wire {
+        keys.session_key_s2c = keys.session_key;
+    }
+}
+
 /// A TUN fd that `AsyncFd` may poll but must never close. Ownership lives in
 /// [`SessionRuntime`] so a disconnect can destroy the tun device immediately,
 /// without waiting for the tokio tasks holding these views to be dropped.
@@ -1039,10 +1056,26 @@ pub async fn run_tunnel_android(
         }
     }
 
+    // Snapshot the streak ONCE: it selects both the handshake mask (below) and
+    // the wire layout, and the two must not disagree mid-setup.
+    let handshake_fail_streak = HANDSHAKE_FAIL_STREAK.load(Ordering::Relaxed);
+    // Past LEGACY_LAYOUT_THRESHOLD we are talking to a pre-Variant-A server (see
+    // that constant): tag-prefix framing AND a single, non-directional session
+    // key. Both sides of that contract are applied from here on.
+    let legacy_wire = handshake_fail_streak >= LEGACY_LAYOUT_THRESHOLD;
+    if legacy_wire {
+        log::warn!(
+            "aivpn: {} handshakes never connected — retrying with the pre-Variant-A wire layout \
+             (tag prefix + single session key) for compatibility with an older server",
+            handshake_fail_streak
+        );
+    }
+
     // ── 1. Ephemeral keypair + initial session keys ──
     let mut keypair = KeyPair::generate();
     let mut dh = keypair.compute_shared(&server_key)?;
     let mut keys = derive_session_keys(&dh, psk.as_ref(), &keypair.public_key_bytes());
+    apply_legacy_key_scheme(&mut keys, legacy_wire);
 
     // ── 2. Create stop signal immediately — before DNS — so a disconnect press
     //    during a slow/hung cellular DNS is handled instantly, not after a 5 s wait.
@@ -1141,7 +1174,6 @@ pub async fn run_tunnel_android(
     // timeouts, resolve WITHOUT the (possibly unmatchable) cached descriptors so
     // the attempt uses a builtin preset every server matches. Snapshot the
     // streak once so `initial_mask` below resolves identically.
-    let handshake_fail_streak = HANDSHAKE_FAIL_STREAK.load(Ordering::Relaxed);
     if handshake_fail_streak >= HANDSHAKE_FALLBACK_THRESHOLD {
         log::warn!(
             "aivpn: {} consecutive handshakes never connected — falling back to a builtin preset mask (a cached bootstrap descriptor may be unmatchable by this server)",
@@ -1235,7 +1267,12 @@ pub async fn run_tunnel_android(
                             mdh_len,
                             server_signing_key.as_ref(),
                         ) {
-                            Ok(cfg) => break cfg,
+                            Ok(cfg) => {
+                                // The ratchet re-derived `keys`; re-apply the
+                                // legacy contract before anything uses them.
+                                apply_legacy_key_scheme(&mut keys, legacy_wire);
+                                break cfg;
+                            }
                             Err(e) => {
                                 log::debug!(
                                     "aivpn: non-ServerHello datagram during handshake — ignoring: {e}"
@@ -1264,6 +1301,7 @@ pub async fn run_tunnel_android(
                     keypair = KeyPair::generate();
                     dh = keypair.compute_shared(&server_key)?;
                     keys = derive_session_keys(&dh, psk.as_ref(), &keypair.public_key_bytes());
+                    apply_legacy_key_scheme(&mut keys, legacy_wire);
                     send_counter = 0;
                     send_seq = 0;
                     // Counters recorded from any pre-rotation datagram no longer
@@ -1297,11 +1335,11 @@ pub async fn run_tunnel_android(
     let keepalive_ms = Arc::new(portable_atomic::AtomicU64::new(
         keepalive_interval.as_millis() as u64,
     ));
-    let mut transition_recv_keys: Option<SessionKeys> = Some(derive_session_keys(
-        &dh,
-        psk.as_ref(),
-        &keypair.public_key_bytes(),
-    ));
+    let mut transition_recv_keys: Option<SessionKeys> = Some({
+        let mut pre_ratchet = derive_session_keys(&dh, psk.as_ref(), &keypair.public_key_bytes());
+        apply_legacy_key_scheme(&mut pre_ratchet, legacy_wire);
+        pre_ratchet
+    });
     let mut transition_recv_deadline = Some(Instant::now() + Duration::from_secs(2));
     let mut transition_recv_win = std::mem::take(&mut recv_win);
     // Hard ceiling on rekey-grace re-arms (see REKEY_TRANSITION_HARD_CAP).
@@ -1878,11 +1916,15 @@ pub async fn run_tunnel_android(
                                     }
                                     let rekey_kp = KeyPair::generate();
                                     if let Ok(dh) = rekey_kp.compute_shared(&new_eph_pub) {
-                                        let new_keys = derive_session_keys(
-                                            &dh,
-                                            Some(&keys.session_key),
-                                            &rekey_kp.public_key_bytes(),
-                                        );
+                                        let new_keys = {
+                                            let mut k = derive_session_keys(
+                                                &dh,
+                                                Some(&keys.session_key),
+                                                &rekey_kp.public_key_bytes(),
+                                            );
+                                            apply_legacy_key_scheme(&mut k, legacy_wire);
+                                            k
+                                        };
                                         // Route the KeyRotate response through the upload task's
                                         // single encryptor instead of building it here with the
                                         // receive loop's separate `send_counter`. Two counters
