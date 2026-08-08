@@ -1539,12 +1539,19 @@ pub async fn run_tunnel_android(
     }
     let _ctrl_tx_guard = CtrlTxGuard;
 
-    let initial_mask = resolve_handshake_mask_resilient(
-        preferred_mask.as_deref(),
-        &current_bootstrap_descriptors(),
-        psk.as_ref(),
-        handshake_fail_streak,
-    );
+    // The data plane MUST use the very mask the handshake was accepted with: the
+    // server pins the session to that mask and reads the ciphertext at its
+    // header length. Re-resolving here used to look equivalent — same inputs,
+    // same function — but it is not: the server pushes fresh
+    // BootstrapDescriptorUpdates as soon as the session is up, so by this point
+    // `current_bootstrap_descriptors()` can return a NEWER descriptor than the
+    // one that shaped the handshake. The resolver then picks a different
+    // candidate, and if its header length differs the server decrypts every
+    // uplink DATA packet at the wrong offset: the tag still matches (it does not
+    // depend on the mask), so the session looks alive — keepalives and quality
+    // reports flow — while not one data packet gets through. Observed against a
+    // live server as a continuous `aead::Error` stream at `session_offset=20`.
+    let initial_mask = handshake_mask.clone();
 
     // (ATTEMPTED_MASK_FAMILY is published earlier, right after `handshake_mask`
     // resolves, so a handshake TIMEOUT is still attributed to the right family.
