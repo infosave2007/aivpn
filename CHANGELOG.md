@@ -1,5 +1,14 @@
 # Changelog
 
+## [1.0.3] - 2026-08-08
+
+### Fixed
+
+- **Roughly one connection key in five could never connect (#68, part of #70)** — the client framed its handshake at the protocol default header length (20 bytes), while the server reads the embedded ephemeral key at the `eph_pub_offset` of the mask it matched. For `quic_https_v2` that offset is 14, so the key landed six bytes past where the server looked: wrong DH input, wrong session keys, and a tag mismatch against every candidate of every registered client — permanently. The PSK selects the preset (`blake3(psk)[0] % 5`), so this bricked about one issued key in five at random: `--show-client` handed out a key the app could never use, and the app sat in an endless reconnect ("hangs after entering the key"). The other four presets have a 20-byte header, where the wrong value happens to equal the right one, which is why it went unnoticed. Both mobile cores now frame with the handshake mask's own length and decode the `ServerHello` at whichever length actually parses.
+- **The data plane could use a different mask than the handshake** — the handshake mask and the data mask were resolved by two separate calls. The server pushes fresh bootstrap descriptors as soon as the session is up, so the second call could see a newer descriptor set and pick a different candidate; if its header length differed, the server decrypted every uplink packet at the wrong offset while the resonance tag still matched, leaving the tunnel "connected" and carrying nothing. The session now reuses the exact mask the handshake was accepted with.
+- **Server: client traffic was dropped on any host with Docker installed** — Docker sets `iptables -P FORWARD DROP`, and netfilter evaluates the legacy iptables FORWARD hook independently of the nftables ruleset, so a packet must be accepted by both. With the nftables backend selected, client packets reached the server's tun and never left it. The accepts are now mirrored into iptables (into `DOCKER-USER` when present, which Docker never flushes) whenever the FORWARD policy is DROP, and removed on teardown. Hosts without Docker are unaffected.
+- **`make android` could publish a debug APK** — with no signing material configured the build silently fell back to `assembleDebug`, and that build shipped as the release asset in 1.0.0 and 1.0.1. A debug APK is `android:debuggable`, so anyone with adb access could attach to the VPN process and read session keys out of its memory, and its signature is the public Android debug key. The build now fails with an explanation instead; `AIVPN_ALLOW_DEBUG_APK=1` restores the old behaviour for local testing only.
+
 ## [1.0.2] - 2026-08-05
 
 ### Fixed
