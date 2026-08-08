@@ -46,6 +46,38 @@ fn detect_fw_backend() -> FwBackend {
     }
 }
 
+/// Chain to hang the compatibility accepts on, and whether they are needed.
+///
+/// netfilter runs the legacy iptables FORWARD hook independently of our nft
+/// table, so a forwarded packet must be accepted by BOTH. Docker sets
+/// `-P FORWARD DROP` on the host, which means an nft-only ruleset silently
+/// drops every client packet: the traffic reaches the server's tun and nothing
+/// ever leaves it. Prefer `DOCKER-USER` (Docker never flushes it, so the rules
+/// survive a Docker reload); fall back to `FORWARD` when that chain is absent.
+#[cfg(target_os = "linux")]
+fn iptables_forward_compat_chain() -> Option<&'static str> {
+    use std::process::Command;
+    let policy_is_drop = Command::new("iptables")
+        .args(["-S", "FORWARD"])
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).contains("-P FORWARD DROP"))
+        .unwrap_or(false);
+    if !policy_is_drop {
+        return None;
+    }
+    let has_docker_user = Command::new("iptables")
+        .args(["-S", "DOCKER-USER"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    Some(if has_docker_user {
+        "DOCKER-USER"
+    } else {
+        "FORWARD"
+    })
+}
+
 /// Add an iptables rule only if an identical rule does not already exist.
 #[cfg(target_os = "linux")]
 fn ipt_ensure(table: &str, chain: &str, rule: &[&str]) {
@@ -429,7 +461,33 @@ impl NatForwarder {
             let backend = detect_fw_backend();
             info!("Firewall backend: {:?}", backend);
             match backend {
-                FwBackend::Nftables => self.setup_nftables()?,
+                FwBackend::Nftables => {
+                    self.setup_nftables()?;
+                    // See `iptables_forward_compat_chain`: on a host where Docker
+                    // set `-P FORWARD DROP`, nft accepts alone are not enough.
+                    if let Some(chain) = iptables_forward_compat_chain() {
+                        let tun = self.tun_name.clone();
+                        ipt_ensure("filter", chain, &["-i", &tun, "-j", "ACCEPT"]);
+                        ipt_ensure(
+                            "filter",
+                            chain,
+                            &[
+                                "-o",
+                                &tun,
+                                "-m",
+                                "conntrack",
+                                "--ctstate",
+                                "ESTABLISHED,RELATED",
+                                "-j",
+                                "ACCEPT",
+                            ],
+                        );
+                        info!(
+                            "iptables: FORWARD policy is DROP — added {chain} accepts for {tun} \
+                             so nftables-forwarded client traffic is not dropped by the legacy hook"
+                        );
+                    }
+                }
                 FwBackend::Iptables => self.setup_iptables()?,
             }
             self.fw_backend = Some(backend);
@@ -709,6 +767,25 @@ impl Drop for NatForwarder {
                         .args(["delete", "table", "ip", "aivpn"])
                         .output();
                     info!("nftables: aivpn table removed");
+                    // Symmetric cleanup of the legacy-hook compatibility accepts.
+                    if let Some(chain) = iptables_forward_compat_chain() {
+                        let tun = self.tun_name.clone();
+                        ipt_delete("filter", chain, &["-i", &tun, "-j", "ACCEPT"]);
+                        ipt_delete(
+                            "filter",
+                            chain,
+                            &[
+                                "-o",
+                                &tun,
+                                "-m",
+                                "conntrack",
+                                "--ctstate",
+                                "ESTABLISHED,RELATED",
+                                "-j",
+                                "ACCEPT",
+                            ],
+                        );
+                    }
                 }
                 Some(FwBackend::Iptables) => {
                     let cidr = self.network_config.cidr_string();
