@@ -1196,6 +1196,18 @@ pub async fn run_tunnel_android(
     *ATTEMPTED_MASK_FAMILY
         .lock()
         .unwrap_or_else(|e| e.into_inner()) = Some(base_mask_family(&handshake_mask.mask_id));
+    // The handshake and every control packet MUST be framed at the handshake
+    // mask's OWN header length, not the protocol default. The server reads the
+    // embedded ephemeral key at that mask's `eph_pub_offset`, which for a
+    // 14-byte-header mask (quic_https_v2 and anything derived from it) is 14 —
+    // framing at 20 puts the key six bytes past where the server looks, so it
+    // derives the wrong session keys and rejects every candidate as a tag
+    // mismatch, forever. The PSK picks the preset, so this bricked roughly one
+    // client in five: `--show-client` handed out a key that could never connect.
+    // Masks with a 20-byte header are unaffected — the two values are equal —
+    // which is why it stayed hidden.
+    let hs_mdh_len = handshake_mask.mdh_len();
+
     // Every distinct downlink MDH length this session may see, current first.
     // The server frames different downlink packets with different masks
     // (bootstrap for early DATA, runtime/catalog for control and rekey, a
@@ -1217,7 +1229,7 @@ pub async fn run_tunnel_android(
             &mut send_counter,
             &inner,
             Some(&obf_pub),
-            mdh_len,
+            hs_mdh_len,
             &handshake_mask,
         )?;
         send_seq = send_seq.wrapping_add(1);
@@ -1258,13 +1270,32 @@ pub async fn run_tunnel_android(
                         // attempt on the first packet — keep waiting for the
                         // real ServerHello until the handshake deadline
                         // (desktop's dispatch loop just skips it).
+                        // The ServerHello comes framed at the length of the mask the server
+                        // matched. Probe on throwaway clones so a 14-byte-header session is
+                        // not discarded as a timeout; the real decode below then runs once
+                        // with the length that actually parses.
+                        let hello_mdh_len = if hs_mdh_len != mdh_len {
+                            let (mut k, mut w, mut c) = (keys.clone(), recv_win.clone(), send_counter);
+                            if process_server_hello_with_mdh_len(
+                                &recv_buf[..n], &mut k, &keypair, &mut w, &mut c, hs_mdh_len,
+                                server_signing_key.as_ref(),
+                            )
+                            .is_ok()
+                            {
+                                hs_mdh_len
+                            } else {
+                                mdh_len
+                            }
+                        } else {
+                            mdh_len
+                        };
                         match process_server_hello_with_mdh_len(
                             &recv_buf[..n],
                             &mut keys,
                             &keypair,
                             &mut recv_win,
                             &mut send_counter,
-                            mdh_len,
+                            hello_mdh_len,
                             server_signing_key.as_ref(),
                         ) {
                             Ok(cfg) => {
@@ -1310,7 +1341,7 @@ pub async fn run_tunnel_android(
                 }
                 let obf_pub = obfuscate_client_eph_pub(&keypair, &server_key);
                 let inner = build_inner_packet(InnerType::Control, send_seq, &keepalive);
-                let pkt = build_shaped_mdh_packet(&keys, &mut send_counter, &inner, Some(&obf_pub), mdh_len, &handshake_mask)?;
+                let pkt = build_shaped_mdh_packet(&keys, &mut send_counter, &inner, Some(&obf_pub), hs_mdh_len, &handshake_mask)?;
                 send_seq = send_seq.wrapping_add(1);
                 udp.send(&pkt).await?;
             }
@@ -1354,7 +1385,7 @@ pub async fn run_tunnel_android(
             &mut send_counter,
             &inner,
             None,
-            mdh_len,
+            hs_mdh_len,
             &handshake_mask,
         )?;
         send_seq = send_seq.wrapping_add(1);
@@ -1373,7 +1404,7 @@ pub async fn run_tunnel_android(
             &mut send_counter,
             &inner,
             None,
-            mdh_len,
+            hs_mdh_len,
             &handshake_mask,
         ) {
             send_seq = send_seq.wrapping_add(1);
@@ -1406,7 +1437,7 @@ pub async fn run_tunnel_android(
             _ = tokio::time::sleep(Duration::from_millis(100)) => {
                 if let Ok(ka) = (ControlPayload::Keepalive { send_ts: 0 }).encode() {
                     let inner = build_inner_packet(InnerType::Control, send_seq, &ka);
-                    if let Ok(pkt) = build_shaped_mdh_packet(&keys, &mut send_counter, &inner, None, mdh_len, &handshake_mask) {
+                    if let Ok(pkt) = build_shaped_mdh_packet(&keys, &mut send_counter, &inner, None, hs_mdh_len, &handshake_mask) {
                         send_seq = send_seq.wrapping_add(1);
                         let _ = udp.send(&pkt).await;
                     }
@@ -1430,7 +1461,7 @@ pub async fn run_tunnel_android(
                     &mut send_counter,
                     &inner,
                     None,
-                    mdh_len,
+                    hs_mdh_len,
                     &handshake_mask,
                 ) {
                     send_seq = send_seq.wrapping_add(1);
@@ -1570,7 +1601,7 @@ pub async fn run_tunnel_android(
                 &mut send_counter,
                 &inner,
                 None,
-                mdh_len,
+                hs_mdh_len,
                 &handshake_mask,
             ) {
                 send_seq = send_seq.wrapping_add(1);
@@ -1629,7 +1660,7 @@ pub async fn run_tunnel_android(
                     &mut send_counter,
                     &inner,
                     None,
-                    mdh_len,
+                    hs_mdh_len,
                     &handshake_mask,
                 ) {
                     // The packet is fully built (and the send counter/seq
