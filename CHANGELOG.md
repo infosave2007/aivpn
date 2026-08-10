@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.0.5] - 2026-08-10
+
+### Fixed
+
+- **Old clients discarded the `ServerHello` and reconnected forever** — a pre-Variant-A client compares the `ClientNetworkConfig` version byte for EQUALITY and drops the whole message when it differs. Wire v2 appended a keepalive byte and bumped that version, so the handshake completed on the server, the `ServerHello` went out, and the client silently threw it away: no ratchet, no data, another handshake minutes later, forever. Caught on a live server — the same client handshaking from the same source port every few minutes, answered each time, never sending a packet in between. The server now emits the v1 form to a peer flagged `legacy_peer`, which costs only the keepalive hint such a client never had. On production this took one looping client from 37 handshakes per 5 minutes to one per 10 minutes, and uplink decrypt failures from 2567 to zero.
+- **One client's stale packets locked out its whole home network** — the handshake-failure cooldown was keyed by source IP, and every device behind a home NAT shares one. When a single phone retried with stale keys the server blocked handshakes from that IP for up to 16 seconds, taking every other client behind the same router with it; two clients on one router were observed looping in lockstep, neither able to reconnect. Worse, the failure that armed the cooldown was often not a failure: a packet from a live session reaches the handshake path whenever the tag lookup misses (the tag window drifted, or the global rescan budget was spent that second), and the server then tried it as a handshake, found no matching client, and locked the peer out while it kept sending. Cooldowns are now keyed by the full peer address, and a peer that still has a session is exempt from both the block and the accounting. Spoofed-source floods stay bounded by the global handshake-scan budget, which varying ports does not evade.
+
 ## [1.0.4] - 2026-08-10
 
 ### Fixed
