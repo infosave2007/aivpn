@@ -106,6 +106,15 @@ pub struct Session {
     pub client_addr: SocketAddr,
     pub state: SessionState,
     pub keys: SessionKeys,
+    /// This peer speaks the pre-Variant-A protocol: tag-prefix framing and ONE
+    /// session key in both directions (`session_key_s2c` did not exist yet).
+    ///
+    /// It must be honoured at EVERY key derivation, not just the handshake: the
+    /// inline rekey installs freshly derived keys every couple of minutes, and
+    /// without this the downlink silently switches to a directional key the old
+    /// client cannot decrypt — it connects, works briefly, then reconnects
+    /// forever.
+    pub legacy_peer: bool,
     pub eph_pub: [u8; X25519_PUBLIC_KEY_SIZE],
 
     /// Packet counter for tag generation
@@ -337,6 +346,7 @@ impl Session {
     ) -> Self {
         let now = Instant::now();
         Self {
+            legacy_peer: false,
             session_id,
             client_addr,
             state: SessionState::Pending,
@@ -1611,9 +1621,15 @@ impl SessionManager {
     pub fn update_session_mask(
         &self,
         session_id: &[u8; 16],
-        new_mask: MaskProfile,
+        mut new_mask: MaskProfile,
     ) -> Option<(Arc<Mutex<Session>>, SocketAddr)> {
         if let Some(session) = self.sessions.get(session_id) {
+            // A pre-Variant-A peer can only parse tag-prefix framing, so a mask
+            // pushed to it must keep that layout whatever the profile says —
+            // otherwise the offsets diverge the moment it applies the update.
+            if session.lock().legacy_peer {
+                new_mask.tag_offset = aivpn_common::mask::LEGACY_TAG_OFFSET;
+            }
             let client_addr;
             {
                 let mut sess = session.lock();
@@ -1854,11 +1870,20 @@ impl SessionManager {
         // Mirror exactly what the client does:
         // new_keys = derive_session_keys(&dh_rekey, Some(&current_session_key), &client_rekey_eph_pub)
         let current_session_key = sess.keys.session_key;
-        let new_keys = crypto::derive_session_keys(
-            &dh_rekey,
-            Some(&current_session_key),
-            client_rekey_eph_pub,
-        );
+        let new_keys = {
+            let mut k = crypto::derive_session_keys(
+                &dh_rekey,
+                Some(&current_session_key),
+                client_rekey_eph_pub,
+            );
+            // A pre-Variant-A peer has no directional split — keep serving it
+            // the single-key contract across the rekey, or its downlink dies
+            // here and the client reconnects forever (see `legacy_peer`).
+            if sess.legacy_peer {
+                k.session_key_s2c = k.session_key;
+            }
+            k
+        };
 
         // Purge any PREVIOUS grace window's tags, then drop stale ratcheted
         // tags. The CURRENT expected_tags deliberately STAY in the global

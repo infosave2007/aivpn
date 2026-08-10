@@ -2971,6 +2971,11 @@ impl Gateway {
                                         if legacy_framing {
                                             session_mask.tag_offset = LEGACY_TAG_OFFSET;
                                             let mut s = sess.lock();
+                                            // Sticky: every later key derivation
+                                            // (PFS ratchet, inline rekey) must keep
+                                            // serving this peer the single-key
+                                            // contract, not just this handshake.
+                                            s.legacy_peer = true;
                                             s.keys.session_key_s2c = s.keys.session_key;
                                             if let Some(rk) = s.ratcheted_keys.as_mut() {
                                                 rk.session_key_s2c = rk.session_key;
