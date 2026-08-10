@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.0.4] - 2026-08-10
+
+### Fixed
+
+- **Old clients connected, then dropped into an endless reconnect** — the handshake put a pre-Variant-A peer into legacy compatibility mode (single, non-directional session key), but that was a one-shot fixup of the keys present at that moment. The inline rekey runs every couple of minutes and installs freshly derived keys, so the downlink silently switched to a directional S2C key such a client cannot decrypt: its session went deaf, the watchdog fired, and it handshaked again. Measured on a live server: 115 accepted legacy handshakes from one client in 40 minutes, each followed by silence. The session now carries an explicit `legacy_peer` flag that every key derivation honours, and a mask pushed to such a peer keeps the tag-prefix layout so a `MaskUpdate` cannot diverge the framing.
+- **Desktop clients could never use the legacy fallback** — it is a two-part contract (tag-prefix framing AND the single session key), and only the mobile cores implemented both. The desktop client, which the macOS and Windows GUIs run as their tunnel process, had neither: it could not reach a server older than the embedded-tag change, and once a server answered it in legacy compatibility mode it could not decrypt its own `ServerHello` — handshake timeout, reconnect, forever. It now mirrors the mobile ladder, collapsing the directional split for such a session at every key derivation (zero-RTT, PFS ratchet, inline rekey).
+
 ## [1.0.3] - 2026-08-08
 
 ### Fixed
