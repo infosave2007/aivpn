@@ -240,6 +240,27 @@ pub fn base_mask_family(mask_id: &str) -> String {
     }
 }
 
+/// Servers older than the directional-key split derive ONE session key and use
+/// it in BOTH directions; `session_key_s2c` did not exist yet, so their downlink
+/// is encrypted with `session_key`. A server that accepts our handshake in
+/// legacy compatibility mode speaks that same contract back to us, so collapse
+/// the split for such a session — every existing decode path then uses the right
+/// key with no other change.
+///
+/// Applied ONLY when the handshake fell back to the pre-Variant-A wire layout
+/// (`tag_offset == LEGACY_TAG_OFFSET`), i.e. only for a peer that cannot speak
+/// the modern protocol. Modern sessions keep strict directional separation.
+///
+/// Without this the client sends a legacy handshake, the server answers in
+/// legacy mode, and the client cannot decrypt its own ServerHello — the
+/// handshake times out and the app reconnects forever. Mirrors
+/// `apply_legacy_key_scheme` in the Android and iOS cores.
+fn apply_legacy_key_scheme(keys: &mut SessionKeys, legacy_wire: bool) {
+    if legacy_wire {
+        keys.session_key_s2c = keys.session_key;
+    }
+}
+
 fn packet_mdh_len_for_mask(mask: &MaskProfile) -> usize {
     mask.header_spec
         .as_ref()
@@ -516,6 +537,14 @@ pub struct AivpnClient {
 }
 
 impl AivpnClient {
+    /// Whether this session negotiated the pre-Variant-A wire layout. The mask
+    /// resolver pins `tag_offset` to `LEGACY_TAG_OFFSET` once the handshake has
+    /// fallen back to it, and a server that accepts such a handshake answers in
+    /// legacy compatibility mode — single, non-directional session key.
+    fn legacy_wire(&self) -> bool {
+        self.config.initial_mask.tag_offset == aivpn_common::mask::LEGACY_TAG_OFFSET
+    }
+
     /// Create new client
     pub fn new(config: ClientConfig) -> Result<Self> {
         let keypair = KeyPair::generate();
@@ -817,11 +846,15 @@ impl AivpnClient {
                 "absent"
             }
         );
-        self.session_keys = Some(crypto::derive_session_keys(
-            &dh_result,
-            self.config.preshared_key.as_ref(),
-            &self.keypair.public_key_bytes(),
-        ));
+        self.session_keys = Some({
+            let mut k = crypto::derive_session_keys(
+                &dh_result,
+                self.config.preshared_key.as_ref(),
+                &self.keypair.public_key_bytes(),
+            );
+            apply_legacy_key_scheme(&mut k, self.legacy_wire());
+            k
+        });
         // Fresh zero-RTT keys mean any prior PFS ratchet no longer applies —
         // the next ServerHello (for this new connection) must be allowed to
         // ratchet again.
@@ -2179,11 +2212,15 @@ impl AivpnClient {
                         return Ok(());
                     }
                 };
-                let new_keys = crypto::derive_session_keys(
-                    &dh_rekey,
-                    Some(&current_sk),
-                    &client_rekey_kp.public_key_bytes(),
-                );
+                let new_keys = {
+                    let mut k = crypto::derive_session_keys(
+                        &dh_rekey,
+                        Some(&current_sk),
+                        &client_rekey_kp.public_key_bytes(),
+                    );
+                    apply_legacy_key_scheme(&mut k, self.legacy_wire());
+                    k
+                };
                 // Send response with OLD keys before switching.
                 //
                 // send_control() only enqueues the payload onto an mpsc
@@ -2372,11 +2409,15 @@ impl AivpnClient {
                         .as_ref()
                         .ok_or(Error::Session("No session keys for ratchet".into()))?
                         .session_key;
-                    let ratcheted = crypto::derive_session_keys(
-                        &dh2,
-                        Some(&current_key),
-                        &self.keypair.public_key_bytes(),
-                    );
+                    let ratcheted = {
+                        let mut k = crypto::derive_session_keys(
+                            &dh2,
+                            Some(&current_key),
+                            &self.keypair.public_key_bytes(),
+                        );
+                        apply_legacy_key_scheme(&mut k, self.legacy_wire());
+                        k
+                    };
 
                     // Keep accepting old inbound keys until the server proves it has
                     // switched too. Outbound traffic moves to ratcheted keys now.

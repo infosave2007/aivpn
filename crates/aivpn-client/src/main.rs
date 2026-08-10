@@ -1070,6 +1070,29 @@ async fn main() {
             initial_mask
         };
 
+        // Second rung (F2): a server older than the embedded-tag layout reads
+        // the resonance tag at packet offset 0 and the ephemeral key TAG_SIZE
+        // bytes into the MDH, so every modern handshake looks like noise to it —
+        // the preset fallback above cannot help, because presets are
+        // embedded-tag too. Past LEGACY_LAYOUT_THRESHOLD, pin the pre-Variant-A
+        // layout; the client then also collapses the directional key split for
+        // the session (see `apply_legacy_key_scheme`), which is the other half
+        // of that contract. Mirrors the mobile cores' resilience ladder.
+        #[cfg(not(feature = "production-secure"))]
+        let initial_mask = if !no_fallback
+            && handshake_fail_streak >= aivpn_common::mask::LEGACY_LAYOUT_THRESHOLD
+        {
+            warn!(
+                "{} consecutive handshakes never connected — retrying with the pre-Variant-A wire layout (tag prefix + single session key) for compatibility with an older server",
+                handshake_fail_streak
+            );
+            let mut m = initial_mask;
+            m.tag_offset = aivpn_common::mask::LEGACY_TAG_OFFSET;
+            m
+        } else {
+            initial_mask
+        };
+
         // Honor --preferred-mask: override with a named built-in preset when
         // available. In polymorphic mode we deliberately leave the initial mask
         // as the bootstrap fallback (matching every GUI) so the opening burst
