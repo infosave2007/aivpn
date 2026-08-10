@@ -2211,6 +2211,37 @@ mod tests {
         )
     }
 
+    /// A live peer must be recognised by its exact address, so a stale packet
+    /// that misses the tag lookup is never charged to the handshake cooldown —
+    /// and a neighbour sharing its public IP behind NAT is never mistaken for it.
+    #[test]
+    fn has_session_for_addr_matches_the_port_not_just_the_ip() {
+        let sm = make_manager();
+        let peer: SocketAddr = "203.0.113.7:47135".parse().unwrap();
+        let neighbour: SocketAddr = "203.0.113.7:38163".parse().unwrap();
+        let stranger: SocketAddr = "198.51.100.9:47135".parse().unwrap();
+
+        assert!(!sm.has_session_for_addr(&peer));
+
+        let sid = [7u8; 16];
+        sm.sessions.insert(
+            sid,
+            Arc::new(Mutex::new(Session::new(
+                sid,
+                peer,
+                make_keys(1),
+                [0u8; X25519_PUBLIC_KEY_SIZE],
+            ))),
+        );
+
+        assert!(sm.has_session_for_addr(&peer));
+        assert!(
+            !sm.has_session_for_addr(&neighbour),
+            "another device behind the same NAT must not inherit this session"
+        );
+        assert!(!sm.has_session_for_addr(&stranger));
+    }
+
     /// Insert a ratcheted session whose last rekey is overdue, so
     /// `start_rekeying_sessions` considers it due on the next tick.
     fn insert_overdue_session(sm: &SessionManager, sid: [u8; 16]) -> Instant {
