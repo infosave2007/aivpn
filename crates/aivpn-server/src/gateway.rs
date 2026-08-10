@@ -4804,7 +4804,9 @@ impl Gateway {
             signature,
             network_config,
         };
-        let encoded = hello.encode()?;
+        // A pre-Variant-A peer rejects the current network-config wire version
+        // outright, taking the whole ServerHello with it — see `encode_for_peer`.
+        let encoded = hello.encode_for_peer(session.lock().legacy_peer)?;
         let inner_header = InnerHeader {
             inner_type: InnerType::Control,
             seq_num: 0,

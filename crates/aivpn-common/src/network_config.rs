@@ -226,6 +226,22 @@ impl ClientNetworkConfig {
         self.netmask().to_string()
     }
 
+    /// Encode for a pre-Variant-A peer: wire v1, without the trailing
+    /// `keepalive_secs` byte v2 appended.
+    ///
+    /// Such a client compares the version byte for EQUALITY and drops the whole
+    /// `ServerHello` when it does not match, so sending it v2 makes the
+    /// handshake complete on the server and die silently on the client — it
+    /// never ratchets, never sends data, and reconnects forever. The dropped
+    /// field only carries the keepalive hint, which a v1 client never had.
+    pub fn encode_wire_v1(&self) -> [u8; 12] {
+        let full = self.encode_wire();
+        let mut buf = [0u8; 12];
+        buf.copy_from_slice(&full[..12]);
+        buf[0] = Self::MIN_WIRE_VERSION;
+        buf
+    }
+
     pub fn encode_wire(&self) -> [u8; Self::WIRE_SIZE] {
         let mut buf = [0u8; Self::WIRE_SIZE];
         buf[0] = Self::WIRE_VERSION;

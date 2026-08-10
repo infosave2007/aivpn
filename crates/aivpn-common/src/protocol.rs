@@ -467,6 +467,37 @@ pub struct MaskOutcome {
 }
 
 impl ControlPayload {
+    /// Encode for a peer that may predate the current wire version.
+    ///
+    /// A pre-Variant-A client compares the `ClientNetworkConfig` version byte
+    /// for EQUALITY and drops the entire `ServerHello` when it differs, so
+    /// sending it the current (v2) form makes the handshake succeed on the
+    /// server and die silently on the client: it never ratchets, never sends
+    /// data, and reconnects forever. Emitting the v1 form for such a peer costs
+    /// only the keepalive hint, which a v1 client never had.
+    pub fn encode_for_peer(&self, legacy_peer: bool) -> Result<Vec<u8>> {
+        match (legacy_peer, self) {
+            (
+                true,
+                Self::ServerHello {
+                    server_eph_pub,
+                    signature,
+                    network_config,
+                },
+            ) => {
+                let mut buf = Vec::new();
+                buf.push(ControlSubtype::ServerHello as u8);
+                buf.extend_from_slice(server_eph_pub);
+                buf.extend_from_slice(signature);
+                if let Some(network_config) = network_config {
+                    buf.extend_from_slice(&network_config.encode_wire_v1());
+                }
+                Ok(buf)
+            }
+            _ => self.encode(),
+        }
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut buf = Vec::new();
 
