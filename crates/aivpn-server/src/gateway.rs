@@ -223,8 +223,9 @@ impl Default for GatewayConfig {
 pub struct MaskCatalog {
     /// Available masks (mask_id → MaskProfile)
     masks: DashMap<String, MaskProfile>,
-    /// Compromised mask IDs — never reuse
-    compromised: DashMap<String, Instant>,
+    /// Masks pulled from rotation by the DPI heuristic, with the profile kept
+    /// so quarantine can expire and return them. See `MASK_QUARANTINE_SECS`.
+    compromised: DashMap<String, (MaskProfile, Instant)>,
     /// Primary mask used for initial handshake parsing.
     primary_mask_id: parking_lot::Mutex<String>,
 }
@@ -245,15 +246,42 @@ impl MaskCatalog {
 
     /// Register a new mask (e.g., received via passive distribution or neural unpack)
     pub fn register_mask(&self, mask: MaskProfile) {
+        self.release_expired_quarantine();
         if !self.compromised.contains_key(&mask.mask_id) {
             self.masks.insert(mask.mask_id.clone(), mask);
         }
     }
 
-    /// Mark a mask as compromised — remove from rotation
+    /// Quarantine a mask — remove it from rotation for `MASK_QUARANTINE_SECS`.
+    ///
+    /// The signal behind this is a heuristic ("this mask reads as a tunnel"),
+    /// not proof, and it fires on ordinary traffic. Permanent removal drained
+    /// the catalog of a production server in hours: every mask ended up
+    /// quarantined, rotation stopped entirely, and the server logged "All masks
+    /// compromised" once a minute for the rest of its uptime. A mask that has
+    /// sat out the quarantine goes back into rotation.
     pub fn mark_compromised(&self, mask_id: &str) {
-        self.compromised.insert(mask_id.to_string(), Instant::now());
-        self.masks.remove(mask_id);
+        if let Some((_, mask)) = self.masks.remove(mask_id) {
+            self.compromised
+                .insert(mask_id.to_string(), (mask, Instant::now()));
+        }
+    }
+
+    /// Return masks whose quarantine has expired to live rotation.
+    fn release_expired_quarantine(&self) {
+        let quarantine = Duration::from_secs(MASK_QUARANTINE_SECS);
+        let expired: Vec<String> = self
+            .compromised
+            .iter()
+            .filter(|e| e.value().1.elapsed() >= quarantine)
+            .map(|e| e.key().clone())
+            .collect();
+        for mask_id in expired {
+            if let Some((_, (mask, _))) = self.compromised.remove(&mask_id) {
+                info!("Mask '{}' leaves quarantine, back in rotation", mask_id);
+                self.masks.insert(mask_id, mask);
+            }
+        }
     }
 
     /// Remove a mask from live rotation without marking it as compromised.
@@ -263,6 +291,7 @@ impl MaskCatalog {
 
     /// Select the best non-compromised mask, excluding `current_mask_id`
     pub fn select_fallback(&self, current_mask_id: &str) -> Option<MaskProfile> {
+        self.release_expired_quarantine();
         self.masks
             .iter()
             .filter(|e| e.key() != current_mask_id)
@@ -272,6 +301,7 @@ impl MaskCatalog {
 
     /// Get mask count
     pub fn available_count(&self) -> usize {
+        self.release_expired_quarantine();
         self.masks.len()
     }
 
@@ -726,6 +756,10 @@ const MAX_FALLBACK_SCANS_PER_SEC: u64 = 20;
 /// legitimate new-connection rate (established clients hit the fast tag_map
 /// path, not this scan).
 const MAX_HANDSHAKE_SCANS_PER_SEC: u64 = 100;
+/// How long a mask stays out of rotation after the DPI heuristic flags it.
+/// Long enough that a mask a censor really is fingerprinting stops appearing
+/// for a meaningful stretch, short enough that the catalog cannot drain.
+const MASK_QUARANTINE_SECS: u64 = 1800;
 const BOOTSTRAP_DESCRIPTOR_CANDIDATES: u8 = 4;
 
 fn bootstrap_epoch(unix_secs: u64) -> u64 {
@@ -5114,6 +5148,39 @@ fn make_kernel_update_tags(sess: &crate::session::Session) -> UpdateTagsPayload 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn quarantined_mask_returns_to_rotation_when_it_expires() {
+        use super::{MaskCatalog, MASK_QUARANTINE_SECS};
+        use std::time::{Duration, Instant};
+
+        let catalog = MaskCatalog::new();
+        let mask = aivpn_common::mask::preset_masks::bootstrap_default();
+        let mask_id = mask.mask_id.clone();
+        catalog.register_mask(mask);
+        assert_eq!(catalog.available_count(), 1);
+
+        catalog.mark_compromised(&mask_id);
+        assert_eq!(
+            catalog.available_count(),
+            0,
+            "a flagged mask must leave rotation immediately"
+        );
+
+        // Backdate the quarantine instead of sleeping through it.
+        if let Some(mut entry) = catalog.compromised.get_mut(&mask_id) {
+            entry.1 = Instant::now()
+                .checked_sub(Duration::from_secs(MASK_QUARANTINE_SECS + 1))
+                .expect("host uptime exceeds the quarantine");
+        }
+
+        assert_eq!(
+            catalog.available_count(),
+            1,
+            "the catalog must not drain permanently — see MASK_QUARANTINE_SECS"
+        );
+        assert!(catalog.select_fallback("other").is_some());
+    }
+
     use super::inner_l7_prefix;
     use super::mask_feedback_throttled;
     use super::mask_preference_throttled;
