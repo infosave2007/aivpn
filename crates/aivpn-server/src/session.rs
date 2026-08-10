@@ -1674,6 +1674,20 @@ impl SessionManager {
     ) -> Result<Vec<u8>> {
         use aivpn_common::crypto::encrypt_payload;
 
+        // A pre-Variant-A peer decodes MaskProfile as a fixed-length MessagePack
+        // array, so the fields Variant A appended (`tag_offset`,
+        // `perturbation_bounds`) make the whole update unparseable for it —
+        // rmp_serde rejects the array outright rather than ignoring the tail.
+        // It would keep its old mask while the server switched to the new one,
+        // and the downlink would go unreadable within one rotation interval
+        // (30s), which is exactly how long those clients survived in production.
+        // Such a peer stays on the mask it handshaked with.
+        if { session.lock().legacy_peer } {
+            return Err(Error::Session(
+                "peer predates the MaskUpdate profile layout — mask rotation skipped".to_string(),
+            ));
+        }
+
         // Serialize mask profile → mask_data (MessagePack to match client's rmp_serde::from_slice)
         let mask_data = rmp_serde::to_vec(new_mask)
             .map_err(|e| Error::Session(format!("Failed to serialize mask: {}", e)))?;
@@ -2209,6 +2223,34 @@ mod tests {
             ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]),
             aivpn_common::mask::preset_masks::bootstrap_default(),
         )
+    }
+
+    /// A pre-Variant-A peer must never be sent a MaskUpdate: it cannot decode
+    /// the profile, so pushing one strands it on a mask the server has left.
+    #[test]
+    fn legacy_peer_gets_no_mask_update() {
+        let sm = make_manager();
+        let sid = [3u8; 16];
+        let mut s = Session::new(
+            sid,
+            "203.0.113.7:47135".parse().unwrap(),
+            make_keys(1),
+            [0u8; X25519_PUBLIC_KEY_SIZE],
+        );
+        s.legacy_peer = true;
+        let session = Arc::new(Mutex::new(s));
+        let mask = aivpn_common::mask::preset_masks::bootstrap_default();
+
+        assert!(
+            sm.build_mask_update_packet(&session, &mask).is_err(),
+            "a legacy peer must not be handed a mask profile it cannot parse"
+        );
+
+        session.lock().legacy_peer = false;
+        assert!(
+            sm.build_mask_update_packet(&session, &mask).is_ok(),
+            "a current peer must still receive rotations"
+        );
     }
 
     /// A live peer must be recognised by its exact address, so a stale packet
