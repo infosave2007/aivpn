@@ -555,9 +555,16 @@ pub struct Gateway {
     tun_write_tx: Option<mpsc::Sender<Vec<u8>>>,
     /// Per-IP rate limiter: (packet_count, window_start)
     rate_limits: Arc<DashMap<IpAddr, (u64, Instant)>>,
-    /// Per-IP handshake failure cooldown: (failure_count, last_failure_time)
-    /// Prevents rapid session-creation loops when client retries with stale keys
-    handshake_cooldowns: Arc<DashMap<IpAddr, (u32, Instant)>>,
+    /// Per-peer handshake failure cooldown: (failure_count, last_failure_time)
+    /// Prevents rapid session-creation loops when client retries with stale keys.
+    ///
+    /// Keyed by the full socket address, not the IP: a home NAT presents every
+    /// device on it as one IP, so an IP-keyed cooldown let one phone's stale
+    /// retries lock out every other client behind the same router — observed in
+    /// production as two clients looping in lockstep, neither able to reconnect.
+    /// Spoofed-source floods are bounded by `handshake_scan_budget` instead,
+    /// which an attacker cannot evade by varying ports either.
+    handshake_cooldowns: Arc<DashMap<SocketAddr, (u32, Instant)>>,
     /// Per-IP handshake mutex: serializes concurrent handshakes arriving on
     /// different source ports from the same client, preventing duplicate sessions
     /// that compete for the same VPN IP and cause aead::Error on data packets.
@@ -2786,13 +2793,17 @@ impl Gateway {
             // Rate-limit failed handshake attempts to prevent rapid session-creation loops.
             // After mask rotation or session timeout, stale clients may flood the server
             // with packets that consistently fail tag validation (issue #21, #42).
+            // A peer with a live session that lands here is not an unknown host:
+            // its packet missed the tag lookup because the window drifted or the
+            // global rescan budget was spent this second. Blocking it would deny
+            // that client its own reconnect for up to 16s while it keeps sending.
+            let peer_has_session = self.session_manager.has_session_for_addr(&client_addr);
             {
-                let ip = client_addr.ip();
-                if let Some(entry) = self.handshake_cooldowns.get(&ip) {
+                if let Some(entry) = self.handshake_cooldowns.get(&client_addr) {
                     let (fail_count, last_fail) = *entry;
                     // Exponential cooldown: 2s → 4s → 8s → 16s (max)
                     let cooldown = Duration::from_millis((2000 * (1 << fail_count.min(3))) as u64);
-                    if last_fail.elapsed() < cooldown {
+                    if !peer_has_session && last_fail.elapsed() < cooldown {
                         debug!("Handshake cooldown active for {}: fail_count={}, elapsed={:?}, cooldown={:?}",
                             hash_addr(&client_addr), fail_count, last_fail.elapsed(), cooldown);
                         return Err(Error::InvalidPacket("Handshake cooldown active"));
@@ -3004,12 +3015,20 @@ impl Gateway {
                 match found {
                     Some(f) => f,
                     None => {
-                        // Track failed handshake for cooldown
-                        let ip = client_addr.ip();
-                        let fail_count =
-                            self.handshake_cooldowns.get(&ip).map(|e| e.0).unwrap_or(0);
+                        // Track failed handshake for cooldown — but never for a
+                        // peer whose session is still up (see `peer_has_session`).
+                        if peer_has_session {
+                            return Err(Error::InvalidPacket(
+                                "Stale packet from an established peer",
+                            ));
+                        }
+                        let fail_count = self
+                            .handshake_cooldowns
+                            .get(&client_addr)
+                            .map(|e| e.0)
+                            .unwrap_or(0);
                         self.handshake_cooldowns
-                            .insert(ip, (fail_count + 1, Instant::now()));
+                            .insert(client_addr, (fail_count + 1, Instant::now()));
                         warn!(
                             "Handshake failed for {} (attempt #{}) — tag mismatch for all {} registered clients",
                             hash_addr(&client_addr),
@@ -3141,8 +3160,8 @@ impl Gateway {
                 }
             }
 
-            // Successful handshake — clear cooldown for this IP
-            self.handshake_cooldowns.remove(&client_addr.ip());
+            // Successful handshake — clear cooldown for this peer
+            self.handshake_cooldowns.remove(&client_addr);
 
             {
                 let mut sess = session.lock();

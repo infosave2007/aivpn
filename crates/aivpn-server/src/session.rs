@@ -1242,6 +1242,19 @@ impl SessionManager {
     /// `recover_session_by_tag`'s scoping). Roamed clients whose windows were
     /// stale are still recovered by the caller's O(1) re-probe of the
     /// refreshed `tag_map`.
+    /// Whether an active session is already bound to this exact peer address.
+    ///
+    /// A packet from such a peer that misses the tag lookup is a stale or
+    /// out-of-window packet from a live tunnel, not an unknown host probing the
+    /// port — the handshake-failure cooldown must not fire on it, or the peer
+    /// locks itself out of its own reconnect. Linear over the session table,
+    /// which only runs on the already-rate-limited handshake failure path.
+    pub fn has_session_for_addr(&self, addr: &SocketAddr) -> bool {
+        self.sessions
+            .iter()
+            .any(|entry| entry.value().lock().client_addr == *addr)
+    }
+
     pub fn refresh_and_find_by_tag(
         &self,
         tag: &[u8; TAG_SIZE],
