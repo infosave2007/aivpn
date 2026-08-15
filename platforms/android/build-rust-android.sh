@@ -159,6 +159,26 @@ if [[ "${BUILD_TYPE}" == "release" ]]; then
         echo "     Release signing: custom keystore (${AIVPN_UPLOAD_KEY_ALIAS})"
     else
         echo "     Release signing: no custom keystore configured, Gradle will emit unsigned APK"
+        if [[ "${AIVPN_ALLOW_DEBUG_APK:-0}" != "1" ]]; then
+            echo "" >&2
+            echo "ERROR: release build requested with no release signing configured." >&2
+            echo "" >&2
+            echo "  Without a keystore this script used to fall back to a DEBUG APK, and that" >&2
+            echo "  build then shipped as the published release asset. A debug APK carries" >&2
+            echo "  android:debuggable=\"true\" — anyone with adb access can attach to the VPN" >&2
+            echo "  process and read session keys and the PSK out of its memory — and it is" >&2
+            echo "  signed with the public Android debug key, so it proves nothing about who" >&2
+            echo "  built it and cannot be upgraded to a properly signed build." >&2
+            echo "" >&2
+            echo "  Provide signing material via platforms/android/keystore.properties or the" >&2
+            echo "  AIVPN_UPLOAD_STORE_FILE / _STORE_PASSWORD / _KEY_ALIAS / _KEY_PASSWORD" >&2
+            echo "  environment variables (in CI: repository secrets)." >&2
+            echo "" >&2
+            echo "  For a local test build only, re-run with AIVPN_ALLOW_DEBUG_APK=1 — never" >&2
+            echo "  publish the artifact it produces." >&2
+            exit 1
+        fi
+        echo "     AIVPN_ALLOW_DEBUG_APK=1 — debug-signed fallback allowed (local testing only)"
     fi
 fi
 
@@ -210,6 +230,14 @@ if [[ "${BUILD_TYPE}" == "release" ]]; then
         fi
 
         if [[ ! -f "${APK_DST}" || "$(shasum -a 256 "${APK_DST}" | awk '{print $1}')" == "$(shasum -a 256 "${RELEASE_APK_UNSIGNED}" | awk '{print $1}')" ]]; then
+            if [[ "${AIVPN_ALLOW_DEBUG_APK:-0}" != "1" ]]; then
+                echo "" >&2
+                echo "ERROR: release signing did not produce a signed APK." >&2
+                echo "  Refusing the debug-APK fallback: it is debuggable, so anyone with adb" >&2
+                echo "  access could read session keys out of the VPN process. Fix the keystore" >&2
+                echo "  configuration, or set AIVPN_ALLOW_DEBUG_APK=1 for a local test build." >&2
+                exit 1
+            fi
             echo "  Building signed debug APK as installable fallback..."
             (
                 cd "${SCRIPT_DIR}"

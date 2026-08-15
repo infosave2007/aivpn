@@ -560,6 +560,32 @@ cargo install aivpn-server
 
 ---
 
+### Android release signing
+
+`make android` builds a **release** APK and requires signing material — it fails
+rather than falling back to a debug build. A debug APK is `android:debuggable`,
+so anyone with adb access can attach to the VPN process and read session keys
+and the PSK out of its memory, and it carries the public Android debug
+signature, which proves nothing about who built it and cannot be upgraded to a
+properly signed build later.
+
+Provide the keystore through `platforms/android/keystore.properties`:
+
+```properties
+storeFile=/absolute/path/to/release.jks
+storePassword=...
+keyAlias=...
+keyPassword=...
+```
+
+or through `AIVPN_UPLOAD_STORE_FILE`, `AIVPN_UPLOAD_STORE_PASSWORD`,
+`AIVPN_UPLOAD_KEY_ALIAS`, `AIVPN_UPLOAD_KEY_PASSWORD`. In CI these come from the
+repository secrets `ANDROID_KEYSTORE_BASE64`, `ANDROID_KEYSTORE_PASSWORD`,
+`ANDROID_KEY_ALIAS` and `ANDROID_KEY_PASSWORD`.
+
+For a throwaway local build, `AIVPN_ALLOW_DEBUG_APK=1 make android` restores the
+old debug-signed fallback. Never publish what it produces.
+
 ## Advanced Features
 
 ### Device Binding (JIT enrollment)
