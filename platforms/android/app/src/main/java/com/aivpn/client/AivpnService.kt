@@ -666,6 +666,21 @@ class AivpnService : VpnService() {
                 }
             } catch (e: CancellationException) {
                 Log.d(TAG, "Service job cancelled")
+                // The cancel may have landed while runTunnel() was still inside
+                // ensureVpnInterface(): stopVpn()/onDestroy() run closeTunnel()
+                // BEFORE establish() returns, so the freshly-established fd is
+                // assigned to vpnInterface afterwards with no owner left. The
+                // kernel then keeps that zombie tun device alive on the orphaned
+                // fd; the NEXT session establishes a second tun with the same
+                // address and downlink silently dies until the process is killed
+                // (issue #71). By this point the canceller has finished its own
+                // cleanup, so a non-null vpnInterface on a manual-stop/destroy
+                // path can only be our orphan — close it. The sessionId guard
+                // keeps a superseded session (restart path) from touching the
+                // interface the new session may already be using.
+                if (mySessionId == sessionId && (manualDisconnect || !isServiceActive)) {
+                    closeTunnel()
+                }
             } finally {
                 // Only update shared service state if this session is still the active one.
                 // A superseded session (cancelAndJoin timeout) must not clobber serviceJob,
