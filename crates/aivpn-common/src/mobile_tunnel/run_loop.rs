@@ -295,8 +295,9 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
     // native layout, so client and server MUST agree here. The FULL mask is
     // kept (not just its tag_offset) so `build_shaped_mdh_packet` can shape the
     // handshake/control MDH from the mask's `header_spec` (FIX 3: DPI-shaped
-    // opening packets instead of pure-random noise). Resolved the same way as
-    // `initial_mask` below (`preferred_mask` + PSK are stable → identical mask).
+    // opening packets instead of pure-random noise). `initial_mask` below is a
+    // clone of this very mask — the data plane must frame with the exact mask
+    // the handshake was accepted with, never a re-resolution.
     // Resilience net: after HANDSHAKE_FALLBACK_THRESHOLD consecutive handshake
     // timeouts, resolve WITHOUT the (possibly unmatchable) cached descriptors so
     // the attempt uses a builtin preset every server matches. Snapshot the
@@ -760,16 +761,24 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
     }
     let _ctrl_tx_guard = CtrlTxGuard;
 
-    let initial_mask = resolve_sticky_handshake_mask(
-        preferred_mask.as_deref(),
-        &current_bootstrap_descriptors(),
-        psk.as_ref(),
-        handshake_fail_streak,
-    );
+    // The data plane MUST use the very mask the handshake was accepted with: the
+    // server pins the session to that mask and reads the ciphertext at its
+    // header length. Re-resolving here used to look equivalent — same inputs,
+    // same function — but it is not: the server pushes fresh
+    // BootstrapDescriptorUpdates as soon as the session is up, so by this point
+    // `current_bootstrap_descriptors()` can return a NEWER descriptor than the
+    // one that shaped the handshake. The resolver then picks a different
+    // candidate, and if its header length differs the server decrypts every
+    // uplink DATA packet at the wrong offset: the tag still matches (it does not
+    // depend on the mask), so the session looks alive — keepalives and quality
+    // reports flow — while not one data packet gets through. Observed upstream
+    // against a live server as a continuous `aead::Error` stream at
+    // `session_offset=20`.
+    let initial_mask = handshake_mask.clone();
 
     // (ATTEMPTED_MASK_FAMILY is published earlier, right after `handshake_mask`
     // resolves, so a handshake TIMEOUT is still attributed to the right family.
-    // `initial_mask` resolves identically, so no second publish is needed here.)
+    // `initial_mask` IS that mask, so no second publish is needed here.)
 
     // §3 F: whether a `polymorphic:`-prefixed `MaskUpdate` has been observed,
     // set by the MaskUpdate arm in the receive loop below. Used to stop the
