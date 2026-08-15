@@ -1535,6 +1535,19 @@ impl SessionManager {
         }
     }
 
+    /// Whether an active session is already bound to this exact peer address.
+    ///
+    /// A packet from such a peer that misses the tag lookup is a stale or
+    /// out-of-window packet from a live tunnel, not an unknown host probing the
+    /// port — the handshake-failure cooldown must not fire on it, or the peer
+    /// locks itself out of its own reconnect. Linear over the session table,
+    /// which only runs on the already-rate-limited handshake failure path.
+    pub fn has_session_for_addr(&self, addr: &SocketAddr) -> bool {
+        self.sessions
+            .iter()
+            .any(|entry| entry.value().lock().client_addr == *addr)
+    }
+
     /// Refresh stale tag windows (time window may have advanced) and try to
     /// find a session matching the given tag.
     ///
@@ -2516,6 +2529,37 @@ mod tests {
             ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]),
             aivpn_common::mask::preset_masks::bootstrap_default(),
         )
+    }
+
+    /// A live peer must be recognised by its exact address, so a stale packet
+    /// that misses the tag lookup is never charged to the handshake cooldown —
+    /// and a neighbour sharing its public IP behind NAT is never mistaken for it.
+    #[test]
+    fn has_session_for_addr_matches_the_port_not_just_the_ip() {
+        let sm = make_manager();
+        let peer: SocketAddr = "203.0.113.7:47135".parse().unwrap();
+        let neighbour: SocketAddr = "203.0.113.7:38163".parse().unwrap();
+        let stranger: SocketAddr = "198.51.100.9:47135".parse().unwrap();
+
+        assert!(!sm.has_session_for_addr(&peer));
+
+        let sid = [7u8; 16];
+        sm.sessions.insert(
+            sid,
+            Arc::new(Mutex::new(Session::new(
+                sid,
+                peer,
+                make_keys(1),
+                [0u8; X25519_PUBLIC_KEY_SIZE],
+            ))),
+        );
+
+        assert!(sm.has_session_for_addr(&peer));
+        assert!(
+            !sm.has_session_for_addr(&neighbour),
+            "another device behind the same NAT must not inherit this session"
+        );
+        assert!(!sm.has_session_for_addr(&stranger));
     }
 
     /// Insert a ratcheted session whose last rekey is overdue, so

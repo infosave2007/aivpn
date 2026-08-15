@@ -167,9 +167,16 @@ pub struct Gateway {
     tun_write_tx: Option<mpsc::Sender<Vec<u8>>>,
     /// Per-IP rate limiter: (packet_count, window_start)
     rate_limits: Arc<DashMap<IpAddr, (u64, Instant)>>,
-    /// Per-IP handshake failure cooldown: (failure_count, last_failure_time)
-    /// Prevents rapid session-creation loops when client retries with stale keys
-    handshake_cooldowns: Arc<DashMap<IpAddr, (u32, Instant)>>,
+    /// Per-peer handshake failure cooldown: (failure_count, last_failure_time)
+    /// Prevents rapid session-creation loops when client retries with stale keys.
+    ///
+    /// Keyed by the full socket address, not the IP: a home NAT presents every
+    /// device on it as one IP, so an IP-keyed cooldown let one phone's stale
+    /// retries lock out every other client behind the same router — observed in
+    /// production as two clients looping in lockstep, neither able to reconnect.
+    /// Spoofed-source floods are bounded by `handshake_scan_budget` instead,
+    /// which an attacker cannot evade by varying ports either.
+    handshake_cooldowns: Arc<DashMap<SocketAddr, (u32, Instant)>>,
     /// Per-IP handshake mutex: serializes concurrent handshakes arriving on
     /// different source ports from the same client, preventing duplicate sessions
     /// that compete for the same VPN IP and cause aead::Error on data packets.

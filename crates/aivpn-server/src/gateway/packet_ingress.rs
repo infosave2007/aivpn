@@ -100,13 +100,17 @@ impl super::Gateway {
             // Rate-limit failed handshake attempts to prevent rapid session-creation loops.
             // After mask rotation or session timeout, stale clients may flood the server
             // with packets that consistently fail tag validation (issue #21, #42).
+            // A peer with a live session that lands here is not an unknown host:
+            // its packet missed the tag lookup because the window drifted or the
+            // global rescan budget was spent this second. Blocking it would deny
+            // that client its own reconnect for up to 16s while it keeps sending.
+            let peer_has_session = self.session_manager.has_session_for_addr(&client_addr);
             {
-                let ip = client_addr.ip();
-                if let Some(entry) = self.handshake_cooldowns.get(&ip) {
+                if let Some(entry) = self.handshake_cooldowns.get(&client_addr) {
                     let (fail_count, last_fail) = *entry;
                     // Exponential cooldown: 2s → 4s → 8s → 16s (max)
                     let cooldown = Duration::from_millis((2000 * (1 << fail_count.min(3))) as u64);
-                    if last_fail.elapsed() < cooldown {
+                    if !peer_has_session && last_fail.elapsed() < cooldown {
                         debug!("Handshake cooldown active for {}: fail_count={}, elapsed={:?}, cooldown={:?}",
                             hash_addr(&client_addr), fail_count, last_fail.elapsed(), cooldown);
                         return Err(Error::InvalidPacket("Handshake cooldown active"));
@@ -447,12 +451,20 @@ impl super::Gateway {
                             );
                             return Ok(());
                         }
-                        // Track failed handshake for cooldown
-                        let ip = client_addr.ip();
-                        let fail_count =
-                            self.handshake_cooldowns.get(&ip).map(|e| e.0).unwrap_or(0);
+                        // Track failed handshake for cooldown — but never for a
+                        // peer whose session is still up (see `peer_has_session`).
+                        if peer_has_session {
+                            return Err(Error::InvalidPacket(
+                                "Stale packet from an established peer",
+                            ));
+                        }
+                        let fail_count = self
+                            .handshake_cooldowns
+                            .get(&client_addr)
+                            .map(|e| e.0)
+                            .unwrap_or(0);
                         self.handshake_cooldowns
-                            .insert(ip, (fail_count + 1, Instant::now()));
+                            .insert(client_addr, (fail_count + 1, Instant::now()));
                         warn!(
                             "Handshake failed for {} (attempt #{}) — tag mismatch for all {} registered clients",
                             hash_addr(&client_addr),
@@ -1033,7 +1045,7 @@ impl super::Gateway {
                 }
             };
             if needs_descriptors {
-                self.handshake_cooldowns.remove(&client_addr.ip());
+                self.handshake_cooldowns.remove(&client_addr);
                 if let Err(e) = self.send_bootstrap_descriptors(&session).await {
                     warn!(
                         "Failed to send deferred bootstrap descriptors to {}: {}",
