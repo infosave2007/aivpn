@@ -397,9 +397,23 @@ impl super::Gateway {
                                 sid[0], sid[1], sid[2], sid[3]
                             );
                             let shutdown = ControlPayload::Shutdown { reason: 4 };
+                            // Per-SESSION mask MDH (same pattern as the inline
+                            // rekey task below and `force_disconnect_client`'s
+                            // doc comment): a session on a generated/custom mask
+                            // has a different MDH length, and a catalog-mdh
+                            // packet lands at the wrong ciphertext offset
+                            // client-side — the client would never decode
+                            // reason=4 (it still gets disconnected server-side,
+                            // but silently).
+                            let session_mdh = session
+                                .lock()
+                                .mask
+                                .as_ref()
+                                .map(packet_mdh_bytes_for_mask)
+                                .unwrap_or_else(|| mdh.clone());
                             if let Err(e) = Self::send_control_message_via(
                                 socket.as_ref(),
-                                &mdh,
+                                &session_mdh,
                                 &shutdown,
                                 session,
                             )

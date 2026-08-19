@@ -225,11 +225,27 @@ impl super::Gateway {
                             client_addr,
                         };
 
-                        if worker_txs[worker_idx].send(packet).await.is_err() {
-                            warn!(
-                                "Receive worker {} channel closed — dropping packet from {}",
-                                worker_idx, client_addr
-                            );
+                        // try_send, not send().await: awaiting a FULL worker
+                        // queue here would stall the single recv loop — and
+                        // with it EVERY session — behind one overloaded shard
+                        // (e.g. a slow TUN consumer backing up one worker's
+                        // tun_write_tx), defeating the point of sharding.
+                        // Dropping the packet degrades just that shard; UDP
+                        // peers retransmit naturally.
+                        match worker_txs[worker_idx].try_send(packet) {
+                            Ok(()) => {}
+                            Err(mpsc::error::TrySendError::Full(_)) => {
+                                warn!(
+                                    "Receive worker {} queue full — dropping packet from {}",
+                                    worker_idx, client_addr
+                                );
+                            }
+                            Err(mpsc::error::TrySendError::Closed(_)) => {
+                                warn!(
+                                    "Receive worker {} channel closed — dropping packet from {}",
+                                    worker_idx, client_addr
+                                );
+                            }
                         }
                     }
                 }

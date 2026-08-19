@@ -309,9 +309,18 @@ impl super::Gateway {
                         ShapingLevel::Off => 0,
                         ShapingLevel::Full | ShapingLevel::Light => {
                             if let Some(ref m) = sess.mask {
+                                // `+ 4` accounts for the InnerHeader
+                                // (`InnerHeader::encode` — [u8; 4]) that is
+                                // part of the encrypted plaintext below (see
+                                // the `plaintext_buf` assembly) but was missing
+                                // here: without it a max-padded packet ran
+                                // SAFE_DOWNLINK_BUDGET + 4 on the wire, and
+                                // every shaped packet sat 4 bytes above its
+                                // mask's target size.
                                 let base_overhead = TAG_SIZE
                                     + session_mdh.len()
                                     + 2
+                                    + 4
                                     + n
                                     + aivpn_common::crypto::POLY1305_TAG_SIZE;
                                 let target = m.size_distribution.sample(&mut rng);

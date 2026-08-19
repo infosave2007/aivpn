@@ -64,9 +64,9 @@ impl super::Gateway {
         // Default layout from runtime primary mask (used for handshake fallback).
         let (catalog_mdh_len, catalog_hs_mdh_len, _eph_offset, _eph_len) =
             self.mask_catalog.packet_layout();
-        let catalog_tag_offset = self
-            .mask_catalog
-            .primary_mask()
+        let catalog_primary_mask = self.mask_catalog.primary_mask();
+        let catalog_tag_offset = catalog_primary_mask
+            .as_ref()
             .map(|m| m.tag_offset)
             .unwrap_or(u16::MAX);
         let mut is_new_session = false;
@@ -140,13 +140,22 @@ impl super::Gateway {
             // its packet missed the tag lookup because the window drifted or the
             // global rescan budget was spent this second. Blocking it would deny
             // that client its own reconnect for up to 16s while it keeps sending.
-            let peer_has_session = self.session_manager.has_session_for_addr(&client_addr);
+            //
+            // `peer_has_session` is a LINEAR scan over the session pool
+            // (`SessionManager::has_session_for_addr`), so it is evaluated
+            // lazily — only where its value is actually needed: inside the
+            // per-IP cooldown check below (reachable only for an address that
+            // already failed once) and on the post-scan failure path. Computing
+            // it eagerly for EVERY handshake-branch packet would let a flood of
+            // spoofed source IPs (each bypassing the per-IP limiter) pin CPU on
+            // the scan before any rate-limit gate runs.
+            let peer_has_session = || self.session_manager.has_session_for_addr(&client_addr);
             {
                 if let Some(entry) = self.handshake_cooldowns.get(&client_addr) {
                     let (fail_count, last_fail) = *entry;
                     // Exponential cooldown: 2s → 4s → 8s → 16s (max)
                     let cooldown = Duration::from_millis((2000 * (1 << fail_count.min(3))) as u64);
-                    if !peer_has_session && last_fail.elapsed() < cooldown {
+                    if !peer_has_session() && last_fail.elapsed() < cooldown {
                         debug!("Handshake cooldown active for {}: fail_count={}, elapsed={:?}, cooldown={:?}",
                             hash_addr(&client_addr), fail_count, last_fail.elapsed(), cooldown);
                         return Err(Error::InvalidPacket("Handshake cooldown active"));
@@ -489,7 +498,7 @@ impl super::Gateway {
                         }
                         // Track failed handshake for cooldown — but never for a
                         // peer whose session is still up (see `peer_has_session`).
-                        if peer_has_session {
+                        if peer_has_session() {
                             return Err(Error::InvalidPacket(
                                 "Stale packet from an established peer",
                             ));
@@ -575,10 +584,16 @@ impl super::Gateway {
                 })?
             };
 
-            // Validate the tag against the session.
+            // Validate the tag against the session. This MUST use the same
+            // ±2-window skew budget as the per-candidate scan above
+            // (`validate_handshake_tag`, see its doc comment) — not the
+            // data-plane `validate_tag` (±1) — or a client whose RTC drifted
+            // ~10-25s passes the candidate scan, then fails this narrower
+            // gate, rolls back, and ratchets its own handshake cooldown on
+            // every retry (permanent lockout).
             let validation = {
                 let sess = session.lock();
-                sess.validate_tag(&tag)
+                sess.validate_handshake_tag(&tag)
             };
             let (counter, is_ratcheted) = match validation {
                 Some(result) => result,
@@ -897,8 +912,18 @@ impl super::Gateway {
         // During mask transition (bootstrap → runtime), also try the catalog
         // (runtime) layout in case the client already applied MaskUpdate — using
         // the catalog mask's OWN prefix, which may differ from the session's.
+        // The prefix MUST be computed length-aware (`effective_tag_prefix_len`)
+        // exactly like the session-mask prefixes above: a catalog mask whose
+        // embedded tag does not fit `catalog_mdh_len` is encoded by the client
+        // with the legacy TAG_SIZE prefix, so the length-blind
+        // `tag_prefix_len(catalog_tag_offset)` would point at the wrong
+        // ciphertext offset for such masks.
         {
-            let catalog_offset = tag_prefix_len(catalog_tag_offset) + catalog_mdh_len;
+            let catalog_prefix = catalog_primary_mask
+                .as_ref()
+                .map(|m| m.effective_tag_prefix_len(catalog_mdh_len))
+                .unwrap_or_else(|| tag_prefix_len(catalog_tag_offset));
+            let catalog_offset = catalog_prefix + catalog_mdh_len;
             if !payload_offsets.contains(&catalog_offset) {
                 payload_offsets.push(catalog_offset);
             }
@@ -933,11 +958,20 @@ impl super::Gateway {
             let key = if is_new_session {
                 &sess.keys.session_key
             } else if is_ratcheted_tag {
-                &sess
-                    .ratcheted_keys
-                    .as_ref()
-                    .ok_or(Error::InvalidPacket("Ratcheted keys missing"))?
-                    .session_key
+                // Ratchet-seam race: `find_existing_session` validated this tag
+                // against `ratcheted_expected_tags`, but a concurrent worker may
+                // have run `complete_session_ratchet` since, which TOOK
+                // `ratcheted_keys` and folded them INTO `sess.keys` (see
+                // `Session::complete_ratchet`). The tag is the same key either
+                // way, so fall back to the (now post-ratchet) primary keys
+                // instead of dropping a legitimate packet. Replay safety is
+                // unaffected: post-completion the same counter→tag pairs live
+                // in `expected_tags` and the packet flows through the normal
+                // replay-window bookkeeping below.
+                match sess.ratcheted_keys.as_ref() {
+                    Some(ratcheted) => &ratcheted.session_key,
+                    None => &sess.keys.session_key,
+                }
             } else {
                 &sess.keys.session_key
             };

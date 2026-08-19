@@ -176,7 +176,24 @@ impl PendingConfigManager {
     /// expired-and-was-swept (both surface as "not found" to the caller —
     /// see `mgmt_service::confirm_config`).
     pub fn confirm(&self, token: &str) -> bool {
-        self.inner.remove(token).is_some()
+        self.confirm_and_take(token).is_some()
+    }
+
+    /// [`Self::confirm`] variant that also returns the confirmed entry, so a
+    /// caller can tell WHAT was confirmed (e.g. gate a live-apply side effect
+    /// on the confirmed change's `target_path` — confirming a mask override
+    /// must not take an unrelated, still-pending `server.json` exit-node
+    /// change live).
+    pub fn confirm_and_take(&self, token: &str) -> Option<PendingConfig> {
+        self.inner.remove(token).map(|(_, v)| v)
+    }
+
+    /// True when a still-pending (unconfirmed, unswept) change targets
+    /// `path`. Lets a caller that wraps a whole `mgmt_service::dispatch`
+    /// detect "THIS request confirmed a change to that file" as
+    /// pending-before ∧ gone-after.
+    pub fn has_pending_for_path(&self, path: &Path) -> bool {
+        self.inner.iter().any(|e| e.value().target_path == path)
     }
 
     /// Sweep every tracked entry: remove and return every unconfirmed
@@ -417,6 +434,42 @@ mod tests {
             mgr.len(),
             1,
             "tok-2 (not yet expired) must still be tracked"
+        );
+    }
+
+    #[test]
+    fn confirm_and_take_returns_the_confirmed_entry_exactly_once() {
+        let start = Instant::now();
+        let mgr = PendingConfigManager::new();
+        mgr.begin(pc(start, Duration::from_secs(120)));
+
+        let confirmed = mgr
+            .confirm_and_take("tok-1")
+            .expect("confirm_and_take must find the pending token");
+        assert_eq!(confirmed.token(), "tok-1");
+        assert_eq!(confirmed.target_path(), Path::new("/tmp/aivpn-test.mask"));
+        assert!(mgr.is_empty());
+        assert!(
+            mgr.confirm_and_take("tok-1").is_none(),
+            "an already-taken token must not confirm twice"
+        );
+    }
+
+    #[test]
+    fn has_pending_for_path_matches_only_live_entries_targeting_that_path() {
+        // Backs the "did THIS request confirm a change to server.json?" gate
+        // in the REST/tunnel confirm handlers: pending-before ∧ gone-after.
+        let start = Instant::now();
+        let mgr = PendingConfigManager::new();
+        mgr.begin(pc(start, Duration::from_secs(120))); // /tmp/aivpn-test.mask
+
+        assert!(mgr.has_pending_for_path(Path::new("/tmp/aivpn-test.mask")));
+        assert!(!mgr.has_pending_for_path(Path::new("/tmp/other.mask")));
+
+        assert!(mgr.confirm("tok-1"));
+        assert!(
+            !mgr.has_pending_for_path(Path::new("/tmp/aivpn-test.mask")),
+            "a confirmed (removed) entry must no longer report as pending"
         );
     }
 }

@@ -84,6 +84,31 @@ mod publish_impl {
         std::time::Duration::from_secs(120),
     ];
 
+    /// Bounds on every outbound publish HTTP request. `publish_all` is
+    /// awaited by the hourly descriptor-rotation task
+    /// (`gateway/run_loop.rs`), so a hung endpoint (TCP connect blackhole,
+    /// stalled TLS, a server that accepts but never answers) without a
+    /// timeout would stop descriptor rotation until process restart — and
+    /// block the channels queued behind it, breaking the "one failing
+    /// channel never blocks the others" contract.
+    const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+    const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+    /// HTTP client with the bounds above applied. `build()` here is
+    /// effectively infallible (no TLS/proxy config that could fail to
+    /// parse), but fall back to a default client rather than panic the
+    /// rotation task if it ever isn't.
+    fn http_client() -> reqwest::Client {
+        reqwest::Client::builder()
+            .connect_timeout(CONNECT_TIMEOUT)
+            .timeout(REQUEST_TIMEOUT)
+            .build()
+            .unwrap_or_else(|e| {
+                warn!("reqwest client build failed ({e}); falling back to default client");
+                reqwest::Client::new()
+            })
+    }
+
     /// Publish `descriptors_json` (the same JSON-array shape produced by
     /// `--export-bootstrap-descriptor` and the management API export
     /// endpoint) to every enabled channel. Channels are independent — one
@@ -204,7 +229,7 @@ mod publish_impl {
         );
 
         let url = format!("{endpoint_trimmed}{canonical_uri}");
-        let client = reqwest::Client::new();
+        let client = http_client();
         let resp = client
             .put(&url)
             .header("Host", host)
@@ -238,7 +263,7 @@ mod publish_impl {
             unreachable!()
         };
 
-        let client = reqwest::Client::new();
+        let client = http_client();
         let auth_header = format!("Bearer {token}");
 
         // Find (or create) the release for our fixed tag, since the client
@@ -362,7 +387,7 @@ mod publish_impl {
             .text("chat_id", chat_id.clone())
             .part("document", part);
 
-        let client = reqwest::Client::new();
+        let client = http_client();
         let resp = client
             .post(&url)
             .multipart(form)

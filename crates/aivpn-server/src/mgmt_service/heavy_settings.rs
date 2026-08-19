@@ -257,6 +257,19 @@ pub fn apply_heavy(
         );
         return Err(MgmtError::Internal(format!("write failed: {}", e)));
     }
+    // The ExitNode heavy setting targets `server.json`, which can hold
+    // plaintext secrets (bootstrap_publish tokens). std::fs::write() creates
+    // the temp file with the process umask (commonly 0644 under root), so
+    // the rename would silently DOWNGRADE an operator-set 0600 on the live
+    // file. Harden the temp file BEFORE the rename — same pattern as
+    // `ClientDatabase::save` / `backup::import_server`.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(e) = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600)) {
+            tracing::warn!("Failed to set pending config permissions to 0600: {}", e);
+        }
+    }
     if let Err(e) = std::fs::rename(&tmp, &resolved.target_path) {
         // Best-effort: don't leave the orphaned temp file behind.
         let _ = std::fs::remove_file(&tmp);
@@ -293,25 +306,34 @@ pub fn apply_heavy(
 }
 
 /// Confirm a pending change by `token` — cancels its rollback, making the
-/// change permanent. `MgmtError::NotFound` for an unknown token OR one
-/// that already expired and was rolled back by the sweep task before this
-/// call arrived (both are indistinguishable to the caller: "there is
-/// nothing left to confirm").
-pub fn confirm_config(ctx: &MgmtCtx, token: &str) -> Result<(), MgmtError> {
+/// change permanent. Returns the confirmed [`PendingConfig`] on success so
+/// the caller can gate change-specific live side effects on WHAT was
+/// confirmed (e.g. the REST/Unix-socket `confirm_config` handler only
+/// hot-swaps the live global exit node when the confirmed entry's
+/// `target_path` is `server.json` — confirming an unrelated ActiveMask
+/// token must not take a still-pending, unconfirmed exit-node change live,
+/// see `management_api::confirm_config`). `MgmtError::NotFound` for an
+/// unknown token OR one that already expired and was rolled back by the
+/// sweep task before this call arrived (both are indistinguishable to the
+/// caller: "there is nothing left to confirm").
+pub fn confirm_config(ctx: &MgmtCtx, token: &str) -> Result<PendingConfig, MgmtError> {
     let manager = ctx.pending_config.ok_or_else(|| {
         MgmtError::Internal("pending-config manager not configured on this node".into())
     })?;
-    if manager.confirm(token) {
-        audit(ctx, "ConfigConfirm", token, "ok");
-        Ok(())
-    } else {
-        audit(
-            ctx,
-            "ConfigConfirm",
-            token,
-            "failed: unknown or expired token",
-        );
-        Err(MgmtError::NotFound)
+    match manager.confirm_and_take(token) {
+        Some(confirmed) => {
+            audit(ctx, "ConfigConfirm", token, "ok");
+            Ok(confirmed)
+        }
+        None => {
+            audit(
+                ctx,
+                "ConfigConfirm",
+                token,
+                "failed: unknown or expired token",
+            );
+            Err(MgmtError::NotFound)
+        }
     }
 }
 
@@ -582,5 +604,111 @@ mod tests {
         )
         .expect_err("ExitNode must fail cleanly when this node has no config_path");
         assert!(matches!(err, MgmtError::Unavailable(_)));
+    }
+    #[test]
+    fn confirm_config_returns_the_confirmed_entry_so_callers_gate_live_apply_on_it() {
+        // Regression: the REST/tunnel confirm handlers live-apply the global
+        // exit node ONLY when the token being confirmed actually targeted
+        // server.json — confirming an unrelated ActiveMask token while an
+        // exit-node change is still pending must NOT take that unconfirmed
+        // change live (`apply_global_exit_and_teardown` re-reads the whole
+        // file). This test pins the confirm→target_path signal both
+        // handlers gate on.
+        let (_dir, db) = test_db();
+        let mask_tmp = tempfile::tempdir().unwrap();
+        let mask_dir = mask_tmp.path().to_path_buf();
+        setup_mask_file(&mask_dir, "quic-video");
+        let config_tmp = tempfile::tempdir().unwrap();
+        let config_path = config_tmp.path().join("server.json");
+        std::fs::write(&config_path, br#"{"listen_addr":"0.0.0.0:443"}"#).unwrap();
+
+        let pending = PendingConfigManager::new();
+        let c = ctx_with_pending_and_config(&db, &mask_dir, &pending, &config_path);
+        let created = add_client(
+            &c,
+            AddClientArgs {
+                name: "nadia".into(),
+                one_time: false,
+                expires_at: None,
+                role: ClientRole::User,
+                qos: None,
+            },
+        )
+        .unwrap();
+
+        let mask_resp = apply_heavy(
+            &c,
+            HeavySetting::ActiveMask {
+                client: created.id.clone(),
+                mask: "quic-video".into(),
+            },
+            Instant::now(),
+        )
+        .unwrap();
+        let exit_resp = apply_heavy(
+            &c,
+            HeavySetting::ExitNode {
+                addr: Some("198.51.100.7:51820".to_string()),
+            },
+            Instant::now(),
+        )
+        .unwrap();
+
+        // Confirming the MASK token returns an entry that does NOT target
+        // server.json — and leaves the exit-node change pending.
+        let confirmed_mask = confirm_config(&c, &mask_resp.token).expect("mask confirm");
+        assert_ne!(
+            confirmed_mask.target_path(),
+            config_path.as_path(),
+            "a mask confirm must not be mistakable for an exit-node change"
+        );
+        assert!(
+            pending.has_pending_for_path(&config_path),
+            "the unrelated exit-node change must still be pending"
+        );
+
+        // Confirming the EXIT-NODE token returns an entry targeting
+        // server.json — the gate's positive case.
+        let confirmed_exit = confirm_config(&c, &exit_resp.token).expect("exit-node confirm");
+        assert_eq!(confirmed_exit.target_path(), config_path.as_path());
+        assert!(!pending.has_pending_for_path(&config_path));
+    }
+    #[cfg(unix)]
+    #[test]
+    fn apply_heavy_lands_server_json_with_owner_only_permissions() {
+        // Regression: the tmp+rename write created the file with the process
+        // umask (0644), silently DOWNGRADING an operator-set 0600 on
+        // server.json (which can hold bootstrap_publish tokens). The temp
+        // file must be hardened to 0600 BEFORE the rename, mirroring
+        // `ClientDatabase::save`.
+        use std::os::unix::fs::PermissionsExt;
+        let (_dir, db) = test_db();
+        let mask_tmp = tempfile::tempdir().unwrap();
+        let mask_dir = mask_tmp.path().to_path_buf();
+        let config_tmp = tempfile::tempdir().unwrap();
+        let config_path = config_tmp.path().join("server.json");
+        std::fs::write(&config_path, br#"{"listen_addr":"0.0.0.0:443"}"#).unwrap();
+
+        let pending = PendingConfigManager::new();
+        let c = ctx_with_pending_and_config(&db, &mask_dir, &pending, &config_path);
+
+        apply_heavy(
+            &c,
+            HeavySetting::ExitNode {
+                addr: Some("198.51.100.7:51820".to_string()),
+            },
+            Instant::now(),
+        )
+        .expect("apply_heavy ExitNode should succeed");
+
+        let mode = std::fs::metadata(&config_path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "server.json must be owner-only after a heavy-setting write"
+        );
     }
 }

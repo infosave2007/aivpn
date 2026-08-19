@@ -95,6 +95,15 @@ impl super::Gateway {
             } else {
                 (None, None)
             };
+            // Snapshot BEFORE dispatch whether a rollback-guarded change to
+            // `server.json` (today: `HeavySetting::ExitNode` — the only
+            // `HeavySetting` whose `target_path` is the config file) is
+            // still pending. Combined with the same check AFTER dispatch
+            // below, this detects "THIS request just confirmed an exit-node
+            // change" — the only event that may take `pool.exit_node` live.
+            let exit_change_pending_before = server_config_path
+                .as_deref()
+                .is_some_and(|p| pending_config.has_pending_for_path(p));
             let ctx = mgmt_service::MgmtCtx {
                 db: &db,
                 server_pub_key,
@@ -114,20 +123,40 @@ impl super::Gateway {
             // from `server.json`, swap `masked_exit_addr` if it changed,
             // pick up any newly-referenced per-client `exit_node`, and prune
             // any now-unreferenced runtime exit dial — all in the SAME
-            // blocking-thread pass. A confirmed `HeavySetting::ExitNode`
-            // apply (this very request, or an earlier one via the tunnel OR
-            // REST) only ever PERSISTS the change to disk (see that
-            // variant's doc comment); this is what makes it also take
-            // effect on this node's own live routing, without a restart.
-            // See `apply_global_exit_and_teardown`'s doc comment — the SAME
-            // function `management_api::apply_config`/`confirm_config` call
-            // for the REST/Unix-socket path.
-            apply_global_exit_and_teardown(
-                &masked_exit_addr,
-                pool_dialer_for_exit.as_ref(),
-                server_config_path.as_deref(),
-                &db,
-            );
+            // blocking-thread pass. GATED on this dispatch having just
+            // confirmed a pending `server.json` change: running it
+            // unconditionally after EVERY mgmt request re-read the whole
+            // file and took an applied-but-UNCONFIRMED `exit_node` live,
+            // which the rollback sweep could still revert out from under
+            // live routing (see `management_api::confirm_config`'s matching
+            // gate on the confirmed entry's `target_path`). A rollback-sweep
+            // removal races harmlessly: the sweep restores the file first
+            // and applies the same swap itself, and this function is a
+            // re-read idempotent.
+            let exit_change_confirmed = exit_change_pending_before
+                && server_config_path
+                    .as_deref()
+                    .is_some_and(|p| !pending_config.has_pending_for_path(p));
+            if exit_change_confirmed {
+                apply_global_exit_and_teardown(
+                    &masked_exit_addr,
+                    pool_dialer_for_exit.as_ref(),
+                    server_config_path.as_deref(),
+                    &db,
+                );
+            } else if let Some(dialer) = pool_dialer_for_exit.as_ref() {
+                // The per-client half of the live-exit bookkeeping still
+                // runs after EVERY dispatched request: client-DB mutations
+                // (a client's own `exit_node`) take effect immediately and
+                // are NOT rollback-guarded — same split as the REST
+                // `update_client` handler, which deliberately does NOT call
+                // the full `apply_global_exit_and_teardown` (that would
+                // re-read `server.json` and take an unconfirmed global
+                // exit-node change live).
+                let clients = db.list_clients();
+                add_dial_peers_for_client_exits_for(dialer, &clients);
+                teardown_unused_exit_dials_for(&masked_exit_addr, Some(dialer), &clients);
+            }
             response
         })
         .await;
@@ -308,7 +337,7 @@ impl super::Gateway {
     /// Handle an inbound `PoolSync` control message (peer pushes its client-DB
     /// delta for CRDT merge). Extracted verbatim from the
     /// `handle_control_message` match arm — thin dispatch, no behavior change.
-    fn on_pool_sync(
+    async fn on_pool_sync(
         &self,
         session: &Arc<parking_lot::Mutex<Session>>,
         client_addr: SocketAddr,
@@ -338,9 +367,18 @@ impl super::Gateway {
                 "rejected: not a pool peer",
             );
         } else if let Some(ref db) = self.client_db {
-            let json_str = String::from_utf8_lossy(&clients_json);
-            match db.merge_from_json(&json_str) {
-                Ok(n) => {
+            let json_str = String::from_utf8_lossy(&clients_json).into_owned();
+            // `merge_from_json` does blocking file IO (`reload_if_changed`'s
+            // stat+read, then `ClientDatabase::save`'s std::fs::write) — the
+            // same class of blocking call `dispatch_mgmt_request` above keeps
+            // off the tokio reactor thread with spawn_blocking. PoolSync
+            // arrives periodically from EVERY peer, so a slow disk here would
+            // stall the whole control-plane dispatch loop.
+            let db = db.clone();
+            let merge_result =
+                tokio::task::spawn_blocking(move || db.merge_from_json(&json_str)).await;
+            match merge_result {
+                Ok(Ok(n)) => {
                     info!(
                         "pool_sync: merged {} clients from peer {}",
                         n,
@@ -362,8 +400,13 @@ impl super::Gateway {
                     // default forever.
                     self.add_dial_peers_for_client_exits();
                 }
-                Err(e) => warn!(
+                Ok(Err(e)) => warn!(
                     "pool_sync: merge failed from {}: {}",
+                    hash_addr(&client_addr),
+                    e
+                ),
+                Err(e) => warn!(
+                    "pool_sync: merge task panicked for {}: {}",
                     hash_addr(&client_addr),
                     e
                 ),
@@ -1497,7 +1540,7 @@ impl super::Gateway {
                 // Client-side only, ignore on server
             }
             ControlPayload::PoolSync { clients_json } => {
-                self.on_pool_sync(session, client_addr, clients_json);
+                self.on_pool_sync(session, client_addr, clients_json).await;
             }
             ControlPayload::PoolStateDigest { digest } => {
                 self.on_pool_state_digest(session, client_addr, digest)

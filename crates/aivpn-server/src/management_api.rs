@@ -700,8 +700,28 @@ async fn put_config(
     let db = state.db.clone();
     let path_for_log = path.display().to_string();
     match tokio::task::spawn_blocking(move || -> Result<(), std::io::Error> {
-        let tmp = path.with_extension("tmp");
+        // Unique (random-suffixed) temp name: two concurrent PUTs must not
+        // share one `<file>.tmp` — interleaved write/rename of a shared name
+        // can rename the OTHER writer's half-written content into place.
+        // Mirrors `heavy_settings::apply_heavy`'s randomized temp-file
+        // pattern.
+        let mut suffix = [0u8; 16];
+        rand::rngs::OsRng.fill_bytes(&mut suffix);
+        let tmp = path.with_extension(format!("tmp.{}", hex::encode(suffix)));
         std::fs::write(&tmp, &content)?;
+        // server.json can hold plaintext secrets (e.g. bootstrap_publish S3 /
+        // GitHub / Telegram tokens). std::fs::write() creates the temp file
+        // with the process umask (commonly 0644 under root), so a rename
+        // would silently DOWNGRADE an operator-set 0600 on the live file.
+        // Harden the temp file BEFORE the rename makes it visible — same
+        // pattern as `ClientDatabase::save`.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Err(e) = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600)) {
+                tracing::warn!("Failed to set server config permissions to 0600: {}", e);
+            }
+        }
         std::fs::rename(&tmp, &path)?;
         db.reload_if_changed();
         Ok(())
@@ -1071,8 +1091,8 @@ async fn confirm_config(
     // (see `ServeConfig::masked_exit_addr`'s doc comment) — but nothing on
     // this path used to re-apply a confirmed `pool.exit_node` change to
     // that live state, unlike the in-tunnel path
-    // (`Gateway::dispatch_mgmt_request`), which re-reads and hot-swaps it
-    // after EVERY mgmt request. Capture what's needed BEFORE `state` is
+    // (`Gateway::dispatch_mgmt_request`), which hot-swaps it once a pending
+    // exit-node change is confirmed. Capture what's needed BEFORE `state` is
     // moved into the blocking closure below.
     let masked_exit_addr = state.masked_exit_addr.clone();
     let pool_dialer_slot = state.pool_dialer_slot.clone();
@@ -1082,30 +1102,38 @@ async fn confirm_config(
         mgmt_service::confirm_config(&state.mgmt_ctx(), &body.token)
     })
     .await;
-    if matches!(result, Ok(Ok(()))) {
+    if let Ok(Ok(confirmed)) = &result {
         // Only a CONFIRMED change (never a merely-applied, still-pending
-        // one) goes live here — an applied-but-unconfirmed `ExitNode`
-        // change already sits on disk with a rollback token
-        // (`apply_heavy`/`PendingConfigManager`), and going live before
-        // confirmation would leave this node's live routing pointed at a
-        // value the gateway's own sweep task could still revert out from
-        // under it. Mirrors the tunnel path's own re-read, just gated on
-        // this specific request having confirmed successfully rather than
+        // one) goes live here — and only when the change THIS token
+        // confirmed actually targeted `server.json` (today that is exactly
+        // `HeavySetting::ExitNode`; `ActiveMask` targets a `.overrides/*.mask`
+        // file). Gating on the confirmed entry's `target_path` matters:
+        // `apply_global_exit_and_teardown` re-reads `server.json` wholesale,
+        // so running it after confirming an UNRELATED token would take an
+        // applied-but-unconfirmed exit-node change live, where the gateway's
+        // own sweep task could still roll it back out from under live
+        // routing. Mirrors the tunnel path's own re-read, just gated on this
+        // specific request having confirmed an exit-node change rather than
         // running unconditionally after every mgmt call.
-        if let Some(masked_exit_addr) = &masked_exit_addr {
-            let dialer = pool_dialer_slot
-                .as_ref()
-                .and_then(|slot| slot.lock().clone());
-            crate::gateway::apply_global_exit_and_teardown(
-                masked_exit_addr,
-                dialer.as_ref(),
-                server_config_path.as_deref(),
-                &db_for_exit,
-            );
+        let confirmed_exit_node = server_config_path
+            .as_deref()
+            .is_some_and(|p| confirmed.target_path() == p);
+        if confirmed_exit_node {
+            if let Some(masked_exit_addr) = &masked_exit_addr {
+                let dialer = pool_dialer_slot
+                    .as_ref()
+                    .and_then(|slot| slot.lock().clone());
+                crate::gateway::apply_global_exit_and_teardown(
+                    masked_exit_addr,
+                    dialer.as_ref(),
+                    server_config_path.as_deref(),
+                    &db_for_exit,
+                );
+            }
         }
     }
     match result {
-        Ok(Ok(())) => StatusCode::NO_CONTENT.into_response(),
+        Ok(Ok(_)) => StatusCode::NO_CONTENT.into_response(),
         Ok(Err(e)) => mgmt_error_response(&e),
         Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, err("internal error")).into_response(),
     }

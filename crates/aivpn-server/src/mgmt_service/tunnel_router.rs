@@ -408,7 +408,7 @@ pub fn dispatch(ctx: &MgmtCtx, method: u8, path: &str, body: &[u8]) -> (u16, Vec
                 Err(_) => return (400, Vec::new()),
             };
             match confirm_config(ctx, &req.token) {
-                Ok(()) => (204, Vec::new()),
+                Ok(_) => (204, Vec::new()),
                 Err(e) => err_response(e),
             }
         }
