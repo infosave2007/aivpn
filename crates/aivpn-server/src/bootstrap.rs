@@ -30,6 +30,59 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tracing::{error, info};
 
+/// Wire the event bus to the configured webhook (`AIVPN_EVENT_WEBHOOK`), if
+/// any. Delivery is best-effort: `emit()` hands each serialized JSON event
+/// line to an unbounded channel (synchronous, never blocks the data path),
+/// and a background task POSTs them one at a time with a hard timeout — a
+/// failing endpoint only logs, it can never stall or kill the event path.
+/// Requires the `event-webhook` cargo feature (pulls in reqwest); without it
+/// a configured URL is rejected loudly instead of silently ignored.
+#[cfg(feature = "event-webhook")]
+fn install_webhook_forwarder(event_bus: &EventBus) {
+    let Some(url) = event_bus.webhook_url().map(str::to_owned) else {
+        return;
+    };
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    event_bus.set_event_sink(Arc::new(move |line: &str| {
+        // A closed receiver (forwarder task died) must never fail emit().
+        let _ = tx.send(line.to_owned());
+    }));
+    tokio::spawn(async move {
+        let client = match reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+        {
+            Ok(c) => c,
+            Err(e) => {
+                error!("event webhook: failed to build HTTP client: {e}");
+                return;
+            }
+        };
+        while let Some(line) = rx.recv().await {
+            if let Err(e) = client
+                .post(&url)
+                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .body(line)
+                .send()
+                .await
+            {
+                error!("event webhook: POST to {url} failed: {e}");
+            }
+        }
+    });
+    info!("event webhook forwarder installed");
+}
+
+#[cfg(not(feature = "event-webhook"))]
+fn install_webhook_forwarder(event_bus: &EventBus) {
+    if event_bus.webhook_url().is_some() {
+        error!(
+            "AIVPN_EVENT_WEBHOOK is set, but this server build lacks the `event-webhook` \
+             feature — webhook delivery is DISABLED (events go to stdout only)"
+        );
+    }
+}
+
 /// Runs the server: logging init, `Gateway`/`AivpnServer` construction,
 /// management API + pool-sync/site-to-site wiring, then blocks on
 /// `server.run()` until shutdown or a fatal error (`std::process::exit`).
@@ -183,11 +236,10 @@ pub async fn run_server(
     #[cfg(all(feature = "management-api", unix))]
     let mgmt_socket_group = file_config.as_ref().and_then(|c| c.management_socket_group);
 
-    // Build structured event bus (stdout JSONL sink)
-    let event_bus = EventBus::new(EventSinkConfig {
-        stdout: true,
-        webhook_url: None,
-    });
+    // Build structured event bus (stdout JSONL sink + optional webhook forwarder,
+    // the latter from `AIVPN_EVENT_WEBHOOK` — see `install_webhook_forwarder`).
+    let event_bus = EventBus::new(EventSinkConfig::from_env());
+    install_webhook_forwarder(&event_bus);
 
     // Audit logger
     let audit_logger = AuditLogger::new(std::path::Path::new(&args.audit_log));

@@ -106,7 +106,10 @@ pub struct GatewayConfig {
     pub bootstrap_masks: Vec<MaskProfile>,
     /// Server-side NAT TUN MTU. Does not affect client VPN MTU (carried in ServerHello).
     pub tun_mtu: u16,
-    /// Structured event bus — emits JSON-lines events to stdout (and optional webhook).
+    /// Structured event bus — emits JSON-lines events to stdout; when
+    /// `AIVPN_EVENT_WEBHOOK` is set (and the server is built with the
+    /// `event-webhook` feature), events are also POSTed to that URL
+    /// (see `bootstrap.rs::install_webhook_forwarder`).
     pub event_bus: EventBus,
     /// Per-client QoS enforcer (token bucket + DSCP).
     pub qos_enforcer: Arc<QosEnforcer>,

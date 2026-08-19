@@ -82,6 +82,9 @@ neural = ["aivpn-common/dpi-gate"]
 metrics = ["prometheus"]
 passive-distribution = ["reqwest"]
 dns = ["reqwest"]
+# Structured-event webhook delivery (`AIVPN_EVENT_WEBHOOK` → HTTP POST per
+# event) — see `bootstrap.rs::install_webhook_forwarder`.
+event-webhook = ["reqwest"]
 management-api = ["axum", "tower", "hyper", "hyper-util", "tokio-stream", "anyhow"]
 production-secure = []
 bootstrap-publish = ["reqwest", "hmac"]

@@ -634,7 +634,9 @@ unsafe fn copy_string_getter(
 /// poll tick.
 #[no_mangle]
 pub extern "C" fn aivpn_get_recording_feedback_seq() -> i64 {
-    RECORDING_FEEDBACK_SEQ.load(Ordering::Relaxed) as i64
+    // catch_unwind so no panic can ever unwind across the FFI boundary and
+    // abort the Network Extension process (LOW-2 pattern, mirrors android-core).
+    std::panic::catch_unwind(|| RECORDING_FEEDBACK_SEQ.load(Ordering::Relaxed) as i64).unwrap_or(0)
 }
 
 /// Kind of the most recent mask-recording feedback message received from the
@@ -642,29 +644,37 @@ pub extern "C" fn aivpn_get_recording_feedback_seq() -> i64 {
 /// 3 = RecordingFailed, 4 = RecordingStatus.
 #[no_mangle]
 pub extern "C" fn aivpn_get_recording_feedback_kind() -> libc::c_int {
-    let guard = ACTIVE_RECORDING_FEEDBACK
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    match guard.as_ref() {
-        None => 0,
-        Some(RecordingFeedback::Ack { .. }) => 1,
-        Some(RecordingFeedback::Complete { .. }) => 2,
-        Some(RecordingFeedback::Failed { .. }) => 3,
-        Some(RecordingFeedback::Status { .. }) => 4,
-    }
+    // catch_unwind: never unwind across FFI into the Network Extension.
+    std::panic::catch_unwind(|| {
+        let guard = ACTIVE_RECORDING_FEEDBACK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        match guard.as_ref() {
+            None => 0,
+            Some(RecordingFeedback::Ack { .. }) => 1,
+            Some(RecordingFeedback::Complete { .. }) => 2,
+            Some(RecordingFeedback::Failed { .. }) => 3,
+            Some(RecordingFeedback::Status { .. }) => 4,
+        }
+    })
+    .unwrap_or(0)
 }
 
 /// Confidence score (0.0-1.0) from the most recent RecordingComplete message.
 /// Returns 0.0 if the current feedback is not a RecordingComplete.
 #[no_mangle]
 pub extern "C" fn aivpn_get_recording_confidence() -> f32 {
-    let guard = ACTIVE_RECORDING_FEEDBACK
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    match guard.as_ref() {
-        Some(RecordingFeedback::Complete { confidence, .. }) => *confidence,
-        _ => 0.0,
-    }
+    // catch_unwind: never unwind across FFI into the Network Extension.
+    std::panic::catch_unwind(|| {
+        let guard = ACTIVE_RECORDING_FEEDBACK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        match guard.as_ref() {
+            Some(RecordingFeedback::Complete { confidence, .. }) => *confidence,
+            _ => 0.0,
+        }
+    })
+    .unwrap_or(0.0)
 }
 
 /// Whether the current authenticated session may record masks, from the most
@@ -672,13 +682,17 @@ pub extern "C" fn aivpn_get_recording_confidence() -> f32 {
 /// has been received yet.
 #[no_mangle]
 pub extern "C" fn aivpn_recording_can_record() -> libc::c_int {
-    let guard = ACTIVE_RECORDING_FEEDBACK
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    match guard.as_ref() {
-        Some(RecordingFeedback::Status { can_record, .. }) => *can_record as libc::c_int,
-        _ => 0,
-    }
+    // catch_unwind: never unwind across FFI into the Network Extension.
+    std::panic::catch_unwind(|| {
+        let guard = ACTIVE_RECORDING_FEEDBACK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        match guard.as_ref() {
+            Some(RecordingFeedback::Status { can_record, .. }) => *can_record as libc::c_int,
+            _ => 0,
+        }
+    })
+    .unwrap_or(0)
 }
 
 /// Copies the 16-byte recording session id from the most recent RecordingAck
@@ -689,21 +703,25 @@ pub extern "C" fn aivpn_recording_can_record() -> libc::c_int {
 /// `out16` must point to at least 16 writable bytes.
 #[no_mangle]
 pub unsafe extern "C" fn aivpn_get_recording_session_id(out16: *mut u8) -> libc::c_int {
-    if out16.is_null() {
-        return 0;
-    }
-    let guard = ACTIVE_RECORDING_FEEDBACK
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    match guard.as_ref() {
-        Some(RecordingFeedback::Ack { session_id, .. }) => {
-            // SAFETY: caller guarantees out16 points to 16 writable bytes;
-            // session_id is always exactly 16 bytes.
-            unsafe { std::ptr::copy_nonoverlapping(session_id.as_ptr(), out16, 16) };
-            1
+    // catch_unwind: never unwind across FFI into the Network Extension.
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if out16.is_null() {
+            return 0;
         }
-        _ => 0,
-    }
+        let guard = ACTIVE_RECORDING_FEEDBACK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        match guard.as_ref() {
+            Some(RecordingFeedback::Ack { session_id, .. }) => {
+                // SAFETY: caller guarantees out16 points to 16 writable bytes;
+                // session_id is always exactly 16 bytes.
+                unsafe { std::ptr::copy_nonoverlapping(session_id.as_ptr(), out16, 16) };
+                1
+            }
+            _ => 0,
+        }
+    }))
+    .unwrap_or(0)
 }
 
 /// Copies the service name associated with the most recent recording
@@ -722,35 +740,39 @@ pub unsafe extern "C" fn aivpn_get_recording_service(
     buf: *mut libc::c_char,
     buf_len: libc::c_int,
 ) -> libc::c_int {
-    if buf.is_null() || buf_len <= 0 {
-        return -1;
-    }
-    let guard = ACTIVE_RECORDING_FEEDBACK
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    let svc: String = match guard.as_ref() {
-        Some(RecordingFeedback::Complete { service, .. }) => service.clone(),
-        Some(RecordingFeedback::Status { active_service, .. }) => {
-            active_service.clone().unwrap_or_default()
+    // catch_unwind: never unwind across FFI into the Network Extension.
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if buf.is_null() || buf_len <= 0 {
+            return -1;
         }
-        Some(RecordingFeedback::Ack { .. }) | Some(RecordingFeedback::Failed { .. }) => {
-            String::new()
-        }
-        None => return -1,
-    };
-    drop(guard);
+        let guard = ACTIVE_RECORDING_FEEDBACK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let svc: String = match guard.as_ref() {
+            Some(RecordingFeedback::Complete { service, .. }) => service.clone(),
+            Some(RecordingFeedback::Status { active_service, .. }) => {
+                active_service.clone().unwrap_or_default()
+            }
+            Some(RecordingFeedback::Ack { .. }) | Some(RecordingFeedback::Failed { .. }) => {
+                String::new()
+            }
+            None => return -1,
+        };
+        drop(guard);
 
-    let bytes = svc.as_bytes();
-    let cap = (buf_len as usize).saturating_sub(1);
-    let n = bytes.len().min(cap);
-    // SAFETY: caller guarantees `buf` points to `buf_len` writable bytes
-    // (checked non-null and > 0 above); `n <= buf_len - 1`, so writing `n`
-    // bytes followed by a NUL at offset `n` stays within `buf_len` bytes.
-    unsafe {
-        std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf as *mut u8, n);
-        *buf.add(n) = 0;
-    }
-    n as libc::c_int
+        let bytes = svc.as_bytes();
+        let cap = (buf_len as usize).saturating_sub(1);
+        let n = bytes.len().min(cap);
+        // SAFETY: caller guarantees `buf` points to `buf_len` writable bytes
+        // (checked non-null and > 0 above); `n <= buf_len - 1`, so writing `n`
+        // bytes followed by a NUL at offset `n` stays within `buf_len` bytes.
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf as *mut u8, n);
+            *buf.add(n) = 0;
+        }
+        n as libc::c_int
+    }))
+    .unwrap_or(-1)
 }
 
 /// Copies a human-readable message for the most recent recording feedback
@@ -771,34 +793,38 @@ pub unsafe extern "C" fn aivpn_get_recording_message(
     buf: *mut libc::c_char,
     buf_len: libc::c_int,
 ) -> libc::c_int {
-    if buf.is_null() || buf_len <= 0 {
-        return -1;
-    }
-    let guard = ACTIVE_RECORDING_FEEDBACK
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    let msg: String = match guard.as_ref() {
-        Some(RecordingFeedback::Ack { status, .. }) => status.clone(),
-        Some(RecordingFeedback::Complete { mask_id, .. }) => mask_id.clone(),
-        Some(RecordingFeedback::Failed { reason }) => reason.clone(),
-        Some(RecordingFeedback::Status { active_service, .. }) => {
-            active_service.clone().unwrap_or_default()
+    // catch_unwind: never unwind across FFI into the Network Extension.
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if buf.is_null() || buf_len <= 0 {
+            return -1;
         }
-        None => return -1,
-    };
-    drop(guard);
+        let guard = ACTIVE_RECORDING_FEEDBACK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let msg: String = match guard.as_ref() {
+            Some(RecordingFeedback::Ack { status, .. }) => status.clone(),
+            Some(RecordingFeedback::Complete { mask_id, .. }) => mask_id.clone(),
+            Some(RecordingFeedback::Failed { reason }) => reason.clone(),
+            Some(RecordingFeedback::Status { active_service, .. }) => {
+                active_service.clone().unwrap_or_default()
+            }
+            None => return -1,
+        };
+        drop(guard);
 
-    let bytes = msg.as_bytes();
-    let cap = (buf_len as usize).saturating_sub(1); // reserve room for the NUL terminator
-    let n = bytes.len().min(cap);
-    // SAFETY: caller guarantees `buf` points to `buf_len` writable bytes
-    // (checked non-null and > 0 above); `n <= buf_len - 1`, so writing `n`
-    // bytes followed by a NUL at offset `n` stays within `buf_len` bytes.
-    unsafe {
-        std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf as *mut u8, n);
-        *buf.add(n) = 0;
-    }
-    n as libc::c_int
+        let bytes = msg.as_bytes();
+        let cap = (buf_len as usize).saturating_sub(1); // reserve room for the NUL terminator
+        let n = bytes.len().min(cap);
+        // SAFETY: caller guarantees `buf` points to `buf_len` writable bytes
+        // (checked non-null and > 0 above); `n <= buf_len - 1`, so writing `n`
+        // bytes followed by a NUL at offset `n` stays within `buf_len` bytes.
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf as *mut u8, n);
+            *buf.add(n) = 0;
+        }
+        n as libc::c_int
+    }))
+    .unwrap_or(-1)
 }
 
 /// Send a RecordingStart control payload to the active tunnel.
@@ -939,6 +965,24 @@ pub unsafe extern "C" fn aivpn_mgmt_request(
     out_buf: *mut u8,
     out_cap: usize,
 ) -> isize {
+    // catch_unwind so a panic (e.g. a poisoned MgmtClient mutex) never unwinds
+    // across the FFI boundary and aborts the whole Network Extension process —
+    // mirrors every android-core JNI wrapper (LOW-2 pattern).
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        aivpn_mgmt_request_impl(method, path, body, body_len, out_status, out_buf, out_cap)
+    }))
+    .unwrap_or(-1)
+}
+
+unsafe fn aivpn_mgmt_request_impl(
+    method: u8,
+    path: *const libc::c_char,
+    body: *const u8,
+    body_len: usize,
+    out_status: *mut u16,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
     if path.is_null() || out_status.is_null() {
         return -1;
     }
@@ -1008,6 +1052,15 @@ pub unsafe extern "C" fn aivpn_qr_png(
     out_buf: *mut u8,
     out_cap: usize,
 ) -> isize {
+    // catch_unwind so a panic in the QR/PNG encoder never aborts the Network
+    // Extension process across the FFI boundary (LOW-2 pattern).
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        aivpn_qr_png_impl(text, out_buf, out_cap)
+    }))
+    .unwrap_or(-1)
+}
+
+unsafe fn aivpn_qr_png_impl(text: *const libc::c_char, out_buf: *mut u8, out_cap: usize) -> isize {
     if text.is_null() {
         return -1;
     }

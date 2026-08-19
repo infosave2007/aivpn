@@ -24,21 +24,26 @@ use super::state::SessionRuntime;
 /// `KeyRotate` response on the upload control channel, then blocks on the paired
 /// receiver until the upload task's single encryptor has actually encrypted that
 /// response (see [`MobileEncryptor::encrypt_control`]). Only after that ack does
-/// the handler publish the new keys into `key_rotate_slot`, guaranteeing the
-/// response is never encrypted with a key the server has not yet installed.
+/// the handler stage the new keys for the TX path (run_loop's
+/// `pending_upload_keys`, promoted on the server's commit proof), guaranteeing
+/// the response is never encrypted with a key the server has not yet installed.
 pub type RekeyAckQueue = Arc<Mutex<VecDeque<oneshot::Sender<()>>>>;
 
 /// One-shot old-key override for a RE-SENT `KeyRotate` response.
 ///
 /// When the server retransmits a KeyRotate (our first response was lost), the
-/// receive loop stages `(old_keys, current_keys)` here before enqueueing the
-/// SAME response again: `encrypt_control` swaps the OLD keys in for that one
-/// packet — the server is still on them — then restores the current keys. The
-/// send counter is shared and MONOTONIC across both keys, so the temporary
-/// swap can never reuse a (key, nonce) pair. Consumed only by KeyRotate
-/// payloads; the initial-response path never sets it (mirrors the desktop
-/// client.rs upload-key swap/restore rendezvous).
-pub type RekeyResendSlot = Arc<Mutex<Option<(SessionKeys, SessionKeys)>>>;
+/// receive loop stages the OLD keys here before enqueueing the SAME response
+/// again: `encrypt_control` swaps them in for that one packet — the server is
+/// still on them — then restores whatever keys were live before the swap.
+/// Restoring the LIVE keys (rather than a restore target staged alongside the
+/// override) is what keeps this correct with staged TX promotion: while the
+/// rekey commit is unconfirmed the live keys ARE the old keys (restore is a
+/// no-op), and only after the promote do they become the new keys. The send
+/// counter is shared and MONOTONIC across both keys, so the temporary swap
+/// can never reuse a (key, nonce) pair. Consumed only by KeyRotate payloads;
+/// the initial-response path never sets it (mirrors the desktop client.rs
+/// upload-key swap/restore rendezvous).
+pub type RekeyResendSlot = Arc<Mutex<Option<SessionKeys>>>;
 
 /// Upload-side [`PacketEncryptor`] for Android: wraps a [`MimicryEncryptor`] and
 /// owns the single send counter for the session. All steady-state outbound
@@ -85,23 +90,28 @@ impl PacketEncryptor for MobileEncryptor {
         }
         // A RE-SENT response (server retransmitted KeyRotate because our first
         // response was lost) must go out under the PREVIOUS keys the server can
-        // still read: swap them in for this one packet, then restore. The
-        // shared monotonic send counter makes the old-key send nonce-safe.
+        // still read: swap them in for this one packet, then restore the keys
+        // that were live before the swap. While the rekey commit is still
+        // unconfirmed (staged TX switch — see run_loop's `pending_upload_keys`)
+        // the live keys ARE the old keys, so the restore is a no-op and TX
+        // stays on them; after the promote the live keys are the new ones.
+        // The shared monotonic send counter makes the old-key send nonce-safe.
         let restore = if is_rotate {
             self.rekey_resend_keys
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .take()
-                .map(|(old_keys, current_keys)| {
+                .map(|old_keys| {
+                    let live_keys = self.inner.current_keys();
                     self.inner.update_keys(old_keys);
-                    current_keys
+                    live_keys
                 })
         } else {
             None
         };
         let pkt = self.inner.encrypt_control(payload);
-        if let Some(current_keys) = restore {
-            self.inner.update_keys(current_keys);
+        if let Some(live_keys) = restore {
+            self.inner.update_keys(live_keys);
         }
         let pkt = pkt?;
         if is_rotate {
@@ -223,7 +233,7 @@ mod tests {
         ack_q.lock().unwrap().push_back(ack_tx);
 
         let mut enc = make_encryptor(current_keys.clone(), slot, ack_q.clone());
-        *enc.rekey_resend_keys.lock().unwrap() = Some((old_keys, current_keys));
+        *enc.rekey_resend_keys.lock().unwrap() = Some(old_keys);
 
         // A non-KeyRotate control payload must NOT consume the override.
         let qr = ControlPayload::QualityReport {

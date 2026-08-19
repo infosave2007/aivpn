@@ -392,10 +392,19 @@ pub async fn run_upload_loop(
                     std::future::pending().await
                 }
             } => {
-                if let Some(payload) = maybe_ctrl {
-                    let encrypted = enc.encrypt_control(&payload)?;
-                    send_tolerant(udp, &encrypted).await?;
-                }
+                let payload = match maybe_ctrl {
+                    Some(p) => p,
+                    // All control senders are gone: the session is tearing
+                    // down (the receive loop dropped its sender). Returning
+                    // `None` here used to be IGNORED, and since a closed
+                    // channel's recv() resolves immediately on every poll,
+                    // this arm kept winning the select! — a 100% CPU busy
+                    // spin for the rest of the session. Exit like the data
+                    // channel does ("TUN->UDP channel closed" above).
+                    None => return Err(Error::Channel("control channel closed".into())),
+                };
+                let encrypted = enc.encrypt_control(&payload)?;
+                send_tolerant(udp, &encrypted).await?;
             }
         }
     }
@@ -435,6 +444,49 @@ mod tests {
         }
 
         fn on_data_sent(&mut self, _payload_len: usize) {}
+    }
+
+    /// Regression test for the control-channel busy-spin: when every control
+    /// sender is dropped, `control_rx.recv()` resolves to `None` on EVERY
+    /// poll, and ignoring that used to keep the `select!` hot — a 100% CPU
+    /// spin for the rest of the session. The loop must instead terminate with
+    /// an error, exactly like a closed data channel does.
+    #[tokio::test]
+    async fn test_closed_control_channel_terminates_upload_loop() {
+        let server_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = server_sock.local_addr().unwrap();
+        let client_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        client_sock.connect(server_addr).await.unwrap();
+
+        let config = UploadConfig::default();
+        // Data channel stays open (sender alive) so the ONLY closed channel is
+        // the control one — the error must be the control-channel close.
+        let (_data_tx, mut data_rx) = mpsc::channel::<Vec<u8>>(4);
+        let (control_tx, mut control_rx) = mpsc::channel::<ControlPayload>(4);
+        drop(control_tx);
+
+        let mut enc = MarkerEncryptor { next_seq: 0 };
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            run_upload_loop(
+                &mut data_rx,
+                Some(&mut control_rx),
+                &client_sock,
+                &mut enc,
+                &config,
+                None,
+            ),
+        )
+        .await;
+
+        match result {
+            Ok(Err(e)) => assert!(
+                e.to_string().contains("control channel closed"),
+                "expected the control-channel-close error, got: {e}"
+            ),
+            Ok(Ok(())) => panic!("run_upload_loop must not return Ok on a closed control channel"),
+            Err(_) => panic!("run_upload_loop did not terminate within 2s — busy-spin regression"),
+        }
     }
 
     /// Regression test for the control-starvation bug: under `biased`

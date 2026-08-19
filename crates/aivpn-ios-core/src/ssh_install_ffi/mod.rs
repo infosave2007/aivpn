@@ -89,6 +89,22 @@ pub unsafe extern "C" fn aivpn_ssh_probe_hostkey(
     out_buf: *mut u8,
     out_cap: usize,
 ) -> isize {
+    // catch_unwind so a panic in the SSH/tokio path can never unwind across
+    // the FFI boundary and abort the whole app/Network Extension process
+    // (LOW-2 pattern, mirrors the android-core wrappers).
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        aivpn_ssh_probe_hostkey_impl(host, port, user, out_buf, out_cap)
+    }))
+    .unwrap_or(-1)
+}
+
+unsafe fn aivpn_ssh_probe_hostkey_impl(
+    host: *const c_char,
+    port: u16,
+    user: *const c_char,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
     if host.is_null() || user.is_null() {
         return -1;
     }
@@ -344,6 +360,16 @@ pub unsafe extern "C" fn aivpn_ssh_install_poll(
     out_buf: *mut u8,
     out_cap: usize,
 ) -> isize {
+    // catch_unwind so a panic in the registry can never unwind across the FFI
+    // boundary and abort the process (LOW-2 pattern). -1 already means "not
+    // found / error" to the caller, so it doubles as the panic fallback.
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        aivpn_ssh_install_poll_impl(handle, out_buf, out_cap)
+    }))
+    .unwrap_or(-1)
+}
+
+unsafe fn aivpn_ssh_install_poll_impl(handle: i64, out_buf: *mut u8, out_cap: usize) -> isize {
     match registry().poll(handle, out_cap) {
         PollOutcome::Event(event) => {
             let bytes = event.as_bytes();

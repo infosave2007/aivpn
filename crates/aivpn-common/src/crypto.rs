@@ -103,10 +103,25 @@ pub struct SessionKeys {
 }
 
 /// X25519 keypair for key exchange
-#[derive(Debug, Clone)]
+///
+/// `Debug` is implemented MANUALLY (no derive): a derived `Debug` would print
+/// `private_key_bytes`, so any `{:?}` on a struct owning a KeyPair would leak
+/// the static private key of the server/device into the logs. The manual impl
+/// prints only the public key (mirrors `SessionKeys`, which deliberately has
+/// no `Debug` at all).
+#[derive(Clone)]
 pub struct KeyPair {
     private_key_bytes: [u8; X25519_PRIVATE_KEY_SIZE],
     public_key_bytes: [u8; X25519_PUBLIC_KEY_SIZE],
+}
+
+impl std::fmt::Debug for KeyPair {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KeyPair")
+            .field("public_key_bytes", &self.public_key_bytes)
+            .field("private_key_bytes", &"[redacted]")
+            .finish()
+    }
 }
 
 impl Drop for KeyPair {

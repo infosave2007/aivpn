@@ -578,6 +578,18 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
     // Hard ceiling on rekey-grace re-arms (see REKEY_TRANSITION_HARD_CAP).
     // Armed once per inline rekey at the key switch; never extended.
     let mut transition_grace_hard: Option<Instant> = None;
+    // M3 staging, parity with desktop client.rs's `pending_upload_keys`: the
+    // post-rekey TX keys are staged HERE at the KeyRotate ack instead of being
+    // published into `key_rotate_slot` immediately. Uplink keeps riding the
+    // OLD keys — and keeps advancing the server's inbound counter inside its
+    // frozen ±TAG_WINDOW_SIZE band — until the server proves it committed our
+    // rekey response: the first downlink packet authenticating under the NEW
+    // keys promotes the staging (the server only switches its downlink at
+    // commit), with the transition-window close as the fallback promote.
+    // Without this, a lost rekey response + active uplink raced our counter
+    // past the server's band, so the re-sent response could never authenticate
+    // and the session desynced until the watchdogs fired.
+    let mut pending_upload_keys: Option<SessionKeys> = None;
     if let Some(cert) = mtls_cert {
         let cert_len_debug = cert.len();
         let cert_payload = ControlPayload::ClientCert { cert_bytes: cert }.encode()?;
@@ -798,15 +810,24 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
         let mut guard = ACTIVE_CONTROL_TX.lock().unwrap_or_else(|e| e.into_inner());
         *guard = Some(ctrl_tx);
     }
-    // RAII guard: clears ACTIVE_CONTROL_TX when the session returns (any path).
-    struct CtrlTxGuard;
+    // RAII guard: clears ACTIVE_CONTROL_TX when the session returns (any
+    // path), but ONLY if the slot still holds THIS session's sender. A
+    // slow-unwinding previous session (stop flush, OEM freezer) may drop its
+    // guard only after its successor already installed a new sender — an
+    // unconditional clear would wipe that sender and permanently sever the
+    // new session's platform-control channel. Compare-and-clear via
+    // `same_channel`, the same pattern as `ActiveSessionGuard::drop`'s
+    // Arc::ptr_eq check in state.rs.
+    struct CtrlTxGuard(mpsc::Sender<ControlPayload>);
     impl Drop for CtrlTxGuard {
         fn drop(&mut self) {
             let mut g = ACTIVE_CONTROL_TX.lock().unwrap_or_else(|e| e.into_inner());
-            *g = None;
+            if g.as_ref().is_some_and(|cur| cur.same_channel(&self.0)) {
+                *g = None;
+            }
         }
     }
-    let _ctrl_tx_guard = CtrlTxGuard;
+    let _ctrl_tx_guard = CtrlTxGuard(ctrl_tx_recv_loop.clone());
 
     // The data plane MUST use the very mask the handshake was accepted with: the
     // server pins the session to that mask and reads the ciphertext at its
@@ -1072,7 +1093,22 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
                     transition_recv_deadline = None;
                     transition_grace_hard = None;
                     transition_recv_win.reset();
+                    // M3 fallback promote (desktop parity): the transition
+                    // window closed without the server ever proving the rekey
+                    // commit — switch TX to the staged keys anyway so TX
+                    // matches the RX keys; a truly unconverged rekey then
+                    // falls through to the data watchdog as before.
+                    if let Some(staged) = pending_upload_keys.take() {
+                        *key_rotate_slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(staged);
+                        log::info!(
+                            "aivpn: rekey transition window closed — promoting staged upload keys"
+                        );
+                    }
                 }
+                // Snapshot the primary window's high-water mark BEFORE decode so
+                // a forward jump afterwards measures the downlink gap (loss).
+                let prev_primary_highest = recv_win.highest();
+                let mut decoded_via_primary = false;
                 let decoded = match decode_downlink_any_mdh_len(
                     &udp_buf[..n],
                     &keys,
@@ -1080,6 +1116,7 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
                     &mut recv_mdh_candidates,
                 ) {
                     Ok(decoded) => {
+                        decoded_via_primary = true;
                         Some(decoded)
                     }
                     Err(e) => {
@@ -1100,6 +1137,37 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
                         }
                     }
                 };
+
+                if decoded_via_primary {
+                    // M3: while a rekey staging is outstanding, a packet that
+                    // authenticates under the CURRENT primary keys proves the
+                    // server received and committed our rekey response (it only
+                    // switches its downlink to the new keys at commit) —
+                    // promote the staged upload keys. No-op otherwise.
+                    if let Some(staged) = pending_upload_keys.take() {
+                        *key_rotate_slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(staged);
+                        log::info!(
+                            "aivpn: rekey commit confirmed by new-key downlink — upload switched to the new keys"
+                        );
+                    }
+                    // Downlink loss estimate for the quality tracker (record_gap
+                    // was previously never called, so loss_ppm() was stuck at 0
+                    // and the 30-point loss component of the quality score was
+                    // dead). A gap counts only when the counter moved FORWARD —
+                    // reordered/duplicate packets inside the window neither add
+                    // nor subtract — and the PFS-ratchet window reset (new
+                    // epoch restarts the counter) is guarded by `now > prev`.
+                    if let (Some(prev), Some(now)) = (prev_primary_highest, recv_win.highest()) {
+                        if now > prev {
+                            let gap = now - prev;
+                            if gap == 1 {
+                                quality_tracker.record_received();
+                            } else {
+                                quality_tracker.record_gap(gap.min(u32::MAX as u64) as u32);
+                            }
+                        }
+                    }
+                }
 
                 if let Some(decoded) = decoded {
                     // Only a successfully authenticated packet proves the link is
@@ -1180,11 +1248,15 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
                                         );
                                         // Stage the one-shot old-key override, then the
                                         // usual rendezvous so we block until THIS response
-                                        // was encrypted (with the old keys swapped in).
+                                        // was encrypted (with the old keys swapped in). The
+                                        // encryptor restores its LIVE keys after the swap —
+                                        // still the old keys while the TX promotion is
+                                        // staged, the new keys after — so a resend can never
+                                        // prematurely switch TX (see RekeyResendSlot).
                                         *rekey_resend_slot
                                             .lock()
                                             .unwrap_or_else(|e| e.into_inner()) =
-                                            Some((old_keys, keys.clone()));
+                                            Some(old_keys);
                                         let (ack_tx, ack_rx) = oneshot::channel();
                                         rekey_ack_slot
                                             .lock()
@@ -1325,10 +1397,21 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
                                             );
                                             transition_recv_win = recv_win.clone();
                                             keys = new_keys;
-                                            *key_rotate_slot
-                                                .lock()
-                                                .unwrap_or_else(|e| e.into_inner()) =
-                                                Some(keys.clone());
+                                            // M3 (desktop `pending_upload_keys` parity):
+                                            // STAGE the new TX keys instead of switching
+                                            // the upload encryptor right away. Uplink keeps
+                                            // riding the OLD keys — so the server's inbound
+                                            // counter keeps advancing with the data stream
+                                            // and a re-sent response (lost-response
+                                            // self-heal) always lands inside its frozen
+                                            // ±TAG_WINDOW_SIZE band — until the first
+                                            // downlink packet authenticating under the NEW
+                                            // keys proves the commit (decode path above),
+                                            // or the transition window closes (fallback
+                                            // promote). The upload counter stays monotonic
+                                            // across the later key change, so no
+                                            // (key, nonce) pair is ever reused.
+                                            pending_upload_keys = Some(keys.clone());
                                             ratcheted_rekey_eph_pub = Some(new_eph_pub);
                                             rekey_response_eph =
                                                 Some(rekey_kp.public_key_bytes());
@@ -1773,6 +1856,13 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
                                                 keys = ratcheted;
                                                 ratcheted_server_eph_pub = Some(server_eph_pub);
                                                 recv_win.reset();
+                                                // A fresh PFS ratchet supersedes any staged
+                                                // inline-rekey upload keys (anomalous ordering
+                                                // — the server only sends KeyRotate to
+                                                // ratcheted sessions — but never let a stale
+                                                // staging clobber the ratcheted upload keys
+                                                // later; mirrors desktop control_handler.rs).
+                                                pending_upload_keys = None;
                                                 // Publish to the upload task so outbound traffic
                                                 // switches too. Unlike the initial handshake ratchet
                                                 // (which starts the upload encryptor fresh at
@@ -1913,6 +2003,14 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
                 if let Some(msg) = maybe_err {
                     tun_reader_task.abort();
                     upload_sender_task.abort();
+                    // A user-initiated stop neutralizes the TUN fds BEFORE the
+                    // stop-fd write lands (state.rs `stop_active_tunnel`), so
+                    // the reader task's EBADF can race ahead of the stop
+                    // signal — report a clean stop, not "TUN read failed",
+                    // for what was just the user pressing Disconnect.
+                    if session.stop_requested.load(Ordering::SeqCst) {
+                        return Ok(());
+                    }
                     return Err(Error::Session(msg));
                 }
             }
