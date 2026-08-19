@@ -397,6 +397,11 @@ fn post_connect_error_marker_line(err: &ssh_install::SshInstallError) -> String 
         // code so a GUI can say "install interrupted, state on the server is
         // unknown" instead of a generic ssh error.
         ssh_install::SshInstallError::Interrupted(_) => "interrupted",
+        // The overall install time budget ran out — a remote step hung while
+        // sshd stayed responsive (apt dpkg-lock wait, stalled download), which
+        // transport keepalives can't catch. A distinct code so a GUI can say
+        // "install timed out, retry is safe".
+        ssh_install::SshInstallError::Timeout(_) => "timeout",
         // Unreachable in practice post-Connected (these only ever occur
         // during the initial `connect()` handshake), but matched explicitly
         // rather than falling into a catch-all so this stays exhaustive if

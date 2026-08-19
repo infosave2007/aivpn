@@ -31,6 +31,7 @@
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use rand::RngCore;
 use russh::client;
@@ -101,9 +102,50 @@ pub enum SshInstallError {
     /// silently treated as exit code 0).
     #[error("remote command ended without an exit status ({0})")]
     Interrupted(String),
+    /// [`run_install`] exceeded its overall time budget
+    /// ([`INSTALL_OVERALL_TIMEOUT`]) — almost always a remote step hung while
+    /// sshd stayed responsive (apt waiting on a dpkg lock, a stalled
+    /// download), which transport keepalives can't catch. The value is the
+    /// budget in seconds.
+    #[error("install timed out after {0}s overall")]
+    Timeout(u64),
 }
 
 pub type Result<T> = std::result::Result<T, SshInstallError>;
+
+/// Keepalive cadence for the SSH transport once authenticated. Together with
+/// russh's default `keepalive_max` (3) this declares the peer dead after ~2
+/// minutes of silence — what catches a half-open TCP connection (dead NAT,
+/// suspended VPS) while a remote command is running, instead of waiting on
+/// `channel.wait()` forever.
+const SSH_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Transport-level inactivity backstop. Guards the phases keepalives don't
+/// cover (pre-auth handshake, authentication) and a peer that goes fully
+/// silent. Deliberately generous: apt/curl inside the installer can legally
+/// stay silent for minutes while downloading (the install script redirects
+/// apt output away), and russh resets this timer on any received data.
+const SSH_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Overall time budget for one [`run_install`] call (connect + upload +
+/// remote installer run). The transport timeouts above only fire when the
+/// server stops answering entirely; a remote step that hangs forever while
+/// sshd stays responsive (apt stuck on a dpkg lock, a stalled download) is
+/// indistinguishable from a slow-but-healthy install at the transport level,
+/// so it needs this outer bound. 30 minutes comfortably covers a slow-VPS
+/// install (package install + binary download, docker mode included).
+const INSTALL_OVERALL_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+
+/// Builds the `russh` client config used by [`connect`]. Split out into a
+/// pure function so the timeout/keepalive policy is unit-testable without a
+/// live SSH server.
+fn ssh_client_config() -> client::Config {
+    client::Config {
+        keepalive_interval: Some(SSH_KEEPALIVE_INTERVAL),
+        inactivity_timeout: Some(SSH_INACTIVITY_TIMEOUT),
+        ..client::Config::default()
+    }
+}
 
 /// Formats a public key's SHA256 fingerprint the same way OpenSSH does
 /// (`SHA256:<base64, no padding>`). Pure — no IO, safe to unit-test with a
@@ -157,7 +199,7 @@ pub async fn connect(
     auth: &SshAuth,
     verify: impl FnOnce(&HostKey) -> bool + Send + 'static,
 ) -> Result<SshSession> {
-    let config = Arc::new(client::Config::default());
+    let config = Arc::new(ssh_client_config());
     let handler = TofuHandler {
         verify: Some(Box::new(verify)),
     };
@@ -351,6 +393,19 @@ impl SshSession {
                     "connection closed before completion".to_string()
                 })))
             }
+        }
+    }
+
+    /// Best-effort removal of the per-run remote install directory. The
+    /// session may already be dead (a dropped connection is a common reason
+    /// the cleanup runs at all), so failures are logged at debug level and
+    /// swallowed — cleanup must never mask the install's real result.
+    async fn cleanup_remote_dir(&self, remote_dir: &str) {
+        if let Err(err) = self
+            .run_streaming(&format!("rm -rf {}", shell_quote(remote_dir)), |_| {})
+            .await
+        {
+            tracing::debug!("ssh-install: remote cleanup of {remote_dir} failed: {err}");
         }
     }
 }
@@ -956,9 +1011,35 @@ pub fn build_install_argv(params: &InstallParams, remote_dir: &str) -> Vec<Strin
 /// `install-server.sh` there via `run_streaming`, reporting progress
 /// through `on_event`. Returns the installer's exit code (also delivered as
 /// the final [`InstallEvent::Finished`]).
+///
+/// The whole operation is bounded by [`INSTALL_OVERALL_TIMEOUT`]
+/// ([`SshInstallError::Timeout`] on expiry): the transport keepalive/
+/// inactivity timeouts configured in [`ssh_client_config`] only fire when the
+/// server stops answering entirely, while a remote step that hangs forever
+/// with sshd still responsive (apt waiting on a dpkg lock, a stalled
+/// download) needs this outer bound. On timeout the in-flight future — and
+/// with it the SSH session — is dropped; no remote cleanup is attempted on
+/// that path since the session is exactly what's suspected to be wedged.
 pub async fn run_install(
     params: InstallParams,
     mut on_event: impl FnMut(InstallEvent),
+) -> Result<i32> {
+    match tokio::time::timeout(
+        INSTALL_OVERALL_TIMEOUT,
+        run_install_inner(params, &mut on_event),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => Err(SshInstallError::Timeout(INSTALL_OVERALL_TIMEOUT.as_secs())),
+    }
+}
+
+/// The body of [`run_install`], split out so the public entry point is a
+/// thin overall-timeout wrapper (see its doc comment).
+async fn run_install_inner(
+    params: InstallParams,
+    on_event: &mut impl FnMut(InstallEvent),
 ) -> Result<i32> {
     let expected_fingerprint = params.expected_fingerprint.clone();
     let mismatch: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
@@ -994,6 +1075,39 @@ pub async fn run_install(
 
     let remote_dir = format!("/tmp/aivpn-install-{}", random_suffix());
     session.ensure_remote_dir(&remote_dir).await?;
+
+    let result = upload_and_run_installer(&session, &params, &remote_dir, on_event).await;
+
+    // Best-effort remote scratch cleanup on EVERY exit path once remote_dir
+    // exists: the uploaded bundle (script, masks, and for
+    // BinarySource::LocalFile an ~11 MB binary) is no longer needed once the
+    // installer script has run — or never ran. Without this every failed
+    // upload/exec and every retry leaked a fresh /tmp/aivpn-install-<hex>
+    // directory on the target host. The install script copies what it needs
+    // to its final locations, so removing the staging dir is safe for any
+    // outcome. Failures are ignored: cleanup must never mask the real result.
+    session.cleanup_remote_dir(&remote_dir).await;
+
+    let (exit_code, connection_key) = result?;
+    on_event(InstallEvent::Finished {
+        exit_code,
+        connection_key,
+    });
+
+    Ok(exit_code)
+}
+
+/// Uploads the embedded installer bundle plus (optionally) a local server
+/// binary into `remote_dir` and runs `install-server.sh` there via
+/// `run_streaming`. Split out from [`run_install_inner`] so the caller can
+/// clean up `remote_dir` on every exit path, error included. Returns the
+/// installer's exit code and the last connection key seen in a marker.
+async fn upload_and_run_installer(
+    session: &SshSession,
+    params: &InstallParams,
+    remote_dir: &str,
+    on_event: &mut impl FnMut(InstallEvent),
+) -> Result<(i32, Option<String>)> {
     session
         .ensure_remote_dir(&format!("{remote_dir}/systemd"))
         .await?;
@@ -1060,7 +1174,7 @@ pub async fn run_install(
             .await?;
     }
 
-    let argv = build_install_argv(&params, &remote_dir);
+    let argv = build_install_argv(params, remote_dir);
     let cmd = argv.join(" ");
 
     let mut connection_key: Option<String> = None;
@@ -1076,24 +1190,7 @@ pub async fn run_install(
         })
         .await?;
 
-    // Best-effort remote scratch cleanup: the uploaded bundle (script,
-    // masks, and for BinarySource::LocalFile an ~11 MB binary) is no longer
-    // needed once the installer script has run — without this every
-    // run/retry leaked a fresh /tmp/aivpn-install-<hex> directory on the
-    // target host. The install script copies what it needs to its final
-    // locations, so removing the staging dir is safe for any exit code.
-    // Failures are ignored: cleanup must never turn a completed install
-    // into an error.
-    let _ = session
-        .run_streaming(&format!("rm -rf {}", shell_quote(&remote_dir)), |_| {})
-        .await;
-
-    on_event(InstallEvent::Finished {
-        exit_code,
-        connection_key: connection_key.clone(),
-    });
-
-    Ok(exit_code)
+    Ok((exit_code, connection_key))
 }
 
 #[cfg(test)]
@@ -1145,6 +1242,29 @@ mod tests {
         assert_eq!(marker.code.as_deref(), Some("port_busy"));
         assert_eq!(marker.msg.as_deref(), Some("port 51820 already in use"));
         assert_eq!(marker.connection_key, None);
+    }
+
+    // --- ssh_client_config ---------------------------------------------------
+
+    #[test]
+    fn ssh_client_config_bounds_dead_and_silent_peers() {
+        let config = ssh_client_config();
+        assert_eq!(
+            config.keepalive_interval,
+            Some(SSH_KEEPALIVE_INTERVAL),
+            "keepalive must be enabled so a half-open TCP connection is detected"
+        );
+        assert_eq!(
+            config.inactivity_timeout,
+            Some(SSH_INACTIVITY_TIMEOUT),
+            "inactivity timeout must backstop a fully silent peer"
+        );
+        // A dead peer must be declared (keepalive_max exceeded) well before
+        // the inactivity backstop fires.
+        assert!(config.keepalive_max > 0);
+        assert!(
+            SSH_KEEPALIVE_INTERVAL * (config.keepalive_max as u32 + 1) < SSH_INACTIVITY_TIMEOUT
+        );
     }
 
     // --- fingerprint formatting ---------------------------------------------
