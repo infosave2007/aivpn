@@ -14,10 +14,16 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::UdpSocket;
+use tokio::sync::Semaphore;
 use tracing::{debug, warn};
 
 const DNS_BUF: usize = 4096;
 const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(5);
+/// Max concurrent in-flight upstream queries. Each one is a spawned task
+/// plus a fresh upstream UDP socket, so an unbounded flood on the listener
+/// would exhaust file descriptors. Excess datagrams are dropped — UDP DNS
+/// clients retry on their own.
+const MAX_IN_FLIGHT: usize = 256;
 
 /// Configuration for the embedded DNS proxy.
 #[derive(Debug, Clone)]
@@ -55,6 +61,7 @@ async fn run_dns_proxy(cfg: DnsProxyConfig) -> std::io::Result<()> {
     );
 
     let mut buf = vec![0u8; DNS_BUF];
+    let in_flight = Arc::new(Semaphore::new(MAX_IN_FLIGHT));
     loop {
         let (len, client_addr) = match listener.recv_from(&mut buf).await {
             Ok(v) => v,
@@ -63,10 +70,23 @@ async fn run_dns_proxy(cfg: DnsProxyConfig) -> std::io::Result<()> {
                 continue;
             }
         };
+        // Bound concurrent upstream queries (task + fresh socket each);
+        // drop the datagram when saturated instead of leaking fd's.
+        let permit = match in_flight.clone().try_acquire_owned() {
+            Ok(p) => p,
+            Err(_) => {
+                debug!(
+                    "DNS proxy: dropping query from {} — {} queries in flight",
+                    client_addr, MAX_IN_FLIGHT
+                );
+                continue;
+            }
+        };
         let query = buf[..len].to_vec();
         let upstream = cfg.upstream_addr;
         let sock = listener.clone();
         tokio::spawn(async move {
+            let _permit = permit;
             match forward_query(&query, upstream, client_addr, &sock).await {
                 Ok(()) => {}
                 Err(e) => debug!("DNS forward error for {}: {}", client_addr, e),

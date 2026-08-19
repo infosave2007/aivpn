@@ -43,6 +43,17 @@ const DNS_QUERY_TIMEOUT: Duration = Duration::from_secs(2);
 /// up instead of leaking indefinitely — same idle-safety concern as the
 /// TCP-CONNECT-leak fix above, just on the opposite direction/trigger.
 const HALF_CLOSE_DRAIN_GRACE: Duration = Duration::from_secs(30);
+/// Bound on the SOCKS5 greeting/auth/request exchange. Without it a client
+/// that connects and then goes silent holds a spawned task (and its smoltcp
+/// slot pressure) forever — classic slow-loris against the accept loop.
+const SOCKS5_NEGOTIATE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Max buffered chunks in one connection's client→tunnel inbound queue.
+/// The read half stops reading from the client socket beyond this and lets
+/// TCP flow control throttle the sender; without a bound a fast local
+/// upload into a slow tunnel grows RSS without limit (the reverse direction
+/// is already bounded by the 1024-element outbound channel below, and the
+/// proxy receive queue in client.rs by PROXY_RX_QUEUE_MAX).
+const SOCKS5_INBOUND_QUEUE_MAX: usize = 1024;
 
 static SRC_PORT: AtomicU16 = AtomicU16::new(49152);
 
@@ -635,11 +646,20 @@ async fn handle_socks5(
 ) {
     let mut session = Socks5Session::new(stream);
 
-    let req = match session.negotiate().await {
-        Ok(req) => req,
-        Err(e) => {
+    let req = match tokio::time::timeout(SOCKS5_NEGOTIATE_TIMEOUT, session.negotiate()).await {
+        Ok(Ok(req)) => req,
+        Ok(Err(e)) => {
             warn!("SOCKS5 negotiate: {}", e);
             let _ = session.send_reply(REP_GENERAL_FAILURE).await;
+            return;
+        }
+        Err(_) => {
+            // Client connected but never finished the handshake (slow-loris).
+            // Drop the connection silently — there is nothing valid to reply to.
+            debug!(
+                "SOCKS5 handshake timed out after {:?} — dropping connection",
+                SOCKS5_NEGOTIATE_TIMEOUT
+            );
             return;
         }
     };
@@ -765,6 +785,20 @@ async fn handle_connect(
     let mut read_half = tokio::spawn(async move {
         let mut buf = vec![0u8; 8192];
         loop {
+            // Bounded inbound queue: while it holds SOCKS5_INBOUND_QUEUE_MAX
+            // undrained chunks, stop reading from the client socket — TCP
+            // flow control then throttles the sender. The smoltcp thread
+            // drains the queue into the socket's 64 KiB send buffer in
+            // service_tcp_conn. Without this bound a fast local upload into
+            // a slow tunnel grew client RSS without limit.
+            while inbound_clone
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .len()
+                >= SOCKS5_INBOUND_QUEUE_MAX
+            {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
             match socks_rd.read(&mut buf).await {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {

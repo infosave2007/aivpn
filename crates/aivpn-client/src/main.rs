@@ -900,8 +900,11 @@ async fn main() {
         )
     };
 
-    // Build server pool from optional "pool" array in the connection key
-    let server_pool = args.connection_key.as_deref().and_then(|ck| {
+    // Build server pool from optional "pool" array in the connection key.
+    // Hostname endpoints are resolved here (async) via the system resolver —
+    // the sync ServerPool::new would silently drop every non-"IP:port" entry,
+    // leaving a hostname pool with zero nodes and failover quietly dead.
+    let pool_peers = args.connection_key.as_deref().and_then(|ck| {
         let payload = ck.trim().strip_prefix("aivpn://").unwrap_or(ck.trim());
         let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .decode(payload)
@@ -911,8 +914,14 @@ async fn main() {
         if peers.is_empty() {
             return None;
         }
-        Some(ServerPool::new(&server_addr, peers, PoolMode::Failover))
+        Some(peers)
     });
+    let server_pool = match pool_peers {
+        Some(peers) => {
+            Some(ServerPool::resolve_and_new(&server_addr, peers, PoolMode::Failover).await)
+        }
+        None => None,
+    };
     if let Some(ref pool) = server_pool {
         info!("Server pool active: {} node(s)", pool.node_count());
     }
