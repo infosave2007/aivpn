@@ -419,9 +419,30 @@ impl PeerSyncer {
         }
 
         let wall_clock_bucket = crypto::current_timestamp_ms() / 5_000;
-        let resume_from = read_counter_file(&counter_state_path)
+        let mut resume_from = read_counter_file(&counter_state_path)
             .map(|c| c.saturating_add(1))
             .unwrap_or(0);
+        // A persisted floor leading the current bucket by more than one
+        // receiver tag window is the residue of a past clock jump (VM
+        // snapshot restore, NTP step, dead RTC): resuming there would land
+        // every tag outside the receiver's wall-clock-centred window — a
+        // permanent, silent desync.  Reseed at the current bucket instead
+        // (same repair as `site_sync::seed_send_counter`).  Nonce-uniqueness
+        // is preserved: values consumed during the wrong-clock interval are
+        // all above the current bucket, and pre-jump values are below the
+        // pre-jump bucket ≤ the current one — no (key, nonce) pair repeats.
+        if resume_from > wall_clock_bucket.saturating_add(crate::site_sync::COUNTER_MAX_FLOOR_LEAD)
+        {
+            warn!(
+                "pool_sync: persisted send counter {} leads the current time bucket {} by \
+                 more than {} counters (stale floor from a past clock jump?) — reseeding at \
+                 the wall-clock bucket",
+                resume_from,
+                wall_clock_bucket,
+                crate::site_sync::COUNTER_MAX_FLOOR_LEAD
+            );
+            resume_from = 0;
+        }
         let start_counter = resume_from.max(wall_clock_bucket);
 
         // Persist the seed immediately (before any packet is sent) so that

@@ -133,7 +133,9 @@ pub struct PoolDialer {
     /// configured) — additive, and a no-op for plain pool-sync-only setups.
     local_subnets: Vec<String>,
     /// Per-peer live control-channel senders, registered while a masked
-    /// dialed session to that peer is up (see `run_one_session`) and removed
+    /// dialed session to that peer is PROVABLY up (promoted by
+    /// `anti_entropy` on the session's first inbound control message — never
+    /// for a pre-handshake dial attempt) and removed
     /// the instant the session ends (including across reconnects — a fresh
     /// entry replaces the old one on the next successful dial). Lets other
     /// code push a `ControlPayload` to one connected peer or broadcast to
@@ -329,7 +331,12 @@ impl PoolDialer {
             pool_kp,
             pool_psk,
             beacon_secs,
-            node_id: config.node_id.clone(),
+            // Store the TRIMMED id — validation and the self-filter above
+            // already keyed off it; carrying the raw string would leak
+            // surrounding whitespace into `masked_route_sync_payload` and
+            // `NodeEnrollment`, where the peer side compares against its own
+            // trimmed config entries and would never match.
+            node_id: node_id.map(str::to_string),
             local_subnets,
             peer_senders: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             pool_status: Arc::new(parking_lot::Mutex::new(HashMap::new())),
@@ -367,13 +374,17 @@ impl PoolDialer {
     /// stays a pure, side-effect-free check. A `true` here does not
     /// guarantee a subsequent `send_to_peer` will succeed (the session can
     /// drop between the two calls) — callers must still handle that
-    /// `send_to_peer` returning `false`.
+    /// `send_to_peer` returning `false`. Registration is LAZY (see
+    /// `anti_entropy`'s promotion latch): a session appears here only after
+    /// its first inbound control message, i.e. after the masked handshake
+    /// provably completed — never for a pre-handshake dial attempt.
     pub fn has_live_session(&self, peer: &str) -> bool {
         self.peer_senders.lock().contains_key(peer)
     }
 
     /// Test-only: register a fake live session for `peer` in `peer_senders`,
-    /// exactly as `run_one_session` does after a real successful dial — for
+    /// exactly as `anti_entropy`'s promotion does after a real session's
+    /// first inbound message — for
     /// tests OUTSIDE this module (e.g. `gateway.rs`'s B2b
     /// `exit_decision_for_session`/`forward_via_exit` integration tests)
     /// that need `has_live_session`/`send_to_peer` to observe `peer` as
@@ -816,14 +827,20 @@ impl PoolDialer {
             .map_err(|e| aivpn_common::error::Error::Session(format!("pool_dialer: {}", e)))?;
         let ctrl = client.control_handle();
 
-        // Registry: make this peer's control sender reachable via
-        // `send_to_peer`/`broadcast` for the lifetime of this session.
-        // `per_session_ctrl` is kept for the guarded cleanup at the end of
-        // this function (identity check via `Sender::same_channel`).
+        // Registry: the peer's control sender is NOT registered in
+        // `peer_senders` yet — `AivpnClient::new` is synchronous and the
+        // handshake only happens later inside `client.run()`, so an eager
+        // insert would make `has_live_session` report a peer whose handshake
+        // may still fail (gateway::choose_exit would then commit client
+        // traffic to ChainForward packets that get try_send-dropped into a
+        // dead control channel). Instead `anti_entropy` promotes the sender
+        // LAZILY on the first inbound control message from this session —
+        // receiving a decrypted control payload from the peer is positive
+        // proof the masked handshake completed. `per_session_ctrl` is kept
+        // for the guarded cleanup at the end of this function (identity
+        // check via `Sender::same_channel`), which works whether or not the
+        // promotion ever happened.
         let per_session_ctrl = ctrl.clone();
-        self.peer_senders
-            .lock()
-            .insert(peer.to_string(), ctrl.clone());
 
         // Wave B1 (pool topology read endpoints): record this connect so
         // `pool_status_snapshot` reflects a live session immediately, even
@@ -885,6 +902,7 @@ impl PoolDialer {
         let node_id = self.node_id.clone();
         let reverse_downlink_tx = self.reverse_downlink_tx.clone();
         let pool_status = self.pool_status.clone();
+        let peer_senders = self.peer_senders.clone();
         let driver = tokio::spawn(async move {
             anti_entropy(
                 ctrl,
@@ -896,6 +914,7 @@ impl PoolDialer {
                 node_id,
                 reverse_downlink_tx,
                 pool_status,
+                peer_senders,
             )
             .await;
         });
@@ -904,15 +923,16 @@ impl PoolDialer {
         driver.abort();
 
         // Registry cleanup: this peer no longer has a live session. A
-        // reconnect (via `dial_loop`) inserts a fresh entry the next time
-        // `run_one_session` succeeds, so this never leaves a stale sender
-        // behind for `send_to_peer`/`broadcast` to find.
+        // reconnect (via `dial_loop`) promotes a fresh entry the next time
+        // `run_one_session`'s anti-entropy sees the first inbound message,
+        // so this never leaves a stale sender behind for
+        // `send_to_peer`/`broadcast` to find.
         //
         // Guarded remove: only remove the entry if it is still THIS
         // session's sender. A stale session winding down (remove_peer →
         // immediate add_peer of the same address, e.g. the admin
-        // re-assigning the same exit) races with the NEW session's insert
-        // above — an unconditional remove here would delete the live new
+        // re-assigning the same exit) races with the NEW session's promotion
+        // — an unconditional remove here would delete the live new
         // session's sender, leaving `has_live_session`/`send_to_peer` dark
         // for that peer until its next reconnect (potentially hours).
         let removed_own_sender = {
@@ -1118,10 +1138,24 @@ async fn anti_entropy(
     node_id: Option<String>,
     reverse_downlink_tx: Option<tokio::sync::mpsc::Sender<Vec<u8>>>,
     pool_status: Arc<parking_lot::Mutex<HashMap<String, PeerSyncStatus>>>,
+    peer_senders: Arc<
+        parking_lot::Mutex<HashMap<String, tokio::sync::mpsc::Sender<ControlPayload>>>,
+    >,
 ) {
     let mut beacon = tokio::time::interval(Duration::from_secs(beacon_secs));
     // The first tick fires immediately; that's desirable here — beacon as
     // soon as the session is up rather than waiting a full interval.
+
+    // Lazy promotion latch: the peer's control sender is registered in
+    // `peer_senders` (making it visible to `send_to_peer`/`broadcast`/
+    // `has_live_session` — the latter being what `gateway::choose_exit`
+    // consults before committing client traffic to this exit) only after the
+    // FIRST inbound control message on this session's tap. An inbound
+    // payload is positive proof the masked handshake completed and the peer
+    // actually answers; registering earlier (right after the synchronous
+    // `AivpnClient::new`) reported pre-handshake sessions as live and let
+    // ChainForward packets be silently dropped into a dead control channel.
+    let mut promoted = false;
 
     // Un-reconciled visibility: start "converged" optimistically (a fresh
     // session hasn't had a chance to diverge yet) so the very first beacon
@@ -1215,6 +1249,15 @@ async fn anti_entropy(
                 }
             }
             msg = tap_rx.recv() => {
+                // Lazy promotion (see the `promoted` latch above): any inbound
+                // control message proves the handshake completed — only now
+                // does this session count as live for `has_live_session` and
+                // friends. Re-inserting on a later message is harmless but
+                // kept behind the latch to stay off the mutex per packet.
+                if !promoted && msg.is_some() {
+                    promoted = true;
+                    peer_senders.lock().insert(peer.clone(), ctrl.clone());
+                }
                 match msg {
                     Some(ControlPayload::PoolStateDigest { digest }) => {
                         let local = db.state_digest();
@@ -1325,13 +1368,35 @@ async fn anti_entropy(
                         // just like it does for the client DB above.
                         // PHASE 4: this dialer-side inbound tap does not
                         // (yet) carry a verified NodeEnrollment identity for
-                        // the peer being dialed, so it passes `None` here —
-                        // out of scope for this change (task instructions
-                        // restrict edits to site_sync.rs/gateway.rs/main.rs/
-                        // server.rs); this is the minimal signature-only fix
-                        // required to keep this call site compiling after
-                        // `handle_route_sync` gained the parameter.
-                        crate::site_sync::handle_route_sync(&subnets_json, &peer, None);
+                        // the peer being dialed, so it passes `None` for
+                        // `verified_node_id` (the lower-trust self-asserted
+                        // node_id path).
+                        //
+                        // `peer` is the config string and may be a
+                        // `hostname:port`, but `handle_route_sync` eagerly
+                        // parses `from_addr` as a SocketAddr (and
+                        // `install_route` needs a literal gateway IP) — a
+                        // hostname peer would be dropped as "unparseable".
+                        // Resolve it first, with the same literal-then-DNS
+                        // fallback `pool_sync::push_to_peer` applies per tick.
+                        let from_addr: Option<String> = match peer.parse::<std::net::SocketAddr>()
+                        {
+                            Ok(addr) => Some(addr.to_string()),
+                            Err(_) => match tokio::net::lookup_host(&peer).await {
+                                Ok(mut addrs) => addrs.next().map(|a| a.to_string()),
+                                Err(_) => None,
+                            },
+                        };
+                        match from_addr {
+                            Some(addr) => {
+                                crate::site_sync::handle_route_sync(&subnets_json, &addr, None)
+                            }
+                            None => warn!(
+                                "pool_dialer: cannot resolve peer {} for its inbound \
+                                 RouteSync — dropping the advert",
+                                peer
+                            ),
+                        }
                     }
                     Some(ControlPayload::ChainForward { payload }) => {
                         // PHASE 4 (reverse chain-forward): the exit node
@@ -1558,6 +1623,18 @@ mod tests {
         assert_eq!(dialer.peers, vec!["peer-b:443".to_string()]);
     }
 
+    /// The stored `node_id` must be the TRIMMED id that validation and the
+    /// self-filter already keyed off — the raw config string would otherwise
+    /// leak surrounding whitespace into `masked_route_sync_payload` and
+    /// `NodeEnrollment`, whose receivers compare against trimmed entries.
+    #[test]
+    fn node_id_is_stored_trimmed() {
+        let mut cfg = base_pool_config();
+        cfg.node_id = Some("  this-node:443  ".to_string());
+        let dialer = PoolDialer::new(test_db(), &cfg, vec![], None, None).unwrap();
+        assert_eq!(dialer.node_id.as_deref(), Some("this-node:443"));
+    }
+
     #[test]
     fn transport_is_masked_reads_config_flag() {
         let mut cfg = base_pool_config();
@@ -1634,10 +1711,64 @@ mod tests {
         assert!(!dialer.has_live_session("peer-a:443"));
     }
 
+    /// Pre-handshake-liveness regression: a dialed session must NOT appear in
+    /// `peer_senders` (the `has_live_session`/`choose_exit` view) from the
+    /// moment `AivpnClient::new` succeeds — the handshake may still fail and
+    /// ChainForward traffic committed to it would be silently dropped.
+    /// Promotion happens only on the first INBOUND control message on the
+    /// session tap (proof the masked handshake completed and the peer talks).
+    #[tokio::test]
+    async fn peer_promoted_to_live_only_after_first_inbound_message() {
+        let cfg = base_pool_config();
+        let dialer = PoolDialer::new(test_db(), &cfg, vec![], None, None).unwrap();
+
+        let (ctrl_tx, _ctrl_rx) = tokio::sync::mpsc::channel::<ControlPayload>(8);
+        let (tap_tx, tap_rx) = tokio::sync::mpsc::channel::<ControlPayload>(4);
+        let driver = tokio::spawn(anti_entropy(
+            ctrl_tx,
+            tap_rx,
+            dialer.db.clone(),
+            3600, // long beacon interval — the test drives only the tap arm
+            "peer-a:443".to_string(),
+            vec![],
+            Some("self:443".to_string()),
+            None,
+            dialer.pool_status.clone(),
+            dialer.peer_senders.clone(),
+        ));
+
+        // Give the driver a chance to run its first beacon tick: the peer
+        // must still be dark — no inbound proof yet.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !dialer.has_live_session("peer-a:443"),
+            "no promotion before any inbound message from the peer"
+        );
+
+        tap_tx
+            .send(ControlPayload::PoolSync {
+                clients_json: b"[]".to_vec(),
+            })
+            .await
+            .unwrap();
+        for _ in 0..100 {
+            if dialer.has_live_session("peer-a:443") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            dialer.has_live_session("peer-a:443"),
+            "the first inbound control message must promote the session to live"
+        );
+        driver.abort();
+    }
+
     /// Registry insert/remove/broadcast logic exercised directly against
     /// `peer_senders` (no live socket/session needed — this is the same map
-    /// `run_one_session` inserts into after connecting and removes from when
-    /// the session ends). Confirms: an inserted sender is reachable via
+    /// `anti_entropy` promotes into on the session's first inbound message and
+    /// `run_one_session` removes from when the session ends). Confirms: an
+    /// inserted sender is reachable via
     /// `send_to_peer`, counted by `broadcast`, and — once removed — behaves
     /// exactly like the "never connected" case again.
     #[test]

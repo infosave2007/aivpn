@@ -40,7 +40,8 @@ use aivpn_common::error::Result;
 use aivpn_common::protocol::{ControlPayload, InnerHeader, InnerType};
 
 use crate::site_sync::{
-    next_send_counter, persist_counter_floor, seed_send_counter, DEFAULT_STATE_DIR,
+    lock_counter_state_file, next_send_counter, persist_counter_floor, seed_send_counter,
+    DEFAULT_STATE_DIR,
 };
 
 /// How far the on-disk send-counter floor is bumped ahead of the value
@@ -51,9 +52,21 @@ use crate::site_sync::{
 /// so forwarding resumes immediately after a crash-restart under load.
 const CHAIN_PERSIST_STRIDE: u64 = 128;
 
+/// How often a hostname-form `exit_node` is re-resolved (dynamic DNS: the
+/// exit's address may change while this entry node keeps running).  Literal
+/// IP:port configs are never re-resolved — nothing to refresh.
+const EXIT_ADDR_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// Forwards IP payloads to the designated exit node as `ChainForward` control packets.
 pub struct ChainForwarder {
-    exit_addr: SocketAddr,
+    /// The configured `pool.exit_node` string ("ip:port" or "hostname:port").
+    /// Retained so a hostname can be re-resolved periodically (dynamic DNS) —
+    /// the same per-tick re-resolution `pool_sync::push_to_peer` applies.
+    exit_node: String,
+    /// Current resolved exit address.  Behind a mutex so the background
+    /// refresher can swap in a new DNS answer without restarting the
+    /// forwarder.
+    exit_addr: Mutex<SocketAddr>,
     session_keys: SessionKeys,
     /// Send counter — doubles as the AEAD nonce (`nonce[..8] = counter`) and
     /// the resonance-tag counter, mirroring `pool_sync.rs`.  Seeded at
@@ -69,6 +82,11 @@ pub struct ChainForwarder {
     persisted_high_water: Mutex<u64>,
     /// Set while persistence is failing, to avoid log spam at line rate.
     persist_warned: AtomicBool,
+    /// Advisory exclusive `flock` on `<counter_state_path>.lock`, held for the
+    /// process's lifetime (same scheme as `PeerSyncer::_counter_lock_file`):
+    /// blocks a second overlapping process from racing this state file and
+    /// reusing (key, nonce) pairs under the static entry→exit send key.
+    _counter_lock_file: std::fs::File,
     socket: UdpSocket,
 }
 
@@ -110,7 +128,10 @@ impl ChainForwarder {
         // names, silently disabling multi-hop — resolve via the system
         // resolver instead. NOTE: only the socket address is resolved; key
         // derivation below intentionally keeps using the exit_node STRING,
-        // which is what the exit node registers as its pool node_id.
+        // which is what the exit node registers as its pool node_id. A
+        // hostname-form exit_node is additionally re-resolved periodically
+        // (see `refresh_exit_addr_loop`) so a dynamic-DNS exit address change
+        // is picked up without a restart.
         let exit_addr: SocketAddr = match exit_node.parse() {
             Ok(addr) => addr,
             Err(_) => match tokio::net::lookup_host(exit_node).await {
@@ -172,29 +193,88 @@ impl ChainForwarder {
         // Seed at max(persisted high-water + 1, current 5-second bucket) —
         // same model as `PeerSyncer::new`.  The counter is the AEAD nonce, so
         // under the static entry→exit key it must never restart from a value
-        // a previous run already consumed.
+        // a previous run already consumed.  The flock is taken FIRST (fail
+        // closed): the persisted floor only protects sequential restarts, not
+        // two overlapping processes racing the same state file.
         let counter_state_path = state_dir.join("chain_forward_counter.state");
+        let lock_file = lock_counter_state_file(&counter_state_path, "chain_forward")?;
         let start_counter = seed_send_counter(&counter_state_path, "chain_forward");
         let send_counter = AtomicU64::new(start_counter);
         let persisted_high_water = Mutex::new(start_counter);
 
-        Some(Arc::new(Self {
-            exit_addr,
+        let fwd = Arc::new(Self {
+            exit_node: exit_node.to_string(),
+            exit_addr: Mutex::new(exit_addr),
             session_keys,
             send_counter,
             counter_state_path,
             persisted_high_water,
             persist_warned: AtomicBool::new(false),
+            _counter_lock_file: lock_file,
             socket,
-        }))
+        });
+
+        // Dynamic DNS: a hostname-form exit_node is re-resolved periodically
+        // so an exit whose address changed comes back without a restart
+        // (mirrors `pool_sync::push_to_peer`'s per-tick re-resolution, but on
+        // a timer — `forward` is a per-packet path and cannot afford DNS).
+        if exit_node.parse::<SocketAddr>().is_err() {
+            let me = fwd.clone();
+            tokio::spawn(async move { me.refresh_exit_addr_loop().await });
+        }
+
+        Some(fwd)
+    }
+
+    /// Periodically re-resolve a hostname-form `exit_node` and swap in the new
+    /// address.  Resolution failures keep the last known address.
+    async fn refresh_exit_addr_loop(&self) {
+        let mut ticker = tokio::time::interval(EXIT_ADDR_REFRESH_INTERVAL);
+        loop {
+            ticker.tick().await;
+            match tokio::net::lookup_host(&self.exit_node).await {
+                Ok(mut addrs) => match addrs.next() {
+                    Some(addr) => {
+                        let mut cur = self.exit_addr.lock();
+                        if *cur != addr {
+                            tracing::info!(
+                                "chain_forward: exit_node '{}' re-resolved {} → {}",
+                                self.exit_node,
+                                *cur,
+                                addr
+                            );
+                            *cur = addr;
+                        }
+                    }
+                    None => {
+                        warn!(
+                            "chain_forward: exit_node '{}' re-resolved to no addresses — \
+                             keeping last known {}",
+                            self.exit_node,
+                            *self.exit_addr.lock()
+                        );
+                    }
+                },
+                Err(e) => {
+                    warn!(
+                        "chain_forward: exit_node '{}' re-resolution failed: {} — \
+                         keeping last known {}",
+                        self.exit_node,
+                        e,
+                        *self.exit_addr.lock()
+                    );
+                }
+            }
+        }
     }
 
     /// Wrap `ip_payload` in a `ChainForward` control packet and transmit to the exit node.
     pub async fn forward(&self, ip_payload: Vec<u8>) {
         match self.build_packet(ip_payload) {
             Ok(pkt) => {
-                if let Err(e) = self.socket.send_to(&pkt, self.exit_addr).await {
-                    debug!("chain_forward: send to {} failed: {}", self.exit_addr, e);
+                let exit_addr = *self.exit_addr.lock();
+                if let Err(e) = self.socket.send_to(&pkt, exit_addr).await {
+                    debug!("chain_forward: send to {} failed: {}", exit_addr, e);
                 }
             }
             Err(e) => debug!("chain_forward: build packet failed: {}", e),
@@ -401,6 +481,11 @@ mod tests {
             last_used = fwd1.send_counter.load(Ordering::Relaxed) - 1;
         }
 
+        // Drop process 1's forwarder first to release its advisory
+        // counter-file flock — a real restart closes the old process's fd
+        // before the new one opens, which is exactly what this drop simulates
+        // (mirrors `pool_sync::restart_never_reuses_a_send_counter_value`).
+        drop(fwd1);
         let fwd2 = make_forwarder(dir.path()).await;
         let resumed = fwd2.send_counter.load(Ordering::Relaxed);
         assert!(
@@ -416,5 +501,22 @@ mod tests {
              stride bound so tags remain inside the receiver window",
             resumed - last_used
         );
+    }
+
+    /// flock regression (mirrors `pool_sync::overlapping_instances_are_refused`):
+    /// two genuinely OVERLAPPING forwarders on the same counter-state file
+    /// must not both run — the second construction fails closed rather than
+    /// racing the first over the static entry→exit (key, nonce) space.
+    #[tokio::test]
+    async fn overlapping_instances_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let fwd1 = make_forwarder(dir.path()).await;
+        assert!(
+            ChainForwarder::new_with_state_dir(EXIT_NODE, [7u8; 32], Some(ENTRY_ID), dir.path())
+                .await
+                .is_none(),
+            "a second overlapping ChainForwarder on the same state file must be refused"
+        );
+        drop(fwd1);
     }
 }

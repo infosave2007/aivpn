@@ -92,6 +92,16 @@ pub(crate) const COUNTER_BUCKET_MS: u64 = 5_000;
 /// 5-second bucket).
 pub(crate) const DEFAULT_STATE_DIR: &str = "/var/lib/aivpn";
 
+/// How far ahead of the current wall-clock bucket a persisted send-counter
+/// floor may lead before `seed_send_counter` treats it as stale residue from
+/// a past clock jump (VM restored from a snapshot, NTP step, dead RTC) rather
+/// than legitimate state.  Must exceed the receiver's tag-window half-width
+/// (`session::TAG_WINDOW_SIZE - 1` = 511 counters): anything beyond that is
+/// already undeliverable at the receiver, so reseeding loses nothing — while
+/// staying small enough that a real jump of a couple of hours triggers it.
+/// 1024 counters ≈ 85 minutes.
+pub(crate) const COUNTER_MAX_FLOOR_LEAD: u64 = 1024;
+
 // ---------------------------------------------------------------------------
 // Send-counter helpers — shared with `chain_forwarder.rs`.
 // Semantics mirror `pool_sync.rs` (`read_counter_file` / `write_counter_file`
@@ -126,9 +136,27 @@ pub(crate) fn write_counter_file(path: &Path, counter: u64) -> std::io::Result<(
 /// leaves the floor in place.
 pub(crate) fn seed_send_counter(state_path: &Path, label: &str) -> u64 {
     let wall_clock_bucket = crypto::current_timestamp_ms() / COUNTER_BUCKET_MS;
-    let resume_from = read_counter_file(state_path)
+    let mut resume_from = read_counter_file(state_path)
         .map(|c| c.saturating_add(1))
         .unwrap_or(0);
+    // A persisted floor leading the current bucket by more than one receiver
+    // tag window is the residue of a past clock jump (VM snapshot restore,
+    // NTP step, dead RTC): resuming there would land every tag outside the
+    // receiver's wall-clock-centred window — a permanent, silent desync that
+    // only deleting the state file used to fix.  Reseed at the current
+    // bucket instead.  Nonce-uniqueness is preserved: every value consumed
+    // DURING the wrong-clock interval sits above the current bucket, and
+    // everything consumed before the jump is below the pre-jump bucket,
+    // which is ≤ the current one — so no (key, nonce) pair repeats.
+    if resume_from > wall_clock_bucket.saturating_add(COUNTER_MAX_FLOOR_LEAD) {
+        warn!(
+            "{}: persisted send counter {} leads the current time bucket {} by more \
+             than {} counters (stale floor from a past clock jump?) — reseeding at the \
+             wall-clock bucket",
+            label, resume_from, wall_clock_bucket, COUNTER_MAX_FLOOR_LEAD
+        );
+        resume_from = 0;
+    }
     let start_counter = resume_from.max(wall_clock_bucket);
     if let Err(e) = write_counter_file(state_path, start_counter) {
         warn!(
@@ -153,6 +181,14 @@ pub(crate) fn seed_send_counter(state_path: &Path, label: &str) -> u64 {
 /// to `max(previous + 1, bucket)` keeps the counter aligned with the
 /// receiver's wall-clock-centred window after any idle period while never
 /// repeating a value within a run.
+///
+/// Deliberately NO symmetric clamp-DOWN: a bursty sender (chain forwarding
+/// under load) legitimately runs the counter far ahead of the current bucket
+/// within a single run, and lowering it would reuse (key, nonce) pairs from
+/// minutes ago.  A counter that ran ahead because of a mid-run clock jump is
+/// indistinguishable from that burst case by value alone, so the stale-floor
+/// repair lives in `seed_send_counter` (process start) instead — a restart
+/// heals the desync.
 pub(crate) fn next_send_counter(counter: &AtomicU64) -> u64 {
     let bucket = crypto::current_timestamp_ms() / COUNTER_BUCKET_MS;
     let prev = counter
@@ -200,6 +236,53 @@ pub(crate) fn persist_counter_floor(
             }
         }
     }
+}
+
+/// Acquire the advisory exclusive `flock` guarding a send-counter state file
+/// — the same scheme as `PeerSyncer::new`'s H3 fix: the persisted high-water
+/// mark only protects SEQUENTIAL restarts, not two overlapping processes
+/// racing the same read-then-write over one state file (which would risk
+/// (key, nonce) reuse under the static link key).  The lock lives on a
+/// dedicated `<state>.state.lock` file, is taken BEFORE the counter state is
+/// touched, and must be held for the process's lifetime (keep the returned
+/// `File` alive; the OS releases the lock on exit/crash).  Returns `None` —
+/// fail closed — when the lock cannot be opened or is already held.
+pub(crate) fn lock_counter_state_file(state_path: &Path, label: &str) -> Option<std::fs::File> {
+    let lock_path = state_path.with_extension("state.lock");
+    let lock_file = match std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .open(&lock_path)
+    {
+        Ok(f) => f,
+        Err(e) => {
+            warn!(
+                "{}: failed to open counter lock file {} — refusing to start: {}",
+                label,
+                lock_path.display(),
+                e
+            );
+            return None;
+        }
+    };
+    {
+        use std::os::unix::io::AsRawFd;
+        // SAFETY: `lock_file` is a valid, open file descriptor for the
+        // duration of this call; `flock` only inspects/mutates kernel lock
+        // state for that fd and does not touch Rust-owned memory.
+        let rc = unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if rc != 0 {
+            warn!(
+                "{}: another process already holds the counter lock at {} — refusing to \
+                 start a second overlapping instance (would risk AEAD nonce reuse under \
+                 the static link key)",
+                label,
+                lock_path.display()
+            );
+            return None;
+        }
+    }
+    Some(lock_file)
 }
 
 /// State-file name for one site peer link, with the peer name sanitised so it
@@ -316,6 +399,11 @@ struct SitePeer {
     persisted_high_water: Mutex<u64>,
     /// Set while persistence is failing, to avoid repeated warnings.
     persist_warned: AtomicBool,
+    /// Advisory exclusive `flock` on `<counter_state_path>.lock`, held for the
+    /// process's lifetime (same scheme as `PeerSyncer::_counter_lock_file`):
+    /// blocks a second overlapping process from racing this state file and
+    /// reusing (key, nonce) pairs under the static per-link send key.
+    _counter_lock_file: std::fs::File,
 }
 
 impl SitePeer {
@@ -364,8 +452,11 @@ impl SitePeer {
         // Seed the counter at max(persisted + 1, current 5-second bucket) so
         // (a) tags land inside the receiver's wall-clock-centred window and
         // (b) no counter/nonce value from a previous run is ever reused
-        // under the static link key.
+        // under the static link key.  The flock is taken FIRST (fail closed):
+        // the persisted floor only protects sequential restarts, not two
+        // overlapping processes racing the same state file.
         let counter_state_path = site_counter_state_path(state_dir, &cfg.name);
+        let lock_file = lock_counter_state_file(&counter_state_path, "site_sync")?;
         let start_counter = seed_send_counter(&counter_state_path, "site_sync");
         let send_counter = AtomicU64::new(start_counter);
         let persisted_high_water = Mutex::new(start_counter);
@@ -378,6 +469,7 @@ impl SitePeer {
             counter_state_path,
             persisted_high_water,
             persist_warned: AtomicBool::new(false),
+            _counter_lock_file: lock_file,
         }))
     }
 
@@ -1084,6 +1176,11 @@ mod tests {
             last_used = peer1.send_counter.load(Ordering::Relaxed) - 1;
         }
 
+        // Drop process 1's peer first to release its advisory counter-file
+        // flock — a real restart closes the old process's fd before the new
+        // one opens, which is exactly what this drop simulates (mirrors
+        // `pool_sync::restart_never_reuses_a_send_counter_value`).
+        drop(peer1);
         let peer2 = SitePeer::new(
             test_peer_cfg("site-b"),
             vec!["192.168.1.0/24".to_string()],
@@ -1097,6 +1194,33 @@ mod tests {
             "restarted site peer must never reuse a counter (last used = \
              {last_used}, resumed at = {resumed})"
         );
+    }
+
+    /// flock regression (mirrors `pool_sync::overlapping_instances_are_refused`):
+    /// two genuinely OVERLAPPING SitePeers on the same counter-state file must
+    /// not both run — the second construction fails closed rather than racing
+    /// the first over (key, nonce) space.
+    #[test]
+    fn overlapping_instances_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let peer1 = SitePeer::new(
+            test_peer_cfg("site-b"),
+            vec!["192.168.1.0/24".to_string()],
+            Some("site-a"),
+            dir.path(),
+        )
+        .unwrap();
+        let peer2 = SitePeer::new(
+            test_peer_cfg("site-b"),
+            vec!["192.168.1.0/24".to_string()],
+            Some("site-a"),
+            dir.path(),
+        );
+        assert!(
+            peer2.is_none(),
+            "a second overlapping SitePeer on the same state file must be refused"
+        );
+        drop(peer1);
     }
 
     #[test]
@@ -1115,6 +1239,62 @@ mod tests {
         assert_eq!(read_counter_file(&path), Some(42));
         write_counter_file(&path, 43).unwrap();
         assert_eq!(read_counter_file(&path), Some(43));
+    }
+
+    /// Clock-jump regression: a persisted floor left far ahead of the current
+    /// wall-clock bucket (VM snapshot restore / NTP step) must NOT be resumed
+    /// from — the receiver's tag window would never reach it and the link
+    /// would stay silently desynced forever.  The seed must reseed at the
+    /// current bucket (and persist that repair).
+    #[test]
+    fn seed_reseeds_stale_floor_from_past_clock_jump() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("counter.state");
+        let bucket = crypto::current_timestamp_ms() / COUNTER_BUCKET_MS;
+        write_counter_file(&path, bucket + COUNTER_MAX_FLOOR_LEAD + 10_000).unwrap();
+
+        let seeded = seed_send_counter(&path, "test");
+        assert!(
+            (bucket..=bucket + 1).contains(&seeded),
+            "stale floor must be reseeded to the current bucket (got {seeded}, bucket {bucket})"
+        );
+        assert_eq!(
+            read_counter_file(&path),
+            Some(seeded),
+            "the reseeded value must be persisted over the stale floor"
+        );
+    }
+
+    /// A floor within the allowed lead is legitimate state (crash-restart
+    /// strides, a burst ahead of the wall clock) and must be resumed past —
+    /// never reseeded downward.
+    #[test]
+    fn seed_respects_floor_within_lead() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("counter.state");
+        let bucket = crypto::current_timestamp_ms() / COUNTER_BUCKET_MS;
+        // Largest floor whose resume value (floor + 1) still does not exceed
+        // bucket + COUNTER_MAX_FLOOR_LEAD.
+        let floor = bucket + COUNTER_MAX_FLOOR_LEAD - 1;
+        write_counter_file(&path, floor).unwrap();
+
+        let seeded = seed_send_counter(&path, "test");
+        assert_eq!(seeded, floor + 1);
+    }
+
+    /// `route_gateway_host` must handle every `via` shape `install_route`
+    /// can be called with: IPv4 host:port, bracketed IPv6 with a port, and
+    /// bare IP literals of either family.
+    #[test]
+    fn route_gateway_host_parses_all_via_forms() {
+        assert_eq!(route_gateway_host("1.2.3.4:443"), "1.2.3.4");
+        assert_eq!(route_gateway_host("[2001:db8::1]:443"), "2001:db8::1");
+        assert_eq!(route_gateway_host("2001:db8::1"), "2001:db8::1");
+        assert_eq!(route_gateway_host("1.2.3.4"), "1.2.3.4");
+        assert_eq!(
+            route_gateway_host("peer.example.com:443"),
+            "peer.example.com"
+        );
     }
 
     // -----------------------------------------------------------------
@@ -1372,9 +1552,32 @@ mod tests {
     }
 }
 
+/// Extract the gateway host from a `via` string given as `host:port`
+/// ("1.2.3.4:443" or "[2001:db8::1]:443") or as a bare IP literal.  The old
+/// `via.split(':').next()` mangled every IPv6 form ("[2001:db8::1]:443"
+/// yielded `"["`, a bare "2001:db8::1" yielded "2001").
+fn route_gateway_host(via: &str) -> &str {
+    // "[2001:db8::1]:443" — bracketed IPv6 literal with a port.
+    if let Some(rest) = via.strip_prefix('[') {
+        if let Some(end) = rest.find(']') {
+            return &rest[..end];
+        }
+    }
+    // Bare IP literal (v4 or v6) without a port — use as-is.  Must be checked
+    // before the port strip below: a bare IPv6 address contains ':'.
+    if via.parse::<IpAddr>().is_ok() {
+        return via;
+    }
+    // "1.2.3.4:443" / "host:443" — strip the port.
+    if let Some((host, _port)) = via.rsplit_once(':') {
+        return host;
+    }
+    via
+}
+
 /// Install a kernel route via `ip route add`.
 fn install_route(subnet: &str, via: &str) {
-    let gateway = via.split(':').next().unwrap_or(via);
+    let gateway = route_gateway_host(via);
     match std::process::Command::new("ip")
         .args(["route", "add", subnet, "via", gateway])
         .status()
