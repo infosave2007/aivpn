@@ -138,7 +138,19 @@ pub async fn mgmt_call(
     cmd.args(["mgmt", "--method", method.as_clap_arg(), "--path", path]);
     if let Some(b) = body {
         let p = std::env::temp_dir().join(format!("aivpn-admin-body-{}.json", scratch_suffix()));
-        tokio::fs::write(&p, &b)
+        // The body can carry client names / exit-node ids / confirm tokens,
+        // and temp_dir() is world-readable — create the scratch file 0600 so
+        // no other local user can read it during its (short) lifetime.
+        let mut opts = tokio::fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        opts.mode(0o600);
+        let mut f = opts
+            .open(&p)
+            .await
+            .map_err(|e| format!("Failed to write request body: {e}"))?;
+        use tokio::io::AsyncWriteExt;
+        f.write_all(&b)
             .await
             .map_err(|e| format!("Failed to write request body: {e}"))?;
         cmd.arg("--body-file").arg(&p);

@@ -760,6 +760,13 @@ pub struct App {
     /// run: (pid, /proc starttime). Not our child — torn down via
     /// `terminate_adopted_wait`, never wait()ed.
     adopted_client: Option<(u32, u64)>,
+    /// `terminate_adopted_wait` for the adopted client is still running
+    /// (kicked off by Message::Disconnect). A Connect arriving inside that
+    /// ~3 s grace window must defer its spawn to OldClientReaped — exactly
+    /// like the `pending_connect` reconnect path — otherwise the old
+    /// client's late SIGTERM cleanup / SIGKILL kill-switch clear tears down
+    /// the NEW session's routes and firewall rules.
+    adopted_reap_in_flight: bool,
     child_handle: Arc<Mutex<Option<tokio::process::Child>>>,
     dialog: DialogMode,
     dlg_name: String,
@@ -963,6 +970,7 @@ impl App {
                 pending_connect: false,
                 launched_kill_switch: false,
                 adopted_client,
+                adopted_reap_in_flight: false,
                 child_handle: Arc::new(Mutex::new(None)),
                 dialog: DialogMode::None,
                 dlg_name: String::new(),
@@ -1044,7 +1052,16 @@ impl App {
                 install_exit_code: None,
                 install_profile_imported: None,
             },
-            Task::none(),
+            // An adopted session starts already Connected, so the
+            // became_connected branch (the only other get_role caller) never
+            // fires for it and the admin panel would stay hidden until a
+            // reconnect. `role` only needs the running daemon's local admin
+            // socket — no connection key — so fetch it right away.
+            if adopted_client.is_some() {
+                Task::perform(admin::get_role(), Message::AdminRoleLoaded)
+            } else {
+                Task::none()
+            },
         )
     }
 
@@ -1154,10 +1171,13 @@ impl App {
                             |_| Message::OldClientReaped,
                         );
                     }
-                    if self.pending_connect {
-                        // A reap from a previous reconnect is still in flight;
-                        // OldClientReaped will spawn the client with the
-                        // currently selected profile when it lands.
+                    if self.pending_connect || self.adopted_reap_in_flight {
+                        // A reap from a previous reconnect — or an adopted
+                        // client's teardown kicked off by Disconnect — is
+                        // still in flight; OldClientReaped will spawn the
+                        // client with the currently selected profile when it
+                        // lands.
+                        self.pending_connect = true;
                         return Task::none();
                     }
                     self.launched_kill_switch = self.settings.kill_switch;
@@ -1169,6 +1189,7 @@ impl App {
             Message::OldClientReaped => {
                 // Old client fully exited and any inline kill-switch clear has
                 // completed — safe to start the new client now.
+                self.adopted_reap_in_flight = false;
                 if self.pending_connect {
                     self.pending_connect = false;
                     if let Some(k) = self.storage.selected_key() {
@@ -1182,9 +1203,19 @@ impl App {
             Message::Disconnect => {
                 self.pending_connect = false;
                 self.connection_key = None;
-                if let Some((pid, starttime)) = self.adopted_client.take() {
-                    tokio::spawn(terminate_adopted_wait(pid, starttime));
-                }
+                let reap_task = if let Some((pid, starttime)) = self.adopted_client.take() {
+                    // Sequenced, not fire-and-forget: a Connect pressed
+                    // during the ~3 s SIGTERM grace must defer its spawn to
+                    // OldClientReaped (see `adopted_reap_in_flight`), or the
+                    // old client's late route restore / kill-switch clear
+                    // would tear down the new session.
+                    self.adopted_reap_in_flight = true;
+                    Task::perform(terminate_adopted_wait(pid, starttime), |_| {
+                        Message::OldClientReaped
+                    })
+                } else {
+                    Task::none()
+                };
                 // Recover from a poisoned mutex so the kill() always executes.
                 let mut guard = match self.child_handle.lock() {
                     Ok(g) => g,
@@ -1199,6 +1230,7 @@ impl App {
                 self.status = VpnStatus::Disconnected;
                 self.bootstrap_fallback = false;
                 self.push_log("Disconnected".to_string());
+                return reap_task;
             }
             Message::StatusReceived(s) => {
                 // While a reconnect waits for the old client's reap, the old

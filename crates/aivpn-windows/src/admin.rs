@@ -795,19 +795,32 @@ fn mgmt_call(
     }
     let out = out.map_err(|e| format!("Failed to run aivpn-client: {e}"))?;
 
-    let stderr_trim = String::from_utf8_lossy(&out.stderr).trim().to_string();
-    if let Ok(status) = stderr_trim.parse::<u16>() {
-        // A genuine numeric `0` only happens on the CLI's own local-failure
-        // sentinel path (the "no reply"/"malformed reply" cases print a
-        // non-numeric message instead, caught by the `else` branch below) —
-        // `check_status` below treats it uniformly as an error, since no
-        // caller ever expects a real HTTP-style status of 0.
-        Ok((status, out.stdout))
-    } else if stderr_trim.is_empty() {
-        Err("aivpn-client mgmt produced no output".to_string())
-    } else {
-        Err(stderr_trim)
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    match parse_mgmt_status(&stderr) {
+        Some(status) => {
+            // A genuine numeric `0` only happens on the CLI's own
+            // local-failure sentinel path (the "no reply"/"malformed reply"
+            // cases print a non-numeric message instead, caught by the `None`
+            // branches below) — `check_status` below treats it uniformly as
+            // an error, since no caller ever expects a real HTTP-style
+            // status of 0.
+            Ok((status, out.stdout))
+        }
+        None if stderr.trim().is_empty() => Err("aivpn-client mgmt produced no output".to_string()),
+        None => Err(stderr.trim().to_string()),
     }
+}
+
+/// Extract the HTTP status `aivpn-client mgmt` prints to stderr
+/// (`eprintln!("{status}")` in its `main.rs`, the LAST thing it writes
+/// there). The client initializes a stderr-writing tracing subscriber
+/// before dispatching the subcommand, so stderr may carry log lines BEFORE
+/// the status line (e.g. with `RUST_LOG` set) — scan for the last
+/// purely-numeric line rather than requiring the whole stderr to be the
+/// status. Same contract as aivpn-linux's `parse_mgmt_status`; `None` = no
+/// parseable status (the caller then surfaces the raw stderr as the error).
+fn parse_mgmt_status(stderr: &str) -> Option<u16> {
+    stderr.lines().rev().find_map(|l| l.trim().parse().ok())
 }
 
 fn mgmt_status_only(client_binary: &Path, method: &str, path: &str) -> Result<(), String> {
@@ -1323,5 +1336,31 @@ mod tests {
         assert!(!mask_id_looks_valid("has space"));
         assert!(!mask_id_looks_valid("has/slash"));
         assert!(!mask_id_looks_valid("has.dot"));
+    }
+
+    // ── mgmt stderr status parse (same contract as aivpn-linux) ─────────
+
+    #[test]
+    fn parse_mgmt_status_plain() {
+        assert_eq!(parse_mgmt_status("200\n"), Some(200));
+        assert_eq!(parse_mgmt_status("404"), Some(404));
+    }
+
+    #[test]
+    fn parse_mgmt_status_ignores_leading_log_lines() {
+        // tracing writes to stderr before the status eprintln (e.g. with
+        // RUST_LOG set) — the status is the LAST numeric line, and leading
+        // noise must not fail the parse.
+        let stderr = "2026-08-19T10:00:00Z  INFO aivpn_client: NoNewPrivs\n204\n";
+        assert_eq!(parse_mgmt_status(stderr), Some(204));
+    }
+
+    #[test]
+    fn parse_mgmt_status_no_numeric_line_is_none() {
+        assert_eq!(
+            parse_mgmt_status("No reply from daemon at 127.0.0.1:44301\n"),
+            None
+        );
+        assert_eq!(parse_mgmt_status(""), None);
     }
 }

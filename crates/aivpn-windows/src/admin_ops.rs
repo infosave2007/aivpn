@@ -444,7 +444,18 @@ impl super::AivpnApp {
             Some(f) => f.clone(),
             None => return,
         };
-        let port: u16 = self.ssh_port.trim().parse().unwrap_or(22);
+        // Same strict port validation as `start_ssh_probe` — silently
+        // falling back to 22 could install to a different endpoint than the
+        // one whose fingerprint was probed/trusted (TOFU). The error surfaces
+        // in the form via `ssh_probe_error` (the wizard's only form-stage
+        // error slot).
+        let port: u16 = match self.ssh_port.trim().parse() {
+            Ok(p) => p,
+            Err(_) => {
+                self.ssh_probe_error = Some("Invalid port".to_string());
+                return;
+            }
+        };
         let user = if self.ssh_user.trim().is_empty() {
             "root".to_string()
         } else {

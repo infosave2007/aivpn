@@ -1103,13 +1103,27 @@ impl super::AivpnApp {
             .spacing([8.0, 4.0])
             .show(ui, |ui| {
                 ui.label(t(lang, "ssh_host"));
-                ui.text_edit_singleline(&mut self.ssh_host);
+                // TOFU: any edit to host/port/user invalidates the probed
+                // fingerprint and the trust decision — otherwise a probe of
+                // host A could bless an install on host B (the Linux GUI
+                // resets these in its *Changed message handlers; here the
+                // fields are edited in place, so watch `.changed()`).
+                if ui.text_edit_singleline(&mut self.ssh_host).changed() {
+                    self.ssh_fingerprint = None;
+                    self.ssh_trusted = false;
+                }
                 ui.end_row();
                 ui.label(t(lang, "ssh_port"));
-                ui.text_edit_singleline(&mut self.ssh_port);
+                if ui.text_edit_singleline(&mut self.ssh_port).changed() {
+                    self.ssh_fingerprint = None;
+                    self.ssh_trusted = false;
+                }
                 ui.end_row();
                 ui.label(t(lang, "ssh_user"));
-                ui.text_edit_singleline(&mut self.ssh_user);
+                if ui.text_edit_singleline(&mut self.ssh_user).changed() {
+                    self.ssh_fingerprint = None;
+                    self.ssh_trusted = false;
+                }
                 ui.end_row();
             });
 

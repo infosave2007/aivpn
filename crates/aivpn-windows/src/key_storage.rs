@@ -98,23 +98,36 @@ pub(crate) fn protect_key(key: &str) -> Result<String, String> {
 }
 
 /// Decrypt a stored connection-key string.
-/// Returns Ok(plaintext) on success, Ok(stored) for legacy plaintext (base64 decode fails,
-/// meaning it was never encrypted), or Err if DPAPI decryption fails (encrypted blob that
-/// could not be decrypted — corrupted or from a different user/machine).
+/// Returns Ok(plaintext) on DPAPI success, Ok(stored) for legacy plaintext —
+/// either a value that never was base64, or a base64-looking plaintext key
+/// whose DPAPI decryption failed (old versions stored the bare key payload,
+/// which can decode as STANDARD base64 when it contains no '-'/'_'; that must
+/// NOT be mistaken for a DPAPI blob and dropped). Err only when the value is
+/// neither decryptable nor a parseable connection key — truly corrupt or
+/// encrypted under a different user/machine.
 ///
 /// `pub(crate)` — see `protect_key` above.
 pub(crate) fn unprotect_key(stored: &str) -> Result<String, String> {
     #[cfg(windows)]
     {
         if let Ok(blob) = base64::engine::general_purpose::STANDARD.decode(stored) {
-            // It decoded as base64 → it was encrypted; DPAPI must succeed.
-            return dpapi::decrypt(&blob)
-                .and_then(|pt| String::from_utf8(pt).ok())
-                .ok_or_else(|| "DPAPI decryption failed".to_string());
+            // It decoded as base64 → probably a DPAPI blob; on success we're
+            // done. A failure does NOT condemn the value (see fn doc) — fall
+            // through to the plaintext validation below.
+            if let Some(pt) = dpapi::decrypt(&blob).and_then(|pt| String::from_utf8(pt).ok()) {
+                return Ok(pt);
+            }
         }
     }
-    // Base64 decode failed → legacy plaintext key; return as-is.
-    Ok(stored.to_string())
+    // Legacy plaintext candidate: accept it only if it still parses as a
+    // connection key. A genuine DPAPI blob that failed decryption is binary
+    // garbage under base64, not key JSON, so it stays Err here and the caller
+    // drops it as before.
+    if ConnectionKey::from_key_string("", stored).is_some() {
+        Ok(stored.to_string())
+    } else {
+        Err("unreadable stored key (corrupt or from a different user/machine)".to_string())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
