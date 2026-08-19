@@ -90,6 +90,17 @@ json_escape() {
     printf '%s' "$s"
 }
 
+# Escape a string for use as the REPLACEMENT of a sed s#...#...# command
+# (delimiter '#'): '\', '&' (expands to the whole match) and '#' (would end
+# the expression early) are special there and must be backslash-escaped.
+sed_escape_replacement() {
+    local s="$1"
+    s="${s//\\/\\\\}"
+    s="${s//&/\\&}"
+    s="${s//#/\\#}"
+    printf '%s' "$s"
+}
+
 # emit_marker STEP STATUS CODE MSG [KEY VALUE]...
 # STATUS is one of: ok | error | info
 emit_marker() {
@@ -467,7 +478,9 @@ seed_config() {
     fi
 
     cp "$template" "$CONFIG_PATH"
-    sed -i "s#\"listen_addr\": *\"[^\"]*\"#\"listen_addr\": \"${LISTEN_ADDR}\"#" "$CONFIG_PATH"
+    local listen_esc
+    listen_esc="$(sed_escape_replacement "$LISTEN_ADDR")"
+    sed -i "s#\"listen_addr\": *\"[^\"]*\"#\"listen_addr\": \"${listen_esc}\"#" "$CONFIG_PATH"
     chmod 644 "$CONFIG_PATH"
     emit_marker "seed_config" "ok" "created" "$CONFIG_PATH created from template (listen_addr=${LISTEN_ADDR})"
 }
@@ -551,15 +564,25 @@ install_systemd_unit() {
         exit 1
     fi
 
+    local esc_listen esc_config esc_keyfile esc_clients esc_maskdir esc_mgmt esc_audit esc_binpath
+    esc_listen="$(sed_escape_replacement "$LISTEN_ADDR")"
+    esc_config="$(sed_escape_replacement "$CONFIG_PATH")"
+    esc_keyfile="$(sed_escape_replacement "$KEY_FILE")"
+    esc_clients="$(sed_escape_replacement "$CLIENTS_DB")"
+    esc_maskdir="$(sed_escape_replacement "$MASK_DIR")"
+    esc_mgmt="$(sed_escape_replacement "$MGMT_SOCKET")"
+    esc_audit="$(sed_escape_replacement "$AUDIT_LOG")"
+    esc_binpath="$(sed_escape_replacement "$BIN_PATH")"
+
     sed \
-        -e "s#__AIVPN_LISTEN__#${LISTEN_ADDR}#g" \
-        -e "s#__AIVPN_CONFIG__#${CONFIG_PATH}#g" \
-        -e "s#__AIVPN_KEYFILE__#${KEY_FILE}#g" \
-        -e "s#__AIVPN_CLIENTS_DB__#${CLIENTS_DB}#g" \
-        -e "s#__AIVPN_MASKDIR__#${MASK_DIR}#g" \
-        -e "s#__AIVPN_MGMT_SOCK__#${MGMT_SOCKET}#g" \
-        -e "s#__AIVPN_AUDITLOG__#${AUDIT_LOG}#g" \
-        -e "s#__AIVPN_BINPATH__#${BIN_PATH}#g" \
+        -e "s#__AIVPN_LISTEN__#${esc_listen}#g" \
+        -e "s#__AIVPN_CONFIG__#${esc_config}#g" \
+        -e "s#__AIVPN_KEYFILE__#${esc_keyfile}#g" \
+        -e "s#__AIVPN_CLIENTS_DB__#${esc_clients}#g" \
+        -e "s#__AIVPN_MASKDIR__#${esc_maskdir}#g" \
+        -e "s#__AIVPN_MGMT_SOCK__#${esc_mgmt}#g" \
+        -e "s#__AIVPN_AUDITLOG__#${esc_audit}#g" \
+        -e "s#__AIVPN_BINPATH__#${esc_binpath}#g" \
         "$unit_src" > "$UNIT_DST"
 
     chmod 644 "$UNIT_DST"
@@ -606,7 +629,13 @@ firewall_open_port() {
     if command -v nft >/dev/null 2>&1; then
         nft add table inet aivpn 2>/dev/null || true
         nft add chain inet aivpn input '{ type filter hook input priority 0 ; }' 2>/dev/null || true
-        nft add rule inet aivpn input udp dport "${port}" accept 2>/dev/null || true
+        # Idempotency: only add the accept rule if it is not already present
+        # (the iptables branch below does the same via -C). Match the rule as
+        # nft renders it ("udp dport <port> accept"); the port is numeric, so
+        # a fixed-string grep is safe.
+        if ! nft list chain inet aivpn input 2>/dev/null | grep -qF "udp dport ${port} accept"; then
+            nft add rule inet aivpn input udp dport "${port}" accept 2>/dev/null || true
+        fi
         emit_marker "firewall" "ok" "nftables" "opened ${port}/udp via nftables"
         return 0
     fi

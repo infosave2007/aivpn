@@ -317,6 +317,13 @@ int aivpn_udp_hook_install(struct socket *sock)
 	if (!sk)
 		return -EINVAL;
 
+	/* Only plain IPv4 UDP sockets may be hooked (same contract as
+	 * aivpn_egress_set): hooking a TCP/AF_UNIX socket would splice a
+	 * foreign receive queue and corrupt its rmem accounting (uncharge
+	 * without charge). AF_INET6 is not supported by the egress path. */
+	if (sk->sk_family != AF_INET || sk->sk_protocol != IPPROTO_UDP)
+		return -EINVAL;
+
 	hs = kzalloc(sizeof(*hs), GFP_KERNEL);
 	if (!hs)
 		return -ENOMEM;

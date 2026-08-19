@@ -243,6 +243,7 @@ int aivpn_encrypt(struct aivpn_kern_session *s, struct sk_buff *skb)
 	u8 tag[AIVPN_TAG_SIZE];
 	u64 counter;
 	unsigned int plain_len = skb->len;
+	u8 *scratch;
 	int ret;
 
 	if (skb_headroom(skb) < AIVPN_TAG_SIZE ||
@@ -260,12 +261,25 @@ int aivpn_encrypt(struct aivpn_kern_session *s, struct sk_buff *skb)
 		memcpy(tag, &ctr_le, AIVPN_TAG_SIZE);
 	}
 
-	skb_put(skb, AIVPN_AUTH_SIZE);
-	sg_init_one(&sg_data, skb->data, plain_len + AIVPN_AUTH_SIZE);
-
+	/* Allocate everything BEFORE touching the skb, and encrypt out-of-place
+	 * into a scratch buffer (mirroring aivpn_decrypt): on any error the
+	 * caller's skb must stay byte-for-byte the original plaintext so the
+	 * user-space fallback path sees a valid packet. In-place encryption
+	 * cannot be rolled back after a failed AEAD. */
 	req = aead_request_alloc(s->tfm, GFP_ATOMIC);
-	if (!req)
+	if (!req) {
+		memzero_explicit(nonce, sizeof(nonce));
 		return -ENOMEM;
+	}
+
+	scratch = kmalloc(plain_len + AIVPN_AUTH_SIZE, GFP_ATOMIC);
+	if (!scratch) {
+		aead_request_free(req);
+		memzero_explicit(nonce, sizeof(nonce));
+		return -ENOMEM;
+	}
+	memcpy(scratch, skb->data, plain_len);
+	sg_init_one(&sg_data, scratch, plain_len + AIVPN_AUTH_SIZE);
 
 	aead_request_set_callback(req, CRYPTO_TFM_REQ_MAY_BACKLOG,
 				  crypto_req_done, &wait);
@@ -277,8 +291,14 @@ int aivpn_encrypt(struct aivpn_kern_session *s, struct sk_buff *skb)
 	memzero_explicit(nonce, sizeof(nonce));
 	if (ret) {
 		aivpn_dbg("encrypt failed: %d\n", ret);
+		kfree_sensitive(scratch);
 		return ret;
 	}
+
+	/* Commit: only now mutate the skb — copy back ciphertext || auth tag. */
+	skb_put(skb, AIVPN_AUTH_SIZE);
+	memcpy(skb->data, scratch, plain_len + AIVPN_AUTH_SIZE);
+	kfree_sensitive(scratch);
 
 	skb_push(skb, AIVPN_TAG_SIZE);
 	memcpy(skb->data, tag, AIVPN_TAG_SIZE);
