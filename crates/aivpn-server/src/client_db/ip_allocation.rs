@@ -9,7 +9,7 @@
 
 use std::net::Ipv4Addr;
 
-use tracing::error;
+use tracing::{error, warn};
 
 use aivpn_common::error::{Error, Result};
 
@@ -277,6 +277,22 @@ impl ClientDatabase {
         if max_host_offset < 2 || num_partitions <= 1 {
             return;
         }
+        // More partitions than usable host offsets cannot be laid out
+        // disjointly: with partition_size clamped to 1, every index past
+        // max-1 would be squeezed onto the same [max, max+1) slice —
+        // cross-node VPN-IP collisions, exactly what partitioning exists to
+        // prevent. Shrink the partition count so each index owns a
+        // non-overlapping range.
+        let num_partitions = if num_partitions > max_host_offset {
+            warn!(
+                "pool: num_partitions ({}) exceeds usable host offsets ({}) — clamping to {}",
+                num_partitions, max_host_offset, max_host_offset
+            );
+            max_host_offset
+        } else {
+            num_partitions
+        };
+        let index = index % num_partitions;
         let bounds = compute_partition_bounds(max_host_offset, num_partitions, index, explicit);
         *self.partition.write() = Some(bounds);
     }
@@ -690,5 +706,53 @@ mod tests {
 
         // Legacy client still untouched after the new allocation too.
         assert_eq!(db.find_by_id(&legacy.id).unwrap().vpn_ip, legacy.vpn_ip);
+    }
+
+    /// Regression: `num_partitions > max_host_offset` used to clamp
+    /// `partition_size` to 1, squeezing every index past `max-1` onto the
+    /// same `[max, max+1)` slice — overlapping partitions owned by different
+    /// nodes, i.e. cross-node VPN-IP collisions. The partition count must be
+    /// clamped to the number of usable host offsets so every index owns a
+    /// disjoint range.
+    #[test]
+    fn oversized_num_partitions_is_clamped_and_never_overlaps() {
+        // /29 → max_host_offset = 6; asking for 1000 partitions must clamp to 6.
+        let small_cfg = VpnNetworkConfig {
+            server_vpn_ip: Ipv4Addr::new(10, 99, 0, 1),
+            prefix_len: 29,
+            ..test_network_config()
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let db = ClientDatabase::load(&dir.path().join("clients.json"), small_cfg).unwrap();
+
+        db.set_node_partition_explicit(4, Some(1000));
+        let info = db.partition_info().expect("partition must be applied");
+        assert_eq!(info.num_partitions, 6, "num_partitions must be clamped");
+        assert_eq!(info.partition_index, 4);
+        assert_eq!(info.partition_size, 1);
+
+        // Allocation works inside the clamped 1-offset partition: index 4
+        // owns offset 5 (offset 1 is the server's own IP).
+        let client = db.add_client("only-slot").unwrap();
+        assert_eq!(client.vpn_ip, Ipv4Addr::new(10, 99, 0, 5));
+
+        // Exhaustive disjointness check for the clamped layout.
+        let bounds: Vec<_> = (0..6)
+            .map(|i| compute_partition_bounds(6, 6, i, false))
+            .collect();
+        for (i, b) in bounds.iter().enumerate() {
+            assert!(
+                b.start_offset < b.end_offset,
+                "partition {i} must be non-empty"
+            );
+            for (j, other) in bounds.iter().enumerate().skip(i + 1) {
+                assert!(
+                    b.end_offset <= other.start_offset,
+                    "partitions {i} and {j} must not overlap"
+                );
+            }
+        }
+        assert_eq!(bounds[0].start_offset, 1);
+        assert_eq!(bounds[5].end_offset, 7, "partitions must cover 1..=6");
     }
 }

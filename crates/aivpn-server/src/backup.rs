@@ -425,8 +425,35 @@ pub fn import_server(
                 )));
             }
             None => {
+                if manifest.mac.is_some() {
+                    // A SIGNED manifest binds the exact file SET, not just
+                    // per-file contents: an attacker with write access to the
+                    // backup store must not be able to slip an extra
+                    // clients.json (with their own PSKs) into an archive
+                    // exported without clients. Unsigned (legacy) backups
+                    // keep the lenient behavior below.
+                    return Err(Error::Session(format!(
+                        "backup integrity check failed: {} is not listed in the signed manifest",
+                        rel
+                    )));
+                }
                 // Older backups (pre-content_hashes) simply lack an entry —
                 // not itself a tamper signal.
+            }
+        }
+    }
+
+    // The reverse direction for signed archives: every manifest entry must
+    // correspond to a staged file, so deleting a file from the archive
+    // (e.g. stripping server.json to keep an old config) is detected too.
+    if manifest.mac.is_some() {
+        for rel in manifest.content_hashes.keys() {
+            if !staged.iter().any(|(staged_rel, _)| staged_rel == rel) {
+                return Err(Error::Session(format!(
+                    "backup integrity check failed: {} is listed in the signed manifest \
+                     but missing from the archive",
+                    rel
+                )));
             }
         }
     }
@@ -439,7 +466,7 @@ pub fn import_server(
     // install, cross-server migration, or a pre-signing backup) — warn and
     // proceed, since the import endpoint is already admin-only (unix
     // socket / CLI on the host).
-    match (&manifest.mac, load_backup_key(target_dir, false)) {
+    let mac_verified = match (&manifest.mac, load_backup_key(target_dir, false)) {
         (Some(mac_hex), Some(key)) => {
             let expected = blake3::keyed_hash(&key, &manifest.mac_input())
                 .to_hex()
@@ -452,6 +479,7 @@ pub fn import_server(
                 ));
             }
             info!("backup integrity signature verified");
+            true
         }
         (Some(_), None) => {
             warn!(
@@ -459,18 +487,23 @@ pub fn import_server(
                  verify authenticity (expected on a fresh install or when migrating from \
                  another server); proceeding"
             );
+            false
         }
         (None, _) => {
             warn!("backup has no integrity signature (older export) — proceeding unverified");
+            false
         }
-    }
+    };
 
     if dry_run {
         return Ok(ImportSummary {
             aivpn_version: manifest.aivpn_version.clone(),
             created_at: manifest.created_at.clone(),
             components: manifest.components.clone(),
-            signed: manifest.mac.is_some(),
+            // `signed` means the signature was actually VERIFIED against the
+            // local key — a mac that was present but unverifiable (no local
+            // key) must not be reported as verified.
+            signed: mac_verified,
             dry_run: true,
         });
     }
@@ -510,7 +543,7 @@ pub fn import_server(
         aivpn_version: manifest.aivpn_version.clone(),
         created_at: manifest.created_at.clone(),
         components: manifest.components.clone(),
-        signed: manifest.mac.is_some(),
+        signed: mac_verified,
         dry_run: false,
     })
 }
@@ -520,4 +553,187 @@ fn semver_major(v: &str) -> u64 {
         .next()
         .and_then(|s| s.parse().ok())
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Read as _;
+
+    fn write_archive(path: &Path, entries: &[(&str, Vec<u8>)]) {
+        let file = std::fs::File::create(path).unwrap();
+        let gz = flate2::write::GzEncoder::new(file, flate2::Compression::default());
+        let mut ar = tar::Builder::new(gz);
+        for (name, bytes) in entries {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(bytes.len() as u64);
+            header.set_mode(0o600);
+            header.set_cksum();
+            ar.append_data(&mut header, name, bytes.as_slice()).unwrap();
+        }
+        ar.finish().unwrap();
+    }
+
+    fn read_archive(path: &Path) -> Vec<(String, Vec<u8>)> {
+        let file = std::fs::File::open(path).unwrap();
+        let gz = flate2::read::GzDecoder::new(file);
+        let mut ar = tar::Archive::new(gz);
+        let mut out = Vec::new();
+        for entry in ar.entries().unwrap() {
+            let mut e = entry.unwrap();
+            let name = e.path().unwrap().to_string_lossy().replace('\\', "/");
+            let mut buf = Vec::new();
+            e.read_to_end(&mut buf).unwrap();
+            out.push((name, buf));
+        }
+        out
+    }
+
+    /// Signed export from `src`, imported into `dst` (which must receive a
+    /// copy of the integrity key for verification to be possible).
+    fn make_signed_backup(src: &Path, archive: &Path) {
+        std::fs::write(src.join("clients.json"), "{\"clients\":[]}").unwrap();
+        std::fs::write(src.join("server.json"), "{}").unwrap();
+        let opts = ExportOptions {
+            include_clients: true,
+            include_config: true,
+            config_path: Some(src.join("server.json")),
+            clients_db: Some(src.join("clients.json")),
+            ..Default::default()
+        };
+        export_server(&opts, archive).unwrap();
+    }
+
+    #[test]
+    fn import_verified_signed_backup_reports_signed() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        let archive = src.path().join("backup.tar.gz");
+        make_signed_backup(src.path(), &archive);
+        std::fs::copy(
+            src.path().join(BACKUP_KEY_FILE),
+            dst.path().join(BACKUP_KEY_FILE),
+        )
+        .unwrap();
+
+        let summary = import_server(&archive, dst.path(), false).unwrap();
+        assert!(summary.signed, "a MAC-verified import must report signed");
+        assert!(dst.path().join("clients.json").exists());
+        assert!(dst.path().join("server.json").exists());
+    }
+
+    /// Regression (MAC must bind the file SET): an attacker with write
+    /// access to the backup store adds a valid, schema-clean file that the
+    /// signed manifest does not list (e.g. a masks/*.json — or, for an
+    /// archive exported without clients, a clients.json full of their own
+    /// PSKs). The old code treated "not in content_hashes" as a benign
+    /// legacy backup and accepted the file.
+    #[test]
+    fn import_rejects_signed_archive_with_unlisted_extra_file() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        let archive = src.path().join("backup.tar.gz");
+        make_signed_backup(src.path(), &archive);
+        std::fs::copy(
+            src.path().join(BACKUP_KEY_FILE),
+            dst.path().join(BACKUP_KEY_FILE),
+        )
+        .unwrap();
+
+        let mut entries = read_archive(&archive);
+        let evil_mask =
+            serde_json::to_vec(&aivpn_common::mask::preset_masks::webrtc_zoom_v3()).unwrap();
+        entries.push(("masks/evil.json".to_string(), evil_mask));
+        let tampered = src.path().join("tampered.tar.gz");
+        let refs: Vec<(&str, Vec<u8>)> = entries
+            .iter()
+            .map(|(n, b)| (n.as_str(), b.clone()))
+            .collect();
+        write_archive(&tampered, &refs);
+
+        let err = import_server(&tampered, dst.path(), true).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("not listed in the signed manifest"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    /// The reverse direction: a file REMOVED from a signed archive must also
+    /// be rejected (the manifest still lists it).
+    #[test]
+    fn import_rejects_signed_archive_with_missing_file() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        let archive = src.path().join("backup.tar.gz");
+        make_signed_backup(src.path(), &archive);
+        std::fs::copy(
+            src.path().join(BACKUP_KEY_FILE),
+            dst.path().join(BACKUP_KEY_FILE),
+        )
+        .unwrap();
+
+        let entries = read_archive(&archive);
+        let kept: Vec<(&str, Vec<u8>)> = entries
+            .iter()
+            .filter(|(n, _)| n != "server.json")
+            .map(|(n, b)| (n.as_str(), b.clone()))
+            .collect();
+        let tampered = src.path().join("tampered.tar.gz");
+        write_archive(&tampered, &kept);
+
+        let err = import_server(&tampered, dst.path(), true).unwrap_err();
+        assert!(
+            err.to_string().contains("missing from the archive"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    /// A signed backup imported on a host WITHOUT the integrity key cannot be
+    /// verified — import proceeds (documented migration path) but the summary
+    /// must not claim the signature was verified.
+    #[test]
+    fn import_signed_backup_without_local_key_reports_unsigned() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap(); // no key copied
+        let archive = src.path().join("backup.tar.gz");
+        make_signed_backup(src.path(), &archive);
+
+        let summary = import_server(&archive, dst.path(), true).unwrap();
+        assert!(
+            !summary.signed,
+            "a mac that could not be verified must not be reported as signed"
+        );
+    }
+
+    /// Genuinely-unsigned (legacy, pre-content_hashes) archives keep the
+    /// lenient behavior: extra/unlisted files are accepted with a warning.
+    #[test]
+    fn import_unsigned_legacy_backup_still_accepted() {
+        let dst = tempfile::tempdir().unwrap();
+        let manifest = BackupManifest {
+            aivpn_version: env!("CARGO_PKG_VERSION").to_string(),
+            created_at: Utc::now().to_rfc3339(),
+            components: vec!["clients".to_string()],
+            content_hashes: Default::default(),
+            mac: None,
+        };
+        let archive = dst.path().join("legacy.tar.gz");
+        write_archive(
+            &archive,
+            &[
+                ("clients.json", b"{\"clients\":[]}".to_vec()),
+                (
+                    "manifest.json",
+                    serde_json::to_vec_pretty(&manifest).unwrap(),
+                ),
+            ],
+        );
+
+        let summary = import_server(&archive, dst.path(), false).unwrap();
+        assert!(!summary.signed);
+        assert!(dst.path().join("clients.json").exists());
+    }
 }

@@ -432,9 +432,49 @@ pub(crate) fn handle_set_client_qos(db: &ClientDatabase, name_or_id: &str, args:
         }
     };
 
-    let bw_up = args.bw_up.as_deref().and_then(parse_bandwidth);
-    let bw_down = args.bw_down.as_deref().and_then(parse_bandwidth);
-    let dscp = args.dscp.as_deref().and_then(dscp_by_name);
+    // Validate every provided value BEFORE applying anything: an unparseable
+    // --dscp/--bw-up must be a hard error, not a silent None in the
+    // full-replacement ClientQos write (which would wipe the existing
+    // setting while the output reported success).
+    let bw_up = match args.bw_up.as_deref() {
+        Some(s) => match parse_bandwidth(s) {
+            Some(v) => Some(v),
+            None => {
+                eprintln!(
+                    "❌ Invalid --bw-up value: '{}' (expected e.g. 500K, 10M, 2G)",
+                    s
+                );
+                std::process::exit(1);
+            }
+        },
+        None => None,
+    };
+    let bw_down = match args.bw_down.as_deref() {
+        Some(s) => match parse_bandwidth(s) {
+            Some(v) => Some(v),
+            None => {
+                eprintln!(
+                    "❌ Invalid --bw-down value: '{}' (expected e.g. 500K, 10M, 2G)",
+                    s
+                );
+                std::process::exit(1);
+            }
+        },
+        None => None,
+    };
+    let dscp = match args.dscp.as_deref() {
+        Some(s) => match dscp_by_name(s) {
+            Some(v) if v <= 63 => Some(v),
+            _ => {
+                eprintln!(
+                    "❌ Invalid --dscp value: '{}' (expected a class name like EF/AF11/CS5 or a number 0-63)",
+                    s
+                );
+                std::process::exit(1);
+            }
+        },
+        None => None,
+    };
 
     if bw_up.is_none()
         && bw_down.is_none()
@@ -455,19 +495,24 @@ pub(crate) fn handle_set_client_qos(db: &ClientDatabase, name_or_id: &str, args:
         priority: args.priority,
     };
 
-    match db.set_client_qos(&client.id, qos) {
+    match db.set_client_qos(&client.id, qos.clone()) {
         Ok(()) => {
+            // Report what was ACTUALLY applied (parsed values), not the raw
+            // CLI strings.
             println!("✅ QoS updated for '{}' ({})", client.name, client.id);
-            if let Some(bw) = args.bw_up.as_deref() {
-                println!("   Upload limit:   {}", bw);
+            match qos.bandwidth_limit_up {
+                Some(bw) => println!("   Upload limit:   {}/s", format_bytes(bw)),
+                None => println!("   Upload limit:   unlimited"),
             }
-            if let Some(bw) = args.bw_down.as_deref() {
-                println!("   Download limit: {}", bw);
+            match qos.bandwidth_limit_down {
+                Some(bw) => println!("   Download limit: {}/s", format_bytes(bw)),
+                None => println!("   Download limit: unlimited"),
             }
-            if let Some(d) = args.dscp.as_deref() {
-                println!("   DSCP class:     {}", d);
+            match qos.dscp_class {
+                Some(d) => println!("   DSCP class:     {}", d),
+                None => println!("   DSCP class:     unset"),
             }
-            if let Some(p) = args.priority {
+            if let Some(p) = qos.priority {
                 println!("   Priority:       {}", p);
             }
         }

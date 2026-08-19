@@ -522,19 +522,26 @@ impl ClientDatabase {
         let mut data = self.data.write();
 
         // Check if anything actually changed in the client configuration.
-        // PSK must be part of the signature so secret rotation takes effect
-        // without requiring a full server restart.
-        let old_sig: std::collections::HashSet<(String, String, [u8; 32], Ipv4Addr, bool)> = data
+        // The signature must cover EVERY synced field (via the same
+        // canonical-field digest pool sync uses — see
+        // `merge::client_record_digest`), not just (id, name, psk, vpn_ip,
+        // enabled): otherwise an external edit that touches only
+        // device_pubkey / one_time / qos / role / expires_at / exit_node
+        // (e.g. a sibling `aivpn-server --reset-device` / `--set-client-qos`
+        // process) is never applied, AND `reload_if_changed` still consumes
+        // the mtime, so the change would never be picked up at all.
+        // vpn_ip rides alongside the digest because it is deliberately not
+        // part of the pool-sync canonical field set (re-homed on conflict).
+        let old_sig: std::collections::HashMap<String, ([u8; 32], Ipv4Addr)> = data
             .clients
             .iter()
-            .map(|c| (c.id.clone(), c.name.clone(), c.psk, c.vpn_ip, c.enabled))
+            .map(|c| (c.id.clone(), (merge::client_record_digest(c), c.vpn_ip)))
             .collect();
-        let new_sig: std::collections::HashSet<(String, String, [u8; 32], Ipv4Addr, bool)> =
-            new_data
-                .clients
-                .iter()
-                .map(|c| (c.id.clone(), c.name.clone(), c.psk, c.vpn_ip, c.enabled))
-                .collect();
+        let new_sig: std::collections::HashMap<String, ([u8; 32], Ipv4Addr)> = new_data
+            .clients
+            .iter()
+            .map(|c| (c.id.clone(), (merge::client_record_digest(c), c.vpn_ip)))
+            .collect();
         let changed = old_sig != new_sig;
 
         if !changed {
@@ -760,6 +767,70 @@ mod tests {
         assert_eq!(reloaded.id, client.id);
         assert_eq!(reloaded.stats.bytes_in, 111);
         assert_eq!(reloaded.stats.bytes_out, 222);
+    }
+
+    /// Regression: the reload change-signature must cover ALL synced fields,
+    /// not just (id, name, psk, vpn_ip, enabled). A sibling process running
+    /// `--reset-device` (device_pubkey + one_time) or `--set-client-qos`
+    /// (qos), or a manual edit of role/expires_at/exit_node, used to leave
+    /// the signature unchanged — and since `reload_if_changed` consumes the
+    /// mtime anyway, the edit would NEVER be applied without a restart.
+    #[test]
+    fn reload_if_changed_applies_external_qos_role_and_device_edits() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("clients.json");
+        let db = ClientDatabase::load(&db_path, test_network_config()).unwrap();
+
+        let client = db.add_client("alice").unwrap();
+
+        let mut on_disk: ClientDbFile =
+            serde_json::from_str(&std::fs::read_to_string(&db_path).unwrap()).unwrap();
+        on_disk.clients[0].device_pubkey = Some([0x42; 32]);
+        on_disk.clients[0].one_time = false;
+        on_disk.clients[0].role = ClientRole::Admin;
+        on_disk.clients[0].exit_node = Some("10.0.9.9:51820".to_string());
+        on_disk.clients[0].qos = Some(crate::qos::ClientQos {
+            bandwidth_limit_up: Some(1_000_000),
+            ..Default::default()
+        });
+
+        let original_mtime = std::fs::metadata(&db_path).unwrap().modified().unwrap();
+        let updated_json = serde_json::to_string_pretty(&on_disk).unwrap();
+        let mut mtime_changed = false;
+        for _ in 0..20 {
+            std::fs::write(&db_path, &updated_json).unwrap();
+            let new_mtime = std::fs::metadata(&db_path).unwrap().modified().unwrap();
+            if new_mtime != original_mtime {
+                mtime_changed = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(60));
+        }
+        assert!(
+            mtime_changed,
+            "test setup failed to advance client DB mtime"
+        );
+
+        assert!(
+            db.reload_if_changed(),
+            "device_pubkey/one_time/role/exit_node/qos edits must trigger reload"
+        );
+        let reloaded = db.find_by_id(&client.id).unwrap();
+        assert_eq!(reloaded.device_pubkey, Some([0x42; 32]));
+        assert!(!reloaded.one_time);
+        assert_eq!(reloaded.role, ClientRole::Admin);
+        assert_eq!(reloaded.exit_node.as_deref(), Some("10.0.9.9:51820"));
+        assert_eq!(
+            reloaded.qos.as_ref().and_then(|q| q.bandwidth_limit_up),
+            Some(1_000_000)
+        );
+
+        // And a second reload with no further edits must report "unchanged"
+        // (the digest covers the same field set on both sides).
+        assert!(
+            !db.reload_if_changed(),
+            "no on-disk change must not be reported as changed"
+        );
     }
 
     #[test]

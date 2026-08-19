@@ -103,6 +103,21 @@ fn write_record_canonical_fields(hasher: &mut blake3::Hasher, c: &ClientConfig) 
     }
 }
 
+/// Full-field per-record digest over the SAME canonical bytes
+/// [`write_record_canonical_fields`] feeds into the pool-sync digests. Used
+/// by `reload_from_disk`'s change signature (mod.rs) so that a change to
+/// ANY converged field — psk, name, enabled, deleted, one_time, updated_at,
+/// expires_at, device_pubkey, qos, role, exit_node — is detected, not just
+/// the old (id, name, psk, vpn_ip, enabled) subset that silently dropped
+/// external edits from `--reset-device`, `--set-client-qos`, or manual
+/// role/expires_at/exit_node changes (mtime was still consumed, so the edit
+/// would never be picked up at all).
+pub(crate) fn client_record_digest(c: &ClientConfig) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    write_record_canonical_fields(&mut hasher, c);
+    *hasher.finalize().as_bytes()
+}
+
 /// Deterministic bucket assignment for a client `id`: the first 8 bytes of
 /// `blake3(id)`, reduced mod [`POOL_SYNC_BUCKETS`]. Shared by
 /// `bucket_digests` (building the digest) and `clients_json_for_buckets`

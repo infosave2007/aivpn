@@ -53,8 +53,19 @@ impl MaskCatalog {
 
     /// Register a new mask (e.g., received via passive distribution or neural unpack)
     pub fn register_mask(&self, mask: MaskProfile) {
-        if !self.compromised.contains_key(&mask.mask_id) {
-            self.masks.insert(mask.mask_id.clone(), mask);
+        let mask_id = mask.mask_id.clone();
+        if self.compromised.contains_key(&mask_id) {
+            return;
+        }
+        self.masks.insert(mask_id.clone(), mask);
+        // TOCTOU: a concurrent `mark_compromised_with_fallback` may have
+        // marked this id compromised BETWEEN the check above and the insert
+        // (it inserts into `compromised` first, then removes from `masks`,
+        // so our insert can land after its remove). Compromised always wins:
+        // re-check and undo the insert, keeping the invariant that an id is
+        // never in both maps at once.
+        if self.compromised.contains_key(&mask_id) {
+            self.masks.remove(&mask_id);
         }
     }
 
@@ -336,6 +347,49 @@ mod tests {
             catalog.available_count(),
             1,
             "register_mask must still refuse a still-compromised id"
+        );
+    }
+
+    /// TOCTOU regression: `register_mask` racing `mark_compromised_with_fallback`
+    /// must never leave the same mask id in BOTH maps (compromised masks must
+    /// not keep serving handshakes). Last-writer-wins in favor of compromised:
+    /// whichever interleaving occurs, the final state has the id in at most
+    /// one map.
+    #[test]
+    fn register_vs_mark_compromised_race_never_leaves_mask_in_both_maps() {
+        use std::sync::Arc;
+
+        let catalog = Arc::new(MaskCatalog::new());
+        let hot = webrtc_zoom_v3();
+        let hot_id = hot.mask_id.clone();
+        // A permanent fallback so mark_compromised_with_fallback is never
+        // refused for catalog-emptiness reasons.
+        catalog.register_mask(aivpn_common::mask::preset_masks::quic_https_v2());
+
+        let register_catalog = Arc::clone(&catalog);
+        let register_mask = hot.clone();
+        let register_thread = std::thread::spawn(move || {
+            for _ in 0..2000 {
+                register_catalog.register_mask(register_mask.clone());
+            }
+        });
+
+        let mark_catalog = Arc::clone(&catalog);
+        let mark_id = hot_id.clone();
+        let mark_thread = std::thread::spawn(move || {
+            for _ in 0..2000 {
+                mark_catalog.mark_compromised_with_fallback(&mark_id);
+            }
+        });
+
+        register_thread.join().unwrap();
+        mark_thread.join().unwrap();
+
+        let in_masks = catalog.masks.contains_key(&hot_id);
+        let in_compromised = catalog.compromised.contains_key(&hot_id);
+        assert!(
+            !(in_masks && in_compromised),
+            "mask id must never be present in both masks and compromised"
         );
     }
 

@@ -278,6 +278,24 @@ pub async fn run_server(
         enforcer
     };
 
+    // Keep the QoS enforcer in sync with clients.json hot-reloads. The
+    // gateway's reload task (gateway/run_loop.rs, 10s interval) refreshes the
+    // DB in memory but has no handle to the enforcer, so QoS edits via CLI
+    // (`--set-client-qos`), the REST API, or manual clients.json edits used
+    // to apply only after a restart. Syncing is idempotent, so it does not
+    // need the reload task's mtime gate — this simply mirrors the DB into
+    // the enforcer on the same cadence.
+    {
+        let enforcer = qos_enforcer.clone();
+        let db = client_db.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                enforcer.sync_from_db(&db);
+            }
+        });
+    }
+
     // Extract values needed after GatewayConfig consumes its inputs
     #[cfg(feature = "dns")]
     let vpn_gateway_ip = std::net::IpAddr::V4(network_config.server_vpn_ip);
