@@ -383,6 +383,18 @@ pub struct AivpnClient {
     /// Hard ceiling on rekey-grace re-arms (see REKEY_TRANSITION_HARD_CAP).
     /// Armed once per inline rekey at the key switch; never extended.
     transition_grace_hard: Option<Instant>,
+    /// Post-rekey session keys staged for the UPLOAD path (M3). The KeyRotate
+    /// handler switches `session_keys` (RX) immediately but parks the same
+    /// keys here instead of overwriting the upload task's live keys, so TX
+    /// keeps riding the OLD keys — and keeps advancing the server's inbound
+    /// counter — until the server proves it committed our rekey response
+    /// (first downlink packet authenticating under the new keys) or the
+    /// transition window closes. Without this, a lost response left the
+    /// server's expected-tag band frozen around its last old-key counter
+    /// while the client raced ahead under the new keys (~170 pps vs the 3 s
+    /// retransmit cadence), so every re-sent response fell outside
+    /// ±TAG_WINDOW_SIZE and the tunnel only healed via a full reconnect.
+    pending_upload_keys: Option<SessionKeys>,
     /// DATA-plane liveness (see `data_watchdog_verdict`): stamped ONLY when an
     /// authenticated DATA payload is delivered to the TUN/proxy. Control
     /// traffic (keepalive-acks, KeyRotate retransmits) must not mask a dead
@@ -630,6 +642,7 @@ impl AivpnClient {
             transition_recv_keys: None,
             transition_recv_deadline: None,
             transition_grace_hard: None,
+            pending_upload_keys: None,
             last_data_rx: Instant::now(),
             upload_at_last_data_rx: 0,
             data_stall_started: None,
@@ -1100,6 +1113,7 @@ impl AivpnClient {
         self.transition_recv_keys = None;
         self.transition_recv_deadline = None;
         self.transition_grace_hard = None;
+        self.pending_upload_keys = None;
     }
 
     /// Obtain an outbound control-channel handle, usable to push
@@ -2782,7 +2796,10 @@ mod tests {
         // deadlocked the tunnel until the RX-silence watchdog reconnected.
         // The handler must RE-SEND the SAME response (same client eph — the
         // server may commit either copy) encrypted with the OLD keys the
-        // server can still read, then restore the new keys for the uplink.
+        // server can still read — and (M3) the uplink must STAY on the old
+        // keys until the server proves the commit, so the server's inbound
+        // counter keeps sliding with the data stream and every re-sent
+        // response lands inside its ±TAG_WINDOW_SIZE tag band.
         let sent = sent_responses.lock().unwrap_or_else(|e| e.into_inner());
         assert_eq!(
             sent.len(),
@@ -2801,7 +2818,61 @@ mod tests {
             "re-sent response must be encrypted with the OLD keys — the \
              server never committed and cannot read the new ones"
         );
+        let client_rekey_eph_pub = sent[0].0;
         drop(sent);
+        // M3: after the re-send the upload keys must be restored to the OLD
+        // keys (the rekey is still unconfirmed) — the committed new keys sit
+        // staged in `pending_upload_keys` until the server's first new-key
+        // downlink packet proves the commit.
+        assert_eq!(
+            upload_state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .keys
+                .session_key,
+            old_keys.session_key,
+            "while the rekey is unconfirmed the upload must stay on the OLD keys (M3)"
+        );
+        assert_eq!(
+            client.pending_upload_keys.as_ref().map(|k| k.session_key),
+            Some(keys_after_first.session_key),
+            "the committed new keys must be STAGED for the upload path, not yet live"
+        );
+
+        // Simulate the server committing the re-sent response: it derives the
+        // same keys (mirrors session.rs commit_session_rekey) and its first
+        // post-commit downlink packet authenticates under them — which must
+        // promote the staged upload keys.
+        let server_dh_rekey = server_rekey_kp
+            .compute_shared(&client_rekey_eph_pub)
+            .expect("server DH must succeed");
+        let server_new_keys = crypto::derive_session_keys(
+            &server_dh_rekey,
+            Some(&old_keys.session_key),
+            &client_rekey_eph_pub,
+        );
+        let server_new_dl = {
+            let mut k = server_new_keys.clone();
+            k.session_key = server_new_keys.session_key_s2c;
+            k
+        };
+        let mdh_len = client.recv_mdh_len;
+        let control = ControlPayload::Keepalive { send_ts: 0 };
+        let encoded = control.encode().unwrap();
+        let inner = build_inner_packet(InnerType::Control, 0, &encoded);
+        let mut server_send_counter = 0u64;
+        let packet = aivpn_common::client_wire::build_random_mdh_packet(
+            &server_new_dl,
+            &mut server_send_counter,
+            &inner,
+            None,
+            mdh_len,
+        )
+        .unwrap();
+        client
+            .receive_and_write_packet(&packet)
+            .await
+            .expect("post-commit new-key downlink must decode");
         assert_eq!(
             upload_state
                 .lock()
@@ -2809,8 +2880,227 @@ mod tests {
                 .keys
                 .session_key,
             keys_after_first.session_key,
-            "after the re-send the upload keys must be restored to the \
-             committed (new) session keys"
+            "the server's first new-key downlink packet proves the commit — \
+             the staged upload keys must be promoted"
+        );
+        assert!(
+            client.pending_upload_keys.is_none(),
+            "staging must be cleared once promoted"
+        );
+
+        drain_task.abort();
+    }
+
+    /// M3 regression: while the rekey is unconfirmed the client must keep its
+    /// UPLOAD on the old keys — no matter how many data packets it sends — so
+    /// the server's inbound counter keeps sliding with the stream and a
+    /// re-sent rekey response always lands inside the server's
+    /// ±TAG_WINDOW_SIZE tag band. Pre-fix the client switched TX to the new
+    /// keys immediately: at ~170 pps over the server's 3 s retransmit cadence
+    /// the re-sent response's counter was ≥511 past the server's frozen
+    /// old-key counter, every retransmit was dropped on tag lookup, and the
+    /// tunnel only healed via the RX-silence reconnect. The upload counter
+    /// must also stay monotonic across the final switch — resetting it would
+    /// reuse (key, nonce) pairs the old key already consumed.
+    #[tokio::test]
+    async fn test_rekey_upload_stays_on_old_keys_until_server_commits() {
+        let config = make_test_config();
+        let mut client = AivpnClient::new(config).expect("new() must not fail");
+
+        let old_client_kp = crypto::KeyPair::generate();
+        let old_server_kp = crypto::KeyPair::generate();
+        let dh_old = old_client_kp
+            .compute_shared(&old_server_kp.public_key_bytes())
+            .unwrap();
+        let mut old_keys =
+            crypto::derive_session_keys(&dh_old, None, &old_client_kp.public_key_bytes());
+        // Equalise directional keys: these tests build server-sim packets with the
+        // C2S encode helper and decode them client-side; the split itself is
+        // covered by `directional_keys_differ` + the live tunnel.
+        old_keys.session_key_s2c = old_keys.session_key;
+        client.session_keys = Some(old_keys.clone());
+
+        let (control_tx, mut control_rx) = mpsc::channel::<ControlPayload>(4);
+        client.control_tx = Some(control_tx);
+        let upload_state = Arc::new(Mutex::new(UploadCryptoState {
+            keys: old_keys.clone(),
+            counter: 0,
+            seq: 0,
+            rekey_ack: VecDeque::new(),
+        }));
+        client.upload_state = Some(upload_state.clone());
+        let captured_client_eph: Arc<Mutex<Option<[u8; 32]>>> = Arc::new(Mutex::new(None));
+        let drain_capture = captured_client_eph.clone();
+        let drain_upload_state = upload_state.clone();
+        let drain_task = tokio::spawn(async move {
+            while let Some(payload) = control_rx.recv().await {
+                let mut state = drain_upload_state.lock().unwrap_or_else(|e| e.into_inner());
+                if let ControlPayload::KeyRotate { new_eph_pub } = payload {
+                    *drain_capture.lock().unwrap_or_else(|e| e.into_inner()) = Some(new_eph_pub);
+                    if let Some(ack) = state.rekey_ack.pop_front() {
+                        let _ = ack.send(());
+                    }
+                }
+            }
+        });
+
+        let server_rekey_kp = crypto::KeyPair::generate();
+        client
+            .handle_server_control(ControlPayload::KeyRotate {
+                new_eph_pub: server_rekey_kp.public_key_bytes(),
+            })
+            .await
+            .expect("KeyRotate handling must not fail");
+
+        let new_session_key = client.session_keys.as_ref().unwrap().session_key;
+        assert_ne!(new_session_key, old_keys.session_key);
+        assert_eq!(
+            upload_state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .keys
+                .session_key,
+            old_keys.session_key,
+            "M3: upload must STAY on the old keys until the server proves the commit"
+        );
+
+        // Simulate a heavy upload burst while the server's retransmit is in
+        // flight: 1000 data packets go out under the STILL-OLD keys, each
+        // bumping the shared monotonic upload counter (the server keeps
+        // validating them, so its expected-tag band slides along).
+        {
+            let mut state = upload_state.lock().unwrap_or_else(|e| e.into_inner());
+            state.counter += 1000;
+            assert_eq!(
+                state.keys.session_key, old_keys.session_key,
+                "upload volume must not force a key switch while unconfirmed"
+            );
+        }
+
+        // The server commits (it received a re-sent response) and switches its
+        // downlink to the new keys — the first such packet promotes the staged
+        // upload keys.
+        let client_rekey_eph_pub = captured_client_eph
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .expect("response must have been observed by the simulated upload task");
+        let server_dh_rekey = server_rekey_kp
+            .compute_shared(&client_rekey_eph_pub)
+            .expect("server DH must succeed");
+        let server_new_keys = crypto::derive_session_keys(
+            &server_dh_rekey,
+            Some(&old_keys.session_key),
+            &client_rekey_eph_pub,
+        );
+        let server_new_dl = {
+            let mut k = server_new_keys.clone();
+            k.session_key = server_new_keys.session_key_s2c;
+            k
+        };
+        assert_eq!(new_session_key, server_new_keys.session_key);
+        let mdh_len = client.recv_mdh_len;
+        let control = ControlPayload::Keepalive { send_ts: 0 };
+        let encoded = control.encode().unwrap();
+        let inner = build_inner_packet(InnerType::Control, 0, &encoded);
+        let mut server_send_counter = 0u64;
+        let packet = aivpn_common::client_wire::build_random_mdh_packet(
+            &server_new_dl,
+            &mut server_send_counter,
+            &inner,
+            None,
+            mdh_len,
+        )
+        .unwrap();
+        client
+            .receive_and_write_packet(&packet)
+            .await
+            .expect("post-commit new-key downlink must decode");
+
+        let state = upload_state.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(
+            state.keys.session_key, new_session_key,
+            "commit proof must promote the staged upload keys"
+        );
+        assert_eq!(
+            state.counter, 1000,
+            "upload counter must stay monotonic across the key switch — no (key, nonce) reuse"
+        );
+        drop(state);
+        assert!(client.pending_upload_keys.is_none());
+
+        drain_task.abort();
+    }
+
+    /// M3 fallback: if the server never proves the commit before the
+    /// transition window closes (e.g. every retransmit was lost AND its final
+    /// give-up leaves it on the old keys), the staged upload keys are still
+    /// promoted when the window closes, so TX matches the RX keys — a truly
+    /// unconverged rekey then falls through to the data watchdog and a clean
+    /// reconnect instead of lingering with divergent directions.
+    #[tokio::test]
+    async fn test_rekey_pending_upload_keys_promoted_at_transition_deadline() {
+        let config = make_test_config();
+        let mut client = AivpnClient::new(config).expect("new() must not fail");
+
+        let old_client_kp = crypto::KeyPair::generate();
+        let old_server_kp = crypto::KeyPair::generate();
+        let dh_old = old_client_kp
+            .compute_shared(&old_server_kp.public_key_bytes())
+            .unwrap();
+        let mut old_keys =
+            crypto::derive_session_keys(&dh_old, None, &old_client_kp.public_key_bytes());
+        old_keys.session_key_s2c = old_keys.session_key;
+        client.session_keys = Some(old_keys.clone());
+
+        let (control_tx, mut control_rx) = mpsc::channel::<ControlPayload>(4);
+        client.control_tx = Some(control_tx);
+        let upload_state = Arc::new(Mutex::new(UploadCryptoState {
+            keys: old_keys.clone(),
+            counter: 0,
+            seq: 0,
+            rekey_ack: VecDeque::new(),
+        }));
+        client.upload_state = Some(upload_state.clone());
+        let drain_upload_state = upload_state.clone();
+        let drain_task = tokio::spawn(async move {
+            while let Some(payload) = control_rx.recv().await {
+                if matches!(payload, ControlPayload::KeyRotate { .. }) {
+                    let mut state = drain_upload_state.lock().unwrap_or_else(|e| e.into_inner());
+                    if let Some(ack) = state.rekey_ack.pop_front() {
+                        let _ = ack.send(());
+                    }
+                }
+            }
+        });
+
+        let server_rekey_kp = crypto::KeyPair::generate();
+        client
+            .handle_server_control(ControlPayload::KeyRotate {
+                new_eph_pub: server_rekey_kp.public_key_bytes(),
+            })
+            .await
+            .expect("KeyRotate handling must not fail");
+        let new_session_key = client.session_keys.as_ref().unwrap().session_key;
+        assert!(client.pending_upload_keys.is_some());
+
+        // Force the transition window shut; any received packet trips the
+        // deadline cleanup — even an undecodable one.
+        client.transition_recv_deadline = Some(Instant::now() - Duration::from_secs(1));
+        let garbage = vec![0xABu8; 64];
+        let _ = client.receive_and_write_packet(&garbage).await;
+
+        assert!(
+            client.pending_upload_keys.is_none(),
+            "staging must be flushed when the transition window closes"
+        );
+        assert_eq!(
+            upload_state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .keys
+                .session_key,
+            new_session_key,
+            "deadline fallback must align TX with the RX keys"
         );
 
         drain_task.abort();

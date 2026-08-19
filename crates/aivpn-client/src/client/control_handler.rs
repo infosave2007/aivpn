@@ -160,11 +160,13 @@ impl super::AivpnClient {
                     // Same rendezvous dance as the initial response: swap the
                     // OLD keys into the upload state, block until the upload
                     // task confirms it encrypted THIS response with them, then
-                    // restore the committed (new) keys.
+                    // restore the live upload keys (still the OLD ones while
+                    // the rekey is unconfirmed — M3 staging — so the swap is a
+                    // no-op then; the committed new keys once it converged).
                     let rekey_ack_rx = self.upload_state.as_ref().map(|upload_state| {
                         let (ack_tx, ack_rx) = oneshot::channel();
                         let mut state = upload_state.lock().unwrap_or_else(|e| e.into_inner());
-                        state.keys = old_keys;
+                        state.keys = old_keys.clone();
                         state.rekey_ack.push_back(ack_tx);
                         ack_rx
                     });
@@ -204,10 +206,19 @@ impl super::AivpnClient {
                             }
                         }
                     }
-                    if let (Some(upload_state), Some(keys)) =
-                        (&self.upload_state, self.session_keys.as_ref())
-                    {
-                        upload_state.lock().unwrap_or_else(|e| e.into_inner()).keys = keys.clone();
+                    // Restore the upload keys displaced by the swap above.
+                    // While the rekey is still unconfirmed (`pending_upload_keys`
+                    // staged) TX must STAY on the old keys (M3: the data stream
+                    // keeps advancing the server's inbound counter, so this
+                    // re-sent response lands inside its tag band); once the
+                    // server has committed, TX runs on the new keys.
+                    let restore_keys = if self.pending_upload_keys.is_some() {
+                        Some(old_keys.clone())
+                    } else {
+                        self.session_keys.clone()
+                    };
+                    if let (Some(upload_state), Some(keys)) = (&self.upload_state, restore_keys) {
+                        upload_state.lock().unwrap_or_else(|e| e.into_inner()).keys = keys;
                     }
                     if let Err(e) = send_result {
                         warn!("Inline rekey: failed to re-send response: {}", e);
@@ -270,6 +281,20 @@ impl super::AivpnClient {
                     ack_rx
                 });
                 if let Err(e) = self.send_control(&response).await {
+                    // Nothing was enqueued — drop the just-registered
+                    // rendezvous so it cannot strand in the shared queue and
+                    // mis-fire on a FUTURE KeyRotate response (the upload task
+                    // pops one ack per KeyRotate it encrypts, regardless of
+                    // which handler installed it), starving that handler's own
+                    // rendezvous. Mirrors the retransmit path's send-failure
+                    // cleanup above.
+                    if let Some(upload_state) = &self.upload_state {
+                        upload_state
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .rekey_ack
+                            .pop_back();
+                    }
                     warn!("Inline rekey: failed to send response: {}", e);
                     return Ok(());
                 }
@@ -283,12 +308,34 @@ impl super::AivpnClient {
                             return Ok(());
                         }
                         Err(_) => {
-                            // Timed out: the upload task died between dequeuing
-                            // the KeyRotate and firing the ack, leaving the
-                            // sender stranded in the shared queue. Remove it so
-                            // it cannot mis-fire on a future KeyRotate and
-                            // abort like the task-gone branch instead of
-                            // hanging the receive loop forever.
+                            // Timed out with no confirmation. Remove the
+                            // stranded ack so it cannot mis-fire on a future
+                            // KeyRotate — but DO NOT abort the rekey. The
+                            // response is already queued and two sub-cases are
+                            // indistinguishable from here:
+                            //  (a) the upload task already dequeued and
+                            //      encrypted it with the OLD keys (consuming
+                            //      our ack) without firing it yet — the
+                            //      response WILL reach the server, which will
+                            //      commit exactly the keys derived below;
+                            //  (b) it is still queued and goes out later,
+                            //      possibly under the NEW keys — unreadable to
+                            //      the server, which then retransmits
+                            //      KeyRotate, and the idempotent re-send path
+                            //      (guarded by `ratcheted_rekey_eph_pub` /
+                            //      `rekey_response_eph`, both armed below)
+                            //      re-sends the SAME response under the old
+                            //      keys until the server commits.
+                            // Aborting here was the key-divergence deadlock:
+                            // the queued response still went out (server
+                            // commits the eph1 keys) while the guard was never
+                            // armed, so the retransmit was processed as a
+                            // FRESH request generating eph2 — client on eph2
+                            // keys, server on eph1 keys, permanently.
+                            // Completing the switch makes both sides always
+                            // converge on the same (eph1) key pair; if the
+                            // upload task is truly dead no response is ever
+                            // sent and the data watchdog reconnects as before.
                             if let Some(upload_state) = &self.upload_state {
                                 upload_state
                                     .lock()
@@ -297,10 +344,11 @@ impl super::AivpnClient {
                                     .pop_back();
                             }
                             warn!(
-                                "Inline rekey: no old-key send confirmation within {:?}, aborting rekey to avoid desync",
+                                "Inline rekey: no old-key send confirmation within {:?} — \
+                                 completing the key switch; a lost/unreadable response heals \
+                                 via the idempotent re-send on the server's retransmit",
                                 REKEY_ACK_TIMEOUT
                             );
-                            return Ok(());
                         }
                     }
                 }
@@ -334,16 +382,22 @@ impl super::AivpnClient {
                 self.session_keys = Some(new_keys);
                 self.ratcheted_rekey_eph_pub = Some(new_eph_pub);
                 self.rekey_response_eph = Some(client_rekey_kp.public_key_bytes());
-                if let Some(upload_state) = &self.upload_state {
-                    let mut state = upload_state.lock().unwrap_or_else(|e| e.into_inner());
-                    if let Some(ref keys) = self.session_keys {
-                        state.keys = keys.clone();
-                    } else {
-                        warn!("ratchet: session_keys missing, skipping upload key update");
-                    }
-                    // state.counter kept monotonic — do NOT reset to 0.
+                // M3: stage the new keys for the upload path but do NOT switch
+                // TX yet. Until the server proves it committed our response
+                // (first downlink packet authenticating under the new keys
+                // promotes the staging — see `promote_pending_upload_keys`),
+                // uplink keeps riding the OLD keys, so the server's inbound
+                // counter keeps advancing with the data stream and a re-sent
+                // response (lost-response self-heal) always lands inside its
+                // ±TAG_WINDOW_SIZE tag band — no matter how many packets were
+                // uploaded in between. The upload counter is monotonic across
+                // the later key change, so no (key, nonce) pair is reused.
+                if self.session_keys.is_some() {
+                    self.pending_upload_keys = self.session_keys.clone();
+                } else {
+                    warn!("ratchet: session_keys missing, skipping upload key staging");
                 }
-                info!("Inline PFS rekey complete — new session keys active");
+                info!("Inline PFS rekey complete — new session keys active (upload staged)");
 
                 // K6: re-install the in-kernel downlink session under the
                 // rotated s2c key (idempotent same-id replace) and re-push the
@@ -451,6 +505,11 @@ impl super::AivpnClient {
                     // Switch to ratcheted keys — outbound uses the new keys immediately.
                     self.session_keys = Some(ratcheted);
                     self.ratcheted_server_eph_pub = Some(server_eph_pub);
+                    // A fresh PFS ratchet supersedes any staged inline-rekey
+                    // upload keys (anomalous ordering — the server only sends
+                    // KeyRotate to ratcheted sessions — but never let a stale
+                    // staging clobber the ratcheted upload keys later).
+                    self.pending_upload_keys = None;
                     self.counter = 0;
                     self.recv_window.reset();
                     if let Some(upload_state) = &self.upload_state {

@@ -1071,6 +1071,27 @@ impl super::AivpnClient {
         .await
     }
 
+    /// M3: promote the staged post-rekey upload keys into the upload task's
+    /// live TX slot. The KeyRotate handler stages the new keys into
+    /// `pending_upload_keys` instead of switching TX immediately, so uplink
+    /// keeps riding the OLD keys — and keeps advancing the server's inbound
+    /// counter — until the server proves it committed our rekey response.
+    /// That way a re-sent rekey response (lost-response self-heal) always
+    /// lands inside the server's ±TAG_WINDOW_SIZE expected-tag band, no
+    /// matter how much data was uploaded in between. Promoted on the first
+    /// downlink packet that authenticates under the NEW keys (proof of
+    /// commit), or as a fallback when the transition window closes. The
+    /// upload counter is untouched (monotonic across the key change), so no
+    /// (key, nonce) pair is ever reused. No-op outside a rekey.
+    fn promote_pending_upload_keys(&mut self) {
+        if let (Some(upload_state), Some(new_keys)) =
+            (&self.upload_state, self.pending_upload_keys.take())
+        {
+            upload_state.lock().unwrap_or_else(|e| e.into_inner()).keys = new_keys;
+            info!("Inline rekey confirmed — upload switched to the committed new keys");
+        }
+    }
+
     /// Receive packet from server and write to TUN (using pre-computed mdh_len)
     pub(super) async fn receive_and_write_packet(&mut self, packet: &[u8]) -> Result<()> {
         if self
@@ -1081,6 +1102,11 @@ impl super::AivpnClient {
             self.transition_recv_deadline = None;
             self.transition_grace_hard = None;
             self.transition_recv_window.reset();
+            // M3 fallback: the transition window closed without the server
+            // ever proving the rekey commit — promote the staged upload keys
+            // anyway so TX matches the RX keys (a truly unconverged rekey
+            // then falls through to the data watchdog as before).
+            self.promote_pending_upload_keys();
         }
 
         let keys = self
@@ -1100,7 +1126,15 @@ impl super::AivpnClient {
             &mut self.recv_window,
             &mut self.recv_mdh_candidates,
         ) {
-            Ok(decoded) => decoded,
+            Ok(decoded) => {
+                // M3: while a rekey staging is outstanding, a packet that
+                // authenticates under the CURRENT session keys proves the
+                // server received and committed our rekey response (it only
+                // switches its downlink to the new keys at commit) — promote
+                // the staged upload keys. No-op when no rekey is in flight.
+                self.promote_pending_upload_keys();
+                decoded
+            }
             Err(primary_err) => {
                 // Fallback: PFS-ratchet transition keys (in-flight packets
                 // encrypted with the pre-rekey keys), same candidate lengths.

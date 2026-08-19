@@ -2826,6 +2826,94 @@ mod tests {
         );
     }
 
+    /// M3 regression (legacy-client safety net): a client whose rekey RESPONSE
+    /// was lost keeps uploading under the NEW (server-unreadable) keys with its
+    /// shared monotonic counter, so its re-sent response — under the OLD keys
+    /// the server still accepts — arrives with a counter far past the server's
+    /// frozen inbound counter (~170 pps × the 3 s retransmit cadence already
+    /// exceeds the plain ±TAG_WINDOW_SIZE band). While the rekey is pending
+    /// `update_tag_window` reaches REKEY_TAG_LOOKAHEAD counters forward, so
+    /// the re-sent response still validates and the rekey commits instead of
+    /// burning all MAX_REKEY_SEND_ATTEMPTS retransmits and dying to the
+    /// client's RX-silence watchdog. (New clients additionally keep TX on the
+    /// old keys until commit, so the band never freezes at all.)
+    #[test]
+    fn rekey_resent_response_validates_past_frozen_counter() {
+        let sm = make_manager();
+        let sid = [11u8; 16];
+        insert_overdue_session(&sm, sid);
+
+        // Simulate a live session: 1000 packets already validated.
+        {
+            let entry = sm.sessions.get(&sid).unwrap();
+            let mut s = entry.value().lock();
+            s.mark_tag_received(1000);
+        }
+
+        let due = sm.start_rekeying_sessions();
+        assert_eq!(due.len(), 1, "overdue session must start rekeying");
+
+        // The client's response is lost; it switches to the new keys and keeps
+        // uploading. Those packets are undecryptable to the pre-commit server
+        // (different tag_secret) — the inbound counter stays frozen at 1000.
+        {
+            let entry = sm.sessions.get(&sid).unwrap();
+            let s = entry.value().lock();
+            let tw = crypto::compute_time_window(crypto::current_timestamp_ms(), DEFAULT_WINDOW_MS);
+            let new_key_tag = crypto::generate_resonance_tag(&[0xEEu8; 32], 1500, tw);
+            assert!(
+                s.validate_tag(&new_key_tag).is_none(),
+                "new-key data must not validate before the rekey commits"
+            );
+            assert_eq!(
+                s.counter, 1000,
+                "unreadable flood must not move the counter"
+            );
+        }
+
+        // The server retransmits KeyRotate; the client re-sends its response
+        // under the OLD keys with its CURRENT counter — 1001 counters past the
+        // server's frozen edge, far outside the plain ±TAG_WINDOW_SIZE band.
+        let (response_counter, response_tag) = {
+            let entry = sm.sessions.get(&sid).unwrap();
+            let s = entry.value().lock();
+            let counter = s.counter + 1001;
+            let tw = crypto::compute_time_window(crypto::current_timestamp_ms(), DEFAULT_WINDOW_MS);
+            let tag = crypto::generate_resonance_tag(&s.keys.tag_secret, counter, tw);
+            (counter, tag)
+        };
+        {
+            let entry = sm.sessions.get(&sid).unwrap();
+            let mut s = entry.value().lock();
+            let (counter, is_ratcheted_tag) = s
+                .validate_tag(&response_tag)
+                .expect("re-sent rekey response must validate via the pending-rekey lookahead");
+            assert!(!is_ratcheted_tag);
+            assert_eq!(counter, response_counter);
+            s.mark_tag_received(counter);
+            assert_eq!(
+                s.counter, response_counter,
+                "validating the far-ahead response resyncs the live edge"
+            );
+        }
+
+        // The response reaches the control plane → the rekey commits.
+        let client_kp = crypto::KeyPair::generate();
+        sm.commit_session_rekey(&sid, &client_kp.public_key_bytes());
+        let entry = sm.sessions.get(&sid).unwrap();
+        let s = entry.value().lock();
+        assert!(s.pending_rekey_keypair.is_none(), "rekey must commit");
+        assert_ne!(
+            s.keys.tag_secret,
+            make_keys(1).tag_secret,
+            "commit must install the new keys"
+        );
+        assert_eq!(
+            s.counter, response_counter,
+            "counters stay monotonic across the commit — no nonce reuse, window resynced"
+        );
+    }
+
     // ── Masked pool-peer handshake (FORK-B of pool-sync redesign) ───────────
 
     /// Simulate the dialer's side of the masked pool-client handshake: derive
