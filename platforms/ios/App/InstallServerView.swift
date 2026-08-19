@@ -33,7 +33,7 @@ private struct InstallLogLine: Identifiable {
 /// annotation — every mutation here happens on the main run loop because
 /// `Timer.scheduledTimer` fires there by default (`RunLoop.main` unless
 /// explicitly moved to another run loop, which this never does).
-final class SshInstallRunner: ObservableObject {
+private final class SshInstallRunner: ObservableObject {
     @Published private(set) var logLines: [InstallLogLine] = []
     @Published private(set) var isRunning = false
     @Published private(set) var finishedExitCode: Int?
