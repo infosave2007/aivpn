@@ -5,6 +5,42 @@
 
 use super::*;
 
+/// M1: validate an FEC-recovered payload and return the real packet length.
+///
+/// An honest XOR recovery reproduces the missing packet zero-padded up to the
+/// group's max length — the encoder XORs only each packet's real bytes
+/// (`FecEncoder::feed`), so every byte past the missing packet's end cancels
+/// to 0. A false trigger (a reordered/foreign packet counted into the
+/// accumulator until `recv == group_size - 1`) XORs ≥3 unrelated payloads
+/// whose tails do NOT cancel; its version/IHL/inner-src bytes can still pass
+/// the anti-spoof check below, so without this proof the garbage (XOR of
+/// plaintext fragments) would be forwarded to NAT.
+///
+/// Returns `Some(tot_len)` — forward exactly that many bytes — or `None` to
+/// drop.
+pub(crate) fn fec_recovered_len(recovered: &[u8]) -> Option<usize> {
+    if recovered.len() < 20 || (recovered[0] >> 4) != 4 {
+        return None;
+    }
+    let ihl = (recovered[0] & 0x0f) as usize * 4;
+    let tot_len = u16::from_be_bytes([recovered[2], recovered[3]]) as usize;
+    if ihl < 20 || tot_len < ihl || tot_len > recovered.len() {
+        return None;
+    }
+    if recovered[tot_len..].iter().any(|b| *b != 0) {
+        return None;
+    }
+    Some(tot_len)
+}
+
+/// True when `seq` is stale relative to the most recently processed FecRepair
+/// seq — i.e. not ahead of it within half a u16 cycle (wrapping-safe). The
+/// client numbers all inner packets monotonically, so such a Data packet
+/// belongs to an already-closed FEC group.
+pub(crate) fn fec_seq_is_stale(repair_seq_hi: u16, seq: u16) -> bool {
+    repair_seq_hi.wrapping_sub(seq) < 0x8000
+}
+
 impl super::Gateway {
     /// Handle incoming packet
     pub(crate) async fn handle_packet(
@@ -1310,6 +1346,31 @@ impl super::Gateway {
                     return Ok(());
                 }
 
+                // FEC late-packet suppression: once a FecRepair was processed,
+                // any Data packet whose inner seq is not ahead of that repair
+                // belongs to an already-closed group — either the late original
+                // of a just-FEC-recovered packet (a duplicate) or a straggler
+                // that would corrupt the new group's XOR accumulator (a false
+                // `recv == group_size - 1` trigger recovers garbage into NAT).
+                // Client inner seqs are monotone; the wrapping subtraction
+                // treats seq as stale iff it lies within half a u16 cycle
+                // behind the repair.
+                {
+                    let sess = session.lock();
+                    if let Some(hi) = sess.fec_repair_seq_hi {
+                        if fec_seq_is_stale(hi, inner_header.seq_num) {
+                            debug!(
+                                "FEC: dropping late Data seq={} from {} \
+                                 (repair seq={} already processed)",
+                                inner_header.seq_num,
+                                hash_addr(&client_addr),
+                                hi
+                            );
+                            return Ok(());
+                        }
+                    }
+                }
+
                 // Anti-spoof + peer routing gate (authoritative, at ingress).
                 // Only IPv4 is routed through the VPN; reject everything else to
                 // prevent clients from injecting arbitrary layer-3 traffic that
@@ -1483,15 +1544,27 @@ impl super::Gateway {
                             sess.fec_xor_buf.iter_mut().for_each(|b| *b = 0);
                             sess.fec_xor_len = 0;
                             sess.fec_pending_seq = repair.group_seq.wrapping_add(1);
+                            // Close all earlier groups: Data packets with inner
+                            // seq <= this repair's seq are late duplicates and
+                            // are dropped at ingress (see the Data branch).
+                            sess.fec_repair_seq_hi = Some(inner_header.seq_num);
                             result
                         };
 
-                        if let Some(recovered) = recovered_opt {
+                        if let Some(mut recovered) = recovered_opt {
                             // Validate recovered packet with the same anti-spoof and
                             // peer-routing checks applied to normal Data packets.
-                            if recovered.len() < 20 || (recovered[0] >> 4) != 4 {
+                            // M1: `fec_recovered_len` additionally proves the XOR
+                            // really reconstructs one missing packet (all-zero
+                            // tail past the IPv4 total length) and trims the
+                            // padding; reordered-group garbage fails it here.
+                            let valid_len = fec_recovered_len(&recovered);
+                            if let Some(tot_len) = valid_len {
+                                recovered.truncate(tot_len);
+                            }
+                            if valid_len.is_none() {
                                 debug!(
-                                    "FEC anti-spoof: dropping non-IPv4 recovered packet \
+                                    "FEC anti-spoof: dropping malformed recovered packet \
                                      (len={} ver={})",
                                     recovered.len(),
                                     recovered.first().map(|b| b >> 4).unwrap_or(0)
@@ -1576,5 +1649,124 @@ impl super::Gateway {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{fec_recovered_len, fec_seq_is_stale};
+
+    /// Minimal IPv4 packet of `len` bytes: version/IHL 0x45, tot_len = len,
+    /// fixed src/dst, payload filled with `seed`.
+    fn ipv4_packet(len: usize, src: [u8; 4], seed: u8) -> Vec<u8> {
+        let mut p = vec![0u8; len];
+        p[0] = 0x45;
+        p[2..4].copy_from_slice(&(len as u16).to_be_bytes());
+        p[8] = 64;
+        p[9] = 17;
+        p[12..16].copy_from_slice(&src);
+        p[16..20].copy_from_slice(&[8, 8, 8, 8]);
+        for b in &mut p[20..] {
+            *b = seed;
+        }
+        p
+    }
+
+    /// M1 regression: an honest XOR recovery (one missing packet, shorter
+    /// than a sibling) is zero-padded up to the group's max length — the
+    /// validator accepts it and reports the real length to trim to.
+    #[test]
+    fn fec_recovered_len_accepts_honest_recovery_with_zero_tail() {
+        use aivpn_common::fec::FecEncoder;
+        let src = [10, 0, 0, 2];
+        let pkts = vec![
+            ipv4_packet(300, src, 0x11),
+            ipv4_packet(120, src, 0x22), // "lost" — recovered below
+            ipv4_packet(500, src, 0x33),
+        ];
+        let mut enc = FecEncoder::new(3, 1500);
+        let mut repair = None;
+        for p in &pkts {
+            repair = enc.feed(p);
+        }
+        let repair = repair.unwrap();
+
+        // Server-side accumulator over the two received packets (mirrors the
+        // Data branch in `process_inner_payload`).
+        let mut xor_buf = vec![0u8; 1500];
+        let mut xor_len = 0usize;
+        for p in [&pkts[0], &pkts[2]] {
+            for (a, b) in xor_buf[..p.len()].iter_mut().zip(p.iter()) {
+                *a ^= b;
+            }
+            xor_len = xor_len.max(p.len());
+        }
+        let out_len = xor_len.max(repair.xor_data.len());
+        let mut out = vec![0u8; out_len];
+        for i in 0..out_len {
+            out[i] =
+                repair.xor_data.get(i).copied().unwrap_or(0) ^ xor_buf.get(i).copied().unwrap_or(0);
+        }
+
+        assert_eq!(fec_recovered_len(&out), Some(pkts[1].len()));
+        out.truncate(pkts[1].len());
+        assert_eq!(out, pkts[1]);
+    }
+
+    /// M1 regression: the reordered-group false trigger XORs ≥3 unrelated
+    /// packets. Version/IHL/inner-src still look right (XOR of an odd count
+    /// of identical header bytes), so only the length-consistency proof
+    /// drops it.
+    #[test]
+    fn fec_recovered_len_rejects_reordered_group_garbage() {
+        let src = [10, 0, 0, 2];
+        let b = ipv4_packet(200, src, 0xBB); // lost member of group N
+        let c = ipv4_packet(300, src, 0xCC); // lost member of group N
+        let x = ipv4_packet(400, src, 0xDD); // first packet of group N+1
+        let mut garbage = vec![0u8; 400];
+        for i in 0..garbage.len() {
+            garbage[i] = b.get(i).copied().unwrap_or(0)
+                ^ c.get(i).copied().unwrap_or(0)
+                ^ x.get(i).copied().unwrap_or(0);
+        }
+        // What the old anti-spoof check saw — and passed.
+        assert_eq!(garbage[0] >> 4, 4);
+        assert_eq!(garbage[0] & 0x0f, 5);
+        assert_eq!(&garbage[12..16], &src);
+        assert_eq!(fec_recovered_len(&garbage), None);
+    }
+
+    #[test]
+    fn fec_recovered_len_rejects_malformed_buffers() {
+        let src = [10, 0, 0, 2];
+        let p = ipv4_packet(128, src, 0x77);
+        // Buffer shorter than the claimed total length.
+        assert_eq!(fec_recovered_len(&p[..100]), None);
+        // Non-zero tail past tot_len (not an honest recovery).
+        let mut padded = p.clone();
+        padded.extend_from_slice(&[1, 2, 3]);
+        assert_eq!(fec_recovered_len(&padded), None);
+        // All-zero tail: accepted, trimmed to tot_len.
+        let mut zpad = p.clone();
+        zpad.extend_from_slice(&[0, 0, 0]);
+        assert_eq!(fec_recovered_len(&zpad), Some(128));
+        // Non-IPv4 and too-short buffers.
+        let mut v6 = p.clone();
+        v6[0] = 0x60;
+        assert_eq!(fec_recovered_len(&v6), None);
+        assert_eq!(fec_recovered_len(&p[..10]), None);
+    }
+
+    #[test]
+    fn fec_seq_is_stale_wraps_safely() {
+        assert!(fec_seq_is_stale(100, 99));
+        // The repair's own seq can never belong to a new Data packet.
+        assert!(fec_seq_is_stale(100, 100));
+        assert!(!fec_seq_is_stale(100, 101));
+        // u16 wrap: 65530 is 11 behind 5.
+        assert!(fec_seq_is_stale(5, 65530));
+        assert!(!fec_seq_is_stale(5, 6));
+        // Exactly half a cycle behind is treated as new.
+        assert!(!fec_seq_is_stale(0, 0x8000));
     }
 }

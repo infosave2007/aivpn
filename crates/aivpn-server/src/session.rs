@@ -88,6 +88,24 @@ pub const MAX_REKEY_SEND_ATTEMPTS: u32 = 5;
 /// tick, all `MAX_REKEY_SEND_ATTEMPTS` sends land within ~12 s of initiation.
 pub const REKEY_RETRANSMIT_SECS: u64 = 3;
 
+/// Extra FORWARD span precomputed into the expected-tag window while an
+/// inline rekey is pending (see `update_tag_window`). A client whose rekey
+/// RESPONSE was lost keeps uploading under the new (server-unreadable) keys
+/// with its shared monotonic counter, so its re-sent response — under the
+/// old keys the server still accepts — can arrive with a counter thousands
+/// past the server's frozen inbound counter (~170 pps over the 3 s
+/// retransmit cadence, more under heavier upload). Outside the precomputed
+/// band the response only had the globally rate-limited fallback scan
+/// (`recover_session_by_tag`, ±2048, 20 scans/s shared) — which the flood of
+/// undecryptable new-key data packets starves, so every retransmit was
+/// wasted and the tunnel healed only via the client's RX-silence reconnect.
+/// The response is content-authenticated (old-key AEAD + the client eph the
+/// server committed to derive from), so accepting it from a far-ahead
+/// counter is sound; validating it also advances `counter` to the client's
+/// live edge, which is exactly what resyncs the post-commit window. Bounded
+/// to cap the per-refresh tag precompute and `tag_map` memory.
+const REKEY_TAG_LOOKAHEAD: u64 = 4096;
+
 /// Session state
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionState {
@@ -281,6 +299,15 @@ pub struct Session {
     /// Next expected FEC group_seq. Mismatches indicate a lost FecRepair
     /// and mean the XOR buffer is stale — recovery must be skipped.
     pub fec_pending_seq: u16,
+    /// Inner seq_num of the most recently processed FecRepair packet.
+    /// The client numbers all inner packets monotonically, so a Data packet
+    /// arriving after this repair with a seq NOT AHEAD of it belongs to an
+    /// already-closed group: it is either the just-FEC-recovered packet
+    /// arriving late (a duplicate) or a straggler whose group is gone —
+    /// either way it must not be delivered again nor pollute the new group's
+    /// XOR accumulator (a false `recv == group_size - 1` trigger recovers
+    /// garbage). None until the first FecRepair is seen.
+    pub fec_repair_seq_hi: Option<u16>,
     /// Highest mask-catalog version already pushed to this client. The gateway
     /// bumps a global catalog version whenever the mask set changes; when this
     /// lags behind, the next Keepalive triggers a fresh `MaskCatalog` push.
@@ -469,6 +496,7 @@ impl Session {
             fec_xor_buf: Vec::new(),
             fec_xor_len: 0,
             fec_pending_seq: 0,
+            fec_repair_seq_hi: None,
             mask_catalog_version_sent: 0,
             capabilities_sent: false,
             kernel_install_sig: 0,
@@ -542,7 +570,18 @@ impl Session {
         self.tag_window_base = self.counter;
         let window_back = TAG_WINDOW_SIZE as u64 - 1;
         let window_start = self.counter.saturating_sub(window_back);
-        let window_end = self.counter.saturating_add(TAG_WINDOW_SIZE as u64 - 1);
+        // While a rekey is pending, reach further FORWARD so the client's
+        // re-sent KeyRotate response — old-key authenticated but potentially
+        // thousands of counters ahead of our frozen inbound counter — lands
+        // in the precomputed band and the O(1) tag_map path (see
+        // REKEY_TAG_LOOKAHEAD).
+        let window_fwd = TAG_WINDOW_SIZE as u64 - 1
+            + if self.pending_rekey_keypair.is_some() {
+                REKEY_TAG_LOOKAHEAD
+            } else {
+                0
+            };
+        let window_end = self.counter.saturating_add(window_fwd);
 
         for counter_val in window_start..=window_end {
             let tag =
@@ -1618,13 +1657,21 @@ impl SessionManager {
     ) -> Option<(Arc<Mutex<Session>>, u64, bool)> {
         let current_tw =
             crypto::compute_time_window(crypto::current_timestamp_ms(), DEFAULT_WINDOW_MS);
-        // Bounded ± search around the session's last known counter. The former
-        // forward-only 65536 window meant 3 × 65 536 ≈ 196k BLAKE3 per matching
-        // session — a spoofed tag from a known client IP could force the full
-        // scan (CPU-DoS). ±2048 (4097 × 3 ≈ 12k) still absorbs realistic counter
-        // drift from a client race while capping the attacker's work; the per-IP
-        // session limit (5) bounds the total.
-        const RECOVERY_RANGE: i64 = 2048;
+        // Bounded forward-only search ahead of the session's last known
+        // counter. The former forward-only 65536 window meant 3 × 65 536 ≈
+        // 196k BLAKE3 per matching session — a spoofed tag from a known client
+        // IP could force the full scan (CPU-DoS). 2048 (2049 × 3 ≈ 6k) still
+        // absorbs realistic counter drift from a client race while capping
+        // the attacker's work; the per-IP session limit (5) bounds the total.
+        //
+        // M2: the search is FORWARD-only because the client counter is
+        // monotone — legitimate drift is always the client running AHEAD of
+        // the server (the documented client-race case). A backward match can
+        // only be a replayed old packet; accepting it used to rewind
+        // `s.counter`, so the next legitimate packet shifted the replay
+        // bitmap by ≥ TAG_WINDOW_SIZE and wiped the session's whole
+        // anti-replay history (ReplayWindow::clear).
+        const RECOVERY_RANGE: u64 = 2048;
 
         for entry in self.sessions.iter() {
             let session = entry.value().clone();
@@ -1641,12 +1688,25 @@ impl SessionManager {
 
             for tw_offset in [0i64, -1, 1] {
                 let tw = (current_tw as i64 + tw_offset) as u64;
-                for i in -RECOVERY_RANGE..=RECOVERY_RANGE {
-                    let c = base.wrapping_add(i as u64);
+                for i in 0..=RECOVERY_RANGE {
+                    let c = base.wrapping_add(i);
                     let expected = crypto::generate_resonance_tag(&tag_secret, c, tw);
                     if bool::from(expected.ct_eq(tag)) {
+                        // c > base is fresh by construction (`counter` is the
+                        // highest validated counter). c == base is fresh only
+                        // when the newest counter was never marked received
+                        // (fresh session); otherwise this is a replay of the
+                        // latest packet — reject without touching state.
+                        if c == base && session.lock().received_bitmap.get_bit(0) {
+                            debug!(
+                                "Counter recovery: counter {} already received — \
+                                 rejecting replay",
+                                c
+                            );
+                            return None;
+                        }
                         info!(
-                            "Counter recovery: found counter {} (drift={}) for session",
+                            "Counter recovery: found counter {} (drift=+{}) for session",
                             c, i
                         );
                         // Update tag window to the recovered counter (mutex already released).
@@ -1656,7 +1716,9 @@ impl SessionManager {
                             // do targeted removal (retain would create a visibility gap).
                             let old_tags: Vec<[u8; TAG_SIZE]> =
                                 s.expected_tags.values().cloned().collect();
-                            s.counter = c;
+                            // Shift the replay bitmap and mark this counter
+                            // received (ingress marks it again — idempotent).
+                            s.mark_tag_received(c);
                             s.update_tag_window();
                             for t in &old_tags {
                                 self.tag_map.remove(t);
@@ -2101,7 +2163,16 @@ impl SessionManager {
             sess.pending_rekey_keypair = Some(server_rekey_kp);
             sess.pending_rekey_attempts = 1;
             sess.last_keyrotate_sent_at = now;
+            // Rebuild the expected-tag window NOW so the pending-rekey
+            // forward lookahead (see `update_tag_window`) is populated before
+            // the client's response can arrive; the tag_map refresh below
+            // publishes it.
+            sess.update_tag_window();
             due.push((session_id, new_eph_pub));
+        }
+
+        for (session_id, _) in &due {
+            self.refresh_session_tags(session_id);
         }
 
         due
@@ -3000,5 +3071,89 @@ mod tests {
             "counter spaces must be shown to overlap — this is why membership \
              cannot identify the epoch (overlap was {overlap})"
         );
+    }
+
+    // ── M2: forward-only counter recovery ────────────────────────────────────
+
+    fn make_manager_with_session() -> (SessionManager, Arc<Mutex<Session>>, SessionKeys) {
+        let server_kp = KeyPair::generate();
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[0x42u8; 32]);
+        let mask = aivpn_common::mask::preset_masks::webrtc_zoom_v3();
+        let mgr = SessionManager::new(server_kp, signing_key, mask);
+        let session = mgr
+            .create_session(
+                "10.9.9.9:10000".parse().unwrap(),
+                [7u8; X25519_PUBLIC_KEY_SIZE],
+                None,
+                None,
+            )
+            .unwrap();
+        let keys = session.lock().keys.clone();
+        (mgr, session, keys)
+    }
+
+    fn session_ip() -> std::net::IpAddr {
+        "10.9.9.9".parse().unwrap()
+    }
+
+    /// M2 regression: a replayed old packet whose counter sits behind
+    /// `sess.counter` (beyond the replay bitmap's reach but inside the old
+    /// ±2048 recovery range) must NOT rewind the session counter — accepting
+    /// it used to erase the whole anti-replay history via ReplayWindow::clear
+    /// on the next legitimate packet. Client counters are monotone, so
+    /// backward drift is always a replay.
+    #[test]
+    fn counter_recovery_rejects_backward_replay() {
+        let (mgr, session, keys) = make_manager_with_session();
+        let tw = crypto::compute_time_window(crypto::current_timestamp_ms(), DEFAULT_WINDOW_MS);
+        {
+            let mut s = session.lock();
+            for c in 0..=3000u64 {
+                s.mark_tag_received(c);
+            }
+        }
+        // Counter 2000 is 1000 behind — inside the old ±2048 range, outside
+        // the 512-deep replay bitmap.
+        let replay_tag = crypto::generate_resonance_tag(&keys.tag_secret, 2000, tw);
+        assert!(
+            mgr.recover_session_by_tag(&replay_tag, &session_ip())
+                .is_none(),
+            "backward counter match must be rejected as a replay"
+        );
+        // Session state untouched: no counter rewind, no bitmap wipe.
+        let s = session.lock();
+        assert_eq!(s.counter, 3000);
+        assert!(s.received_bitmap.get_bit(0));
+    }
+
+    /// M2 companion: the documented client-race case is FORWARD drift and
+    /// must keep working; the recovered counter is marked received so the
+    /// same packet cannot be replayed through either validation path.
+    #[test]
+    fn counter_recovery_accepts_forward_drift_and_marks_received() {
+        let (mgr, session, keys) = make_manager_with_session();
+        let tw = crypto::compute_time_window(crypto::current_timestamp_ms(), DEFAULT_WINDOW_MS);
+        {
+            let mut s = session.lock();
+            for c in 0..=100u64 {
+                s.mark_tag_received(c);
+            }
+        }
+        // Client 800 ahead of the server — past the ±512 validation window
+        // but inside RECOVERY_RANGE.
+        let drift_tag = crypto::generate_resonance_tag(&keys.tag_secret, 900, tw);
+        let (recovered_session, counter, is_ratcheted) = mgr
+            .recover_session_by_tag(&drift_tag, &session_ip())
+            .expect("forward drift must recover");
+        assert_eq!(counter, 900);
+        assert!(!is_ratcheted);
+        assert_eq!(recovered_session.lock().counter, 900);
+        // Marked received: validate_tag now rejects the same tag as a replay…
+        assert!(recovered_session.lock().validate_tag(&drift_tag).is_none());
+        // …and a second recovery attempt with it is rejected too (c == base
+        // with the newest-counter bit set).
+        assert!(mgr
+            .recover_session_by_tag(&drift_tag, &session_ip())
+            .is_none());
     }
 }
