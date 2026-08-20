@@ -816,6 +816,8 @@ impl super::App {
                     bootstrap_header,
                     bootstrap_box,
                     Space::with_height(4),
+                    self.view_ext_section(),
+                    Space::with_height(4),
                     horizontal_rule(1),
                     log_header,
                     log_box,
@@ -1983,5 +1985,87 @@ impl super::App {
             .align_x(iced::alignment::Horizontal::Center)
             .align_y(iced::alignment::Vertical::Center)
             .into()
+    }
+
+    /// Render the extra settings section declared by the descriptor.
+    ///
+    /// Entirely generic: it walks the declared fields and draws each with the
+    /// matching widget, knowing nothing about what any of them mean. With no
+    /// descriptor (the public build) it returns empty space, so no extra UI
+    /// appears at all.
+    fn view_ext_section(&self) -> Element<'_, Message> {
+        use iced::widget::{checkbox, pick_list, text, text_input, Space};
+
+        let Some(desc) = &self.ext_descriptor else {
+            return Space::with_height(0).into();
+        };
+
+        let header_label = if self.ext_open { "[-]" } else { "[+]" };
+        let mut col = column![button(text(format!("{header_label} {}", desc.title)))
+            .on_press(Message::ToggleExtPanel)
+            .style(button::text)]
+        .spacing(6);
+
+        if !self.ext_open {
+            return col.into();
+        }
+
+        for f in &desc.fields {
+            let key = f.key.clone();
+            let current = self
+                .ext_values
+                .iter()
+                .find(|(k, _)| *k == f.key)
+                .map(|(_, v)| v);
+            let row_el: Element<Message> = match &f.kind {
+                aivpn_common::ui_ext::FieldKind::Toggle => {
+                    let on = matches!(
+                        current,
+                        Some(aivpn_common::ui_ext::FieldValue::Toggle(true))
+                    );
+                    checkbox(f.label.clone(), on)
+                        .on_toggle(move |v| Message::ExtToggleChanged(key.clone(), v))
+                        .into()
+                }
+                aivpn_common::ui_ext::FieldKind::Text | aivpn_common::ui_ext::FieldKind::Secret => {
+                    let value = match current {
+                        Some(aivpn_common::ui_ext::FieldValue::Text(s)) => s.clone(),
+                        _ => String::new(),
+                    };
+                    let mut input = text_input(&f.label, &value)
+                        .on_input(move |v| Message::ExtTextChanged(key.clone(), v))
+                        .width(Length::Fill);
+                    if matches!(f.kind, aivpn_common::ui_ext::FieldKind::Secret) {
+                        input = input.secure(true);
+                    }
+                    row![text(f.label.clone()).size(13).width(160), input]
+                        .spacing(8)
+                        .align_y(Alignment::Center)
+                        .into()
+                }
+                aivpn_common::ui_ext::FieldKind::Select { options } => {
+                    let selected = match current {
+                        Some(aivpn_common::ui_ext::FieldValue::Select(i)) => *i,
+                        _ => 0,
+                    };
+                    let sel = options.get(selected).cloned();
+                    let opts = options.clone();
+                    row![
+                        text(f.label.clone()).size(13).width(160),
+                        pick_list(options.clone(), sel, move |chosen| {
+                            let idx = opts.iter().position(|o| o == &chosen).unwrap_or(0);
+                            Message::ExtSelectChanged(key.clone(), idx)
+                        })
+                    ]
+                    .spacing(8)
+                    .align_y(Alignment::Center)
+                    .into()
+                }
+            };
+            col = col.push(row_el);
+        }
+
+        col = col.push(button(text("Применить").size(13)).on_press(Message::ExtApply));
+        col.into()
     }
 }

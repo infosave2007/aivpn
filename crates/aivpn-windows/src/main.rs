@@ -169,6 +169,12 @@ struct AivpnApp {
 
     window_visible: bool,
     quitting: bool,
+    /// Extra settings section declared by an optional descriptor file. `None`
+    /// in a public build — then no extra UI is rendered at all.
+    ext_descriptor: Option<aivpn_common::ui_ext::Descriptor>,
+    /// Live values of that section's fields, in declaration order.
+    ext_values: Vec<(String, aivpn_common::ui_ext::FieldValue)>,
+    ext_transport: Option<aivpn_common::transport::TransportConfig>,
     /// True when this instance was launched via --elevated-connect (the
     /// self-relaunch-elevated hop): new() already started the connection, so
     /// the connect_on_startup hook must not fire on top of it (HIGH-1).
@@ -522,6 +528,9 @@ impl AivpnApp {
             recording_service: String::new(),
             window_visible: true,
             quitting: false,
+            ext_descriptor: aivpn_common::ui_ext::load_default(),
+            ext_values: Vec::new(),
+            ext_transport: None,
             elevated_connect_hop: false,
             tray_connected: None,
             tray: None,
@@ -822,6 +831,7 @@ impl AivpnApp {
             share_mask_feedback,
             receive_mask_hints,
             Some(country_code.as_str()),
+            self.ext_transport.as_ref(),
         ) {
             self.show_error(e);
         }

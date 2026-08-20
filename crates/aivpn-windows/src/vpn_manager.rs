@@ -265,6 +265,7 @@ impl VpnManager {
         share_mask_feedback: bool,
         receive_mask_hints: bool,
         country_code: Option<&str>,
+        transport: Option<&aivpn_common::transport::TransportConfig>,
     ) -> Result<(), String> {
         if self.child.is_some() {
             return Err("Already running".to_string());
@@ -328,6 +329,17 @@ impl VpnManager {
 
         let mut cmd = Command::new(&self.client_binary);
         cmd.env("AIVPN_CONNECTION_KEY", connection_key);
+        // An extension may have selected an alternative transport. Pass it
+        // neutrally: a name plus a base64 blob the client forwards to the
+        // factory unparsed. Absent → direct UDP.
+        if let Some(cfg) = transport {
+            use base64::Engine as _;
+            cmd.env("AIVPN_TRANSPORT", cfg.name());
+            cmd.env(
+                "AIVPN_TRANSPORT_PARAMS",
+                base64::engine::general_purpose::STANDARD.encode(cfg.params()),
+            );
+        }
 
         if full_tunnel {
             cmd.arg("--full-tunnel");

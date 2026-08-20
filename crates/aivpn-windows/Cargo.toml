@@ -13,6 +13,9 @@ path = "src/main.rs"
 
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }
+# Neutral descriptor for extra settings sections. The GUI reads an optional
+# file and renders whatever it declares; with no file it renders nothing.
+aivpn-common = { path = "../aivpn-common", features = ["ui-ext"] }
 serde_json = "1.0"
 base64 = "0.22"
 dirs = "6"

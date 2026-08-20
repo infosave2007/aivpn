@@ -647,6 +647,88 @@ impl super::AivpnApp {
     /// exit node. Only ever called for `is_admin` (see `draw_admin_panel`'s
     /// call site) — unlike every other admin subsection, there is no
     /// Viewer-visible read-only rendering at all.
+    /// Render the extra settings section declared by the descriptor.
+    ///
+    /// Fully generic: it walks the declared fields and draws each with the
+    /// matching egui widget, knowing nothing about what any of them mean. With
+    /// no descriptor (the public build) it draws nothing. `lang` is unused
+    /// because every label comes from the descriptor, never from the app's own
+    /// strings — a build the module is not part of contributes none of its
+    /// text.
+    pub(crate) fn draw_ext_section(&mut self, ui: &mut eframe::egui::Ui, _lang: Lang) {
+        use aivpn_common::ui_ext::{FieldKind, FieldValue};
+        use eframe::egui;
+
+        let Some(desc) = self.ext_descriptor.clone() else {
+            return;
+        };
+
+        // Seed live values from the descriptor once.
+        if self.ext_values.is_empty() {
+            self.ext_values = desc
+                .fields
+                .iter()
+                .map(|f| {
+                    let v = match &f.kind {
+                        FieldKind::Toggle => FieldValue::Toggle(false),
+                        FieldKind::Text | FieldKind::Secret => FieldValue::Text(String::new()),
+                        FieldKind::Select { .. } => FieldValue::Select(0),
+                    };
+                    (f.key.clone(), v)
+                })
+                .collect();
+        }
+
+        egui::CollapsingHeader::new(&desc.title)
+            .default_open(false)
+            .show(ui, |ui| {
+                for f in &desc.fields {
+                    let Some(slot) = self.ext_values.iter_mut().find(|(k, _)| *k == f.key) else {
+                        continue;
+                    };
+                    match (&f.kind, &mut slot.1) {
+                        (FieldKind::Toggle, FieldValue::Toggle(on)) => {
+                            ui.checkbox(on, &f.label);
+                        }
+                        (FieldKind::Text, FieldValue::Text(value)) => {
+                            ui.label(&f.label);
+                            ui.add(egui::TextEdit::singleline(value).desired_width(f32::INFINITY));
+                        }
+                        (FieldKind::Secret, FieldValue::Text(value)) => {
+                            ui.label(&f.label);
+                            ui.add(
+                                egui::TextEdit::singleline(value)
+                                    .password(true)
+                                    .desired_width(f32::INFINITY),
+                            );
+                        }
+                        (FieldKind::Select { options }, FieldValue::Select(selected)) => {
+                            ui.horizontal(|ui| {
+                                ui.label(&f.label);
+                                let cur = options.get(*selected).cloned().unwrap_or_default();
+                                egui::ComboBox::from_id_salt(format!("ext_{}", f.key))
+                                    .selected_text(cur)
+                                    .show_ui(ui, |ui| {
+                                        for (i, opt) in options.iter().enumerate() {
+                                            if ui.selectable_label(*selected == i, opt).clicked() {
+                                                *selected = i;
+                                            }
+                                        }
+                                    });
+                            });
+                        }
+                        // Kind and value disagree — only reachable if the
+                        // seeding above and the descriptor drift apart, which
+                        // would be a bug here rather than bad input.
+                        _ => {}
+                    }
+                }
+                if ui.button("Применить").clicked() {
+                    self.ext_transport = aivpn_common::ui_ext::apply(&desc, &self.ext_values);
+                }
+            });
+    }
+
     pub(crate) fn draw_admin_server_settings_section(
         &mut self,
         ui: &mut eframe::egui::Ui,

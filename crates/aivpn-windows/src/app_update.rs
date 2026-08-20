@@ -794,6 +794,9 @@ impl eframe::App for super::AivpnApp {
                         }
                     });
 
+                    // Plugged-in transport settings (empty in a public build).
+                    self.draw_ext_section(ui, lang);
+
                     let mut startup = self.settings.connect_on_startup;
                     if ui
                         .checkbox(&mut startup, t(lang, "connect_on_startup"))

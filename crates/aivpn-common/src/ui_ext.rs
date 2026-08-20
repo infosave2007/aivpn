@@ -196,6 +196,52 @@ pub fn load_descriptor(path: &Path) -> Option<Descriptor> {
     }
 }
 
+/// Переменная окружения, задающая путь к дескриптору явно.
+///
+/// Нужна для проверок и для запуска из дерева сборки, где рядом с бинарём
+/// ничего не лежит.
+pub const DESCRIPTOR_ENV: &str = "AIVPN_EXT_SECTIONS";
+
+/// Имя файла дескриптора в стандартных местах.
+pub const DESCRIPTOR_FILE: &str = "ext-sections.json";
+
+/// Найти и прочитать дескриптор по обычным правилам.
+///
+/// Порядок: переменная [`DESCRIPTOR_ENV`], затем каталог рядом с исполняемым
+/// файлом, затем пользовательский каталог настроек. `None` — ни одного файла
+/// не нашлось, и это нормальный случай публичной сборки.
+///
+/// Политика живёт здесь, а не в каждом GUI: иначе два интерфейса разошлись бы
+/// в том, где ищут файл, и расхождение обнаружилось бы у пользователя.
+pub fn load_default() -> Option<Descriptor> {
+    if let Ok(explicit) = std::env::var(DESCRIPTOR_ENV) {
+        if !explicit.trim().is_empty() {
+            return load_descriptor(Path::new(&explicit));
+        }
+    }
+
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            if let Some(d) = load_descriptor(&dir.join(DESCRIPTOR_FILE)) {
+                return Some(d);
+            }
+        }
+    }
+
+    let config_home = std::env::var("XDG_CONFIG_HOME")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var("HOME")
+                .ok()
+                .map(|h| Path::new(&h).join(".config"))
+        })
+        .or_else(|| std::env::var("APPDATA").ok().map(std::path::PathBuf::from))?;
+
+    load_descriptor(&config_home.join("aivpn").join(DESCRIPTOR_FILE))
+}
+
 /// Свернуть отредактированные значения в конфигурацию транспорта.
 ///
 /// `None` — «использовать транспорт по умолчанию»: поле-шлюз выключено. Иначе

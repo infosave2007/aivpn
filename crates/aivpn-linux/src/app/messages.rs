@@ -5,6 +5,14 @@ use super::*;
 
 #[derive(Debug, Clone)]
 pub enum Message {
+    /// Extra settings section (see `aivpn_common::ui_ext`): open/close the
+    /// panel, edit one field, apply. The GUI treats these generically — it
+    /// never learns what a field means.
+    ToggleExtPanel,
+    ExtToggleChanged(String, bool),
+    ExtTextChanged(String, String),
+    ExtSelectChanged(String, usize),
+    ExtApply,
     Connect,
     /// The previous aivpn-client child has fully exited (reconnect path):
     /// its SIGTERM cleanup — route restore, kill-switch removal — is done,

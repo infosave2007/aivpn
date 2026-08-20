@@ -768,6 +768,15 @@ pub struct App {
     /// the NEW session's routes and firewall rules.
     adopted_reap_in_flight: bool,
     child_handle: Arc<Mutex<Option<tokio::process::Child>>>,
+    /// Extra settings section declared by an optional descriptor file. `None`
+    /// in a public build, in which case none of this UI is rendered.
+    ext_descriptor: Option<aivpn_common::ui_ext::Descriptor>,
+    /// Live values of that section's fields, in declaration order.
+    ext_values: Vec<(String, aivpn_common::ui_ext::FieldValue)>,
+    /// Transport the section selected, passed to the client process on the
+    /// next connect. `None` = the default transport.
+    ext_transport: Option<aivpn_common::transport::TransportConfig>,
+    ext_open: bool,
     dialog: DialogMode,
     dlg_name: String,
     dlg_key: String,
@@ -972,6 +981,16 @@ impl App {
                 adopted_client,
                 adopted_reap_in_flight: false,
                 child_handle: Arc::new(Mutex::new(None)),
+                ext_descriptor: {
+                    let d = aivpn_common::ui_ext::load_default();
+                    if d.is_some() {
+                        tracing::info!("extra settings section loaded from descriptor");
+                    }
+                    d
+                },
+                ext_values: Vec::new(),
+                ext_transport: None,
+                ext_open: false,
                 dialog: DialogMode::None,
                 dlg_name: String::new(),
                 dlg_key: String::new(),
@@ -1495,6 +1514,64 @@ impl App {
                     .to_uppercase();
                 self.settings.country_code = cleaned;
                 self.settings.save();
+            }
+            // ── Extra settings section (aivpn_common::ui_ext) ──────────────
+            // Generic handling: the GUI mutates whatever field the descriptor
+            // declared and hands the whole set back on apply. It never
+            // interprets a key, a label or a value.
+            Message::ToggleExtPanel => {
+                self.ext_open = !self.ext_open;
+                if self.ext_open && self.ext_values.is_empty() {
+                    if let Some(d) = &self.ext_descriptor {
+                        self.ext_values = d
+                            .fields
+                            .iter()
+                            .map(|f| {
+                                let v = match &f.kind {
+                                    aivpn_common::ui_ext::FieldKind::Toggle => {
+                                        aivpn_common::ui_ext::FieldValue::Toggle(false)
+                                    }
+                                    aivpn_common::ui_ext::FieldKind::Text
+                                    | aivpn_common::ui_ext::FieldKind::Secret => {
+                                        aivpn_common::ui_ext::FieldValue::Text(String::new())
+                                    }
+                                    aivpn_common::ui_ext::FieldKind::Select { .. } => {
+                                        aivpn_common::ui_ext::FieldValue::Select(0)
+                                    }
+                                };
+                                (f.key.clone(), v)
+                            })
+                            .collect();
+                    }
+                }
+            }
+            Message::ExtToggleChanged(key, v) => {
+                if let Some(slot) = self.ext_values.iter_mut().find(|(k, _)| *k == key) {
+                    slot.1 = aivpn_common::ui_ext::FieldValue::Toggle(v);
+                }
+            }
+            Message::ExtTextChanged(key, v) => {
+                if let Some(slot) = self.ext_values.iter_mut().find(|(k, _)| *k == key) {
+                    slot.1 = aivpn_common::ui_ext::FieldValue::Text(v);
+                }
+            }
+            Message::ExtSelectChanged(key, idx) => {
+                if let Some(slot) = self.ext_values.iter_mut().find(|(k, _)| *k == key) {
+                    slot.1 = aivpn_common::ui_ext::FieldValue::Select(idx);
+                }
+            }
+            Message::ExtApply => {
+                // The descriptor decides whether these values select a
+                // transport; `None` means the default one.
+                self.ext_transport = self
+                    .ext_descriptor
+                    .as_ref()
+                    .and_then(|d| aivpn_common::ui_ext::apply(d, &self.ext_values));
+                self.log_lines.push(if self.ext_transport.is_some() {
+                    "Settings applied — will take effect on next connect".into()
+                } else {
+                    "Settings applied — using default transport".into()
+                });
             }
             Message::ToggleBootstrapPanel => {
                 self.bootstrap_open = !self.bootstrap_open;
@@ -2627,6 +2704,7 @@ impl App {
             Some(key) => {
                 let key = key.clone();
                 let child_handle = self.child_handle.clone();
+                let ext_transport = self.ext_transport.clone();
                 let kill_switch = self.launched_kill_switch;
                 let adaptive_level = self.settings.adaptive_level;
                 let dns_proxy = self.settings.dns_proxy.clone();
@@ -2710,6 +2788,17 @@ impl App {
                         server_signing_key,
                     };
                     let mut cmd = vpn_manager::build_client_command(&binary, &key, &launch_params);
+                    // The section may have selected an alternative transport.
+                    // It travels neutrally: a name plus a base64 parameter blob
+                    // this GUI never parses. Absent → the client uses direct UDP.
+                    if let Some(cfg) = &ext_transport {
+                        use base64::Engine as _;
+                        cmd.env("AIVPN_TRANSPORT", cfg.name());
+                        cmd.env(
+                            "AIVPN_TRANSPORT_PARAMS",
+                            base64::engine::general_purpose::STANDARD.encode(cfg.params()),
+                        );
+                    }
 
                     let mut child = match cmd.spawn() {
                         Ok(c) => c,

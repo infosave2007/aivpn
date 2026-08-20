@@ -12,6 +12,9 @@ path = "src/main.rs"
 
 [dependencies]
 iced = { version = "0.13", features = ["tokio", "image"] }
+# Neutral descriptor for extra settings sections. The GUI reads an optional
+# file and renders whatever it declares; with no file it renders nothing.
+aivpn-common = { path = "../aivpn-common", features = ["ui-ext"] }
 ksni = "0.3"
 png = "0.18"
 serde = { version = "1.0", features = ["derive"] }
