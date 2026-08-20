@@ -56,6 +56,14 @@ jobs:
     - name: Mask DPI gate (R2 Phase A)
       run: make mask-gate
 
+    # The public tree carries a seam for pluggable datagram transports. What
+    # must never appear alongside it is vocabulary naming a specific
+    # out-of-tree implementation — one doc comment, log line or translation is
+    # enough to undo the separation, and review does not catch those reliably.
+    # Hard gate: it must be held at zero.
+    - name: Public-tree vocabulary gate
+      run: make hygiene-gate
+
   cargo-audit:
     runs-on: ubuntu-latest
     # Advisory-only: reports known vulnerabilities in Cargo.lock without
