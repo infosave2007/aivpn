@@ -38,24 +38,6 @@ pub fn installed_transport_factory(
     TRANSPORT_FACTORY.get().cloned()
 }
 
-/// Инициализация библиотеки при загрузке `.so`.
-///
-/// Вынесена из `JNI_OnLoad` отдельной публичной функцией, чтобы внешний крейт,
-/// собирающий собственный `.so` поверх этого, мог объявить свой `JNI_OnLoad`,
-/// поставить фабрику и делегировать сюда, не дублируя логику.
-pub fn jni_on_load(_vm: *mut std::ffi::c_void, _reserved: *mut std::ffi::c_void) -> i32 {
-    // JNI_VERSION_1_6
-    0x0001_0006
-}
-
-/// `JNI_OnLoad` публичной сборки: фабрику не устанавливает.
-#[no_mangle]
-pub extern "system" fn JNI_OnLoad(
-    vm: *mut std::ffi::c_void,
-    reserved: *mut std::ffi::c_void,
-) -> i32 {
-    jni_on_load(vm, reserved)
-}
 mod android_tunnel;
 // The socket guard is part of this crate's API: whatever opens sockets on
 // Android needs it to keep them out of the tunnel.
