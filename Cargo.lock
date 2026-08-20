@@ -187,6 +187,7 @@ dependencies = [
  "aes 0.8.4",
  "aes-gcm 0.10.3",
  "anyhow",
+ "async-trait",
  "bincode",
  "blake3",
  "bytes",
@@ -237,6 +238,7 @@ dependencies = [
 name = "aivpn-linux"
 version = "1.0.0"
 dependencies = [
+ "aivpn-common",
  "base64 0.22.1",
  "dirs 6.0.0",
  "iced",
@@ -304,6 +306,7 @@ dependencies = [
 name = "aivpn-windows"
 version = "1.0.0"
 dependencies = [
+ "aivpn-common",
  "base64 0.22.1",
  "dirs 6.0.0",
  "eframe",
