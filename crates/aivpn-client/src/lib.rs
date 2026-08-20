@@ -11,6 +11,11 @@
 #[cfg(test)]
 pub(crate) static TEST_HOME_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+// Тело клиента переехало сюда из main.rs и обращается к своему же крейту по
+// имени (`aivpn_client::…`, 32 места). Псевдоним позволяет этим путям
+// продолжать работать изнутри библиотеки, не переписывая их на `crate::`.
+extern crate self as aivpn_client;
+
 pub mod adaptive;
 pub mod bench;
 pub mod bootstrap_cache;
@@ -23,6 +28,7 @@ pub mod mask_feedback_log;
 pub mod net_change;
 pub mod proxy;
 pub mod record_cmd;
+pub mod run;
 pub mod secure_write;
 pub mod server_pool;
 #[cfg(feature = "ssh-install")]
@@ -43,4 +49,5 @@ pub use aivpn_common::qr;
 #[cfg(feature = "ssh-install")]
 pub use aivpn_common::ssh_install;
 pub use client::AivpnClient;
+pub use run::run;
 pub use tunnel::Tunnel;
