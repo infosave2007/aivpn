@@ -129,6 +129,8 @@ pub async fn run_tunnel_ios(
         country_code,
         prior_outcomes_json,
         cached_descriptors_json,
+        // iOS does not wire an alternative transport yet — the seam is ready.
+        None,
     )
     .await;
 

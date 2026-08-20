@@ -7,7 +7,59 @@
 
 #![allow(non_snake_case)]
 
+// ── Установка транспорта из внешней сборки ───────────────────────────────────
+
+/// Фабрика транспорта, установленная сборкой, которая её несёт.
+///
+/// Публичный `.so` не устанавливает ничего, и тогда единственный путь
+/// датаграмм — прямой UDP. Сборка с дополнительным транспортом вызывает
+/// [`install_transport_factory`] из своего `JNI_OnLoad`, то есть до первого
+/// JNI-вызова и без единой правки Kotlin.
+///
+/// Здесь нет `#[cfg]` и нет имени какого-либо конкретного транспорта: этот
+/// крейт не знает и не может узнать, что именно ему установили.
+static TRANSPORT_FACTORY: std::sync::OnceLock<
+    std::sync::Arc<dyn aivpn_common::transport::TransportFactory>,
+> = std::sync::OnceLock::new();
+
+/// Установить фабрику транспорта.
+///
+/// Идемпотентна: второй вызов игнорируется. `.so`, дважды подсунувший свою
+/// фабрику, — это ошибка сборки, а не сценарий, который надо поддерживать.
+pub fn install_transport_factory(
+    factory: std::sync::Arc<dyn aivpn_common::transport::TransportFactory>,
+) {
+    let _ = TRANSPORT_FACTORY.set(factory);
+}
+
+/// Установленная фабрика, если она есть.
+pub fn installed_transport_factory(
+) -> Option<std::sync::Arc<dyn aivpn_common::transport::TransportFactory>> {
+    TRANSPORT_FACTORY.get().cloned()
+}
+
+/// Инициализация библиотеки при загрузке `.so`.
+///
+/// Вынесена из `JNI_OnLoad` отдельной публичной функцией, чтобы внешний крейт,
+/// собирающий собственный `.so` поверх этого, мог объявить свой `JNI_OnLoad`,
+/// поставить фабрику и делегировать сюда, не дублируя логику.
+pub fn jni_on_load(_vm: *mut std::ffi::c_void, _reserved: *mut std::ffi::c_void) -> i32 {
+    // JNI_VERSION_1_6
+    0x0001_0006
+}
+
+/// `JNI_OnLoad` публичной сборки: фабрику не устанавливает.
+#[no_mangle]
+pub extern "system" fn JNI_OnLoad(
+    vm: *mut std::ffi::c_void,
+    reserved: *mut std::ffi::c_void,
+) -> i32 {
+    jni_on_load(vm, reserved)
+}
 mod android_tunnel;
+// The socket guard is part of this crate's API: whatever opens sockets on
+// Android needs it to keep them out of the tunnel.
+pub use android_tunnel::VpnProtectGuard;
 #[cfg(feature = "ssh-install")]
 mod ssh_job_registry;
 
@@ -91,6 +143,8 @@ pub extern "system" fn Java_com_aivpn_client_AivpnJni_runTunnel<'local>(
     country_code_obj: JObject<'local>,         // nullable JString — 2-letter ISO-3166-1 code
     prior_outcomes_json_obj: JObject<'local>, // nullable JString — §2 prior unreported outcomes (JSON)
     cached_descriptors_json_obj: JObject<'local>, // nullable JString — app-persisted signed bootstrap descriptors (JSON array)
+    transport_name_obj: JObject<'local>, // nullable JString — alternative transport name ("alt"), or null for direct UDP
+    transport_params_json_obj: JObject<'local>, // nullable JString — opaque JSON params for that transport
 ) -> jstring {
     // ── Initialize Android logcat logger once per process lifetime ──
     static LOG_INIT: std::sync::Once = std::sync::Once::new();
@@ -301,6 +355,27 @@ pub extern "system" fn Java_com_aivpn_client_AivpnJni_runTunnel<'local>(
         }
     };
 
+    // Alternative transport: name + opaque JSON params. The public build
+    // ignores these (it registers no such transport); the extended build opens
+    // the transport by name inside `run_tunnel_android`.
+    let unpack_opt_string = |env: &mut JNIEnv<'local>, obj: &JObject<'local>| -> Option<String> {
+        if obj.is_null() {
+            return None;
+        }
+        match env.is_instance_of(obj, "java/lang/String") {
+            Ok(true) => {
+                let js: JString<'local> = unsafe { JString::from_raw(obj.as_raw()) };
+                env.get_string(&js)
+                    .ok()
+                    .map(String::from)
+                    .filter(|s| !s.is_empty())
+            }
+            _ => None,
+        }
+    };
+    let transport_name = unpack_opt_string(&mut env, &transport_name_obj);
+    let transport_params_json = unpack_opt_string(&mut env, &transport_params_json_obj);
+
     // §2 crowdsourced blocking feedback: 2-letter ISO-3166-1 alpha-2 country code.
     // Only accepted when exactly 2 ASCII letters; anything else is treated as unset
     // (matches desktop's `--country-code` CLI validation in aivpn-client/main.rs).
@@ -412,6 +487,8 @@ pub extern "system" fn Java_com_aivpn_client_AivpnJni_runTunnel<'local>(
             country_code,
             prior_outcomes_json,
             cached_descriptors_json,
+            transport_name,
+            transport_params_json,
         ))
     }));
 

@@ -42,6 +42,7 @@ use aivpn_common::protocol::{
     ControlPayload, InnerType, MaskOutcome, MAX_PACKET_SIZE, UDP_RECV_BUF_SIZE,
 };
 use aivpn_common::quality::{AdaptiveLevel, QualityTracker};
+use aivpn_common::transport::DatagramTransport;
 use aivpn_common::upload_pipeline::{self, PacketEncryptor, UploadConfig};
 
 use crate::bootstrap_cache;
@@ -364,7 +365,21 @@ pub struct AivpnClient {
     config: ClientConfig,
     state: ClientState,
     tunnel: Tunnel,
-    udp_socket: Option<Arc<UdpSocket>>,
+    /// The session's datagram carrier. Today always a `UdpTransport` wrapping
+    /// the connected `UdpSocket` created in `connect()`; behind the trait so a
+    /// non-UDP transport can be swapped in without touching the protocol.
+    transport: Option<Arc<dyn DatagramTransport>>,
+    /// Transports this build can open, beyond the built-in direct UDP path.
+    ///
+    /// Empty unless something registered a factory (see
+    /// `set_transport_registry`), which is the whole extension mechanism: the
+    /// client never names a concrete alternative transport, it only resolves
+    /// whatever `config.transport` asks for against this registry.
+    transport_registry: Arc<aivpn_common::transport::TransportRegistry>,
+    /// Platform hook that keeps a transport's own sockets out of this tunnel.
+    /// Defaults to a no-op, which is correct for the direct UDP path — that
+    /// socket is exempted by routing, not by this guard.
+    socket_guard: aivpn_common::transport::SharedGuard,
     mimicry_engine: Option<MimicryEngine>,
     pub control_tx: Option<mpsc::Sender<ControlPayload>>,
     /// Receiver half preset by `control_handle()`, consumed by `run()` in
@@ -614,7 +629,9 @@ impl AivpnClient {
             config,
             state: ClientState::Provisioned,
             tunnel,
-            udp_socket: None,
+            transport: None,
+            transport_registry: Arc::new(aivpn_common::transport::TransportRegistry::new()),
+            socket_guard: aivpn_common::transport::no_socket_guard(),
             mimicry_engine: None,
             control_tx: None,
             preset_control_rx: None,
@@ -804,6 +821,45 @@ impl AivpnClient {
             ))
         })?;
 
+        // A configured transport replaces the direct UDP socket entirely. The
+        // protocol above this point is unchanged either way — it only ever sees
+        // `DatagramTransport`.
+        if let Some(cfg) = self.config.transport.clone() {
+            let transport = self
+                .transport_registry
+                .open(&cfg, self.socket_guard.clone())
+                .await?;
+            info!(
+                "Session datagrams carried by transport '{}' (max datagram {} B)",
+                cfg.name(),
+                transport.max_datagram()
+            );
+            self.transport = Some(transport);
+            return self.finish_connect(server_addr).await;
+        }
+
+        self.open_udp_socket(server_addr).await?;
+        self.finish_connect(server_addr).await
+    }
+
+    /// Install the set of transports this build can open, and the platform hook
+    /// that keeps their sockets out of this tunnel.
+    ///
+    /// Called from `main` with whatever that binary registered. The client does
+    /// not construct registries itself and never names a transport: everything
+    /// it knows comes through the registry and `config.transport`.
+    pub fn set_transport_registry(
+        &mut self,
+        registry: Arc<aivpn_common::transport::TransportRegistry>,
+        guard: aivpn_common::transport::SharedGuard,
+    ) {
+        self.transport_registry = registry;
+        self.socket_guard = guard;
+    }
+
+    /// Create the connected UDP socket this client has always used, and install
+    /// it as the session transport.
+    async fn open_udp_socket(&mut self, server_addr: SocketAddr) -> Result<()> {
         // Create UDP socket with 4MB OS buffers (OPTIMIZATION)
         let domain = if server_addr.is_ipv4() {
             socket2::Domain::IPV4
@@ -858,8 +914,17 @@ impl AivpnClient {
         let std_sock: std::net::UdpSocket = socket2_sock.into();
         let socket = UdpSocket::from_std(std_sock).map_err(Error::Io)?;
 
-        self.udp_socket = Some(Arc::new(socket));
+        self.transport = Some(aivpn_common::transport::udp_transport(Arc::new(socket)));
+        Ok(())
+    }
 
+    /// Everything `connect()` does once a transport exists, regardless of which
+    /// transport it is.
+    ///
+    /// `server_addr` stays a parameter even when the datagrams never travel to
+    /// it directly: the tunnel still needs the server's address for its own
+    /// routing (the host route and the kill-switch exemption are keyed on it).
+    async fn finish_connect(&mut self, server_addr: SocketAddr) -> Result<()> {
         // Auto-detect kernel acceleration (Linux only).
         #[cfg(target_os = "linux")]
         {
@@ -1099,7 +1164,7 @@ impl AivpnClient {
             self.kernel_tun_set = false;
         }
 
-        self.udp_socket = None;
+        self.transport = None;
 
         // Detach XDP filter (Linux only, best-effort)
         #[cfg(target_os = "linux")]
@@ -1180,10 +1245,10 @@ impl AivpnClient {
         let aivpn_packet =
             mimicry.build_packet(&inner_payload, keys, &mut self.counter, Some(&obf))?;
 
-        let socket = self.udp_socket.as_ref().ok_or(Error::Session(
+        let transport = self.transport.as_ref().ok_or(Error::Session(
             "UDP socket not initialized before send_init".into(),
         ))?;
-        socket.send(&aivpn_packet).await?;
+        transport.send(&aivpn_packet).await.map_err(Error::Io)?;
 
         info!("Sent init handshake ({} bytes)", aivpn_packet.len());
         Ok(())
@@ -1438,6 +1503,22 @@ impl AivpnClient {
         self.state == ClientState::Connected
     }
 
+    /// Stable, neutral identifier of the transport carrying this session, for a
+    /// status line ("connected via …").
+    ///
+    /// It is the transport's own `kind` string, nothing more: a build that
+    /// registers no alternative transport can only ever return `"udp"`, so this
+    /// says nothing about how — or whether — any other transport works. There
+    /// is deliberately no separate label for an alternative transport here; any
+    /// distinction a UI needs comes from the transport name in configuration,
+    /// not from this string. `"udp"` before the first connection, too.
+    pub fn transport_kind(&self) -> &'static str {
+        self.transport
+            .as_ref()
+            .map(|t| t.kind().as_str())
+            .unwrap_or(aivpn_common::transport::TransportKind::Udp.as_str())
+    }
+
     /// Get traffic statistics
     pub fn bytes_sent(&self) -> u64 {
         self.bytes_sent.load(Ordering::Relaxed)
@@ -1604,6 +1685,7 @@ mod tests {
             inbound_control_tap: None,
             node_identity: None,
             pool_node_id: None,
+            transport: None,
         }
     }
 

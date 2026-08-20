@@ -107,6 +107,13 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
     // `bootstrap_cache::select_initial_mask`). A truly-first-ever connect (no
     // persisted descriptor yet) still uses the preset — acceptable residual.
     cached_descriptors_json: Option<String>,
+    // Pre-opened alternative datagram transport. When `Some`, all session
+    // datagrams ride it instead of the connected UDP socket; the platform
+    // builds it (e.g. from a configured transport name) and applies its own
+    // socket guard before handing it over. `None` — the default and only
+    // possibility in a build with no alternative transport — keeps the UDP
+    // path byte-for-byte unchanged.
+    alt_transport: Option<Arc<dyn crate::transport::DatagramTransport>>,
 ) -> Result<()> {
     let level = AdaptiveLevel::from_u8(adaptive_level);
     let session = Arc::new(SessionRuntime::new());
@@ -270,6 +277,15 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
     std_udp.set_nonblocking(true)?;
     let udp = Arc::new(UdpSocket::from_std(std_udp)?);
 
+    // Every session datagram goes through this. Default: a thin wrapper over
+    // the connected UDP socket (identical send/recv on the same socket — not a
+    // byte changes). When the platform supplied an alternative transport, use
+    // that instead and the UDP socket stays idle.
+    let transport: Arc<dyn crate::transport::DatagramTransport> = match alt_transport {
+        Some(t) => t,
+        None => crate::transport::udp_transport(udp.clone()),
+    };
+
     // ── 4. Send init handshake (Control/Keepalive + obfuscated eph_pub) ──
     let mut send_counter: u64 = 0;
     let mut send_seq: u16 = 0;
@@ -366,7 +382,7 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
             &handshake_mask,
         )?;
         send_seq = send_seq.wrapping_add(1);
-        udp.send(&pkt).await?;
+        transport.send(&pkt).await?;
     }
 
     // ── 5. Wait for ServerHello with timeout ──
@@ -395,7 +411,7 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
                 return Ok(());
             }
 
-            res = udp.recv(&mut recv_buf) => {
+            res = transport.recv(&mut recv_buf) => {
                 match res {
                     Ok(n) => {
                         // Peek for a terminal `HandshakeReject` BEFORE handing the
@@ -529,7 +545,7 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
                 let inner = build_inner_packet(InnerType::Control, send_seq, &keepalive);
                 let pkt = build_shaped_mdh_packet(&keys, &mut send_counter, &inner, Some(&obf_pub), hs_mdh_len, &handshake_mask)?;
                 send_seq = send_seq.wrapping_add(1);
-                udp.send(&pkt).await?;
+                transport.send(&pkt).await?;
             }
         }
     };
@@ -603,7 +619,7 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
             &handshake_mask,
         )?;
         send_seq = send_seq.wrapping_add(1);
-        udp.send(&pkt).await?;
+        transport.send(&pkt).await?;
         log::debug!("mTLS: ClientCert sent ({} bytes)", cert_len_debug);
     }
     // Immediately send a keepalive to prevent CGNAT outbound mapping expiry.
@@ -626,7 +642,7 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
             &handshake_mask,
         ) {
             send_seq = send_seq.wrapping_add(1);
-            let _ = udp.send(&pkt).await;
+            let _ = transport.send(&pkt).await;
         }
     }
     // §2 L2 failure attribution — the handshake + PFS ratchet above completed
@@ -686,7 +702,7 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
                     let inner = build_inner_packet(InnerType::Control, send_seq, &ka);
                     if let Ok(pkt) = build_shaped_mdh_packet(&keys, &mut send_counter, &inner, None, hs_mdh_len, &handshake_mask) {
                         send_seq = send_seq.wrapping_add(1);
-                        let _ = udp.send(&pkt).await;
+                        let _ = transport.send(&pkt).await;
                     }
                 }
             }
@@ -718,7 +734,7 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
                     &handshake_mask,
                 ) {
                     send_seq = send_seq.wrapping_add(1);
-                    let _ = udp.send(&pkt).await;
+                    let _ = transport.send(&pkt).await;
                 }
             }
         }
@@ -955,7 +971,7 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
                     // spawned so it never blocks the rest of tunnel setup,
                     // removes that fixed offset.
                     send_seq = send_seq.wrapping_add(1);
-                    let udp_feedback = udp.clone();
+                    let udp_feedback = transport.clone();
                     tokio::spawn(async move {
                         let jitter_ms = rand::random::<u16>() % 3001;
                         time::sleep(Duration::from_millis(jitter_ms as u64)).await;
@@ -977,7 +993,11 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
     let rekey_resend_slot: RekeyResendSlot = Arc::new(Mutex::new(None));
     let rekey_resend_for_enc = Arc::clone(&rekey_resend_slot);
 
-    let udp_tx = udp.clone();
+    // The shared upload pipeline now speaks `DatagramTransport`. The mobile
+    // cores still own a connected `UdpSocket` directly (a full port to the
+    // transport abstraction is a separate step), so wrap it here — a pure
+    // pass-through, identical send() calls on the identical socket.
+    let udp_tx: Arc<dyn crate::transport::DatagramTransport> = transport.clone();
     let keys_tx = keys.clone();
     let session_for_upload = session.clone();
     let keepalive_ms_upload = keepalive_ms.clone();
@@ -1068,7 +1088,7 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
             }
 
             // ── UDP → TUN (inbound from server) ──
-            r = udp.recv(&mut udp_buf) => {
+            r = transport.recv(&mut udp_buf) => {
                 let n = match r {
                     Ok(n) => n,
                     Err(_) if session.stop_requested.load(Ordering::SeqCst) => {

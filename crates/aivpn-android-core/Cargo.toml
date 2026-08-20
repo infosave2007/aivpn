@@ -9,7 +9,11 @@ repository.workspace = true
 # Produces a C-compatible shared library (.so) loaded by System.loadLibrary("aivpn_core").
 [lib]
 name = "aivpn_core"
-crate-type = ["cdylib"]
+# cdylib — это .so, который грузит System.loadLibrary("aivpn_core").
+# rlib — чтобы внешняя сборка могла собрать собственный .so поверх этого,
+# добавив свои транспорты. На публичный .so не влияет: число экспортируемых
+# символов то же (проверяется в build-rust-android.sh).
+crate-type = ["cdylib", "rlib"]
 
 [features]
 default = ["ssh-install"]

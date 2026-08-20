@@ -114,3 +114,11 @@ qr = ["dep:qrcode", "dep:image", "dep:anyhow"]
 # default aivpn-common build or the mobile FFI cores (aivpn-android-core /
 # aivpn-ios-core), neither of which enables this feature.
 ssh-install = ["dep:russh", "dep:russh-sftp", "tokio"]
+
+# The descriptor contract test needs the module it tests. Without
+# `required-features` a plain `cargo test --workspace` — which does not enable
+# `ui-ext`, since no dependent asks for it — would try to compile this target
+# against an absent module and fail.
+[[test]]
+name = "ui_ext_descriptor"
+required-features = ["ui-ext"]

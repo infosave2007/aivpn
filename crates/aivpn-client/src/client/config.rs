@@ -106,6 +106,15 @@ pub struct ClientConfig {
     /// (matching `pool_dialer.rs`'s pre-existing `unwrap_or_default()`
     /// handling for its own `RouteSync`/enrollment payloads).
     pub pool_node_id: Option<String>,
+    /// Which datagram transport to open, when the session should not use a
+    /// direct UDP socket.
+    ///
+    /// `None` — the default and the only possibility in a build that registers
+    /// nothing — means the connected `UdpSocket` created in `connect()`, i.e.
+    /// exactly the behaviour that existed before this field. When set, the name
+    /// is resolved against the client's transport registry; an unregistered
+    /// name fails the connection rather than silently reverting to UDP.
+    pub transport: Option<aivpn_common::transport::TransportConfig>,
 }
 
 /// Client state

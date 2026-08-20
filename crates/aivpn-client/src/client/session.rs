@@ -286,8 +286,8 @@ impl super::AivpnClient {
         };
 
         // Spawn UDP reader task
-        let udp_socket = self
-            .udp_socket
+        let rx_transport = self
+            .transport
             .as_ref()
             .ok_or(Error::Session(
                 "UDP socket not initialized before run()".into(),
@@ -304,7 +304,7 @@ impl super::AivpnClient {
                     break;
                 }
 
-                match udp_socket.recv(&mut buf).await {
+                match rx_transport.recv(&mut buf).await {
                     Ok(n) => {
                         consecutive_errors = 0;
                         if n > 0 {
@@ -430,8 +430,8 @@ impl super::AivpnClient {
         };
 
         // ── Spawn upload task using the shared pipeline ──
-        let upload_udp = self
-            .udp_socket
+        let upload_transport = self
+            .transport
             .as_ref()
             .ok_or(Error::Session(
                 "UDP socket not initialized before upload task".into(),
@@ -461,7 +461,7 @@ impl super::AivpnClient {
         let mut upload_task = tokio::spawn(Self::spawn_upload(
             tun_to_udp_rx,
             control_rx,
-            upload_udp,
+            upload_transport,
             upload_engine,
             upload_state,
             upload_bytes_sent,
@@ -516,7 +516,7 @@ impl super::AivpnClient {
         // change (a real interface handover), forces a reconnect long before
         // the passive RX-silence threshold would.
         #[cfg(any(target_os = "ios", target_os = "windows", target_os = "linux"))]
-        let server_ep = self.udp_socket.as_ref().and_then(|s| s.peer_addr().ok());
+        let server_ep = self.transport.as_ref().and_then(|t| t.peer_addr());
         #[cfg(any(target_os = "ios", target_os = "windows", target_os = "linux"))]
         let mut underlying_src_ip = server_ep.and_then(probe_underlying_source_ip);
         #[cfg(any(target_os = "ios", target_os = "windows", target_os = "linux"))]
@@ -880,7 +880,7 @@ impl super::AivpnClient {
         let _ = stats_task.await;
         let _ = tun_task.await;
         let _ = udp_task.await;
-        // Await upload_task too: it holds an Arc<UdpSocket> clone, and the
+        // Await upload_task too: it holds an Arc<dyn DatagramTransport> clone, and the
         // disconnect() below removes the K6 kernel session and drops the
         // socket — the fd must not linger in a detached task past that point.
         // Skip only if the `join_res` select branch already consumed the
@@ -900,7 +900,7 @@ impl super::AivpnClient {
     async fn spawn_upload(
         mut rx: mpsc::Receiver<Vec<u8>>,
         mut control_rx: mpsc::Receiver<ControlPayload>,
-        udp: Arc<UdpSocket>,
+        transport: Arc<dyn DatagramTransport>,
         engine: MimicryEngine,
         upload_state: Arc<Mutex<UploadCryptoState>>,
         bytes_sent: Arc<AtomicU64>,
@@ -1063,7 +1063,7 @@ impl super::AivpnClient {
         upload_pipeline::run_upload_loop(
             &mut rx,
             Some(&mut control_rx),
-            &udp,
+            &transport,
             &mut enc,
             &config,
             inspector,

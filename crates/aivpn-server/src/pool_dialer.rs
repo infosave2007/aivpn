@@ -821,6 +821,10 @@ impl PoolDialer {
             // for `node_identity` reproduces the pre-Phase-4 no-op exactly.
             node_identity: self.node_identity.clone(),
             pool_node_id: self.node_id.clone(),
+            // The pool dialer always speaks direct UDP to its peer: it is a
+            // server-to-server link, not a client session that might need an
+            // alternative carrier.
+            transport: None,
         };
 
         let mut client = AivpnClient::new(cfg)

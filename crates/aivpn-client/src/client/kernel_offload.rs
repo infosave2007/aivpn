@@ -32,7 +32,6 @@ impl super::AivpnClient {
     /// kernel simply never accelerates.
     #[cfg(target_os = "linux")]
     pub(super) fn kernel_install_session(&mut self) {
-        use std::os::unix::io::AsRawFd;
         let Some(ka) = self.kernel_accel.clone() else {
             return;
         };
@@ -45,7 +44,7 @@ impl super::AivpnClient {
             return;
         };
         let (session_key_s2c, tag_secret) = (keys.session_key_s2c, keys.tag_secret);
-        let Some(udp) = self.udp_socket.clone() else {
+        let Some(transport) = self.transport.clone() else {
             return;
         };
 
@@ -80,7 +79,7 @@ impl super::AivpnClient {
         // the egress fast path, which the client never arms via SET_EGRESS) —
         // filled in sanely anyway.
         let mut client_addr_bytes = [0u8; 28];
-        if let Ok(peer) = udp.peer_addr() {
+        if let Some(peer) = transport.peer_addr() {
             match peer {
                 SocketAddr::V4(v4) => {
                     client_addr_bytes[0..2].copy_from_slice(&(libc::AF_INET as u16).to_ne_bytes());
@@ -139,7 +138,13 @@ impl super::AivpnClient {
         //    downlink Data is consumed in softirq; everything else falls back
         //    to this loop via the hook's re-queue + original data_ready wake.
         if !self.kernel_hooked {
-            if let Err(e) = ka.set_udp_sock(udp.as_raw_fd()) {
+            // Kernel offload hooks the raw socket, so it only exists for
+            // transports that HAVE one. `None` (a future non-UDP transport)
+            // simply means "stay on the user-space path" — always correct.
+            let Some(fd) = transport.raw_fd() else {
+                return;
+            };
+            if let Err(e) = ka.set_udp_sock(fd) {
                 warn!("kernel accel: set_udp_sock failed: {e} — kernel session installed but idle");
                 return;
             }

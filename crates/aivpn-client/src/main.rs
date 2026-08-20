@@ -1166,7 +1166,22 @@ async fn main() {
     // existing poll-based watchdogs unchanged. The same `Arc<Notify>` handle
     // is threaded into every reconnect iteration's `ClientConfig` below so a
     // single OS registration serves every `AivpnClient::run()` call.
-    let network_change_notify = aivpn_client::net_change::spawn();
+    // An alternative transport can generate its own link/address churn (a
+    // WebRTC-style engine opens sockets and runs ICE) that the OS network-change
+    // listener cannot distinguish from a real network change, tearing the
+    // session down mid-session. When such a transport is configured, or when the
+    // operator sets AIVPN_DISABLE_NETCHANGE, skip the native listener and rely
+    // on the poll-based watchdogs, which key off actual RX silence rather than
+    // interface events.
+    let disable_netchange = std::env::var("AIVPN_DISABLE_NETCHANGE").is_ok()
+        || std::env::var("AIVPN_TRANSPORT")
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false);
+    let network_change_notify = if disable_netchange {
+        None
+    } else {
+        aivpn_client::net_change::spawn()
+    };
     // Whether the user opted in to sharing outcome data (failures + successes).
     // Recording a failure additionally requires a country code (the server
     // aggregates per region and drops feedback without one).
@@ -1534,10 +1549,15 @@ async fn main() {
             inbound_control_tap: None,
             node_identity: None,
             pool_node_id: None,
+            transport: transport_config(),
         };
 
         match AivpnClient::new(config) {
             Ok(mut client) => {
+                client.set_transport_registry(
+                    std::sync::Arc::new(transport_registry()),
+                    platform_socket_guard(),
+                );
                 info!("Client initialized successfully (TUN: {})", tun_name);
 
                 // Write initial stats file (platform-appropriate paths)
@@ -1846,4 +1866,53 @@ mod tests {
         let key = decode_base64_key("test key", &b64);
         assert_eq!(key, [0u8; 32]);
     }
+}
+
+/// Which datagram transport this run should open, if configuration names one.
+///
+/// Deliberately configuration-only: there is no command-line flag and no UI
+/// control for this, so the choice cannot be made accidentally and does not
+/// have to be represented anywhere a user can see. `AIVPN_TRANSPORT` names the
+/// transport; `AIVPN_TRANSPORT_PARAMS` carries base64 parameters that are
+/// passed through without being parsed here — what they mean is entirely the
+/// business of whichever factory claimed the name.
+///
+/// `None` — the case in a build that registers nothing — is the direct UDP
+/// socket the client has always used.
+fn transport_config() -> Option<aivpn_common::transport::TransportConfig> {
+    let name = std::env::var("AIVPN_TRANSPORT")
+        .ok()
+        .filter(|s| !s.trim().is_empty())?;
+    let params = std::env::var("AIVPN_TRANSPORT_PARAMS")
+        .ok()
+        .and_then(|s| base64::engine::general_purpose::STANDARD.decode(s).ok())
+        .unwrap_or_default();
+    Some(aivpn_common::transport::TransportConfig::new(
+        name.trim(),
+        params,
+    ))
+}
+
+/// The transports this binary can open.
+///
+/// This function is the extension point: a build that plugs in additional
+/// datagram transports registers them here, and nothing else in the client
+/// changes — it resolves whatever `transport_config()` asks for against this
+/// registry and otherwise knows nothing about what is in it. The default build
+/// registers none, so the only path is the direct UDP socket.
+fn transport_registry() -> aivpn_common::transport::TransportRegistry {
+    #[allow(unused_mut)]
+    let mut registry = aivpn_common::transport::TransportRegistry::new();
+    registry
+}
+
+/// Platform hook that keeps a transport's own sockets out of this tunnel.
+///
+/// The direct UDP socket does not need one — it is kept out by the host route
+/// installed for the server address — so the default build supplies a guard
+/// that protects nothing. A transport that opens sockets of its own to
+/// addresses this client does not route around needs a real implementation
+/// here (SO_MARK on Linux, `VpnService.protect` on Android).
+fn platform_socket_guard() -> aivpn_common::transport::SharedGuard {
+    aivpn_common::transport::no_socket_guard()
 }
