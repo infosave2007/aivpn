@@ -25,6 +25,9 @@ pub mod mgmt;
 #[cfg(feature = "client-upload")]
 pub mod mimicry;
 
+#[cfg(feature = "transport")]
+pub mod transport;
+
 #[cfg(feature = "client-upload")]
 pub mod upload_pipeline;
 

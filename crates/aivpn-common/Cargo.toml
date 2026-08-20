@@ -41,6 +41,10 @@ portable-atomic = "1"
 # Async (optional — needed for upload_pipeline)
 tokio = { workspace = true, optional = true }
 
+# Object-safe async traits (optional — only pulled in by the `transport`
+# feature, i.e. by the client-side datagram transport abstraction).
+async-trait = { workspace = true, optional = true }
+
 # Logging (optional — only pulled in by the shared mobile tunnel core, which
 # was hoisted from the mobile FFI crates where `log` is the established
 # facade; the rest of aivpn-common uses `tracing`).
@@ -80,7 +84,13 @@ tokio = { workspace = true, features = ["test-util"] }
 
 [features]
 default = []
-client-upload = ["tokio"]
+# Datagram-transport abstraction (`trait DatagramTransport` + `UdpTransport`).
+# Everything above "send/receive one datagram" — crypto, resonance tags, MDH,
+# masks — is transport-agnostic and lives above this seam. Today the only
+# implementation is `UdpTransport`, a thin wrapper over the connected
+# `tokio::net::UdpSocket` the clients already used.
+transport = ["tokio", "dep:async-trait"]
+client-upload = ["tokio", "transport"]
 # Shared mobile VPN tunnel core (state/encryptor/io) hoisted from
 # aivpn-ios-core / aivpn-android-core. Unix-only in practice (libc, eventfd /
 # pipe stop signal); only the mobile FFI crates enable it.
