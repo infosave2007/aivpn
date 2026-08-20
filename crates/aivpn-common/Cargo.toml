@@ -90,6 +90,9 @@ default = []
 # implementation is `UdpTransport`, a thin wrapper over the connected
 # `tokio::net::UdpSocket` the clients already used.
 transport = ["tokio", "dep:async-trait"]
+# Descriptor-driven extra settings sections for the desktop GUIs. Off by
+# default; the public GUI holds no descriptor and renders nothing extra.
+ui-ext = ["transport"]
 client-upload = ["tokio", "transport"]
 # Shared mobile VPN tunnel core (state/encryptor/io) hoisted from
 # aivpn-ios-core / aivpn-android-core. Unix-only in practice (libc, eventfd /

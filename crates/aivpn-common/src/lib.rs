@@ -28,6 +28,12 @@ pub mod mimicry;
 #[cfg(feature = "transport")]
 pub mod transport;
 
+// Descriptor-driven extra settings sections for the GUIs. Data only: a build
+// with no descriptor file renders no extra settings. Needs `transport` for
+// `TransportConfig`.
+#[cfg(feature = "ui-ext")]
+pub mod ui_ext;
+
 #[cfg(feature = "client-upload")]
 pub mod upload_pipeline;
 
