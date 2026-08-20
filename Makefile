@@ -33,7 +33,7 @@ RUSER  ?= root
 endif
 REMOTE ?= /opt/aivpn
 
-.PHONY: help setup check test clippy fmt mask-gate hygiene-gate swift-parse \
+.PHONY: help setup check test clippy fmt mask-gate hygiene-gate selfcontained swift-parse \
         server server-tiny client server-docker \
         server-arm64 client-arm64 \
         server-musl-armv7 server-musl-mipsel server-musl-aarch64 server-musl-aarch64-full \
@@ -59,6 +59,7 @@ help:
 	@printf "    %-40s %s\n" "make fmt"                 "cargo fmt --all"
 	@printf "    %-40s %s\n" "make mask-gate"           "nDPI-gate every assets/masks/*.json (R2 Phase A)"
 	@printf "    %-40s %s\n" "make hygiene-gate"        "Vocabulary gate over the publicly distributed tree"
+	@printf "    %-40s %s\n" "make selfcontained"       "Prove the public tree builds with nothing beside it"
 	@printf "    %-40s %s\n" "make swift-parse"         "Syntax-check platforms/ios + platforms/macos (no Xcode needed)"
 	@printf "\n  Server / Client — Linux x86_64\n"
 	@printf "    %-40s %s\n" "make server"              "Full server [management-api,metrics,neural]"
@@ -143,6 +144,12 @@ mask-gate:
 # item.
 hygiene-gate:
 	scripts/ci-public-hygiene.sh
+
+# Cargo resolves every declared dependency, including switched-off optional
+# ones, so a path dependency reaching outside this repository breaks the build
+# for anyone who merely cloned it — while working fine for whoever added it.
+selfcontained:
+	scripts/ci-selfcontained.sh
 
 # Syntax gate for the Apple sources. They can only be BUILT on macOS, so edits
 # to platforms/ios and platforms/macos otherwise go in unverified until the

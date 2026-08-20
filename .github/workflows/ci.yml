@@ -64,6 +64,12 @@ jobs:
     - name: Public-tree vocabulary gate
       run: make hygiene-gate
 
+    # A path dependency reaching outside the repository is a hard Cargo error
+    # for everyone who just cloned it, and invisible to whoever added it — their
+    # working copy has the sibling directory.
+    - name: Self-contained public tree
+      run: make selfcontained
+
   cargo-audit:
     runs-on: ubuntu-latest
     # Advisory-only: reports known vulnerabilities in Cargo.lock without
