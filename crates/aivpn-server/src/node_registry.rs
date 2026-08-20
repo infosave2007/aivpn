@@ -31,7 +31,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use base64::Engine as _;
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use tracing::{error, info, warn};
 
@@ -85,6 +85,18 @@ pub struct NodeRegistry {
     /// different tasks) never collide on `{path}.{pid}.tmp` and fail the
     /// rename with ENOENT (D5 fix).
     tmp_counter: AtomicU64,
+    /// Serializes `persist()` end to end — snapshot, write and rename under
+    /// one lock.
+    ///
+    /// Unique temp names stopped the two writers from clobbering each
+    /// other's file, but not from inverting: a thread that snapshots the map
+    /// and is then descheduled can rename its stale copy over a newer one,
+    /// dropping every binding added in between. Taking this lock before the
+    /// snapshot makes the last rename always carry the newest state.
+    ///
+    /// It is not the `nodes` lock: holding that across file I/O would block
+    /// every reader for the duration of a write.
+    persist_lock: Mutex<()>,
 }
 
 /// Decode a base64-encoded 32-byte Ed25519 public key, logging and
@@ -138,6 +150,7 @@ impl NodeRegistry {
             revoked: RwLock::new(revoked),
             allow_auto_add,
             tmp_counter: AtomicU64::new(0),
+            persist_lock: Mutex::new(()),
         }
     }
 
@@ -353,6 +366,9 @@ impl NodeRegistry {
     /// (never called while a caller already holds `nodes`/`revoked` locked)
     /// so this can never deadlock against the RwLocks.
     fn persist(&self) -> std::io::Result<()> {
+        // Held across snapshot, write and rename: see `persist_lock`.
+        let _serialize = self.persist_lock.lock();
+
         let encoded_nodes: HashMap<String, String> = {
             let nodes = self.nodes.read();
             nodes
