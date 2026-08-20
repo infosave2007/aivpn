@@ -131,7 +131,7 @@ dependencies = [
 
 [[package]]
 name = "aivpn-android-core"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "aivpn-common",
  "android_logger",
@@ -148,7 +148,7 @@ dependencies = [
 
 [[package]]
 name = "aivpn-client"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "aivpn-common",
  "base64 0.22.1",
@@ -182,7 +182,7 @@ dependencies = [
 
 [[package]]
 name = "aivpn-common"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "aes 0.8.4",
  "aes-gcm 0.10.3",
@@ -221,7 +221,7 @@ dependencies = [
 
 [[package]]
 name = "aivpn-ios-core"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "aivpn-common",
  "base64 0.22.1",
@@ -236,7 +236,7 @@ dependencies = [
 
 [[package]]
 name = "aivpn-linux"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "aivpn-common",
  "base64 0.22.1",
@@ -256,7 +256,7 @@ dependencies = [
 
 [[package]]
 name = "aivpn-server"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "aivpn-client",
  "aivpn-common",
@@ -304,7 +304,7 @@ dependencies = [
 
 [[package]]
 name = "aivpn-windows"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "aivpn-common",
  "base64 0.22.1",

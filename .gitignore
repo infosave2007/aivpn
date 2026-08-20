@@ -107,3 +107,15 @@ docs/
 aivpn-android/
 *.jks
 *.keystore
+
+# Kernel-module build output (out-of-tree build leaves these in place)
+platforms/linux-kernel/*.ko
+platforms/linux-kernel/*.mod
+platforms/linux-kernel/*.mod.c
+platforms/linux-kernel/*.o
+platforms/linux-kernel/.*.cmd
+platforms/linux-kernel/src/.*.cmd
+platforms/linux-kernel/Module.symvers
+platforms/linux-kernel/modules.order
+# Stray busybox binary occasionally dropped by stand tooling
+/busybox

@@ -1,6 +1,8 @@
 # Changelog
 
-## [1.0.0-RC2] - 2026-07-18
+## [1.1.0] - 2026-08-20
+
+> **First minor release since 1.0.x.** It consolidates everything after the RC2 label (2026-07-18) on top of the 1.0.2–1.0.5 fixes: a redesigned pool-sync transport, a behaviour-preserving architectural refactor of the largest modules, unification of the two mobile tunnels onto one shared core, and a seam for pluggable datagram transports. The version moves to 1.1.0 because the mobile cores, the GUI hosts and the client entry point changed shape — the wire protocol did not.
 
 > **Release candidate for 1.0.0 (label RC2).** No version bump — the apps still display **1.0.0**; “RC2” is only the release label. This entry consolidates everything since RC1 (2026-07-07): a large reconnection-stability and pool-IP-coordination pass, a full security-hardening audit round across every platform, protocol correctness fixes, and a handful of new capabilities (authenticated handshake-reject, configurable downlink shaping, a native OS network-change listener, and honest min-cluster mask fitting).
 
@@ -75,7 +77,34 @@
 - **CI: `clippy` is advisory (non-blocking)** — pending a style-lint cleanup backlog, `clippy` warnings no longer fail the pipeline; `cargo fmt --check` still gates.
 - **iOS device key moved to a shared Keychain access group** — so the main app (not just the tunnel extension) can read the device public key for the SSH-install "bind to this device" flow. **Operator note:** a device that already had a key stored under the old extension-only access group generates a fresh one on its next connect, so any admin client that was previously device-bound to that device must be re-bound (re-issue its key). One-time migration effect only.
 
-## [1.0.0-RC2] — 2026-07-18
+### Added — since RC2
+
+- **Pluggable datagram transports (seam only)** — `aivpn-common::transport` introduces a `DatagramTransport` trait, the direct-UDP implementation every build has always used, a platform `SocketGuard` (`SO_MARK` on Linux, no-op elsewhere) and a name→factory registry. A build that registers nothing behaves exactly as before; a configured name that is not registered fails the connection rather than silently reverting to UDP. Behind the `transport` feature, off by default.
+- **Descriptor-driven extra settings sections** — `aivpn-common::ui_ext` lets a build declare an additional settings section as *data* (a versioned JSON descriptor: typed fields with labels) that the Linux, Windows and Android UIs render generically without knowing what any field means. No descriptor, no section — which is what a stock build gets.
+- **`aivpn_client::run()` as a library entry point** — the client binary's body moved into the library and now takes the transports the build can open plus a socket guard. The shipped binary passes none and behaves as before.
+- **Public-tree hygiene and self-containment gates** — `make hygiene-gate` (case-insensitive vocabulary gate over the distributed tree) and `make selfcontained` (no manifest may reference a path outside the repository; build and test with no extra feature), both wired into CI.
+
+### Fixed — since RC2
+
+- **The kill-switch blocked the client's own traffic when the server address was IPv6** — the nftables bypass rule was built with a hard-coded `ip` family, so with an IPv6 server it matched no packet at all and enabling the kill-switch cut the tunnel it was meant to protect. The family is now selected from the address and covered by tests.
+- **A closed control channel spun the upload loop at 100 % CPU** — a closed channel's `recv()` resolves immediately on every poll, so that arm kept winning the `select!` for the rest of the session. It now terminates the loop like a closed data channel does.
+- **Two inbound-control paths silently ignored unknown messages** — the triplicated `ControlPayload` handling on the desktop and both mobile cores is now an exhaustive match, which surfaced and fixed two paths that dropped messages they should have acted on.
+- **tc/eBPF QoS program never actually ran**, plus skb/socket hardening in the kernel data path.
+- **Upstream fixes 1.0.2 – 1.0.5 carried over** — TUN-duplicate ownership by the session (with a two-phase fd release that closes a reuse window the upstream fix leaves open), descriptor-mask condemnation on a dead data plane, Docker's `FORWARD DROP` silencing nftables-only rules, one mask per session on mobile, handshake framing at the mask's own header length, handshake cooldown keyed on the full socket address with live sessions exempt, and a guard against shipping a debug APK as a release artifact.
+
+### Security — since RC2
+
+- **The upstream legacy wire-layout compatibility is deliberately absent** — `apply_legacy_key_scheme` collapses `session_key_s2c` into `session_key`, and the data plane's nonce is a little-endian counter with no direction separator, both starting at zero. That reuses a `(key, nonce)` pair in ChaCha20-Poly1305 from the very first packet: the keystream cancels in the XOR of two ciphertexts and the Poly1305 one-time key is reused. The feature does not work without the collapse, so it is removed in full rather than half-kept. A safe route remains open for the future — keep directional keys and separate the directions into non-overlapping counter ranges — and would have to be proven against a live old server. The same prohibition was already written down in `site_sync.rs`.
+
+### Refactored — since RC2
+
+- **Pool sync redesigned as "the server dials its peer as a masked pool client"** (PSK derived via `HKDF(sync_key)`), with bidirectional anti-entropy on last-writer-wins plus tombstone merge. It unifies what used to be three separate mechanisms: `pool_sync`, `chain_forward` and `site_sync`.
+- **The largest modules were decomposed into focused submodules, behaviour unchanged** — `gateway.rs`, `mgmt_service`, `client_db` and the server `main` on the server side; `client.rs` on the desktop; the Linux and Windows GUI god-files. Loop cadences became named constants and the `handle_control_message` god-function became per-message handlers.
+- **The two mobile tunnels became one** — iOS and Android now share `aivpn-common::mobile_tunnel` behind a `PlatformIo` trait (`run_tunnel_generic`), collapsing roughly 6 200 duplicated lines into about 330 and eliminating six behavioural divergences between the platforms, including one where a forged `ServerHello` killed the session on only one of them.
+
+## [1.1.0] — 2026-08-20
+
+> **Первый минорный релиз после 1.0.x.** Собирает всё, что сделано после метки RC2 (2026-07-18), поверх исправлений 1.0.2–1.0.5: переработанный транспорт синхронизации пула, поведение-сохраняющий архитектурный рефакторинг самых крупных модулей, объединение двух мобильных туннелей в одно общее ядро и шов для подключаемых транспортов датаграмм. Версия поднята до 1.1.0, потому что изменилась форма мобильных ядер, хостов GUI и точки входа клиента — проволочный протокол не менялся.
 
 > **Релиз-кандидат версии 1.0.0 (метка RC2).** Без смены версии — в приложениях по-прежнему отображается **1.0.0**, «RC2» лишь метка релиза. Запись объединяет всё, что сделано после RC1 (2026-07-07): большой заход по стабильности переподключения и координации IP в пуле, полный раунд усиления безопасности на всех платформах, исправления корректности протокола и несколько новых возможностей (аутентифицированный отказ в рукопожатии, настраиваемый шейпинг нисходящего трафика, нативный слушатель смены сети и честная подгонка масок по минимальному кластеру).
 
@@ -149,6 +178,74 @@
 - **Контейнер `aivpn-web` снова работает под root** — эксперимент с не-root контейнером откачен в ожидании переключателя группы сокета сервера; панель пока поставляется как root-контейнер (вместе с этим приехал выбор уровня шейпинга в конфиге).
 - **CI: `clippy` совещательный (не блокирующий)** — в ожидании расчистки бэклога стиль-линтов предупреждения `clippy` больше не валят пайплайн; `cargo fmt --check` по-прежнему гейтит.
 - **Ключ устройства на iOS перенесён в общую группу доступа Keychain** — чтобы основное приложение (а не только туннельное расширение) могло прочитать публичный ключ устройства для потока «привязать к этому устройству» в SSH-установщике. **Примечание для оператора:** устройство, у которого ключ уже хранился в старой группе доступа (только расширение), при следующем подключении сгенерирует новый, поэтому любой админ-клиент, ранее привязанный к этому устройству, нужно пере-привязать (перевыпустить ключ). Разовый эффект миграции.
+
+### Добавлено — после RC2
+
+- **Подключаемые транспорты датаграмм (только шов)** — в `aivpn-common::transport` появились трейт `DatagramTransport`, реализация поверх прямого UDP-сокета, которым и так всегда пользовались все сборки, платформенный `SocketGuard` (`SO_MARK` на Linux, no-op в остальных) и реестр имя→фабрика. Сборка, не зарегистрировавшая ничего, ведёт себя ровно как раньше; настроенное, но незарегистрированное имя роняет подключение, а не откатывается молча на UDP. За фичей `transport`, по умолчанию выключенной.
+- **Дополнительные секции настроек из дескриптора** — `aivpn-common::ui_ext` позволяет сборке объявить дополнительную секцию настроек **данными** (версионированный JSON: типизированные поля с подписями), которые UI Linux, Windows и Android рисуют обобщённо, не зная смысла ни одного поля. Нет дескриптора — нет секции, и это поведение штатной сборки.
+- **`aivpn_client::run()` как точка входа-библиотека** — тело клиентского бинаря переехало в библиотеку и принимает список транспортов, которые сборка умеет открывать, плюс socket guard. Поставляемый бинарь не передаёт ничего и ведёт себя как прежде.
+- **Гейты гигиены и самодостаточности публичного дерева** — `make hygiene-gate` (регистронезависимая проверка словаря по распространяемому дереву) и `make selfcontained` (ни один манифест не смотрит за пределы репозитория; сборка и тесты без единой дополнительной фичи), оба подключены в CI.
+
+### Исправлено — после RC2
+
+- **Kill-switch блокировал собственный трафик клиента при IPv6-адресе сервера** — правило обхода в nftables строилось с жёстко зашитым семейством `ip`, поэтому при IPv6-сервере не совпадало ни с одним пакетом, и включённый kill-switch резал туннель, который должен был защищать. Семейство теперь выбирается по адресу и покрыто тестами.
+- **Закрытый control-канал раскручивал цикл отправки до 100 % CPU** — `recv()` закрытого канала резолвится мгновенно на каждом опросе, поэтому эта ветка выигрывала `select!` до конца сессии. Теперь цикл завершается так же, как при закрытом канале данных.
+- **Два пути входящего управления молча игнорировали неизвестные сообщения** — трижды продублированная обработка `ControlPayload` (десктоп и оба мобильных ядра) переведена на исчерпывающий `match`, что вскрыло и починило два пути, терявших сообщения, на которые следовало реагировать.
+- **Программа QoS на tc/eBPF фактически не выполнялась**, плюс усиление работы с skb/сокетами в ядерном пути данных.
+- **Перенесены исправления upstream 1.0.2 – 1.0.5** — владение TUN-дубликатами сессией (с двухфазным освобождением дескриптора, закрывающим окно переиспользования, которое upstream-фикс оставляет открытым), осуждение дескрипторной маски при мёртвом data plane, правила nftables, глушимые политикой Docker `FORWARD DROP`, одна маска на мобильную сессию, фрейминг рукопожатия по длине заголовка самой маски, cooldown рукопожатия по полному адресу сокета с исключением живых сессий и запрет отгружать debug-APK как релизный артефакт.
+
+### Безопасность — после RC2
+
+- **Совместимость с legacy-раскладкой провода из upstream намеренно отсутствует** — `apply_legacy_key_scheme` схлопывает `session_key_s2c` в `session_key`, а nonce в data plane — счётчик little-endian без разделителя направления, и оба стартуют с нуля. Это даёт переиспользование пары `(key, nonce)` в ChaCha20-Poly1305 с первого же пакета: keystream сокращается в XOR двух шифротекстов, one-time key Poly1305 переиспользуется. Без схлопывания функция не работает вообще, поэтому убрана целиком, а не оставлена наполовину. Безопасный путь на будущее остаётся: сохранить направленные ключи и развести направления по непересекающимся диапазонам счётчика — и проверить на живом старом сервере. Тот же запрет уже был записан в `site_sync.rs`.
+
+### Рефакторинг — после RC2
+
+- **Синхронизация пула переработана по принципу «сервер дайлит пира как замаскированный клиент пула»** (PSK выводится через `HKDF(sync_key)`), с двунаправленной anti-entropy на last-writer-wins и слиянием tombstone. Это объединяет три ранее раздельных механизма: `pool_sync`, `chain_forward` и `site_sync`.
+- **Самые крупные модули разложены на сфокусированные подмодули без изменения поведения** — `gateway.rs`, `mgmt_service`, `client_db` и серверный `main` на сервере; `client.rs` на десктопе; god-файлы GUI Linux и Windows. Периоды циклов стали именованными константами, а god-функция `handle_control_message` — обработчиками на сообщение.
+- **Два мобильных туннеля стали одним** — iOS и Android используют общий `aivpn-common::mobile_tunnel` за трейтом `PlatformIo` (`run_tunnel_generic`), что свернуло около 6 200 продублированных строк примерно в 330 и устранило шесть расхождений в поведении платформ, включая одно, где поддельный `ServerHello` убивал сессию только на одной из них.
+
+
+## [1.0.5] - 2026-08-10
+
+### Fixed
+
+- **Old clients discarded the `ServerHello` and reconnected forever** — a pre-Variant-A client compares the `ClientNetworkConfig` version byte for EQUALITY and drops the whole message when it differs. Wire v2 appended a keepalive byte and bumped that version, so the handshake completed on the server, the `ServerHello` went out, and the client silently threw it away: no ratchet, no data, another handshake minutes later, forever. Caught on a live server — the same client handshaking from the same source port every few minutes, answered each time, never sending a packet in between. The server now emits the v1 form to a peer flagged `legacy_peer`, which costs only the keepalive hint such a client never had. On production this took one looping client from 37 handshakes per 5 minutes to one per 10 minutes, and uplink decrypt failures from 2567 to zero.
+- **One client's stale packets locked out its whole home network** — the handshake-failure cooldown was keyed by source IP, and every device behind a home NAT shares one. When a single phone retried with stale keys the server blocked handshakes from that IP for up to 16 seconds, taking every other client behind the same router with it; two clients on one router were observed looping in lockstep, neither able to reconnect. Worse, the failure that armed the cooldown was often not a failure: a packet from a live session reaches the handshake path whenever the tag lookup misses (the tag window drifted, or the global rescan budget was spent that second), and the server then tried it as a handshake, found no matching client, and locked the peer out while it kept sending. Cooldowns are now keyed by the full peer address, and a peer that still has a session is exempt from both the block and the accounting. Spoofed-source floods stay bounded by the global handshake-scan budget, which varying ports does not evade.
+
+## [1.0.4] - 2026-08-10
+
+### Fixed
+
+- **Old clients connected, then dropped into an endless reconnect** — the handshake put a pre-Variant-A peer into legacy compatibility mode (single, non-directional session key), but that was a one-shot fixup of the keys present at that moment. The inline rekey runs every couple of minutes and installs freshly derived keys, so the downlink silently switched to a directional S2C key such a client cannot decrypt: its session went deaf, the watchdog fired, and it handshaked again. Measured on a live server: 115 accepted legacy handshakes from one client in 40 minutes, each followed by silence. The session now carries an explicit `legacy_peer` flag that every key derivation honours, and a mask pushed to such a peer keeps the tag-prefix layout so a `MaskUpdate` cannot diverge the framing.
+- **Desktop clients could never use the legacy fallback** — it is a two-part contract (tag-prefix framing AND the single session key), and only the mobile cores implemented both. The desktop client, which the macOS and Windows GUIs run as their tunnel process, had neither: it could not reach a server older than the embedded-tag change, and once a server answered it in legacy compatibility mode it could not decrypt its own `ServerHello` — handshake timeout, reconnect, forever. It now mirrors the mobile ladder, collapsing the directional split for such a session at every key derivation (zero-RTT, PFS ratchet, inline rekey).
+
+## [1.0.3] - 2026-08-08
+
+### Fixed
+
+- **Roughly one connection key in five could never connect (#68, part of #70)** — the client framed its handshake at the protocol default header length (20 bytes), while the server reads the embedded ephemeral key at the `eph_pub_offset` of the mask it matched. For `quic_https_v2` that offset is 14, so the key landed six bytes past where the server looked: wrong DH input, wrong session keys, and a tag mismatch against every candidate of every registered client — permanently. The PSK selects the preset (`blake3(psk)[0] % 5`), so this bricked about one issued key in five at random: `--show-client` handed out a key the app could never use, and the app sat in an endless reconnect ("hangs after entering the key"). The other four presets have a 20-byte header, where the wrong value happens to equal the right one, which is why it went unnoticed. Both mobile cores now frame with the handshake mask's own length and decode the `ServerHello` at whichever length actually parses.
+- **The data plane could use a different mask than the handshake** — the handshake mask and the data mask were resolved by two separate calls. The server pushes fresh bootstrap descriptors as soon as the session is up, so the second call could see a newer descriptor set and pick a different candidate; if its header length differed, the server decrypted every uplink packet at the wrong offset while the resonance tag still matched, leaving the tunnel "connected" and carrying nothing. The session now reuses the exact mask the handshake was accepted with.
+- **Server: client traffic was dropped on any host with Docker installed** — Docker sets `iptables -P FORWARD DROP`, and netfilter evaluates the legacy iptables FORWARD hook independently of the nftables ruleset, so a packet must be accepted by both. With the nftables backend selected, client packets reached the server's tun and never left it. The accepts are now mirrored into iptables (into `DOCKER-USER` when present, which Docker never flushes) whenever the FORWARD policy is DROP, and removed on teardown. Hosts without Docker are unaffected.
+- **`make android` could publish a debug APK** — with no signing material configured the build silently fell back to `assembleDebug`, and that build shipped as the release asset in 1.0.0 and 1.0.1. A debug APK is `android:debuggable`, so anyone with adb access could attach to the VPN process and read session keys out of its memory, and its signature is the public Android debug key. The build now fails with an explanation instead; `AIVPN_ALLOW_DEBUG_APK=1` restores the old behaviour for local testing only.
+
+## [1.0.2] - 2026-08-05
+
+### Fixed
+
+- **Android: tunnel connected but carried no traffic, only a reinstall helped (#71, #70)** — the Rust core duplicates the Android TUN descriptor, and those duplicates outlived the interface: Kotlin closes its `ParcelFileDescriptor` on disconnect and gives the native call 3 s to unwind, so a slower unwind left the tun device alive as a zombie still holding the VPN address. The next session established a *second* tun with the same address, app packets were routed into the dead one nobody reads, and the tunnel reported "connected" while the server saw keepalives and not one data packet. Caught on a device as `tun0` DOWN holding the VPN address next to a live `tun1`. The session now owns both duplicates (the `AsyncFd`s only borrow them), so stopping the tunnel destroys the device immediately; both closers take the descriptor with `swap(-1)`, so it is closed exactly once. After a disconnect the process holds zero tun descriptors and the device zero tun interfaces.
+- **Android: a cached bootstrap descriptor could strand the data plane** — a session that completes the handshake but never receives a single downlink data packet now discards its cached descriptors (in-process and app-persisted, the verdict surviving an app restart) and pins the next attempt to a builtin preset. Narrowly scoped: a healthy covert session that merely stalls on a network change keeps its descriptors and just reconnects.
+- **Server: an uplink packet that failed to decrypt could wedge the packet loop** — the diagnostic path re-locked the session mutex already held by the enclosing block (`parking_lot` is not reentrant), deadlocking the worker and, with the lock never released, every other session with it.
+
+### Added
+
+- **Interoperability with servers and clients from before the embedded-tag layout** — an app updated past that change could not reach an older server at all, and an upgraded server could not serve an older app; both sides retried forever. Clients now fall back to the legacy tag-prefix layout (and its single, non-directional session key) after repeated failed handshakes, and servers accept that layout in a second handshake pass that runs only when the modern pass finds nothing. Upgrade order no longer matters — see "Version Compatibility" in the README.
+
+## [1.0.1] - 2026-07-09
+
+### Fixed
+
+- **musl / embedded cross-compilation** — `AtomicU64` now comes from `portable_atomic` in the shared upload pipeline (`aivpn-common`) and the server mask store, instead of `std::sync::atomic::AtomicU64` (absent on 32-bit targets without native 64-bit atomics). The `recvmmsg` flags argument is cast portably (`as _`) for musl. Restores the `server-musl-*` and `client-musl-mipsel` release-asset builds.
+- **Windows release packaging** — `make windows` no longer deletes `aivpn-windows-gui.zip` after building the NSIS installer, so the release workflow publishes both the installer and the portable GUI zip.
 
 ## [1.0.0-RC1] - 2026-07-07
 
@@ -239,8 +336,6 @@
 
 ### Fixed
 
-- **musl / embedded cross-compilation** — `AtomicU64` now comes from `portable_atomic` in the shared upload pipeline (`aivpn-common`) and the server mask store, instead of `std::sync::atomic::AtomicU64` (absent on 32-bit targets without native 64-bit atomics). The `recvmmsg` flags argument is cast portably (`as _`) for musl. Restores the `server-musl-*` and `client-musl-mipsel` release-asset builds.
-- **Windows release packaging** — `make windows` no longer deletes `aivpn-windows-gui.zip` after building the NSIS installer, so the release workflow publishes both the installer and the portable GUI zip.
 - **A lost inline-rekey `KeyRotate` self-heals with zero reconnects (server + all clients).** In-flight PFS rekey previously sent `KeyRotate` exactly once; if that packet was lost, the server sat on new keys while the client kept the old ones — an irrecoverable desync ending in a ~35 s watchdog reconnect. The server now retransmits an unacknowledged `KeyRotate` on a short (~4 s, below the client's RX-silence watchdog) timer reusing the same rekey keypair, the rekey-ack wait is bounded so a dead upload task can't hang the receive loop, and uplink/downlink packet counters stay monotonic across the rekey (no nonce regression). Live-verified with injected packet loss: zero reconnects. Ported to desktop, iOS, and Android.
 - **Self-healing downlink MDH-length discovery (all clients)** — after a missed mask update, downlink packets framed at a different mask-derived-header length became undecodable and the session died; clients now track every MDH length ever seen for the session, the shared decoder tries all of them, and the active framing is re-discovered automatically.
 - **Pool/site/chain sync framing is mask-independent** — server-to-server sync packets were framed against the sending node's primary mask while the receiver derived the offset from *its own* primary mask; with embedded-tag masks (8 of 11 bundled) the AEAD never verified, so pool client databases silently never converged. Peer sync (pool sync, multi-site sync, chain forwarding) now uses a fixed cluster framing layout independent of any mask, plus a deterministic primary-mask choice; verified live on a two-node pool running embedded-tag masks.
@@ -460,8 +555,6 @@
 
 ### Исправлено
 
-- **Кросс-компиляция musl / embedded** — `AtomicU64` теперь берётся из `portable_atomic` в общем upload-конвейере (`aivpn-common`) и хранилище масок сервера вместо `std::sync::atomic::AtomicU64` (отсутствует на 32-битных целях без нативных 64-битных атомиков). Аргумент флагов `recvmmsg` приводится переносимо (`as _`) для musl. Восстанавливает сборки release-артефактов `server-musl-*` и `client-musl-mipsel`.
-- **Упаковка Windows-релиза** — `make windows` больше не удаляет `aivpn-windows-gui.zip` после сборки NSIS-инсталлятора, поэтому release-workflow публикует и инсталлятор, и переносимый zip GUI.
 - **Потерянный inline-rekey `KeyRotate` самовосстанавливается без реконнекта (сервер + все клиенты).** Ротация ключей PFS «в полёте» раньше отправляла `KeyRotate` ровно один раз; при потере этого пакета сервер оставался на новых ключах, а клиент — на старых: невосстановимый рассинхрон, заканчивавшийся реконнектом по watchdog через ~35 с. Сервер теперь ретранслирует неподтверждённый `KeyRotate` по короткому таймеру (~4 с, меньше клиентского watchdog RX-тишины) с той же rekey-ключевой парой, ожидание rekey-ack ограничено по времени (мёртвая upload-задача не может подвесить цикл приёма), а счётчики пакетов uplink/downlink остаются монотонными через rekey (нет регрессии nonce). Проверено вживую с инъекцией потери пакета: ноль реконнектов. Портировано на десктоп, iOS и Android.
 - **Самовосстанавливающееся определение длины MDH на downlink (все клиенты)** — после пропущенного обновления маски downlink-пакеты, оформленные с другой длиной mask-derived-header, становились нераскодируемыми и сессия умирала; клиенты теперь запоминают каждую длину MDH, когда-либо виденную в сессии, общий декодер пробует их все, и активный фрейминг переоткрывается автоматически.
 - **Фрейминг синхронизации pool/site/chain не зависит от маски** — межсерверные sync-пакеты оформлялись по первичной маске отправляющего узла, а получатель вычислял смещение по *своей* первичной маске; с масками со встроенным тегом (8 из 11 в бандле) AEAD никогда не сходился, и клиентские базы пула молча не синхронизировались. Пиринговая синхронизация (pool, мультисайт, chain-форвардинг) теперь использует фиксированную кластерную раскладку, независимую от любых масок, плюс детерминированный выбор первичной маски; проверено вживую на пуле из двух узлов с масками со встроенным тегом.

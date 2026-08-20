@@ -47,7 +47,7 @@ services:
         max-file: "3"
     labels:
       - "com.aivpn.service=gateway"
-      - "com.aivpn.version=1.0.0"
+      - "com.aivpn.version=1.1.0"
 
 # Prometheus/Grafana (optional monitoring) live in a SEPARATE compose file —
 # deploy/monitoring/docker-compose.monitoring.yml — not here. Reason: Docker
