@@ -108,6 +108,14 @@ object AivpnJni {
          * preset.
          */
         cachedDescriptorsJson: String?,
+        /**
+         * Optional transport override from the modular settings seam
+         * ([TransportSettingsRegistry]): a short transport name the native core
+         * understands, or null for the built-in default transport.
+         */
+        transportName: String?,
+        /** JSON parameter object accompanying [transportName], or null. */
+        transportParamsJson: String?,
     ): String
 
     /**

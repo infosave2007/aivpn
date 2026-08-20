@@ -168,6 +168,12 @@
     <string name="mask_country_code_hint">DE</string>
     <string name="mask_country_code_invalid">Country code must be exactly 2 letters</string>
 
+    <!-- Modular transport settings (edition-specific providers; entry hidden when none) -->
+    <string name="transport_settings_title">Connection transport</string>
+    <string name="desc_transport_settings">Additional connection transport settings for this edition.</string>
+    <string name="transport_apply">Apply</string>
+    <string name="transport_applied">Transport settings applied — takes effect on the next connect</string>
+
     <!-- Event notification channel -->
     <string name="notification_event_channel">AIVPN Events</string>
     <string name="notification_event_channel_desc">Connection state change notifications</string>

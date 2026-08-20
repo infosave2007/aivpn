@@ -944,6 +944,17 @@ class AivpnService : VpnService() {
                 // null and falls back to the preset — acceptable residual.
                 val cachedDescriptorsArg: String? =
                     SecureStorage.loadBootstrapDescriptors(this@AivpnService, snapServerKey)
+                // Modular transport settings seam: an opaque transport override
+                // persisted by TransportSettingsActivity (only a closed edition
+                // registers a provider that can produce one). Absent → null →
+                // the core uses the built-in default transport. Params are only
+                // meaningful alongside a name, so they are gated on it.
+                val extTransportName = feedbackPrefs
+                    .getString(PrefsKeys.PREF_EXT_TRANSPORT_NAME, null)
+                    ?.takeIf { it.isNotBlank() }
+                val extTransportParams = if (extTransportName != null) {
+                    feedbackPrefs.getString(PrefsKeys.PREF_EXT_TRANSPORT_PARAMS, null)
+                } else null
                 val error = withContext(Dispatchers.IO) {
                     AivpnJni.runTunnel(
                         this@AivpnService, tunFd, host, port, serverKey, psk, snapMtlsCert,
@@ -951,6 +962,7 @@ class AivpnService : VpnService() {
                         maskOperatorPubkey, maskVerifyMode,
                         polymorphicBase, effShareFeedback, effReceiveHints, countryCode(),
                         priorOutcomesArg, cachedDescriptorsArg,
+                        extTransportName, extTransportParams,
                     )
                 }
                 if (error.isNotEmpty()) throw RuntimeException(error)

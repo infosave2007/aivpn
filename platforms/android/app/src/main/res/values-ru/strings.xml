@@ -168,6 +168,12 @@
     <string name="mask_country_code_hint">DE</string>
     <string name="mask_country_code_invalid">Код страны должен состоять ровно из 2 букв</string>
 
+    <!-- Модульные настройки транспорта (провайдеры конкретной редакции; пункт скрыт, если их нет) -->
+    <string name="transport_settings_title">Транспорт подключения</string>
+    <string name="desc_transport_settings">Дополнительные настройки транспорта подключения для этой редакции.</string>
+    <string name="transport_apply">Применить</string>
+    <string name="transport_applied">Настройки транспорта применены — вступят в силу при следующем подключении</string>
+
     <!-- Канал уведомлений событий -->
     <string name="notification_event_channel">События AIVPN</string>
     <string name="notification_event_channel_desc">Уведомления об изменении состояния подключения</string>

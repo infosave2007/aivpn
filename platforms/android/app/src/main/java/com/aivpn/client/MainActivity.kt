@@ -837,6 +837,13 @@ class MainActivity : AppCompatActivity() {
             Item(getString(R.string.bootstrap_discovery), getString(R.string.desc_bootstrap_discovery), MENU_BOOTSTRAP_DISCOVERY),
             Item(getString(R.string.mask_privacy), getString(R.string.desc_mask_privacy), MENU_MASK_PRIVACY),
         )
+        // Modular transport settings: only an edition that ships a descriptor
+        // asset has anything to configure. The public build ships none, so the
+        // entry never appears.
+        if (loadTransportDescriptor(this) != null) {
+            items.add(Item(getString(R.string.transport_settings_title),
+                getString(R.string.desc_transport_settings), MENU_TRANSPORT_SETTINGS))
+        }
         if (mgmtRole == 1 || mgmtRole == 2) {
             items.add(Item(getString(R.string.admin_menu_title), getString(R.string.desc_admin_menu), MENU_ADMIN))
         }
@@ -936,6 +943,7 @@ class MainActivity : AppCompatActivity() {
             MENU_MASK_PRIVACY -> showMaskPrivacyDialog()
             MENU_ADMIN -> startActivity(Intent(this, AdminActivity::class.java))
             MENU_INSTALL_SERVER -> startActivity(Intent(this, InstallServerActivity::class.java))
+            MENU_TRANSPORT_SETTINGS -> startActivity(Intent(this, TransportSettingsActivity::class.java))
         }
     }
 
@@ -1476,6 +1484,7 @@ class MainActivity : AppCompatActivity() {
         private const val MENU_MASK_PRIVACY = 1008
         private const val MENU_ADMIN = 1009
         private const val MENU_INSTALL_SERVER = 1010
+        private const val MENU_TRANSPORT_SETTINGS = 1011
 
         val MASK_OPTIONS = arrayOf(
             "auto",

@@ -58,6 +58,14 @@ object PrefsKeys {
     /** Most recently received RegionalMaskHints, JSON-encoded
      *  (`{"country_code":"US","masks":[["webrtc_zoom_v3",0.87],...]}`). */
     const val PREF_REGIONAL_HINTS_JSON = "regional_hints_json"
+
+    // Modular transport settings seam (TransportSettingsRegistry) — an opaque
+    // transport override produced by a registered provider's TransportChoice.
+    // Absent (both keys removed) = use the built-in default transport.
+    /** Short transport name understood by the native core, e.g. from a closed edition. */
+    const val PREF_EXT_TRANSPORT_NAME = "ext_transport_name"
+    /** JSON parameter object accompanying [PREF_EXT_TRANSPORT_NAME]. */
+    const val PREF_EXT_TRANSPORT_PARAMS = "ext_transport_params"
 }
 
 /**

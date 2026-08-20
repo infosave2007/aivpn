@@ -43,6 +43,14 @@
             android:exported="false"
             android:parentActivityName=".MainActivity" />
 
+        <!-- Modular transport settings (TransportSettingsRegistry). Generic
+             renderer only: with no registered provider (public edition) it
+             finishes immediately and its MainActivity entry point is hidden. -->
+        <activity
+            android:name=".TransportSettingsActivity"
+            android:exported="false"
+            android:parentActivityName=".MainActivity" />
+
         <!-- Background reliability & permissions health check -->
         <activity
             android:name=".BackgroundHealthActivity"
