@@ -89,6 +89,13 @@ PATTERNS=(
 #   only thing standing between a stray name and a public release.
 
 # ── What counts as the public tree ───────────────────────────────────────────
+#
+# Everything except build output and internal notes. There used to be
+# exclusions here for the closed crates; they are gone because those crates are
+# gone — the closed side lives in its own repository now, and a list naming it
+# would itself be the kind of hint this gate exists to prevent. If a directory
+# ever needs excluding again, that is a signal the separation slipped.
+
 EXCLUDE_DIRS=(
   '.git'
   'target'
@@ -96,13 +103,6 @@ EXCLUDE_DIRS=(
   # Already excluded from distribution by .gitignore.
   'docs'
   'research'
-  # R&D spike crate — not published.
-  'aivpn-carrier-spike'
-  # The closed transport crate — the private side of the seam. publish=false,
-  # not in default-members; the vocabulary that must not appear in the public
-  # tree lives here by design.
-  'aivpn-carrier'
-  'aivpn-alt-ui'
   # Generated web output: re-embeds every source and dependency string.
   '.svelte-kit'
   'build'
