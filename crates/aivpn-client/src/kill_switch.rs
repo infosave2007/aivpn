@@ -17,6 +17,19 @@ use tracing::warn;
 pub struct KillSwitch {
     tun_name: String,
     server_ip: String,
+    /// Firewall mark whose traffic is let out alongside the tunnel.
+    ///
+    /// The server-address bypass below only covers a session that talks to the
+    /// server directly. A transport that reaches the server by some other route
+    /// opens sockets to addresses this struct does not know and cannot
+    /// enumerate — so with only the address bypass, switching the kill-switch
+    /// on would block the very transport carrying the tunnel, and "leak
+    /// protection" would read to the user as "the VPN stopped working".
+    ///
+    /// Marked traffic is therefore accepted as a class. It is the same mark the
+    /// socket guard stamps, so exactly the sockets that were deliberately kept
+    /// out of the tunnel are the ones allowed out here — nothing broader.
+    mark: Option<u32>,
     active: bool,
 }
 
@@ -25,7 +38,35 @@ impl KillSwitch {
         Self {
             tun_name,
             server_ip,
+            mark: None,
             active: false,
+        }
+    }
+
+    /// Also let out traffic carrying `mark` (see the field's documentation).
+    /// Must be set before `activate()`; changing it afterwards has no effect
+    /// until the next activation.
+    pub fn with_mark(mut self, mark: u32) -> Self {
+        self.mark = Some(mark);
+        self
+    }
+
+    /// Address family for the server-bypass nft rule: `ip6` when the server
+    /// address is IPv6, `ip` otherwise.
+    ///
+    /// This used to be hard-coded to `ip`. With an IPv6 server the rule then
+    /// matched no packet at all, so switching the kill-switch on blocked the
+    /// client's own traffic to its server — which reads to a user as "the VPN
+    /// stopped working", not as "leak protection engaged".
+    ///
+    /// A bare `:` test is enough: `server_ip` is an address, never a
+    /// host:port pair (the port lives separately in the connection key), so
+    /// the only colons that can appear are an IPv6 separator.
+    fn nft_family(&self) -> &'static str {
+        if self.server_ip.contains(':') {
+            "ip6"
+        } else {
+            "ip"
         }
     }
 
@@ -114,10 +155,14 @@ impl KillSwitch {
             let _ = Command::new("nft")
                 .args(["flush", "chain", "inet", "aivpn_ks", "output"])
                 .status();
-            for rule in &[
+            let ip_family = self.nft_family();
+            let mut rules: Vec<Vec<String>> = vec![
                 vec![
                     "add", "rule", "inet", "aivpn_ks", "output", "oifname", "lo", "accept",
-                ],
+                ]
+                .into_iter()
+                .map(String::from)
+                .collect(),
                 vec![
                     "add",
                     "rule",
@@ -127,27 +172,46 @@ impl KillSwitch {
                     "oifname",
                     self.tun_name.as_str(),
                     "accept",
-                ],
+                ]
+                .into_iter()
+                .map(String::from)
+                .collect(),
                 // Server IP bypass — use ip/ip6 family based on address type
-                {
-                    let ip_family = if self.server_ip.contains(':') {
-                        "ip6"
-                    } else {
-                        "ip"
-                    };
+                vec![
+                    "add",
+                    "rule",
+                    "inet",
+                    "aivpn_ks",
+                    "output",
+                    ip_family,
+                    "daddr",
+                    self.server_ip.as_str(),
+                    "accept",
+                ]
+                .into_iter()
+                .map(String::from)
+                .collect(),
+            ];
+            // Marked traffic — the transport's own sockets (see `mark`).
+            if let Some(m) = self.mark {
+                rules.push(
                     vec![
                         "add",
                         "rule",
                         "inet",
                         "aivpn_ks",
                         "output",
-                        ip_family,
-                        "daddr",
-                        self.server_ip.as_str(),
+                        "meta",
+                        "mark",
+                        &format!("0x{m:x}"),
                         "accept",
                     ]
-                },
-            ] {
+                    .into_iter()
+                    .map(String::from)
+                    .collect(),
+                );
+            }
+            for rule in &rules {
                 let rule_ok = Command::new("nft")
                     .args(rule.as_slice())
                     .status()
@@ -182,13 +246,22 @@ impl KillSwitch {
         let _ = Command::new(ipt)
             .args(["-D", "OUTPUT", "-j", "AIVPN_KS"])
             .status();
-        for cmd in &[
+        let mark_arg = self.mark.map(|m| format!("0x{m:x}"));
+        let mut cmds: Vec<Vec<&str>> = vec![
             vec![ipt, "-I", "OUTPUT", "1", "-j", "AIVPN_KS"],
             vec![ipt, "-A", "AIVPN_KS", "-o", "lo", "-j", "ACCEPT"],
             vec![ipt, "-A", "AIVPN_KS", "-o", tun, "-j", "ACCEPT"],
             vec![ipt, "-A", "AIVPN_KS", "-d", sip, "-j", "ACCEPT"],
-            vec![ipt, "-A", "AIVPN_KS", "-j", "DROP"],
-        ] {
+        ];
+        // Marked traffic — the transport's own sockets (see `mark`). Must be
+        // appended before the DROP that terminates the chain.
+        if let Some(m) = mark_arg.as_deref() {
+            cmds.push(vec![
+                ipt, "-A", "AIVPN_KS", "-m", "mark", "--mark", m, "-j", "ACCEPT",
+            ]);
+        }
+        cmds.push(vec![ipt, "-A", "AIVPN_KS", "-j", "DROP"]);
+        for cmd in &cmds {
             let ok = Command::new(cmd[0])
                 .args(&cmd[1..])
                 .status()
@@ -561,6 +634,49 @@ impl KillSwitch {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// No mark by default: a session that talks to the server directly needs
+    /// only the address bypass, and accepting an unset mark would widen the
+    /// hole for nothing.
+    #[test]
+    fn no_mark_bypass_unless_asked() {
+        let ks = KillSwitch::new("tun0".to_string(), "1.2.3.4".to_string());
+        assert_eq!(ks.mark, None);
+    }
+
+    /// The mark survives onto the struct that builds the firewall rules — if it
+    /// did not, switching the kill-switch on would block the transport carrying
+    /// the tunnel, and the failure would look like a network fault rather than
+    /// a policy decision.
+    #[test]
+    fn mark_bypass_is_stored() {
+        let ks = KillSwitch::new("tun0".to_string(), "1.2.3.4".to_string()).with_mark(0x4149);
+        assert_eq!(ks.mark, Some(0x4149));
+        assert!(!ks.is_active(), "with_mark must not activate anything");
+    }
+
+    /// IPv6 server addresses must select the ip6 family. See `nft_family`:
+    /// with `ip` hard-coded the bypass rule matched nothing and the
+    /// kill-switch blocked the tunnel's own traffic.
+    #[test]
+    fn ipv6_server_selects_ip6_family() {
+        let ks = KillSwitch::new("tun0".to_string(), "2001:db8::1".to_string());
+        assert_eq!(ks.nft_family(), "ip6");
+    }
+
+    #[test]
+    fn ipv4_server_selects_ip_family() {
+        let ks = KillSwitch::new("tun0".to_string(), "203.0.113.1".to_string());
+        assert_eq!(ks.nft_family(), "ip");
+    }
+
+    /// The compressed all-zeros form is still IPv6 and still has colons —
+    /// guarding the detection against a "looks too short to be v6" rewrite.
+    #[test]
+    fn compressed_ipv6_still_selects_ip6() {
+        let ks = KillSwitch::new("tun0".to_string(), "::1".to_string());
+        assert_eq!(ks.nft_family(), "ip6");
+    }
 
     #[test]
     fn test_new_not_active() {
