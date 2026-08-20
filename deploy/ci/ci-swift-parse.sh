@@ -17,7 +17,7 @@
 # Gracefully SKIPS (exit 0) when no Swift toolchain is installed, so nobody is
 # blocked by it. Install one with your distro's `swift` package to enable it.
 set -uo pipefail
-cd "$(dirname "$0")/.." || exit 1
+cd "$(dirname "$0")/../.." || exit 1
 
 if ! command -v swiftc >/dev/null 2>&1; then
     echo "swift-parse: SKIP — no Swift toolchain (install 'swift' to enable)"

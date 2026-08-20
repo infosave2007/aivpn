@@ -6,7 +6,9 @@
 #   cargo install cargo-ndk
 #   rustup target add aarch64-linux-android armv7-linux-androideabi x86_64-linux-android
 #
-# Optional release signing via keystore.properties in aivpn-android/:
+# Optional release signing via keystore.properties next to this script
+# (platforms/android/keystore.properties — that is where both this script and
+# app/build.gradle actually look):
 #   storeFile=/absolute/path/to/release.jks
 #   storePassword=...
 #   keyAlias=...

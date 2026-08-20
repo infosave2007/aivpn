@@ -22,7 +22,9 @@ docs/
 # builds from them. Keeping them in the context slows every `docker build` by
 # the time it takes to tar and ship them to the daemon.
 research/
-monitoring/
+deploy/monitoring/
+# CI gates: invoked by the Makefile, no business in an image
+deploy/ci/
 .qoder/
 .venv/
 *.log

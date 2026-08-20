@@ -74,10 +74,10 @@ Packet dots mark three positions per ring to suggest distributed nodes and signa
 
 | Platform | File | Notes |
 |----------|------|-------|
-| macOS | `aivpn-macos/AppIcon.icns` | Multi-size ICNS generated from SVG |
-| Windows | `aivpn-windows/assets/aivpn.ico` | Multi-size ICO (256,128,64,48,32,16 px) |
-| Android | `aivpn-android/app/src/main/res/mipmap-*/ic_launcher.png` | Per-density PNGs |
-| iOS | `aivpn-ios/App/Assets.xcassets/AppIcon.appiconset/` | Generated via Xcode |
+| macOS | `platforms/macos/AppIcon.icns` | Multi-size ICNS generated from SVG |
+| Windows | `crates/aivpn-windows/assets/aivpn.ico` | Multi-size ICO (256,128,64,48,32,16 px) |
+| Android | `assets/brand/android/mipmap-*/ic_launcher.png` | Per-density PNGs, copied into the app at build time |
+| iOS | `assets/brand/ios/Assets.xcassets/AppIcon.appiconset/` | Generated via Xcode |
 
 ---
 

@@ -27,12 +27,12 @@
 #   1  at least one mask REJECTed by nDPI  (build-failing condition)
 #   2  toolchain absent AND MASK_GATE_REQUIRE=1  (enforced-but-unbuildable)
 #
-# Usage: scripts/ci-mask-gate.sh [mask_dir]   (default: assets/masks)
+# Usage: deploy/ci/ci-mask-gate.sh [mask_dir]   (default: assets/masks)
 set -euo pipefail
 
 # ── Resolve repo-root-relative paths (independent of caller CWD) ──────────────
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO="$(cd "$HERE/.." && pwd)"
+REPO="$(cd "$HERE/../.." && pwd)"
 EVAL_DIR="$REPO/research/mask-generation/eval-gate"
 EVAL_GATE="$EVAL_DIR/eval_gate.sh"
 MASKPCAP="$EVAL_DIR/target/release/maskpcap"

@@ -34,6 +34,7 @@ endif
 REMOTE ?= /opt/aivpn
 
 .PHONY: help setup check test clippy fmt mask-gate hygiene-gate selfcontained swift-parse \
+        linux \
         server server-tiny client server-docker \
         server-arm64 client-arm64 \
         server-musl-armv7 server-musl-mipsel server-musl-aarch64 server-musl-aarch64-full \
@@ -55,6 +56,7 @@ help:
 	@printf "    %-40s %s\n" "make setup"               "Install dev tools, run clippy + tests"
 	@printf "    %-40s %s\n" "make check"               "cargo check (fast)"
 	@printf "    %-40s %s\n" "make test"                "cargo test --workspace"
+	@printf "    %-40s %s\n" "make test-docker"         "End-to-end server+client stack in Docker"
 	@printf "    %-40s %s\n" "make clippy"              "cargo clippy --all-targets"
 	@printf "    %-40s %s\n" "make fmt"                 "cargo fmt --all"
 	@printf "    %-40s %s\n" "make mask-gate"           "nDPI-gate every assets/masks/*.json (R2 Phase A)"
@@ -78,6 +80,7 @@ help:
 	@printf "    %-40s %s\n" "make client-musl-aarch64" "musl static aarch64"
 	@printf "\n  Platform\n"
 	@printf "    %-40s %s\n" "make windows"             "Windows GUI + zip  (cross from Linux)"
+	@printf "    %-40s %s\n" "make windows-docker"      "Windows client .exe via Docker (no local mingw)"
 	@printf "    %-40s %s\n" "make ios [TEAM_ID=XX]"    "iOS IPA            (macOS + Xcode only)"
 	@printf "    %-40s %s\n" "make macos"               "macOS .app + .pkg + .dmg (macOS only)"
 	@printf "    %-40s %s\n" "make linux-appimage"      "Linux AppImage"
@@ -97,6 +100,7 @@ help:
 	@printf "    %-40s %s\n" "make web-dev"             "Start aivpn-web dev servers (Hono + SvelteKit)"
 	@printf "\n  Deploy\n"
 	@printf "    %-40s %s\n" "make deploy"              "Deploy server to VPS via Docker"
+	@printf "    %-40s %s\n" "make server-deploy HOST=x" "Upload a built server binary to HOST over SSH"
 	@printf "\n  Clean\n"
 	@printf "    %-40s %s\n" "make clean"               "cargo clean + kernel module objects"
 	@printf "    %-40s %s\n" "make clean-releases"      "Remove releases/"
@@ -135,7 +139,7 @@ fmt:
 # (nDPI + maskpcap under the gitignored research/ tree) is not built, so devs
 # without it are not blocked. See docs/R2_PHASE_A.md.
 mask-gate:
-	scripts/ci-mask-gate.sh
+	deploy/ci/ci-mask-gate.sh
 
 # The public tree carries a seam for pluggable datagram transports. The seam
 # itself is unremarkable; what must not leak is vocabulary naming a specific
@@ -143,13 +147,13 @@ mask-gate:
 # comment, a debug log, a translation — so this is a build gate, not a review
 # item.
 hygiene-gate:
-	scripts/ci-public-hygiene.sh
+	deploy/ci/ci-public-hygiene.sh
 
 # Cargo resolves every declared dependency, including switched-off optional
 # ones, so a path dependency reaching outside this repository breaks the build
 # for anyone who merely cloned it — while working fine for whoever added it.
 selfcontained:
-	scripts/ci-selfcontained.sh
+	deploy/ci/ci-selfcontained.sh
 
 # Syntax gate for the Apple sources. They can only be BUILT on macOS, so edits
 # to platforms/ios and platforms/macos otherwise go in unverified until the
@@ -157,7 +161,7 @@ selfcontained:
 # Linux and catches truncated/malformed edits (not type errors). Gracefully
 # SKIPS when no Swift toolchain is installed. See docs in the script.
 swift-parse:
-	scripts/ci-swift-parse.sh
+	deploy/ci/ci-swift-parse.sh
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Server / Client — Linux x86_64
@@ -516,7 +520,6 @@ linux-appimage:
 	    > "$$APPDIR/usr/share/applications/aivpn.desktop"; \
 	cp "$$APPDIR/usr/share/applications/aivpn.desktop" "$$APPDIR/"; \
 	ICON=assets/brand/icon-1024.png; \
-	[ -f "$$ICON" ] || ICON=crates/aivpn-linux/assets/icon.png; \
 	if [ -f "$$ICON" ]; then \
 	    cp "$$ICON" "$$APPDIR/usr/share/icons/hicolor/256x256/apps/aivpn.png"; \
 	    cp "$$ICON" "$$APPDIR/aivpn.png"; \

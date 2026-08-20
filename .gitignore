@@ -119,3 +119,10 @@ platforms/linux-kernel/Module.symvers
 platforms/linux-kernel/modules.order
 # Stray busybox binary occasionally dropped by stand tooling
 /busybox
+
+# Dependency trees — regenerable, must never be committed
+node_modules/
+# Python virtualenvs used by the research tooling
+vngvenv/
+venv/
+.venv/

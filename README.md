@@ -41,7 +41,14 @@ platforms/android/       — Android Kotlin app (MVVM: MainViewModel + RecyclerV
 platforms/ios/           — iOS SwiftUI app + NetworkExtension PacketTunnelProvider
 platforms/macos/         — macOS SwiftUI menu bar app + privileged helper daemon
 platforms/aivpn-web/     — Web management panel (Hono 4 + SvelteKit 2, SQLite/PostgreSQL)
-mask-assets/             — bundled traffic mimicry JSON profiles
+platforms/linux/         — Linux desktop packaging (AppImage, .desktop)
+platforms/linux-kernel/  — optional in-kernel data-path module (out-of-tree)
+platforms/openwrt/       — OpenWrt package
+platforms/mikrotik/      — MikroTik RouterOS container
+assets/masks/            — bundled traffic mimicry JSON profiles
+assets/brand/            — icons and brand material
+deploy/                  — server installer, systemd unit, Dockerfiles
+deploy/ci/               — CI gates run by the Makefile (see `make help`)
 ```
 
 ### Key modules
@@ -944,7 +951,8 @@ aivpn/
 ├── platforms/ios/             # iOS SwiftUI app + NEPacketTunnelProvider
 ├── crates/aivpn-windows/      # Windows egui GUI
 ├── platforms/macos/           # macOS SwiftUI menu bar app
-├── mask-assets/           # Bundled traffic mimicry profiles (JSON)
+├── assets/masks/          # Bundled traffic mimicry profiles (JSON)
+├── deploy/ci/             # CI gates invoked from the Makefile
 ├── deploy/docker/             # Dockerfiles and entrypoint
 ├── Dockerfile
 ├── docker-compose.yml
