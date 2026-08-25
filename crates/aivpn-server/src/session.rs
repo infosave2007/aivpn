@@ -618,7 +618,14 @@ impl Session {
 
         let history_window = TAG_WINDOW_SIZE as u64 - 1;
         let window_start = self.counter.saturating_sub(history_window);
-        let window_end = self.counter.saturating_add(TAG_WINDOW_SIZE as u64 - 1);
+        let window_end = self.counter.saturating_add(
+            TAG_WINDOW_SIZE as u64 - 1
+                + if self.pending_rekey_keypair.is_some() {
+                    REKEY_TAG_LOOKAHEAD
+                } else {
+                    0
+                },
+        );
 
         // Check initial keys — current time window (pre-computed)
         for (counter, expected) in &self.expected_tags {
@@ -629,10 +636,24 @@ impl Session {
                 return Some((*counter, false));
             }
         }
-        // Check adjacent time windows (±1) on-the-fly for clock skew
+        // Check the live time window and its neighbours on-the-fly for clock
+        // skew. Normally the live window is already in `expected_tags`, but a
+        // tag can arrive just after the clock crosses a window boundary and
+        // before the precomputed map is refreshed. Skipping the live window
+        // unconditionally created a short validation blackout at every
+        // boundary. During a pending rekey the wider forward span is required
+        // here too: a re-sent response can be both far ahead of the frozen
+        // counter and in a different time window from the cached map.
         let current_tw =
             crypto::compute_time_window(crypto::current_timestamp_ms(), DEFAULT_WINDOW_MS);
-        for tw_offset in [current_tw.wrapping_sub(1), current_tw.wrapping_add(1)] {
+        for tw_offset in [
+            current_tw,
+            current_tw.wrapping_sub(1),
+            current_tw.wrapping_add(1),
+        ] {
+            if tw_offset == self.tag_window_tw {
+                continue;
+            }
             for counter_val in window_start..=window_end {
                 let expected =
                     crypto::generate_resonance_tag(&self.keys.tag_secret, counter_val, tw_offset);
@@ -2876,9 +2897,21 @@ mod tests {
         // server's frozen edge, far outside the plain ±TAG_WINDOW_SIZE band.
         let (response_counter, response_tag) = {
             let entry = sm.sessions.get(&sid).unwrap();
-            let s = entry.value().lock();
+            let mut s = entry.value().lock();
             let counter = s.counter + 1001;
             let tw = crypto::compute_time_window(crypto::current_timestamp_ms(), DEFAULT_WINDOW_MS);
+
+            // Deterministically simulate crossing a time-window boundary
+            // before the precomputed tag map is refreshed. This also guards
+            // the pending-rekey lookahead in the on-the-fly live-window path.
+            let stale_tw = tw.wrapping_sub(1);
+            let tag_secret = s.keys.tag_secret;
+            for (cached_counter, cached_tag) in &mut s.expected_tags {
+                *cached_tag =
+                    crypto::generate_resonance_tag(&tag_secret, *cached_counter, stale_tw);
+            }
+            s.tag_window_tw = stale_tw;
+
             let tag = crypto::generate_resonance_tag(&s.keys.tag_secret, counter, tw);
             (counter, tag)
         };
