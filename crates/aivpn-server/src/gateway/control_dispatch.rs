@@ -1338,6 +1338,18 @@ impl super::Gateway {
                     );
                     self.session_manager
                         .commit_session_rekey(&session_id, &new_eph_pub);
+                    // Send an immediate packet under the newly committed S2C
+                    // keys. Clients stage their C2S switch until a new-key
+                    // downlink proves commit; without this acknowledgement an
+                    // idle client may not receive any downlink before its next
+                    // keepalive, leaving both sides waiting on each other.
+                    let commit_ack = ControlPayload::ControlAck {
+                        ack_seq: 0,
+                        ack_for_subtype: aivpn_common::protocol::ControlSubtype::KeyRotate as u8,
+                    };
+                    if let Err(e) = self.send_control_message(&commit_ack, session).await {
+                        debug!("Inline rekey commit acknowledgement send failed: {}", e);
+                    }
                     // refresh_session_tags is redundant — commit_session_rekey already updates tag_map
                 } else {
                     debug!(

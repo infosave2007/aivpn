@@ -2037,6 +2037,24 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
 
             // ── RX silence detector (proper interval, not recreated each iteration) ──
             _ = rx_check.tick() => {
+                // The receive branch performs this same transition cleanup
+                // before decoding a datagram, but it cannot run when the
+                // commit-confirming downlink itself was lost. Promote staged
+                // upload keys from the independent watchdog clock as well so
+                // an idle mobile tunnel cannot remain on old TX keys until the
+                // 120-second RX-silence reconnect.
+                if transition_recv_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                    transition_recv_keys = None;
+                    transition_recv_deadline = None;
+                    transition_grace_hard = None;
+                    transition_recv_win.reset();
+                    if let Some(staged) = pending_upload_keys.take() {
+                        *key_rotate_slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(staged);
+                        log::info!(
+                            "aivpn: rekey transition timer closed — promoting staged upload keys"
+                        );
+                    }
+                }
                 // Post-freeze/suspend liveness probe (see WAKE_GAP_THRESHOLD):
                 // a tick gap ≫ RX_CHECK_INTERVAL means the process was frozen
                 // (OEM freezer) or the device suspended. Arm a probe: unless

@@ -106,6 +106,17 @@ pub const REKEY_RETRANSMIT_SECS: u64 = 3;
 /// to cap the per-refresh tag precompute and `tag_map` memory.
 const REKEY_TAG_LOOKAHEAD: u64 = 4096;
 
+/// Minimum lifetime of the old client-to-server keys after an inline rekey.
+///
+/// Mobile and desktop clients deliberately keep transmitting with the old
+/// keys until a packet under the new server-to-client keys proves that the
+/// server committed their response. Their transition window is 20 seconds;
+/// expiring the server's old-key grace after the generic 2-second in-flight
+/// floor can therefore reject the client's next idle keepalive (normally 4–8
+/// seconds later), preventing the very confirmation packet that would finish
+/// the transition. Keep this aligned with the clients' transition grace.
+const INLINE_REKEY_GRACE_MIN: Duration = Duration::from_secs(20);
+
 /// Session state
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionState {
@@ -618,7 +629,14 @@ impl Session {
 
         let history_window = TAG_WINDOW_SIZE as u64 - 1;
         let window_start = self.counter.saturating_sub(history_window);
-        let window_end = self.counter.saturating_add(TAG_WINDOW_SIZE as u64 - 1);
+        let window_end = self.counter.saturating_add(
+            TAG_WINDOW_SIZE as u64 - 1
+                + if self.pending_rekey_keypair.is_some() {
+                    REKEY_TAG_LOOKAHEAD
+                } else {
+                    0
+                },
+        );
 
         // Check initial keys — current time window (pre-computed)
         for (counter, expected) in &self.expected_tags {
@@ -629,10 +647,24 @@ impl Session {
                 return Some((*counter, false));
             }
         }
-        // Check adjacent time windows (±1) on-the-fly for clock skew
+        // Check the live time window and its neighbours on-the-fly for clock
+        // skew. Normally the live window is already in `expected_tags`, but a
+        // tag can arrive just after the clock crosses a window boundary and
+        // before the precomputed map is refreshed. Skipping the live window
+        // unconditionally created a short validation blackout at every
+        // boundary. During a pending rekey the wider forward span is required
+        // here too: a re-sent response can be both far ahead of the frozen
+        // counter and in a different time window from the cached map.
         let current_tw =
             crypto::compute_time_window(crypto::current_timestamp_ms(), DEFAULT_WINDOW_MS);
-        for tw_offset in [current_tw.wrapping_sub(1), current_tw.wrapping_add(1)] {
+        for tw_offset in [
+            current_tw,
+            current_tw.wrapping_sub(1),
+            current_tw.wrapping_add(1),
+        ] {
+            if tw_offset == self.tag_window_tw {
+                continue;
+            }
             for counter_val in window_start..=window_end {
                 let expected =
                     crypto::generate_resonance_tag(&self.keys.tag_secret, counter_val, tw_offset);
@@ -822,6 +854,13 @@ impl Session {
         }
         let scaled = Duration::from_millis(self.client_srtt_ms as u64 * 4);
         scaled.clamp(FLOOR, CAP)
+    }
+
+    /// Old-key grace for an inline rekey. Unlike the initial ratchet, the
+    /// client intentionally keeps TX on the previous keys until a new-key
+    /// downlink confirms commit, so the grace must cover that protocol window.
+    pub fn inline_rekey_grace(&self) -> Duration {
+        self.rekey_grace().max(INLINE_REKEY_GRACE_MIN)
     }
 
     /// Complete PFS ratchet: switch to ratcheted keys, zeroize old ones
@@ -2302,7 +2341,7 @@ impl SessionManager {
         }
 
         // Preserve old keys for an RTT-scaled grace window (in-flight packets from client).
-        let grace = sess.rekey_grace();
+        let grace = sess.inline_rekey_grace();
         sess.pre_ratchet_tags = std::mem::take(&mut sess.expected_tags);
         sess.pre_ratchet_expire = Some(Instant::now() + grace);
         sess.pre_ratchet_received.clear();
@@ -2406,6 +2445,22 @@ mod tests {
         let mut s = make_session();
         s.observe_client_rtt(20_000); // 4×20s = 80s, capped to 30s
         assert_eq!(s.rekey_grace(), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn inline_rekey_grace_covers_client_commit_transition() {
+        let mut s = Session::new(
+            [0u8; 16],
+            "127.0.0.1:1".parse().unwrap(),
+            make_keys(1),
+            [0u8; 32],
+        );
+        s.client_srtt_ms = 100;
+        assert_eq!(s.rekey_grace(), Duration::from_secs(2));
+        assert_eq!(s.inline_rekey_grace(), Duration::from_secs(20));
+
+        s.client_srtt_ms = 10_000;
+        assert_eq!(s.inline_rekey_grace(), Duration::from_secs(30));
     }
 
     #[test]
@@ -2876,9 +2931,21 @@ mod tests {
         // server's frozen edge, far outside the plain ±TAG_WINDOW_SIZE band.
         let (response_counter, response_tag) = {
             let entry = sm.sessions.get(&sid).unwrap();
-            let s = entry.value().lock();
+            let mut s = entry.value().lock();
             let counter = s.counter + 1001;
             let tw = crypto::compute_time_window(crypto::current_timestamp_ms(), DEFAULT_WINDOW_MS);
+
+            // Deterministically simulate crossing a time-window boundary
+            // before the precomputed tag map is refreshed. This also guards
+            // the pending-rekey lookahead in the on-the-fly live-window path.
+            let stale_tw = tw.wrapping_sub(1);
+            let tag_secret = s.keys.tag_secret;
+            for (cached_counter, cached_tag) in &mut s.expected_tags {
+                *cached_tag =
+                    crypto::generate_resonance_tag(&tag_secret, *cached_counter, stale_tw);
+            }
+            s.tag_window_tw = stale_tw;
+
             let tag = crypto::generate_resonance_tag(&s.keys.tag_secret, counter, tw);
             (counter, tag)
         };
