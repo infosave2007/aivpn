@@ -174,13 +174,12 @@ fn current_timestamp_ms() -> u64 {
 fn write_status(status: &RecordingLocalStatus) {
     if let Ok(json) = serde_json::to_vec(status) {
         for path in recording_status_paths() {
-            if std::fs::write(&path, &json).is_ok() {
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
-                }
-            }
+            // Atomic temp+rename (not plain std::fs::write, which
+            // open+truncate+writes in place) so a CLI `record status` poll
+            // landing mid-write never sees a 0-byte/partial file — and
+            // O_NOFOLLOW/create_new-hardened, since this can fall back to a
+            // predictable world-writable /tmp path (see secure_write.rs).
+            crate::secure_write::write_status_best_effort(&path, &json);
         }
     }
 }
@@ -333,6 +332,110 @@ pub fn handle_recording_complete(service: &str, mask_id: &str, confidence: f32) 
     println!("   Broadcasting to all clients...");
 }
 
+/// P2.3-desktop: parsed form of an admin-socket command, once the
+/// `"{token}:"` prefix has already been verified and stripped (see
+/// [`tokens_match`]). Extends the pre-existing `record_*` commands with a
+/// generic in-tunnel management bridge (`Mgmt`), the cached role
+/// (`Role`), and QR PNG generation (`Qr`) — all reachable by the desktop
+/// GUIs (Windows egui / Linux iced) via `aivpn-client` subcommands, since
+/// those GUIs shell out to the binary rather than embedding the crate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AdminCommand {
+    RecordStart(String),
+    RecordStop,
+    RecordStatus,
+    /// Report `AivpnClient::cached_role()`.
+    Role,
+    /// Generate a QR PNG for the given (UTF-8) text.
+    Qr(String),
+    /// Issue `AivpnClient::mgmt_call(method, path, body)`. `method`: 0=GET,
+    /// 1=POST, 2=PATCH, 3=DELETE, 4=PUT (mirrors `ControlPayload::MgmtRequest`).
+    Mgmt {
+        method: u8,
+        path: String,
+        body: Vec<u8>,
+    },
+}
+
+/// Decode a base64 (standard alphabet, padded) blob. Used for both the
+/// `mgmt:` body field and the `qr:` text field — chosen (over URL-safe) to
+/// match the majority of existing base64 use in this crate's `main.rs`.
+pub fn decode_body_b64(b64: &str) -> std::result::Result<Vec<u8>, base64::DecodeError> {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD.decode(b64)
+}
+
+/// Encode bytes as base64 (standard alphabet, padded). Inverse of
+/// [`decode_body_b64`].
+pub fn encode_body_b64(bytes: &[u8]) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
+/// Parse the command portion of an admin-socket datagram — i.e. everything
+/// after the already-verified `"{token}:"` prefix. Grammar:
+///
+/// - `"record_start:{service}"`, `"record_stop"`, `"record_status"` — pre-existing.
+/// - `"role"` — report the cached server-assigned role.
+/// - `"qr:{base64(text)}"` — generate a QR PNG for `text`.
+/// - `"mgmt:{method}:{path}:{base64(body)}"` — in-tunnel management call;
+///   `method` is the decimal `u8` (0=GET,1=POST,2=PATCH,3=DELETE,4=PUT),
+///   `path` is the REST-shaped API path, `body` is base64 (may be empty).
+///
+/// Returns `None` on any malformed input (unknown command, non-numeric
+/// method, invalid base64, etc.) — callers should treat that identically to
+/// a rejected token, i.e. drop the datagram.
+pub fn parse_admin_command(rest: &str) -> Option<AdminCommand> {
+    if let Some(service) = rest.strip_prefix("record_start:") {
+        return Some(AdminCommand::RecordStart(service.to_string()));
+    }
+    if rest == "record_stop" {
+        return Some(AdminCommand::RecordStop);
+    }
+    if rest == "record_status" {
+        return Some(AdminCommand::RecordStatus);
+    }
+    if rest == "role" {
+        return Some(AdminCommand::Role);
+    }
+    if let Some(b64) = rest.strip_prefix("qr:") {
+        let bytes = decode_body_b64(b64).ok()?;
+        let text = String::from_utf8(bytes).ok()?;
+        return Some(AdminCommand::Qr(text));
+    }
+    if let Some(mgmt_rest) = rest.strip_prefix("mgmt:") {
+        let mut parts = mgmt_rest.splitn(3, ':');
+        let method: u8 = parts.next()?.parse().ok()?;
+        let path = parts.next()?.to_string();
+        if path.is_empty() {
+            return None;
+        }
+        let body_b64 = parts.next().unwrap_or("");
+        let body = if body_b64.is_empty() {
+            Vec::new()
+        } else {
+            decode_body_b64(body_b64).ok()?
+        };
+        return Some(AdminCommand::Mgmt { method, path, body });
+    }
+    None
+}
+
+/// Format the reply sent back on the admin socket for a `Mgmt` command:
+/// `"{status}:{base64(body)}"`.
+pub fn format_mgmt_reply(status: u16, body: &[u8]) -> String {
+    format!("{}:{}", status, encode_body_b64(body))
+}
+
+/// Inverse of [`format_mgmt_reply`] — used by the CLI side to decode the
+/// daemon's reply.
+pub fn parse_mgmt_reply(reply: &str) -> Option<(u16, Vec<u8>)> {
+    let (status_str, body_b64) = reply.split_once(':')?;
+    let status: u16 = status_str.parse().ok()?;
+    let body = decode_body_b64(body_b64).ok()?;
+    Some((status, body))
+}
+
 /// Display recording failure
 pub fn handle_recording_failed(reason: &str) {
     info!("❌ Recording failed: {}", reason);
@@ -358,4 +461,256 @@ pub fn handle_recording_failed(reason: &str) {
     println!("   - Use the service for at least 1 minute");
     println!("   - Ensure active traffic (not idle)");
     println!("   - Need at least 500 packets captured");
+}
+
+#[cfg(test)]
+mod admin_command_tests {
+    use super::*;
+
+    #[test]
+    fn tokens_match_rejects_bad_token() {
+        assert!(!tokens_match("wrong-token", "correct-token-abcdef"));
+        assert!(tokens_match("same-token-1234", "same-token-1234"));
+    }
+
+    #[test]
+    fn parses_record_commands_unchanged() {
+        assert_eq!(
+            parse_admin_command("record_start:netflix"),
+            Some(AdminCommand::RecordStart("netflix".to_string()))
+        );
+        assert_eq!(
+            parse_admin_command("record_stop"),
+            Some(AdminCommand::RecordStop)
+        );
+        assert_eq!(
+            parse_admin_command("record_status"),
+            Some(AdminCommand::RecordStatus)
+        );
+    }
+
+    #[test]
+    fn parses_role_command() {
+        assert_eq!(parse_admin_command("role"), Some(AdminCommand::Role));
+    }
+
+    #[test]
+    fn parses_qr_command_roundtrip() {
+        let b64 = encode_body_b64(b"aivpn://connect-payload");
+        let cmd = parse_admin_command(&format!("qr:{b64}"));
+        assert_eq!(
+            cmd,
+            Some(AdminCommand::Qr("aivpn://connect-payload".to_string()))
+        );
+    }
+
+    #[test]
+    fn qr_command_rejects_invalid_base64() {
+        assert_eq!(parse_admin_command("qr:not-valid-b64!!"), None);
+    }
+
+    #[test]
+    fn parses_mgmt_command_with_body() {
+        let body = br#"{"k":"v"}"#;
+        let b64 = encode_body_b64(body);
+        let line = format!("mgmt:1:/api/v1/clients:{b64}");
+        let parsed = parse_admin_command(&line);
+        assert_eq!(
+            parsed,
+            Some(AdminCommand::Mgmt {
+                method: 1,
+                path: "/api/v1/clients".to_string(),
+                body: body.to_vec(),
+            })
+        );
+    }
+
+    #[test]
+    fn parses_mgmt_command_with_empty_body() {
+        let line = "mgmt:0:/api/v1/clients:";
+        assert_eq!(
+            parse_admin_command(line),
+            Some(AdminCommand::Mgmt {
+                method: 0,
+                path: "/api/v1/clients".to_string(),
+                body: Vec::new(),
+            })
+        );
+    }
+
+    #[test]
+    fn mgmt_command_rejects_non_numeric_method() {
+        assert_eq!(parse_admin_command("mgmt:GET:/api/v1/clients:"), None);
+    }
+
+    #[test]
+    fn mgmt_command_rejects_missing_method_or_path() {
+        assert_eq!(parse_admin_command("mgmt:1"), None);
+        assert_eq!(parse_admin_command("mgmt:"), None);
+        assert_eq!(parse_admin_command("mgmt:1:"), None);
+    }
+
+    /// A missing trailing `:{base64(body)}` field (as opposed to an empty
+    /// one, `"...:path:"`) is treated the same as an explicit empty body —
+    /// lenient parsing, not a malformed command — since the method and path
+    /// (the two fields that actually select the request) are both present.
+    #[test]
+    fn mgmt_command_tolerates_missing_body_field_as_empty() {
+        assert_eq!(
+            parse_admin_command("mgmt:1:/api/v1/clients"),
+            Some(AdminCommand::Mgmt {
+                method: 1,
+                path: "/api/v1/clients".to_string(),
+                body: Vec::new(),
+            })
+        );
+    }
+
+    #[test]
+    fn unknown_command_returns_none() {
+        assert_eq!(parse_admin_command("frobnicate"), None);
+        assert_eq!(parse_admin_command(""), None);
+    }
+
+    #[test]
+    fn mgmt_reply_roundtrips() {
+        let body = b"{\"clients\":[]}";
+        let reply = format_mgmt_reply(200, body);
+        assert_eq!(reply, format!("200:{}", encode_body_b64(body)));
+        let (status, decoded) = parse_mgmt_reply(&reply).expect("reply must parse");
+        assert_eq!(status, 200);
+        assert_eq!(decoded, body);
+    }
+
+    #[test]
+    fn mgmt_reply_roundtrips_empty_body() {
+        let reply = format_mgmt_reply(204, &[]);
+        let (status, decoded) = parse_mgmt_reply(&reply).expect("reply must parse");
+        assert_eq!(status, 204);
+        assert!(decoded.is_empty());
+    }
+
+    #[test]
+    fn mgmt_reply_parse_rejects_malformed_input() {
+        assert_eq!(parse_mgmt_reply("not-a-reply"), None);
+        assert_eq!(parse_mgmt_reply("abc:AAAA"), None);
+    }
+
+    /// End-to-end: the token-check step (as done by the admin task in
+    /// `client.rs`) followed by command parsing, exercised together the way
+    /// a real datagram is processed.
+    #[test]
+    fn full_datagram_pipeline_token_then_parse() {
+        let token = "abcdefghijklmnopqrstuvwxyzABCDEF";
+        let raw = format!(
+            "{token}:mgmt:2:/api/v1/clients/1:{}",
+            encode_body_b64(b"{}")
+        );
+        let (tok, rest) = raw.split_once(':').expect("datagram has a token prefix");
+        assert!(tokens_match(tok, token));
+        assert_eq!(
+            parse_admin_command(rest),
+            Some(AdminCommand::Mgmt {
+                method: 2,
+                path: "/api/v1/clients/1".to_string(),
+                body: b"{}".to_vec(),
+            })
+        );
+
+        let bad_raw = format!("wrong-token:mgmt:2:/api/v1/clients/1:");
+        let (tok2, _rest2) = bad_raw
+            .split_once(':')
+            .expect("datagram has a token prefix");
+        assert!(!tokens_match(tok2, token));
+    }
+
+    /// Loopback test of the request/reply framing the admin task in
+    /// `client.rs` uses, over a real UDP socket, with a stub standing in
+    /// for `AivpnClient::mgmt_call` (whose own correlation/timeout behavior
+    /// is covered directly by `client.rs`'s `mgmt_call_*` tests — this test
+    /// is about the wire framing, not the mgmt correlation logic).
+    #[tokio::test]
+    async fn admin_socket_mgmt_roundtrip_with_stub_callback() {
+        let token = "loopback-test-token-0123456789ab";
+        let server = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind server socket");
+        let server_addr = server.local_addr().expect("server local_addr");
+
+        let server_task = tokio::spawn(async move {
+            let mut buf = [0u8; 4096];
+            let (len, peer) = server.recv_from(&mut buf).await.expect("recv request");
+            let raw = std::str::from_utf8(&buf[..len]).expect("utf8 request");
+            let (tok, rest) = raw.split_once(':').expect("token prefix");
+            assert!(tokens_match(tok, token), "token must match");
+            let cmd = parse_admin_command(rest).expect("command must parse");
+            let AdminCommand::Mgmt { method, path, body } = cmd else {
+                panic!("expected an AdminCommand::Mgmt, got {cmd:?}");
+            };
+            assert_eq!(method, 1);
+            assert_eq!(path, "/api/v1/clients");
+            assert_eq!(body, b"{}");
+
+            // Stub standing in for `mgmt.mgmt_call(...).await` in client.rs.
+            let reply = format_mgmt_reply(200, b"[]");
+            server
+                .send_to(reply.as_bytes(), peer)
+                .await
+                .expect("send reply");
+        });
+
+        let client = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind client socket");
+        let line = format!("{token}:mgmt:1:/api/v1/clients:{}", encode_body_b64(b"{}"));
+        client
+            .send_to(line.as_bytes(), server_addr)
+            .await
+            .expect("send request");
+
+        let mut buf = [0u8; 4096];
+        let (len, _) = client.recv_from(&mut buf).await.expect("recv reply");
+        let reply = std::str::from_utf8(&buf[..len]).expect("utf8 reply");
+        let (status, body) = parse_mgmt_reply(reply).expect("reply must parse");
+        assert_eq!(status, 200);
+        assert_eq!(body, b"[]");
+
+        server_task.await.expect("server task must not panic");
+    }
+
+    /// Same idea, but for the token-rejection path: a bad token must never
+    /// reach `parse_admin_command` (mirrors the `None =>` arm in client.rs's
+    /// admin task, which drops the datagram before parsing).
+    #[tokio::test]
+    async fn admin_socket_rejects_bad_token_before_parsing() {
+        let real_token = "real-token-0123456789abcdefghij";
+        let server = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind server socket");
+        let server_addr = server.local_addr().expect("server local_addr");
+
+        let server_task = tokio::spawn(async move {
+            let mut buf = [0u8; 4096];
+            let (len, _peer) = server.recv_from(&mut buf).await.expect("recv request");
+            let raw = std::str::from_utf8(&buf[..len]).expect("utf8 request");
+            let (tok, _rest) = raw.split_once(':').expect("token prefix");
+            // Simulates the admin task's token check: a mismatched token
+            // never gets as far as `parse_admin_command`.
+            assert!(!tokens_match(tok, real_token));
+        });
+
+        let client = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind client socket");
+        let line = format!(
+            "wrong-token:mgmt:1:/api/v1/clients:{}",
+            encode_body_b64(b"{}")
+        );
+        client
+            .send_to(line.as_bytes(), server_addr)
+            .await
+            .expect("send request");
+
+        server_task.await.expect("server task must not panic");
+    }
 }

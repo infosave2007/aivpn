@@ -4,7 +4,7 @@
 //! via `tc` (traffic control) and updates per-client rules via `bpftool map`.
 //!
 //! The eBPF TC egress hook marks DSCP on outbound packets and enforces
-//! per-client bandwidth limits using a BPF LRU_HASH map `qos_rules`.
+//! per-client bandwidth limits using a BPF LRU_HASH map `aivpn_qos_rules`.
 //! Falls back gracefully when `tc` or `bpftool` are unavailable.
 
 use std::path::{Path, PathBuf};
@@ -111,20 +111,33 @@ impl TcQosLoader {
         }
     }
 
-    /// Update or insert a per-client QoS rule in the BPF `qos_rules` map.
+    /// Update or insert a per-client QoS rule in the BPF `aivpn_qos_rules` map.
     ///
-    /// Value layout (17 bytes): `[rate_up_bps: u64 BE][rate_down_bps: u64 BE][dscp: u8]`
+    /// The value must match `struct qos_rule` in `deploy/ebpf/tc_qos_prog.c`
+    /// byte-for-byte (32 bytes, native endian):
+    ///   `[rate_bps: u64][tokens: u64][last_refill_ns: u64][dscp: u8][pad: 7]`
+    /// The bucket starts full (`tokens = rate_bps / 10`, matching the program's
+    /// 100 ms burst) and `last_refill_ns = 0` (the program caps elapsed time at
+    /// 1 s, so the first packet sees a full bucket).
     /// Map pinned at `/sys/fs/bpf/aivpn_qos_rules`.
     pub fn update_rule(&self, rule: &TcQosRule) -> bool {
         if !self.attached {
             return false;
         }
 
-        // Pack value: 8 + 8 + 1 = 17 bytes, hex-encoded for bpftool
-        let mut value = [0u8; 17];
-        value[0..8].copy_from_slice(&rule.rate_up_bps.to_be_bytes());
-        value[8..16].copy_from_slice(&rule.rate_down_bps.to_be_bytes());
-        value[16] = rule.dscp;
+        // The program runs on the TUN egress path (server -> client), so the
+        // enforced rate is the client's downstream limit.
+        let rate_bps = rule.rate_down_bps;
+        let burst = rate_bps / 10; // 100 ms burst, same as the BPF program
+
+        // Pack value: 8 + 8 + 8 + 1 + 7 = 32 bytes, native endian, hex-encoded
+        // for bpftool.
+        let mut value = [0u8; 32];
+        value[0..8].copy_from_slice(&rate_bps.to_ne_bytes());
+        value[8..16].copy_from_slice(&burst.to_ne_bytes());
+        value[16..24].copy_from_slice(&0u64.to_ne_bytes()); // last_refill_ns = 0
+        value[24] = rule.dscp;
+        // value[25..32] padding stays zeroed
 
         let key_hex = format!("{:08x}", rule.vpn_ip);
         let val_hex: String = value.iter().map(|b| format!("{:02x}", b)).collect();

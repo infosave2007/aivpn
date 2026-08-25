@@ -5,12 +5,10 @@ import {
   verifyAuthenticationResponse,
   type VerifiedRegistrationResponse,
   type VerifiedAuthenticationResponse,
+  type RegistrationResponseJSON,
+  type AuthenticationResponseJSON,
+  type AuthenticatorTransportFuture,
 } from '@simplewebauthn/server'
-import type {
-  RegistrationResponseJSON,
-  AuthenticationResponseJSON,
-  AuthenticatorTransportFuture,
-} from '@simplewebauthn/types'
 import { config, RP_ID, RP_NAME } from '../config'
 import { randomUUID } from 'node:crypto'
 
@@ -59,7 +57,13 @@ export async function getRegistrationOptions(
     })),
     authenticatorSelection: {
       residentKey: 'preferred',
-      userVerification: 'preferred',
+      // 'required': every NEWLY enrolled authenticator must perform user
+      // verification (PIN/biometric), not just user presence — this only
+      // affects future registrations (an incapable authenticator simply
+      // fails to enroll, with no impact on any existing account), so there is
+      // no retroactive lockout risk here, unlike the authentication side
+      // below.
+      userVerification: 'required',
     },
   })
 
@@ -79,7 +83,10 @@ export async function verifyRegistration(
     expectedChallenge,
     expectedOrigin: config.ORIGIN,
     expectedRPID: RP_ID,
-    requireUserVerification: false,
+    // Matches authenticatorSelection.userVerification: 'required' above —
+    // reject a registration whose authenticator didn't actually perform UV
+    // even if it claims to support it.
+    requireUserVerification: true,
   })
 
   if (!verification.verified || !verification.registrationInfo) {
@@ -101,6 +108,18 @@ export async function getAuthenticationOptions(
       id: pk.credential_id,
       transports: (pk.transports ?? []) as AuthenticatorTransportFuture[],
     })),
+    // Deliberately kept 'preferred' rather than 'required', unlike the
+    // registration side above. Existing passkeys were enrolled back when
+    // registration also allowed 'preferred', so some already-enrolled
+    // authenticators (e.g. a bare FIDO2 security key with no PIN set) may not
+    // be capable of user verification at all. 'required' here — for BOTH the
+    // ceremony request and requireUserVerification below — would make the
+    // browser's WebAuthn call fail outright for those credentials, and for
+    // `passkey_only` accounts (db/schema.ts users.passkey_only) that have no
+    // password fallback, that is a full account lockout, not just a
+    // downgrade. Revisit once there's a way to know/require UV capability at
+    // enrollment time for all existing accounts (e.g. a forced re-enrollment
+    // migration), or accept the lockout risk as a deliberate policy change.
     userVerification: 'preferred',
   })
 
@@ -158,6 +177,9 @@ export async function verifyAuthentication(
       counter: passkeyRecord.counter,
       transports: (passkeyRecord.transports ?? []) as AuthenticatorTransportFuture[],
     },
+    // Matches userVerification: 'preferred' in getAuthenticationOptions above
+    // — see the comment there for why this isn't 'required' (lockout risk for
+    // already-enrolled, possibly non-UV-capable authenticators).
     requireUserVerification: false,
   })
 

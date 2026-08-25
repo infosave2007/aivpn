@@ -41,7 +41,14 @@ platforms/android/       — Android Kotlin (MVVM: MainViewModel + RecyclerView)
 platforms/ios/           — iOS SwiftUI + NetworkExtension PacketTunnelProvider
 platforms/macos/         — macOS SwiftUI в строке меню + привилегированный демон
 platforms/aivpn-web/     — Веб-панель управления (Hono 4 + SvelteKit 2, SQLite/PostgreSQL)
-mask-assets/             — встроенные профили мимикрии (JSON)
+platforms/linux/         — упаковка для Linux (AppImage, .desktop)
+platforms/linux-kernel/  — необязательный модуль ядра для пути данных
+platforms/openwrt/       — пакет для OpenWrt
+platforms/mikrotik/      — контейнер для MikroTik RouterOS
+assets/masks/            — встроенные профили мимикрии (JSON)
+assets/brand/            — иконки и брендовые материалы
+deploy/                  — установщик сервера, systemd-юнит, Dockerfile
+deploy/ci/               — гейты CI, запускаемые из Makefile (см. `make help`)
 ```
 
 ### Ключевые модули
@@ -800,7 +807,8 @@ aivpn/
 ├── platforms/ios/             # iOS SwiftUI + NEPacketTunnelProvider
 ├── crates/aivpn-windows/      # Windows egui GUI
 ├── platforms/macos/           # macOS SwiftUI в строке меню
-├── mask-assets/           # Встроенные профили мимикрии (JSON)
+├── assets/masks/          # Встроенные профили мимикрии (JSON)
+├── deploy/ci/             # Гейты CI, вызываемые из Makefile
 ├── deploy/docker/             # Dockerfiles и точка входа
 ├── Dockerfile
 ├── docker-compose.yml

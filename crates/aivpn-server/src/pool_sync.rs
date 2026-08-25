@@ -130,6 +130,86 @@ pub struct PoolSyncConfig {
     /// rejected, preventing this node from being used as an open relay.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exit_node_enabled: Option<bool>,
+    /// FORK-B pool-sync dialer ([`crate::pool_dialer::PoolDialer`]):
+    /// interval, in seconds, between `PoolStateDigest` beacons sent over a
+    /// dialed masked pool-client session. `None` defaults to 30. Ignored
+    /// unless `transport` is `"masked"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sync_beacon_secs: Option<u64>,
+    /// FORK-B pool-sync transport selector: `"legacy"` (default, `None`) runs
+    /// the existing mask-independent push-only [`PeerSyncer`]; `"masked"`
+    /// activates [`crate::pool_dialer::PoolDialer`] instead — each node
+    /// dials its peers as a fully masked, headless pool-client and runs
+    /// bidirectional anti-entropy over that session. Additive: any value
+    /// other than exactly `"masked"` (including unset) reproduces the
+    /// pre-existing legacy behavior byte-for-byte.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport: Option<String>,
+    /// Phase 4 (per-node cryptographic identity): whether an UNKNOWN peer
+    /// `node_id` presenting a valid `NodeEnrollment` proof gets bound
+    /// (Trust-On-First-Use) automatically, or is rejected pending manual
+    /// operator approval (e.g. via a future admin/CLI pinning command).
+    /// `None` defaults to `true` — TOFU — so an existing masked pool
+    /// deployment upgraded to a build with `node_registry` wired in keeps
+    /// working without any operator action; set explicitly to `false` to
+    /// require manual pinning of every pool node's identity key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_auto_add: Option<bool>,
+    /// Path to this node's own 32-byte Ed25519 identity seed (see
+    /// `aivpn_common::crypto::node_identity_from_seed`), used by the masked
+    /// pool-client dialer to sign this node's own `NodeEnrollment` proof
+    /// when connecting to a peer. Consumed by the dialer, not by anything in
+    /// this file — wiring it into `PoolDialer` is a separate task.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_identity_key: Option<String>,
+    /// BUG D1 (route-auth identity enforcement): whether a masked pool-peer
+    /// session MUST have a crypto-verified `verified_node_id` (bound via a
+    /// validated `NodeEnrollment` proof) before its `RouteSync` announcements
+    /// are honored. `None`/`false` (default) keeps the pre-existing
+    /// migration-safe behavior — `handle_route_sync` is called with
+    /// `verified_node_id` when present and otherwise falls back to the
+    /// self-asserted node_id embedded in the payload (with a warn). Set to
+    /// `true` on a deployment that has fully rolled out per-node identity
+    /// (Phase 4 `NodeEnrollment`) to require every route-announcing peer to
+    /// have proven its identity — self-asserted-identity RouteSync is
+    /// dropped outright instead of being trusted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub require_node_enrollment: Option<bool>,
+    /// Wave B-IP: explicit override for this node's hard VPN-IP partition
+    /// index (see `ClientDatabase::set_node_partition_explicit`). When set,
+    /// replaces the default `hash(node_id) % num_partitions` derivation with
+    /// this exact index — lets an operator rule out even a hash collision
+    /// between two nodes' `node_id`s, or hand-balance partitions across a
+    /// pool larger than the default sizing targets. Any value is accepted
+    /// (it is taken modulo the resolved partition count), so a simple
+    /// per-node incrementing counter (0, 1, 2, …) is a safe choice without
+    /// needing to know the exact partition count. `None` (default) uses the
+    /// hash-derived index.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_ip_partition: Option<u32>,
+}
+
+impl PoolSyncConfig {
+    /// `true` only when `transport` is exactly `"masked"` — see the
+    /// `transport` field doc for the additive/gating rationale.
+    pub fn transport_is_masked(&self) -> bool {
+        self.transport.as_deref() == Some("masked")
+    }
+
+    /// Whether an unknown pool-node identity should be auto-bound
+    /// (Trust-On-First-Use) on first valid `NodeEnrollment` proof. Defaults
+    /// to `true` when unset — see the `allow_auto_add` field doc.
+    pub fn allow_auto_add(&self) -> bool {
+        self.allow_auto_add.unwrap_or(true)
+    }
+
+    /// Whether `RouteSync` from a masked pool-peer without a crypto-verified
+    /// `verified_node_id` must be dropped rather than trusted with a
+    /// self-asserted identity. Defaults to `false` when unset — see the
+    /// `require_node_enrollment` field doc.
+    pub fn require_node_enrollment(&self) -> bool {
+        self.require_node_enrollment.unwrap_or(false)
+    }
 }
 
 /// One configured pool peer with its directional key material.
@@ -187,6 +267,19 @@ pub struct PeerSyncer {
     /// send loops (which all share `send_counter`) can never race each
     /// other's writes into persisting a smaller value after a larger one.
     persisted_high_water: Mutex<u64>,
+    /// H3: advisory exclusive `flock` held on `<counter_state_path>.lock` for
+    /// the lifetime of this `PeerSyncer`. The persisted high-water mark alone
+    /// only protects against *sequential* restarts — it does nothing to stop
+    /// two overlapping processes (e.g. a crash-restart loop or an operator
+    /// launching a duplicate) from both reading the same on-disk counter,
+    /// then independently advancing `send_counter` from that same start
+    /// value and encrypting with the same static per-peer session key. That
+    /// is a real (key, nonce) reuse — catastrophic for ChaCha20-Poly1305.
+    /// Held here (never explicitly unlocked) so the OS releases it
+    /// automatically on process exit/crash; a second instance's attempt to
+    /// acquire it fails immediately and `new()` refuses to start pool sync
+    /// rather than risk nonce reuse.
+    _counter_lock_file: std::fs::File,
 }
 
 impl PeerSyncer {
@@ -263,10 +356,93 @@ impl PeerSyncer {
         // back to the current time bucket only when no persisted state
         // exists (first run) or it is stale/unreadable.
         let counter_state_path = db.file_path().with_file_name("pool_sync_counter.state");
+
+        // H3: acquire an advisory exclusive flock on a dedicated lock file
+        // BEFORE touching the counter state, and hold it for the process's
+        // lifetime. This is what actually prevents cross-process nonce
+        // reuse: the persisted high-water mark only protects sequential
+        // restarts, not two overlapping processes racing the same read-then-
+        // write. Fail closed — refuse to start pool sync — if the lock is
+        // already held.
+        let lock_path = counter_state_path.with_extension("state.lock");
+        let lock_file = match std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .open(&lock_path)
+        {
+            Ok(f) => f,
+            Err(e) => {
+                warn!(
+                    "pool_sync: failed to open counter lock file {} — pool sync disabled: {}",
+                    lock_path.display(),
+                    e
+                );
+                return None;
+            }
+        };
+        {
+            use std::os::unix::io::AsRawFd;
+            // SAFETY: `lock_file` is a valid, open file descriptor for the
+            // duration of this call; `flock` only inspects/mutates kernel
+            // lock state for that fd and does not touch Rust-owned memory.
+            let rc = unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+            if rc != 0 {
+                warn!(
+                    "pool_sync: another process already holds the counter lock at {} — \
+                     refusing to start a second overlapping pool-sync instance (would risk \
+                     AEAD nonce reuse under the static pool session key)",
+                    lock_path.display()
+                );
+                return None;
+            }
+        }
+
+        // Best-effort cleanup of orphaned temp files. `write_counter_file` names
+        // its temp `pool_sync_counter.<pid>.tmp`; a process that is killed
+        // mid-persist (e.g. the crash-restart loops this survives) leaves its
+        // temp behind, and since the name is per-PID nothing ever reclaimed
+        // them — they accumulated unboundedly (hundreds observed in the field).
+        // Sweep any stale `pool_sync_counter.*.tmp` at startup. Safe: this runs
+        // before this process writes its own temp, and a co-located second
+        // instance's in-flight temp is only ever consumed by an atomic rename,
+        // so at worst one best-effort persist retries.
+        if let Some(dir) = counter_state_path.parent() {
+            if let Ok(entries) = std::fs::read_dir(dir) {
+                for entry in entries.flatten() {
+                    let name = entry.file_name();
+                    let name = name.to_string_lossy();
+                    if name.starts_with("pool_sync_counter.") && name.ends_with(".tmp") {
+                        let _ = std::fs::remove_file(entry.path());
+                    }
+                }
+            }
+        }
+
         let wall_clock_bucket = crypto::current_timestamp_ms() / 5_000;
-        let resume_from = read_counter_file(&counter_state_path)
+        let mut resume_from = read_counter_file(&counter_state_path)
             .map(|c| c.saturating_add(1))
             .unwrap_or(0);
+        // A persisted floor leading the current bucket by more than one
+        // receiver tag window is the residue of a past clock jump (VM
+        // snapshot restore, NTP step, dead RTC): resuming there would land
+        // every tag outside the receiver's wall-clock-centred window — a
+        // permanent, silent desync.  Reseed at the current bucket instead
+        // (same repair as `site_sync::seed_send_counter`).  Nonce-uniqueness
+        // is preserved: values consumed during the wrong-clock interval are
+        // all above the current bucket, and pre-jump values are below the
+        // pre-jump bucket ≤ the current one — no (key, nonce) pair repeats.
+        if resume_from > wall_clock_bucket.saturating_add(crate::site_sync::COUNTER_MAX_FLOOR_LEAD)
+        {
+            warn!(
+                "pool_sync: persisted send counter {} leads the current time bucket {} by \
+                 more than {} counters (stale floor from a past clock jump?) — reseeding at \
+                 the wall-clock bucket",
+                resume_from,
+                wall_clock_bucket,
+                crate::site_sync::COUNTER_MAX_FLOOR_LEAD
+            );
+            resume_from = 0;
+        }
         let start_counter = resume_from.max(wall_clock_bucket);
 
         // Persist the seed immediately (before any packet is sent) so that
@@ -291,6 +467,7 @@ impl PeerSyncer {
             send_counter,
             counter_state_path,
             persisted_high_water,
+            _counter_lock_file: lock_file,
         }))
     }
 
@@ -373,10 +550,22 @@ impl PeerSyncer {
 
     async fn push_to_peer(&self, socket: &UdpSocket, link_idx: usize) -> Result<usize> {
         let link = &self.peer_links[link_idx];
-        let peer_addr: SocketAddr = link
-            .addr
-            .parse()
-            .map_err(|_| Error::Session(format!("pool_sync: invalid peer addr: {}", link.addr)))?;
+        // Fast path: a literal IP:port. Fall back to DNS resolution so a peer
+        // configured as `host:port` (which the docs explicitly recommend as the
+        // node_id form) actually pushes instead of failing to parse every tick.
+        let peer_addr: SocketAddr = match link.addr.parse() {
+            Ok(addr) => addr,
+            Err(_) => tokio::net::lookup_host(&link.addr)
+                .await
+                .ok()
+                .and_then(|mut addrs| addrs.next())
+                .ok_or_else(|| {
+                    Error::Session(format!(
+                        "pool_sync: cannot resolve peer addr: {}",
+                        link.addr
+                    ))
+                })?,
+        };
 
         // Include tombstones: revocations propagate as `deleted == true`
         // records, so a peer's stale live copy is overwritten via LWW merge.
@@ -560,6 +749,12 @@ mod tests {
             sync_key: Some(base64::engine::general_purpose::STANDARD.encode([7u8; 32])),
             exit_node: None,
             exit_node_enabled: None,
+            sync_beacon_secs: None,
+            transport: None,
+            allow_auto_add: None,
+            node_identity_key: None,
+            require_node_enrollment: None,
+            node_ip_partition: None,
         }
     }
 
@@ -601,6 +796,12 @@ mod tests {
         // "Process 2": a fresh PeerSyncer built right away, against the same
         // clients DB (and therefore the same counter-state file) — the
         // worst case for landing in the same wall-clock bucket as process 1.
+        // Drop process 1's syncer first to release its advisory counter-file
+        // flock (H3) — a real restart closes the old process's fd before the
+        // new one opens, which is exactly what this drop simulates; two
+        // genuinely *overlapping* instances are covered by
+        // `overlapping_instances_are_refused` below.
+        drop(syncer1);
         let syncer2 = PeerSyncer::new(db, &cfg, test_events()).unwrap();
         let resumed_counter = syncer2.send_counter.load(Ordering::Relaxed);
 
@@ -610,6 +811,28 @@ mod tests {
              the same static session key (last used = {last_used_counter}, resumed at \
              = {resumed_counter})"
         );
+    }
+
+    /// H3 regression: two `PeerSyncer`s that are genuinely overlapping (the
+    /// first is still alive, unlike the restart test above which drops it
+    /// first) must not both be able to run against the same counter-state
+    /// file — the second construction must fail closed rather than risk
+    /// reusing a (key, nonce) pair the first instance might already be using.
+    #[test]
+    fn overlapping_instances_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("clients.json");
+        let db = Arc::new(ClientDatabase::load(&db_path, test_network_config()).unwrap());
+        let cfg = test_pool_config();
+
+        let syncer1 = PeerSyncer::new(db.clone(), &cfg, test_events()).unwrap();
+        let syncer2 = PeerSyncer::new(db, &cfg, test_events());
+        assert!(
+            syncer2.is_none(),
+            "a second overlapping PeerSyncer instance must be refused, not silently \
+             allowed to race the first over the same counter state"
+        );
+        drop(syncer1);
     }
 
     /// Build a `PeerSyncer` named `node_id` whose single peer is `peer`,

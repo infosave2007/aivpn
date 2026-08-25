@@ -6,6 +6,13 @@ import android.content.SharedPreferences
 object PrefsKeys {
     const val ADAPTIVE_LEVEL = "adaptive_level"
     const val PREFS_NAME = "aivpn_prefs"
+    /**
+     * Prefix for the per-server VPN IP the server re-homed this client to (pool
+     * IP-collision resolution). Full key = this prefix + server address. When
+     * present it overrides the key-embedded IP so the rebuilt TUN uses the
+     * address the server's anti-spoof check actually expects.
+     */
+    const val PREF_VPN_IP_OVERRIDE = "vpn_ip_override_"
     /** Whether to auto-connect VPN on device boot. Stored via [BootPrefs] (device-protected). */
     const val PREF_AUTO_CONNECT = "auto_connect"
     /** Last active profile UUID, written on every explicit connect. Read by BootReceiver. */
@@ -51,6 +58,14 @@ object PrefsKeys {
     /** Most recently received RegionalMaskHints, JSON-encoded
      *  (`{"country_code":"US","masks":[["webrtc_zoom_v3",0.87],...]}`). */
     const val PREF_REGIONAL_HINTS_JSON = "regional_hints_json"
+
+    // Modular transport settings seam (TransportSettingsRegistry) — an opaque
+    // transport override produced by a registered provider's TransportChoice.
+    // Absent (both keys removed) = use the built-in default transport.
+    /** Short transport name understood by the native core, e.g. from a closed edition. */
+    const val PREF_EXT_TRANSPORT_NAME = "ext_transport_name"
+    /** JSON parameter object accompanying [PREF_EXT_TRANSPORT_NAME]. */
+    const val PREF_EXT_TRANSPORT_PARAMS = "ext_transport_params"
 }
 
 /**

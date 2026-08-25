@@ -23,6 +23,12 @@ pub struct TrafficStats {
     pub bytes_received: u64,
     pub quality_score: u8,
     pub server_adaptive_level: u8,
+    /// Session epoch (unix ms) stamped by the client's stats writer once per
+    /// session (`since:` key). Changes on a silent in-process reconnect, so a
+    /// reader can detect a session restart (counters reset together with the
+    /// timer). None when the file predates the field (old client binary) or
+    /// was a pre-session zero-write.
+    pub connected_since: Option<u64>,
 }
 
 /// Locate a binary named `name` either next to the currently-running
@@ -104,13 +110,20 @@ pub fn read_traffic_stats() -> TrafficStats {
         PathBuf::from("/tmp/traffic.stats"),
     ];
     let mut stats = TrafficStats::default();
-    for path in &candidates {
-        if let Some((_, content)) = read_trusted_stats_file(path) {
-            if let Some(s) = parse_traffic_stats(&content) {
-                stats.bytes_sent = s.bytes_sent;
-                stats.bytes_received = s.bytes_received;
-                break;
-            }
+    // Rank candidates by mtime (exactly like quality.json below): with a
+    // fixed first-parse-wins order, a stale file left at an earlier path by
+    // a previous run shadows the live one being updated at a later path.
+    let mut traffic_by_freshness: Vec<_> = candidates
+        .iter()
+        .filter_map(|p| read_trusted_stats_file(p))
+        .collect();
+    traffic_by_freshness.sort_by(|a, b| b.0.cmp(&a.0));
+    for (_, content) in traffic_by_freshness {
+        if let Some(s) = parse_traffic_stats(&content) {
+            stats.bytes_sent = s.bytes_sent;
+            stats.bytes_received = s.bytes_received;
+            stats.connected_since = s.connected_since;
+            break;
         }
     }
     // The client writes quality.json to /var/run/aivpn/ when it can (root /
@@ -144,17 +157,21 @@ pub fn read_traffic_stats() -> TrafficStats {
 fn parse_traffic_stats(content: &str) -> Option<TrafficStats> {
     let mut sent = None;
     let mut received = None;
+    let mut since = None;
     for part in content.split(',') {
         let part = part.trim();
         if let Some(v) = part.strip_prefix("sent:") {
             sent = v.trim().parse().ok();
         } else if let Some(v) = part.strip_prefix("received:") {
             received = v.trim().parse().ok();
+        } else if let Some(v) = part.strip_prefix("since:") {
+            since = v.trim().parse().ok();
         }
     }
     Some(TrafficStats {
         bytes_sent: sent?,
         bytes_received: received?,
+        connected_since: since,
         ..Default::default()
     })
 }
@@ -197,6 +214,157 @@ pub fn extract_server_addr(key: &str) -> Option<String> {
         .ok()?;
     let json: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
     json["s"].as_str().map(|s| s.to_string())
+}
+
+/// Parameters needed to build the `aivpn-client` child process command line,
+/// mirrored 1:1 out of `App::subscription`'s worker stream (moved here for
+/// parity with the Windows GUI, whose equivalent argv-building lives as a
+/// named function/method in this same module rather than inlined in the
+/// event loop — see `aivpn-windows/src/vpn_manager.rs::connect`).
+pub struct ClientLaunchParams {
+    pub full_tunnel: bool,
+    pub mtls_cert: Option<String>,
+    pub kill_switch: bool,
+    pub adaptive_level: u8,
+    pub dns_proxy: String,
+    pub exclude_routes: Vec<String>,
+    pub include_routes: Vec<String>,
+    pub socks5_enabled: bool,
+    pub socks5_addr: String,
+    pub preferred_mask: String,
+    pub polymorphic_mask: bool,
+    pub share_mask_feedback: bool,
+    pub receive_mask_hints: bool,
+    pub country_code: String,
+    pub bootstrap_cdn_url: String,
+    pub bootstrap_telegram_token: String,
+    pub bootstrap_telegram_chat: String,
+    pub bootstrap_github: String,
+    pub server_signing_key: String,
+}
+
+/// Build the `aivpn-client` launch command. Pure move of the inline
+/// construction previously done directly inside `App::subscription`'s
+/// worker stream closure — same flags, same env-vs-argv choices (the
+/// connection key and the bootstrap Telegram token go via env, never argv,
+/// since `/proc/<pid>/cmdline` is world-readable on Linux), same order.
+pub fn build_client_command(
+    binary: &std::path::Path,
+    key: &str,
+    params: &ClientLaunchParams,
+) -> tokio::process::Command {
+    let mut cmd = tokio::process::Command::new(binary);
+    // Ensure the VPN client is killed if this GUI process exits
+    // (e.g. Quit from the tray). Without this, dropping the Child
+    // on shutdown leaves aivpn-client orphaned with the tunnel up.
+    cmd.kill_on_drop(true);
+    // Pass the connection key (which embeds the PSK) via the
+    // environment, NOT argv: /proc/<pid>/cmdline is world-readable
+    // on Linux, so a CLI arg would expose the PSK to every local
+    // user. /proc/<pid>/environ is owner/root-only, and the client
+    // reads AIVPN_CONNECTION_KEY then immediately removes it from
+    // its own environment. Matches the Windows GUI.
+    cmd.env("AIVPN_CONNECTION_KEY", key);
+    if params.full_tunnel {
+        cmd.arg("--full-tunnel");
+    }
+    if let Some(ref cert) = params.mtls_cert {
+        if !cert.is_empty() {
+            cmd.args(["--mtls-cert", cert]);
+        }
+    }
+    if params.kill_switch {
+        cmd.arg("--kill-switch");
+    }
+    if params.adaptive_level > 0 {
+        cmd.args(["--adaptive-level", &params.adaptive_level.to_string()]);
+    }
+    if !params.dns_proxy.is_empty() {
+        cmd.args(["--dns-proxy", &params.dns_proxy]);
+    }
+    for route in &params.exclude_routes {
+        cmd.args(["--exclude-routes", route]);
+    }
+    for route in &params.include_routes {
+        cmd.args(["--include-routes", route]);
+    }
+    if params.socks5_enabled && !params.socks5_addr.is_empty() {
+        cmd.args(["--proxy-listen", &params.socks5_addr]);
+    }
+    let has_concrete_mask = !params.preferred_mask.is_empty() && params.preferred_mask != "auto";
+    if params.polymorphic_mask && has_concrete_mask {
+        // Polymorphic mode takes precedence: request a per-session
+        // unique variant of the chosen base mask instead of the
+        // fixed preset.
+        cmd.args(["--polymorphic-base", &params.preferred_mask]);
+    } else if has_concrete_mask {
+        cmd.args(["--preferred-mask", &params.preferred_mask]);
+    }
+    if params.share_mask_feedback {
+        cmd.arg("--share-mask-feedback");
+    }
+    if params.receive_mask_hints {
+        cmd.arg("--receive-mask-hints");
+    }
+    if !params.country_code.is_empty() {
+        cmd.args(["--country-code", &params.country_code]);
+    }
+    if !params.bootstrap_cdn_url.is_empty() {
+        cmd.args(["--bootstrap-cdn-url", &params.bootstrap_cdn_url]);
+    }
+    if !params.bootstrap_telegram_token.is_empty() {
+        // Via env, not argv — the token is a real credential and
+        // /proc/<pid>/cmdline is world-readable on Linux.
+        cmd.env(
+            "AIVPN_BOOTSTRAP_TELEGRAM_TOKEN",
+            &params.bootstrap_telegram_token,
+        );
+    }
+    if !params.bootstrap_telegram_chat.is_empty() {
+        cmd.args(["--bootstrap-telegram-chat", &params.bootstrap_telegram_chat]);
+    }
+    if !params.bootstrap_github.is_empty() {
+        cmd.args(["--bootstrap-github", &params.bootstrap_github]);
+    }
+    if !params.server_signing_key.is_empty() {
+        cmd.args(["--server-signing-key", &params.server_signing_key]);
+    }
+    cmd.stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    cmd
+}
+
+/// Parse one line of the client's machine-readable stdout status protocol:
+/// "AIVPN-STATUS connected <vpn_ip>" / "AIVPN-STATUS reconnecting" /
+/// "AIVPN-STATUS disconnected" / "AIVPN-STATUS rejected <reason>". Pure move
+/// out of `App::subscription`'s worker stream closure (was a zero-capture
+/// local closure there already, so hoisting it out is behavior-identical).
+pub fn parse_status_line(l: &str) -> Option<VpnStatus> {
+    let mut it = l.trim().strip_prefix("AIVPN-STATUS ")?.split_whitespace();
+    match it.next()? {
+        "connected" => Some(VpnStatus::Connected {
+            vpn_ip: it.next().unwrap_or_default().to_string(),
+        }),
+        "reconnecting" => Some(VpnStatus::Connecting),
+        "disconnected" => Some(VpnStatus::Disconnected),
+        // 3f: authenticated terminal handshake refusal —
+        // surfaced as an Error status (same red/urgent UI
+        // treatment as any other fatal client-side
+        // error). Mapped from the client's ASCII token
+        // (see handshake_reject_token in client.rs) so
+        // this doesn't depend on its English log wording.
+        "rejected" => {
+            let token = it.next().unwrap_or("unspecified");
+            let msg = match token {
+                "one_time_used" => "server: one-time key already used",
+                "expired" => "server: client expired",
+                "disabled" => "server: client disabled",
+                _ => "server: connection refused",
+            };
+            Some(VpnStatus::Error(msg.to_string()))
+        }
+        _ => None,
+    }
 }
 
 pub fn format_bytes(bytes: u64) -> String {

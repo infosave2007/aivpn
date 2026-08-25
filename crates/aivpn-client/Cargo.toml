@@ -24,9 +24,16 @@ production-secure = []
 # default). Samples the client's own outbound wire and requests a mask rotation
 # (via the existing MaskPreference path) when its flow reads as a tunnel.
 client-dpi-gate = ["aivpn-common/client-dpi-gate"]
+# Wave C2a/C2b — pure-Rust SSH client (+ embedded installer bundle,
+# high-level orchestration) for the in-app server installer, hoisted into
+# aivpn-common so the mobile FFI cores can use it too. OFF by default: pulls
+# in `russh`/`russh-sftp` via aivpn-common, which must NOT bloat the default
+# aivpn-client build or the mobile FFI cores (aivpn-android-core /
+# aivpn-ios-core), neither of which enables this feature.
+ssh-install = ["aivpn-common/ssh-install"]
 
 [dependencies]
-aivpn-common = { path = "../aivpn-common", version = "*", features = ["client-upload"] }
+aivpn-common = { path = "../aivpn-common", version = "*", features = ["client-upload", "qr"] }
 
 # Crypto
 chacha20poly1305.workspace = true
@@ -59,7 +66,7 @@ clap = { version = "4.4", features = ["derive", "env"] }
 base64 = "0.22"
 hex = "0.4"
 portable-atomic = "1"
-reqwest = { version = "0.11", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
 # Userspace TCP/IP stack for proxy mode (--proxy-listen)
 smoltcp = { version = "0.11", default-features = false, features = ["socket-dns", "alloc", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-tcp", "socket-udp"] }

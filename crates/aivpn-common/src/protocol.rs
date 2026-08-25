@@ -107,6 +107,37 @@ pub enum ControlSubtype {
     /// Server pushes the catalog of masks the client may select, each tagged
     /// with an auto-generated flag so pickers can mark generated masks (0x1F)
     MaskCatalog = 0x1F,
+    HandshakeReject = 0x20,
+    /// Pool anti-entropy state-digest beacon — fixed 32-byte BLAKE3 digest (0x21)
+    PoolStateDigest = 0x21,
+    /// Pool anti-entropy Phase 2 bucketed (Merkle-lite) digest exchange —
+    /// sent in reaction to a `PoolStateDigest` mismatch so only the
+    /// differing buckets' records need to travel, not the whole DB (0x22)
+    PoolBucketDigests = 0x22,
+    /// Phase 4 per-node cryptographic identity proof — a pool node signs
+    /// `(node_id, node_pub, time_window)` with its long-term Ed25519 identity
+    /// key so a peer can bind/pin `node_id` to `node_pub` instead of trusting
+    /// a self-asserted `node_id` string (0x23)
+    NodeEnrollment = 0x23,
+    /// Server → client, sent once per session (typically piggybacked after
+    /// ratchet completion / on the Keepalive path): announces the connecting
+    /// client's server-assigned role and a reserved feature-flag bitmask so
+    /// the client UI can gate admin/viewer management affordances (0x24)
+    Capabilities = 0x24,
+    /// Client → server: an in-tunnel management API call (Phase A in-app
+    /// admin). Proxies a curated REST-shaped request (method/path/body) into
+    /// the server's `mgmt_service` layer, correlated by `req_id` (0x25)
+    MgmtRequest = 0x25,
+    /// Server → client: the response to a `MgmtRequest`, correlated by the
+    /// same `req_id` (0x26)
+    MgmtResponse = 0x26,
+    /// Bidirectional pool-peer announcement of this node's VPN-IP partition
+    /// assignment (Wave B-IP `ClientDatabase::set_node_partition`/
+    /// `_explicit`) and VPN subnet CIDR — pure operator-visibility exchange,
+    /// carries no session/security proof. Either side of a masked pool-peer
+    /// session may send it; a receiver that itself has a partition should
+    /// reply with its own (0x27)
+    PartitionAnnounce = 0x27,
 }
 
 impl ControlSubtype {
@@ -143,6 +174,14 @@ impl ControlSubtype {
             0x1D => Some(Self::RegionalMaskHints),
             0x1E => Some(Self::FeedbackConfig),
             0x1F => Some(Self::MaskCatalog),
+            0x20 => Some(Self::HandshakeReject),
+            0x21 => Some(Self::PoolStateDigest),
+            0x22 => Some(Self::PoolBucketDigests),
+            0x23 => Some(Self::NodeEnrollment),
+            0x24 => Some(Self::Capabilities),
+            0x25 => Some(Self::MgmtRequest),
+            0x26 => Some(Self::MgmtResponse),
+            0x27 => Some(Self::PartitionAnnounce),
             _ => None,
         }
     }
@@ -296,7 +335,7 @@ impl AivpnPacket {
 }
 
 /// Control message payload
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ControlPayload {
     KeyRotate {
         new_eph_pub: [u8; 32],
@@ -322,6 +361,15 @@ pub enum ControlPayload {
         server_ts_ms: u64,
     },
     Shutdown {
+        reason: u8,
+    },
+    /// Handshake-time authenticated reject. Sent ONLY to a peer that has
+    /// already proven knowledge of the PSK during the handshake (so probers
+    /// without the PSK still get silence — unobservability preserved). Tells
+    /// the client WHY it was refused so it can show a message and STOP the
+    /// reconnect loop instead of hammering forever. `reason`: 1=one-time key
+    /// already used, 2=expired, 3=disabled, 0=unspecified.
+    HandshakeReject {
         reason: u8,
     },
     ControlAck {
@@ -371,6 +419,47 @@ pub enum ControlPayload {
     PoolSync {
         clients_json: Vec<u8>,
     },
+    /// Pool anti-entropy beacon: BLAKE3 digest of the sender's canonical
+    /// merged client-DB state. Peers compare digests and only exchange a full
+    /// PoolSync snapshot when they differ. Fixed 32-byte body.
+    PoolStateDigest {
+        digest: [u8; 32],
+    },
+    /// Phase 2 bucketed (Merkle-lite) digest delta: `ClientDatabase::bucket_digests()`
+    /// output, `POOL_SYNC_BUCKETS * 8` bytes (8 bytes per bucket). Sent in
+    /// reaction to a `PoolStateDigest` mismatch; the receiver diffs it
+    /// against its own `bucket_digests()` and replies with a `PoolSync`
+    /// containing only the records in the differing buckets.
+    ///
+    /// `reply_requested` completes the reverse direction of a bucket
+    /// exchange over a single (possibly one-way-dialed) session: when set,
+    /// the receiver — after sending its own differing-bucket `PoolSync` —
+    /// also sends back its own `bucket_digests()` with `reply_requested:
+    /// false`, so the original sender can compute ITS differing buckets and
+    /// push them too. `reply_requested: false` never triggers another bucket
+    /// message, which bounds the exchange and prevents a digest/bucket
+    /// ping-pong.
+    PoolBucketDigests {
+        digests: Vec<u8>,
+        reply_requested: bool,
+    },
+    /// Phase 4 per-node cryptographic identity proof. A pool node proves
+    /// ownership of its `node_id` by signing `(node_id, node_pub,
+    /// time_window)` — via `aivpn_common::crypto::node_enrollment_signing_bytes`
+    /// — with its long-term Ed25519 identity key
+    /// (`aivpn_common::crypto::node_identity_from_seed`). The receiver
+    /// verifies with `aivpn_common::crypto::verify_node_enrollment` and, on
+    /// success, binds/pins `node_id` → `node_pub` (Phase 4 TOFU / operator
+    /// manual approval — the binding policy itself is out of scope here).
+    /// This message only PROVES identity ownership; it carries no other pool
+    /// state.
+    NodeEnrollment {
+        node_id: String,
+        node_pub: [u8; 32],
+        time_window: u64,
+        #[serde(with = "serde_bytes")]
+        signature: [u8; 64],
+    },
     /// Site-to-site subnet advertisement — JSON array of CIDR strings.
     RouteSync {
         subnets_json: Vec<u8>,
@@ -387,7 +476,16 @@ pub enum ControlPayload {
     CertRejected {},
     /// Device enrollment — client proves ownership of its static X25519 keypair.
     /// Sent by client after ServerHello using ratcheted session keys.
-    /// `dh_proof` = X25519(static_priv, server_static_pub) — proves private key possession.
+    ///
+    /// `dh_proof` = `device_enrollment_proof(dh_shared, server_eph_pub, client_eph_pub)`
+    /// (see `aivpn_common::crypto::device_enrollment_proof`), where
+    /// `dh_shared = X25519(static_priv, server_static_pub)` proves private-key
+    /// possession, and `server_eph_pub || client_eph_pub` (THIS FIXED ORDER on
+    /// both ends) is the ephemeral pair this session's PFS handshake used —
+    /// binding the proof to the session so a captured `dh_proof` cannot be
+    /// replayed into a different session. The server verifies ONLY this
+    /// transcript-bound value — see `verify_device_enrollment_proof` in
+    /// `aivpn-server/src/gateway.rs`.
     DeviceEnrollment {
         static_pub: [u8; 32],
         dh_proof: [u8; 32],
@@ -455,6 +553,56 @@ pub enum ControlPayload {
     MaskCatalog {
         masks: Vec<(String, String, bool)>,
     },
+    /// Server → client, sent once per session: the connecting client's
+    /// server-assigned role (see `aivpn_server::client_db::ClientRole::rank`
+    /// — 0=User, 1=Viewer, 2=Admin) and a reserved feature-flag bitmask
+    /// (currently unused, always 0) for future capability negotiation.
+    Capabilities {
+        role: u8,
+        features: u32,
+    },
+    /// Client → server: an in-tunnel management API call (Phase A in-app
+    /// admin). `method`: 0=GET, 1=POST, 2=PATCH, 3=DELETE, 4=PUT. `path` is
+    /// a curated REST-shaped path (e.g. "/api/v1/clients"), capped at 512
+    /// bytes on encode. `body` is an optional JSON payload, capped at
+    /// 262144 bytes (256 KiB) on encode. `req_id` correlates the eventual
+    /// `MgmtResponse`.
+    MgmtRequest {
+        req_id: u32,
+        method: u8,
+        path: String,
+        body: Vec<u8>,
+    },
+    /// Server → client: the response to a `MgmtRequest`, correlated by the
+    /// same `req_id`. `status` mirrors an HTTP status code (200, 403, 404,
+    /// 429, ...). `body` is capped at 262144 bytes (256 KiB) on encode.
+    MgmtResponse {
+        req_id: u32,
+        status: u16,
+        body: Vec<u8>,
+    },
+    /// Wave B-IP.2: a masked pool-peer's VPN-IP partition announcement —
+    /// pure operator-visibility exchange (see `aivpn_server::pool_partition`
+    /// for the receiver-side conflict/mismatch checker). Carries no proof;
+    /// correctness of the disjoint-slice guarantee itself is already
+    /// enforced deterministically by Wave B-IP's `set_node_partition`/
+    /// `_explicit` on each node independently, whether or not either side
+    /// ever sees this message.
+    PartitionAnnounce {
+        /// This node's configured VPN subnet, e.g. "10.0.0.0/24"
+        /// (`VpnNetworkConfig::cidr_string`).
+        subnet_cidr: String,
+        /// `hash(node_id) % num_partitions`, or the operator-pinned
+        /// `pool.node_ip_partition` value when `explicit` is true.
+        partition_index: u32,
+        /// Number of host offsets this node's partition slice spans.
+        partition_size: u32,
+        /// Total number of partitions the subnet is currently divided into.
+        num_partitions: u32,
+        /// True iff `partition_index` came from an operator-pinned
+        /// `pool.node_ip_partition` rather than a hash of `node_id`.
+        explicit: bool,
+    },
 }
 
 /// Aggregated success/fail outcome counters for a single mask, as reported by
@@ -467,37 +615,6 @@ pub struct MaskOutcome {
 }
 
 impl ControlPayload {
-    /// Encode for a peer that may predate the current wire version.
-    ///
-    /// A pre-Variant-A client compares the `ClientNetworkConfig` version byte
-    /// for EQUALITY and drops the entire `ServerHello` when it differs, so
-    /// sending it the current (v2) form makes the handshake succeed on the
-    /// server and die silently on the client: it never ratchets, never sends
-    /// data, and reconnects forever. Emitting the v1 form for such a peer costs
-    /// only the keepalive hint, which a v1 client never had.
-    pub fn encode_for_peer(&self, legacy_peer: bool) -> Result<Vec<u8>> {
-        match (legacy_peer, self) {
-            (
-                true,
-                Self::ServerHello {
-                    server_eph_pub,
-                    signature,
-                    network_config,
-                },
-            ) => {
-                let mut buf = Vec::new();
-                buf.push(ControlSubtype::ServerHello as u8);
-                buf.extend_from_slice(server_eph_pub);
-                buf.extend_from_slice(signature);
-                if let Some(network_config) = network_config {
-                    buf.extend_from_slice(&network_config.encode_wire_v1());
-                }
-                Ok(buf)
-            }
-            _ => self.encode(),
-        }
-    }
-
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut buf = Vec::new();
 
@@ -546,6 +663,39 @@ impl ControlPayload {
             Self::Shutdown { reason } => {
                 buf.push(ControlSubtype::Shutdown as u8);
                 buf.push(*reason);
+            }
+            Self::HandshakeReject { reason } => {
+                buf.push(ControlSubtype::HandshakeReject as u8);
+                buf.push(*reason);
+            }
+            Self::PoolStateDigest { digest } => {
+                buf.push(ControlSubtype::PoolStateDigest as u8);
+                buf.extend_from_slice(digest);
+            }
+            Self::PoolBucketDigests {
+                digests,
+                reply_requested,
+            } => {
+                buf.push(ControlSubtype::PoolBucketDigests as u8);
+                buf.extend_from_slice(&((1 + digests.len()) as u32).to_le_bytes());
+                buf.push(*reply_requested as u8);
+                buf.extend_from_slice(digests);
+            }
+            Self::NodeEnrollment {
+                node_id,
+                node_pub,
+                time_window,
+                signature,
+            } => {
+                buf.push(ControlSubtype::NodeEnrollment as u8);
+                let node_id_bytes = node_id.as_bytes();
+                let total_len = (4 + node_id_bytes.len() + 32 + 8 + 64) as u32;
+                buf.extend_from_slice(&total_len.to_le_bytes());
+                buf.extend_from_slice(&(node_id_bytes.len() as u32).to_le_bytes());
+                buf.extend_from_slice(node_id_bytes);
+                buf.extend_from_slice(node_pub);
+                buf.extend_from_slice(&time_window.to_le_bytes());
+                buf.extend_from_slice(signature);
             }
             Self::ControlAck {
                 ack_seq,
@@ -741,6 +891,67 @@ impl ControlPayload {
                     buf.push(if *generated { 1 } else { 0 });
                 }
             }
+            Self::Capabilities { role, features } => {
+                buf.push(ControlSubtype::Capabilities as u8);
+                buf.push(*role);
+                buf.extend_from_slice(&features.to_le_bytes());
+            }
+            Self::MgmtRequest {
+                req_id,
+                method,
+                path,
+                body,
+            } => {
+                let path_bytes = path.as_bytes();
+                if path_bytes.len() > 512 {
+                    return Err(Error::InvalidPacket("MgmtRequest path too long"));
+                }
+                if body.len() > 262_144 {
+                    return Err(Error::InvalidPacket("MgmtRequest body too long"));
+                }
+                buf.push(ControlSubtype::MgmtRequest as u8);
+                buf.extend_from_slice(&req_id.to_le_bytes());
+                buf.push(*method);
+                buf.extend_from_slice(&(path_bytes.len() as u16).to_le_bytes());
+                buf.extend_from_slice(path_bytes);
+                buf.extend_from_slice(&(body.len() as u32).to_le_bytes());
+                buf.extend_from_slice(body);
+            }
+            Self::MgmtResponse {
+                req_id,
+                status,
+                body,
+            } => {
+                if body.len() > 262_144 {
+                    return Err(Error::InvalidPacket("MgmtResponse body too long"));
+                }
+                buf.push(ControlSubtype::MgmtResponse as u8);
+                buf.extend_from_slice(&req_id.to_le_bytes());
+                buf.extend_from_slice(&status.to_le_bytes());
+                buf.extend_from_slice(&(body.len() as u32).to_le_bytes());
+                buf.extend_from_slice(body);
+            }
+            Self::PartitionAnnounce {
+                subnet_cidr,
+                partition_index,
+                partition_size,
+                num_partitions,
+                explicit,
+            } => {
+                let cidr_bytes = subnet_cidr.as_bytes();
+                if cidr_bytes.len() > u16::MAX as usize {
+                    return Err(Error::InvalidPacket(
+                        "PartitionAnnounce subnet_cidr too long",
+                    ));
+                }
+                buf.push(ControlSubtype::PartitionAnnounce as u8);
+                buf.extend_from_slice(&(cidr_bytes.len() as u16).to_le_bytes());
+                buf.extend_from_slice(cidr_bytes);
+                buf.extend_from_slice(&partition_index.to_le_bytes());
+                buf.extend_from_slice(&partition_size.to_le_bytes());
+                buf.extend_from_slice(&num_partitions.to_le_bytes());
+                buf.push(*explicit as u8);
+            }
         }
 
         Ok(buf)
@@ -828,6 +1039,92 @@ impl ControlPayload {
                     return Err(Error::InvalidPacket("Shutdown too short"));
                 }
                 Ok(Self::Shutdown { reason: data[1] })
+            }
+            ControlSubtype::HandshakeReject => {
+                if data.len() < 2 {
+                    return Err(Error::InvalidPacket("HandshakeReject too short"));
+                }
+                Ok(Self::HandshakeReject { reason: data[1] })
+            }
+            ControlSubtype::PoolStateDigest => {
+                if data.len() < 1 + 32 {
+                    return Err(Error::InvalidPacket("PoolStateDigest too short"));
+                }
+                let mut digest = [0u8; 32];
+                digest.copy_from_slice(&data[1..1 + 32]);
+                Ok(Self::PoolStateDigest { digest })
+            }
+            ControlSubtype::PoolBucketDigests => {
+                if data.len() < 6 {
+                    return Err(Error::InvalidPacket("PoolBucketDigests too short"));
+                }
+                let payload_len = u32::from_le_bytes([data[1], data[2], data[3], data[4]]) as usize;
+                if payload_len < 1 {
+                    return Err(Error::InvalidPacket("PoolBucketDigests invalid length"));
+                }
+                // Overflow-safe on 32-bit targets, same reasoning as PoolSync.
+                if data.len().saturating_sub(5) < payload_len {
+                    return Err(Error::InvalidPacket("PoolBucketDigests invalid length"));
+                }
+                let reply_requested = data[5] != 0;
+                let digests_len = payload_len - 1;
+                Ok(Self::PoolBucketDigests {
+                    digests: data[6..6 + digests_len].to_vec(),
+                    reply_requested,
+                })
+            }
+            ControlSubtype::NodeEnrollment => {
+                // subtype(1) + total_len(4) + node_id_len(4) = 9 minimum to
+                // read both length fields.
+                if data.len() < 9 {
+                    return Err(Error::InvalidPacket("NodeEnrollment too short"));
+                }
+                let total_len = u32::from_le_bytes([data[1], data[2], data[3], data[4]]) as usize;
+                // Overflow-safe on 32-bit targets, same reasoning as PoolSync.
+                if data.len().saturating_sub(5) < total_len {
+                    return Err(Error::InvalidPacket("NodeEnrollment invalid length"));
+                }
+                // total_len must at least cover node_id_len(4) + node_pub(32)
+                // + time_window(8) + signature(64), even for an empty node_id.
+                if total_len < 4 + 32 + 8 + 64 {
+                    return Err(Error::InvalidPacket("NodeEnrollment invalid length"));
+                }
+                let node_id_len = u32::from_le_bytes([data[5], data[6], data[7], data[8]]) as usize;
+                // The declared total_len must exactly account for
+                // node_id_len + node_pub + time_window + signature — this
+                // rejects an inconsistent (attacker-crafted) pair of length
+                // fields instead of silently misreading the trailing bytes.
+                if total_len != 4 + node_id_len + 32 + 8 + 64 {
+                    return Err(Error::InvalidPacket("NodeEnrollment length mismatch"));
+                }
+
+                let mut offset = 9usize;
+                if data.len() < offset + node_id_len {
+                    return Err(Error::InvalidPacket("NodeEnrollment node_id truncated"));
+                }
+                let node_id =
+                    String::from_utf8_lossy(&data[offset..offset + node_id_len]).to_string();
+                offset += node_id_len;
+
+                if data.len() < offset + 32 + 8 + 64 {
+                    return Err(Error::InvalidPacket("NodeEnrollment truncated"));
+                }
+                let mut node_pub = [0u8; 32];
+                node_pub.copy_from_slice(&data[offset..offset + 32]);
+                offset += 32;
+
+                let time_window = u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap());
+                offset += 8;
+
+                let mut signature = [0u8; 64];
+                signature.copy_from_slice(&data[offset..offset + 64]);
+
+                Ok(Self::NodeEnrollment {
+                    node_id,
+                    node_pub,
+                    time_window,
+                    signature,
+                })
             }
             ControlSubtype::ControlAck => {
                 if data.len() < 4 {
@@ -1213,6 +1510,99 @@ impl ControlPayload {
                 }
                 Ok(Self::MaskCatalog { masks })
             }
+            ControlSubtype::Capabilities => {
+                if data.len() < 6 {
+                    return Err(Error::InvalidPacket("Capabilities too short"));
+                }
+                let role = data[1];
+                let features = u32::from_le_bytes([data[2], data[3], data[4], data[5]]);
+                Ok(Self::Capabilities { role, features })
+            }
+            ControlSubtype::MgmtRequest => {
+                if data.len() < 8 {
+                    return Err(Error::InvalidPacket("MgmtRequest too short"));
+                }
+                let req_id = u32::from_le_bytes([data[1], data[2], data[3], data[4]]);
+                let method = data[5];
+                let path_len = u16::from_le_bytes([data[6], data[7]]) as usize;
+                if data.len().saturating_sub(8) < path_len {
+                    return Err(Error::InvalidPacket("MgmtRequest path truncated"));
+                }
+                let path_start = 8;
+                let path_end = path_start + path_len;
+                let path = String::from_utf8_lossy(&data[path_start..path_end]).to_string();
+                if data.len().saturating_sub(path_end) < 4 {
+                    return Err(Error::InvalidPacket("MgmtRequest missing body length"));
+                }
+                let body_len = u32::from_le_bytes([
+                    data[path_end],
+                    data[path_end + 1],
+                    data[path_end + 2],
+                    data[path_end + 3],
+                ]) as usize;
+                let body_start = path_end + 4;
+                // Overflow-safe on 32-bit targets (see PoolSync above).
+                if data.len().saturating_sub(body_start) < body_len {
+                    return Err(Error::InvalidPacket("MgmtRequest body truncated"));
+                }
+                let body = data[body_start..body_start + body_len].to_vec();
+                Ok(Self::MgmtRequest {
+                    req_id,
+                    method,
+                    path,
+                    body,
+                })
+            }
+            ControlSubtype::MgmtResponse => {
+                if data.len() < 11 {
+                    return Err(Error::InvalidPacket("MgmtResponse too short"));
+                }
+                let req_id = u32::from_le_bytes([data[1], data[2], data[3], data[4]]);
+                let status = u16::from_le_bytes([data[5], data[6]]);
+                let body_len = u32::from_le_bytes([data[7], data[8], data[9], data[10]]) as usize;
+                // Overflow-safe on 32-bit targets (see PoolSync above).
+                if data.len().saturating_sub(11) < body_len {
+                    return Err(Error::InvalidPacket("MgmtResponse body truncated"));
+                }
+                let body = data[11..11 + body_len].to_vec();
+                Ok(Self::MgmtResponse {
+                    req_id,
+                    status,
+                    body,
+                })
+            }
+            ControlSubtype::PartitionAnnounce => {
+                if data.len() < 3 {
+                    return Err(Error::InvalidPacket("PartitionAnnounce too short"));
+                }
+                let cidr_len = u16::from_le_bytes([data[1], data[2]]) as usize;
+                let cidr_start = 3;
+                if data.len().saturating_sub(cidr_start) < cidr_len {
+                    return Err(Error::InvalidPacket(
+                        "PartitionAnnounce subnet_cidr truncated",
+                    ));
+                }
+                let cidr_end = cidr_start + cidr_len;
+                let subnet_cidr = String::from_utf8_lossy(&data[cidr_start..cidr_end]).to_string();
+                // partition_index(4) + partition_size(4) + num_partitions(4) + explicit(1)
+                if data.len().saturating_sub(cidr_end) < 13 {
+                    return Err(Error::InvalidPacket("PartitionAnnounce truncated"));
+                }
+                let partition_index =
+                    u32::from_le_bytes(data[cidr_end..cidr_end + 4].try_into().unwrap());
+                let partition_size =
+                    u32::from_le_bytes(data[cidr_end + 4..cidr_end + 8].try_into().unwrap());
+                let num_partitions =
+                    u32::from_le_bytes(data[cidr_end + 8..cidr_end + 12].try_into().unwrap());
+                let explicit = data[cidr_end + 12] != 0;
+                Ok(Self::PartitionAnnounce {
+                    subnet_cidr,
+                    partition_index,
+                    partition_size,
+                    num_partitions,
+                    explicit,
+                })
+            }
         }
     }
 }
@@ -1325,6 +1715,14 @@ mod tests {
             (0x1D, ControlSubtype::RegionalMaskHints),
             (0x1E, ControlSubtype::FeedbackConfig),
             (0x1F, ControlSubtype::MaskCatalog),
+            (0x20, ControlSubtype::HandshakeReject),
+            (0x21, ControlSubtype::PoolStateDigest),
+            (0x22, ControlSubtype::PoolBucketDigests),
+            (0x23, ControlSubtype::NodeEnrollment),
+            (0x24, ControlSubtype::Capabilities),
+            (0x25, ControlSubtype::MgmtRequest),
+            (0x26, ControlSubtype::MgmtResponse),
+            (0x27, ControlSubtype::PartitionAnnounce),
         ];
         for (byte, expected) in pairs {
             assert_eq!(
@@ -1335,7 +1733,7 @@ mod tests {
             );
         }
         assert_eq!(ControlSubtype::from_u8(0x00), None);
-        assert_eq!(ControlSubtype::from_u8(0x20), None);
+        assert_eq!(ControlSubtype::from_u8(0x28), None);
     }
 
     // -----------------------------------------------------------------------
@@ -1820,6 +2218,115 @@ mod tests {
     }
 
     #[test]
+    fn control_payload_pool_state_digest_roundtrip() {
+        let digest = [0xABu8; 32];
+        let p = ControlPayload::PoolStateDigest { digest };
+        let decoded = roundtrip(&p);
+        if let ControlPayload::PoolStateDigest { digest: d } = decoded {
+            assert_eq!(d, digest);
+        } else {
+            panic!("wrong variant");
+        }
+    }
+
+    #[test]
+    fn control_payload_pool_bucket_digests_roundtrip() {
+        let digests = vec![0xCDu8; 64 * 8]; // POOL_SYNC_BUCKETS * 8
+        for reply_requested in [true, false] {
+            let p = ControlPayload::PoolBucketDigests {
+                digests: digests.clone(),
+                reply_requested,
+            };
+            let decoded = roundtrip(&p);
+            if let ControlPayload::PoolBucketDigests {
+                digests: d,
+                reply_requested: r,
+            } = decoded
+            {
+                assert_eq!(d, digests);
+                assert_eq!(r, reply_requested);
+            } else {
+                panic!("wrong variant");
+            }
+        }
+    }
+
+    #[test]
+    fn control_payload_pool_bucket_digests_empty_roundtrip() {
+        for reply_requested in [true, false] {
+            let p = ControlPayload::PoolBucketDigests {
+                digests: vec![],
+                reply_requested,
+            };
+            let decoded = roundtrip(&p);
+            if let ControlPayload::PoolBucketDigests {
+                digests: d,
+                reply_requested: r,
+            } = decoded
+            {
+                assert!(d.is_empty());
+                assert_eq!(r, reply_requested);
+            } else {
+                panic!("wrong variant");
+            }
+        }
+    }
+
+    #[test]
+    fn control_payload_node_enrollment_roundtrip() {
+        let node_id = "node-alpha-01".to_string();
+        let node_pub = [0x5Au8; 32];
+        let time_window = 123_456_789u64;
+        let signature = [0x7Bu8; 64];
+
+        let p = ControlPayload::NodeEnrollment {
+            node_id: node_id.clone(),
+            node_pub,
+            time_window,
+            signature,
+        };
+        let decoded = roundtrip(&p);
+        if let ControlPayload::NodeEnrollment {
+            node_id: n,
+            node_pub: pk,
+            time_window: tw,
+            signature: sig,
+        } = decoded
+        {
+            assert_eq!(n, node_id);
+            assert_eq!(pk, node_pub);
+            assert_eq!(tw, time_window);
+            assert_eq!(sig, signature);
+        } else {
+            panic!("wrong variant");
+        }
+    }
+
+    #[test]
+    fn control_payload_node_enrollment_empty_node_id_roundtrips() {
+        // Sibling string-bearing variants (e.g. RecordingStart's `service`)
+        // allow an empty string to round-trip rather than rejecting it — the
+        // wire format has no minimum-length constraint on node_id, so match
+        // that convention here.
+        let node_pub = [0x11u8; 32];
+        let time_window = 1u64;
+        let signature = [0x22u8; 64];
+
+        let p = ControlPayload::NodeEnrollment {
+            node_id: String::new(),
+            node_pub,
+            time_window,
+            signature,
+        };
+        let decoded = roundtrip(&p);
+        if let ControlPayload::NodeEnrollment { node_id: n, .. } = decoded {
+            assert!(n.is_empty());
+        } else {
+            panic!("wrong variant");
+        }
+    }
+
+    #[test]
     fn control_payload_route_sync_roundtrip() {
         let subnets_json = br#"["10.0.0.0/8","192.168.0.0/16"]"#.to_vec();
         let p = ControlPayload::RouteSync {
@@ -2274,6 +2781,71 @@ mod tests {
     }
 
     #[test]
+    fn control_payload_pool_state_digest_too_short_returns_error() {
+        // subtype + 31 bytes — needs 32
+        let mut data = vec![0x21u8];
+        data.extend_from_slice(&[0xAB; 31]);
+        assert!(ControlPayload::decode(&data).is_err());
+    }
+
+    #[test]
+    fn control_payload_pool_bucket_digests_too_short_returns_error() {
+        // only 3 bytes — needs 6 (subtype + u32 len + flag byte)
+        assert!(ControlPayload::decode(&[0x22, 0x00, 0x00]).is_err());
+    }
+
+    #[test]
+    fn control_payload_pool_bucket_digests_length_exceeds_data_returns_error() {
+        let mut data = vec![0x22u8];
+        data.extend_from_slice(&9999u32.to_le_bytes());
+        data.push(0u8); // flag byte present, but payload_len (9999) exceeds actual data
+        assert!(ControlPayload::decode(&data).is_err());
+    }
+
+    #[test]
+    fn control_payload_pool_bucket_digests_zero_length_returns_error() {
+        // payload_len = 0 is invalid now: the flag byte alone requires
+        // payload_len >= 1.
+        let mut data = vec![0x22u8];
+        data.extend_from_slice(&0u32.to_le_bytes());
+        assert!(ControlPayload::decode(&data).is_err());
+    }
+
+    #[test]
+    fn control_payload_node_enrollment_too_short_returns_error() {
+        // only 8 bytes — needs 9 (subtype + u32 total_len + u32 node_id_len)
+        assert!(ControlPayload::decode(&[0x23, 0, 0, 0, 0, 0, 0, 0]).is_err());
+    }
+
+    #[test]
+    fn control_payload_node_enrollment_total_len_exceeds_data_returns_error() {
+        let mut data = vec![0x23u8];
+        data.extend_from_slice(&9999u32.to_le_bytes()); // total_len far exceeds actual data
+        data.extend_from_slice(&0u32.to_le_bytes()); // node_id_len = 0
+        assert!(ControlPayload::decode(&data).is_err());
+    }
+
+    #[test]
+    fn control_payload_node_enrollment_total_len_below_minimum_returns_error() {
+        // total_len must be >= 4 + 32 + 8 + 64 = 108 even for an empty node_id.
+        let mut data = vec![0x23u8];
+        data.extend_from_slice(&10u32.to_le_bytes());
+        data.extend_from_slice(&0u32.to_le_bytes());
+        assert!(ControlPayload::decode(&data).is_err());
+    }
+
+    #[test]
+    fn control_payload_node_enrollment_inconsistent_lengths_returns_error() {
+        // total_len says 108 (empty node_id) but node_id_len claims 5 bytes —
+        // the two length fields disagree and must be rejected, not misread.
+        let mut data = vec![0x23u8];
+        data.extend_from_slice(&108u32.to_le_bytes());
+        data.extend_from_slice(&5u32.to_le_bytes());
+        data.extend_from_slice(&[0u8; 5 + 32 + 8 + 64]);
+        assert!(ControlPayload::decode(&data).is_err());
+    }
+
+    #[test]
     fn control_payload_u32_len_near_max_returns_error_on_all_targets() {
         // Regression for the 32-bit usize overflow: with `len` near u32::MAX,
         // the old `data.len() < 5 + len` check wrapped on armv7/mipsel
@@ -2292,5 +2864,166 @@ mod tests {
                 );
             }
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Capabilities / MgmtRequest / MgmtResponse (P0.2)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn mgmt_and_caps_roundtrip() {
+        let caps = ControlPayload::Capabilities {
+            role: 2,
+            features: 0,
+        };
+        assert_eq!(
+            ControlPayload::decode(&caps.encode().unwrap()).unwrap(),
+            caps
+        );
+
+        let req = ControlPayload::MgmtRequest {
+            req_id: 7,
+            method: 2,
+            path: "/api/v1/clients".into(),
+            body: vec![1, 2, 3],
+        };
+        assert_eq!(ControlPayload::decode(&req.encode().unwrap()).unwrap(), req);
+
+        let resp = ControlPayload::MgmtResponse {
+            req_id: 7,
+            status: 201,
+            body: b"{}".to_vec(),
+        };
+        assert_eq!(
+            ControlPayload::decode(&resp.encode().unwrap()).unwrap(),
+            resp
+        );
+    }
+
+    #[test]
+    fn mgmt_response_large_body_roundtrips_intact() {
+        let body = vec![0xABu8; 40 * 1024];
+        let resp = ControlPayload::MgmtResponse {
+            req_id: 42,
+            status: 200,
+            body: body.clone(),
+        };
+        let encoded = resp.encode().unwrap();
+        let decoded = ControlPayload::decode(&encoded).unwrap();
+        match decoded {
+            ControlPayload::MgmtResponse {
+                req_id,
+                status,
+                body: decoded_body,
+            } => {
+                assert_eq!(req_id, 42);
+                assert_eq!(status, 200);
+                assert_eq!(decoded_body, body);
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mgmt_request_rejects_oversized_path_and_body_on_encode() {
+        let too_long_path = ControlPayload::MgmtRequest {
+            req_id: 1,
+            method: 0,
+            path: "a".repeat(513),
+            body: vec![],
+        };
+        assert!(too_long_path.encode().is_err());
+
+        let too_long_body = ControlPayload::MgmtRequest {
+            req_id: 1,
+            method: 0,
+            path: "/x".into(),
+            body: vec![0u8; 262_145],
+        };
+        assert!(too_long_body.encode().is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // PartitionAnnounce (Wave B-IP.2)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn partition_announce_roundtrip() {
+        let msg = ControlPayload::PartitionAnnounce {
+            subnet_cidr: "10.0.0.0/24".to_string(),
+            partition_index: 3,
+            partition_size: 31,
+            num_partitions: 8,
+            explicit: false,
+        };
+        let encoded = msg.encode().unwrap();
+        let decoded = ControlPayload::decode(&encoded).unwrap();
+        assert_eq!(decoded, msg);
+    }
+
+    #[test]
+    fn partition_announce_roundtrip_explicit_and_empty_cidr() {
+        let msg = ControlPayload::PartitionAnnounce {
+            subnet_cidr: String::new(),
+            partition_index: 0,
+            partition_size: 0,
+            num_partitions: 1,
+            explicit: true,
+        };
+        let encoded = msg.encode().unwrap();
+        let decoded = ControlPayload::decode(&encoded).unwrap();
+        assert_eq!(decoded, msg);
+    }
+
+    #[test]
+    fn partition_announce_truncated_bytes_return_error_not_panic() {
+        let full = ControlPayload::PartitionAnnounce {
+            subnet_cidr: "10.1.2.0/24".to_string(),
+            partition_index: 5,
+            partition_size: 31,
+            num_partitions: 8,
+            explicit: true,
+        }
+        .encode()
+        .unwrap();
+
+        for cut in 1..full.len() {
+            let truncated = &full[..cut];
+            assert!(
+                ControlPayload::decode(truncated).is_err(),
+                "expected Err at cut={}",
+                cut
+            );
+        }
+    }
+
+    #[test]
+    fn mgmt_request_truncated_bytes_return_error_not_panic() {
+        // Well-formed header claiming a path/body that the buffer doesn't
+        // actually contain must be rejected, never panic on an out-of-bounds
+        // slice.
+        let full = ControlPayload::MgmtRequest {
+            req_id: 9,
+            method: 1,
+            path: "/api/v1/status".into(),
+            body: vec![9, 9, 9, 9],
+        }
+        .encode()
+        .unwrap();
+
+        // Truncate at every prefix length and assert decode never panics and
+        // always returns Err for a genuinely incomplete buffer.
+        for cut in 1..full.len() {
+            let truncated = &full[..cut];
+            let result = std::panic::catch_unwind(|| ControlPayload::decode(truncated));
+            assert!(result.is_ok(), "decode panicked at cut={cut}");
+            assert!(
+                result.unwrap().is_err(),
+                "expected Err for truncated MgmtRequest at cut={cut}"
+            );
+        }
+
+        // Also assert a minimal too-short buffer (just the subtype byte).
+        assert!(ControlPayload::decode(&[0x25u8]).is_err());
     }
 }

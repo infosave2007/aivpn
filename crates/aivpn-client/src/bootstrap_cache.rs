@@ -1,5 +1,8 @@
 use std::fs;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
@@ -8,8 +11,79 @@ use aivpn_common::mask::{
     current_unix_secs, derive_bootstrap_candidates, BootstrapDescriptor, MaskProfile,
 };
 
+/// Sticky last-known-good mask (client). Set on the first real DATA RX of a
+/// session and reused in AUTO mode across reconnects instead of re-deriving from
+/// the churning bootstrap-descriptor set. FIX (Jul 15): a data-plane stall makes
+/// the client reconnect while the handshake still succeeds, so the old resolver
+/// hopped masks each reconnect and never let the data plane settle. Mirrors the
+/// mobile cores' `LAST_GOOD_MASK`.
+pub static LAST_GOOD_MASK: Mutex<Option<MaskProfile>> = Mutex::new(None);
+
+/// Liveness half of the sticky-mask fix (client). Counts consecutive SHORT
+/// sessions that ended on the data watchdog while a sticky mask was in use, so a
+/// mask that keeps getting throttled is abandoned (LAST_GOOD_MASK cleared) and
+/// AUTO explores a different one, instead of looping on it forever.
+static DATA_STALL_STREAK: AtomicU32 = AtomicU32::new(0);
+/// A session that stayed up at least this long is a working mask; a later stall
+/// is a transient hiccup, so the streak resets and the mask stays sticky.
+const HEALTHY_SESSION_MIN: Duration = Duration::from_secs(45);
+/// Abandon the sticky mask after this many consecutive short data-stall sessions.
+const DATA_STALL_EXPLORE_THRESHOLD: u32 = 4;
+
+/// Call when a session ends on the data watchdog: a healthy-length session
+/// resets the stall streak; repeated short stalls clear the sticky mask so AUTO
+/// can explore alternatives.
+pub fn note_data_stall_and_maybe_explore(established: Instant) {
+    if established.elapsed() >= HEALTHY_SESSION_MIN {
+        DATA_STALL_STREAK.store(0, Ordering::Relaxed);
+        return;
+    }
+    let n = DATA_STALL_STREAK.fetch_add(1, Ordering::Relaxed) + 1;
+    if n >= DATA_STALL_EXPLORE_THRESHOLD {
+        *LAST_GOOD_MASK.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        DATA_STALL_STREAK.store(0, Ordering::Relaxed);
+        tracing::warn!(
+            "sticky mask produced {n} short data-stall sessions — clearing it so auto-mask can try a different mask"
+        );
+    }
+}
+
 const CACHE_FILE_NAME: &str = "bootstrap_descriptors.json";
 const MAX_CACHED_DESCRIPTORS: usize = 8;
+
+/// Bootstrap descriptor ids excluded from `select_initial_mask` for the
+/// lifetime of this process. `production-secure` builds must never fall back
+/// to an unsigned builtin mask, but without any resilience net a cached
+/// descriptor whose signer rotated its key (or an epoch the server no longer
+/// retains) wedges the client on the same dead handshake forever — selection
+/// is otherwise a deterministic newest-`created_at`-first pick. Excluding a
+/// proven-unmatchable descriptor id (without deleting it from disk — a
+/// multi-epoch server may still accept it later) lets selection advance to
+/// the next-newest still-valid SIGNED descriptor instead. See main.rs's
+/// `#[cfg(feature = "production-secure")]` handshake-fallback block.
+static EXCLUDED_DESCRIPTOR_IDS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// Mark a descriptor id as unmatchable for this run's `select_initial_mask`.
+/// Idempotent. Returns `true` if this was a new exclusion.
+pub fn exclude_descriptor(descriptor_id: &str) -> bool {
+    let mut ids = EXCLUDED_DESCRIPTOR_IDS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if ids.iter().any(|id| id == descriptor_id) {
+        false
+    } else {
+        ids.push(descriptor_id.to_string());
+        true
+    }
+}
+
+fn is_excluded(descriptor_id: &str) -> bool {
+    EXCLUDED_DESCRIPTOR_IDS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .any(|id| id == descriptor_id)
+}
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct BootstrapCacheFile {
@@ -46,6 +120,9 @@ pub fn load_descriptors() -> Vec<BootstrapDescriptor> {
 pub fn select_initial_mask(preshared_key: Option<&[u8; 32]>) -> Option<MaskProfile> {
     let now = current_unix_secs();
     for descriptor in load_descriptors() {
+        if is_excluded(&descriptor.descriptor_id) {
+            continue;
+        }
         if !descriptor.is_valid_at(now) {
             continue;
         }
@@ -59,7 +136,50 @@ pub fn select_initial_mask(preshared_key: Option<&[u8; 32]>) -> Option<MaskProfi
     None
 }
 
+/// Advisory file lock guarding `store_descriptor`'s read-modify-write of the
+/// cache file. Without it, two client processes against the same `$HOME`
+/// (two profiles, GUI + manual CLI, or a startup multi-channel refresh
+/// racing a server-pushed `BootstrapDescriptorUpdate`) can both read the
+/// same pre-mutation state and each write back a version missing the
+/// other's newly-fetched descriptor — a silent lost update (the atomic
+/// tmp+rename already prevents outright file corruption, just not this).
+/// Held for the lifetime of the returned guard; released automatically when
+/// the underlying fd is closed on Drop. Unix-only (flock) — best-effort
+/// no-op elsewhere.
+#[cfg(unix)]
+struct CacheFileLock {
+    _file: std::fs::File,
+}
+
+#[cfg(unix)]
+impl CacheFileLock {
+    fn acquire() -> Option<Self> {
+        use std::os::unix::io::AsRawFd;
+        let dir = cache_dir();
+        let _ = fs::create_dir_all(&dir);
+        let lock_path = dir.join("bootstrap_descriptors.lock");
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .open(&lock_path)
+            .ok()?;
+        // SAFETY: flock(2) on a valid, owned fd with a plain integer
+        // operation flag. LOCK_EX blocks until the lock is available, so
+        // concurrent store_descriptor calls serialize their
+        // read-modify-write instead of interleaving. The lock is released
+        // automatically (by the kernel) when this fd is closed, including
+        // on process crash — no stale-lock cleanup needed.
+        let ret = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+        if ret != 0 {
+            return None;
+        }
+        Some(Self { _file: file })
+    }
+}
+
 pub fn store_descriptor(descriptor: BootstrapDescriptor) -> Result<()> {
+    #[cfg(unix)]
+    let _lock = CacheFileLock::acquire();
     let mut cache = load_cache_file();
     cache
         .descriptors

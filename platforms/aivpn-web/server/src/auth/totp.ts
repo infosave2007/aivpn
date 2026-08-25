@@ -60,7 +60,7 @@ export async function generateTotpSecret(username: string): Promise<TotpSetup> {
   }
 }
 
-export const TOTP_STEP_SECONDS = 30
+const TOTP_STEP_SECONDS = 30
 
 /**
  * Verify a TOTP code. Returns the accepted RFC 6238 time step on success,

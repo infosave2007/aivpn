@@ -45,6 +45,14 @@ const VIEWER_ALLOWED: Array<{ method: string; pattern: RegExp }> = [
   { method: 'GET', pattern: /^\/api\/v1\/kernel$/ },
   // Realtime dashboard event stream (SSE) — read-only status/traffic events.
   { method: 'GET', pattern: /^\/api\/v1\/events$/ },
+  // Pool topology (nodes/links/health) — node IDs, addresses, sync/connected
+  // state; no keys or credentials. Sidebar.svelte marks Pool `adminOnly:
+  // false` on this same assumption ("plain GET proxied route, allowed for
+  // viewers too") — these three entries were missing here, which silently
+  // 403'd every viewer's Pool page despite the nav link being shown to them.
+  { method: 'GET', pattern: /^\/api\/v1\/pool\/nodes$/ },
+  { method: 'GET', pattern: /^\/api\/v1\/pool\/links$/ },
+  { method: 'GET', pattern: /^\/api\/v1\/pool\/health$/ },
 ]
 
 /**
@@ -53,7 +61,14 @@ const VIEWER_ALLOWED: Array<{ method: string; pattern: RegExp }> = [
  *
  * Deliberately EXCLUDED (viewers get 403): config + backup + bootstrap +
  * clients/:id/connection-key (all expose operator or client secrets) and
- * audit-log (admin action history + client IPs — admin-only oversight data).
+ * audit-log (admin action history + client IPs — admin-only oversight data,
+ * including with ?verify=1 — the query string doesn't affect the canonical
+ * path this allowlist matches against, see canonicalizeForAuthz below).
+ *
+ * POST clients/:id/revoke and PATCH clients/:id (role assignment) are never
+ * reachable by viewers regardless of this allowlist: requireReadAccess()
+ * rejects any non-GET request from a viewer before this check ever runs
+ * (defence-in-depth — they're also simply absent from VIEWER_ALLOWED).
  */
 export function isViewerAllowed(method: string, path: string): boolean {
   return VIEWER_ALLOWED.some((r) => r.method === method && r.pattern.test(path))
@@ -72,7 +87,7 @@ export function isViewerAllowed(method: string, path: string): boolean {
  * resolve `.`/`..` segments, collapse repeated slashes, drop the trailing
  * slash (except root) and lowercase.
  */
-export function canonicalizeForAuthz(pathname: string): string | null {
+function canonicalizeForAuthz(pathname: string): string | null {
   let decoded: string
   try {
     decoded = decodeURIComponent(pathname)
@@ -191,6 +206,11 @@ proxy.all('/*', requireReadAccess(), async (c) => {
     'connection', 'keep-alive', 'transfer-encoding', 'te',
     'trailer', 'upgrade', 'proxy-authorization', 'proxy-authenticate',
     'host',
+    // Never forward the panel's own session credentials to the management
+    // daemon: the panel already authenticated the caller, and the refresh
+    // cookie (__Host-aivpn_rt, Path=/, 7-day) + access JWT would otherwise land
+    // in the daemon's request logs, widening the blast radius of a log leak.
+    'cookie', 'authorization',
   ])
   const forwardHeaders: Record<string, string> = {}
   // `c.req.raw.headers` is a Web `Headers` object, not a plain object —
@@ -216,17 +236,25 @@ proxy.all('/*', requireReadAccess(), async (c) => {
   // memory. Reject early when a declared Content-Length exceeds the limit; the
   // streamed guard in forwardToUnixSocket catches an absent/lying length.
   // SSE responses are unaffected — this limits the request body only.
+  // Backup imports get their own (much larger) cap: real backups exceed the
+  // general-purpose limit by design (the daemon itself accepts up to 50 MB).
+  const maxBodyBytes = canonicalPath === '/api/v1/backup/import'
+    ? config.PROXY_MAX_BACKUP_BODY_BYTES
+    : config.PROXY_MAX_BODY_BYTES
+  const tooLargeMsg = `Payload too large (limit ${maxBodyBytes} bytes; raise ${
+    canonicalPath === '/api/v1/backup/import' ? 'PROXY_MAX_BACKUP_BODY_BYTES' : 'PROXY_MAX_BODY_BYTES'
+  } if this request is legitimate)`
   if (hasBody) {
     const declaredLen = Number(c.req.header('content-length'))
-    if (Number.isFinite(declaredLen) && declaredLen > config.PROXY_MAX_BODY_BYTES) {
-      return c.json({ error: 'Payload too large' }, 413)
+    if (Number.isFinite(declaredLen) && declaredLen > maxBodyBytes) {
+      return c.json({ error: tooLargeMsg }, 413)
     }
   }
 
   const body = hasBody ? c.req.raw.body : null
 
   try {
-    const upstream = await forwardToUnixSocket(method, fullPath, forwardHeaders, body, config.PROXY_MAX_BODY_BYTES)
+    const upstream = await forwardToUnixSocket(method, fullPath, forwardHeaders, body, maxBodyBytes)
 
     // Determine if this is an SSE stream
     const contentType = upstream.headers['content-type'] ?? ''
@@ -278,7 +306,7 @@ proxy.all('/*', requireReadAccess(), async (c) => {
     })
   } catch (err: unknown) {
     if (err instanceof PayloadTooLargeError) {
-      return c.json({ error: 'Payload too large' }, 413)
+      return c.json({ error: tooLargeMsg }, 413)
     }
     const message = err instanceof Error ? err.message : String(err)
     // Common case: aivpn daemon not running

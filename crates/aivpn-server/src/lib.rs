@@ -15,7 +15,11 @@
 pub mod batch_io;
 pub mod client_db;
 pub mod gateway;
+pub mod mgmt_service;
+pub mod mgmt_wire_common;
 pub mod nat;
+pub mod node_registry;
+pub mod pending_config;
 pub mod server;
 pub mod session;
 
@@ -44,6 +48,8 @@ pub mod recording;
 pub mod audit_log;
 pub mod backup;
 pub mod ebpf_observer;
+pub mod pool_dialer;
+pub mod pool_partition;
 pub mod pool_sync;
 pub mod qos;
 pub mod tc_loader;
@@ -56,6 +62,10 @@ pub mod mtls;
 pub mod site_sync;
 
 pub mod bootstrap_publish;
+
+// server.json schema — shared by main.rs startup loading and the management
+// API's PUT /api/v1/config type-level validation.
+pub mod server_config;
 
 pub use client_db::ClientDatabase;
 pub use gateway::{Gateway, GatewayConfig};

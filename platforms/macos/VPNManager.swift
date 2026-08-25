@@ -146,6 +146,9 @@ class VPNManager: ObservableObject {
 
     private var statusPollTimer: Timer?
     private var trafficTimer: Timer?
+    // Session epoch (`since:` unix ms) from the last traffic.stats sample;
+    // a change marks an in-process client reconnect (counters restarted).
+    private var lastTrafficSince: Int64 = 0
     private var minimumRecordingStatusTimestamp: UInt64 = 0
     private var lastRecordingNotificationTimestamp: UInt64 = 0
 
@@ -154,7 +157,7 @@ class VPNManager: ObservableObject {
     private var pathMonitor: NWPathMonitor?
     private let pathMonitorQueue = DispatchQueue(label: "com.aivpn.pathmonitor")
     private var lastPathStatus: NWPath.Status?
-    private var lastPathInterfaceTypes: Set<NWInterface.InterfaceType> = []
+    private var lastPathPrimaryInterfaceType: NWInterface.InterfaceType?
     private var networkChangeReconnectWorkItem: DispatchWorkItem?
 
     // Parameters from the most recent connect()/connectProxy() call, replayed by
@@ -196,8 +199,7 @@ class VPNManager: ObservableObject {
         
         // Для обратной совместимости: если есть старый ключ и нет новых, добавить его
         if let raw = defaults.string(forKey: "connection_key"), !raw.isEmpty {
-            let keyValue = raw.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
-                .replacingOccurrences(of: "aivpn://", with: "")
+            let keyValue = ConnectionKey.normalizeKeyValue(raw)
             if KeychainStorage.shared.keys.isEmpty {
                 _ = KeychainStorage.shared.addKey(name: "Default", keyValue: keyValue)
                 selectedKeyId = KeychainStorage.shared.selectedKeyId
@@ -257,19 +259,74 @@ class VPNManager: ObservableObject {
             task.standardOutput = outputPipe
             task.standardError = outputPipe
 
+            // Drain the pipe CONCURRENTLY with the child. Reading only after
+            // waitUntilExit deadlocks once the child writes more than the pipe
+            // buffer (~64KB): the child blocks on write, we block on wait.
+            var outputData = Data()
+            let drainDone = DispatchSemaphore(value: 0)
+            let readHandle = outputPipe.fileHandleForReading
+            DispatchQueue.global(qos: .utility).async {
+                outputData = readHandle.readDataToEndOfFile()
+                drainDone.signal()
+            }
+
             do {
                 try task.run()
-                task.waitUntilExit()
-                let outputData = outputPipe.fileHandleForReading.readDataToEndOfFile()
-                let output = String(data: outputData, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-                DispatchQueue.main.async {
-                    completion?(task.terminationStatus == 0, output)
-                }
             } catch {
+                // Unblock the drain: with no child holding the write end, EOF
+                // only arrives after we close our own copy.
+                outputPipe.fileHandleForWriting.closeFile()
+                _ = drainDone.wait(timeout: .now() + 1)
                 DispatchQueue.main.async {
                     completion?(false, error.localizedDescription)
                 }
+                return
             }
+
+            // Bounded wait — bench can legitimately run for tens of seconds;
+            // a child hung beyond that is killed instead of leaking this block
+            // (and the child) forever.
+            let deadline = Date().addingTimeInterval(60)
+            while task.isRunning && Date() < deadline {
+                usleep(100_000)
+            }
+            if task.isRunning {
+                task.terminate()
+                usleep(500_000)
+                if task.isRunning {
+                    kill(task.processIdentifier, SIGKILL)
+                }
+            }
+            task.waitUntilExit()
+            // After exit all write ends are closed, so the drain finishes
+            // promptly; the timeout is a safety bound, not an expected path.
+            _ = drainDone.wait(timeout: .now() + 2)
+            let output = String(data: outputData, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            DispatchQueue.main.async {
+                completion?(task.terminationStatus == 0, output)
+            }
+        }
+    }
+
+    /// Routes a record_* action through the privileged helper. The record CLI
+    /// authenticates against a per-uid admin token/socket (/tmp/aivpn-<uid>);
+    /// the full-tunnel client runs as root (uid 0), so record commands issued
+    /// as the console user target /tmp/aivpn-501 where no daemon listens and
+    /// are ALWAYS rejected. Only proxy mode (client runs as the current user)
+    /// may keep using runBundledClientCommand for record commands.
+    private func sendRecordCommandViaHelper(_ action: String, service: String? = nil,
+                                            completion: ((Bool, String) -> Void)? = nil) {
+        let request = HelperRequest(action: action, key: nil, fullTunnel: nil,
+                                    binaryPath: helperClientBinaryPath(), service: service,
+                                    mtlsCertPath: nil, excludeRoutes: nil,
+                                    adaptiveLevel: nil, dnsProxy: nil, killSwitch: nil)
+        // The helper bounds the record subcommand at 10s; leave headroom.
+        sendToHelper(request, timeoutSeconds: 15.0) { response in
+            guard let response = response else {
+                completion?(false, "Helper not responding")
+                return
+            }
+            completion?(response.status == "ok", response.message)
         }
     }
 
@@ -286,7 +343,11 @@ class VPNManager: ObservableObject {
     }
 
     private func requestRecordingStatusRefresh() {
-        runBundledClientCommand(["record", "status"], completion: nil)
+        if isProxyMode {
+            runBundledClientCommand(["record", "status"], completion: nil)
+        } else {
+            sendRecordCommandViaHelper("record_status", completion: nil)
+        }
     }
 
     func clearRecordingResult() {
@@ -358,6 +419,14 @@ class VPNManager: ObservableObject {
     /// Удалить ключ
     func deleteKey(id: String) {
         KeychainStorage.shared.deleteKey(id: id)
+        // `keys` is a computed passthrough to KeychainStorage, not an
+        // @Published property, so mutating the store publishes nothing on its
+        // own. Only the `selectedKeyId == id` branch below touches @Published
+        // state — without this explicit send, deleting a NON-selected key
+        // leaves its row on screen until something else happens to refresh
+        // the view. iOS's VPNManager does exactly the same after every
+        // add/delete/update.
+        objectWillChange.send()
         if selectedKeyId == id {
             selectedKeyId = KeychainStorage.shared.selectedKeyId
             savedKey = KeychainStorage.shared.selectedKey?.keyValue ?? ""
@@ -367,6 +436,9 @@ class VPNManager: ObservableObject {
     /// Обновить имя ключа
     func updateKeyName(id: String, newName: String) {
         KeychainStorage.shared.updateKeyName(id: id, newName: newName)
+        // Same reason as deleteKey above: renaming a non-selected key changes
+        // only the computed `keys` passthrough, which publishes nothing.
+        objectWillChange.send()
     }
     
     /// Обновить ключ полностью
@@ -384,6 +456,8 @@ class VPNManager: ObservableObject {
            let key = KeychainStorage.shared.keys.first(where: { $0.id == id }) {
             savedKey = key.keyValue
         }
+        // Same reason as deleteKey above.
+        if updated { objectWillChange.send() }
         return updated
     }
 
@@ -542,8 +616,12 @@ class VPNManager: ObservableObject {
                     self.isConnected = true
                     self.startStatusPolling()
                     self.startTrafficMonitor()
-                } else if response.connected != nil {
-                    // Helper responded with status — start polling to track
+                } else if response.pid != nil {
+                    // A client process exists but isn't connected yet
+                    // (connecting or mid-reconnect) — poll to track the
+                    // transition. When the helper is idle (no client at all)
+                    // do NOT start polling: the 2s loop used to run forever
+                    // from app launch with nothing to report.
                     self.startStatusPolling()
                 }
             } else {
@@ -558,8 +636,7 @@ class VPNManager: ObservableObject {
         guard !isConnecting else { return }
         guard !isConnected else { return }
 
-        let normalizedKey = key.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
-            .replacingOccurrences(of: "aivpn://", with: "")
+        let normalizedKey = ConnectionKey.normalizeKeyValue(key)
 
         savedKey = normalizedKey
         lastConnectFullTunnel = fullTunnel
@@ -579,6 +656,7 @@ class VPNManager: ObservableObject {
         lastError = nil
         bytesSent = 0
         bytesReceived = 0
+        lastTrafficSince = 0
         recordingState = .idle
         canRecordMasks = false
         recordingCapabilityKnown = false
@@ -638,8 +716,7 @@ class VPNManager: ObservableObject {
     func connectProxy(key: String, proxyPort: Int, preferredMask: String? = nil, polymorphicBase: String? = nil, shareMaskFeedback: Bool = false, receiveMaskHints: Bool = false, countryCode: String? = nil) {
         guard !isConnecting else { return }
 
-        let normalizedKey = key.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
-            .replacingOccurrences(of: "aivpn://", with: "")
+        let normalizedKey = ConnectionKey.normalizeKeyValue(key)
 
         savedKey = normalizedKey
         lastConnectProxyPort = proxyPort
@@ -659,6 +736,7 @@ class VPNManager: ObservableObject {
         lastError = nil
         bytesSent = 0
         bytesReceived = 0
+        lastTrafficSince = 0
 
         guard let binaryPath = bundledClientBinaryPath() else {
             isConnecting = false
@@ -686,17 +764,25 @@ class VPNManager: ObservableObject {
         var processArgs = ["--proxy-listen", "127.0.0.1:\(proxyPort)"]
         // Polymorphic base takes precedence over preferredMask, mirroring the
         // helper's startClient() behavior for the full-tunnel connect path.
-        // Same allow-list as aivpn-helper/main.swift's `allowedMasks` — this
-        // path has no privileged helper in front of it (SOCKS5/no-admin mode
-        // launches aivpn-client directly), so it must validate itself instead
-        // of relying on the helper to reject a bad value.
-        let allowedMasks = ["webrtc_zoom_v3", "quic_https_v2",
-                            "webrtc_yandex_telemost_v1", "webrtc_vk_teams_v1",
-                            "webrtc_sberjazz_v1"]
-        if let polyBase = polymorphicBase, !polyBase.isEmpty, polyBase != "auto", allowedMasks.contains(polyBase) {
-            processArgs += ["--polymorphic-base", polyBase]
-        } else if let mask = preferredMask, !mask.isEmpty, mask != "auto", allowedMasks.contains(mask) {
-            processArgs += ["--preferred-mask", mask]
+        // Same pattern gate as aivpn-helper/main.swift's isAcceptableMaskId —
+        // this path has no privileged helper in front of it (SOCKS5/no-admin
+        // mode launches aivpn-client directly), so it must validate itself.
+        // A pattern (not a preset allow-list) because mask ids come from the
+        // server-pushed catalog, including generated ids; Process passes argv
+        // directly with no shell. An id that fails the gate is logged, not
+        // silently dropped.
+        if let polyBase = polymorphicBase, !polyBase.isEmpty, polyBase != "auto" {
+            if Self.isAcceptableMaskId(polyBase) {
+                processArgs += ["--polymorphic-base", polyBase]
+            } else {
+                NSLog("AIVPN: invalid polymorphic base '%@' — ignored", polyBase)
+            }
+        } else if let mask = preferredMask, !mask.isEmpty, mask != "auto" {
+            if Self.isAcceptableMaskId(mask) {
+                processArgs += ["--preferred-mask", mask]
+            } else {
+                NSLog("AIVPN: invalid preferred mask '%@' — ignored", mask)
+            }
         }
         if shareMaskFeedback {
             processArgs += ["--share-mask-feedback"]
@@ -780,9 +866,10 @@ class VPNManager: ObservableObject {
     private func pollProxyLog() {
         // Timeout check is cheap and must happen on the main thread to mutate state.
         if let start = proxyPollStartTime, Date().timeIntervalSince(start) > proxyConnectTimeout {
-            stopProxyPoll()
-            isConnecting = false
             lastError = "Proxy connection timed out"
+            // Tear the spawned client down too — flipping UI state alone
+            // leaked the process, which kept running detached forever.
+            stopProxyMode()
             return
         }
         // File I/O is dispatched off the main thread to avoid blocking the RunLoop.
@@ -802,8 +889,10 @@ class VPNManager: ObservableObject {
                     let lines = log.components(separatedBy: "\n").filter { !$0.isEmpty }
                     if let errLine = lines.last(where: { Self.isErrorLogLine($0) }) {
                         self.lastError = String(errLine.prefix(200))
-                        self.stopProxyPoll()
-                        self.isConnecting = false
+                        // Mirror the timeout path: terminate the client we
+                        // spawned instead of leaking it after a declared
+                        // connect failure.
+                        self.stopProxyMode()
                     }
                 }
             }
@@ -934,6 +1023,13 @@ class VPNManager: ObservableObject {
         while read(fd, &tmpBuf, tmpBuf.count) > 0 {}
     }
 
+    /// True for a well-formed mask id: lowercase alphanumerics + underscore,
+    /// bounded length. Mirrors the helper's isAcceptableMaskId — accepts every
+    /// server-catalog id (presets, generated, recorded) without a preset list.
+    static func isAcceptableMaskId(_ id: String) -> Bool {
+        return id.range(of: "^[a-z0-9_]{1,64}$", options: .regularExpression) != nil
+    }
+
     /// True when an (ANSI-stripped) log line is an actual ERROR-level tracing
     /// record — level token at/near line start — rather than any line merely
     /// containing the substring "error".
@@ -968,11 +1064,16 @@ class VPNManager: ObservableObject {
         lastRecordingResult = nil
         recordingState = .starting(service: trimmedService)
 
-        runBundledClientCommand(["record", "start", "--service", trimmedService]) { [weak self] ok, output in
+        let onResult: (Bool, String) -> Void = { [weak self] ok, output in
             guard let self = self else { return }
             if !ok {
                 self.recordingState = .failed(service: trimmedService, reason: output.isEmpty ? "Failed to start recording" : output)
             }
+        }
+        if isProxyMode {
+            runBundledClientCommand(["record", "start", "--service", trimmedService], completion: onResult)
+        } else {
+            sendRecordCommandViaHelper("record_start", service: trimmedService, completion: onResult)
         }
     }
 
@@ -988,11 +1089,16 @@ class VPNManager: ObservableObject {
 
         minimumRecordingStatusTimestamp = currentTimestampMs()
         recordingState = .stopping(service: currentService)
-        runBundledClientCommand(["record", "stop"]) { [weak self] ok, output in
+        let onResult: (Bool, String) -> Void = { [weak self] ok, output in
             guard let self = self else { return }
             if !ok {
                 self.recordingState = .failed(service: currentService, reason: output.isEmpty ? "Failed to stop recording" : output)
             }
+        }
+        if isProxyMode {
+            runBundledClientCommand(["record", "stop"], completion: onResult)
+        } else {
+            sendRecordCommandViaHelper("record_stop", completion: onResult)
         }
     }
 
@@ -1024,6 +1130,37 @@ class VPNManager: ObservableObject {
 
             let connected = response.connected ?? false
             let message = response.message
+
+            // G-A4: authenticated terminal handshake refusal — the helper's
+            // getStatus() surfaces this as a well-known
+            // "AIVPN-STATUS rejected <token>" message (see rejectToken() in
+            // aivpn-helper/main.swift, itself scanning for the exact line
+            // client.rs's HandshakeReject arm prints — see
+            // handshake_reject_token there). Checked before the connected/
+            // failure branching below so it fires whether the poll still
+            // sees the pid alive (still-connecting window) or already
+            // reports "Process exited" (the client's own terminal_rejected
+            // reconnect-loop break in main.rs usually wins that race).
+            // Mirrors the Linux GUI's parse_status_line "rejected" arm,
+            // just localized here instead of hardcoded English.
+            if message.hasPrefix("AIVPN-STATUS rejected ") {
+                let token = String(message.dropFirst("AIVPN-STATUS rejected ".count))
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                self.isConnecting = false
+                self.isConnected = false
+                self.lastError = LocalizationManager.shared.rejectReasonText(token: token)
+                self.stopStatusPolling()
+                self.trafficTimer?.invalidate()
+                self.trafficTimer = nil
+                self.serverAdaptiveLevel = 0
+                self.postConnectionNotification(connected: false)
+                // The client already exited on its own (terminal_rejected
+                // stops main.rs's reconnect loop before it ever retries) —
+                // this just reaps any leftover helper-side pid/state so a
+                // stale entry can't linger; a no-op if it's already gone.
+                self.sendToHelper(HelperRequest(action: "disconnect", key: nil, fullTunnel: nil, binaryPath: nil, service: nil, mtlsCertPath: nil, excludeRoutes: nil, adaptiveLevel: nil, dnsProxy: nil, killSwitch: nil)) { _ in }
+                return
+            }
 
             if connected && !self.isConnected {
                 // Transition: connecting → connected
@@ -1065,6 +1202,11 @@ class VPNManager: ObservableObject {
                     self.isConnected = false
                     self.lastError = message
                     self.stopStatusPolling()
+                    // A transient ERROR line does not mean the root client
+                    // died — after declaring failure to the user, actually
+                    // tear the client down instead of leaving it running
+                    // detached from the UI state. No-op if it already exited.
+                    self.sendToHelper(HelperRequest(action: "disconnect", key: nil, fullTunnel: nil, binaryPath: nil, service: nil, mtlsCertPath: nil, excludeRoutes: nil, adaptiveLevel: nil, dnsProxy: nil, killSwitch: nil)) { _ in }
                 } else {
                     // Still connecting — update status message for user
                     self.lastError = nil
@@ -1161,8 +1303,25 @@ class VPNManager: ObservableObject {
                 return
             }
             
-            // Response message contains "sent:X,received:Y,quality:Z"
+            // Response message contains "sent:X,received:Y,since:E,quality:Z"
             let parts = response.message.components(separatedBy: ",")
+
+            // The client stamps its stats with a per-session `since:` epoch
+            // (unix ms). A CHANGE in since means the client silently
+            // re-established in-process: reset the displayed counters first so
+            // the new (lower) absolute values are an intentional restart, not
+            // a glitch, regardless of field order in the message.
+            for part in parts {
+                let kv = part.components(separatedBy: ":")
+                if kv.count == 2, kv[0] == "since", let value = Int64(kv[1]) {
+                    if self.lastTrafficSince != 0 && value != self.lastTrafficSince {
+                        self.bytesSent = 0
+                        self.bytesReceived = 0
+                    }
+                    self.lastTrafficSince = value
+                }
+            }
+
             for part in parts {
                 let kv = part.components(separatedBy: ":")
                 if kv.count == 2 {
@@ -1204,21 +1363,28 @@ class VPNManager: ObservableObject {
 
     private func handlePathUpdate(_ path: NWPath) {
         let previousStatus = lastPathStatus
-        let previousInterfaces = lastPathInterfaceTypes
-        let currentInterfaces = Set(path.availableInterfaces.map { $0.type })
+        let previousPrimary = lastPathPrimaryInterfaceType
+        // availableInterfaces is priority-ordered; the first entry is the one
+        // traffic actually rides. Comparing the whole SET restarted the tunnel
+        // whenever any SECONDARY interface appeared or vanished (iPhone hotspot
+        // plugged in, dock ethernet blip, Wi-Fi re-validating while Ethernet is
+        // primary) even though the ridden path never changed — the same
+        // reconnect ping-pong fixed on Android for standby-SIM announcements.
+        let currentPrimary = path.availableInterfaces.first?.type
 
         lastPathStatus = path.status
-        lastPathInterfaceTypes = currentInterfaces
+        lastPathPrimaryInterfaceType = currentPrimary
 
         // First callback only establishes the baseline — nothing has changed yet.
         guard let previousStatus = previousStatus else { return }
 
         // Network came back after being unreachable (e.g. wifi drop -> reconnect),
-        // or the set of available interfaces changed while still online (e.g.
+        // or the interface traffic rides changed while still online (e.g.
         // wifi -> cellular handover, or waking from sleep on a different network).
         let networkRestored = previousStatus != .satisfied && path.status == .satisfied
-        let interfaceSwitched = path.status == .satisfied && !previousInterfaces.isEmpty
-            && currentInterfaces != previousInterfaces
+        let interfaceSwitched = path.status == .satisfied
+            && previousPrimary != nil && currentPrimary != nil
+            && currentPrimary != previousPrimary
 
         guard networkRestored || interfaceSwitched else { return }
         guard isConnected, !isConnecting else { return }

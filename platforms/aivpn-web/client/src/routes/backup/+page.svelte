@@ -8,6 +8,8 @@
   let importError = $state(false);
   let exporting = $state(false);
   let dragOver = $state(false);
+  let exportingBootstrap = $state(false);
+  let bootstrapError = $state('');
 
   async function handleExport() {
     exporting = true;
@@ -25,6 +27,33 @@
       alert(e instanceof Error ? e.message : 'Export failed');
     } finally {
       exporting = false;
+    }
+  }
+
+  /**
+   * GET /api/v1/bootstrap/export (admin-only, gated in proxy.ts) — the same
+   * signed previous/current/next-epoch bootstrap descriptor JSON array an
+   * already-connected client receives, and what
+   * `--export-bootstrap-descriptor` prints on the CLI. Download-only, no
+   * mutation — plain direct apiFetch like handleExport above.
+   */
+  async function handleExportBootstrap() {
+    exportingBootstrap = true;
+    bootstrapError = '';
+    try {
+      const res = await apiFetch('/api/v1/bootstrap/export');
+      if (!res.ok) throw new Error(await res.text() || 'Export failed');
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `aivpn-bootstrap-descriptor-${new Date().toISOString().slice(0, 10)}.json`;
+      a.click();
+      URL.revokeObjectURL(url);
+    } catch (e: unknown) {
+      bootstrapError = e instanceof Error ? e.message : 'Export failed';
+    } finally {
+      exportingBootstrap = false;
     }
   }
 
@@ -76,6 +105,24 @@
     >
       <Download size={16} />
       {exporting ? 'Exporting...' : 'Export Backup'}
+    </button>
+  </div>
+
+  <div class="bg-white dark:bg-gray-800 rounded-xl p-6 border border-gray-200 dark:border-gray-700 space-y-3">
+    <h2 class="text-base font-semibold text-gray-900 dark:text-white">Bootstrap Descriptor</h2>
+    <p class="text-sm text-gray-500 dark:text-gray-400">Download the signed previous/current/next-epoch bootstrap descriptor to publish manually (same data an already-connected client receives, and what <code class="font-mono text-xs">--export-bootstrap-descriptor</code> prints on the CLI).</p>
+    {#if bootstrapError}
+      <div class="p-3 rounded-lg text-sm bg-red-50 dark:bg-red-900/20 text-red-700 dark:text-red-400 border border-red-200 dark:border-red-800">
+        {bootstrapError}
+      </div>
+    {/if}
+    <button
+      onclick={handleExportBootstrap}
+      disabled={exportingBootstrap}
+      class="flex items-center gap-2 px-4 py-2 bg-indigo-600 hover:bg-indigo-700 disabled:opacity-50 text-white rounded-lg text-sm font-medium"
+    >
+      <Download size={16} />
+      {exportingBootstrap ? 'Exporting...' : 'Export Bootstrap Descriptor'}
     </button>
   </div>
 

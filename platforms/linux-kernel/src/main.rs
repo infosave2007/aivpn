@@ -22,7 +22,10 @@ module! {
 }
 
 struct AivpnModule {
-    _dev: Pin<KBox<dev::AivpnDev>>,
+    /// `Option` so `Drop` can deregister the misc device (drop the
+    /// registration) BEFORE tearing down the session table — plain struct
+    /// fields would only drop AFTER the `Drop::drop` body runs.
+    dev: Option<Pin<KBox<dev::AivpnDev>>>,
 }
 
 impl kernel::Module for AivpnModule {
@@ -35,13 +38,22 @@ impl kernel::Module for AivpnModule {
         }
         let dev = dev::AivpnDev::new()?;
         pr_info!("aivpn: module loaded — /dev/aivpn ready\n");
-        Ok(Self { _dev: dev })
+        Ok(Self { dev: Some(dev) })
     }
 }
 
 impl Drop for AivpnModule {
     fn drop(&mut self) {
-        // SAFETY: misc device deregistered before this runs (via _dev Drop).
+        // Deregister /dev/aivpn FIRST. The Rust-for-Linux miscdevice vtable
+        // does not set file_operations.owner (verified: the fops table is
+        // zero-filled apart from open/release/ioctl and carries no
+        // __this_module relocation), so nothing pins this module while the
+        // device node exists — the ioctl dispatcher must be gone before the
+        // session table it dispatches into is torn down. Field drops would
+        // otherwise run only AFTER this body, i.e. after fini.
+        self.dev = None;
+        // SAFETY: called once at module unload, after the misc device above
+        // is deregistered, so no new ioctl can reach the session table.
         unsafe { aivpn_session_table_fini() };
         pr_info!("aivpn: module unloaded\n");
     }

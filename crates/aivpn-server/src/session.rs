@@ -88,6 +88,24 @@ pub const MAX_REKEY_SEND_ATTEMPTS: u32 = 5;
 /// tick, all `MAX_REKEY_SEND_ATTEMPTS` sends land within ~12 s of initiation.
 pub const REKEY_RETRANSMIT_SECS: u64 = 3;
 
+/// Extra FORWARD span precomputed into the expected-tag window while an
+/// inline rekey is pending (see `update_tag_window`). A client whose rekey
+/// RESPONSE was lost keeps uploading under the new (server-unreadable) keys
+/// with its shared monotonic counter, so its re-sent response — under the
+/// old keys the server still accepts — can arrive with a counter thousands
+/// past the server's frozen inbound counter (~170 pps over the 3 s
+/// retransmit cadence, more under heavier upload). Outside the precomputed
+/// band the response only had the globally rate-limited fallback scan
+/// (`recover_session_by_tag`, ±2048, 20 scans/s shared) — which the flood of
+/// undecryptable new-key data packets starves, so every retransmit was
+/// wasted and the tunnel healed only via the client's RX-silence reconnect.
+/// The response is content-authenticated (old-key AEAD + the client eph the
+/// server committed to derive from), so accepting it from a far-ahead
+/// counter is sound; validating it also advances `counter` to the client's
+/// live edge, which is exactly what resyncs the post-commit window. Bounded
+/// to cap the per-refresh tag precompute and `tag_map` memory.
+const REKEY_TAG_LOOKAHEAD: u64 = 4096;
+
 /// Session state
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionState {
@@ -106,15 +124,6 @@ pub struct Session {
     pub client_addr: SocketAddr,
     pub state: SessionState,
     pub keys: SessionKeys,
-    /// This peer speaks the pre-Variant-A protocol: tag-prefix framing and ONE
-    /// session key in both directions (`session_key_s2c` did not exist yet).
-    ///
-    /// It must be honoured at EVERY key derivation, not just the handshake: the
-    /// inline rekey installs freshly derived keys every couple of minutes, and
-    /// without this the downlink silently switches to a directional key the old
-    /// client cannot decrypt — it connects, works briefly, then reconnects
-    /// forever.
-    pub legacy_peer: bool,
     pub eph_pub: [u8; X25519_PUBLIC_KEY_SIZE],
 
     /// Packet counter for tag generation
@@ -185,6 +194,14 @@ pub struct Session {
     /// keyed by counter cannot alias; it is cleared each ratchet and bounded by
     /// the ~2s grace window, so it stays small.
     pub pre_ratchet_received: std::collections::HashSet<u64>,
+    /// The AEAD keys those `pre_ratchet_tags` were minted under, retained for
+    /// the same grace window. Without these the grace mechanism was inert:
+    /// the tag resolved, the packet passed anti-replay, and then decryption
+    /// used the freshly installed CURRENT key — so every in-flight old-key
+    /// packet failed authentication and was dropped anyway, which is exactly
+    /// what the grace window exists to prevent (worst on the high-RTT links
+    /// `rekey_grace` scales for). Cleared with the tags in `cleanup_expired`.
+    pub pre_ratchet_keys: Option<crypto::SessionKeys>,
 
     /// mTLS certificate gate — true means the client is cleared to send Data.
     /// Defaults to true (non-mTLS deployments are unaffected). When the
@@ -202,6 +219,52 @@ pub struct Session {
     /// carry `ControlPayload::PoolSync` messages — any other session sending
     /// PoolSync is an attempt to inject or overwrite client records.
     pub is_pool_peer: bool,
+
+    /// True when this session was established via the masked pool-client
+    /// handshake — a sibling aivpn server dialed us as a control-only
+    /// pool-client (PSK = `pool_client_psk(sync_key)`, DH against the shared
+    /// `pool_server_keypair(sync_key)`) to run DB anti-entropy. FORK-B of the
+    /// pool-sync redesign. Unlike `is_pool_peer` (a synthetic static-key
+    /// cluster session forced onto FIXED cluster framing), this session rides
+    /// a NORMAL per-session masked handshake — ServerHello PFS ratchet and
+    /// MaskUpdate mask adoption both apply — so it uses normal mask framing,
+    /// never cluster framing. It has NO `vpn_ip` and is never NATed; it is
+    /// only permitted to exchange `ControlPayload::PoolSync` /
+    /// `PoolStateDigest` for DB anti-entropy.
+    pub is_masked_pool_peer: bool,
+
+    /// Crypto-authenticated pool-node identity (Phase 4 — per-node
+    /// cryptographic identity). Set once a masked pool-peer session
+    /// (`is_masked_pool_peer`) proves its `node_id` via a valid
+    /// `ControlPayload::NodeEnrollment` — verified and bound/pinned by
+    /// `crate::node_registry::NodeRegistry::authenticate`. `None` until
+    /// proven, even if the peer has already self-asserted a `node_id`
+    /// elsewhere (e.g. in pool-sync payloads): this field supersedes any
+    /// self-asserted node_id for route authorization, since a self-asserted
+    /// id alone is trivially spoofable by anyone who can complete the masked
+    /// pool-client handshake.
+    pub verified_node_id: Option<String>,
+
+    /// Wave B-IP.2: the last `pool_partition::PartitionCheck` decision
+    /// computed for this session's peer (from an inbound
+    /// `ControlPayload::PartitionAnnounce`). `None` until the first
+    /// announce arrives. Used purely to dedupe the operator-visibility
+    /// log — a peer that keeps re-announcing the same conflict/mismatch
+    /// (or stays fine) logs only on a state TRANSITION, not on every
+    /// anti-entropy beacon.
+    pub last_partition_check: Option<crate::pool_partition::PartitionCheck>,
+
+    /// Return-routability gate for the (potentially amplifying)
+    /// `BootstrapDescriptorUpdate` burst: set once that burst has actually
+    /// been sent for this session. Sending is deferred from immediately
+    /// after ServerHello until the client proves — by sending a packet
+    /// tagged with the ratcheted keys — that it genuinely received
+    /// ServerHello at its real address (see the `is_ratcheted_tag` branch in
+    /// `Gateway::handle_packet`). Without this a spoofed-source handshake
+    /// alone triggers a multi-packet reply burst toward the spoofed victim
+    /// with no proof the initiator can even receive it — a reflection/
+    /// amplification primitive.
+    pub bootstrap_descriptors_sent: bool,
 
     /// Pending keypair for in-flight key rotation. Set when server sends KeyRotate,
     /// cleared when client responds.
@@ -236,11 +299,28 @@ pub struct Session {
     /// Next expected FEC group_seq. Mismatches indicate a lost FecRepair
     /// and mean the XOR buffer is stale — recovery must be skipped.
     pub fec_pending_seq: u16,
+    /// Inner seq_num of the most recently processed FecRepair packet.
+    /// The client numbers all inner packets monotonically, so a Data packet
+    /// arriving after this repair with a seq NOT AHEAD of it belongs to an
+    /// already-closed group: it is either the just-FEC-recovered packet
+    /// arriving late (a duplicate) or a straggler whose group is gone —
+    /// either way it must not be delivered again nor pollute the new group's
+    /// XOR accumulator (a false `recv == group_size - 1` trigger recovers
+    /// garbage). None until the first FecRepair is seen.
+    pub fec_repair_seq_hi: Option<u16>,
     /// Highest mask-catalog version already pushed to this client. The gateway
     /// bumps a global catalog version whenever the mask set changes; when this
     /// lags behind, the next Keepalive triggers a fresh `MaskCatalog` push.
     /// Starts at 0 so the catalog is sent once shortly after connect.
     pub mask_catalog_version_sent: u64,
+
+    /// True once a `ControlPayload::Capabilities` announcement (this
+    /// session's server-assigned role) has been pushed to the client.
+    /// Mirrors `mask_catalog_version_sent`'s send-once gate, but a plain
+    /// bool suffices — role doesn't change mid-session the way the mask
+    /// catalog does; a role change takes effect on the client's next
+    /// reconnect, when a fresh `Session` (and a fresh `false`) is created.
+    pub capabilities_sent: bool,
 
     /// Signature of the session state last pushed to the kernel accelerator
     /// (c2s key + wire offsets). 0 = never installed. When the live state
@@ -263,7 +343,26 @@ pub struct Session {
     /// rebuild EVERY session's window — O(sessions × window) BLAKE3 per miss).
     /// 0 = never built.
     pub tag_window_tw: u64,
+
+    /// 1a perf fix: pre-generated pool of mask-dependent headers (MDH) for
+    /// this session's current `mask`, so `next_mdh()` round-robins through
+    /// cached headers on the downlink hot path instead of calling the mask's
+    /// RNG-based `HeaderSpec::generate()` fresh for every packet. Empty when
+    /// `mask` is `None` or has no dynamic `header_spec` (a static
+    /// `header_template` mask always yields the same bytes, so no pool is
+    /// needed). Rebuilt by `rebuild_mdh_pool()` whenever `mask` changes —
+    /// scoped per-session (not a global cache) so per-session polymorphic
+    /// mask variants (unique `mask_id` per session) never share a pool and a
+    /// mask switch can never serve a stale header.
+    mdh_pool: Vec<Vec<u8>>,
+    /// Round-robin cursor into `mdh_pool`.
+    mdh_pool_idx: usize,
 }
+
+/// Number of headers pre-generated per mask pool (1a). Large enough that the
+/// on-wire header distribution still looks freshly random across a session's
+/// packet stream; small enough to build in microseconds on a mask switch.
+const MDH_POOL_SIZE: usize = 64;
 
 /// Anti-replay bitmap tracking which of the last `TAG_WINDOW_SIZE` counters
 /// (relative to the newest seen) have already been received. Bit 0 is the
@@ -346,7 +445,6 @@ impl Session {
     ) -> Self {
         let now = Instant::now();
         Self {
-            legacy_peer: false,
             session_id,
             client_addr,
             state: SessionState::Pending,
@@ -379,9 +477,14 @@ impl Session {
             pre_ratchet_tags: HashMap::new(),
             pre_ratchet_expire: None,
             pre_ratchet_received: std::collections::HashSet::new(),
+            pre_ratchet_keys: None,
             mtls_ok: true,
             is_site_peer: false,
             is_pool_peer: false,
+            is_masked_pool_peer: false,
+            verified_node_id: None,
+            last_partition_check: None,
+            bootstrap_descriptors_sent: false,
             pending_rekey_keypair: None,
             pending_rekey_attempts: 0,
             last_keyrotate_sent_at: now,
@@ -393,11 +496,56 @@ impl Session {
             fec_xor_buf: Vec::new(),
             fec_xor_len: 0,
             fec_pending_seq: 0,
+            fec_repair_seq_hi: None,
             mask_catalog_version_sent: 0,
+            capabilities_sent: false,
             kernel_install_sig: 0,
             kernel_dl_window: 0,
             tag_window_tw: 0,
+            mdh_pool: Vec::new(),
+            mdh_pool_idx: 0,
         }
+    }
+
+    /// Rebuild `mdh_pool` for the session's current `mask`. Cheap relative to
+    /// per-packet cost but never called on the hot path itself — only from
+    /// the two places `mask` is assigned (initial bootstrap mask and
+    /// `commit_pending_mask` below).
+    pub fn rebuild_mdh_pool(&mut self) {
+        self.mdh_pool.clear();
+        self.mdh_pool_idx = 0;
+        if let Some(spec) = self.mask.as_ref().and_then(|m| m.header_spec.as_ref()) {
+            let mut rng = rand::thread_rng();
+            self.mdh_pool = (0..MDH_POOL_SIZE)
+                .map(|_| spec.generate(&mut rng))
+                .collect();
+        }
+    }
+
+    /// Next mask-dependent header for a downlink packet (1a). Round-robins
+    /// through the pre-generated pool — no RNG call on the hot path — falling
+    /// back to the static `header_template` for masks with no `header_spec`,
+    /// and lazily (re)building the pool if it is unexpectedly empty (should
+    /// not happen once `rebuild_mdh_pool` runs on every mask assignment, but
+    /// keeps this safe against future call sites that set `mask` directly).
+    pub fn next_mdh(&mut self) -> Vec<u8> {
+        let Some(mask) = self.mask.as_ref() else {
+            return Vec::new();
+        };
+        if mask.header_spec.is_none() {
+            return mask.header_template.clone();
+        }
+        if self.mdh_pool.is_empty() {
+            self.rebuild_mdh_pool();
+        }
+        if self.mdh_pool.is_empty() {
+            // header_spec generated zero-length headers (e.g. no fields) —
+            // nothing to round-robin; return the empty header directly.
+            return Vec::new();
+        }
+        let idx = self.mdh_pool_idx % self.mdh_pool.len();
+        self.mdh_pool_idx = self.mdh_pool_idx.wrapping_add(1);
+        self.mdh_pool[idx].clone()
     }
 
     /// Compute next nonce for encryption from send_counter (u64)
@@ -422,7 +570,18 @@ impl Session {
         self.tag_window_base = self.counter;
         let window_back = TAG_WINDOW_SIZE as u64 - 1;
         let window_start = self.counter.saturating_sub(window_back);
-        let window_end = self.counter.saturating_add(TAG_WINDOW_SIZE as u64 - 1);
+        // While a rekey is pending, reach further FORWARD so the client's
+        // re-sent KeyRotate response — old-key authenticated but potentially
+        // thousands of counters ahead of our frozen inbound counter — lands
+        // in the precomputed band and the O(1) tag_map path (see
+        // REKEY_TAG_LOOKAHEAD).
+        let window_fwd = TAG_WINDOW_SIZE as u64 - 1
+            + if self.pending_rekey_keypair.is_some() {
+                REKEY_TAG_LOOKAHEAD
+            } else {
+                0
+            };
+        let window_end = self.counter.saturating_add(window_fwd);
 
         for counter_val in window_start..=window_end {
             let tag =
@@ -567,10 +726,25 @@ impl Session {
         }
     }
 
-    /// Returns true if the given counter belongs to the pre-ratchet tag set
-    /// (i.e. the tag matched old keys during the grace window).
-    pub fn is_pre_ratchet_counter(&self, counter: u64) -> bool {
-        self.pre_ratchet_tags.contains_key(&counter)
+    /// Pre-ratchet keys, but only while the grace window is still open.
+    ///
+    /// Deliberately replaces the old `is_pre_ratchet_counter(counter)` helper:
+    /// counter membership CANNOT identify the epoch. `complete_ratchet` resets
+    /// `counter` to 0 and the ratcheted tag window is minted for 0..512, while
+    /// `pre_ratchet_tags` (an old window built by `update_tag_window`, whose
+    /// start is `saturating_sub`bed to 0 for the small counters seen at the
+    /// post-handshake ratchet) also covers 0..512 — so the two counter spaces
+    /// overlap almost entirely. Only which key actually authenticates the
+    /// packet can tell the epochs apart.
+    pub fn pre_ratchet_keys_in_grace(&self) -> Option<&crypto::SessionKeys> {
+        let live = self
+            .pre_ratchet_expire
+            .is_some_and(|expire| Instant::now() < expire);
+        if live {
+            self.pre_ratchet_keys.as_ref()
+        } else {
+            None
+        }
     }
 
     /// Mark a pre-ratchet counter as received so it cannot be replayed (C-S-2).
@@ -661,7 +835,9 @@ impl Session {
             self.pre_ratchet_expire = Some(Instant::now() + grace);
             self.pre_ratchet_received.clear();
 
-            self.keys = ratcheted_keys;
+            // Retain the keys those tags belong to for the same window, or the
+            // grace is inert (see `pre_ratchet_keys`).
+            self.pre_ratchet_keys = Some(std::mem::replace(&mut self.keys, ratcheted_keys));
             self.counter = 0;
             self.send_counter = 0;
             self.tag_window_base = self.counter;
@@ -670,7 +846,16 @@ impl Session {
             self.pending_bytes_in = 0;
             self.pending_bytes_out = 0;
             self.is_ratcheted = true;
-            self.server_eph_pub = None;
+            // Keep `server_eph_pub` (a PUBLIC key) — the client sends its
+            // transcript-bound `DeviceEnrollment` proof immediately AFTER the
+            // ratchet, and the server must still hold this ratchet's
+            // `server_eph_pub` to recompute the expected proof (see
+            // `verify_device_enrollment_proof`). PFS only requires erasing the
+            // PRIVATE ephemeral (the `server_eph_kp` secret, already dropped
+            // after DH2 in `create_session`); retaining the public half leaks
+            // nothing. Nulling it here made the server reject every enrollment
+            // with Shutdown reason 3, killing the session right after the
+            // handshake — the whole data plane went dead.
             self.server_hello_signature = None;
         }
     }
@@ -685,6 +870,9 @@ impl Session {
                 let (new_mask, _) = self.pending_mask.take().unwrap();
                 info!("Committing deferred mask switch to '{}'", new_mask.mask_id);
                 self.mask = Some(new_mask);
+                // 1a: the old pool's headers belong to the mask we just left
+                // — rebuild before the next downlink packet picks one up.
+                self.rebuild_mdh_pool();
                 // Reset FSM state for the new mask
                 self.fsm_state = 0;
                 self.fsm_packets = 0;
@@ -776,14 +964,48 @@ impl SessionManager {
         preshared_key: Option<[u8; 32]>,
         cand_tag: &[u8; TAG_SIZE],
     ) -> bool {
+        let Ok(dh1) = self.server_keys.compute_shared(eph_pub) else {
+            return false;
+        };
+        self.handshake_tag_precheck_inner(eph_pub, preshared_key, cand_tag, &dh1)
+    }
+
+    /// FORK-B of the pool-sync redesign: identical cheap pre-check as
+    /// `handshake_tag_precheck`, but for a sibling aivpn server dialing us as
+    /// a masked pool-client. The DH uses the shared pool server keypair
+    /// (`static_kp`, derived from `sync_key` via `crypto::pool_server_keypair`)
+    /// instead of `self.server_keys`, since the dialer computed its side of
+    /// DH1 against that shared keypair's public key, not our real long-term
+    /// server static key.
+    pub fn handshake_tag_precheck_with_static(
+        &self,
+        eph_pub: &[u8; X25519_PUBLIC_KEY_SIZE],
+        preshared_key: Option<[u8; 32]>,
+        cand_tag: &[u8; TAG_SIZE],
+        static_kp: &crypto::KeyPair,
+    ) -> bool {
+        let Ok(dh1) = static_kp.compute_shared(eph_pub) else {
+            return false;
+        };
+        self.handshake_tag_precheck_inner(eph_pub, preshared_key, cand_tag, &dh1)
+    }
+
+    /// Shared tag-search loop behind `handshake_tag_precheck` and
+    /// `handshake_tag_precheck_with_static` — the two differ only in which
+    /// key material produces `dh1`; everything after that (session-key
+    /// derivation + windowed tag search) is identical.
+    fn handshake_tag_precheck_inner(
+        &self,
+        eph_pub: &[u8; X25519_PUBLIC_KEY_SIZE],
+        preshared_key: Option<[u8; 32]>,
+        cand_tag: &[u8; TAG_SIZE],
+        dh1: &[u8; 32],
+    ) -> bool {
         // Small counter window — init is counter 0; a few extra tolerate the rare
         // case where the very first datagram reordered ahead of the init is the
         // one that reaches the scan.
         const HANDSHAKE_TAG_SEARCH: u64 = 16;
-        let Ok(dh1) = self.server_keys.compute_shared(eph_pub) else {
-            return false;
-        };
-        let keys = crypto::derive_session_keys(&dh1, preshared_key.as_ref(), eph_pub);
+        let keys = crypto::derive_session_keys(dh1, preshared_key.as_ref(), eph_pub);
         let now = crypto::current_timestamp_ms();
         let base_tw = crypto::compute_time_window(now, DEFAULT_WINDOW_MS);
         // ±2 windows of clock-skew tolerance for the 0-RTT handshake. Data-plane
@@ -871,6 +1093,89 @@ impl SessionManager {
 
         // DH1: server_static * client_eph → initial keys (0-RTT)
         let dh1 = self.server_keys.compute_shared(&eph_pub)?;
+
+        let session =
+            self.build_and_insert_session(client_addr, eph_pub, dh1, preshared_key, false)?;
+        let session_id = session.lock().session_id;
+
+        // Assign VPN IP and register mapping.
+        // Priority: 1) static IP from client config, 2) reused IP, 3) auto-assign
+        let vpn_ip = if let Some(ip) = static_vpn_ip.or(reused_vpn_ip) {
+            // Static or reused IP — ensure it's removed from the free pool
+            self.ip_pool.lock().remove(&ip.octets()[3]);
+            Some(ip)
+        } else {
+            // Allocate the lowest available IP from the pool
+            self.ip_pool
+                .lock()
+                .pop_first()
+                .map(|octet| Ipv4Addr::new(10, 0, 0, octet))
+        };
+
+        if let Some(vpn_ip) = vpn_ip {
+            session.lock().vpn_ip = Some(vpn_ip);
+            self.vpn_ip_map.insert(vpn_ip, session_id);
+            debug!("Assigned VPN IP {} to session", vpn_ip);
+        }
+
+        Ok(session)
+    }
+
+    /// FORK-B of the pool-sync redesign: register a session for a sibling
+    /// aivpn server that dialed us as a control-only masked pool-client, to
+    /// run DB anti-entropy (`ControlPayload::PoolSync` / `PoolStateDigest`).
+    ///
+    /// Unlike `create_pool_peer_session` (a synthetic, handshake-free,
+    /// static-key cluster session forced onto FIXED cluster framing), this
+    /// rides the SAME masked-handshake machinery as `create_session` — DH1
+    /// against the shared `pool_kp` (= `crypto::pool_server_keypair(sync_key)`)
+    /// with `pool_psk` (= `crypto::pool_client_psk(sync_key)`) as the initial
+    /// PSK, followed by the identical PFS ratchet prep + ServerHello signature
+    /// + tag-window population — so the dialer's normal ServerHello/ratchet/
+    /// MaskUpdate flow works completely unchanged and the session uses normal
+    /// mask framing, not cluster framing.
+    ///
+    /// No VPN IP is assigned (no `ip_pool`/`vpn_ip_map` touched) and the
+    /// per-IP (5) / per-subnet (10) caps in `create_session` are bypassed —
+    /// those caps defend against unauthenticated, spoofable client floods,
+    /// whereas this peer is already authenticated by the pool-client PSK.
+    /// The `MAX_SESSIONS` guard is still enforced.
+    pub fn create_masked_pool_peer_session(
+        &self,
+        client_addr: SocketAddr,
+        eph_pub: [u8; X25519_PUBLIC_KEY_SIZE],
+        pool_kp: &crypto::KeyPair,
+        pool_psk: &[u8; 32],
+    ) -> Result<Arc<Mutex<Session>>> {
+        if self.sessions.len() >= MAX_SESSIONS {
+            return Err(Error::Session("Max sessions reached".into()));
+        }
+
+        // DH1: shared pool server keypair * dialer's ephemeral pub → initial keys
+        let dh1 = pool_kp.compute_shared(&eph_pub)?;
+
+        self.build_and_insert_session(client_addr, eph_pub, dh1, Some(*pool_psk), true)
+    }
+
+    /// Shared core of `create_session` and `create_masked_pool_peer_session`:
+    /// derive initial keys from the caller-supplied `dh1` + PSK, run PFS
+    /// ratchet preparation (fresh server ephemeral keypair, DH2, ratcheted
+    /// keys, ServerHello signature), build the `Session`, populate both tag
+    /// windows into `tag_map`, and insert the session into `self.sessions`.
+    ///
+    /// Does NOT touch VPN-IP assignment or any session-count/rate caps —
+    /// callers handle those before/after, since the two session kinds differ
+    /// there (a masked pool peer gets no VPN IP and bypasses the per-IP/
+    /// per-subnet caps that only defend against unauthenticated client
+    /// floods).
+    fn build_and_insert_session(
+        &self,
+        client_addr: SocketAddr,
+        eph_pub: [u8; X25519_PUBLIC_KEY_SIZE],
+        dh1: [u8; 32],
+        preshared_key: Option<[u8; 32]>,
+        is_masked_pool_peer: bool,
+    ) -> Result<Arc<Mutex<Session>>> {
         // Never log key material (DH shared secret, PSK, tag_secret) — even at
         // trace, RUST_LOG is operator-controllable and these secrets are what
         // make sessions unlinkable. eph_pub is a public key, so it is safe to log.
@@ -919,6 +1224,7 @@ impl SessionManager {
             sess.server_eph_pub = Some(server_eph_pub);
             sess.server_hello_signature = Some(signature);
             sess.ratcheted_keys = Some(ratcheted_keys);
+            sess.is_masked_pool_peer = is_masked_pool_peer;
 
             // Compute initial tags
             sess.update_tag_window();
@@ -935,26 +1241,6 @@ impl SessionManager {
 
         // Insert into session map
         self.sessions.insert(session_id, session.clone());
-
-        // Assign VPN IP and register mapping.
-        // Priority: 1) static IP from client config, 2) reused IP, 3) auto-assign
-        let vpn_ip = if let Some(ip) = static_vpn_ip.or(reused_vpn_ip) {
-            // Static or reused IP — ensure it's removed from the free pool
-            self.ip_pool.lock().remove(&ip.octets()[3]);
-            Some(ip)
-        } else {
-            // Allocate the lowest available IP from the pool
-            self.ip_pool
-                .lock()
-                .pop_first()
-                .map(|octet| Ipv4Addr::new(10, 0, 0, octet))
-        };
-
-        if let Some(vpn_ip) = vpn_ip {
-            session.lock().vpn_ip = Some(vpn_ip);
-            self.vpn_ip_map.insert(vpn_ip, session_id);
-            debug!("Assigned VPN IP {} to session", vpn_ip);
-        }
 
         Ok(session)
     }
@@ -984,6 +1270,65 @@ impl SessionManager {
         for session_id in to_remove {
             info!(
                 "Removing stale session for IP {} after successful re-handshake",
+                ip
+            );
+            if self.remove_session(&session_id).is_some() {
+                removed.push(session_id);
+            }
+        }
+        removed
+    }
+
+    /// B1 fix companion: dedup masked pool-client peer sessions from the same
+    /// source IP. Unlike `cleanup_old_sessions_for_ip`, this ONLY removes
+    /// sessions with `is_masked_pool_peer == true` — ordinary client, pool-peer
+    /// (`is_pool_peer`), and site-peer (`is_site_peer`) sessions from that same
+    /// IP are never touched, since a masked pool-client dialer's source IP can
+    /// legitimately be a sibling aivpn node that also happens to be a normal
+    /// client's egress (or vice versa) and those session kinds have entirely
+    /// separate dedup rules already.
+    ///
+    /// `create_masked_pool_peer_session` gives every dialer handshake a fresh
+    /// random session_id (`build_and_insert_session`, unlike the deterministic
+    /// `create_pool_peer_session`), and masked peers have neither a `vpn_ip`
+    /// nor a `client_id`, so none of the existing dedup paths
+    /// (`cleanup_old_sessions_for_ip`/`_vpn_ip`/`_client_id`) ever fire for
+    /// them. Without an explicit dedup call, every reconnect from a legitimate
+    /// dialer (backoff 2–30 s, see `pool_dialer.rs`) — or every handshake from
+    /// anyone who knows the pool-client PSK — piles up a new permanent session
+    /// instead of replacing the old one. The caller (gateway, after a masked
+    /// handshake validates) is expected to call this right after
+    /// `create_masked_pool_peer_session` succeeds, mirroring how
+    /// `create_session` callers must call `cleanup_old_sessions_for_ip`.
+    ///
+    /// Returns the list of removed session IDs (for stopping recordings, etc.,
+    /// mirroring the other `cleanup_*` helpers — masked peers never have
+    /// recordings in practice, but the shape stays consistent).
+    pub fn cleanup_masked_peer_sessions_for_ip(
+        &self,
+        ip: &std::net::IpAddr,
+        keep_session_id: &[u8; 16],
+    ) -> Vec<[u8; 16]> {
+        let to_remove: Vec<[u8; 16]> = self
+            .sessions
+            .iter()
+            .filter_map(|entry| {
+                let session = entry.value().lock();
+                if session.is_masked_pool_peer
+                    && session.client_addr.ip() == *ip
+                    && entry.key() != keep_session_id
+                {
+                    Some(*entry.key())
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        let mut removed = Vec::new();
+        for session_id in to_remove {
+            info!(
+                "Removing stale masked pool-peer session for IP {} after successful re-handshake",
                 ip
             );
             if self.remove_session(&session_id).is_some() {
@@ -1229,19 +1574,6 @@ impl SessionManager {
         }
     }
 
-    /// Refresh stale tag windows (time window may have advanced) and try to
-    /// find a session matching the given tag.
-    ///
-    /// DoS containment: a fallback miss used to rebuild EVERY session's tag
-    /// windows (O(sessions × window) BLAKE3 per miss) and run the expensive
-    /// `validate_tag` (with its on-the-fly ±1-window search) against every
-    /// session — an attacker-influenceable CPU amplifier. Now the rebuild is
-    /// skipped for sessions whose windows are already current (amortized to
-    /// once per session per time window), and full validation only runs for
-    /// sessions belonging to the packet's source IP (mirroring
-    /// `recover_session_by_tag`'s scoping). Roamed clients whose windows were
-    /// stale are still recovered by the caller's O(1) re-probe of the
-    /// refreshed `tag_map`.
     /// Whether an active session is already bound to this exact peer address.
     ///
     /// A packet from such a peer that misses the tag lookup is a stale or
@@ -1255,6 +1587,19 @@ impl SessionManager {
             .any(|entry| entry.value().lock().client_addr == *addr)
     }
 
+    /// Refresh stale tag windows (time window may have advanced) and try to
+    /// find a session matching the given tag.
+    ///
+    /// DoS containment: a fallback miss used to rebuild EVERY session's tag
+    /// windows (O(sessions × window) BLAKE3 per miss) and run the expensive
+    /// `validate_tag` (with its on-the-fly ±1-window search) against every
+    /// session — an attacker-influenceable CPU amplifier. Now the rebuild is
+    /// skipped for sessions whose windows are already current (amortized to
+    /// once per session per time window), and full validation only runs for
+    /// sessions belonging to the packet's source IP (mirroring
+    /// `recover_session_by_tag`'s scoping). Roamed clients whose windows were
+    /// stale are still recovered by the caller's O(1) re-probe of the
+    /// refreshed `tag_map`.
     pub fn refresh_and_find_by_tag(
         &self,
         tag: &[u8; TAG_SIZE],
@@ -1312,13 +1657,21 @@ impl SessionManager {
     ) -> Option<(Arc<Mutex<Session>>, u64, bool)> {
         let current_tw =
             crypto::compute_time_window(crypto::current_timestamp_ms(), DEFAULT_WINDOW_MS);
-        // Bounded ± search around the session's last known counter. The former
-        // forward-only 65536 window meant 3 × 65 536 ≈ 196k BLAKE3 per matching
-        // session — a spoofed tag from a known client IP could force the full
-        // scan (CPU-DoS). ±2048 (4097 × 3 ≈ 12k) still absorbs realistic counter
-        // drift from a client race while capping the attacker's work; the per-IP
-        // session limit (5) bounds the total.
-        const RECOVERY_RANGE: i64 = 2048;
+        // Bounded forward-only search ahead of the session's last known
+        // counter. The former forward-only 65536 window meant 3 × 65 536 ≈
+        // 196k BLAKE3 per matching session — a spoofed tag from a known client
+        // IP could force the full scan (CPU-DoS). 2048 (2049 × 3 ≈ 6k) still
+        // absorbs realistic counter drift from a client race while capping
+        // the attacker's work; the per-IP session limit (5) bounds the total.
+        //
+        // M2: the search is FORWARD-only because the client counter is
+        // monotone — legitimate drift is always the client running AHEAD of
+        // the server (the documented client-race case). A backward match can
+        // only be a replayed old packet; accepting it used to rewind
+        // `s.counter`, so the next legitimate packet shifted the replay
+        // bitmap by ≥ TAG_WINDOW_SIZE and wiped the session's whole
+        // anti-replay history (ReplayWindow::clear).
+        const RECOVERY_RANGE: u64 = 2048;
 
         for entry in self.sessions.iter() {
             let session = entry.value().clone();
@@ -1335,12 +1688,25 @@ impl SessionManager {
 
             for tw_offset in [0i64, -1, 1] {
                 let tw = (current_tw as i64 + tw_offset) as u64;
-                for i in -RECOVERY_RANGE..=RECOVERY_RANGE {
-                    let c = base.wrapping_add(i as u64);
+                for i in 0..=RECOVERY_RANGE {
+                    let c = base.wrapping_add(i);
                     let expected = crypto::generate_resonance_tag(&tag_secret, c, tw);
                     if bool::from(expected.ct_eq(tag)) {
+                        // c > base is fresh by construction (`counter` is the
+                        // highest validated counter). c == base is fresh only
+                        // when the newest counter was never marked received
+                        // (fresh session); otherwise this is a replay of the
+                        // latest packet — reject without touching state.
+                        if c == base && session.lock().received_bitmap.get_bit(0) {
+                            debug!(
+                                "Counter recovery: counter {} already received — \
+                                 rejecting replay",
+                                c
+                            );
+                            return None;
+                        }
                         info!(
-                            "Counter recovery: found counter {} (drift={}) for session",
+                            "Counter recovery: found counter {} (drift=+{}) for session",
                             c, i
                         );
                         // Update tag window to the recovered counter (mutex already released).
@@ -1350,7 +1716,9 @@ impl SessionManager {
                             // do targeted removal (retain would create a visibility gap).
                             let old_tags: Vec<[u8; TAG_SIZE]> =
                                 s.expected_tags.values().cloned().collect();
-                            s.counter = c;
+                            // Shift the replay bitmap and mark this counter
+                            // received (ingress marks it again — idempotent).
+                            s.mark_tag_received(c);
                             s.update_tag_window();
                             for t in &old_tags {
                                 self.tag_map.remove(t);
@@ -1530,6 +1898,7 @@ impl SessionManager {
                 sess.pre_ratchet_tags.clear();
                 sess.pre_ratchet_received.clear();
                 sess.pre_ratchet_expire = None;
+                sess.pre_ratchet_keys = None;
             }
         }
 
@@ -1544,6 +1913,23 @@ impl SessionManager {
                 // inbound peer traffic. Evicting one silently kills pool/site
                 // sync from that peer until a full restart, because nothing
                 // ever re-creates a removed peer session.
+                //
+                // `is_masked_pool_peer` sessions are deliberately EXCLUDED from
+                // this exemption (B1 fix): unlike the synthetic sync_key
+                // sessions above, a masked pool-client session is a real,
+                // ordinary masked handshake — `build_and_insert_session` runs
+                // the identical PFS/keepalive machinery a normal client uses,
+                // and the dialer (a normal `AivpnClient` in `control_only`
+                // mode, see pool_dialer.rs) sends real protocol Keepalive
+                // packets on the same NAT-capped interval (≤25 s) as any
+                // client, refreshing `last_seen` well inside the (default
+                // 30 s) idle window. So a LIVE dialer session is never
+                // wrongly evicted here. Leaving it exempt let every dialer
+                // reconnect (or unauthenticated handshake against the
+                // pool-client PSK) accumulate a permanent session — no
+                // dedup path fires for these (no vpn_ip, no client_id) and
+                // nothing else ever removes them — exhausting MAX_SESSIONS
+                // in seconds. A dead/gone dialer now ages out normally.
                 if sess.is_pool_peer || sess.is_site_peer {
                     return false;
                 }
@@ -1634,15 +2020,9 @@ impl SessionManager {
     pub fn update_session_mask(
         &self,
         session_id: &[u8; 16],
-        mut new_mask: MaskProfile,
+        new_mask: MaskProfile,
     ) -> Option<(Arc<Mutex<Session>>, SocketAddr)> {
         if let Some(session) = self.sessions.get(session_id) {
-            // A pre-Variant-A peer can only parse tag-prefix framing, so a mask
-            // pushed to it must keep that layout whatever the profile says —
-            // otherwise the offsets diverge the moment it applies the update.
-            if session.lock().legacy_peer {
-                new_mask.tag_offset = aivpn_common::mask::LEGACY_TAG_OFFSET;
-            }
             let client_addr;
             {
                 let mut sess = session.lock();
@@ -1748,7 +2128,16 @@ impl SessionManager {
             let session_id = *entry.key();
             let mut sess = entry.value().lock();
 
-            // Skip pool/site peers and sessions still pending ratchet.
+            // Skip pool/site peers (synthetic sync_key sessions with no real
+            // ephemeral ratchet state) and sessions still pending ratchet.
+            //
+            // `is_masked_pool_peer` sessions are deliberately NOT skipped here
+            // (B3 fix): `build_and_insert_session` runs the same PFS ratchet
+            // preparation for a masked pool peer as for a normal client
+            // (fresh server ephemeral keypair, DH2, ratcheted keys), so these
+            // sessions have real ratchet state and should rotate keys like
+            // any other session instead of running on a single static key
+            // for the session's entire (potentially days-long) lifetime.
             if sess.is_pool_peer || sess.is_site_peer || !sess.is_ratcheted {
                 continue;
             }
@@ -1774,7 +2163,16 @@ impl SessionManager {
             sess.pending_rekey_keypair = Some(server_rekey_kp);
             sess.pending_rekey_attempts = 1;
             sess.last_keyrotate_sent_at = now;
+            // Rebuild the expected-tag window NOW so the pending-rekey
+            // forward lookahead (see `update_tag_window`) is populated before
+            // the client's response can arrive; the tag_map refresh below
+            // publishes it.
+            sess.update_tag_window();
             due.push((session_id, new_eph_pub));
+        }
+
+        for (session_id, _) in &due {
+            self.refresh_session_tags(session_id);
         }
 
         due
@@ -1883,20 +2281,11 @@ impl SessionManager {
         // Mirror exactly what the client does:
         // new_keys = derive_session_keys(&dh_rekey, Some(&current_session_key), &client_rekey_eph_pub)
         let current_session_key = sess.keys.session_key;
-        let new_keys = {
-            let mut k = crypto::derive_session_keys(
-                &dh_rekey,
-                Some(&current_session_key),
-                client_rekey_eph_pub,
-            );
-            // A pre-Variant-A peer has no directional split — keep serving it
-            // the single-key contract across the rekey, or its downlink dies
-            // here and the client reconnects forever (see `legacy_peer`).
-            if sess.legacy_peer {
-                k.session_key_s2c = k.session_key;
-            }
-            k
-        };
+        let new_keys = crypto::derive_session_keys(
+            &dh_rekey,
+            Some(&current_session_key),
+            client_rekey_eph_pub,
+        );
 
         // Purge any PREVIOUS grace window's tags, then drop stale ratcheted
         // tags. The CURRENT expected_tags deliberately STAY in the global
@@ -1918,8 +2307,10 @@ impl SessionManager {
         sess.pre_ratchet_expire = Some(Instant::now() + grace);
         sess.pre_ratchet_received.clear();
 
-        // Install new keys.
-        sess.keys = new_keys;
+        // Install new keys, retaining the outgoing ones for the grace window so
+        // in-flight old-key packets can actually be decrypted (see
+        // `pre_ratchet_keys`) — preserving only their tags is not enough.
+        sess.pre_ratchet_keys = Some(std::mem::replace(&mut sess.keys, new_keys));
         // BOTH counters stay MONOTONIC across the inline rekey. The AEAD key
         // changes here (new tag_secret / session_key_s2c / session_key_c2s), so
         // continuing the counters never reuses a (key, nonce) pair.
@@ -2433,5 +2824,424 @@ mod tests {
             sm.rekey_retransmits_due().is_empty(),
             "a committed rekey must never be retransmitted"
         );
+    }
+
+    /// M3 regression (legacy-client safety net): a client whose rekey RESPONSE
+    /// was lost keeps uploading under the NEW (server-unreadable) keys with its
+    /// shared monotonic counter, so its re-sent response — under the OLD keys
+    /// the server still accepts — arrives with a counter far past the server's
+    /// frozen inbound counter (~170 pps × the 3 s retransmit cadence already
+    /// exceeds the plain ±TAG_WINDOW_SIZE band). While the rekey is pending
+    /// `update_tag_window` reaches REKEY_TAG_LOOKAHEAD counters forward, so
+    /// the re-sent response still validates and the rekey commits instead of
+    /// burning all MAX_REKEY_SEND_ATTEMPTS retransmits and dying to the
+    /// client's RX-silence watchdog. (New clients additionally keep TX on the
+    /// old keys until commit, so the band never freezes at all.)
+    #[test]
+    fn rekey_resent_response_validates_past_frozen_counter() {
+        let sm = make_manager();
+        let sid = [11u8; 16];
+        insert_overdue_session(&sm, sid);
+
+        // Simulate a live session: 1000 packets already validated.
+        {
+            let entry = sm.sessions.get(&sid).unwrap();
+            let mut s = entry.value().lock();
+            s.mark_tag_received(1000);
+        }
+
+        let due = sm.start_rekeying_sessions();
+        assert_eq!(due.len(), 1, "overdue session must start rekeying");
+
+        // The client's response is lost; it switches to the new keys and keeps
+        // uploading. Those packets are undecryptable to the pre-commit server
+        // (different tag_secret) — the inbound counter stays frozen at 1000.
+        {
+            let entry = sm.sessions.get(&sid).unwrap();
+            let s = entry.value().lock();
+            let tw = crypto::compute_time_window(crypto::current_timestamp_ms(), DEFAULT_WINDOW_MS);
+            let new_key_tag = crypto::generate_resonance_tag(&[0xEEu8; 32], 1500, tw);
+            assert!(
+                s.validate_tag(&new_key_tag).is_none(),
+                "new-key data must not validate before the rekey commits"
+            );
+            assert_eq!(
+                s.counter, 1000,
+                "unreadable flood must not move the counter"
+            );
+        }
+
+        // The server retransmits KeyRotate; the client re-sends its response
+        // under the OLD keys with its CURRENT counter — 1001 counters past the
+        // server's frozen edge, far outside the plain ±TAG_WINDOW_SIZE band.
+        let (response_counter, response_tag) = {
+            let entry = sm.sessions.get(&sid).unwrap();
+            let s = entry.value().lock();
+            let counter = s.counter + 1001;
+            let tw = crypto::compute_time_window(crypto::current_timestamp_ms(), DEFAULT_WINDOW_MS);
+            let tag = crypto::generate_resonance_tag(&s.keys.tag_secret, counter, tw);
+            (counter, tag)
+        };
+        {
+            let entry = sm.sessions.get(&sid).unwrap();
+            let mut s = entry.value().lock();
+            let (counter, is_ratcheted_tag) = s
+                .validate_tag(&response_tag)
+                .expect("re-sent rekey response must validate via the pending-rekey lookahead");
+            assert!(!is_ratcheted_tag);
+            assert_eq!(counter, response_counter);
+            s.mark_tag_received(counter);
+            assert_eq!(
+                s.counter, response_counter,
+                "validating the far-ahead response resyncs the live edge"
+            );
+        }
+
+        // The response reaches the control plane → the rekey commits.
+        let client_kp = crypto::KeyPair::generate();
+        sm.commit_session_rekey(&sid, &client_kp.public_key_bytes());
+        let entry = sm.sessions.get(&sid).unwrap();
+        let s = entry.value().lock();
+        assert!(s.pending_rekey_keypair.is_none(), "rekey must commit");
+        assert_ne!(
+            s.keys.tag_secret,
+            make_keys(1).tag_secret,
+            "commit must install the new keys"
+        );
+        assert_eq!(
+            s.counter, response_counter,
+            "counters stay monotonic across the commit — no nonce reuse, window resynced"
+        );
+    }
+
+    // ── Masked pool-peer handshake (FORK-B of pool-sync redesign) ───────────
+
+    /// Simulate the dialer's side of the masked pool-client handshake: derive
+    /// `dh1` against the shared pool server keypair's public key exactly like
+    /// a real dialing peer would, then compute the counter-0 handshake tag
+    /// for the current time window (mirrors how `create_session`'s init
+    /// packet tag is produced).
+    fn dial_masked_pool_peer(sync_key: &[u8; 32]) -> (crypto::KeyPair, [u8; 32], [u8; TAG_SIZE]) {
+        let pool_kp = crypto::pool_server_keypair(sync_key);
+        let pool_psk = crypto::pool_client_psk(sync_key);
+
+        let client_eph = crypto::KeyPair::generate();
+        let dh = client_eph
+            .compute_shared(&pool_kp.public_key_bytes())
+            .expect("dial DH must succeed");
+        let keys =
+            crypto::derive_session_keys(&dh, Some(&pool_psk), &client_eph.public_key_bytes());
+
+        let tw = crypto::compute_time_window(crypto::current_timestamp_ms(), DEFAULT_WINDOW_MS);
+        let tag = crypto::generate_resonance_tag(&keys.tag_secret, 0, tw);
+
+        (client_eph, pool_psk, tag)
+    }
+
+    #[test]
+    fn masked_pool_peer_precheck_accepts_dialer_tag() {
+        let sm = make_manager();
+        let sync_key = [42u8; 32];
+        let pool_kp = crypto::pool_server_keypair(&sync_key);
+        let (client_eph, pool_psk, tag) = dial_masked_pool_peer(&sync_key);
+
+        assert!(sm.handshake_tag_precheck_with_static(
+            &client_eph.public_key_bytes(),
+            Some(pool_psk),
+            &tag,
+            &pool_kp,
+        ));
+    }
+
+    #[test]
+    fn masked_pool_peer_precheck_rejects_wrong_psk() {
+        let sm = make_manager();
+        let sync_key = [42u8; 32];
+        let pool_kp = crypto::pool_server_keypair(&sync_key);
+        let (client_eph, _pool_psk, tag) = dial_masked_pool_peer(&sync_key);
+
+        let wrong_psk = [7u8; 32];
+        assert!(!sm.handshake_tag_precheck_with_static(
+            &client_eph.public_key_bytes(),
+            Some(wrong_psk),
+            &tag,
+            &pool_kp,
+        ));
+    }
+
+    #[test]
+    fn masked_pool_peer_precheck_rejects_wrong_static_key() {
+        let sm = make_manager();
+        let sync_key = [42u8; 32];
+        let (client_eph, pool_psk, tag) = dial_masked_pool_peer(&sync_key);
+
+        // A different sync_key derives a different pool server keypair — the
+        // DH the receiver computes no longer matches the dialer's, so the
+        // pre-check must fail closed.
+        let other_sync_key = [43u8; 32];
+        let wrong_pool_kp = crypto::pool_server_keypair(&other_sync_key);
+
+        assert!(!sm.handshake_tag_precheck_with_static(
+            &client_eph.public_key_bytes(),
+            Some(pool_psk),
+            &tag,
+            &wrong_pool_kp,
+        ));
+    }
+
+    #[test]
+    fn create_masked_pool_peer_session_has_no_vpn_ip_and_validates_tag() {
+        let sm = make_manager();
+        let sync_key = [42u8; 32];
+        let pool_kp = crypto::pool_server_keypair(&sync_key);
+        let pool_psk = crypto::pool_client_psk(&sync_key);
+        let (client_eph, _psk, tag) = dial_masked_pool_peer(&sync_key);
+
+        let addr: SocketAddr = "127.0.0.1:6000".parse().unwrap();
+        let session = sm
+            .create_masked_pool_peer_session(
+                addr,
+                client_eph.public_key_bytes(),
+                &pool_kp,
+                &pool_psk,
+            )
+            .expect("masked pool peer session creation must succeed");
+
+        let sess = session.lock();
+        assert!(
+            sess.is_masked_pool_peer,
+            "must be flagged as masked pool peer"
+        );
+        assert_eq!(
+            sess.vpn_ip, None,
+            "masked pool peer must never get a VPN IP"
+        );
+        assert!(
+            sess.validate_handshake_tag(&tag).is_some(),
+            "dialer's handshake tag must validate against the created session's initial keys"
+        );
+    }
+
+    // ── B1 fix: cleanup_masked_peer_sessions_for_ip dedup scoping ──────────
+
+    #[test]
+    fn cleanup_masked_peer_sessions_for_ip_only_removes_matching_masked_peers() {
+        let sm = make_manager();
+        let sync_key = [42u8; 32];
+        let pool_kp = crypto::pool_server_keypair(&sync_key);
+        let pool_psk = crypto::pool_client_psk(&sync_key);
+
+        let addr_a: SocketAddr = "127.0.0.1:6001".parse().unwrap();
+        let addr_b: SocketAddr = "127.0.0.2:6002".parse().unwrap();
+
+        // Two masked pool-peer sessions from the SAME source IP — simulates a
+        // reconnecting (or attacking) dialer whose earlier session was never
+        // deduped (the B1 leak).
+        let (eph1, _, _) = dial_masked_pool_peer(&sync_key);
+        let keep_session = sm
+            .create_masked_pool_peer_session(addr_a, eph1.public_key_bytes(), &pool_kp, &pool_psk)
+            .expect("first masked peer session must be created");
+        let keep_id = keep_session.lock().session_id;
+
+        let (eph2, _, _) = dial_masked_pool_peer(&sync_key);
+        let stale_session = sm
+            .create_masked_pool_peer_session(addr_a, eph2.public_key_bytes(), &pool_kp, &pool_psk)
+            .expect("second masked peer session must be created");
+        let stale_id = stale_session.lock().session_id;
+
+        // A masked peer session from a DIFFERENT source IP must never be
+        // touched by a cleanup scoped to `addr_a`.
+        let (eph3, _, _) = dial_masked_pool_peer(&sync_key);
+        let other_ip_session = sm
+            .create_masked_pool_peer_session(addr_b, eph3.public_key_bytes(), &pool_kp, &pool_psk)
+            .expect("third masked peer session must be created");
+        let other_ip_id = other_ip_session.lock().session_id;
+
+        // An ORDINARY client session sharing the SAME source IP must survive:
+        // cleanup_masked_peer_sessions_for_ip must be scoped to
+        // `is_masked_pool_peer` sessions only, never touching real clients
+        // (or pool_peer/site_peer synthetic sessions) that happen to share an
+        // address with a dialer.
+        let client_eph = crypto::KeyPair::generate();
+        let client_session = sm
+            .create_session(addr_a, client_eph.public_key_bytes(), None, None)
+            .expect("ordinary client session must be created");
+        let client_id = client_session.lock().session_id;
+
+        let removed = sm.cleanup_masked_peer_sessions_for_ip(&addr_a.ip(), &keep_id);
+
+        assert_eq!(
+            removed,
+            vec![stale_id],
+            "only the stale same-IP masked peer session must be removed"
+        );
+        assert!(
+            sm.get_session(&keep_id).is_some(),
+            "the kept masked peer session must survive"
+        );
+        assert!(
+            sm.get_session(&stale_id).is_none(),
+            "the stale same-IP masked peer session must be removed"
+        );
+        assert!(
+            sm.get_session(&other_ip_id).is_some(),
+            "a masked peer session on a DIFFERENT IP must survive"
+        );
+        assert!(
+            sm.get_session(&client_id).is_some(),
+            "an ordinary client session on the SAME IP must survive"
+        );
+    }
+
+    // ── Pre-ratchet grace: keys must outlive the tags ─────────────────────────
+
+    #[test]
+    fn complete_ratchet_retains_pre_ratchet_keys_for_the_grace_window() {
+        let mut s = make_session();
+        let old_session_key = s.keys.session_key;
+        s.ratcheted_keys = Some(make_keys(9));
+        s.update_ratcheted_tag_window();
+
+        s.complete_ratchet();
+
+        // The new epoch is installed...
+        assert_eq!(s.keys.session_key, [9u8; CHACHA20_KEY_SIZE]);
+        // ...and the OLD AEAD key is still reachable while the grace is open.
+        // Retaining only `pre_ratchet_tags` made the whole grace mechanism
+        // inert: the tag resolved but the packet could never be decrypted.
+        let retained = s
+            .pre_ratchet_keys_in_grace()
+            .expect("pre-ratchet keys must be retained for the grace window");
+        assert_eq!(retained.session_key, old_session_key);
+    }
+
+    #[test]
+    fn pre_ratchet_keys_are_not_offered_once_the_grace_expires() {
+        let mut s = make_session();
+        s.ratcheted_keys = Some(make_keys(9));
+        s.update_ratcheted_tag_window();
+        s.complete_ratchet();
+
+        // Force the deadline into the past.
+        s.pre_ratchet_expire = Some(Instant::now() - Duration::from_secs(1));
+        assert!(
+            s.pre_ratchet_keys_in_grace().is_none(),
+            "expired grace must not keep offering the old keys"
+        );
+    }
+
+    #[test]
+    fn post_ratchet_counter_spaces_overlap_so_counters_cannot_identify_the_epoch() {
+        // Guards the reason the epoch discriminator is "which key decrypted"
+        // rather than "is this counter in pre_ratchet_tags". `complete_ratchet`
+        // resets counter to 0 and the ratcheted window is minted for 0..512,
+        // while the outgoing window (built around a small post-handshake
+        // counter, start saturating_sub'd to 0) also covers 0..512 — so a
+        // membership test classifies early CURRENT-epoch packets as
+        // pre-ratchet, skipping mark_tag_received() and leaving the replay
+        // bitmap empty.
+        let mut s = make_session();
+        s.counter = 3; // realistic: the ratchet fires right after the handshake
+        s.update_tag_window();
+        s.ratcheted_keys = Some(make_keys(9));
+        s.update_ratcheted_tag_window();
+
+        s.complete_ratchet();
+
+        assert_eq!(s.counter, 0, "ratchet restarts the counter space");
+        let overlap = s
+            .expected_tags
+            .keys()
+            .filter(|c| s.pre_ratchet_tags.contains_key(c))
+            .count();
+        assert!(
+            overlap > 0,
+            "counter spaces must be shown to overlap — this is why membership \
+             cannot identify the epoch (overlap was {overlap})"
+        );
+    }
+
+    // ── M2: forward-only counter recovery ────────────────────────────────────
+
+    fn make_manager_with_session() -> (SessionManager, Arc<Mutex<Session>>, SessionKeys) {
+        let server_kp = KeyPair::generate();
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[0x42u8; 32]);
+        let mask = aivpn_common::mask::preset_masks::webrtc_zoom_v3();
+        let mgr = SessionManager::new(server_kp, signing_key, mask);
+        let session = mgr
+            .create_session(
+                "10.9.9.9:10000".parse().unwrap(),
+                [7u8; X25519_PUBLIC_KEY_SIZE],
+                None,
+                None,
+            )
+            .unwrap();
+        let keys = session.lock().keys.clone();
+        (mgr, session, keys)
+    }
+
+    fn session_ip() -> std::net::IpAddr {
+        "10.9.9.9".parse().unwrap()
+    }
+
+    /// M2 regression: a replayed old packet whose counter sits behind
+    /// `sess.counter` (beyond the replay bitmap's reach but inside the old
+    /// ±2048 recovery range) must NOT rewind the session counter — accepting
+    /// it used to erase the whole anti-replay history via ReplayWindow::clear
+    /// on the next legitimate packet. Client counters are monotone, so
+    /// backward drift is always a replay.
+    #[test]
+    fn counter_recovery_rejects_backward_replay() {
+        let (mgr, session, keys) = make_manager_with_session();
+        let tw = crypto::compute_time_window(crypto::current_timestamp_ms(), DEFAULT_WINDOW_MS);
+        {
+            let mut s = session.lock();
+            for c in 0..=3000u64 {
+                s.mark_tag_received(c);
+            }
+        }
+        // Counter 2000 is 1000 behind — inside the old ±2048 range, outside
+        // the 512-deep replay bitmap.
+        let replay_tag = crypto::generate_resonance_tag(&keys.tag_secret, 2000, tw);
+        assert!(
+            mgr.recover_session_by_tag(&replay_tag, &session_ip())
+                .is_none(),
+            "backward counter match must be rejected as a replay"
+        );
+        // Session state untouched: no counter rewind, no bitmap wipe.
+        let s = session.lock();
+        assert_eq!(s.counter, 3000);
+        assert!(s.received_bitmap.get_bit(0));
+    }
+
+    /// M2 companion: the documented client-race case is FORWARD drift and
+    /// must keep working; the recovered counter is marked received so the
+    /// same packet cannot be replayed through either validation path.
+    #[test]
+    fn counter_recovery_accepts_forward_drift_and_marks_received() {
+        let (mgr, session, keys) = make_manager_with_session();
+        let tw = crypto::compute_time_window(crypto::current_timestamp_ms(), DEFAULT_WINDOW_MS);
+        {
+            let mut s = session.lock();
+            for c in 0..=100u64 {
+                s.mark_tag_received(c);
+            }
+        }
+        // Client 800 ahead of the server — past the ±512 validation window
+        // but inside RECOVERY_RANGE.
+        let drift_tag = crypto::generate_resonance_tag(&keys.tag_secret, 900, tw);
+        let (recovered_session, counter, is_ratcheted) = mgr
+            .recover_session_by_tag(&drift_tag, &session_ip())
+            .expect("forward drift must recover");
+        assert_eq!(counter, 900);
+        assert!(!is_ratcheted);
+        assert_eq!(recovered_session.lock().counter, 900);
+        // Marked received: validate_tag now rejects the same tag as a replay…
+        assert!(recovered_session.lock().validate_tag(&drift_tag).is_none());
+        // …and a second recovery attempt with it is rejected too (c == base
+        // with the newest-counter bit set).
+        assert!(mgr
+            .recover_session_by_tag(&drift_tag, &session_ip())
+            .is_none());
     }
 }

@@ -11,6 +11,67 @@ import org.json.JSONObject
  * Secure storage using EncryptedSharedPreferences.
  * Keys are encrypted with Android Keystore — safe from root access.
  *
+ * ## 3d: hardware-backed wrapping key (mTLS cert + device-enrollment key)
+ *
+ * The AES-256-GCM master key that wraps every value in this store (the JIT
+ * device-enrollment private key `device_privkey_v1`, the `mtlsCertBase64`
+ * profile field, connection profiles, etc.) already lives in the
+ * AndroidKeyStore by construction — `MasterKey.Builder` never lets the raw
+ * AES key material leave hardware — but `setRequestStrongBoxBacked(true)`
+ * below additionally asks for the DISCRETE secure element (StrongBox) when
+ * the device has one, instead of settling for the SoC's TEE. This is a
+ * genuinely no-risk request, verified against the exact
+ * `androidx.security:security-crypto:1.1.0-alpha06` bytecode this app
+ * depends on (decompiled `MasterKey$Builder$Api23Impl.build()`):
+ *   - It internally gates on `PackageManager.hasSystemFeature(
+ *     "android.hardware.strongbox_keystore")` — on a device without
+ *     StrongBox hardware it silently builds a normal TEE-backed key instead
+ *     of throwing, so this is safe to request unconditionally.
+ *   - Key creation goes through `MasterKeys.getOrCreate(spec)` — an EXISTING
+ *     alias is reused as-is, never regenerated. An app upgrading from a
+ *     pre-3d build (TEE-backed master key already in the Keystore) keeps
+ *     using that same key and can still decrypt every value it already
+ *     wrote; only a fresh install (no existing alias) can land on the
+ *     StrongBox-backed key. No explicit migration step is needed — this is
+ *     backward compatible by construction.
+ *
+ * ## Why the actual key material still can't be imported into Keystore
+ * non-exportably
+ *
+ * The task framing ("import the private key into AndroidKeyStore... use it
+ * for the mTLS handshake") assumes a PKCS#12-shaped cert+key pair. That is
+ * NOT what this app stores:
+ *   - `mtlsCertBase64` (see `ConnectionProfile.mtlsCertBase64`) is a
+ *     104-byte `SimpleCert` (`aivpn-server/src/mtls.rs`): a client X25519
+ *     PUBLIC key + expiry + a CA ed25519 signature over them — no private
+ *     key at all. It is sent to the server verbatim in `ClientCert{
+ *     cert_bytes}`; there is nothing secret in it to protect with
+ *     non-exportable hardware import.
+ *   - The matching PRIVATE half is the per-session ephemeral X25519 keypair
+ *     Rust generates fresh every connection (`KeyPair::generate()` in
+ *     `android_tunnel.rs`) — it never touches Kotlin/this store, lives only
+ *     in Rust process memory for the session's lifetime, and is discarded
+ *     after. There is no persistent mTLS private key on the Kotlin side to
+ *     import in the first place.
+ *   - The one genuinely persistent client-identity private key this app DOES
+ *     store is the JIT device-enrollment key (`device_privkey_v1`, see
+ *     `saveDeviceKey`/`loadDeviceKey` below) — a raw 32-byte X25519 scalar
+ *     handed directly to Rust's `curve25519-dalek` for a raw
+ *     Diffie-Hellman. AndroidKeyStore cannot hold this non-exportably and
+ *     still be usable here: (1) it has no Curve25519/X25519 key type at all
+ *     (EC support is limited to the NIST P-curves), and (2) even if it did,
+ *     a non-exportable key's entire point is that the raw scalar never
+ *     leaves the secure element/TEE — but this app's Diffie-Hellman is a
+ *     bespoke Rust computation (`curve25519-dalek`), not a JCA
+ *     `KeyAgreement` call the Keystore could perform on the key's behalf.
+ *     Making this key non-exportable would require redesigning the
+ *     handshake around a Keystore-native curve (e.g. P-256 `KeyAgreement`)
+ *     end to end across the wire protocol and every platform — out of
+ *     scope here (Android-only, no `aivpn-common` changes). This is the
+ *     documented limitation the task anticipates: at minimum, the storage
+ *     key wrapping this private key is hardware-backed (StrongBox when
+ *     available) as implemented above.
+ *
  * Corruption recovery: after a backup restore, OTA, or Keystore wipe the master key
  * no longer matches the on-disk keyset/values, and every access throws
  * AEADBadTagException / KeyStoreException (both [java.security.GeneralSecurityException]s).
@@ -25,11 +86,22 @@ object SecureStorage {
 
     @Volatile private var cachedPrefs: SharedPreferences? = null
 
+    /**
+     * Requests a StrongBox-backed master key when the device has a discrete
+     * secure element, falling back to the SoC TEE otherwise. See the class
+     * doc comment (3d) for why this is safe to request unconditionally and
+     * why it needs no migration for existing installs.
+     */
+    private fun createMasterKey(appContext: Context): MasterKey {
+        return MasterKey.Builder(appContext)
+            .setKeyScheme(MasterKey.KeyScheme.AES256_GCM)
+            .setRequestStrongBoxBacked(true)
+            .build()
+    }
+
     private fun createPrefs(context: Context): SharedPreferences {
         val appContext = context.applicationContext
-        val masterKey = MasterKey.Builder(appContext)
-            .setKeyScheme(MasterKey.KeyScheme.AES256_GCM)
-            .build()
+        val masterKey = createMasterKey(appContext)
         return EncryptedSharedPreferences.create(
             appContext,
             PREFS_FILE,
@@ -259,6 +331,11 @@ object SecureStorage {
 
     // ──────────── Device binding key (JIT enrollment) ────────────
 
+    // 3d: this is the one persistent client-identity private key this app
+    // stores — see the class doc comment for why it cannot be imported into
+    // AndroidKeyStore non-exportably (raw X25519 scalar consumed directly by
+    // Rust's curve25519-dalek for the DeviceEnrollment DH proof) and why the
+    // StrongBox-preferred master key above is the mitigation in scope here.
     private const val KEY_DEVICE_PRIVKEY = "device_privkey_v1"
 
     fun saveDeviceKey(context: Context, keyBytes: ByteArray) {

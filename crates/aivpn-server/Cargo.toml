@@ -17,6 +17,11 @@ path = "src/bin/aivpn-mask-repair.rs"
 
 [dependencies]
 aivpn-common = { path = "../aivpn-common", version = "*" }
+# FORK-B pool-sync dialer: the server embeds a headless control-only
+# `AivpnClient` to dial pool peers as a masked pool-client (see
+# `pool_dialer.rs`). Only reachable when `pool.transport = "masked"` is
+# configured — additive, no effect on default behavior.
+aivpn-client = { path = "../aivpn-client", version = "*" }
 
 # Crypto
 chacha20poly1305.workspace = true
@@ -59,13 +64,15 @@ base64 = "0.22"
 clap = { version = "4.4", features = ["derive", "env"] }
 
 # Monitoring (Phase 5)
-prometheus = { version = "0.13", optional = true }
+prometheus = { version = "0.14", optional = true }
 
 # HTTP client for passive distribution (Phase 4) and bootstrap-descriptor auto-publish
-reqwest = { version = "0.11", features = ["json", "stream", "multipart"], optional = true }
+reqwest = { version = "0.12", features = ["json", "stream", "multipart"], optional = true }
 # AWS SigV4 request signing for the S3-compatible bootstrap-publish channel
 hmac = { version = "0.12", optional = true }
-sha2 = { version = "0.10", optional = true }
+# Also used unconditionally by `audit_log.rs`'s tamper-evident hash chain
+# (P1.4) — no longer gated behind `bootstrap-publish`.
+sha2 = "0.10"
 
 [features]
 default = []
@@ -75,9 +82,12 @@ neural = ["aivpn-common/dpi-gate"]
 metrics = ["prometheus"]
 passive-distribution = ["reqwest"]
 dns = ["reqwest"]
+# Structured-event webhook delivery (`AIVPN_EVENT_WEBHOOK` → HTTP POST per
+# event) — see `bootstrap.rs::install_webhook_forwarder`.
+event-webhook = ["reqwest"]
 management-api = ["axum", "tower", "hyper", "hyper-util", "tokio-stream", "anyhow"]
 production-secure = []
-bootstrap-publish = ["reqwest", "hmac", "sha2"]
+bootstrap-publish = ["reqwest", "hmac"]
 
 # Management API (Unix socket HTTP server)
 [dependencies.axum]

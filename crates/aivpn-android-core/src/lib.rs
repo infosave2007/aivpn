@@ -7,20 +7,58 @@
 
 #![allow(non_snake_case)]
 
+// ── Установка транспорта из внешней сборки ───────────────────────────────────
+
+/// Фабрика транспорта, установленная сборкой, которая её несёт.
+///
+/// Публичный `.so` не устанавливает ничего, и тогда единственный путь
+/// датаграмм — прямой UDP. Сборка с дополнительным транспортом вызывает
+/// [`install_transport_factory`] из своего `JNI_OnLoad`, то есть до первого
+/// JNI-вызова и без единой правки Kotlin.
+///
+/// Здесь нет `#[cfg]` и нет имени какого-либо конкретного транспорта: этот
+/// крейт не знает и не может узнать, что именно ему установили.
+static TRANSPORT_FACTORY: std::sync::OnceLock<
+    std::sync::Arc<dyn aivpn_common::transport::TransportFactory>,
+> = std::sync::OnceLock::new();
+
+/// Установить фабрику транспорта.
+///
+/// Идемпотентна: второй вызов игнорируется. `.so`, дважды подсунувший свою
+/// фабрику, — это ошибка сборки, а не сценарий, который надо поддерживать.
+pub fn install_transport_factory(
+    factory: std::sync::Arc<dyn aivpn_common::transport::TransportFactory>,
+) {
+    let _ = TRANSPORT_FACTORY.set(factory);
+}
+
+/// Установленная фабрика, если она есть.
+pub fn installed_transport_factory(
+) -> Option<std::sync::Arc<dyn aivpn_common::transport::TransportFactory>> {
+    TRANSPORT_FACTORY.get().cloned()
+}
+
 mod android_tunnel;
+// The socket guard is part of this crate's API: whatever opens sockets on
+// Android needs it to keep them out of the tunnel.
+pub use android_tunnel::VpnProtectGuard;
+#[cfg(feature = "ssh-install")]
+mod ssh_job_registry;
 
 use aivpn_common::client_wire::DEFAULT_MDH_LEN;
 use aivpn_common::protocol::ControlPayload;
 use android_tunnel::{
-    bootstrap_descriptors_json, clear_pending_stop, get_active_download_bytes,
-    get_active_upload_bytes, run_tunnel_android, send_control_payload, stop_active_tunnel,
-    take_discard_persisted_descriptors, take_recording_feedback_json, ACTIVE_ADAPTIVE_LEVEL,
-    ACTIVE_FEEDBACK_INTERVAL, ACTIVE_FEEDBACK_THRESHOLD, ACTIVE_MASK_CATALOG_JSON,
-    ACTIVE_QUALITY_SCORE, ACTIVE_REGIONAL_HINTS_JSON, ATTEMPTED_MASK_FAMILY, EVER_CONNECTED,
-    MASK_CATALOG_SEQ, MASK_FEEDBACK_SENT, REGIONAL_HINTS_SEQ,
+    active_control_tx, active_mgmt, bootstrap_descriptors_json, clear_pending_stop,
+    get_active_download_bytes, get_active_upload_bytes, run_tunnel_android, send_control_payload,
+    stop_active_tunnel, take_discard_persisted_descriptors, take_recording_feedback_json,
+    ACTIVE_ADAPTIVE_LEVEL, ACTIVE_FEEDBACK_INTERVAL, ACTIVE_FEEDBACK_THRESHOLD,
+    ACTIVE_MASK_CATALOG_JSON, ACTIVE_QUALITY_SCORE, ACTIVE_REGIONAL_HINTS_JSON, ASSIGNED_VPN_IP,
+    ATTEMPTED_MASK_FAMILY, CERT_REJECTED, EVER_CONNECTED, HANDSHAKE_REJECTED,
+    HANDSHAKE_REJECT_REASON, MASK_CATALOG_SEQ, MASK_FEEDBACK_SENT, REGIONAL_HINTS_SEQ,
 };
 
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 
 use jni::objects::{JByteArray, JClass, JObject, JString};
 use jni::sys::{jint, jlong, jstring};
@@ -44,6 +82,15 @@ use jni::JNIEnv;
 ///     serverSigningKey: ByteArray?, // 32 bytes ed25519 verifying key, or null to skip
 ///                                   // ServerHello signature verification (opt-in,
 ///                                   // matching desktop's --server-signing-key)
+///     maskOperatorPubkey: ByteArray?, // 32 bytes ed25519 verifying key for
+///                                   // artifact-level MaskUpdate signature
+///                                   // verification (the "mop" connection-key
+///                                   // field), or null to skip — matching
+///                                   // desktop's --mask-operator-pubkey
+///     maskVerifyMode: Int,          // 0=off, 1=warn, 2=enforce; matches desktop's
+///                                   // --mask-verify-mode (any other value is
+///                                   // treated as warn, the same default desktop
+///                                   // uses absent an explicit override)
 ///     polymorphicBase: String?,     // §3 base mask id to request a per-session
 ///                                   // polymorphic variant of, or null to disable
 ///     shareMaskFeedback: Boolean,   // §2 opt-in: report mask success/fail outcomes
@@ -70,12 +117,16 @@ pub extern "system" fn Java_com_aivpn_client_AivpnJni_runTunnel<'local>(
     static_privkey_obj: JObject<'local>, // nullable JByteArray — device binding key
     mask_name_obj: JObject<'local>,      // nullable JString — preferred mask profile name
     server_signing_key_obj: JObject<'local>, // nullable JByteArray — ed25519 verifying key
-    polymorphic_base_obj: JObject<'local>, // nullable JString — §3 polymorphic base mask id
-    share_mask_feedback: jni::sys::jboolean, // §2 opt-in: report mask outcomes
-    receive_mask_hints: jni::sys::jboolean, // §2 opt-in: accept server region hints
-    country_code_obj: JObject<'local>,   // nullable JString — 2-letter ISO-3166-1 code
+    mask_operator_pubkey_obj: JObject<'local>, // nullable JByteArray — mask-operator ed25519 verifying key ("mop")
+    mask_verify_mode_int: jint,                // 0=off, 1=warn (default), 2=enforce
+    polymorphic_base_obj: JObject<'local>,     // nullable JString — §3 polymorphic base mask id
+    share_mask_feedback: jni::sys::jboolean,   // §2 opt-in: report mask outcomes
+    receive_mask_hints: jni::sys::jboolean,    // §2 opt-in: accept server region hints
+    country_code_obj: JObject<'local>,         // nullable JString — 2-letter ISO-3166-1 code
     prior_outcomes_json_obj: JObject<'local>, // nullable JString — §2 prior unreported outcomes (JSON)
     cached_descriptors_json_obj: JObject<'local>, // nullable JString — app-persisted signed bootstrap descriptors (JSON array)
+    transport_name_obj: JObject<'local>, // nullable JString — alternative transport name ("alt"), or null for direct UDP
+    transport_params_json_obj: JObject<'local>, // nullable JString — opaque JSON params for that transport
 ) -> jstring {
     // ── Initialize Android logcat logger once per process lifetime ──
     static LOG_INIT: std::sync::Once = std::sync::Once::new();
@@ -210,6 +261,51 @@ pub extern "system" fn Java_com_aivpn_client_AivpnJni_runTunnel<'local>(
         }
     };
 
+    // R2 Phase B: operator mask-verifying public key ("mop" connection-key
+    // field) — same 32-byte-optional-byte-array shape as server_signing_key
+    // above, but feeds `verify_mask_artifact` instead of ServerHello/transport
+    // signature checks (see android_tunnel.rs's `mask_operator_pubkey` doc).
+    let mask_operator_pubkey: Option<[u8; 32]> = if mask_operator_pubkey_obj.is_null() {
+        None
+    } else {
+        match env.is_instance_of(&mask_operator_pubkey_obj, "[B") {
+            Ok(true) => {}
+            Ok(false) => {
+                return make_str(
+                    &mut env,
+                    "mask_operator_pubkey must be a byte array (byte[])",
+                )
+            }
+            Err(e) => {
+                return make_str(
+                    &mut env,
+                    &format!("mask_operator_pubkey type check failed: {e}"),
+                )
+            }
+        }
+        let arr: JByteArray<'local> =
+            unsafe { JByteArray::from_raw(mask_operator_pubkey_obj.as_raw()) };
+        match env.convert_byte_array(&arr) {
+            Ok(b) if b.len() == 32 => {
+                let mut out = [0u8; 32];
+                out.copy_from_slice(&b);
+                Some(out)
+            }
+            Ok(b) => {
+                return make_str(
+                    &mut env,
+                    &format!("mask_operator_pubkey must be 32 bytes, got {}", b.len()),
+                )
+            }
+            Err(e) => return make_str(&mut env, &format!("bad mask_operator_pubkey: {e}")),
+        }
+    };
+    let mask_verify_mode: aivpn_common::mask::MaskVerifyMode = match mask_verify_mode_int {
+        0 => aivpn_common::mask::MaskVerifyMode::Off,
+        2 => aivpn_common::mask::MaskVerifyMode::Enforce,
+        _ => aivpn_common::mask::MaskVerifyMode::Warn,
+    };
+
     let preferred_mask: Option<String> = if mask_name_obj.is_null() {
         None
     } else {
@@ -240,6 +336,27 @@ pub extern "system" fn Java_com_aivpn_client_AivpnJni_runTunnel<'local>(
             _ => None,
         }
     };
+
+    // Alternative transport: name + opaque JSON params. The public build
+    // ignores these (it registers no such transport); the extended build opens
+    // the transport by name inside `run_tunnel_android`.
+    let unpack_opt_string = |env: &mut JNIEnv<'local>, obj: &JObject<'local>| -> Option<String> {
+        if obj.is_null() {
+            return None;
+        }
+        match env.is_instance_of(obj, "java/lang/String") {
+            Ok(true) => {
+                let js: JString<'local> = unsafe { JString::from_raw(obj.as_raw()) };
+                env.get_string(&js)
+                    .ok()
+                    .map(String::from)
+                    .filter(|s| !s.is_empty())
+            }
+            _ => None,
+        }
+    };
+    let transport_name = unpack_opt_string(&mut env, &transport_name_obj);
+    let transport_params_json = unpack_opt_string(&mut env, &transport_params_json_obj);
 
     // §2 crowdsourced blocking feedback: 2-letter ISO-3166-1 alpha-2 country code.
     // Only accepted when exactly 2 ASCII letters; anything else is treated as unset
@@ -344,12 +461,16 @@ pub extern "system" fn Java_com_aivpn_client_AivpnJni_runTunnel<'local>(
             static_privkey,
             preferred_mask,
             server_signing_key,
+            mask_operator_pubkey,
+            mask_verify_mode,
             polymorphic_base,
             share_mask_feedback,
             receive_mask_hints,
             country_code,
             prior_outcomes_json,
             cached_descriptors_json,
+            transport_name,
+            transport_params_json,
         ))
     }));
 
@@ -421,14 +542,76 @@ pub extern "system" fn Java_com_aivpn_client_AivpnJni_getDownloadBytes(
     get_active_download_bytes() as jlong
 }
 
-/// Returns the last adaptive level hint received from the server via AdaptiveHint (0–3).
-/// 0 means no hint has been received yet this session.
+/// Returns the last adaptive level hint received from the server via
+/// AdaptiveHint: 0–3 (0 = server says adaptive Off — a real downgrade), or
+/// -1 when no hint has been received yet this session. The static stores
+/// `level + 1` so 0 can keep meaning "no hint".
 #[no_mangle]
 pub extern "system" fn Java_com_aivpn_client_AivpnJni_getAdaptiveLevelHint(
     _env: JNIEnv,
     _class: JClass,
 ) -> jint {
-    ACTIVE_ADAPTIVE_LEVEL.load(Ordering::Relaxed) as jint
+    ACTIVE_ADAPTIVE_LEVEL.load(Ordering::Relaxed) as jint - 1
+}
+
+/// Returns the VPN IPv4 address the server assigned to this session in its
+/// ServerHello network config (dotted quad), or an empty string when the
+/// current session has not received one. When this differs from the IP
+/// embedded in the connection key, the server has re-homed the client (pool
+/// IP-conflict resolution) and the TUN must be rebuilt with this address —
+/// otherwise the server's anti-spoof check silently drops all uplink data.
+#[no_mangle]
+pub extern "system" fn Java_com_aivpn_client_AivpnJni_getAssignedVpnIp(
+    mut env: JNIEnv,
+    _class: JClass,
+) -> jstring {
+    let raw = ASSIGNED_VPN_IP.load(Ordering::Relaxed);
+    let s = if raw == 0 {
+        String::new()
+    } else {
+        std::net::Ipv4Addr::from(raw).to_string()
+    };
+    // L8: route through make_str so an extreme JNI failure degrades to an
+    // empty string (after clearing the pending exception) instead of handing
+    // a null jstring to a Kotlin `external fun` declared non-null String.
+    make_str(&mut env, &s)
+}
+
+/// Returns `true` (and atomically clears the flag) if the server sent
+/// `CertRejected` (mTLS client certificate rejected) at any point since the
+/// last call — poll this live during a session (like `getAssignedVpnIp`), not
+/// just after `runTunnel` returns, since the server keeps the tunnel up while
+/// rejecting the cert rather than tearing it down. A `true` result means the
+/// current certificate will never be accepted by this server; the caller
+/// should prompt the user to re-provision instead of waiting for a timeout.
+#[no_mangle]
+pub extern "system" fn Java_com_aivpn_client_AivpnJni_certRejected(
+    _env: JNIEnv,
+    _class: JClass,
+) -> jni::sys::jboolean {
+    CERT_REJECTED.swap(false, Ordering::Relaxed) as jni::sys::jboolean
+}
+
+/// Returns the `HandshakeReject` reason code (0=unspecified, 1=one-time key
+/// already used, 2=client expired, 3=client disabled) and atomically clears
+/// the pending flag, or `-1` if no `HandshakeReject` has been observed since
+/// the last call (mirrors the `-1` = "nothing yet" sentinel used by
+/// `getAdaptiveLevelHint`). Unlike `certRejected`, this is TERMINAL: the
+/// server only ever sends `HandshakeReject` to a peer that already proved
+/// PSK knowledge during the handshake, so retrying under the same credential
+/// can never succeed. The caller (`AivpnService.kt`) must stop its reconnect
+/// loop instead of backing off and retrying — see the `HANDSHAKE_REJECTED`
+/// doc comment in `android_tunnel.rs`.
+#[no_mangle]
+pub extern "system" fn Java_com_aivpn_client_AivpnJni_handshakeRejectReason(
+    _env: JNIEnv,
+    _class: JClass,
+) -> jint {
+    if HANDSHAKE_REJECTED.swap(false, Ordering::Relaxed) {
+        HANDSHAKE_REJECT_REASON.load(Ordering::Relaxed) as jint
+    } else {
+        -1
+    }
 }
 
 // ──────────────────────────────────────────────────────────
@@ -651,11 +834,16 @@ pub extern "system" fn Java_com_aivpn_client_AivpnJni_getBootstrapDescriptorsJso
 }
 
 /// `true` when the last session proved its cached bootstrap descriptors are
-/// unusable against this server (handshake accepted, data plane never carried a
-/// single downlink DATA packet). The platform must then DELETE the persisted
-/// descriptor blob for this server, otherwise the next cold start reloads the
-/// same descriptor and the tunnel connects with a dead data path again — the
-/// issue #71 loop, which today only ends when the user clears app data.
+/// unusable against this server: the handshake was accepted but not a single
+/// downlink DATA packet ever arrived. The persisted blob for that server must
+/// then be deleted, otherwise the next cold start reloads the same descriptor
+/// and reconnects into the same dead data plane — the loop that today only
+/// clearing app data breaks, and only for one connection.
+///
+/// The app must ALSO remember the verdict and pass
+/// `DESCRIPTORS_DISTRUSTED_SENTINEL` ("distrusted") as `cachedDescriptorsJson`
+/// on subsequent connects, or an app restart re-adopts the server's freshly
+/// pushed descriptors and breaks its first reconnect again.
 ///
 /// Poll once after `runTunnel` returns; reading clears the flag.
 #[no_mangle]
@@ -664,6 +852,128 @@ pub extern "system" fn Java_com_aivpn_client_AivpnJni_getDiscardPersistedDescrip
     _class: JClass,
 ) -> jni::sys::jboolean {
     u8::from(std::panic::catch_unwind(take_discard_persisted_descriptors).unwrap_or(false))
+}
+
+// ──────────────────────────────────────────────────────────
+// In-tunnel management API (P2.3-Android)
+// ──────────────────────────────────────────────────────────
+
+/// Returns the server-assigned management role cached from the last
+/// `Capabilities` control message: 0=User, 1=Viewer, 2=Admin. Defaults to 0
+/// until one arrives (or for a server build that predates in-app admin).
+#[no_mangle]
+pub extern "system" fn Java_com_aivpn_client_AivpnJni_getRole(
+    _env: JNIEnv,
+    _class: JClass,
+) -> jint {
+    active_mgmt().cached_role() as jint
+}
+
+/// Issues an in-tunnel management-API call over the active session's control
+/// channel and blocks the calling (JNI) thread until the correlated
+/// `MgmtResponse` arrives or a 10s timeout elapses.
+///
+/// Parameters (Kotlin):
+/// ```kotlin
+/// external fun mgmtRequest(
+///     method: Int,     // 0=GET, 1=POST, 2=PATCH, 3=DELETE, 4=PUT
+///     path: String,     // curated REST-shaped path, e.g. "/api/v1/clients"
+///     body: ByteArray?, // optional JSON request body, or null for none
+/// ): ByteArray
+/// ```
+///
+/// Return layout: a 2-byte big-endian status-code prefix followed by the
+/// response body, i.e. `[status_hi, status_lo, ...body]`. An empty array
+/// (`byte[0]`) signals "no active session", "send failed", or "timed out" —
+/// the caller cannot distinguish those three from the empty array alone, but
+/// a genuine server response always carries at least the 2-byte prefix, so
+/// `response.size < 2` is the reliable "call did not complete" check on the
+/// Kotlin side.
+///
+/// Sync-JNI-over-async: `MgmtClient::mgmt_call`'s `oneshot::Receiver` is
+/// resolved from the *tunnel task's* runtime thread when the matching
+/// `MgmtResponse` control message arrives there (see the `active_mgmt()`
+/// arm wired into the inbound control match in `android_tunnel.rs`). This
+/// function runs on an arbitrary JNI caller thread with no tunnel-runtime
+/// handle of its own, so it spins up a throwaway
+/// `current_thread` runtime just to block on that receiver — the
+/// `mpsc::Sender` clone (enqueueing the outbound `MgmtRequest`) and the
+/// `oneshot::Receiver` (awaiting the reply) both cross runtimes freely;
+/// only the receiver's `.await` needs an executor, and it doesn't need to be
+/// the same one that resolves it.
+#[no_mangle]
+pub extern "system" fn Java_com_aivpn_client_AivpnJni_mgmtRequest<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    method: jint,
+    path: JString<'local>,
+    body: JObject<'local>, // nullable JByteArray
+) -> jni::sys::jbyteArray {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let path_str = match env.get_string(&path) {
+            Ok(s) => String::from(s),
+            Err(_) => return Vec::new(),
+        };
+
+        let body_vec: Vec<u8> = if body.is_null() {
+            Vec::new()
+        } else {
+            let arr: JByteArray<'local> = unsafe { JByteArray::from_raw(body.as_raw()) };
+            env.convert_byte_array(&arr).unwrap_or_default()
+        };
+
+        let control_tx = match active_control_tx() {
+            Some(tx) => tx,
+            None => return Vec::new(),
+        };
+
+        let rt = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(rt) => rt,
+            Err(_) => return Vec::new(),
+        };
+
+        match rt.block_on(active_mgmt().mgmt_call(
+            &control_tx,
+            method as u8,
+            &path_str,
+            body_vec,
+            Duration::from_secs(10),
+        )) {
+            Ok((status, resp_body)) => {
+                let mut out = Vec::with_capacity(2 + resp_body.len());
+                out.push((status >> 8) as u8);
+                out.push((status & 0xff) as u8);
+                out.extend_from_slice(&resp_body);
+                out
+            }
+            Err(_) => Vec::new(),
+        }
+    }))
+    .unwrap_or_default();
+    make_bytes(&mut env, &result)
+}
+
+/// Renders `text` (a connection key / enrollment URI) as a PNG QR code via
+/// `aivpn_common::qr::png_for`, for the in-app "show admin invite" flow.
+/// Returns an empty array on encode failure.
+#[no_mangle]
+pub extern "system" fn Java_com_aivpn_client_AivpnJni_qrPng<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    text: JString<'local>,
+) -> jni::sys::jbyteArray {
+    let png = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let text_str = match env.get_string(&text) {
+            Ok(s) => String::from(s),
+            Err(_) => return Vec::new(),
+        };
+        aivpn_common::qr::png_for(&text_str).unwrap_or_default()
+    }))
+    .unwrap_or_default();
+    make_bytes(&mut env, &png)
 }
 
 // ──────────────────────────────────────────────────────────
@@ -735,6 +1045,355 @@ fn verify_bootstrap_descriptor_impl(
 }
 
 // ──────────────────────────────────────────────────────────
+// SSH-install JNI bridge (C2b) — in-app aivpn-server installer over SSH.
+//
+// Gated behind the (default-on, see Cargo.toml) `ssh-install` feature, which
+// also gates `aivpn_common::ssh_install` itself. `sshInstallStart` returns
+// immediately with a job handle and drives the actual SSH work (connect,
+// TOFU-verified host key, sftp upload, streamed remote exec) on a dedicated
+// background `std::thread` — never on the calling JNI thread, since a real
+// install can run for minutes. `sshInstallPoll` drains that job's event
+// queue (see `ssh_job_registry`) from the caller's own polling loop/thread.
+//
+// There is no cancellation: `sshInstallFree` only forgets the handle on the
+// Rust side (so its queued events stop being retrievable and the small
+// per-handle allocation is reclaimed) — the background thread, if still
+// running, keeps driving the SSH session to completion regardless, same as
+// closing a file descriptor doesn't stop the write already in flight. A
+// caller that wants to react to "user cancelled" must do so on the platform
+// side (e.g. stop polling, show nothing further); the remote
+// `install-server.sh` run itself completes or fails on its own.
+// ──────────────────────────────────────────────────────────
+
+/// Decodes `privkey_b64` (32 raw bytes, base64 STANDARD) as an X25519 device static
+/// private key and returns its public key, base64 STANDARD-encoded.
+///
+/// This is the mobile counterpart of desktop's
+/// `aivpn_client::ssh_install_cmd::local_device_pubkey_b64` — but desktop reads its
+/// 32-byte private key straight off disk (`~/.config/aivpn/device.key`), while this core
+/// never persists the device key itself (there is no on-disk `device.key` on
+/// iOS/Android): the app owns that secret (Android Keystore / EncryptedSharedPreferences)
+/// and already hands the raw 32 bytes to `runTunnel`'s `staticPrivkey` JNI parameter for
+/// JIT enrollment on every session, so the getter mirrors that same input contract instead
+/// of inventing a new storage location. Same `KeyPair::from_private_key` →
+/// `public_key_bytes()` derivation as desktop, so a device produces the identical pubkey
+/// through either path.
+///
+/// Returns `None` if `privkey_b64` is not valid base64, or does not decode to exactly 32
+/// bytes. Never panics.
+#[cfg(feature = "ssh-install")]
+fn device_pubkey_b64_from_privkey_b64(privkey_b64: &str) -> Option<String> {
+    use base64::Engine;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(privkey_b64.trim())
+        .ok()?;
+    if bytes.len() != 32 {
+        return None;
+    }
+    let mut arr = [0u8; 32];
+    arr.copy_from_slice(&bytes);
+    let kp = aivpn_common::crypto::KeyPair::from_private_key(arr);
+    Some(base64::engine::general_purpose::STANDARD.encode(kp.public_key_bytes()))
+}
+
+/// Returns the device's X25519 public key — derived from the caller-supplied
+/// `privkeyB64` (same 32-byte device static private key passed as `staticPrivkey` into
+/// `runTunnel`), base64 STANDARD-encoded. Lets the in-app SSH install wizard populate
+/// `sshInstallStart`'s params JSON `device_pubkey_b64` field to request a device-bound
+/// (admin-capable) client at add time (mirrors desktop's `--device-pubkey` flow), without
+/// the app needing to reimplement X25519 key derivation or link a general-purpose crypto
+/// library itself.
+///
+/// Parameters (Kotlin):
+/// ```kotlin
+/// external fun devicePubkey(privkeyB64: String): String?
+/// ```
+/// Returns the base64 pubkey, or `null` if `privkeyB64` is not valid base64 or does not
+/// decode to exactly 32 bytes. Never panics across the FFI boundary.
+#[cfg(feature = "ssh-install")]
+#[no_mangle]
+pub extern "system" fn Java_com_aivpn_client_AivpnJni_devicePubkey<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    privkey_b64: JString<'local>,
+) -> jstring {
+    let pubkey: Option<String> = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let s = match env.get_string(&privkey_b64) {
+            Ok(s) => String::from(s),
+            Err(_) => return None,
+        };
+        device_pubkey_b64_from_privkey_b64(&s)
+    }))
+    .unwrap_or(None);
+    match pubkey {
+        Some(pk) => make_str(&mut env, &pk),
+        None => std::ptr::null_mut(),
+    }
+}
+
+/// Connects to `host:port` as `user` with no real intent to authenticate,
+/// captures the SSH host key's `SHA256:...` fingerprint during key exchange,
+/// and returns it for the caller to show the user for TOFU confirmation
+/// before calling `sshInstallStart`. Blocks the calling thread (spins up a
+/// throwaway single-thread tokio runtime) — call off the UI thread.
+///
+/// Parameters (Kotlin):
+/// ```kotlin
+/// external fun sshProbeHostkey(host: String, port: Int, user: String): String?
+/// ```
+/// Returns the fingerprint, or `null` on any error (DNS/TCP/protocol
+/// failure, invalid port, bad UTF-8 in `host`/`user`). Never panics across
+/// the FFI boundary.
+#[cfg(feature = "ssh-install")]
+#[no_mangle]
+pub extern "system" fn Java_com_aivpn_client_AivpnJni_sshProbeHostkey<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    host: JString<'local>,
+    port: jint,
+    user: JString<'local>,
+) -> jstring {
+    let host_str = match env.get_string(&host) {
+        Ok(s) => String::from(s),
+        Err(_) => return std::ptr::null_mut(),
+    };
+    let user_str = match env.get_string(&user) {
+        Ok(s) => String::from(s),
+        Err(_) => return std::ptr::null_mut(),
+    };
+    if !(1..=65535).contains(&port) {
+        return std::ptr::null_mut();
+    }
+
+    let target = aivpn_common::ssh_install::SshTarget {
+        host: host_str,
+        port: port as u16,
+        user: user_str,
+    };
+
+    // catch_unwind so a future panic in the SSH/tokio path can never abort
+    // the whole app process across the FFI boundary (mirrors runTunnel/
+    // mgmtRequest above).
+    let fingerprint: Option<String> =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .ok()?;
+            rt.block_on(aivpn_common::ssh_install::probe_host_fingerprint(&target))
+                .ok()
+        }))
+        .unwrap_or(None);
+
+    match fingerprint {
+        Some(fp) => make_str(&mut env, &fp),
+        None => std::ptr::null_mut(),
+    }
+}
+
+/// Returns the SHA256 (hex) of the embedded `install-server.sh`, so the UI
+/// can show the user what will run before they confirm.
+///
+/// Parameters (Kotlin): `external fun sshInstallScriptSha256(): String`
+#[cfg(feature = "ssh-install")]
+#[no_mangle]
+pub extern "system" fn Java_com_aivpn_client_AivpnJni_sshInstallScriptSha256(
+    mut env: JNIEnv,
+    _class: JClass,
+) -> jstring {
+    make_str(
+        &mut env,
+        &aivpn_common::ssh_install::installer_script_sha256_hex(),
+    )
+}
+
+/// Returns the full text of the embedded `install-server.sh`.
+///
+/// Parameters (Kotlin): `external fun sshInstallScript(): String`
+#[cfg(feature = "ssh-install")]
+#[no_mangle]
+pub extern "system" fn Java_com_aivpn_client_AivpnJni_sshInstallScript(
+    mut env: JNIEnv,
+    _class: JClass,
+) -> jstring {
+    make_str(&mut env, aivpn_common::ssh_install::installer_script())
+}
+
+/// Parses `paramsJson` (the same wire contract `install_params_from_json`
+/// documents in aivpn-common — host/port/user/auth/fingerprint/binary/mode/
+/// etc.) and, if valid, spawns a background thread that runs the installer
+/// (`aivpn_common::ssh_install::run_install`) against it, returning
+/// immediately with a job handle to poll via `sshInstallPoll`.
+///
+/// Parameters (Kotlin):
+/// ```kotlin
+/// external fun sshInstallStart(paramsJson: String): Long
+/// ```
+/// Returns the job handle (>=1), or `-1` if `paramsJson` is malformed (bad
+/// UTF-8, invalid JSON, or fails aivpn-common's install-params validation) —
+/// in that case no job is created and there is nothing to poll or free.
+#[cfg(feature = "ssh-install")]
+#[no_mangle]
+pub extern "system" fn Java_com_aivpn_client_AivpnJni_sshInstallStart<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    params_json: JString<'local>,
+) -> jlong {
+    let json = match env.get_string(&params_json) {
+        Ok(s) => String::from(s),
+        Err(_) => return -1,
+    };
+    let params = match aivpn_common::ssh_install::install_params_from_json(&json) {
+        Ok(p) => p,
+        Err(_) => return -1,
+    };
+
+    let handle = ssh_job_registry::registry().create();
+    std::thread::spawn(move || run_ssh_install_job(handle, params));
+    handle
+}
+
+/// Drives a single `run_install` call to completion on the background
+/// thread spawned by `sshInstallStart`, translating each
+/// `aivpn_common::ssh_install::InstallEvent` into its JSON wire form (via
+/// `install_event_to_json`) and pushing it onto `handle`'s event queue as it
+/// happens, then marking the job done so `sshInstallPoll` can report
+/// `PollOutcome::Done`.
+///
+/// `run_install` itself already emits a `Finished` event (with the real
+/// exit code) through the `on_event` callback right before returning `Ok`,
+/// so the `Ok` arm below pushes nothing further. An `Err` return means
+/// `run_install` failed before/without emitting its own `Finished` (e.g. a
+/// connect/auth/host-key-mismatch failure) — that arm synthesizes the
+/// `{"type":"line","line":"ERROR: <err>"}` then
+/// `{"type":"finished","exit_code":-1,"connection_key":null}` pair so a
+/// poller never sees a job that silently stops emitting anything.
+///
+/// Wrapped in `catch_unwind` (this is a plain background thread, not itself
+/// crossing the JNI boundary, but an uncaught panic here would otherwise
+/// leave `handle` marked pending forever — a real job leak, since nothing
+/// else would ever call `mark_done`) — a panic degrades to the same
+/// synthetic error `Finished` event.
+#[cfg(feature = "ssh-install")]
+fn run_ssh_install_job(handle: i64, params: aivpn_common::ssh_install::InstallParams) {
+    use aivpn_common::ssh_install::{install_event_to_json, run_install, InstallEvent};
+
+    let registry = ssh_job_registry::registry();
+    let push_error_and_finish = |msg: String| {
+        registry.push_event(
+            handle,
+            install_event_to_json(&InstallEvent::Line(format!("ERROR: {msg}"))),
+        );
+        registry.push_event(
+            handle,
+            install_event_to_json(&InstallEvent::Finished {
+                exit_code: -1,
+                connection_key: None,
+            }),
+        );
+    };
+
+    let rt = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            push_error_and_finish(format!("failed to start install runtime: {e}"));
+            registry.mark_done(handle);
+            return;
+        }
+    };
+
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        rt.block_on(run_install(params, |ev| {
+            registry.push_event(handle, install_event_to_json(&ev));
+        }))
+    }));
+
+    match outcome {
+        Ok(Ok(_exit_code)) => {}
+        Ok(Err(e)) => push_error_and_finish(e.to_string()),
+        Err(_) => push_error_and_finish("internal error: installer panicked (caught)".to_string()),
+    }
+
+    registry.mark_done(handle);
+}
+
+/// Pops and returns the next queued event (single-line JSON, the same
+/// `install_event_to_json` shape `InstallEvent` documents) for `handle`, or
+/// reports pending/done via nullability.
+///
+/// Parameters (Kotlin):
+/// ```kotlin
+/// external fun sshInstallPoll(handle: Long): String?
+/// ```
+/// - An event is queued → that event's JSON string.
+/// - No event queued, job still running → `null` — poll again later.
+/// - No event queued, job finished → `""` — safe to call `sshInstallFree`.
+/// - `handle` unknown (bad value, or already freed) → `""` (same wire value
+///   as "finished" — nothing further will ever come from this handle).
+///
+/// JNI strings have no size limit worth worrying about here, so each event
+/// is popped and returned whole; there is no separate "peek" call.
+#[cfg(feature = "ssh-install")]
+#[no_mangle]
+pub extern "system" fn Java_com_aivpn_client_AivpnJni_sshInstallPoll(
+    mut env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+) -> jstring {
+    use ssh_job_registry::PollOutcome;
+
+    // catch_unwind so a panic in the registry lock can never abort the app
+    // process across the FFI boundary (mirrors getAttemptedMaskFamily above).
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        ssh_job_registry::registry().poll(handle)
+    }))
+    .unwrap_or(PollOutcome::NotFound);
+
+    match outcome {
+        PollOutcome::Event(json) => make_str(&mut env, &json),
+        PollOutcome::Pending => std::ptr::null_mut(),
+        PollOutcome::Done | PollOutcome::NotFound => make_str(&mut env, ""),
+    }
+}
+
+/// Forgets `handle` on the Rust side, freeing its queued-events storage.
+///
+/// Parameters (Kotlin):
+/// ```kotlin
+/// external fun sshInstallFree(handle: Long): Int
+/// ```
+/// Returns `0` if a job was actually removed, `-1` if `handle` was already
+/// unknown (double-free, or a handle that was never valid).
+///
+/// **No cancellation**: if the background install thread (spawned by
+/// `sshInstallStart`) is still running, freeing the handle does not stop
+/// it — it keeps driving the SSH session (connect/upload/remote exec) to
+/// completion on its own; only its output becomes unobservable (further
+/// `push_event`/`mark_done` calls against the now-missing handle are no-ops
+/// in `ssh_job_registry`). There is currently no SSH-level abort plumbed
+/// through from this JNI layer.
+#[cfg(feature = "ssh-install")]
+#[no_mangle]
+pub extern "system" fn Java_com_aivpn_client_AivpnJni_sshInstallFree(
+    _env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+) -> jint {
+    let freed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        ssh_job_registry::registry().free(handle)
+    }))
+    .unwrap_or(false);
+    if freed {
+        0
+    } else {
+        -1
+    }
+}
+
+// ──────────────────────────────────────────────────────────
 // Helpers
 // ──────────────────────────────────────────────────────────
 
@@ -748,4 +1407,62 @@ fn make_str(env: &mut JNIEnv, s: &str) -> jstring {
     env.new_string("")
         .map(|js| js.into_raw())
         .unwrap_or(std::ptr::null_mut())
+}
+
+/// Builds a Java `byte[]` from `bytes`, mirroring `make_str`'s
+/// never-panic-across-FFI contract: a pending JVM exception is cleared and
+/// retried as an empty array rather than calling `.expect()`.
+fn make_bytes(env: &mut JNIEnv, bytes: &[u8]) -> jni::sys::jbyteArray {
+    if let Ok(arr) = env.byte_array_from_slice(bytes) {
+        return arr.into_raw();
+    }
+    let _ = env.exception_clear();
+    env.byte_array_from_slice(&[])
+        .map(|arr| arr.into_raw())
+        .unwrap_or(std::ptr::null_mut())
+}
+
+#[cfg(all(test, feature = "ssh-install"))]
+mod device_pubkey_tests {
+    use super::device_pubkey_b64_from_privkey_b64;
+
+    #[test]
+    fn device_pubkey_known_vector() {
+        // Fixed 32-byte privkey (bytes 0x01..=0x20) -> known pubkey, computed once via
+        // the same KeyPair::from_private_key/public_key_bytes derivation this function
+        // wraps (see its doc comment for why: same desktop KeyPair API, just fed the
+        // app-supplied bytes instead of a device.key file). Same vector as
+        // aivpn-ios-core's ssh_install_ffi::tests::device_pubkey_known_vector, so both
+        // mobile cores are pinned to derive the identical pubkey from the same privkey.
+        let privkey_b64 = "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA=";
+        let pubkey = device_pubkey_b64_from_privkey_b64(privkey_b64).expect("valid 32-byte key");
+        assert_eq!(pubkey, "B6N8vBQgk8i3VdwbEOhstCY3StFqqFPtC9/AsrhtHHw=");
+    }
+
+    #[test]
+    fn device_pubkey_roundtrips_against_keypair_generate() {
+        // Cross-checks against a freshly generated KeyPair so this doesn't just pin a
+        // magic constant: any random device key exported via export_private_key() must
+        // decode back to the same public_key_bytes() through the FFI-facing helper.
+        use base64::Engine;
+        let kp = aivpn_common::crypto::KeyPair::generate();
+        let privkey_b64 = base64::engine::general_purpose::STANDARD.encode(kp.export_private_key());
+        let expected_pubkey_b64 =
+            base64::engine::general_purpose::STANDARD.encode(kp.public_key_bytes());
+        assert_eq!(
+            device_pubkey_b64_from_privkey_b64(&privkey_b64),
+            Some(expected_pubkey_b64)
+        );
+    }
+
+    #[test]
+    fn device_pubkey_rejects_garbage_input() {
+        assert_eq!(device_pubkey_b64_from_privkey_b64(""), None);
+        assert_eq!(device_pubkey_b64_from_privkey_b64("not base64!!!"), None);
+        // valid base64 but wrong decoded length (16 bytes, not 32)
+        assert_eq!(
+            device_pubkey_b64_from_privkey_b64("AQIDBAUGBwgJCgsMDQ4PEA=="),
+            None
+        );
+    }
 }

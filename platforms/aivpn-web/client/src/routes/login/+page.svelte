@@ -1,12 +1,17 @@
 <script lang="ts">
   import { goto } from '$app/navigation';
+  import { page } from '$app/stores';
   import { onMount } from 'svelte';
   import { authStore } from '$lib/stores/auth.svelte';
   import { auth } from '$lib/api';
   import { startAuthentication } from '@simplewebauthn/browser';
 
-  let email = $state('');
+  let username = $state('');
   let password = $state('');
+
+  // Settings redirects here with ?reason=reauth after a security change
+  // (password/2FA/passkey) revokes every session — explain the forced logout.
+  const reauthNotice = $derived($page.url.searchParams.get('reason') === 'reauth');
   let totpCode = $state('');
   let requiresTotp = $state(false);
   let loading = $state(false);
@@ -29,7 +34,7 @@
     loading = true;
     error = '';
     try {
-      const res = await auth.login(email, password);
+      const res = await auth.login(username, password);
       if (res.totp_required) {
         requiresTotp = true;
       } else if (res.access_token) {
@@ -49,7 +54,7 @@
     loading = true;
     error = '';
     try {
-      const res = await auth.loginTotp(email, password, totpCode);
+      const res = await auth.loginTotp(username, password, totpCode);
       authStore.setToken(res.access_token);
       const user = await auth.me();
       authStore.setUser(user);
@@ -91,6 +96,11 @@
 
     <!-- Card -->
     <div class="rounded-2xl p-6" style="background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.1); backdrop-filter: blur(12px)">
+      {#if reauthNotice && !error}
+        <div class="mb-4 p-3 rounded-lg text-sm" style="background: rgba(123,97,255,0.12); border: 1px solid rgba(123,97,255,0.4); color: #c4b5fd">
+          Security settings were changed — all sessions were signed out. Please sign in again.
+        </div>
+      {/if}
       {#if error}
         <div class="mb-4 p-3 rounded-lg text-sm" style="background: rgba(220,38,38,0.15); border: 1px solid rgba(220,38,38,0.4); color: #fca5a5">
           {error}
@@ -114,12 +124,12 @@
         <!-- Password form (disabled in exclusive mode) -->
         <form onsubmit={(e) => { e.preventDefault(); handleLogin(); }} class="space-y-4">
           <div>
-            <label class="block text-sm font-medium mb-1" style="color: rgba(255,255,255,0.7)" for="email">Username</label>
+            <label class="block text-sm font-medium mb-1" style="color: rgba(255,255,255,0.7)" for="username">Username</label>
             <input
-              id="email"
+              id="username"
               type="text"
               autocomplete="username"
-              bind:value={email}
+              bind:value={username}
               required
               class="w-full px-3 py-2 rounded-lg text-sm focus:outline-none focus:ring-2"
               style="background: rgba(255,255,255,0.08); border: 1px solid rgba(255,255,255,0.15); color: #fff; --tw-ring-color: #7B61FF"

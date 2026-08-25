@@ -197,9 +197,6 @@ impl ClientNetworkConfig {
     /// rejects mismatched versions — a v2 client refuses to negotiate with a v1
     /// server (and vice versa) rather than silently failing every packet.
     const WIRE_VERSION: u8 = 2;
-    /// Oldest wire version a client still accepts from a server. See
-    /// `decode_wire`: v1 carries the same fields minus `keepalive_secs`.
-    const MIN_WIRE_VERSION: u8 = 1;
 
     pub fn validate(&self) -> Result<()> {
         VpnNetworkConfig {
@@ -226,22 +223,6 @@ impl ClientNetworkConfig {
         self.netmask().to_string()
     }
 
-    /// Encode for a pre-Variant-A peer: wire v1, without the trailing
-    /// `keepalive_secs` byte v2 appended.
-    ///
-    /// Such a client compares the version byte for EQUALITY and drops the whole
-    /// `ServerHello` when it does not match, so sending it v2 makes the
-    /// handshake complete on the server and die silently on the client — it
-    /// never ratchets, never sends data, and reconnects forever. The dropped
-    /// field only carries the keepalive hint, which a v1 client never had.
-    pub fn encode_wire_v1(&self) -> [u8; 12] {
-        let full = self.encode_wire();
-        let mut buf = [0u8; 12];
-        buf.copy_from_slice(&full[..12]);
-        buf[0] = Self::MIN_WIRE_VERSION;
-        buf
-    }
-
     pub fn encode_wire(&self) -> [u8; Self::WIRE_SIZE] {
         let mut buf = [0u8; Self::WIRE_SIZE];
         buf[0] = Self::WIRE_VERSION;
@@ -260,21 +241,7 @@ impl ClientNetworkConfig {
                 "Client network config has invalid wire length",
             ));
         }
-        // Wire v1 is byte-identical to v2 over the first 12 bytes; v2 only
-        // appended the keepalive field, whose absence the length check above
-        // already tolerates. Accepting v1 is what lets a current client finish
-        // a handshake with a server that predates it — otherwise the ServerHello
-        // authenticates, parses, and is thrown away here, and the app reconnects
-        // forever against an older deployment (issues #70, #68).
-        //
-        // This does NOT weaken the refusal the version bump was introduced for.
-        // v2 exists because of the mask-defined tag offset: a v1 peer assumes
-        // tag@0. Reaching this point at all means the handshake already
-        // validated, which against a v1 server only happens once the client has
-        // fallen back to the tag@0 layout (`LEGACY_LAYOUT_THRESHOLD`). A client
-        // still using an embedded-tag mask can never get a v1 ServerHello to
-        // authenticate, so it can never accept a peer it cannot talk to.
-        if !(Self::MIN_WIRE_VERSION..=Self::WIRE_VERSION).contains(&data[0]) {
+        if data[0] != Self::WIRE_VERSION {
             return Err(Error::InvalidPacket(
                 "Unsupported client network config wire version",
             ));

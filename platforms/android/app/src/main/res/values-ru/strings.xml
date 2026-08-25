@@ -8,6 +8,11 @@
     <string name="status_reconnecting">Повторное подключение…</string>
     <string name="status_error">Ошибка: %s</string>
     <string name="status_native_lib_unavailable">Ошибка: нативная библиотека недоступна — переустановите приложение</string>
+    <string name="status_cert_rejected">Сервер отклонил сертификат — требуется повторное предоставление</string>
+    <string name="status_handshake_reject_one_time_used">Этот одноразовый ключ уже был использован</string>
+    <string name="status_handshake_reject_expired">Срок действия ключа клиента истёк</string>
+    <string name="status_handshake_reject_disabled">Этот клиент отключён сервером</string>
+    <string name="status_handshake_reject_unspecified">Сервер отклонил подключение</string>
     <string name="btn_connect">Подключить</string>
     <string name="btn_disconnect">Отключить</string>
     <string name="hint_server">Адрес сервера</string>
@@ -163,9 +168,18 @@
     <string name="mask_country_code_hint">DE</string>
     <string name="mask_country_code_invalid">Код страны должен состоять ровно из 2 букв</string>
 
+    <!-- Модульные настройки транспорта (провайдеры конкретной редакции; пункт скрыт, если их нет) -->
+    <string name="transport_settings_title">Транспорт подключения</string>
+    <string name="desc_transport_settings">Дополнительные настройки транспорта подключения для этой редакции.</string>
+    <string name="transport_apply">Применить</string>
+    <string name="transport_applied">Настройки транспорта применены — вступят в силу при следующем подключении</string>
+
     <!-- Канал уведомлений событий -->
     <string name="notification_event_channel">События AIVPN</string>
     <string name="notification_event_channel_desc">Уведомления об изменении состояния подключения</string>
+
+    <!-- Канал воркера автопереподключения (тихая заглушка прогресса, expedited work на API < 31) -->
+    <string name="notification_reconnect_channel">Автопереподключение AIVPN</string>
 
     <!-- Оповещения безопасности: неожиданная остановка VPN (трафик больше не защищён) -->
     <string name="notification_alert_channel">Оповещения безопасности AIVPN</string>
@@ -206,4 +220,165 @@
     <string name="bg_health_oem_generic">На некоторых устройствах также нужно включить «Автозапуск» для AIVPN в фирменном приложении батареи/безопасности.</string>
     <string name="bg_health_hint_ok">Фон: защищено</string>
     <string name="bg_health_hint_risk">Фон: под угрозой — нажмите, чтобы исправить</string>
+
+    <!-- In-app admin: client management (P3.1) -->
+    <string name="admin_menu_title">Управление клиентами</string>
+    <string name="desc_admin_menu">Просмотр клиентов, пула и журнала аудита — добавление/изменение/отзыв только для Admin</string>
+    <string name="admin_title">Управление клиентами</string>
+    <string name="admin_refresh">Обновить</string>
+    <string name="admin_not_connected">Нет подключения — подключитесь к VPN, чтобы управлять клиентами</string>
+    <string name="admin_no_clients">Пока нет клиентов</string>
+    <string name="admin_add_client">Добавить клиента</string>
+    <string name="admin_action_key">Ключ</string>
+    <string name="admin_action_edit">Изменить</string>
+    <string name="admin_action_reset">Сброс устройства</string>
+    <string name="admin_action_revoke">Отозвать</string>
+    <string name="admin_dialog_add_title">Добавить клиента</string>
+    <string name="admin_dialog_edit_title">Изменить клиента</string>
+    <string name="admin_hint_name">Имя клиента</string>
+    <string name="admin_hint_expiry">Срок действия (ISO 8601, необязательно)</string>
+    <string name="admin_one_time">Одноразовый ключ</string>
+    <string name="admin_enabled">Включён</string>
+    <string name="admin_status_enabled">Включён</string>
+    <string name="admin_status_disabled">Отключён</string>
+    <string name="admin_status_one_time">Одноразовый</string>
+    <string name="admin_status_expires">Истекает: %s</string>
+    <string name="admin_revoke_confirm_title">Отозвать клиента?</string>
+    <string name="admin_revoke_confirm_msg">Это навсегда отзовёт \"%s\" и отключит его. Продолжить?</string>
+    <string name="admin_reset_confirm_title">Сбросить привязку устройства?</string>
+    <string name="admin_reset_confirm_msg">\"%s\" потребуется заново привязать устройство при следующем подключении. Продолжить?</string>
+    <string name="admin_share">Поделиться</string>
+    <string name="admin_copy">Копировать</string>
+    <string name="admin_copied">Скопировано</string>
+    <string name="admin_reject_reason_prefix">Отклонено: %s</string>
+    <string name="admin_error_generic">Ошибка запроса (%d)</string>
+    <string name="admin_error_with_reason">Ошибка запроса (%1$d): %2$s</string>
+    <string name="admin_hint_exit_node">Выходной узел (необязательно, host:port — пусто = глобальный по умолчанию)</string>
+    <string name="admin_hint_exit_node_live">Персональный выходной узел применяется вживую, без переподключения. Глобальный по умолчанию — только после перезапуска сервера.</string>
+    <string name="admin_exit_option_default">(по умолчанию)</string>
+    <string name="admin_exit_option_custom">Свой вариант…</string>
+    <string name="admin_exit_node_prefix">Выход: %s</string>
+    <string name="admin_title_viewer">Управление клиентами (Viewer, только просмотр)</string>
+
+    <!-- Топология пула (Wave B3) -->
+    <string name="pool_title">Топология пула</string>
+    <string name="pool_no_nodes">Нет узлов пула</string>
+    <string name="pool_health_transport">Транспорт: %s</string>
+    <string name="pool_health_nodes">Всего узлов: %d</string>
+    <string name="pool_health_connected">Подключённых пиров: %d</string>
+    <string name="pool_health_converged">Синхронизированных пиров: %d</string>
+    <string name="pool_health_diverged">Часть подключённых пиров рассинхронизирована</string>
+    <string name="pool_warning_partition_conflict">Внимание: конфликт разделов VPN-IP с пиром</string>
+    <string name="pool_warning_subnet_mismatch">Внимание: несовпадение подсети VPN с пиром</string>
+    <string name="pool_node_revoked">Отозван</string>
+    <string name="pool_node_no_address">Нет адреса</string>
+    <string name="pool_node_verified">Подтверждён</string>
+    <string name="pool_node_unverified">Не подтверждён</string>
+    <string name="pool_node_connected">Подключён</string>
+    <string name="pool_node_disconnected">Отключён</string>
+    <string name="pool_node_last_seen">Последний раз виден: %s</string>
+    <string name="pool_node_never">никогда</string>
+
+    <!-- Настройки сервера с откатом (Wave 2 / G-A3): только Admin -->
+    <string name="server_settings_title">Настройки сервера</string>
+    <string name="server_settings_mask_title">Активная маска</string>
+    <string name="server_settings_mask_caption">Применяется вживую, немедленно — перезапуск сервера не требуется. Подтвердите в течение окна ниже, иначе изменение будет автоматически откачено.</string>
+    <string name="server_settings_mask_client_label">Клиент (переопределение маски — per-client)</string>
+    <string name="server_settings_mask_label">Маска</string>
+    <string name="server_settings_mask_no_clients">Список клиентов недоступен — подключитесь к VPN и нажмите обновить.</string>
+    <string name="server_settings_mask_id_hint">Введите id маски</string>
+    <string name="server_settings_mask_none_loaded">Список масок пока недоступен — подключитесь к VPN и откройте этот экран заново, либо введите id маски вручную.</string>
+    <string name="server_settings_exit_title">Глобальный выходной узел по умолчанию (пул)</string>
+    <string name="server_settings_exit_caption">Применяется только после ПЕРЕЗАПУСКА сервера — не вживую. Это резервный вариант для любого клиента без собственного персонального выходного узла.</string>
+    <string name="server_settings_exit_hint">host:port — пусто = нет</string>
+    <string name="server_settings_apply">Применить</string>
+    <string name="server_settings_confirm">Подтвердить</string>
+    <string name="server_settings_pending_banner">Подтвердите в течение %d с, иначе изменение будет автоматически откачено</string>
+    <string name="server_settings_confirmed">Подтверждено — изменение теперь постоянное</string>
+    <string name="server_settings_reverted">Не подтверждено вовремя — сервер уже откатил это изменение</string>
+
+    <!-- Журнал аудита (G-A2): цепочка хешей подписанных действий админа, Viewer + Admin -->
+    <string name="audit_title">Журнал аудита</string>
+    <string name="audit_no_entries">Записей аудита пока нет</string>
+    <string name="audit_chain_verified">Цепочка подтверждена</string>
+    <string name="audit_chain_broken">Цепочка повреждена на записи №%d</string>
+    <string name="audit_entry_target_prefix">Цель: %s</string>
+    <string name="audit_entry_actor_prefix">%1$s · %2$s</string>
+
+    <!-- Мастер установки сервера по SSH (C3) -->
+    <string name="install_menu_title">Установить сервер</string>
+    <string name="desc_install_menu">Установить новый aivpn-server по SSH</string>
+    <string name="install_title">Установка сервера</string>
+    <string name="install_step_next">Далее</string>
+    <string name="install_step1_title">Цель</string>
+    <string name="install_step2_title">Ключ хоста</string>
+    <string name="install_step3_title">Установка</string>
+    <string name="install_hint_host">Хост или IP</string>
+    <string name="install_hint_port">Порт SSH</string>
+    <string name="install_hint_user">Пользователь SSH</string>
+    <string name="install_hint_auth">Аутентификация</string>
+    <string name="install_auth_password">Пароль</string>
+    <string name="install_auth_key_pem">Приватный ключ</string>
+    <string name="install_hint_password">Пароль SSH</string>
+    <string name="install_hint_key_pem">Приватный ключ (PEM)</string>
+    <string name="install_hint_key_passphrase">Пароль ключа (опционально)</string>
+    <string name="install_hint_binary_source">Бинарник сервера</string>
+    <string name="install_binary_default">По умолчанию (GitHub Releases)</string>
+    <string name="install_binary_url">Произвольный URL</string>
+    <string name="install_binary_file">Локальный файл</string>
+    <string name="install_hint_binary_url">https://.../aivpn-server</string>
+    <string name="install_pick_binary_file">Выбрать файл…</string>
+    <string name="install_no_file_selected">Файл не выбран</string>
+    <string name="install_error_need_binary_url">Укажите URL бинарника</string>
+    <string name="install_error_need_binary_file">Выберите локальный файл бинарника aivpn-server</string>
+    <string name="install_error_file_read_failed">Не удалось прочитать выбранный файл</string>
+    <string name="install_hint_mode">Режим установки</string>
+    <string name="install_mode_systemd">systemd</string>
+    <string name="install_mode_docker">Docker</string>
+    <string name="install_hint_server_ip">Публичный IP сервера (опционально — для авто-создания admin-клиента)</string>
+    <string name="install_hint_server_port">Публичный порт сервера (опционально)</string>
+    <string name="install_device_binding">Привязать admin-клиента к этому устройству</string>
+    <string name="install_device_binding_hint">Ключ регистрации этого устройства будет отправлен на сервер, чтобы он создал admin-клиента, привязанного к устройству — использовать его сможет только это устройство.</string>
+    <string name="install_device_binding_failed">Не удалось получить публичный ключ устройства для привязки — установка прервана. Снимите галочку «Привязать admin-клиента к этому устройству» и повторите попытку без привязки.</string>
+    <string name="install_error_bad_port">Укажите корректный порт SSH (1–65535)</string>
+    <string name="install_error_need_password">Введите пароль SSH</string>
+    <string name="install_error_need_key">Вставьте приватный ключ (PEM)</string>
+    <string name="install_error_core_unavailable">Нативное ядро недоступно — установка невозможна</string>
+    <string name="install_tofu_probing">Подключение к %s…</string>
+    <string name="install_tofu_error">Ошибка подключения: %s</string>
+    <string name="install_tofu_error_generic">Не удалось подключиться или прочитать ключ хоста</string>
+    <string name="install_tofu_retry">Повторить</string>
+    <string name="install_tofu_fingerprint_label">Отпечаток ключа хоста</string>
+    <string name="install_tofu_confirm_hint">Сверьте этот отпечаток по другому каналу перед тем, как довериться ему</string>
+    <string name="install_show_script">Показать скрипт установки</string>
+    <string name="install_script_sha256">SHA256: %s</string>
+    <string name="install_trust">Доверяю и устанавливаю</string>
+    <string name="install_running">Установка…</string>
+    <string name="install_success">Сервер успешно установлен</string>
+    <string name="install_import_profile">Импортировать профиль</string>
+    <string name="install_failed">Установка не удалась (код выхода %d)</string>
+    <string name="install_error_bad_params">Внутренняя ошибка: некорректные параметры установки</string>
+    <string name="install_log_connected">Подключено, ключ хоста: %s</string>
+    <string name="install_log_uploading">Загрузка %s…</string>
+    <string name="install_log_finished">Завершено, код выхода %d</string>
+    <string name="install_profile_imported">Профиль импортирован</string>
+    <string name="install_profile_auto_imported">Профиль импортирован автоматически:</string>
+    <string name="install_marker_port_busy">Целевой порт уже занят другим процессом</string>
+    <string name="install_marker_no_masks">Нет доступных профилей маскировки для установки</string>
+    <string name="install_marker_template_missing">В пакете установки отсутствует шаблон конфигурации сервера</string>
+    <string name="install_marker_unit_template_missing">В пакете установки отсутствует шаблон systemd-юнита</string>
+    <string name="install_marker_no_local_device_key">Ключ устройства недоступен — admin-клиент создан без привязки к устройству</string>
+    <string name="install_marker_root_required">Установщику требуются права root на целевом хосте</string>
+    <string name="install_marker_missing_server_ip">Для создания admin-клиента требуется публичный IP сервера</string>
+    <string name="install_marker_add_client_failed">Не удалось создать admin-клиента на сервере</string>
+    <string name="install_marker_key_not_found">Admin-клиент создан, но ключ подключения не получен</string>
+    <string name="install_marker_unsupported_arch">Архитектура процессора целевого хоста не поддерживается</string>
+    <string name="install_marker_download_failed">Не удалось скачать бинарник aivpn-server</string>
+    <string name="install_marker_checksum_mismatch">Скачанный бинарник не прошёл проверку контрольной суммы</string>
+    <string name="install_marker_service_not_active">Служба aivpn-server не запустилась</string>
+    <string name="install_marker_port_not_listening">aivpn-server не начал прослушивать ожидаемый порт</string>
+    <string name="install_marker_port_owned_by_other">Порт прослушивания занят другим процессом</string>
+    <string name="install_marker_docker_missing">Docker не установлен на целевом хосте</string>
+    <string name="install_marker_compose_missing">docker compose недоступен на целевом хосте</string>
+    <string name="install_marker_container_not_running">Контейнер aivpn-server не сообщил о запуске</string>
 </resources>

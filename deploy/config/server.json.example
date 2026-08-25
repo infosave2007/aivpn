@@ -18,16 +18,20 @@
   "idle_timeout_secs": 30,
   "session_timeout_secs": null,
 
+  "management_socket": "/run/aivpn/api.sock",
+  "management_socket_group": null,
+
   "allow_peer_routing": false,
 
   "neural_enabled": true,
-  "downlink_shaping": true,
+  "downlink_shaping": "full",
 
   "mask_verify_mode": "warn",
   "mask_signing_key": null,
   "mask_operator_pubkey": null,
 
   "pool": {
+    "node_id": "",
     "peers": [],
     "sync_key": "",
     "exit_node": null,

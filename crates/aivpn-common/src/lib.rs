@@ -20,10 +20,31 @@ pub mod recording;
 pub mod dpi_gate;
 
 #[cfg(feature = "client-upload")]
+pub mod mgmt;
+
+#[cfg(feature = "client-upload")]
 pub mod mimicry;
+
+#[cfg(feature = "transport")]
+pub mod transport;
+
+// Descriptor-driven extra settings sections for the GUIs. Data only: a build
+// with no descriptor file renders no extra settings. Needs `transport` for
+// `TransportConfig`.
+#[cfg(feature = "ui-ext")]
+pub mod ui_ext;
 
 #[cfg(feature = "client-upload")]
 pub mod upload_pipeline;
+
+#[cfg(feature = "mobile-tunnel")]
+pub mod mobile_tunnel;
+
+#[cfg(feature = "qr")]
+pub mod qr;
+
+#[cfg(feature = "ssh-install")]
+pub mod ssh_install;
 
 #[cfg(unix)]
 pub mod kernel_accel;

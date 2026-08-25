@@ -4,7 +4,7 @@ import { verifyAccessToken } from './jwt'
 import { getDb, IS_SQLITE, sqliteUsers, sqliteSessions, pgUsers, pgSessions } from '../db'
 import type { UserRole } from '../db/schema'
 
-export interface AuthUser {
+interface AuthUser {
   id: number
   role: UserRole
   session_version: number

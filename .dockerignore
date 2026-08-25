@@ -1,11 +1,30 @@
 target/
+# Docker ignore patterns without a slash match only the top level, so `target/`
+# above does not cover a per-crate target dir.
+**/target/
+# Bun/npm trees under platforms/ (aivpn-web). These are never needed by the
+# Rust images and, for the web image, actively break the build when they
+# shadow the freshly installed ones — see platforms/aivpn-web/.dockerignore.
+**/node_modules/
 .git/
 .gitignore
 *.md
 releases/
 !releases/*.exe
+# deploy/docker/Dockerfile.prebuilt COPYs a prebuilt Linux server binary out of
+# releases/, which the blanket `releases/` rule above would otherwise hide from
+# the build context entirely (COPY would fail with "not found in build
+# context"). Re-include exactly the artifacts that Dockerfile references.
+!releases/aivpn-server-linux-*
+!releases/aivpn-client-linux-*
 docs/
-monitoring/
+# nDPI sources + pcap corpora for the DPI harness — multiple GB, and no image
+# builds from them. Keeping them in the context slows every `docker build` by
+# the time it takes to tar and ship them to the daemon.
+research/
+deploy/monitoring/
+# CI gates: invoked by the Makefile, no business in an image
+deploy/ci/
 .qoder/
 .venv/
 *.log

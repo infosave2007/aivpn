@@ -6,7 +6,8 @@ START=90
 STOP=10
 
 PROG=/usr/bin/aivpn-client
-CONFIG=/etc/aivpn/client.json
+# UCI config — procd watches this file and restarts the service on change
+CONFIG=/etc/config/aivpn
 
 start_service() {
     local enabled connection_key server server_key

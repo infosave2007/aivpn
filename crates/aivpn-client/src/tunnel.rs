@@ -5,7 +5,7 @@
 
 use std::io;
 use tokio::io::AsyncWriteExt;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use crate::kill_switch::KillSwitch;
 use aivpn_common::error::{Error, Result};
@@ -102,13 +102,28 @@ impl TunnelConfig {
         network_config: ClientNetworkConfig,
         full_tunnel: bool,
     ) -> Self {
+        // Clamp to MAX_PACKET_SIZE (1500): client.rs's FecEncoder is
+        // hardcoded to a 1500-byte parity buffer
+        // (`FecEncoder::new(fec_n, 1500)`), and `FecEncoder::feed()` silently
+        // truncates anything longer — bytes beyond 1500 never get XORed into
+        // repair parity, so any lost packet in a group containing an
+        // oversized member gets "recovered" corrupted/truncated instead of
+        // failing loudly. `network_config.mtu` is server-controlled (pushed
+        // in `apply_server_network_override`) as well as
+        // config-file/bootstrap-controlled here at startup, up to u16::MAX —
+        // this is the single choke point both paths route through before a
+        // `TunnelConfig` (and the MTU actually applied to the TUN device) is
+        // produced.
+        let mtu = network_config
+            .mtu
+            .min(aivpn_common::protocol::MAX_PACKET_SIZE as u16);
         Self {
             tun_name,
             tun_addr: network_config.client_ip.to_string(),
             server_vpn_ip: network_config.server_vpn_ip.to_string(),
             tun_netmask: network_config.netmask_string(),
             prefix_len: network_config.prefix_len,
-            mtu: network_config.mtu,
+            mtu,
             full_tunnel,
             mdh_len: network_config.mdh_len,
             include_routes: Vec::new(),
@@ -192,8 +207,55 @@ pub struct Tunnel {
     wintun_if_index: Option<String>,
     /// CIDRs added by apply_split_routes — removed on Drop.
     split_routes_applied: Vec<String>,
+    /// Whether this Tunnel instance installed the IPv6 blackhole default
+    /// route (macOS: configure_macos; Linux: enable_full_tunnel). Drop must
+    /// only remove a blackhole we added ourselves — unconditionally deleting
+    /// `blackhole default` could tear down a route some other tool owns.
+    /// Never touched by the Windows code paths; allow(dead_code) silences
+    /// that build's warning.
+    #[allow(dead_code)]
+    ipv6_blackhole_added: bool,
     /// Active kill-switch instance; deactivated on graceful Drop.
     kill_switch_state: Option<KillSwitch>,
+}
+
+/// PID of a currently in-flight `pkexec` child spawned by
+/// `Tunnel::run_via_pkexec_stdin`, if any (0 = none). Tracked so the client
+/// can attempt to kill it from its own shutdown/Drop path —
+/// `Tunnel::drop()` calls `kill_orphaned_pkexec_child()` — instead of
+/// leaving it reparented to init (and the polkit auth dialog still showing)
+/// if this process is killed/crashes while the dialog is up.
+///
+/// This is necessarily a best-effort, PARTIAL mitigation, not a full fix:
+/// `pkexec` is normally installed setuid-root, so it runs with euid 0 from
+/// the instant of its own `exec()` — before the auth dialog even appears.
+/// An unprivileged client cannot `kill()` a process it doesn't own (EPERM);
+/// the same setuid-exec rule is also why `PR_SET_PDEATHSIG` doesn't help
+/// here (the kernel clears it on any setuid/capability-bearing exec). So
+/// this fully closes the orphan window only when the client itself runs as
+/// root (a supported/documented mode — see vpn_manager.rs); for an
+/// unprivileged client it's a harmless no-op attempt, no worse than the
+/// prior status quo, and still covers the actual reachable case of a clean
+/// disconnect/reconnect/panic-unwind racing an open auth dialog (Drop runs
+/// on all of those, just not on SIGKILL of this process).
+#[cfg(target_os = "linux")]
+static ACTIVE_PKEXEC_PID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Best-effort kill of a tracked in-flight `pkexec` child. See
+/// `ACTIVE_PKEXEC_PID` for why this can't be a complete fix.
+#[cfg(target_os = "linux")]
+fn kill_orphaned_pkexec_child() {
+    let pid = ACTIVE_PKEXEC_PID.swap(0, std::sync::atomic::Ordering::SeqCst);
+    if pid != 0 {
+        // SAFETY: FFI call to kill(2) with a pid we obtained from our own
+        // Child::id() and an integer signal constant — no pointers involved.
+        // A permission failure (pid already root-owned) or a stale pid
+        // (process already exited) both just return an ignored errno; this
+        // is best-effort cleanup, not a correctness-critical path.
+        unsafe {
+            libc::kill(pid as i32, libc::SIGKILL);
+        }
+    }
 }
 
 impl Tunnel {
@@ -208,6 +270,7 @@ impl Tunnel {
             saved_ipv6_iface: None,
             wintun_if_index: None,
             split_routes_applied: Vec::new(),
+            ipv6_blackhole_added: false,
             kill_switch_state: None,
         }
     }
@@ -376,6 +439,36 @@ impl Tunnel {
             self.config.tun_name, self.config.tun_addr, self.config.tun_netmask
         );
 
+        // Claim this device with the native network-change listener BEFORE any
+        // configuration below touches it. Everything `configure_linux()` and
+        // the later `apply_network_config()` do emits netlink LINK/IFADDR
+        // events on exactly this interface; without the claim the listener
+        // reports them as "the network moved" and the session is torn down
+        // moments after it establishes. Registering first closes the window in
+        // which our own setup events could still be misread.
+        //
+        // Resolution failure is non-fatal: index 0 means "nothing registered",
+        // so the listener falls back to reporting every event — the pre-filter
+        // behavior — rather than going silent.
+        //
+        // Linux-only: `if_nametoindex` is not part of the Windows libc surface,
+        // and Linux is the only platform whose listener consumes the index (see
+        // `net_change::set_own_tun_ifindex`).
+        #[cfg(target_os = "linux")]
+        {
+            let ifindex = std::ffi::CString::new(self.config.tun_name.as_str())
+                .map(|c| unsafe { libc::if_nametoindex(c.as_ptr()) })
+                .unwrap_or(0);
+            if ifindex == 0 {
+                debug!(
+                    "net_change: could not resolve ifindex for {} — network-change \
+                     events will not be filtered for this session",
+                    self.config.tun_name
+                );
+            }
+            crate::net_change::set_own_tun_ifindex(ifindex);
+        }
+
         // Platform-specific post-creation configuration
         #[cfg(target_os = "macos")]
         self.configure_macos().await?;
@@ -418,9 +511,30 @@ impl Tunnel {
 
     pub async fn apply_network_config(
         &mut self,
-        network_config: ClientNetworkConfig,
+        mut network_config: ClientNetworkConfig,
     ) -> Result<()> {
         network_config.validate()?;
+        // Clamp to MAX_PACKET_SIZE — see the matching comment in
+        // `TunnelConfig::from_network_config`. This is the live path that
+        // sets the TUN device's actual MTU on a server-pushed
+        // (ServerHello/mid-session) network-config override, so it must be
+        // clamped independently of that other choke point, not just rely on
+        // it.
+        network_config.mtu = network_config
+            .mtu
+            .min(aivpn_common::protocol::MAX_PACKET_SIZE as u16);
+        // Remember the address the device carried BEFORE this override: on
+        // Linux `ip addr replace <new>` with a different IP ADDS it as a
+        // secondary address, the old one stays primary and keeps winning
+        // source selection — so the server's anti-spoof check would still see
+        // the stale IP and drop every data packet. The old CIDR must be
+        // deleted explicitly.
+        #[cfg(target_os = "linux")]
+        let stale_cidr = self
+            .config
+            .client_network_config()
+            .ok()
+            .map(|c| c.cidr_string());
         self.config.tun_addr = network_config.client_ip.to_string();
         self.config.server_vpn_ip = network_config.server_vpn_ip.to_string();
         self.config.tun_netmask = network_config.netmask_string();
@@ -445,12 +559,46 @@ impl Tunnel {
         }
 
         #[cfg(target_os = "linux")]
-        self.configure_linux()?;
+        {
+            self.configure_linux()?;
+            let new_cidr = self.config.client_network_config()?.cidr_string();
+            if let Some(stale) = stale_cidr.filter(|old| *old != new_cidr) {
+                self.remove_stale_linux_addr(&stale);
+            }
+        }
 
         #[cfg(target_os = "windows")]
         self.configure_windows()?;
 
         Ok(())
+    }
+
+    /// Delete a stale IPv4 address left on the TUN device after a
+    /// server-pushed network override changed the client IP (see
+    /// `apply_network_config`). Best-effort: the new address is already
+    /// installed, so a failure here only risks the kernel still preferring
+    /// the old source IP.
+    #[cfg(target_os = "linux")]
+    fn remove_stale_linux_addr(&self, stale_cidr: &str) {
+        let tun_name = &self.config.tun_name;
+        match Self::run_ip_batch_privileged(&[(
+            "addr_del",
+            &["addr", "del", stale_cidr, "dev", tun_name],
+        )]) {
+            Ok(results)
+                if results
+                    .iter()
+                    .any(|(name, code)| name == "addr_del" && *code == 0) =>
+            {
+                info!("Removed stale tunnel address {}", stale_cidr);
+            }
+            Ok(_) => warn!(
+                "Could not remove stale tunnel address {} — outgoing packets may keep \
+                 the old source IP until reconnect",
+                stale_cidr
+            ),
+            Err(e) => warn!("Stale address cleanup failed: {}", e),
+        }
     }
 
     // ──────────────────── macOS ────────────────────
@@ -616,29 +764,33 @@ impl Tunnel {
         let _ = Command::new("/sbin/route")
             .args(["-n", "delete", "-inet6", "default"])
             .status();
-        let _ = Command::new("/sbin/route")
+        let blackhole_ok = Command::new("/sbin/route")
             .args(["-n", "add", "-inet6", "-net", "::/0", "-blackhole"])
-            .status();
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        // Remember that WE added the blackhole so Drop only restores IPv6
+        // when there is actually something of ours to remove.
+        self.ipv6_blackhole_added = blackhole_ok;
         info!("IPv6 blocked — all v6 traffic goes to blackhole (no leak possible)");
 
-        // Verify routes
+        // Verify routes — diagnostic-only (just logs which routes are
+        // present). Best-effort: this must never fail the whole connect
+        // attempt just because `netstat` couldn't exec (missing from PATH,
+        // sandboxed environment, transient ENOMEM/EMFILE) — that would abort
+        // an otherwise fully working `configure_macos()` → `create()` →
+        // `connect()` over a logging command.
         info!("Verifying routes...");
-        let output = Command::new("netstat")
-            .args(["-rn", "-f", "inet"])
-            .output()
-            .map_err(|e| {
-                Error::Io(io::Error::new(
-                    io::ErrorKind::Other,
-                    format!("Failed to run netstat: {}", e),
-                ))
-            })?;
-
-        let routes = String::from_utf8_lossy(&output.stdout);
-        if routes.contains(&vpn_network_addr) {
-            info!("Routes verified:");
-            for line in routes.lines().filter(|l| l.contains(&vpn_network_addr)) {
-                debug!("  {}", line.trim());
+        if let Ok(output) = Command::new("netstat").args(["-rn", "-f", "inet"]).output() {
+            let routes = String::from_utf8_lossy(&output.stdout);
+            if routes.contains(&vpn_network_addr) {
+                info!("Routes verified:");
+                for line in routes.lines().filter(|l| l.contains(&vpn_network_addr)) {
+                    debug!("  {}", line.trim());
+                }
             }
+        } else {
+            warn!("Failed to run netstat for route verification (diagnostic-only, continuing)");
         }
 
         Ok(())
@@ -648,6 +800,11 @@ impl Tunnel {
 
     /// Run `ip <args>`, falling back to `pkexec ip <args>` if the direct
     /// invocation is rejected by the kernel with a permission error.
+    ///
+    /// Returns the command's plain shell exit code (0 = success) — NOT a
+    /// raw wait status; callers must compare `code == 0` rather than going
+    /// anywhere near `ExitStatus::from_raw` (which expects `code << 8` and
+    /// would classify exit code 128 as a success).
     ///
     /// Background: aivpn-linux grants CAP_NET_ADMIN to both the client
     /// binary and every `ip` binary it finds as a *file capability* (see
@@ -667,7 +824,7 @@ impl Tunnel {
     /// integration, etc.), recover unconditionally by asking pkexec for
     /// one-shot root privilege instead of relying on the file capability.
     #[cfg(target_os = "linux")]
-    fn run_ip_privileged(args: &[&str]) -> io::Result<std::process::ExitStatus> {
+    fn run_ip_privileged(args: &[&str]) -> io::Result<i32> {
         Ok(Self::run_ip_batch_privileged(&[("cmd", args)])?
             .into_iter()
             .next()
@@ -772,6 +929,9 @@ impl Tunnel {
             ["addr", "replace", cidr, "dev", iface] => {
                 Some(format!("{name}\taddr_replace\t{cidr}\t{iface}"))
             }
+            ["addr", "del", cidr, "dev", iface] => {
+                Some(format!("{name}\taddr_del\t{cidr}\t{iface}"))
+            }
             ["route", "replace", cidr, "dev", iface] => {
                 Some(format!("{name}\troute_replace_dev\t{cidr}\t{iface}"))
             }
@@ -787,6 +947,17 @@ impl Tunnel {
             ["route", "replace", cidr, "via", gw] => {
                 Some(format!("{name}\troute_replace_via\t{cidr}\t{gw}"))
             }
+            ["route", "del", cidr] => Some(format!("{name}\troute_del\t{cidr}")),
+            ["route", "add", "default", "via", gw] => {
+                Some(format!("{name}\troute_add_default_via\t{gw}"))
+            }
+            ["route", "add", "default", "via", gw, "dev", iface] => {
+                Some(format!("{name}\troute_add_default_via_dev\t{gw}\t{iface}"))
+            }
+            ["-6", "route", "del", "blackhole", "default"] => {
+                Some(format!("{name}\troute_del_ipv6_blackhole"))
+            }
+            ["-6", "route", "del", "::/0"] => Some(format!("{name}\troute_del_ipv6_default")),
             _ => None,
         }
     }
@@ -808,15 +979,19 @@ impl Tunnel {
     /// shell-free equivalent of `parse_marker_statuses`'s
     /// `__AIVPN_STATUS:<name>:<code>` markers used by the `pkexec sh -c
     /// "..."` fallback path.
+    ///
+    /// The code is the command's plain shell exit code (0-255), NOT a raw
+    /// wait status: `ExitStatus::from_raw(code)` would misclassify e.g. 128
+    /// as success (`from_raw` expects `code << 8`). Keep it an `i32` and
+    /// compare `== 0` at call sites.
     #[cfg(target_os = "linux")]
-    fn parse_helper_statuses(stdout: &[u8]) -> Vec<(String, std::process::ExitStatus)> {
-        use std::os::unix::process::ExitStatusExt;
+    fn parse_helper_statuses(stdout: &[u8]) -> Vec<(String, i32)> {
         String::from_utf8_lossy(stdout)
             .lines()
             .filter_map(|line| {
                 let (name, code) = line.rsplit_once(':')?;
                 let code: i32 = code.trim().parse().ok()?;
-                Some((name.to_string(), std::process::ExitStatus::from_raw(code)))
+                Some((name.to_string(), code))
             })
             .collect()
     }
@@ -841,6 +1016,19 @@ impl Tunnel {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()?;
+
+        ACTIVE_PKEXEC_PID.store(child.id(), std::sync::atomic::Ordering::SeqCst);
+        // Guard clears the tracked PID on every exit path (normal return,
+        // `?`-early-return doesn't apply here, but future edits might add
+        // one) so a completed/reaped child is never mistakenly signaled by
+        // `kill_orphaned_pkexec_child()` later.
+        struct ClearPidOnDrop;
+        impl Drop for ClearPidOnDrop {
+            fn drop(&mut self) {
+                ACTIVE_PKEXEC_PID.store(0, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let _clear_guard = ClearPidOnDrop;
 
         if let Some(mut stdin) = child.stdin.take() {
             // Best-effort: if the helper (or pkexec itself) exits early —
@@ -872,11 +1060,12 @@ impl Tunnel {
     /// combined script's own exit code, so callers get the exact same
     /// per-command success/failure information as before — this is a pure
     /// prompt-count optimization, not a change in what counts as success.
+    ///
+    /// The returned codes are plain shell exit codes (0 = success), NOT raw
+    /// wait statuses — compare `code == 0` at call sites; `ExitStatus::
+    /// from_raw(code)` would misclassify e.g. 128 as success.
     #[cfg(target_os = "linux")]
-    fn run_ip_batch_privileged(
-        commands: &[(&str, &[&str])],
-    ) -> io::Result<Vec<(String, std::process::ExitStatus)>> {
-        use std::os::unix::process::ExitStatusExt;
+    fn run_ip_batch_privileged(commands: &[(&str, &[&str])]) -> io::Result<Vec<(String, i32)>> {
         use std::process::Command;
 
         let script: String = commands
@@ -889,14 +1078,14 @@ impl Tunnel {
             .collect::<Vec<_>>()
             .join("\n");
 
-        let parse_marker_statuses = |stdout: &[u8]| -> Vec<(String, std::process::ExitStatus)> {
+        let parse_marker_statuses = |stdout: &[u8]| -> Vec<(String, i32)> {
             String::from_utf8_lossy(stdout)
                 .lines()
                 .filter_map(|line| line.strip_prefix("__AIVPN_STATUS:"))
                 .filter_map(|rest| {
                     let (name, code) = rest.rsplit_once(':')?;
                     let code: i32 = code.trim().parse().ok()?;
-                    Some((name.to_string(), std::process::ExitStatus::from_raw(code)))
+                    Some((name.to_string(), code))
                 })
                 .collect()
         };
@@ -906,13 +1095,21 @@ impl Tunnel {
         // Every command must have produced a marker line, and every one of
         // those must itself have succeeded, for the batch to count as fully
         // resolved without escalation.
-        if direct_results.len() == commands.len() && direct_results.iter().all(|(_, s)| s.success())
-        {
+        if direct_results.len() == commands.len() && direct_results.iter().all(|(_, c)| *c == 0) {
             return Ok(direct_results);
         }
 
         let stderr = String::from_utf8_lossy(&output.stderr);
-        eprint!("{}", stderr);
+        // "No such process" (ESRCH) from `ip route del` means the route was
+        // already gone — the desired end state for a delete, not an error
+        // worth echoing to the user's terminal on every disconnect.
+        let stderr_noteworthy: Vec<&str> = stderr
+            .lines()
+            .filter(|l| !l.contains("No such process"))
+            .collect();
+        if !stderr_noteworthy.is_empty() {
+            eprintln!("{}", stderr_noteworthy.join("\n"));
+        }
 
         let looks_like_permission_denied = stderr.contains("Operation not permitted");
         if !looks_like_permission_denied {
@@ -989,7 +1186,7 @@ impl Tunnel {
         let addr_ok = results
             .iter()
             .find(|(name, _)| name == "addr")
-            .is_some_and(|(_, s)| s.success());
+            .is_some_and(|(_, c)| *c == 0);
         if !addr_ok {
             return Err(Error::Io(io::Error::new(
                 io::ErrorKind::Other,
@@ -1003,7 +1200,7 @@ impl Tunnel {
         let route_ok = results
             .iter()
             .find(|(name, _)| name == "route")
-            .is_some_and(|(_, s)| s.success());
+            .is_some_and(|(_, c)| *c == 0);
         if route_ok {
             info!("Added route {} via {}", vpn_cidr, tun_name);
         } else {
@@ -1386,7 +1583,11 @@ impl Tunnel {
             ))
         })?;
 
-        let succeeded = |name: &str| results.iter().any(|(n, s)| n == name && s.success());
+        let succeeded = |name: &str| results.iter().any(|(n, c)| n == name && *c == 0);
+
+        // Remember whether the IPv6 blackhole actually landed so teardown
+        // (restore_ipv6 / Drop) only removes a route we added ourselves.
+        self.ipv6_blackhole_added = succeeded("ipv6_blackhole");
 
         if self.server_ip.is_some() {
             let bypass_added = succeeded("bypass_onlink")
@@ -1525,6 +1726,36 @@ impl Tunnel {
             )?;
         }
 
+        // IPv4 is now fully routed through the TUN via the 0/1+128/1 trick, but
+        // that leaves the OS's pre-existing IPv6 default route untouched — on
+        // any dual-stack network (most residential/mobile ISPs) IPv6-capable
+        // destinations reach the physical NIC directly, fully bypassing the
+        // VPN, while the user believes "full tunnel" protects them. Windows
+        // has no direct equivalent of macOS/Linux's "route ::/0 to a
+        // blackhole" (route.exe doesn't do IPv6; a netsh blackhole route needs
+        // a real interface). `Disable-NetAdapterBinding -ComponentID
+        // ms_tcpip6` is the standard, no-reboot way to pull IPv6 off every
+        // adapter for the session; `disable_full_tunnel` re-enables it.
+        // Best-effort: a failure here (e.g. no admin rights on the binding
+        // call, which differs from the route-add rights already required
+        // above) must not abort an otherwise fully working IPv4 tunnel.
+        let ipv6_disabled = Command::new("powershell")
+            .args([
+                "-Command",
+                "Disable-NetAdapterBinding -Name '*' -ComponentID ms_tcpip6",
+            ])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if ipv6_disabled {
+            info!("IPv6 disabled on all adapters for the session — no v6 leak around full-tunnel");
+        } else {
+            warn!(
+                "Failed to disable IPv6 bindings — full-tunnel mode may not protect IPv6 traffic \
+                 on this dual-stack network"
+            );
+        }
+
         info!("Full tunnel mode enabled — all traffic routed through VPN");
         Ok(())
     }
@@ -1550,25 +1781,46 @@ impl Tunnel {
     /// Disable full-tunnel mode on Linux
     #[cfg(target_os = "linux")]
     fn disable_full_tunnel(&mut self) {
-        use std::process::Command;
-
-        for net in ["0.0.0.0/1", "128.0.0.0/1"] {
-            let _ = Command::new("ip").args(["route", "del", net]).status();
-        }
+        // Route removal goes through the same privileged batch path as the
+        // additions in enable_full_tunnel: on hosts where file capabilities
+        // are voided at exec time (see run_ip_privileged's doc comment),
+        // connect installed these routes via pkexec, and a bare `ip route
+        // del` here would fail with EPERM — leaving 0.0.0.0/1 + 128.0.0.0/1
+        // pointing at a dead TUN device (no connectivity until reboot).
+        // Deleting an already-absent route fails with ESRCH ("No such
+        // process"), which is not a permission error, so it neither triggers
+        // a pkexec prompt nor gets treated as fatal below.
+        let mut batch: Vec<(&str, Vec<&str>)> = vec![
+            ("del_ft_0", vec!["route", "del", "0.0.0.0/1"]),
+            ("del_ft_1", vec!["route", "del", "128.0.0.0/1"]),
+        ];
         if let Some(ref server_ip) = self.server_ip {
-            let _ = Command::new("ip")
-                .args(["route", "del", server_ip])
-                .status();
+            batch.push(("del_bypass", vec!["route", "del", server_ip.as_str()]));
         }
         // Restore default gateway
         if let Some(ref gw) = self.saved_default_gw {
             let mut args = vec!["route", "add", "default", "via", gw.as_str()];
-            let dev_owned;
             if let Some(ref dev) = self.saved_default_dev {
-                dev_owned = dev.clone();
-                args.extend_from_slice(&["dev", dev_owned.as_str()]);
+                args.extend_from_slice(&["dev", dev.as_str()]);
             }
-            let _ = Command::new("ip").args(&args).status();
+            batch.push(("restore_default", args));
+        }
+        let named_args: Vec<(&str, &[&str])> = batch
+            .iter()
+            .map(|(name, args)| (*name, args.as_slice()))
+            .collect();
+        match Self::run_ip_batch_privileged(&named_args) {
+            Ok(results) => {
+                for (name, code) in &results {
+                    if *code != 0 {
+                        debug!(
+                            "Full-tunnel cleanup: {} exited {} (route likely already absent)",
+                            name, code
+                        );
+                    }
+                }
+            }
+            Err(e) => warn!("Full-tunnel route cleanup failed: {}", e),
         }
         // Remove the IPv6 blackhole added by enable_full_tunnel so v6 works
         // again after disconnect.
@@ -1589,6 +1841,13 @@ impl Tunnel {
         if let Some(ref server_ip) = self.server_ip {
             let _ = Command::new("route").args(["delete", server_ip]).status();
         }
+        // Symmetric restore for the IPv6 binding disabled in enable_full_tunnel.
+        let _ = Command::new("powershell")
+            .args([
+                "-Command",
+                "Enable-NetAdapterBinding -Name '*' -ComponentID ms_tcpip6",
+            ])
+            .status();
         info!("Full tunnel routes removed");
     }
 
@@ -1624,9 +1883,16 @@ impl Tunnel {
         let tun = self.config.tun_name.clone();
 
         for cidr in self.config.include_routes.clone() {
-            let ok = Self::run_ip_privileged(&["route", "replace", &cidr, "dev", &tun])
-                .map(|s| s.success())
-                .unwrap_or(false);
+            // IPv6 prefixes need `ip -6` — a bare `ip route replace <v6>`
+            // is rejected by iproute2 and the route silently never lands
+            // (DNS leak in split mode when the DNS upstream is v6).
+            let ok = if cidr.contains(':') {
+                Self::run_ip_privileged(&["-6", "route", "replace", &cidr, "dev", &tun])
+            } else {
+                Self::run_ip_privileged(&["route", "replace", &cidr, "dev", &tun])
+            }
+            .map(|c| c == 0)
+            .unwrap_or(false);
             if ok {
                 info!("Split-tunnel include: {} via {}", cidr, tun);
                 self.split_routes_applied.push(cidr);
@@ -1652,9 +1918,13 @@ impl Tunnel {
 
         if let Some(gw) = gw_opt {
             for cidr in self.config.exclude_routes.clone() {
-                let ok = Self::run_ip_privileged(&["route", "replace", &cidr, "via", &gw])
-                    .map(|s| s.success())
-                    .unwrap_or(false);
+                let ok = if cidr.contains(':') {
+                    Self::run_ip_privileged(&["-6", "route", "replace", &cidr, "via", &gw])
+                } else {
+                    Self::run_ip_privileged(&["route", "replace", &cidr, "via", &gw])
+                }
+                .map(|c| c == 0)
+                .unwrap_or(false);
                 if ok {
                     info!("Split-tunnel exclude: {} via {} (bypass VPN)", cidr, gw);
                     self.split_routes_applied.push(cidr);
@@ -1671,9 +1941,27 @@ impl Tunnel {
 
     #[cfg(target_os = "linux")]
     fn remove_split_routes(&mut self) {
-        use std::process::Command;
-        for cidr in self.split_routes_applied.drain(..) {
-            let _ = Command::new("ip").args(["route", "del", &cidr]).status();
+        // Same privileged batch path as apply_split_routes (see
+        // disable_full_tunnel for why a bare `ip route del` can silently
+        // EPERM here). `ip -6` for IPv6 prefixes, symmetric with how they
+        // were added. Already-absent routes fail with ESRCH, which is fine
+        // and neither escalates nor counts as fatal.
+        let cidrs: Vec<String> = self.split_routes_applied.drain(..).collect();
+        let mut batch: Vec<(String, Vec<&str>)> = Vec::with_capacity(cidrs.len());
+        for (i, cidr) in cidrs.iter().enumerate() {
+            let args: Vec<&str> = if cidr.contains(':') {
+                vec!["-6", "route", "del", cidr.as_str()]
+            } else {
+                vec!["route", "del", cidr.as_str()]
+            };
+            batch.push((format!("split_{i}"), args));
+        }
+        if !batch.is_empty() {
+            let named_args: Vec<(&str, &[&str])> = batch
+                .iter()
+                .map(|(name, args)| (name.as_str(), args.as_slice()))
+                .collect();
+            let _ = Self::run_ip_batch_privileged(&named_args);
         }
         if !self.config.include_routes.is_empty() || !self.config.exclude_routes.is_empty() {
             info!("Split-tunnel routes removed");
@@ -1862,8 +2150,16 @@ impl Tunnel {
 
     /// Restore IPv6 on macOS when disconnecting
     #[cfg(target_os = "macos")]
-    fn restore_ipv6(&self) {
+    fn restore_ipv6(&mut self) {
         use std::process::Command;
+
+        // Only remove the blackhole if WE added it (configure_macos) —
+        // unconditionally deleting `blackhole default` here could tear down
+        // a route owned by something else.
+        if !self.ipv6_blackhole_added {
+            return;
+        }
+        self.ipv6_blackhole_added = false;
 
         info!("Restoring IPv6...");
         // Remove the blackhole.  If we saved the interface before blocking,
@@ -1891,17 +2187,27 @@ impl Tunnel {
 
     /// Restore IPv6 on Linux
     #[cfg(target_os = "linux")]
-    fn restore_ipv6(&self) {
-        use std::process::Command;
+    fn restore_ipv6(&mut self) {
+        // Only remove the blackhole if WE added it (enable_full_tunnel) —
+        // unconditionally deleting `blackhole default` here could tear down
+        // a route owned by something else.
+        if !self.ipv6_blackhole_added {
+            return;
+        }
+        self.ipv6_blackhole_added = false;
 
         info!("Restoring IPv6...");
         // Remove the blackhole (if any).  Let the kernel re-discover the gateway.
-        let _ = Command::new("ip")
-            .args(["-6", "route", "del", "blackhole", "default"])
-            .status();
-        let _ = Command::new("ip")
-            .args(["-6", "route", "del", "::/0"])
-            .status();
+        // Same privileged batch path as the addition: a bare `ip` call would
+        // silently EPERM on hosts where file capabilities are voided at exec
+        // time, leaving the blackhole (and the v6 outage) in place.
+        let _ = Self::run_ip_batch_privileged(&[
+            (
+                "del_v6_blackhole",
+                &["-6", "route", "del", "blackhole", "default"],
+            ),
+            ("del_v6_default", &["-6", "route", "del", "::/0"]),
+        ]);
         info!("IPv6 blackhole removed — kernel will auto-restore via ND/RA");
     }
 
@@ -1960,6 +2266,13 @@ impl Drop for Tunnel {
         // Kill-switch is NOT deactivated on drop to persist across reconnects.
         // Call deactivate_kill_switch() explicitly on intentional exit.
 
+        // Best-effort cleanup of an in-flight pkexec child (see
+        // ACTIVE_PKEXEC_PID's doc comment for what this does and doesn't
+        // cover) — runs on every normal disconnect/reconnect-loop iteration
+        // and on unwinding panics, just not on SIGKILL of this process.
+        #[cfg(target_os = "linux")]
+        kill_orphaned_pkexec_child();
+
         self.remove_split_routes();
 
         if self.config.full_tunnel && self.saved_default_gw.is_some() {
@@ -1967,14 +2280,21 @@ impl Drop for Tunnel {
         }
 
         // Restore IPv6 blackhole route removed during full-tunnel setup.
-        // Must run on both macOS (saves/restores via saved_ipv6_iface) and Linux
-        // (removes the blackhole default route added in disable_ipv6).
+        // Runs unconditionally, but restore_ipv6() itself is a no-op unless
+        // this Tunnel actually installed the blackhole (ipv6_blackhole_added),
+        // so a blackhole owned by something else is never touched.
         #[cfg(any(target_os = "macos", target_os = "linux"))]
         self.restore_ipv6();
 
         if self.writer.is_some() || self.reader.is_some() {
             info!("Closing TUN device: {}", self.config.tun_name);
         }
+
+        // Release the claim: the next connect creates a TUN under a fresh
+        // random name and index, and a stale index left registered here could
+        // suppress a genuine event on whatever device the kernel later assigns
+        // that index to.
+        crate::net_change::set_own_tun_ifindex(0);
     }
 }
 
@@ -2031,6 +2351,83 @@ mod tests {
         assert!(
             !std::path::Path::new("/tmp/aivpn_shell_quote_pwned").exists(),
             "shell_quote failed to neutralize an embedded command substitution/terminator"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_parse_helper_statuses_uses_shell_exit_codes() {
+        // The helper prints `<name>:<shell exit code>`. Regression test for
+        // the from_raw bug: ExitStatus::from_raw(128) has code() == Some(0),
+        // i.e. a failed command (exit 128) looked like a success. The parser
+        // must surface the plain exit code so callers can compare `== 0`.
+        let results = Tunnel::parse_helper_statuses(b"addr:0\ndel_ft_0:128\nbadline\nroute:2\n");
+        assert_eq!(
+            results,
+            vec![
+                ("addr".to_string(), 0),
+                ("del_ft_0".to_string(), 128),
+                ("route".to_string(), 2),
+            ]
+        );
+        assert!(results.iter().any(|(_, c)| *c == 0));
+        assert!(results.iter().filter(|(_, c)| *c != 0).count() == 2);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_helper_line_for_delete_and_restore_shapes() {
+        // The teardown paths (disable_full_tunnel / remove_split_routes /
+        // restore_ipv6) feed these shapes into run_ip_batch_privileged; each
+        // must map to a whitelisted helper verb so the helper path (rather
+        // than the `pkexec sh -c` fallback) can serve them.
+        assert_eq!(
+            Tunnel::helper_line_for("del_ft_0", &["route", "del", "0.0.0.0/1"]),
+            Some("del_ft_0\troute_del\t0.0.0.0/1".to_string())
+        );
+        assert_eq!(
+            Tunnel::helper_line_for("del_bypass", &["route", "del", "203.0.113.5"]),
+            Some("del_bypass\troute_del\t203.0.113.5".to_string())
+        );
+        assert_eq!(
+            Tunnel::helper_line_for(
+                "restore_default",
+                &["route", "add", "default", "via", "192.168.1.1"]
+            ),
+            Some("restore_default\troute_add_default_via\t192.168.1.1".to_string())
+        );
+        assert_eq!(
+            Tunnel::helper_line_for(
+                "restore_default",
+                &[
+                    "route",
+                    "add",
+                    "default",
+                    "via",
+                    "192.168.1.1",
+                    "dev",
+                    "eth0"
+                ]
+            ),
+            Some("restore_default\troute_add_default_via_dev\t192.168.1.1\teth0".to_string())
+        );
+        assert_eq!(
+            Tunnel::helper_line_for(
+                "del_v6_blackhole",
+                &["-6", "route", "del", "blackhole", "default"]
+            ),
+            Some("del_v6_blackhole\troute_del_ipv6_blackhole".to_string())
+        );
+        assert_eq!(
+            Tunnel::helper_line_for("del_v6_default", &["-6", "route", "del", "::/0"]),
+            Some("del_v6_default\troute_del_ipv6_default".to_string())
+        );
+        // IPv6 split-route deletes/replaces have no helper verb (the helper
+        // validates IPv4 fields only) — they must fall back to `pkexec sh
+        // -c` for the whole batch, never be silently dropped.
+        assert_eq!(
+            Tunnel::helper_line_for("split_0", &["-6", "route", "del", "2001:db8::/128"]),
+            None
         );
     }
 }

@@ -1,33 +1,109 @@
 <script lang="ts">
   import { page } from '$app/stores';
   import { goto } from '$app/navigation';
+  import { toStore } from 'svelte/store';
   import { createQuery, createMutation, useQueryClient } from '@tanstack/svelte-query';
-  import { clients as clientsApi } from '$lib/api';
-  import type { Client, ClientQos } from '$lib/api';
+  import { clients as clientsApi, masks as masksApi } from '$lib/api';
+  import type { Client, ClientQos, ClientRole } from '$lib/api';
+  import { authStore } from '$lib/stores/auth.svelte';
   import QrModal from '$lib/components/QrModal.svelte';
   import ConnectionKeyModal from '$lib/components/ConnectionKeyModal.svelte';
   import { ArrowLeft, Key, QrCode } from 'lucide-svelte';
 
-  const id = $derived($page.params.id);
+  // Role assignment / revoke are web-panel ADMIN-only actions (never
+  // available over the tunnel); the server enforces this independently
+  // (requireReadAccess blocks non-GET for viewers before proxy.ts is reached).
+  const isAdmin = $derived(authStore.user?.role === 'admin');
+  const ROLES: ClientRole[] = ['user', 'viewer', 'admin'];
+
+  // Route params are always populated when this component is mounted (the
+  // [id] segment matched); the `string | undefined` from the index-signature
+  // typing is a tsconfig strictness artifact, not a real possibility here.
+  const id = $derived($page.params.id as string);
   const qc = useQueryClient();
 
-  const query = createQuery({
+  // The options object MUST be a store: createQuery wraps a plain value in
+  // `readable(...)` (createBaseQuery.ts), which never re-emits, so the key
+  // would stay pinned to the id this component first mounted with. On a
+  // same-route param change that page then DISPLAYS the old client while the
+  // mutations below (which read the current `id` at call time) act on the new
+  // one — "Revoke Client" would tombstone the wrong client.
+  const query = createQuery(toStore(() => ({
     queryKey: ['client', id],
     queryFn: () => clientsApi.get(id),
-  });
+  })));
 
   let form = $state<Partial<Client> & { qos: ClientQos }>({ qos: {} });
+  // Exit-node override is edited as plain text (empty = clear to global
+  // default) rather than through `form.exit_node` directly, so an
+  // untouched null/undefined field never gets coerced to '' and flagged
+  // as a change in buildPatch().
+  let exitNodeInput = $state('');
   let toast = $state('');
   let toastError = $state(false);
 
+  // Seed the form ONCE per client (same idea as `initialized` on the config
+  // page). It used to re-seed on EVERY refetch, and with staleTime 30s plus
+  // the default refetchOnWindowFocus that silently reverted the operator's
+  // unsaved edits as soon as they alt-tabbed back. Tracking the seeded id
+  // rather than a plain boolean keeps the form correct when the [id] route
+  // param changes while this component stays mounted.
+  let seededId = $state<string | null>(null);
+
   $effect(() => {
-    if ($query.data) {
-      form = { ...$query.data, qos: { ...($query.data.qos ?? {}) } };
+    const data = $query.data;
+    if (data && data.id !== seededId) {
+      seededId = data.id;
+      form = { ...data, qos: { ...(data.qos ?? {}) } };
+      exitNodeInput = data.exit_node ?? '';
     }
   });
 
+  /** Normalise a QoS form value: only positive finite numbers are limits. */
+  function qosNum(v: unknown): number | undefined {
+    return typeof v === 'number' && Number.isFinite(v) && v > 0 ? v : undefined;
+  }
+
+  /**
+   * Send ONLY changed fields. PATCH semantics on the server: an omitted `qos`
+   * leaves QoS untouched, `null` clears it — the old code spread the ENTIRE
+   * client object (id, stats, …) into the body and always sent a `qos` object
+   * (an empty `{}` when the form was untouched), silently wiping any existing
+   * QoS limits on every unrelated save.
+   */
+  function buildPatch(orig: Client): Parameters<typeof clientsApi.update>[1] {
+    const patch: Parameters<typeof clientsApi.update>[1] = {};
+    if (form.name !== undefined && form.name !== orig.name) patch.name = form.name;
+    if (form.enabled !== undefined && form.enabled !== orig.enabled) patch.enabled = form.enabled;
+    if (form.one_time !== undefined && form.one_time !== orig.one_time) patch.one_time = form.one_time;
+    if (isAdmin && form.role !== undefined && form.role !== (orig.role ?? 'user')) patch.role = form.role;
+
+    if (isAdmin) {
+      const trimmed = exitNodeInput.trim();
+      const nextExitNode = trimmed === '' ? null : trimmed;
+      if (nextExitNode !== (orig.exit_node ?? null)) patch.exit_node = nextExitNode;
+    }
+
+    const newQos: ClientQos = {};
+    const up = qosNum(form.qos.bandwidth_limit_up);
+    const down = qosNum(form.qos.bandwidth_limit_down);
+    if (up !== undefined) newQos.bandwidth_limit_up = up;
+    if (down !== undefined) newQos.bandwidth_limit_down = down;
+    if (orig.qos?.dscp_class !== undefined) newQos.dscp_class = orig.qos.dscp_class; // not editable here — preserve
+
+    const origQos: ClientQos = {
+      ...(qosNum(orig.qos?.bandwidth_limit_up) !== undefined ? { bandwidth_limit_up: orig.qos!.bandwidth_limit_up } : {}),
+      ...(qosNum(orig.qos?.bandwidth_limit_down) !== undefined ? { bandwidth_limit_down: orig.qos!.bandwidth_limit_down } : {}),
+      ...(orig.qos?.dscp_class !== undefined ? { dscp_class: orig.qos.dscp_class } : {}),
+    };
+    if (JSON.stringify(newQos) !== JSON.stringify(origQos)) {
+      patch.qos = Object.keys(newQos).length > 0 ? newQos : null; // null clears QoS server-side
+    }
+    return patch;
+  }
+
   const updateMut = createMutation({
-    mutationFn: (data: Partial<Client>) => clientsApi.update(id, data),
+    mutationFn: (data: Parameters<typeof clientsApi.update>[1]) => clientsApi.update(id, data),
     onSuccess: (updated) => {
       qc.setQueryData(['client', id], updated);
       toast = 'Saved successfully';
@@ -44,6 +120,34 @@
   const resetMut = createMutation({
     mutationFn: () => clientsApi.resetDevice(id),
     onSuccess: () => { toast = 'Device reset'; toastError = false; setTimeout(() => { toast = ''; }, 3000); },
+    onError: (e: Error) => { toast = e.message; toastError = true; setTimeout(() => { toast = ''; }, 4000); },
+  });
+
+  const revokeMut = createMutation({
+    mutationFn: () => clientsApi.revoke(id),
+    onSuccess: () => { toast = 'Client revoked and disconnected'; toastError = false; goto('/clients'); },
+    onError: (e: Error) => { toast = e.message; toastError = true; setTimeout(() => { toast = ''; }, 4000); },
+  });
+
+  // Per-client active-mask override (server: POST /api/v1/masks/active,
+  // CLI: --set-mask). Writes a <mask_dir>/.overrides/<client-id>.mask file —
+  // there is no GET endpoint to read the current override back, so the
+  // dropdown is write-only (select + apply), same as the CLI.
+  const masksQuery = createQuery({ queryKey: ['masks'], queryFn: () => masksApi.list() });
+  let selectedMask = $state('');
+
+  const setMaskMut = createMutation({
+    mutationFn: (mask: string) => masksApi.setActive(id, mask),
+    onSuccess: (res) => {
+      toast = `Active mask set to "${res.mask}"`;
+      toastError = false;
+      setTimeout(() => { toast = ''; }, 3000);
+    },
+    onError: (e: Error) => {
+      toast = e.message;
+      toastError = true;
+      setTimeout(() => { toast = ''; }, 4000);
+    },
   });
 
   let qrOpen = $state(false);
@@ -56,14 +160,27 @@
     return res.connection_key;
   }
 
+  /** Surface key-fetch failures (403 for viewer role, daemon down) as a
+   *  toast — a bare async onclick otherwise dies as an unhandled rejection
+   *  with zero UI feedback. */
+  function keyError(e: unknown) {
+    toast = e instanceof Error ? e.message : 'Failed to load connection key';
+    toastError = true;
+    setTimeout(() => { toast = ''; }, 4000);
+  }
+
   async function showKey() {
-    connKey = await loadKey();
-    connKeyOpen = true;
+    try {
+      connKey = await loadKey();
+      connKeyOpen = true;
+    } catch (e) { keyError(e); }
   }
 
   async function showQr() {
-    qrData = await loadKey();
-    qrOpen = true;
+    try {
+      qrData = await loadKey();
+      qrOpen = true;
+    } catch (e) { keyError(e); }
   }
 
   function formatBytes(b: number): string {
@@ -95,7 +212,7 @@
     </div>
   {:else if $query.data}
     <form
-      onsubmit={(e) => { e.preventDefault(); $updateMut.mutate(form); }}
+      onsubmit={(e) => { e.preventDefault(); if ($query.data) $updateMut.mutate(buildPatch($query.data)); }}
       class="bg-white dark:bg-gray-800 rounded-xl p-6 border border-gray-200 dark:border-gray-700 space-y-5"
     >
       <h2 class="text-base font-semibold text-gray-900 dark:text-white">Edit Client</h2>
@@ -120,6 +237,35 @@
           <span class="text-sm text-gray-700 dark:text-gray-300">One-time use</span>
         </label>
       </div>
+
+      {#if isAdmin}
+        <div>
+          <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1" for="crole">Role</label>
+          <select
+            id="crole"
+            bind:value={form.role}
+            class="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-white text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500"
+          >
+            {#each ROLES as r (r)}
+              <option value={r}>{r}</option>
+            {/each}
+          </select>
+        </div>
+
+        <div>
+          <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1" for="cexit">Exit node</label>
+          <input
+            id="cexit"
+            type="text"
+            bind:value={exitNodeInput}
+            placeholder="host:port (empty = use pool default)"
+            class="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-white text-sm font-mono focus:outline-none focus:ring-2 focus:ring-indigo-500"
+          />
+          <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">
+            Overrides the pool's global default exit node for this client only. Takes effect live — no restart needed. Leave empty to fall back to the global default.
+          </p>
+        </div>
+      {/if}
 
       <div class="grid grid-cols-2 gap-4">
         <div>
@@ -199,6 +345,29 @@
       </div>
     </div>
 
+    <div class="bg-white dark:bg-gray-800 rounded-xl p-6 border border-gray-200 dark:border-gray-700 space-y-3">
+      <h2 class="text-base font-semibold text-gray-900 dark:text-white">Active Mask Override</h2>
+      <p class="text-sm text-gray-500 dark:text-gray-400">Force this client's traffic-mimicry mask, overriding its normal selection.</p>
+      <div class="flex gap-3">
+        <select
+          bind:value={selectedMask}
+          class="flex-1 px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-white text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500"
+        >
+          <option value="" disabled selected>Select mask…</option>
+          {#each ($masksQuery.data ?? []) as mask (mask.id)}
+            <option value={mask.id}>{mask.id}{mask.generated ? ' (auto)' : ''}</option>
+          {/each}
+        </select>
+        <button
+          onclick={() => { if (selectedMask) $setMaskMut.mutate(selectedMask); }}
+          disabled={!selectedMask || $setMaskMut.isPending}
+          class="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 disabled:opacity-50 text-white rounded-lg text-sm font-medium"
+        >
+          {$setMaskMut.isPending ? 'Applying…' : 'Apply'}
+        </button>
+      </div>
+    </div>
+
     <div class="bg-white dark:bg-gray-800 rounded-xl p-6 border border-gray-200 dark:border-gray-700 border-red-200 dark:border-red-900">
       <h2 class="text-base font-semibold text-red-600 dark:text-red-400 mb-2">Danger Zone</h2>
       <p class="text-sm text-gray-500 dark:text-gray-400 mb-4">Reset device binding — the next device to connect will be bound.</p>
@@ -209,6 +378,19 @@
       >
         {$resetMut.isPending ? 'Resetting...' : 'Reset Device'}
       </button>
+
+      {#if isAdmin}
+        <div class="mt-6 pt-6 border-t border-red-200 dark:border-red-900">
+          <p class="text-sm text-gray-500 dark:text-gray-400 mb-4">Revoke — tombstone this client and force-disconnect any active session. Distinct from delete; irreversible.</p>
+          <button
+            onclick={() => { if (confirm('Permanently revoke and disconnect this client? This cannot be undone.')) $revokeMut.mutate(); }}
+            disabled={$revokeMut.isPending}
+            class="px-4 py-2 bg-red-600 hover:bg-red-700 disabled:opacity-50 text-white rounded-lg text-sm font-medium"
+          >
+            {$revokeMut.isPending ? 'Revoking...' : 'Revoke Client'}
+          </button>
+        </div>
+      {/if}
     </div>
   {/if}
 </div>

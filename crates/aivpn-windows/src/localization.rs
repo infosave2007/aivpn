@@ -13,7 +13,7 @@ pub enum Lang {
     Ru,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppSettings {
     #[serde(default = "default_lang")]
     pub lang: Lang,
@@ -76,7 +76,40 @@ impl AppSettings {
         let path = settings_path();
         if path.exists() {
             if let Ok(data) = std::fs::read_to_string(&path) {
-                if let Ok(s) = serde_json::from_str::<AppSettings>(&data) {
+                if let Ok(mut s) = serde_json::from_str::<AppSettings>(&data) {
+                    // MEDIUM: the Telegram bootstrap bot token is a real credential
+                    // (grants control of the bootstrap-distribution bot) that used to
+                    // be stored in plaintext here, unlike the connection key — which
+                    // is DPAPI-encrypted in keys.json. Decrypt it the same way,
+                    // transparently migrating any legacy-plaintext value (mirrors
+                    // KeyStorage::load()'s handling of legacy plaintext keys below).
+                    let mut needs_save = false;
+                    if !s.bootstrap_telegram_token.is_empty() {
+                        match crate::key_storage::unprotect_key(&s.bootstrap_telegram_token) {
+                            Ok(decrypted) => {
+                                if decrypted == s.bootstrap_telegram_token {
+                                    // Didn't change → base64 decode failed → legacy
+                                    // plaintext. Re-encrypt on the immediate save below.
+                                    needs_save = true;
+                                } else {
+                                    s.bootstrap_telegram_token = decrypted;
+                                }
+                            }
+                            Err(e) => {
+                                // Corrupted or from a different user/machine — drop it
+                                // rather than risk treating ciphertext as a live token,
+                                // same treatment KeyStorage gives an undecryptable key.
+                                crate::vpn_manager::gui_log(&format!(
+                                    "aivpn: dropping corrupt bootstrap_telegram_token: {e}"
+                                ));
+                                s.bootstrap_telegram_token = String::new();
+                                needs_save = true;
+                            }
+                        }
+                    }
+                    if needs_save {
+                        s.save();
+                    }
                     return s;
                 }
             }
@@ -119,14 +152,33 @@ impl AppSettings {
         if let Some(p) = path.parent() {
             let _ = std::fs::create_dir_all(p);
         }
-        let Ok(json) = serde_json::to_string_pretty(self) else {
+        // Encrypt the Telegram bootstrap token before it touches disk — build a
+        // disk-only copy rather than mutating `self`, so the in-memory value the
+        // rest of the app uses (e.g. passed to aivpn-client.exe via env var)
+        // stays plaintext. Best-effort: if DPAPI is ever unavailable, fall back
+        // to writing it in plaintext (this field's pre-existing behavior) rather
+        // than losing every other setting sharing this file.
+        let mut on_disk = self.clone();
+        if !on_disk.bootstrap_telegram_token.is_empty() {
+            match crate::key_storage::protect_key(&on_disk.bootstrap_telegram_token) {
+                Ok(encrypted) => on_disk.bootstrap_telegram_token = encrypted,
+                Err(e) => {
+                    crate::vpn_manager::gui_log(&format!(
+                        "aivpn: bootstrap_telegram_token DPAPI encryption failed, saving plaintext: {e}"
+                    ));
+                }
+            }
+        }
+        let Ok(json) = serde_json::to_string_pretty(&on_disk) else {
             return;
         };
         // Atomic write: write to .tmp then rename to prevent corrupt settings.json on crash
         let tmp = path.with_extension("json.tmp");
         if std::fs::write(&tmp, &json).is_ok() {
             if let Err(e) = std::fs::rename(&tmp, &path) {
-                eprintln!("AppSettings::save rename {:?} → {:?}: {e}", tmp, path);
+                crate::vpn_manager::gui_log(&format!(
+                    "AppSettings::save rename {tmp:?} → {path:?}: {e}"
+                ));
                 let _ = std::fs::remove_file(&tmp);
             }
         }
@@ -305,6 +357,19 @@ pub fn t(lang: Lang, key: &str) -> &'static str {
             "Туннель активен, трафика нет. Проверьте aivpn-client.exe и сервер."
         }
 
+        // Assigned VPN IP (HIGH #2, client parity): live value from the
+        // client's traffic.stats `ip:` field, updated on a server pool
+        // re-home — not the connection key's static one-time-parsed IP.
+        (Lang::En, "vpn_ip_label") => "IP",
+        (Lang::Ru, "vpn_ip_label") => "IP",
+
+        // 3c: bootstrap-fallback indicator — live value from the client's
+        // traffic.stats `fallback:` key (this GUI's child stdout is piped to
+        // Stdio::null(), so unlike Linux it can't read the client's
+        // "AIVPN-STATUS bootstrap-fallback" stdout line directly).
+        (Lang::En, "bootstrap_fallback_label") => "Using built-in mask (fallback)",
+        (Lang::Ru, "bootstrap_fallback_label") => "Встроенная маска (аварийный режим)",
+
         // Tray connect/disconnect
         (Lang::En, "tray_connect") => "Connect",
         (Lang::Ru, "tray_connect") => "Подключить",
@@ -372,6 +437,248 @@ pub fn t(lang: Lang, key: &str) -> &'static str {
         (Lang::Ru, "receive_mask_hints") => "Получать подсказки по маскам для моего региона",
         (Lang::En, "country_code") => "Country code (ISO 3166-1 alpha-2, e.g. DE)",
         (Lang::Ru, "country_code") => "Код страны (ISO 3166-1 alpha-2, напр. DE)",
+
+        // Admin panel (P3.4) — in-tunnel client management, Admin role only
+        (Lang::En, "admin_panel") => "Admin — Clients",
+        (Lang::Ru, "admin_panel") => "Админ — Клиенты",
+        (Lang::En, "admin_refresh") => "Refresh",
+        (Lang::Ru, "admin_refresh") => "Обновить",
+        (Lang::En, "admin_loading") => "Loading…",
+        (Lang::Ru, "admin_loading") => "Загрузка…",
+        (Lang::En, "admin_no_clients") => "No clients registered",
+        (Lang::Ru, "admin_no_clients") => "Клиенты не зарегистрированы",
+        (Lang::En, "admin_one_time_badge") => "one-time",
+        (Lang::Ru, "admin_one_time_badge") => "разовый",
+        (Lang::En, "admin_expires") => "Expires",
+        (Lang::Ru, "admin_expires") => "Истекает",
+        (Lang::En, "admin_key_qr") => "Key / QR",
+        (Lang::Ru, "admin_key_qr") => "Ключ / QR",
+        (Lang::En, "admin_reset_device") => "Reset device",
+        (Lang::Ru, "admin_reset_device") => "Сбросить устройство",
+        (Lang::En, "admin_revoke") => "Revoke",
+        (Lang::Ru, "admin_revoke") => "Отозвать",
+        (Lang::En, "admin_add_client") => "Add client",
+        (Lang::Ru, "admin_add_client") => "Добавить клиента",
+        (Lang::En, "admin_one_time") => "One-time enrollment (bind first connecting device)",
+        (Lang::Ru, "admin_one_time") => {
+            "Разовая привязка (первое подключённое устройство)"
+        }
+        (Lang::En, "admin_expiry_hint") => "Expiry (RFC3339, optional)",
+        (Lang::Ru, "admin_expiry_hint") => "Срок действия (RFC3339, необязательно)",
+        (Lang::En, "admin_enabled") => "Enabled",
+        (Lang::Ru, "admin_enabled") => "Включён",
+        (Lang::En, "admin_status_header") => "Server status",
+        (Lang::Ru, "admin_status_header") => "Статус сервера",
+        (Lang::En, "admin_status_clients") => "Clients enabled/total",
+        (Lang::Ru, "admin_status_clients") => "Клиентов включено/всего",
+        (Lang::En, "admin_status_kernel") => "Kernel module",
+        (Lang::Ru, "admin_status_kernel") => "Kernel-модуль",
+        (Lang::En, "admin_save_key_file") => "Save key to file",
+        (Lang::Ru, "admin_save_key_file") => "Сохранить ключ в файл",
+        (Lang::En, "admin_show_qr") => "Show QR",
+        (Lang::Ru, "admin_show_qr") => "Показать QR",
+        (Lang::En, "admin_save_qr_file") => "Save QR to file",
+        (Lang::Ru, "admin_save_qr_file") => "Сохранить QR в файл",
+        (Lang::En, "admin_saved_to") => "Saved to",
+        (Lang::Ru, "admin_saved_to") => "Сохранено в",
+        (Lang::En, "admin_revoke_confirm_title") => "Revoke client?",
+        (Lang::Ru, "admin_revoke_confirm_title") => "Отозвать клиента?",
+        (Lang::En, "admin_revoke_confirm_body") => "Permanently revoke and disconnect",
+        (Lang::Ru, "admin_revoke_confirm_body") => "Безвозвратно отозвать и отключить",
+        (Lang::En, "admin_revoke_confirm_warn") => {
+            "This cannot be undone. The client's key stops working immediately."
+        }
+        (Lang::Ru, "admin_revoke_confirm_warn") => {
+            "Это необратимо. Ключ клиента перестанет работать немедленно."
+        }
+
+        // G-A1: Viewer read-only admin-panel badge
+        (Lang::En, "admin_view_only") => "View only",
+        (Lang::Ru, "admin_view_only") => "Только просмотр",
+
+        // G-A2: audit-log panel (Viewer + Admin, GET-only)
+        (Lang::En, "admin_audit_panel") => "Audit log",
+        (Lang::Ru, "admin_audit_panel") => "Журнал аудита",
+        (Lang::En, "admin_audit_no_entries") => "No audit entries",
+        (Lang::Ru, "admin_audit_no_entries") => "Нет записей аудита",
+        (Lang::En, "admin_audit_chain_verified") => "chain verified",
+        (Lang::Ru, "admin_audit_chain_verified") => "цепочка подтверждена",
+        (Lang::En, "admin_audit_chain_broken") => "chain BROKEN",
+        (Lang::Ru, "admin_audit_chain_broken") => "ЦЕПОЧКА НАРУШЕНА",
+
+        // Per-client exit node (B3) — Admin edit, shown to Viewer read-only
+        (Lang::En, "admin_exit_node") => "Exit node",
+        (Lang::Ru, "admin_exit_node") => "Узел выхода",
+        (Lang::En, "admin_exit_node_hint") => "Exit node (optional, host:port — empty = global default)",
+        (Lang::Ru, "admin_exit_node_hint") => {
+            "Узел выхода (необязательно, host:port — пусто = глобальный по умолчанию)"
+        }
+
+        // G-B1: exit-node picker (ComboBox sourced from GET /pool/nodes)
+        (Lang::En, "admin_exit_node_default") => "(default)",
+        (Lang::Ru, "admin_exit_node_default") => "(по умолчанию)",
+        (Lang::En, "admin_exit_node_custom") => "Custom…",
+        (Lang::Ru, "admin_exit_node_custom") => "Другой…",
+        (Lang::En, "admin_exit_node_live_hint") => {
+            "Per-client exit node applies live, no reconnect needed. The global default (set on the server) only takes effect after a restart."
+        }
+        (Lang::Ru, "admin_exit_node_live_hint") => {
+            "Персональный узел выхода клиента применяется вживую, без переподключения. Глобальный узел по умолчанию (на сервере) вступает в силу только после рестарта."
+        }
+
+        // Pool topology view (B3) — Viewer + Admin
+        (Lang::En, "admin_pool_section") => "Pool topology",
+        (Lang::Ru, "admin_pool_section") => "Топология пула",
+        (Lang::En, "admin_pool_transport") => "Transport",
+        (Lang::Ru, "admin_pool_transport") => "Транспорт",
+        (Lang::En, "admin_pool_connected") => "Connected",
+        (Lang::Ru, "admin_pool_connected") => "Подключено",
+        (Lang::En, "admin_pool_converged") => "Converged",
+        (Lang::Ru, "admin_pool_converged") => "Синхронизировано",
+        (Lang::En, "admin_pool_no_nodes") => "No pool nodes",
+        (Lang::Ru, "admin_pool_no_nodes") => "Узлы пула отсутствуют",
+        (Lang::En, "admin_pool_verified") => "verified",
+        (Lang::Ru, "admin_pool_verified") => "подтверждён",
+        (Lang::En, "admin_pool_revoked") => "revoked",
+        (Lang::Ru, "admin_pool_revoked") => "отозван",
+        (Lang::En, "admin_pool_last_seen") => "Last seen",
+        (Lang::Ru, "admin_pool_last_seen") => "Последний раз в сети",
+        (Lang::En, "admin_pool_partition_conflict") => {
+            "⚠ Partition conflict: a peer claims the same VPN-IP partition as this node"
+        }
+        (Lang::Ru, "admin_pool_partition_conflict") => {
+            "⚠ Конфликт партиции: пир заявляет ту же партицию VPN-IP, что и этот узел"
+        }
+        (Lang::En, "admin_pool_subnet_mismatch") => {
+            "⚠ Subnet mismatch: a peer disagrees on the VPN subnet"
+        }
+        (Lang::Ru, "admin_pool_subnet_mismatch") => {
+            "⚠ Несовпадение подсети: пир не согласен с VPN-подсетью"
+        }
+
+        // G-A3: Server Settings (Admin only) — apply-with-rollback for the
+        // active mask (per-client) and the global default exit node.
+        (Lang::En, "admin_settings_panel") => "Server Settings",
+        (Lang::Ru, "admin_settings_panel") => "Настройки сервера",
+        (Lang::En, "admin_settings_mask_section") => "Active mask",
+        (Lang::Ru, "admin_settings_mask_section") => "Активная маска",
+        (Lang::En, "admin_settings_mask_client_label") => "Client",
+        (Lang::Ru, "admin_settings_mask_client_label") => "Клиент",
+        (Lang::En, "admin_settings_mask_no_clients") => {
+            "No clients loaded — refresh the client list above first"
+        }
+        (Lang::Ru, "admin_settings_mask_no_clients") => {
+            "Клиенты не загружены — сначала обновите список клиентов выше"
+        }
+        (Lang::En, "admin_settings_mask_id_label") => "Mask ID",
+        (Lang::Ru, "admin_settings_mask_id_label") => "ID маски",
+        (Lang::En, "admin_settings_mask_id_hint") => "e.g. webrtc_zoom_v3",
+        (Lang::Ru, "admin_settings_mask_id_hint") => "напр. webrtc_zoom_v3",
+        (Lang::En, "admin_settings_exit_section") => "Global exit node (pool default)",
+        (Lang::Ru, "admin_settings_exit_section") => "Глобальный узел выхода (по умолчанию)",
+        (Lang::En, "admin_settings_exit_restart_hint") => {
+            "Applies after the server process restarts — not live."
+        }
+        (Lang::Ru, "admin_settings_exit_restart_hint") => {
+            "Применяется после рестарта процесса сервера — не вживую."
+        }
+        (Lang::En, "admin_settings_exit_none") => "(none)",
+        (Lang::Ru, "admin_settings_exit_none") => "(нет)",
+        (Lang::En, "admin_settings_apply") => "Apply",
+        (Lang::Ru, "admin_settings_apply") => "Применить",
+        (Lang::En, "admin_settings_confirm") => "Confirm",
+        (Lang::Ru, "admin_settings_confirm") => "Подтвердить",
+        (Lang::En, "admin_settings_pending_banner") => {
+            "Confirm within the time shown or this change is rolled back automatically"
+        }
+        (Lang::Ru, "admin_settings_pending_banner") => {
+            "Подтвердите за отведённое время, иначе изменение будет автоматически откачено"
+        }
+        (Lang::En, "admin_settings_rolled_back") => {
+            "Not confirmed in time — the change was rolled back."
+        }
+        (Lang::Ru, "admin_settings_rolled_back") => {
+            "Не подтверждено вовремя — изменение откачено."
+        }
+
+        // C3: SSH server-install wizard — entry point + form + progress
+        (Lang::En, "ssh_wizard_open_btn") => "Install server via SSH",
+        (Lang::Ru, "ssh_wizard_open_btn") => "Установить сервер по SSH",
+        (Lang::En, "ssh_wizard_title") => "SSH server install",
+        (Lang::Ru, "ssh_wizard_title") => "Установка сервера по SSH",
+        (Lang::En, "ssh_host") => "Host",
+        (Lang::Ru, "ssh_host") => "Хост",
+        (Lang::En, "ssh_port") => "Port",
+        (Lang::Ru, "ssh_port") => "Порт",
+        (Lang::En, "ssh_user") => "User",
+        (Lang::Ru, "ssh_user") => "Пользователь",
+        (Lang::En, "ssh_auth_password") => "Password",
+        (Lang::Ru, "ssh_auth_password") => "Пароль",
+        (Lang::En, "ssh_auth_key") => "Private key",
+        (Lang::Ru, "ssh_auth_key") => "Приватный ключ",
+        (Lang::En, "ssh_password") => "SSH password",
+        (Lang::Ru, "ssh_password") => "Пароль SSH",
+        (Lang::En, "ssh_key_path") => "Key file path",
+        (Lang::Ru, "ssh_key_path") => "Путь к файлу ключа",
+        (Lang::En, "ssh_key_passphrase") => "Key passphrase (optional)",
+        (Lang::Ru, "ssh_key_passphrase") => "Пароль ключа (необязательно)",
+        (Lang::En, "ssh_mode_docker") => "Install via Docker (default: systemd)",
+        (Lang::Ru, "ssh_mode_docker") => "Установить через Docker (по умолчанию: systemd)",
+        (Lang::En, "ssh_server_ip") => "Server public IP (optional)",
+        (Lang::Ru, "ssh_server_ip") => "Публичный IP сервера (необязательно)",
+        (Lang::En, "ssh_server_port") => "Server port (optional)",
+        (Lang::Ru, "ssh_server_port") => "Порт сервера (необязательно)",
+        (Lang::En, "ssh_bind_device") => "Bind this device (create an admin client for it)",
+        (Lang::Ru, "ssh_bind_device") => "Привязать это устройство (создать для него admin-клиента)",
+        (Lang::En, "ssh_show_script_btn") => "Show script",
+        (Lang::Ru, "ssh_show_script_btn") => "Показать скрипт",
+        (Lang::En, "ssh_probe_btn") => "Connect & get fingerprint",
+        (Lang::Ru, "ssh_probe_btn") => "Подключиться и получить отпечаток",
+        (Lang::En, "ssh_fingerprint_label") => "Host key fingerprint:",
+        (Lang::Ru, "ssh_fingerprint_label") => "Отпечаток ключа хоста:",
+        (Lang::En, "ssh_trust_checkbox") => "I trust this fingerprint",
+        (Lang::Ru, "ssh_trust_checkbox") => "Доверяю этому отпечатку",
+        (Lang::En, "ssh_install_btn") => "Install",
+        (Lang::Ru, "ssh_install_btn") => "Установить",
+        (Lang::En, "ssh_installing") => "Installing…",
+        (Lang::Ru, "ssh_installing") => "Установка…",
+        (Lang::En, "ssh_install_done_ok") => "Install finished successfully.",
+        (Lang::Ru, "ssh_install_done_ok") => "Установка успешно завершена.",
+        (Lang::En, "ssh_install_done_error") => "Install failed — see the log above.",
+        (Lang::Ru, "ssh_install_done_error") => "Установка завершилась с ошибкой — см. журнал выше.",
+        (Lang::En, "ssh_import_profile_btn") => "Import profile",
+        (Lang::Ru, "ssh_import_profile_btn") => "Импортировать профиль",
+        (Lang::En, "ssh_import_profile_done") => "Profile imported automatically.",
+        (Lang::Ru, "ssh_import_profile_done") => "Профиль импортирован автоматически.",
+        // G-C1: shown only if the automatic import itself failed (retry path)
+        (Lang::En, "ssh_import_profile_retry_hint") => {
+            "Automatic import failed — you can retry it manually:"
+        }
+        (Lang::Ru, "ssh_import_profile_retry_hint") => {
+            "Автоматический импорт не удался — можно повторить вручную:"
+        }
+        (Lang::En, "ssh_wizard_close_btn") => "Close",
+        (Lang::Ru, "ssh_wizard_close_btn") => "Закрыть",
+        (Lang::En, "ssh_script_title") => "install-server.sh",
+        (Lang::Ru, "ssh_script_title") => "install-server.sh",
+        (Lang::En, "ssh_script_sha256") => "SHA256:",
+        (Lang::Ru, "ssh_script_sha256") => "SHA256:",
+
+        // C3/GAP-G3: server binary source (default GitHub Releases / custom
+        // URL / local file) — mirrors ssh_install_cmd.rs's RunArgs
+        // --binary-file/--binary-url flags.
+        (Lang::En, "ssh_binary_source_label") => "Server binary",
+        (Lang::Ru, "ssh_binary_source_label") => "Бинарь сервера",
+        (Lang::En, "ssh_binary_source_default") => "Default (GitHub Releases)",
+        (Lang::Ru, "ssh_binary_source_default") => "По умолчанию (GitHub Releases)",
+        (Lang::En, "ssh_binary_source_url") => "Custom URL",
+        (Lang::Ru, "ssh_binary_source_url") => "Произвольный URL",
+        (Lang::En, "ssh_binary_source_file") => "Local file",
+        (Lang::Ru, "ssh_binary_source_file") => "Локальный файл",
+        (Lang::En, "ssh_binary_url_label") => "Binary URL",
+        (Lang::Ru, "ssh_binary_url_label") => "URL бинаря",
+        (Lang::En, "ssh_binary_file_label") => "Local binary path",
+        (Lang::Ru, "ssh_binary_file_label") => "Путь к локальному бинарю",
 
         // Default fallback
         (_, _) => "???",

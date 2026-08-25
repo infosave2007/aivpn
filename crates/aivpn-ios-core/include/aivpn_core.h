@@ -67,6 +67,18 @@ typedef void (*aivpn_ready_callback_t)(const char *host, void *ctx);
 ///                       in the Swift App Group layer). A truly-first-ever
 ///                       connect with no persisted descriptor still uses the
 ///                       preset.
+/// @param mask_operator_pubkey  Optional 32-byte ed25519 verifying key used to
+///                       check the embedded operator signature on mask
+///                       artifacts pushed via MaskUpdate (R2 Phase B), or NULL
+///                       to leave it unconfigured (mirrors desktop's
+///                       --mask-operator-pubkey / config-file / connection-key
+///                       "mop" field precedence — the Swift layer resolves
+///                       which source wins before this call).
+/// @param mask_verify_mode  Optional NUL-terminated verification mode string
+///                       ("off"|"warn"|"enforce", case-insensitive), or
+///                       NULL/empty/unrecognized for the default ("warn" —
+///                       same default desktop uses with no override
+///                       configured). Never fails the call on a bad string.
 /// @return 0 on a clean rekey-triggered exit, -1 on error.
 int aivpn_run_tunnel(
     int tun_fd,
@@ -88,7 +100,9 @@ int aivpn_run_tunnel(
     const char *country_code,
     const char *prior_outcomes_json,
     const char *preferred_mask,
-    const char *cached_descriptors_json
+    const char *cached_descriptors_json,
+    const uint8_t *mask_operator_pubkey,
+    const char *mask_verify_mode
 );
 
 /// Close the active UDP socket so the tunnel loop exits immediately.
@@ -107,11 +121,23 @@ int64_t aivpn_get_upload_bytes(void);
 /// Total bytes received from the server in the current session.
 int64_t aivpn_get_download_bytes(void);
 
+/// Wall-clock epoch milliseconds at which the current session became
+/// established, or 0 when no session is active. Same session scope as the
+/// byte counters, so the UI stopwatch can never desync from them.
+int64_t aivpn_get_connected_since_ms(void);
+
 /// Current connection quality score (0–100). Returns 0 when no session is active.
 int aivpn_get_quality_score(void);
 
 /// Most recent AdaptiveHint level received from the server (0–3).
 int aivpn_get_adaptive_level_hint(void);
+
+/// VPN IPv4 the server assigned to this session in its ServerHello network
+/// config, as a host-order u32 (10.0.0.3 = 0x0A000003), or 0 when none has
+/// been received this session. Differs from the connection-key IP after a
+/// pool re-home — re-apply tunnel network settings with this address or the
+/// server's anti-spoof check silently drops all uplink data.
+unsigned int aivpn_get_assigned_vpn_ip(void);
 
 /// Monotonically increasing counter, bumped each time new mask-recording
 /// feedback (RecordingAck/RecordingComplete/RecordingFailed/RecordingStatus)
@@ -172,6 +198,23 @@ int aivpn_start_recording(const char *service);
 /// Send RecordingStop to the active tunnel.
 void aivpn_stop_recording(void);
 
+/// Seed the process-global consecutive handshake-fail streak from a
+/// platform-persisted value. The streak drives the descriptor→builtin-preset
+/// fallback; it lives in a process-global static, but iOS tears the Network
+/// Extension process down between failed starts, so without re-seeding the
+/// fallback threshold could never be reached and a poisoned cached descriptor
+/// would block connecting until it expires. Call ONCE per extension process,
+/// before the first aivpn_run_tunnel attempt, with the value previously read
+/// via aivpn_get_handshake_fail_streak and persisted per server. Clamped
+/// internally against corrupted persisted values.
+void aivpn_seed_handshake_fail_streak(unsigned int streak);
+
+/// Current consecutive handshake-fail streak (see
+/// aivpn_seed_handshake_fail_streak). Read after each aivpn_run_tunnel return
+/// and persist per server; reset to 0 internally when a session's PFS ratchet
+/// completes and when the server key changes.
+unsigned int aivpn_get_handshake_fail_streak(void);
+
 /// §2 crowdsourced blocking feedback — whether the most recently completed
 /// aivpn_run_tunnel call ever reached a connected (post-handshake, PFS ratchet
 /// complete) state. Read immediately after the call returns: 0 means the
@@ -180,6 +223,27 @@ void aivpn_stop_recording(void);
 /// aivpn_get_attempted_mask_family() (mirrors desktop main.rs's
 /// client.ever_connected() check in the reconnect loop).
 int aivpn_ever_connected(void);
+
+/// Whether the server sent CertRejected (mTLS certificate rejected) during the
+/// most recently completed aivpn_run_tunnel call. 0 = not rejected (or no
+/// mTLS cert was configured). Poll alongside get_traffic and, when 1, prompt
+/// the user to re-provision their mTLS cert instead of retrying forever in
+/// silence.
+int aivpn_cert_was_rejected(void);
+
+/// Whether the server sent HandshakeReject (an AEAD-authenticated,
+/// handshake-time refusal sent only to a peer that already proved knowledge
+/// of the PSK) during the most recently completed aivpn_run_tunnel call.
+/// 0 = not rejected. Unlike a timeout or transient disconnect this is a
+/// TERMINAL refusal — the platform must stop its reconnect loop instead of
+/// retrying. Poll alongside get_traffic and, when 1, show the user the
+/// reason from aivpn_get_handshake_reject_reason() and stop reconnecting.
+int aivpn_handshake_was_rejected(void);
+
+/// Reason code for the most recent HandshakeReject (only meaningful when
+/// aivpn_handshake_was_rejected() returns non-zero). 0 = unspecified,
+/// 1 = one-time key already used, 2 = client expired, 3 = client disabled.
+int aivpn_get_handshake_reject_reason(void);
 
 /// §2 crowdsourced blocking feedback — whether a MaskFeedback control message
 /// was actually sent during the most recently completed aivpn_run_tunnel call
@@ -289,6 +353,250 @@ int aivpn_verify_bootstrap_descriptor(
     size_t descriptor_json_len,
     const uint8_t *signing_pubkey
 );
+
+/// Current server-assigned role (0=User, 1=Viewer, 2=Admin) cached from the
+/// most recent Capabilities control message this session, or 0 (User)
+/// before one has arrived. Reset at the start of each aivpn_run_tunnel
+/// attempt.
+uint8_t aivpn_get_role(void);
+
+/// Issue an in-tunnel management API call (Phase A in-app admin) and block
+/// until the correlated response arrives or the call times out (10s).
+///
+/// @param method      0=GET, 1=POST, 2=PATCH, 3=DELETE, 4=PUT.
+/// @param path         NUL-terminated, curated REST-shaped path (e.g.
+///                     "/api/v1/clients").
+/// @param body         Optional JSON request payload, or NULL for none.
+/// @param body_len     Length of body in bytes (0 if body is NULL).
+/// @param out_status   Receives the response status code on success. Must
+///                     point to a writable uint16_t.
+/// @param out_buf      Buffer to receive the response body bytes (NOT
+///                     NUL-terminated — it is arbitrary JSON, not a C
+///                     string). May be NULL only if out_cap is 0.
+/// @param out_cap      Size of out_buf in bytes.
+/// @return Buffer convention shared with aivpn_qr_png: if the response body
+///         fits in out_cap, it is copied into out_buf and the number of
+///         bytes written is returned (always <= out_cap). If it does not
+///         fit, out_buf is left untouched and the needed length is
+///         returned instead (always > out_cap) — the caller distinguishes
+///         the two cases by comparing the return value against the
+///         out_cap it passed in, then retries with a buffer of at least
+///         that size. Returns -1 on any error: NULL/invalid path, no
+///         active tunnel session, the control channel is closed, or the
+///         call times out awaiting a response.
+intptr_t aivpn_mgmt_request(
+    uint8_t method,
+    const char *path,
+    const uint8_t *body,
+    size_t body_len,
+    uint16_t *out_status,
+    uint8_t *out_buf,
+    size_t out_cap
+);
+
+/// Render `text` (typically an aivpn://... connection key) as a QR code PNG
+/// and copy the encoded bytes into out_buf.
+///
+/// @param text     NUL-terminated, valid-UTF-8 string to encode.
+/// @param out_buf  Buffer to receive the PNG bytes. May be NULL only if
+///                 out_cap is 0.
+/// @param out_cap  Size of out_buf in bytes.
+/// @return Same written-len-or-needed-len convention as
+///         aivpn_mgmt_request: the number of PNG bytes written when out_cap
+///         was large enough, or the needed length (out_buf left untouched)
+///         otherwise. Returns -1 if text is NULL/not valid UTF-8/empty, or
+///         PNG encoding fails.
+intptr_t aivpn_qr_png(
+    const char *text,
+    uint8_t *out_buf,
+    size_t out_cap
+);
+
+// ─────────────────────────────────────────────────────────────────────────
+// Wave C2b-iOS — in-app SSH server installer (crates/aivpn-ios-core/src/
+// ssh_install_ffi/, wrapping aivpn_common::ssh_install; gated behind this
+// crate's `ssh-install` feature, DEFAULT-on so `make ios`'s plain
+// `cargo build -p aivpn-ios-core` picks it up with no extra flag).
+//
+// There is NO cancellation of an in-flight install (see
+// aivpn_ssh_install_start's doc comment below) — once started it runs to
+// completion on its own background thread regardless of polling/free calls.
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Probes host:port over SSH as `user` — no real authentication is attempted
+/// (auth is never reached; key exchange alone yields the host key) — and
+/// writes the server's OpenSSH-style `SHA256:<base64>` host-key fingerprint
+/// into out_buf. Show this to the user for out-of-band TOFU confirmation
+/// (e.g. against `ssh-keyscan`/a hosting control panel) BEFORE calling
+/// aivpn_ssh_install_start with it as the `fingerprint` field of that call's
+/// params_json.
+///
+/// Blocking: runs on a private current_thread Tokio runtime local to this
+/// call; does not touch any active tunnel session or its runtime.
+///
+/// Buffer contract shared with aivpn_mgmt_request/aivpn_qr_png: returns the
+/// number of bytes written when out_cap was large enough (always <=
+/// out_cap), or the needed length (out_buf left untouched, always >
+/// out_cap) otherwise — compare the return value against the out_cap you
+/// passed to tell the two cases apart, then retry with a bigger buffer.
+/// Returns -1 on any error: NULL host/user, non-UTF-8 input, DNS/TCP/SSH
+/// protocol failure, or local runtime creation failure.
+///
+/// @param host     NUL-terminated hostname or IP address.
+/// @param port     SSH port (usually 22).
+/// @param user     NUL-terminated SSH username (unused for the actual probe,
+///                 but part of the SSH handshake target).
+/// @param out_buf  Buffer to receive the NUL-free fingerprint string bytes.
+///                 May be NULL only if out_cap is 0.
+/// @param out_cap  Size of out_buf in bytes.
+intptr_t aivpn_ssh_probe_hostkey(
+    const char *host,
+    uint16_t port,
+    const char *user,
+    uint8_t *out_buf,
+    size_t out_cap
+);
+
+/// Copies the SHA256 (hex, 64 ASCII chars) of the embedded installer script
+/// into out_buf — show it to the user alongside aivpn_ssh_install_script's
+/// output so they can verify what will run on their VPS before confirming.
+/// Computed at compile time from the same script embedded in the binary;
+/// cannot fail other than a too-small/NULL buffer.
+///
+/// Buffer contract: same written-len-or-needed-len convention as
+/// aivpn_ssh_probe_hostkey.
+///
+/// @param out_buf  Buffer to receive the hex string bytes. May be NULL only
+///                 if out_cap is 0.
+/// @param out_cap  Size of out_buf in bytes.
+intptr_t aivpn_ssh_install_bundle_sha256(
+    uint8_t *out_buf,
+    size_t out_cap
+);
+
+/// Decodes privkey_b64 (32 raw bytes, base64 STANDARD) as the device's
+/// X25519 static private key — the same 32 bytes the app already owns and
+/// passes as aivpn_run_tunnel's static_privkey parameter for JIT enrollment;
+/// this core does NOT persist a device key of its own — and copies its
+/// derived public key, base64 STANDARD-encoded, into out_buf. Lets the
+/// in-app SSH install wizard populate install_params_from_json's
+/// "device_pubkey_b64" field to request a device-bound (admin-capable)
+/// client at add time (mirrors desktop's `aivpn ssh-install run
+/// --device-pubkey` flow), without the app linking its own X25519 crate.
+///
+/// Buffer contract: same written-len-or-needed-len convention as
+/// aivpn_ssh_probe_hostkey.
+///
+/// @param privkey_b64  NUL-terminated base64 STANDARD encoding of the
+///                     device's 32-byte X25519 static private key.
+/// @param out_buf      Buffer to receive the base64 pubkey bytes. May be
+///                     NULL only if out_cap is 0.
+/// @param out_cap      Size of out_buf in bytes.
+/// @return Number of bytes written / needed length per the shared buffer
+///         contract, or -1 if privkey_b64 is NULL, not valid UTF-8, not
+///         valid base64, or does not decode to exactly 32 bytes.
+intptr_t aivpn_device_pubkey_from_privkey(
+    const char *privkey_b64,
+    uint8_t *out_buf,
+    size_t out_cap
+);
+
+/// Copies the embedded installer script's own text
+/// (deploy/install-server.sh, typically ~20 KB) into out_buf, for display
+/// before the user confirms an install.
+///
+/// Buffer contract: same written-len-or-needed-len convention as
+/// aivpn_ssh_probe_hostkey.
+///
+/// @param out_buf  Buffer to receive the script text bytes. May be NULL
+///                 only if out_cap is 0.
+/// @param out_cap  Size of out_buf in bytes.
+intptr_t aivpn_ssh_install_script(
+    uint8_t *out_buf,
+    size_t out_cap
+);
+
+/// Parses params_json and starts the SSH install on a dedicated background
+/// thread, returning immediately with an opaque job handle for
+/// aivpn_ssh_install_poll. JSON contract (mirrors
+/// aivpn_common::ssh_install::install_params_from_json):
+/// ```
+/// {
+///   "host": "1.2.3.4", "port": 22, "user": "root",
+///   "auth": {"type":"password","password":"..."}
+///         | {"type":"key_pem","pem":"...","passphrase":null}
+///         | {"type":"key_file","path":"/abs/path","passphrase":null},
+///   "fingerprint": "SHA256:...",
+///   "binary": {"type":"url","url":"..."}
+///           | {"type":"file","path":"..."}
+///           | {"type":"default"},
+///   "server_ip": null, "server_port": null,
+///   "mode": "systemd" | "docker",
+///   "device_pubkey_b64": null,
+///   "extra_args": []
+/// }
+/// ```
+/// `fingerprint` is required — TOFU confirmation (via
+/// aivpn_ssh_probe_hostkey) must already have happened out-of-band.
+/// `binary` defaults to "default", `mode` to "systemd", `extra_args` to [].
+///
+/// Every InstallEvent the install produces is queued as a single-line JSON
+/// string (aivpn_common::ssh_install::install_event_to_json's wire format:
+/// `{"type":"connected"|"uploading"|"line"|"marker"|"finished",...}`) for
+/// aivpn_ssh_install_poll to drain, in order. If the SSH session itself
+/// fails before producing its own "finished" event (connect/auth/host-key-
+/// mismatch/IO error — as opposed to the remote script merely exiting
+/// nonzero, which surfaces as a normal finished event with that exit code),
+/// two synthetic events are queued instead, in order:
+///   1. {"type":"line","line":"ERROR: <err>"}
+///   2. {"type":"finished","exit_code":-1,"connection_key":null}
+///
+/// @param params_json  NUL-terminated JSON object per the contract above.
+/// @return  Job handle (always >= 1) on success, or -1 if params_json is
+///          NULL, not valid UTF-8, or fails to parse.
+int64_t aivpn_ssh_install_start(const char *params_json);
+
+/// Pops the next queued InstallEvent (JSON-encoded, see
+/// aivpn_ssh_install_start) for `handle` into out_buf.
+///
+/// Buffer contract — peek-then-pop, a variant of the written-len-or-
+/// needed-len convention:
+///  - > 0:  an event was available and fit in out_cap; it has been POPPED
+///          from the queue and its JSON bytes (<= out_cap) were written
+///          into out_buf. Return value = bytes written.
+///  - an event is available but does NOT fit in out_cap: return value is
+///          the needed length (always > out_cap); the event is left in the
+///          queue (NOT popped) — retry with a buffer of at least that size
+///          to get the exact same event.
+///  - 0:    the queue is empty and the job is still running. Poll again
+///          later.
+///  - -2:   the queue is empty and the job has finished — no more events
+///          will ever arrive for this handle. Call aivpn_ssh_install_free
+///          and stop polling.
+///  - -1:   `handle` is not a currently registered job (never returned by
+///          aivpn_ssh_install_start, or already freed).
+///
+/// @param handle   Job handle from aivpn_ssh_install_start.
+/// @param out_buf  Buffer to receive the event's JSON bytes (NOT
+///                 NUL-terminated). May be NULL only if out_cap is 0.
+/// @param out_cap  Size of out_buf in bytes.
+intptr_t aivpn_ssh_install_poll(
+    int64_t handle,
+    uint8_t *out_buf,
+    size_t out_cap
+);
+
+/// Removes `handle` from the job registry so aivpn_ssh_install_poll no
+/// longer recognizes it. Does NOT cancel an in-flight install: if the
+/// background SSH thread is still running, it keeps producing events into
+/// the registry after this call — those become silent no-ops for `handle`
+/// (nothing leaks, nothing crashes); the SSH session and remote script run
+/// to completion with no observer.
+///
+/// @param handle  Job handle from aivpn_ssh_install_start.
+/// @return 0 if `handle` was found and removed, -1 if it was not
+///         registered (never issued, or already freed).
+int aivpn_ssh_install_free(int64_t handle);
 
 #ifdef __cplusplus
 }

@@ -21,7 +21,13 @@ func loadMaskCatalogFile() -> [MaskCatalogItem] {
     for path in paths {
         guard let data = FileManager.default.contents(atPath: path) else { continue }
         if let items = try? JSONDecoder().decode([MaskCatalogItem].self, from: data) {
-            return items
+            // Only surface ids the helper's/client's pattern gate will accept
+            // (lowercase alphanumerics + underscore, ≤64 chars) — a corrupted
+            // or tampered catalog entry must not become a doomed connect.
+            return items.filter {
+                $0.mask_id == "auto" ||
+                $0.mask_id.range(of: "^[a-z0-9_]{1,64}$", options: .regularExpression) != nil
+            }
         }
     }
     return []
@@ -49,6 +55,13 @@ struct ContentView: View {
     @AppStorage("maskCountryCode") private var maskCountryCode: String = ""
     @AppStorage("themePreference") private var themePreference: String = "system"
     @State private var showDiagnostics: Bool = false
+    // P3.3-macOS: cached server-assigned role, refreshed (off main thread —
+    // AdminApi.role() blocks on a socket round trip up to 10s) whenever the
+    // tunnel connects. nil = unknown/unreachable/not connected; the admin
+    // section only ever shows for role >= AdminApi.roleViewer (G-A1: Viewer
+    // included, read-only), so "unknown" and "User (0)" both fail closed to
+    // "hidden", never a false-positive reveal.
+    @State private var adminRole: UInt8? = nil
     @State private var benchRunning: Bool = false
     @State private var benchResult: BenchDisplayResult? = nil
     @State private var editingKeyId: String?
@@ -290,6 +303,32 @@ struct ContentView: View {
             .padding(.vertical, 8)
             .background(Color(NSColor.controlBackgroundColor).opacity(0.3))
             .cornerRadius(8)
+
+            Divider()
+
+            // Install a server via SSH — the basic "spin up my first server"
+            // scenario, so unlike "Manage clients"/AdminWindowController
+            // below (gated on vpn.isConnected && adminRole >= roleViewer,
+            // which by definition can never be true before any server
+            // exists) this entry point is ALWAYS available: no connection,
+            // no admin role required. Only the install flow itself needs
+            // this; migration is web-only (see MIGRATION.md-equivalent —
+            // the native wizard was removed, use the web admin panel).
+            Button(action: { InstallServerWindowController.shared.show() }) {
+                HStack {
+                    Image(systemName: "server.rack")
+                        .font(.caption)
+                    Text(loc.t("install_wizard_button"))
+                        .font(.caption)
+                    Spacer()
+                    Image(systemName: "chevron.right")
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                }
+            }
+            .buttonStyle(.plain)
+            .padding(.horizontal, 16)
+            .padding(.vertical, 8)
 
             Divider()
 
@@ -776,6 +815,75 @@ struct ContentView: View {
                 Divider()
             }
 
+            // Admin: client-management console (P3.3-macOS). Shown for any
+            // server-assigned role above User — Viewer (1) as well as
+            // Admin (2) — cached from the last Capabilities control
+            // message; never assignable from this app, the server decides.
+            // G-A1: Viewer gets the same entry point but the window itself
+            // (AdminWindowController/AdminRootView in AdminView.swift)
+            // independently re-derives `AdminStore.canMutate` from its own
+            // `AdminApi.role()` call and hides every mutating control when
+            // it isn't Admin — this button's label/icon just previews that
+            // mode up front so a Viewer isn't surprised. Opens its own
+            // window rather than an inline section: the popover is a fixed
+            // 360×440 and a client list + add-client form + QR/save-panel
+            // flow needs real room, the same way "Manage…"/"Preferences…"
+            // in other menu-bar apps opens a separate window instead of
+            // growing the popover indefinitely.
+            if vpn.isConnected, let adminRole = adminRole, adminRole >= AdminApi.roleViewer {
+                Button(action: { AdminWindowController.shared.show() }) {
+                    HStack {
+                        Image(systemName: adminRole == AdminApi.roleAdmin
+                              ? "person.2.badge.gearshape" : "eye")
+                            .font(.caption)
+                        Text(adminRole == AdminApi.roleAdmin
+                             ? loc.t("admin_panel_button") : loc.t("admin_panel_button_viewer"))
+                            .font(.caption)
+                        Spacer()
+                        Image(systemName: "chevron.right")
+                            .font(.caption2)
+                            .foregroundColor(.secondary)
+                    }
+                }
+                .buttonStyle(.plain)
+                .padding(.horizontal, 16)
+                .padding(.vertical, 8)
+
+                Divider()
+            }
+
+            // G-A3: Server Settings (apply-with-rollback: active mask +
+            // global default exit node) — Admin ONLY, unlike the client-
+            // management console above which Viewer can also open in
+            // read-only mode. There is no read-only story for this window
+            // (every control on it is a mutation), so it is simply absent
+            // for Viewer/User rather than opened-and-then-blocked; the
+            // window itself (ServerSettingsRootView in ServerSettingsView.
+            // swift) independently re-derives `ServerSettingsStore.isAdmin`
+            // from its own `AdminApi.role()` call and shows an admin-only
+            // message if the role isn't (or is no longer) Admin by the time
+            // it's opened — same defense-in-depth convention as the button
+            // above.
+            if vpn.isConnected, let adminRole = adminRole, adminRole == AdminApi.roleAdmin {
+                Button(action: { ServerSettingsWindowController.shared.show() }) {
+                    HStack {
+                        Image(systemName: "slider.horizontal.3")
+                            .font(.caption)
+                        Text(loc.t("server_settings_button"))
+                            .font(.caption)
+                        Spacer()
+                        Image(systemName: "chevron.right")
+                            .font(.caption2)
+                            .foregroundColor(.secondary)
+                    }
+                }
+                .buttonStyle(.plain)
+                .padding(.horizontal, 16)
+                .padding(.vertical, 8)
+
+                Divider()
+            }
+
             // Connect / Disconnect button
             Button(action: {
                 if vpn.isConnected {
@@ -786,41 +894,40 @@ struct ContentView: View {
                         return
                     }
                     
-                    if !vpn.helperAvailable {
-                        vpn.checkHelperAvailable()
-                    } else {
-                        if proxyMode {
-                            // Proxy mode explicitly means "SOCKS5, no root". Never fall
-                            // through to the full-tunnel helper connect on a bad port —
-                            // that would silently start a root VPN the user didn't ask for.
-                            guard let port = Int(proxyPort), port > 1024 else {
-                                vpn.lastError = loc.t("proxy_port_invalid")
-                                return
-                            }
-                            vpn.connectProxy(key: selectedKey.keyValue, proxyPort: port,
-                                             preferredMask: preferredMask == "auto" ? nil : preferredMask,
-                                             polymorphicBase: (polymorphicMask && preferredMask != "auto") ? preferredMask : nil,
-                                             shareMaskFeedback: shareMaskFeedback,
-                                             receiveMaskHints: receiveMaskHints,
-                                             countryCode: maskCountryCode.count == 2 ? maskCountryCode : nil)
-                        } else {
-                            vpn.connect(key: selectedKey.keyValue, fullTunnel: fullTunnel,
-                                        mtlsCertPath: selectedKey.mtlsCertPath,
-                                        excludeRoutes: excludeRoutes.isEmpty ? nil : excludeRoutes,
-                                        adaptiveLevel: adaptiveLevel,
-                                        dnsProxy: dnsProxyAddr.isEmpty ? nil : dnsProxyAddr,
-                                        killSwitch: killSwitch,
-                                        preferredMask: preferredMask == "auto" ? nil : preferredMask,
-                                        polymorphicBase: (polymorphicMask && preferredMask != "auto") ? preferredMask : nil,
-                                        shareMaskFeedback: shareMaskFeedback,
-                                        receiveMaskHints: receiveMaskHints,
-                                        countryCode: maskCountryCode.count == 2 ? maskCountryCode : nil,
-                                        bootstrapCdnUrl: selectedKey.bootstrapCdnUrl,
-                                        bootstrapTelegramToken: selectedKey.bootstrapTelegramToken,
-                                        bootstrapTelegramChat: selectedKey.bootstrapTelegramChat,
-                                        bootstrapGithub: selectedKey.bootstrapGithub,
-                                        serverSigningKey: selectedKey.serverSigningKey)
+                    // No dead "re-check helper" branch here: in non-proxy mode
+                    // the button is disabled while the helper is unavailable,
+                    // and proxy mode doesn't use the helper at all.
+                    if proxyMode {
+                        // Proxy mode explicitly means "SOCKS5, no root". Never fall
+                        // through to the full-tunnel helper connect on a bad port —
+                        // that would silently start a root VPN the user didn't ask for.
+                        guard let port = Int(proxyPort), port > 1024 else {
+                            vpn.lastError = loc.t("proxy_port_invalid")
+                            return
                         }
+                        vpn.connectProxy(key: selectedKey.keyValue, proxyPort: port,
+                                         preferredMask: preferredMask == "auto" ? nil : preferredMask,
+                                         polymorphicBase: (polymorphicMask && preferredMask != "auto") ? preferredMask : nil,
+                                         shareMaskFeedback: shareMaskFeedback,
+                                         receiveMaskHints: receiveMaskHints,
+                                         countryCode: maskCountryCode.count == 2 ? maskCountryCode : nil)
+                    } else {
+                        vpn.connect(key: selectedKey.keyValue, fullTunnel: fullTunnel,
+                                    mtlsCertPath: selectedKey.mtlsCertPath,
+                                    excludeRoutes: excludeRoutes.isEmpty ? nil : excludeRoutes,
+                                    adaptiveLevel: adaptiveLevel,
+                                    dnsProxy: dnsProxyAddr.isEmpty ? nil : dnsProxyAddr,
+                                    killSwitch: killSwitch,
+                                    preferredMask: preferredMask == "auto" ? nil : preferredMask,
+                                    polymorphicBase: (polymorphicMask && preferredMask != "auto") ? preferredMask : nil,
+                                    shareMaskFeedback: shareMaskFeedback,
+                                    receiveMaskHints: receiveMaskHints,
+                                    countryCode: maskCountryCode.count == 2 ? maskCountryCode : nil,
+                                    bootstrapCdnUrl: selectedKey.bootstrapCdnUrl,
+                                    bootstrapTelegramToken: selectedKey.bootstrapTelegramToken,
+                                    bootstrapTelegramChat: selectedKey.bootstrapTelegramChat,
+                                    bootstrapGithub: selectedKey.bootstrapGithub,
+                                    serverSigningKey: selectedKey.serverSigningKey)
                     }
                 }
             }) {
@@ -919,10 +1026,22 @@ struct ContentView: View {
         .preferredColorScheme(colorSchemeOverride)
         .onAppear {
             connectOnLaunch = LaunchAgentManager.shared.isEnabled
+            if vpn.isConnected {
+                refreshAdminRole()
+            }
         }
         .onReceive(vpn.$isConnected) { connected in
             if let appDelegate = NSApp.delegate as? AppDelegate {
                 appDelegate.updateStatusIcon(connected: connected)
+            }
+            if connected {
+                refreshAdminRole()
+            } else {
+                // Role is only meaningful for a live session (cached from
+                // Capabilities, reset server-side on reconnect) — clear it
+                // immediately on disconnect so a stale Admin reveal can't
+                // outlive the session that granted it.
+                adminRole = nil
             }
         }
         .confirmationDialog(loc.t("delete_key_confirm"), isPresented: $showDeleteConfirm) {
@@ -976,7 +1095,10 @@ struct ContentView: View {
     }
 
     private var connectButtonEnabled: Bool {
-        !vpn.isConnecting && vpn.helperAvailable && !vpn.keys.isEmpty
+        // Proxy mode (SOCKS5) never talks to the privileged helper — the
+        // client is launched directly as the current user — so it must not be
+        // gated on helper availability.
+        !vpn.isConnecting && (proxyMode || vpn.helperAvailable) && !vpn.keys.isEmpty
     }
 
     private var connectButtonBackgroundColor: Color {
@@ -1063,6 +1185,20 @@ struct ContentView: View {
             return true
         default:
             return false
+        }
+    }
+
+    /// Refreshes `adminRole` from the running daemon. `AdminApi.role()`
+    /// performs a blocking socket round trip (up to 10s) so it MUST run off
+    /// the main thread — SwiftUI would otherwise freeze the whole popover
+    /// for up to that long on every connect. A stale/failed read (nil) just
+    /// keeps the admin section hidden; it never shows a wrong role.
+    private func refreshAdminRole() {
+        DispatchQueue.global(qos: .utility).async {
+            let role = AdminApi.role()
+            DispatchQueue.main.async {
+                adminRole = role
+            }
         }
     }
 }

@@ -1,5 +1,6 @@
 import Darwin
 import Foundation
+import Security
 import SwiftUI
 
 // MARK: - Bootstrap Descriptor Discovery
@@ -71,12 +72,92 @@ func base64URLNoPad(_ data: Data) -> String {
 // once a discovery run succeeds they live only inside the resulting
 // ConnectionKey, protected by Keychain via KeychainStorage (the same
 // mechanism every other connection key already uses).
-struct BootstrapChannelSettings: Codable, Equatable {
+struct BootstrapChannelSettings: Equatable {
     var cdnURL: String = ""
     var githubRepo: String = ""
+    /// A REAL credential — possession grants control of the bootstrap-
+    /// distribution bot — unlike the other fields here, which are just
+    /// distribution endpoints/public keys. Deliberately excluded from this
+    /// struct's Codable payload below (see CodingKeys) so it is never
+    /// written into the plaintext UserDefaults blob the other fields use;
+    /// it is persisted separately in the Keychain by
+    /// BootstrapChannelSettingsStore instead.
     var telegramBotToken: String = ""
     var telegramChatId: String = ""
     var signingPublicKeyHex: String = ""
+}
+
+// Manual Codable conformance (not derived): `telegramBotToken` is
+// intentionally omitted from both encode(to:) and init(from:) so it can
+// never round-trip through the UserDefaults-backed JSON blob. Decoding
+// always leaves it at "" — callers (BootstrapChannelSettingsStore.init)
+// are responsible for filling it in from the Keychain afterwards.
+extension BootstrapChannelSettings: Codable {
+    private enum CodingKeys: String, CodingKey {
+        case cdnURL, githubRepo, telegramChatId, signingPublicKeyHex
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        cdnURL = try c.decodeIfPresent(String.self, forKey: .cdnURL) ?? ""
+        githubRepo = try c.decodeIfPresent(String.self, forKey: .githubRepo) ?? ""
+        telegramChatId = try c.decodeIfPresent(String.self, forKey: .telegramChatId) ?? ""
+        signingPublicKeyHex = try c.decodeIfPresent(String.self, forKey: .signingPublicKeyHex) ?? ""
+        telegramBotToken = ""
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(cdnURL, forKey: .cdnURL)
+        try c.encode(githubRepo, forKey: .githubRepo)
+        try c.encode(telegramChatId, forKey: .telegramChatId)
+        try c.encode(signingPublicKeyHex, forKey: .signingPublicKeyHex)
+    }
+}
+
+/// Stores the Telegram bootstrap-discovery bot token in the Keychain
+/// instead of plaintext UserDefaults (which is an unencrypted plist,
+/// included in local/iCloud device backups). Uses the same access class
+/// as ConnectionKey.swift's primary Keychain items —
+/// kSecAttrAccessibleWhenUnlockedThisDeviceOnly — since this is app-local
+/// state, not shared with the tunnel extension (no access group needed).
+private enum BootstrapTokenKeychain {
+    private static let service = "com.aivpn.client.bootstrap-telegram-token"
+    private static let account = "telegram_bot_token"
+
+    static func load() -> String? {
+        let query: [CFString: Any] = [
+            kSecClass:       kSecClassGenericPassword,
+            kSecAttrService: service,
+            kSecAttrAccount: account,
+            kSecMatchLimit:  kSecMatchLimitOne,
+            kSecReturnData:  true,
+        ]
+        var result: CFTypeRef?
+        let status = SecItemCopyMatching(query as CFDictionary, &result)
+        guard status == errSecSuccess, let data = result as? Data else { return nil }
+        return String(data: data, encoding: .utf8)
+    }
+
+    static func save(_ token: String) {
+        let query: [CFString: Any] = [
+            kSecClass:       kSecClassGenericPassword,
+            kSecAttrService: service,
+            kSecAttrAccount: account,
+        ]
+        guard !token.isEmpty, let data = token.data(using: .utf8) else {
+            SecItemDelete(query as CFDictionary)
+            return
+        }
+        let update: [CFString: Any] = [kSecValueData: data]
+        let status = SecItemUpdate(query as CFDictionary, update as CFDictionary)
+        if status == errSecItemNotFound {
+            var attrs = query
+            attrs[kSecAttrAccessible] = kSecAttrAccessibleWhenUnlockedThisDeviceOnly
+            attrs[kSecValueData] = data
+            SecItemAdd(attrs as CFDictionary, nil)
+        }
+    }
 }
 
 final class BootstrapChannelSettingsStore: ObservableObject {
@@ -93,11 +174,13 @@ final class BootstrapChannelSettingsStore: ObservableObject {
         } else {
             settings = BootstrapChannelSettings()
         }
+        settings.telegramBotToken = BootstrapTokenKeychain.load() ?? ""
     }
 
     func save() {
         guard let data = try? JSONEncoder().encode(settings) else { return }
         UserDefaults.standard.set(data, forKey: defaultsKey)
+        BootstrapTokenKeychain.save(settings.telegramBotToken)
     }
 }
 

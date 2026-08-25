@@ -41,7 +41,14 @@ platforms/android/       — Android Kotlin 应用（MVVM：MainViewModel + Recy
 platforms/ios/           — iOS SwiftUI 应用 + NetworkExtension PacketTunnelProvider
 platforms/macos/         — macOS SwiftUI 菜单栏应用 + 特权辅助守护程序
 platforms/aivpn-web/     — Web 管理面板（Hono 4 + SvelteKit 2，SQLite/PostgreSQL）
-mask-assets/             — 捆绑的流量拟态 JSON 配置文件
+platforms/linux/         — Linux 桌面打包（AppImage、.desktop）
+platforms/linux-kernel/  — 可选的内核态数据路径模块
+platforms/openwrt/       — OpenWrt 软件包
+platforms/mikrotik/      — MikroTik RouterOS 容器
+assets/masks/            — 捆绑的流量拟态 JSON 配置文件
+assets/brand/            — 图标与品牌素材
+deploy/                  — 服务器安装脚本、systemd unit、Dockerfile
+deploy/ci/               — 由 Makefile 调用的 CI 门禁（见 `make help`）
 ```
 
 ### 核心模块
@@ -795,7 +802,8 @@ aivpn/
 ├── platforms/ios/
 ├── crates/aivpn-windows/
 ├── platforms/macos/
-├── mask-assets/
+├── assets/masks/          # 捆绑的流量拟态配置文件（JSON）
+├── deploy/ci/             # 由 Makefile 调用的 CI 门禁
 ├── deploy/docker/
 ├── Dockerfile
 ├── docker-compose.yml

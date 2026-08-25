@@ -41,7 +41,14 @@ platforms/android/       — Android Kotlin app (MVVM: MainViewModel + RecyclerV
 platforms/ios/           — iOS SwiftUI app + NetworkExtension PacketTunnelProvider
 platforms/macos/         — macOS SwiftUI menu bar app + privileged helper daemon
 platforms/aivpn-web/     — Web management panel (Hono 4 + SvelteKit 2, SQLite/PostgreSQL)
-mask-assets/             — bundled traffic mimicry JSON profiles
+platforms/linux/         — Linux desktop packaging (AppImage, .desktop)
+platforms/linux-kernel/  — optional in-kernel data-path module (out-of-tree)
+platforms/openwrt/       — OpenWrt package
+platforms/mikrotik/      — MikroTik RouterOS container
+assets/masks/            — bundled traffic mimicry JSON profiles
+assets/brand/            — icons and brand material
+deploy/                  — server installer, systemd unit, Dockerfiles
+deploy/ci/               — CI gates run by the Makefile (see `make help`)
 ```
 
 ### Key modules
@@ -97,11 +104,18 @@ Server-to-server client database synchronization uses `ControlPayload::PoolSync`
 | Bootstrap Descriptor Discovery | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Polymorphic Masks | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Crowdsourced Mask Feedback (opt-in) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| In-App Admin (roles, client mgmt, revoke, audit)‡ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Pool Topology View + Per-Client Exit Node | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| SSH Server Install Wizard§ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Live Metrics Graphs† | — | — | — | — | — | — |
 
 \* Android's `VpnService` API routes all device traffic (including DNS) through the encrypted tunnel by design — there's no separate local DNS-proxy listener because none is needed; DNS leaks aren't possible on this platform.
 
 † Live Metrics Graphs is a server + [Web Management Panel](#web-management-panel) feature, not a client capability — it requires building the server with `--features metrics` and is viewed from the web dashboard, not from any of the clients above.
+
+‡ See [In-App Client Administration & Roles](#in-app-client-administration--roles). On desktop, the CLI exposes the same surface via `aivpn-client mgmt`/`aivpn-client role` (bridged over the local admin socket); Linux CLI's checkmark reflects that CLI bridge rather than a graphical admin screen.
+
+§ See [SSH Server Installer](#ssh-server-installer). Requires the client to be built with the `ssh-install` Cargo feature (bundled by default in the released GUI/mobile builds); on Linux CLI it is the `aivpn-client ssh-install {script,probe,run}` subcommand rather than a graphical wizard.
 
 ---
 
@@ -114,8 +128,8 @@ Server-to-server client database synchronization uses `ControlPayload::PoolSync`
 **Features:**
 - JWT auth (15 min access token + 7-day refresh httpOnly cookie), argon2id passwords
 - TOTP 2FA (AES-256-GCM encrypted secrets) and WebAuthn passkeys
-- Roles: `admin` (full access) and `viewer` (read-only)
-- Pages: Dashboard (live charts), Clients, Config, Masks, Backup, Logs, Settings
+- Roles: `admin` (full access) and `viewer` (read-only) — these are the **web panel's own** login roles, independent of a VPN client's [`ClientRole`](#in-app-client-administration--roles). `viewer` is enforced through a fail-closed allowlist of GET-only proxied endpoints (clients, pool nodes/links/health, masks, status, kernel, events); config, backup, bootstrap export, and mask upload/delete stay admin-only.
+- Pages: Dashboard (live charts), Clients (add/edit/QR/revoke, role assignment), Pool (topology graph, per-client exit node, audit hash-chain verify badge), Config, Masks, Backup, Logs, Settings
 - All `/api/v1/*` proxied to the aivpn Unix socket (`/run/aivpn/api.sock`)
 - Realtime SSE event stream at `/web/events`
 - **Live metrics graphs** — the Dashboard renders live time-series charts (active sessions, bandwidth in/out, packet rate, p50/p95 packet-processing latency) plus pulsing badges for mask/key rotations and DPI-attacks-detected, all fed over the same `/web/events` SSE stream from an in-memory ~10-minute ring buffer (no new persistent storage). Requires the server to be built with `--features metrics` (see [Optional features (Cargo)](#optional-features-cargo)); the dashboard shows a hint instead of the charts if the server lacks that feature.
@@ -255,7 +269,14 @@ aivpn-server \
 
 Output includes the connection key (`aivpn://…`) — distribute it to the client.
 
-Other management commands: `--list-clients`, `--show-client`, `--remove-client`.
+Add `--role viewer|admin` to grant that client [in-app management access](#in-app-client-administration--roles) (requires the client to already be device-bound — combine with `--device-pubkey <BASE64>` to create a device-bound admin in one shot, no separate enrollment step):
+
+```bash
+aivpn-server --add-client "Admin Phone" --role admin --device-pubkey <BASE64_DEVICE_PUBKEY> \
+    --key-file /etc/aivpn/server.key --clients-db /etc/aivpn/clients.json --server-ip YOUR_PUBLIC_IP:443
+```
+
+Other management commands: `--list-clients`, `--show-client`, `--remove-client`, `--enable-client`/`--disable-client`, `--reset-device`.
 
 ---
 
@@ -395,26 +416,6 @@ aivpn-server --show-client "Name" --key-file /etc/aivpn/server.key \
 
 ---
 
-## Version Compatibility
-
-Clients and servers interoperate across the wire-layout change introduced in 1.0.0
-(the resonance tag moved from a fixed 8-byte prefix into the mimicked protocol
-header), so **the upgrade order does not matter**:
-
-- A current client that cannot complete a handshake falls back to the older
-  tag-prefix layout — and to the single, non-directional session key that goes
-  with it — after a few failed attempts (about a minute). Nothing to configure;
-  the client logs `retrying with the pre-Variant-A wire layout` when it happens.
-- A current server accepts both layouts. The older layout is tried only in a
-  second handshake pass that runs when no current-layout candidate matches, so
-  a current client's handshake costs exactly what it did before, and upgrading a
-  server does not lock out users who are still on an older app.
-
-Connection keys are unaffected: the server's key material does not change with an
-upgrade, so existing `aivpn://` keys keep working.
-
----
-
 ## Server Configuration Reference
 
 Default config path: `config/server.json` (local) or `/etc/aivpn/server.json`. CLI flags override file values.
@@ -462,6 +463,10 @@ Default config path: `config/server.json` (local) or `/etc/aivpn/server.json`. C
 | `network_config.ipv6_prefix` | `fd10:cafe::/48` | ULA /48 prefix for client IPv6 addresses |
 | `pool.peers` | `[]` | Peer server addresses for database sync |
 | `pool.sync_key` | `""` | Shared 32-byte BLAKE3 key (base64). Generate: `openssl rand -base64 32` |
+| `pool.node_id` | _(unset)_ | This node's own identifier within the pool (recommended: its `host:port`); pool sync is disabled while unset |
+| `pool.node_ip_partition` | hash-derived | Pin this node's hard VPN-IP partition index explicitly instead of deriving it from `hash(node_id)` — rules out a hash collision, or hand-balances a large pool. See [Pool Topology and Per-Client Exit Routing](#pool-topology-and-per-client-exit-routing) |
+| `pool.transport` | `"legacy"` | `"masked"` switches pool sync to dial peers as a fully masked pool-client with bidirectional anti-entropy, instead of the mask-independent push-only legacy transport |
+| `pool.exit_node` / `pool.exit_node_enabled` | unset / `false` | Global-default multi-hop exit (see [Multi-hop Chain Forwarding](#multi-hop-chain-forwarding)); overridable per client |
 
 ### Optional features (Cargo)
 
@@ -502,9 +507,10 @@ make client        # Linux x86_64
 ### musl static cross-builds (for routers)
 
 ```bash
-make server-musl-armv7    # ARMv7
-make server-musl-mipsel   # MIPSel
-make server-musl-aarch64  # AArch64
+make server-musl-armv7        # ARMv7
+make server-musl-mipsel       # MIPSel
+make server-musl-aarch64      # AArch64 (default features)
+make server-musl-aarch64-full # AArch64, full feature set (management-api,metrics,neural) — what CI publishes as aivpn-server-linux-aarch64
 ```
 
 ### Platform builds
@@ -614,6 +620,47 @@ Device key storage per platform:
 | Android | Android Keystore via `EncryptedSharedPreferences` |
 | iOS | Keychain, `kSecAttrAccessibleAfterFirstUnlock` |
 
+### In-App Client Administration & Roles
+
+Any client can be granted a management **role** that gates what it may do — both against the Unix-socket REST API and via an in-tunnel management channel carried inside ordinary VPN traffic, so administration works even when no other path to the server is reachable:
+
+| Role (`ClientRole`) | Rank | Grants (curated tunnel/API surface: clients, pool topology, audit log, status, heavy-config apply/confirm) |
+|---|---|---|
+| `user` (default) | 0 | connect only — no management access |
+| `viewer` | 1 | read-only: GET on every curated route (list/inspect clients, connection key, pool nodes/health/links, status, audit log) |
+| `admin` | 2 | the full curated allowlist, reads and mutations: add/edit/remove/revoke clients, role assignment, per-client `exit_node`, reset-device, apply/confirm heavy config (active mask, global exit node) |
+
+Elevating a client above `user` requires it to already be **device-bound** (see [Device Binding](#device-binding-jit-enrollment)) — a role is a privilege grant, so it is always tied to a proven device key, never a bare PSK:
+
+```bash
+# Fresh client, device-bound and elevated to admin in one step
+aivpn-server --add-client "Admin Phone" --role admin --device-pubkey <BASE64_DEVICE_PUBKEY> \
+    --key-file /etc/aivpn/server.key --clients-db /etc/aivpn/clients.json --server-ip IP:PORT
+
+# Elevate an already device-bound client afterwards (role-only re-add)
+aivpn-server --add-client "Alice" --role viewer --key-file /etc/aivpn/server.key \
+    --clients-db /etc/aivpn/clients.json --server-ip IP:PORT
+```
+
+`--role` and `--device-pubkey` also apply to `--add-client-one-time`, so a fresh one-time-enrollment slot can be pre-granted a role that takes effect once the device actually binds.
+
+**Managing the server from inside the tunnel** — an admin/viewer-role client can issue `MgmtRequest`/`MgmtResponse` control messages against a curated subset of the REST surface (`/api/v1/status`, `/api/v1/clients*`, `/api/v1/audit-log`, `/api/v1/config/apply`+`/confirm`, `/api/v1/pool/*`), rate-limited per session. Full config `PUT`, `/api/v1/backup/import`, and mask-signing-key management are deliberately **never** reachable this way, even for `admin` — those stay Unix-socket-only (local CLI, or the web panel's own separately-gated `admin` login). Desktop clients bridge the curated surface to a local admin socket via the CLI:
+
+```bash
+aivpn-client mgmt --method GET --path /api/v1/clients
+aivpn-client role   # prints the role (0=user/1=viewer/2=admin) the server granted this client
+```
+
+Android and iOS expose the equivalent calls through JNI/FFI (`mgmtRequest`/`getRole`/`qrPng`), and all 5 platform GUIs (Linux, Windows, macOS, Android, iOS) plus the web panel's Clients page ship an admin screen: list clients, add a new one with its QR code, edit, and revoke — role-gated so a `viewer`-role session only sees the read side.
+
+**Revoke** — `POST /api/v1/clients/:id/revoke` (or the tunnel equivalent) force-disconnects the client's live session immediately and disables it from reconnecting, and pushes a priority pool beacon so other pool nodes learn about the revoke without waiting for the next sync interval.
+
+**Tamper-evident audit log** — every admin action, whether via the REST API or the in-tunnel path, is appended to a hash-chain log (`--audit-log`, default `/var/log/aivpn/audit.log`, JSONL). `GET /api/v1/audit-log?verify=1` walks the chain and returns `{ entries, verified, broken_at }` instead of the plain entry array; the web panel surfaces this as a verify badge.
+
+**Apply-with-rollback for heavy settings** — changes that could lock the operator out if misapplied (the server's active mask, the global-default exit node) go through a commit-confirm flow instead of applying immediately: `POST /api/v1/config/apply` stages the change and starts a rollback timer; `POST /api/v1/config/confirm` commits it before the timer expires. An unconfirmed change reverts automatically.
+
+**Web panel role gating** — the web panel has its own separate `admin`/`viewer` login roles that gate its proxy in front of the server API; see [Web Management Panel](#web-management-panel) for the allowlist. They are independent of the `ClientRole` table above.
+
 ### Connection Quality Score and Adaptive Mode
 
 AIVPN continuously computes a **0–100 quality score** from RTT (40 pts), jitter (20 pts), packet loss (30 pts), and Neural MSE (10 pts). Adaptive Mode adjusts keepalive interval and FEC group size automatically:
@@ -647,9 +694,17 @@ Nodes in a pool share their client databases in real time over the standard VPN 
 }
 ```
 
+### Pool Topology and Per-Client Exit Routing
+
+**Read-only topology endpoints** — `GET /api/v1/pool/nodes`, `/api/v1/pool/health`, `/api/v1/pool/links` expose the pool's current node list, per-node health, and inter-node link status, reachable by `viewer`-role sessions too. The web panel's **Pool** page renders this as a live topology graph.
+
+**Hard per-node VPN-IP partitioning** — each pool node claims a disjoint slice of the VPN subnet (`hash(node_id) % partitions` by default, or pinned explicitly via `pool.node_ip_partition`), so independent client adds performed on two different nodes at the same time can never collide on the same VPN IP. Nodes exchange their claimed partitions (`ControlPayload::PartitionAnnounce`) and flag an operator-caused overlap (e.g. a hash collision, or a misconfigured `node_ip_partition`) instead of silently corrupting the pool. The pre-existing deterministic re-home logic remains as a backstop for any IP that still ends up contended.
+
+**Per-client exit routing** — independent of the pool-wide default below, any individual client can be routed through a specific pool exit node, live, without a server restart: `PATCH /api/v1/clients/:id` with `{"exit_node": "host:port"}` (or `null` to fall back to the global default), also reachable over the tunnel mgmt path. Unlike `role`, setting a client's own `exit_node` is not a privilege grant and needs no device binding. The server dials the target exit peer on demand if it isn't already an active pool connection. All 5 client GUIs and the web panel's Pool/Clients pages expose an exit-node picker per client.
+
 ### Multi-hop Chain Forwarding
 
-Route client traffic through two AIVPN nodes. The client connects only to the entry node; the internet sees the exit node's IP.
+Route client traffic through two AIVPN nodes. The client connects only to the entry node; the internet sees the exit node's IP. This sets the **global default** exit node for every client that has no per-client `exit_node` override (see [Pool Topology and Per-Client Exit Routing](#pool-topology-and-per-client-exit-routing) above); changing it live goes through the [apply-with-rollback](#in-app-client-administration--roles) flow since a bad global exit can black-hole all pool traffic.
 
 **Entry node:**
 ```json
@@ -659,6 +714,39 @@ Route client traffic through two AIVPN nodes. The client connects only to the en
 ```json
 { "pool": { "sync_key": "<same-key>", "exit_node_enabled": true } }
 ```
+
+### SSH Server Installer
+
+`deploy/install-server.sh` is an idempotent, systemd-first installer for a fresh Linux VPS: it detects the distro/architecture, checks the target port is free, fetches (or accepts a locally-supplied) `aivpn-server` release binary and verifies its SHA256, generates `server.key`/`server.json`, seeds mask profiles, installs and starts a systemd unit (or deploys via `docker compose` with `--mode docker`), opens the firewall, optionally provisions a device-bound admin client in the same run, and health-checks that `aivpn-server` actually owns the listening port afterwards. Re-running it is an upgrade: `server.key`/`clients.json` are never overwritten, the binary/unit are always replaced, and the service restarts at the end. Every step prints one machine-readable line on stdout:
+
+```
+##AIVPN {"step":"...","status":"ok|error|info","code":"...","msg":"..."}
+```
+
+so a caller (a script, or the in-app installer UI below) can track progress without scraping text.
+
+```bash
+sudo bash deploy/install-server.sh --device-pubkey <BASE64_DEVICE_PUBKEY> --server-ip vpn.example.com:443
+deploy/install-server.sh --help          # full flag / env-var reference
+deploy/install-server.sh --show-script   # print the script's own source before running it as root
+deploy/install-server.sh --print-sha256  # print the script's own sha256sum
+```
+
+Key flags: `--mode systemd|docker`, `--port`/`--listen`, `--binary-url`/`--binary-file`, `--masks-url`/`--masks-dir`, `--device-pubkey`/`--server-ip`/`--admin-name`, `--config`/`--key-file`/`--clients-db`/`--mask-dir`/`--management-socket`/`--audit-log`, `--skip-firewall`, `--skip-deps`. Must be run from this repo's `deploy/` directory (or a full checkout) so it can find `deploy/config/server.json.example` and `deploy/systemd/aivpn-server.service` alongside it — only the server *binary* is fetched over the network by default.
+
+**In-app install wizard** — every native client (Linux, Windows, macOS, Android, iOS) embeds a `russh`-based SSH client (`aivpn_common::ssh_install`, behind the `ssh-install` Cargo feature) together with the installer script, systemd unit, bundled masks, and config template as an embedded asset, and drives a setup wizard entirely from the app: enter the target host, confirm the TOFU SSH host-key fingerprint, optionally review the install script and its SHA256 before running it, watch live progress parsed from the `##AIVPN` markers, then import the resulting `aivpn://` connection key. The wizard's entry point is on the main screen, not gated behind an existing connection or an admin session — bootstrapping a brand-new server from scratch needs neither. On the CLI the same flow is `aivpn-client ssh-install {script,probe,run}`:
+
+```bash
+aivpn-client ssh-install probe --host vpn.example.com --user root
+aivpn-client ssh-install run --host vpn.example.com --fingerprint "SHA256:..." \
+    --key-file ~/.ssh/id_ed25519 --device-pubkey <BASE64_DEVICE_PUBKEY> --server-ip vpn.example.com:443
+```
+
+`ssh-install run` authenticates with exactly one of `--password-env`/`--password-stdin`/`--key-file` (never a raw `--password` argument — argv is visible via `/proc/<pid>/cmdline`), and accepts `--binary-file`/`--binary-url` to control which `aivpn-server` build gets installed, plus `--mode systemd|docker` and pass-through `--extra-arg` tokens forwarded to `install-server.sh`.
+
+Native clients originally also shipped a dedicated **migration wizard** (export the current server via `/api/v1/backup/export`, install a fresh server, import via `/api/v1/backup/import`) alongside the install wizard, but it was intentionally dropped from all 5 (Linux, Windows, macOS, Android, iOS) to avoid five near-duplicate implementations of the same export/import flow. Server migration is now a **web-panel-only** capability, driven from the existing Backup page (which already talks to the same `/api/v1/backup/export`/`/api/v1/backup/import` routes) — native clients keep only the install wizard above.
+
+CI publishes full-feature (`management-api,metrics,neural`) `aivpn-server` release binaries for both `x86_64` and `aarch64`, each with a `SHA256SUMS` file — matching what `install-server.sh`'s default `--binary-url` (GitHub Releases) fetches and verifies against.
 
 ### Bootstrap Descriptor Distribution
 
@@ -850,13 +938,21 @@ aivpn/
 │   ├── gateway.rs         # UDP gateway, session dispatch
 │   ├── neural.rs          # Neural Resonance module
 │   ├── nat.rs             # NAT forwarder (IPv4 + IPv6 NAT66)
-│   ├── client_db.rs       # Client database
-│   └── pool_sync.rs       # In-protocol pool synchronization
+│   ├── client_db.rs       # Client database (roles, device binding, exit_node)
+│   ├── mgmt_service.rs    # Shared REST + in-tunnel management dispatch
+│   ├── audit_log.rs       # Tamper-evident hash-chain admin audit log
+│   ├── pending_config.rs  # Apply-with-rollback (commit-confirm) for heavy config
+│   ├── pool_sync.rs       # In-protocol pool synchronization
+│   ├── pool_dialer.rs     # Masked pool-client transport (dial peers, exit routing)
+│   └── pool_partition.rs  # Hard per-node VPN-IP partitioning
+├── crates/aivpn-common/src/ssh_install.rs  # russh SSH-install client + embedded installer bundle
+├── deploy/install-server.sh   # systemd-first server installer (##AIVPN progress markers)
 ├── platforms/android/         # Android Kotlin app
 ├── platforms/ios/             # iOS SwiftUI app + NEPacketTunnelProvider
 ├── crates/aivpn-windows/      # Windows egui GUI
 ├── platforms/macos/           # macOS SwiftUI menu bar app
-├── mask-assets/           # Bundled traffic mimicry profiles (JSON)
+├── assets/masks/          # Bundled traffic mimicry profiles (JSON)
+├── deploy/ci/             # CI gates invoked from the Makefile
 ├── deploy/docker/             # Dockerfiles and entrypoint
 ├── Dockerfile
 ├── docker-compose.yml

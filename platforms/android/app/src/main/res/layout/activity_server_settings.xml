@@ -1,0 +1,281 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout
+    xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:orientation="vertical"
+    android:background="@color/background">
+
+    <!-- Compact toolbar: back + title + refresh (same pattern as AdminActivity/PoolActivity) -->
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="48dp"
+        android:orientation="horizontal"
+        android:gravity="center_vertical"
+        android:paddingHorizontal="8dp">
+
+        <ImageButton
+            android:id="@+id/btnBack"
+            android:layout_width="40dp"
+            android:layout_height="40dp"
+            android:src="@android:drawable/ic_menu_revert"
+            android:background="?attr/selectableItemBackgroundBorderless"
+            android:contentDescription="@string/btn_cancel"
+            android:scaleType="centerInside"
+            app:tint="@color/text_primary" />
+
+        <TextView
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:text="@string/server_settings_title"
+            android:textSize="18sp"
+            android:textStyle="bold"
+            android:textColor="@color/text_primary"
+            android:paddingStart="4dp" />
+
+        <ImageButton
+            android:id="@+id/btnRefresh"
+            android:layout_width="40dp"
+            android:layout_height="40dp"
+            android:src="@android:drawable/ic_popup_sync"
+            android:background="?attr/selectableItemBackgroundBorderless"
+            android:contentDescription="@string/admin_refresh"
+            android:scaleType="centerInside"
+            app:tint="@color/text_primary" />
+    </LinearLayout>
+
+    <TextView
+        android:id="@+id/textNotConnected"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="@string/admin_not_connected"
+        android:textSize="13sp"
+        android:textColor="@color/accent_lemon"
+        android:padding="14dp"
+        android:visibility="gone" />
+
+    <androidx.core.widget.NestedScrollView
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_weight="1">
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical"
+            android:paddingBottom="24dp">
+
+            <!-- ──────────── Active mask (live, no restart) ──────────── -->
+            <com.google.android.material.card.MaterialCardView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginHorizontal="12dp"
+                android:layout_marginTop="12dp"
+                app:cardBackgroundColor="@color/surface"
+                app:cardCornerRadius="16dp"
+                app:cardElevation="0dp"
+                app:strokeWidth="0dp">
+
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:orientation="vertical"
+                    android:padding="14dp">
+
+                    <TextView
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:text="@string/server_settings_mask_title"
+                        android:textSize="15sp"
+                        android:textStyle="bold"
+                        android:textColor="@color/text_primary" />
+
+                    <TextView
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:text="@string/server_settings_mask_caption"
+                        android:textSize="11sp"
+                        android:textColor="@color/text_secondary"
+                        android:paddingTop="2dp"
+                        android:paddingBottom="8dp" />
+
+                    <!-- The active mask is strictly per-client server-side
+                         (.overrides/{client}.mask) — an empty client id is
+                         rejected with 400, so a client MUST be picked. -->
+                    <TextView
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:text="@string/server_settings_mask_client_label"
+                        android:textSize="12sp"
+                        android:textColor="@color/text_secondary" />
+
+                    <Spinner
+                        android:id="@+id/spinnerMaskClient"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content" />
+
+                    <TextView
+                        android:id="@+id/textMaskClientEmpty"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:text="@string/server_settings_mask_no_clients"
+                        android:textSize="12sp"
+                        android:textColor="@color/text_secondary"
+                        android:visibility="gone" />
+
+                    <TextView
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:text="@string/server_settings_mask_label"
+                        android:textSize="12sp"
+                        android:textColor="@color/text_secondary"
+                        android:paddingTop="8dp" />
+
+                    <Spinner
+                        android:id="@+id/spinnerMask"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:visibility="gone" />
+
+                    <EditText
+                        android:id="@+id/editMaskCustom"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:hint="@string/server_settings_mask_id_hint"
+                        android:singleLine="true"
+                        android:textSize="13sp"
+                        android:visibility="gone" />
+
+                    <TextView
+                        android:id="@+id/textMaskEmpty"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:text="@string/server_settings_mask_none_loaded"
+                        android:textSize="12sp"
+                        android:textColor="@color/text_secondary"
+                        android:visibility="gone" />
+
+                    <Button
+                        android:id="@+id/btnApplyMask"
+                        style="?android:attr/buttonBarButtonStyle"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:layout_gravity="end"
+                        android:layout_marginTop="8dp"
+                        android:textColor="@color/accent"
+                        android:text="@string/server_settings_apply" />
+
+                    <LinearLayout
+                        android:id="@+id/rowMaskPending"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:orientation="vertical"
+                        android:visibility="gone"
+                        android:paddingTop="6dp">
+
+                        <TextView
+                            android:id="@+id/textMaskBanner"
+                            android:layout_width="match_parent"
+                            android:layout_height="wrap_content"
+                            android:textSize="12sp"
+                            android:textStyle="bold"
+                            android:textColor="@color/accent_lemon" />
+
+                        <Button
+                            android:id="@+id/btnConfirmMask"
+                            style="?android:attr/buttonBarButtonStyle"
+                            android:layout_width="wrap_content"
+                            android:layout_height="wrap_content"
+                            android:layout_gravity="end"
+                            android:textColor="@color/green"
+                            android:text="@string/server_settings_confirm" />
+                    </LinearLayout>
+                </LinearLayout>
+            </com.google.android.material.card.MaterialCardView>
+
+            <!-- ──────────── Global default exit node (pool, restart required) ──────────── -->
+            <com.google.android.material.card.MaterialCardView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginHorizontal="12dp"
+                android:layout_marginTop="12dp"
+                app:cardBackgroundColor="@color/surface"
+                app:cardCornerRadius="16dp"
+                app:cardElevation="0dp"
+                app:strokeWidth="0dp">
+
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:orientation="vertical"
+                    android:padding="14dp">
+
+                    <TextView
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:text="@string/server_settings_exit_title"
+                        android:textSize="15sp"
+                        android:textStyle="bold"
+                        android:textColor="@color/text_primary" />
+
+                    <TextView
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:text="@string/server_settings_exit_caption"
+                        android:textSize="11sp"
+                        android:textColor="@color/text_secondary"
+                        android:paddingTop="2dp"
+                        android:paddingBottom="8dp" />
+
+                    <EditText
+                        android:id="@+id/editExitNode"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:hint="@string/server_settings_exit_hint"
+                        android:singleLine="true"
+                        android:textSize="13sp" />
+
+                    <Button
+                        android:id="@+id/btnApplyExit"
+                        style="?android:attr/buttonBarButtonStyle"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:layout_gravity="end"
+                        android:layout_marginTop="8dp"
+                        android:textColor="@color/accent"
+                        android:text="@string/server_settings_apply" />
+
+                    <LinearLayout
+                        android:id="@+id/rowExitPending"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:orientation="vertical"
+                        android:visibility="gone"
+                        android:paddingTop="6dp">
+
+                        <TextView
+                            android:id="@+id/textExitBanner"
+                            android:layout_width="match_parent"
+                            android:layout_height="wrap_content"
+                            android:textSize="12sp"
+                            android:textStyle="bold"
+                            android:textColor="@color/accent_lemon" />
+
+                        <Button
+                            android:id="@+id/btnConfirmExit"
+                            style="?android:attr/buttonBarButtonStyle"
+                            android:layout_width="wrap_content"
+                            android:layout_height="wrap_content"
+                            android:layout_gravity="end"
+                            android:textColor="@color/green"
+                            android:text="@string/server_settings_confirm" />
+                    </LinearLayout>
+                </LinearLayout>
+            </com.google.android.material.card.MaterialCardView>
+
+        </LinearLayout>
+    </androidx.core.widget.NestedScrollView>
+
+</LinearLayout>

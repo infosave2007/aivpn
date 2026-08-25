@@ -2,8 +2,21 @@ global:
   scrape_interval: 15s
   evaluation_interval: 15s
 
-scrape_configs:
-  - job_name: 'aivpn-server'
-    static_configs:
-      - targets: ['host.docker.internal:9090']
-    metrics_path: '/metrics'
+# aivpn-server (built with the "metrics" feature) exposes metrics ONLY via the
+# management API unix socket (/run/aivpn/api.sock). There is no TCP /metrics
+# listener, so Prometheus cannot scrape the server directly with a static
+# target — the previous 'host.docker.internal:9090' target silently scraped
+# nothing (9090 is Prometheus's own port).
+#
+# To scrape aivpn metrics, run a unix-socket→TCP bridge (exporter sidecar),
+# e.g. socat inside the compose network:
+#   socat TCP-LISTEN:9101,fork,reuseaddr UNIX-CONNECT:/run/aivpn/api.sock
+# then enable a job like the commented example below.
+#
+# scrape_configs:
+#   - job_name: 'aivpn-server'
+#     metrics_path: '/metrics'
+#     static_configs:
+#       - targets: ['aivpn-metrics-proxy:9101']
+
+scrape_configs: []

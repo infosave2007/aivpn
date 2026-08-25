@@ -15,6 +15,14 @@ set "DESKTOP_SHORTCUT=%Public%\Desktop\AIVPN.lnk"
 set "START_MENU_SHORTCUT=%START_MENU_DIR%\AIVPN.lnk"
 set "START_MENU_UNINSTALL_SHORTCUT=%START_MENU_DIR%\Uninstall AIVPN.lnk"
 
+rem Upgrade over a running app: stop both processes first (otherwise the
+rem copy fails with a sharing violation or leaves a mixed-version install),
+rem and clear any kill-switch firewall rules the killed client leaves behind.
+taskkill /IM aivpn.exe /F >nul 2>nul
+taskkill /IM aivpn-client.exe /F >nul 2>nul
+timeout /t 2 /nobreak >nul 2>nul
+if exist "%INSTALL_DIR%\aivpn-client.exe" "%INSTALL_DIR%\aivpn-client.exe" kill-switch clear >nul 2>nul
+
 echo Installing AIVPN to "%INSTALL_DIR%"...
 if not exist "%INSTALL_DIR%" mkdir "%INSTALL_DIR%"
 if not exist "%START_MENU_DIR%" mkdir "%START_MENU_DIR%"
@@ -59,6 +67,10 @@ exit /b 0
     echo ^)
     echo taskkill /IM aivpn.exe /F ^>nul 2^>nul
     echo taskkill /IM aivpn-client.exe /F ^>nul 2^>nul
+    echo rem Clear kill-switch firewall rules BEFORE deleting the binary --
+    echo rem taskkill bypasses the client's own cleanup, and after the del
+    echo rem below nothing on the machine can remove the block-all rules.
+    echo "%%~dp0aivpn-client.exe" kill-switch clear ^>nul 2^>nul
     echo del /F /Q "%%ProgramData%%\Microsoft\Windows\Start Menu\Programs\AIVPN\AIVPN.lnk" ^>nul 2^>nul
     echo del /F /Q "%%ProgramData%%\Microsoft\Windows\Start Menu\Programs\AIVPN\Uninstall AIVPN.lnk" ^>nul 2^>nul
     echo rmdir /Q "%%ProgramData%%\Microsoft\Windows\Start Menu\Programs\AIVPN" ^>nul 2^>nul

@@ -8,16 +8,15 @@
 //! - Security edge cases (replay, wrong keys, corruption)
 
 use std::collections::HashSet;
-use std::net::SocketAddr;
 
 use aivpn_common::crypto::{
     self, compute_time_window, current_timestamp_ms, decrypt_payload, derive_session_keys,
     encrypt_payload, generate_resonance_tag, KeyPair, SessionKeys, CHACHA20_KEY_SIZE,
-    DEFAULT_WINDOW_MS, NONCE_SIZE, POLY1305_TAG_SIZE, TAG_SIZE, X25519_PUBLIC_KEY_SIZE,
+    DEFAULT_WINDOW_MS, NONCE_SIZE, TAG_SIZE,
 };
 use aivpn_common::mask::preset_masks::{all as all_preset_masks, webrtc_zoom_v3};
 use aivpn_common::mask::MaskProfile;
-use aivpn_common::protocol::{AivpnPacket, ControlPayload, ControlSubtype, InnerHeader, InnerType};
+use aivpn_common::protocol::{ControlPayload, ControlSubtype, InnerHeader, InnerType};
 use subtle::ConstantTimeEq;
 
 // ============================================================================
@@ -39,10 +38,10 @@ fn battle_key_exchange_100_pairs() {
 #[test]
 fn battle_key_exchange_deterministic_from_private() {
     // from_private_key must produce same public key and shared secret
-    let a = KeyPair::generate();
+    let _a = KeyPair::generate();
     let priv_bytes = {
         // Re-generate from same private — we'll use a known key
-        let mut key = [0x42u8; 32];
+        let key = [0x42u8; 32];
         key
     };
     let k1 = KeyPair::from_private_key(priv_bytes);
@@ -585,7 +584,7 @@ fn battle_full_key_exchange_pipeline() {
     assert!(bool::from(tag.ct_eq(&expected)));
 
     // 7. Verify encryption interop
-    let mut nonce = [0u8; NONCE_SIZE];
+    let nonce = [0u8; NONCE_SIZE];
     let ct = encrypt_payload(&client_keys.session_key, &nonce, b"test").unwrap();
     let pt = decrypt_payload(&server_keys.session_key, &nonce, &ct).unwrap();
     assert_eq!(pt, b"test");

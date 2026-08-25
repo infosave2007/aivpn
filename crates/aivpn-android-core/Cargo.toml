@@ -9,15 +9,25 @@ repository.workspace = true
 # Produces a C-compatible shared library (.so) loaded by System.loadLibrary("aivpn_core").
 [lib]
 name = "aivpn_core"
-crate-type = ["cdylib"]
+# cdylib — это .so, который грузит System.loadLibrary("aivpn_core").
+# rlib — чтобы внешняя сборка могла собрать собственный .so поверх этого,
+# добавив свои транспорты. На публичный .so не влияет: число экспортируемых
+# символов то же (проверяется в build-rust-android.sh).
+crate-type = ["cdylib", "rlib"]
 
 [features]
-default = []
+default = ["ssh-install"]
 # R2 Phase D — client-side inline ML-DPI self-gate (OFF by default).
 client-dpi-gate = ["aivpn-common/client-dpi-gate"]
+# C2b — pure-Rust SSH client + embedded installer bundle for the in-app
+# server installer (JNI bridge in `lib.rs`/`ssh_job_registry.rs`). ON by
+# default: cargo-ndk's `-- build -p aivpn-android-core` (see
+# platforms/android/build-rust-android.sh) passes no --features flag, so the
+# in-app installer must ship in the default .so build to be usable at all.
+ssh-install = ["aivpn-common/ssh-install"]
 
 [dependencies]
-aivpn-common = { path = "../aivpn-common", version = "*", features = ["client-upload"] }
+aivpn-common = { path = "../aivpn-common", version = "*", features = ["client-upload", "qr", "mobile-tunnel"] }
 
 jni       = "0.21"
 libc      = "0.2"
@@ -27,3 +37,9 @@ tokio     = { version = "1.35", features = ["rt", "net", "time", "io-util", "mac
 rand      = "0.8"
 log       = "0.4"
 android_logger = "0.14"
+# device-pubkey getter (devicePubkey JNI): same version pin as
+# aivpn-client's local_device_pubkey_b64.
+base64    = "0.22"
+# Transport-level verification of server-signed MaskUpdate control payloads
+# (mirrors aivpn-client/aivpn-common's use of the same crate/version).
+ed25519-dalek = "2.0"

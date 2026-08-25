@@ -10,16 +10,29 @@ name = "aivpn_core"
 crate-type = ["staticlib"]
 
 [features]
-default = []
+default = ["ssh-install"]
 # R2 Phase D — client-side inline ML-DPI self-gate (OFF by default).
 client-dpi-gate = ["aivpn-common/client-dpi-gate"]
+# Wave C2b-iOS — FFI bridge for the in-app SSH server installer (probe host
+# key / show script+sha256 / run install / poll progress). DEFAULT-on: the
+# `make ios` target (see repo Makefile's `ios:` rule) invokes
+# `cargo build -p aivpn-ios-core --target ...` with no `--features` flag, so
+# only a crate-default feature reaches the real iOS build — there is no
+# separate opt-in switch on the Xcode/xcodebuild side to flip it on.
+ssh-install = ["aivpn-common/ssh-install"]
 
 [dependencies]
-aivpn-common = { path = "../aivpn-common", features = ["client-upload"] }
+aivpn-common = { path = "../aivpn-common", features = ["client-upload", "qr", "mobile-tunnel"] }
 
 libc       = "0.2"
 portable-atomic = "1"
 tokio      = { version = "1.35", features = ["rt", "net", "time", "io-util", "macros", "sync"] }
 rand       = "0.8"
 log        = "0.4"
+# device-pubkey getter (aivpn_device_pubkey_from_privkey): same version pin
+# as aivpn-client's local_device_pubkey_b64.
+base64     = "0.22"
 serde_json.workspace = true
+# MaskUpdate transport-level signature verification (parity with desktop
+# client.rs / aivpn-android-core, which pin the same version).
+ed25519-dalek = "2.0"

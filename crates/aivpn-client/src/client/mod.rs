@@ -6,6 +6,16 @@
 //! - Key exchange and session management
 //! - Control plane handling
 
+mod config;
+mod control_handler;
+mod kernel_offload;
+mod reject;
+mod session;
+
+pub use config::{ClientConfig, ClientState};
+pub use reject::handshake_reject_message;
+use reject::handshake_reject_token;
+
 use bytes::Bytes;
 use portable_atomic::AtomicU64;
 use std::collections::VecDeque;
@@ -26,11 +36,13 @@ use aivpn_common::client_wire::{
 use aivpn_common::crypto::{self, KeyPair, SessionKeys, X25519_PUBLIC_KEY_SIZE};
 use aivpn_common::error::{Error, Result};
 use aivpn_common::mask::{current_unix_secs, BootstrapDescriptor, MaskProfile};
+use aivpn_common::mgmt::MgmtClient;
 use aivpn_common::network_config::ClientNetworkConfig;
 use aivpn_common::protocol::{
     ControlPayload, InnerType, MaskOutcome, MAX_PACKET_SIZE, UDP_RECV_BUF_SIZE,
 };
 use aivpn_common::quality::{AdaptiveLevel, QualityTracker};
+use aivpn_common::transport::DatagramTransport;
 use aivpn_common::upload_pipeline::{self, PacketEncryptor, UploadConfig};
 
 use crate::bootstrap_cache;
@@ -67,6 +79,22 @@ const KEEPALIVE_NAT_CAP: Duration = Duration::from_secs(25);
 /// (mobile doze, event-loop backpressure) or the server pushed an interval
 /// above the cap, since normal keepalives fire well under 20 s.
 const NAT_WARMUP_AFTER: Duration = Duration::from_secs(20);
+
+// ── Post-freeze/suspend liveness probe ──
+// System suspend (laptop lid close) or an outside freeze (SIGSTOP, cgroup
+// freezer) stops this process entirely; the first watchdog tick after wake
+// sees a gap far beyond the 5 s watchdog cadence. A session whose server-side
+// state died during the gap would otherwise linger dead for up to the
+// RX-silence net: keepalives resume unanswered, and the data watchdog needs
+// ≥TX_WITHOUT_RX_MIN_BYTES of uplink to condemn. After a gap this large,
+// demand ANY decodable RX within the probe window instead. Same
+// constants/semantics as android_tunnel.rs.
+const WAKE_GAP_THRESHOLD: Duration = Duration::from_secs(15);
+/// Probe window bounds: max(2×keepalive interval, MIN) capped at MAX — at
+/// least two keepalives (sent immediately after wake) must have a chance to
+/// be answered before the session is condemned.
+const WAKE_PROBE_WINDOW_MIN: Duration = Duration::from_secs(10);
+const WAKE_PROBE_WINDOW_MAX: Duration = Duration::from_secs(60);
 
 /// How long the client keeps the PREVIOUS session keys accepting inbound
 /// packets after an inline rekey. Must cover the server's KeyRotate
@@ -215,6 +243,20 @@ const KERNEL_TAG_REFRESH_STRIDE: u64 = 64;
 /// recovers it. 2048 × ~1.5 KB ≈ 3 MB worst case.
 const PROXY_RX_QUEUE_MAX: usize = 2048;
 
+/// B2/D2 fix: freshness window for the `NodeEnrollment` proof this client
+/// signs on behalf of the embedded pool-peer dialer. MUST match
+/// `aivpn-server`'s `node_registry::NODE_ENROLL_WINDOW_MS` (both 60_000,
+/// private to that module) — a mismatch would make every enrollment this
+/// node sends look stale (or not-yet-valid) to a peer's
+/// `NodeRegistry::authenticate`.
+const NODE_ENROLLMENT_WINDOW_MS: u64 = 60_000;
+
+/// B2/D2 fix: how often `spawn_node_enrollment_resend` re-signs and resends
+/// the `NodeEnrollment` proof over an established pool-peer dialer session.
+/// Well under `NODE_ENROLLMENT_WINDOW_MS`'s ~2-minute freshness bound, so a
+/// peer's registry is never left without a fresh-enough proof between ticks.
+const NODE_ENROLLMENT_RESEND_INTERVAL: Duration = Duration::from_secs(60);
+
 /// Current unix time in milliseconds.
 fn epoch_ms() -> u64 {
     std::time::SystemTime::now()
@@ -223,43 +265,41 @@ fn epoch_ms() -> u64 {
         .as_millis() as u64
 }
 
-/// Collapse a per-session mask id to its base protocol-family preset id for
-/// §2 crowdsourced feedback. `bootstrap:{desc}:{base}:{slot}:{seed}` and
-/// `polymorphic:{base}:{hex}` both carry per-session/PSK-derived entropy that
-/// would leak a quasi-identifier and fragment the server's k-anonymity buckets;
-/// only the stable `{base}` family is meaningful (and safe) to report.
-pub fn base_mask_family(mask_id: &str) -> String {
-    if let Some(rest) = mask_id.strip_prefix("bootstrap:") {
-        // desc:base:slot:seed → the base is the 2nd colon-delimited field.
-        rest.split(':').nth(1).unwrap_or(rest).to_string()
-    } else if let Some(rest) = mask_id.strip_prefix("polymorphic:") {
-        // base:hex → the base is the 1st field.
-        rest.split(':').next().unwrap_or(rest).to_string()
+/// Path A proactive carrier-change detection for the platforms that have NO
+/// native network-path monitor wired into this core: iOS (the NetworkExtension
+/// never forwards `defaultPath` changes into Rust), Windows and Linux (no
+/// NWPath equivalent). Android and macOS are deliberately excluded — they drive
+/// their own OS callbacks (`registerNetworkCallback` / `NWPathMonitor`) and
+/// adding a second trigger here would double-fire against already-tuned logic.
+///
+/// Returns the local source IP the kernel currently selects to reach `server`
+/// — i.e. the address of the PHYSICAL interface the tunnel's underlying UDP
+/// socket rides. A freshly `connect()`ed UDP socket only performs a route
+/// lookup and source-address selection; NO datagram leaves the host, so this is
+/// cheap and radio-silent (safe to call on a metered mobile link every few
+/// seconds). Because the kernel returns the source of the DEFAULT route to the
+/// server, a secondary interface that is not the default route never appears
+/// here: this cannot flap on standby-SIM / hotspot / dock-ethernet churn — the
+/// exact false-positive class fixed on Android (82aee70) and macOS (561daeb).
+#[cfg(any(target_os = "ios", target_os = "windows", target_os = "linux"))]
+fn probe_underlying_source_ip(server: SocketAddr) -> Option<std::net::IpAddr> {
+    let domain = if server.is_ipv4() {
+        socket2::Domain::IPV4
     } else {
-        mask_id.to_string()
-    }
+        socket2::Domain::IPV6
+    };
+    let sock =
+        socket2::Socket::new(domain, socket2::Type::DGRAM, Some(socket2::Protocol::UDP)).ok()?;
+    sock.connect(&server.into()).ok()?;
+    sock.local_addr().ok()?.as_socket().map(|a| a.ip())
 }
 
-/// Servers older than the directional-key split derive ONE session key and use
-/// it in BOTH directions; `session_key_s2c` did not exist yet, so their downlink
-/// is encrypted with `session_key`. A server that accepts our handshake in
-/// legacy compatibility mode speaks that same contract back to us, so collapse
-/// the split for such a session — every existing decode path then uses the right
-/// key with no other change.
-///
-/// Applied ONLY when the handshake fell back to the pre-Variant-A wire layout
-/// (`tag_offset == LEGACY_TAG_OFFSET`), i.e. only for a peer that cannot speak
-/// the modern protocol. Modern sessions keep strict directional separation.
-///
-/// Without this the client sends a legacy handshake, the server answers in
-/// legacy mode, and the client cannot decrypt its own ServerHello — the
-/// handshake times out and the app reconnects forever. Mirrors
-/// `apply_legacy_key_scheme` in the Android and iOS cores.
-fn apply_legacy_key_scheme(keys: &mut SessionKeys, legacy_wire: bool) {
-    if legacy_wire {
-        keys.session_key_s2c = keys.session_key;
-    }
-}
+/// Collapse a per-session mask id to its base protocol-family preset id for
+/// §2 crowdsourced feedback. See `aivpn_common::mask::base_mask_family` for
+/// the shared implementation (single source of truth for the desktop client
+/// and both mobile cores). Re-exported here so existing callers/tests that
+/// use `aivpn_client::client::base_mask_family` keep working unchanged.
+pub use aivpn_common::mask::base_mask_family;
 
 fn packet_mdh_len_for_mask(mask: &MaskProfile) -> usize {
     mask.header_spec
@@ -268,72 +308,40 @@ fn packet_mdh_len_for_mask(mask: &MaskProfile) -> usize {
         .unwrap_or_else(|| mask.header_template.len())
 }
 
-/// Client configuration
-#[derive(Debug, Clone)]
-pub struct ClientConfig {
-    pub server_addr: String,
-    pub server_public_key: [u8; X25519_PUBLIC_KEY_SIZE],
-    /// Ed25519 signing public key for verifying ServerHello signatures and mask updates.
-    /// When `Some`, the client rejects unsigned or incorrectly signed messages from
-    /// the server, preventing MITM attacks.
-    pub server_signing_key: Option<[u8; 32]>,
-    pub preshared_key: Option<[u8; 32]>,
-    pub initial_mask: MaskProfile,
-    pub tun_config: TunnelConfig,
-    /// When set, run as SOCKS5 proxy on this address instead of a TUN device.
-    pub proxy_listen: Option<std::net::SocketAddr>,
-    /// Optional 104-byte mTLS certificate sent to the server after session setup.
-    /// Required when the server is configured with `mtls.required = true`.
-    pub mtls_cert: Option<Vec<u8>>,
-    /// Initial adaptive mode level from `--adaptive-level`/GUI selection. The
-    /// quality tracker can still raise/lower this automatically afterward,
-    /// but the user's explicit choice is honored as the starting point
-    /// instead of always starting at `Off`.
-    pub initial_adaptive_level: AdaptiveLevel,
-    /// When set, request a polymorphic (per-session perturbed) variant of this
-    /// base mask id from the server right after the handshake completes. The
-    /// server responds with the usual `MaskUpdate` control message — no other
-    /// client-side handling is needed.
-    pub polymorphic_base: Option<String>,
-    /// §2 crowdsourced blocking feedback — opt-in, OFF by default. When true
-    /// (and `country_code` is set), the client batches mask success/fail
-    /// outcomes in-memory and reports them to the server once per connection
-    /// (see `maybe_send_mask_feedback`). No effect unless `country_code` is
-    /// also `Some`.
-    pub share_mask_feedback: bool,
-    /// §2 crowdsourced blocking feedback — opt-in, OFF by default. When true,
-    /// the client stores `RegionalMaskHints` pushed by the server (see
-    /// `regional_mask_hints()`) for future mask-selection use.
-    pub receive_mask_hints: bool,
-    /// ISO-3166-1 alpha-2 country code the client believes it is in. Required
-    /// for `share_mask_feedback` to have any effect — the server aggregates
-    /// feedback per region and never receives one without the other.
-    pub country_code: Option<[u8; 2]>,
-    /// R2 Phase B: operator Ed25519 mask-verifying public key. Verifies the
-    /// embedded `MaskProfile.signature` (artifact provenance: "this mask went
-    /// through the operator's gates") of masks received via `MaskUpdate`.
-    /// SEPARATE from `server_signing_key`, which authenticates the transport
-    /// (the msgpack bytes as pushed by *this* server) — the two are
-    /// defense-in-depth layers. Sourced from `--mask-operator-pubkey`, the
-    /// config file, or the `mop` field of the aivpn:// connection key.
-    pub mask_operator_pubkey: Option<[u8; 32]>,
-    /// R2 Phase B: artifact verification mode for received masks:
-    /// off | warn (default, log-and-accept) | enforce (reject). Derived
-    /// per-session variants (`polymorphic:*`/`bootstrap:*`) are exempt — they
-    /// are authenticated by the session channel and are not independently
-    /// signature-verifiable.
-    pub mask_verify_mode: aivpn_common::mask::MaskVerifyMode,
-}
-
-/// Client state
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ClientState {
-    Unprovisioned,
-    Provisioned,
-    Connecting,
-    Connected,
-    Reconnecting,
-    Disconnected,
+/// B2/D2 fix: build a fresh, SESSION-BOUND `ControlPayload::NodeEnrollment`
+/// proof. `time_window` is recomputed from the current wall-clock time on
+/// every call (using [`NODE_ENROLLMENT_WINDOW_MS`]), so both the initial send
+/// and every periodic resend carry a current window. `server_eph_pub`/
+/// `client_eph_pub` bind the proof to one specific masked pool-peer session's
+/// ephemeral transcript — see [`ClientConfig::node_identity`]'s doc comment
+/// for why that binding is what closes the cross-session-replay hole this
+/// fix addresses.
+fn build_node_enrollment_payload(
+    node_identity: &ed25519_dalek::SigningKey,
+    node_id: &str,
+    node_pub: &[u8; 32],
+    server_eph_pub: &[u8; 32],
+    client_eph_pub: &[u8; 32],
+) -> ControlPayload {
+    let time_window =
+        crypto::compute_time_window(crypto::current_timestamp_ms(), NODE_ENROLLMENT_WINDOW_MS);
+    let msg = crypto::node_enrollment_signing_bytes(
+        node_id,
+        node_pub,
+        time_window,
+        server_eph_pub,
+        client_eph_pub,
+    );
+    let signature = {
+        use ed25519_dalek::Signer;
+        node_identity.sign(&msg).to_bytes()
+    };
+    ControlPayload::NodeEnrollment {
+        node_id: node_id.to_string(),
+        node_pub: *node_pub,
+        time_window,
+        signature,
+    }
 }
 
 struct UploadCryptoState {
@@ -357,9 +365,31 @@ pub struct AivpnClient {
     config: ClientConfig,
     state: ClientState,
     tunnel: Tunnel,
-    udp_socket: Option<Arc<UdpSocket>>,
+    /// The session's datagram carrier. Today always a `UdpTransport` wrapping
+    /// the connected `UdpSocket` created in `connect()`; behind the trait so a
+    /// non-UDP transport can be swapped in without touching the protocol.
+    transport: Option<Arc<dyn DatagramTransport>>,
+    /// Transports this build can open, beyond the built-in direct UDP path.
+    ///
+    /// Empty unless something registered a factory (see
+    /// `set_transport_registry`), which is the whole extension mechanism: the
+    /// client never names a concrete alternative transport, it only resolves
+    /// whatever `config.transport` asks for against this registry.
+    transport_registry: Arc<aivpn_common::transport::TransportRegistry>,
+    /// Platform hook that keeps a transport's own sockets out of this tunnel.
+    /// Defaults to a no-op, which is correct for the direct UDP path — that
+    /// socket is exempted by routing, not by this guard.
+    socket_guard: aivpn_common::transport::SharedGuard,
     mimicry_engine: Option<MimicryEngine>,
     pub control_tx: Option<mpsc::Sender<ControlPayload>>,
+    /// Receiver half preset by `control_handle()`, consumed by `run()` in
+    /// place of the receiver it would otherwise create itself. Lets an
+    /// embedder (e.g. the server running this client as a pool-peer dialer
+    /// in `control_only` mode) obtain a `Sender<ControlPayload>` handle
+    /// BEFORE `run(&mut self, ..)` takes `&mut self` for the duration of the
+    /// session, so it can keep pushing payloads (pool DB-sync beacons/
+    /// snapshots) through the masked session while `run()` is executing.
+    preset_control_rx: Option<mpsc::Receiver<ControlPayload>>,
     pending_mask: Arc<Mutex<Option<aivpn_common::mask::MaskProfile>>>,
     session_keys: Option<SessionKeys>,
     upload_state: Option<Arc<Mutex<UploadCryptoState>>>,
@@ -368,6 +398,18 @@ pub struct AivpnClient {
     /// Hard ceiling on rekey-grace re-arms (see REKEY_TRANSITION_HARD_CAP).
     /// Armed once per inline rekey at the key switch; never extended.
     transition_grace_hard: Option<Instant>,
+    /// Post-rekey session keys staged for the UPLOAD path (M3). The KeyRotate
+    /// handler switches `session_keys` (RX) immediately but parks the same
+    /// keys here instead of overwriting the upload task's live keys, so TX
+    /// keeps riding the OLD keys — and keeps advancing the server's inbound
+    /// counter — until the server proves it committed our rekey response
+    /// (first downlink packet authenticating under the new keys) or the
+    /// transition window closes. Without this, a lost response left the
+    /// server's expected-tag band frozen around its last old-key counter
+    /// while the client raced ahead under the new keys (~170 pps vs the 3 s
+    /// retransmit cadence), so every re-sent response fell outside
+    /// ±TAG_WINDOW_SIZE and the tunnel only healed via a full reconnect.
+    pending_upload_keys: Option<SessionKeys>,
     /// DATA-plane liveness (see `data_watchdog_verdict`): stamped ONLY when an
     /// authenticated DATA payload is delivered to the TUN/proxy. Control
     /// traffic (keepalive-acks, KeyRotate retransmits) must not mask a dead
@@ -443,6 +485,15 @@ pub struct AivpnClient {
     // Traffic counters
     bytes_sent: Arc<AtomicU64>,
     bytes_received: Arc<AtomicU64>,
+    /// Client's currently-effective VPN IP (the `client_ip` half of the last
+    /// applied `ClientNetworkConfig`). Seeded from the static key's `i` field
+    /// at construction and updated live by `apply_server_network_override` on
+    /// every server-confirmed network change, including a pool re-home that
+    /// assigns a different IP than the key's. Shared with the stats-writer
+    /// task (below) so file-based GUIs (Windows, whose child stdout is piped
+    /// to `Stdio::null()`) can observe the re-home the same way Linux's
+    /// stdout `AIVPN-STATUS` line does.
+    current_vpn_ip: Arc<Mutex<String>>,
     // Pre-allocated buffers for zero-copy I/O (OPTIMIZATION)
     _send_buf: Vec<u8>,
     _recv_buf: Vec<u8>,
@@ -498,6 +549,17 @@ pub struct AivpnClient {
     /// task polls this to know when to stop resending (see the ServerHello
     /// handler's retry spawn).
     polymorphic_confirmed: Arc<AtomicBool>,
+    /// 3f: set true when the server sent an authenticated `HandshakeReject`
+    /// (subtype 0x20) — a terminal, PSK-proven refusal (one-time key already
+    /// used / client expired / client disabled). `main.rs`'s reconnect loop
+    /// checks this after `run()` returns and stops retrying instead of
+    /// backing off and reconnecting, since retrying against a definitive
+    /// refusal would only hammer the server forever.
+    terminal_rejected: bool,
+    /// Reason code from the `HandshakeReject` that set `terminal_rejected`
+    /// (see `handshake_reject_message` for the mapping). Meaningless while
+    /// `terminal_rejected` is false.
+    reject_reason: u8,
     /// Kernel-module accelerator (Linux only, auto-detected via /dev/aivpn).
     #[cfg(target_os = "linux")]
     kernel_accel: Option<Arc<KernelAccel>>,
@@ -534,17 +596,19 @@ pub struct AivpnClient {
     /// Interface on which the XDP early-filter was attached (Linux only).
     #[cfg(target_os = "linux")]
     xdp_iface: Option<String>,
+    /// P2.1/P2.R: in-tunnel mgmt client (`MgmtRequest`/`MgmtResponse`
+    /// correlation + cached server-assigned role). Hoisted into
+    /// `aivpn_common::mgmt::MgmtClient` so mobile FFI cores
+    /// (`aivpn-ios-core`, `aivpn-android-core`), which depend on
+    /// `aivpn-common` but not on this crate, share the identical
+    /// implementation instead of re-implementing it. Cheaply cloneable
+    /// (internally `Arc`-wrapped) so `mgmt_call`/`cached_role` can take
+    /// `&self` and still be called concurrently from multiple embedders
+    /// (FFI, admin-socket bridge).
+    mgmt: MgmtClient,
 }
 
 impl AivpnClient {
-    /// Whether this session negotiated the pre-Variant-A wire layout. The mask
-    /// resolver pins `tag_offset` to `LEGACY_TAG_OFFSET` once the handshake has
-    /// fallen back to it, and a server that accepts such a handshake answers in
-    /// legacy compatibility mode — single, non-directional session key.
-    fn legacy_wire(&self) -> bool {
-        self.config.initial_mask.tag_offset == aivpn_common::mask::LEGACY_TAG_OFFSET
-    }
-
     /// Create new client
     pub fn new(config: ClientConfig) -> Result<Self> {
         let keypair = KeyPair::generate();
@@ -552,6 +616,7 @@ impl AivpnClient {
         let recv_mdh_len = packet_mdh_len_for_mask(&config.initial_mask);
         let bytes_sent = Arc::new(AtomicU64::new(0));
         let bytes_received = Arc::new(AtomicU64::new(0));
+        let initial_vpn_ip = config.tun_config.tun_addr.clone();
 
         let static_keypair = load_or_generate_static_keypair();
         let initial_adaptive_level = config.initial_adaptive_level;
@@ -564,9 +629,12 @@ impl AivpnClient {
             config,
             state: ClientState::Provisioned,
             tunnel,
-            udp_socket: None,
+            transport: None,
+            transport_registry: Arc::new(aivpn_common::transport::TransportRegistry::new()),
+            socket_guard: aivpn_common::transport::no_socket_guard(),
             mimicry_engine: None,
             control_tx: None,
+            preset_control_rx: None,
             pending_mask: Arc::new(Mutex::new(None)),
             session_keys: None,
             #[cfg(target_os = "linux")]
@@ -591,6 +659,7 @@ impl AivpnClient {
             transition_recv_keys: None,
             transition_recv_deadline: None,
             transition_grace_hard: None,
+            pending_upload_keys: None,
             last_data_rx: Instant::now(),
             upload_at_last_data_rx: 0,
             data_stall_started: None,
@@ -609,6 +678,7 @@ impl AivpnClient {
             recv_mdh_candidates: vec![recv_mdh_len],
             bytes_sent: bytes_sent.clone(),
             bytes_received: bytes_received.clone(),
+            current_vpn_ip: Arc::new(Mutex::new(initial_vpn_ip)),
             // Pre-allocate buffers to MAX_PACKET_SIZE to avoid reallocations
             _send_buf: Vec::with_capacity(MAX_PACKET_SIZE),
             _recv_buf: Vec::with_capacity(MAX_PACKET_SIZE),
@@ -628,6 +698,9 @@ impl AivpnClient {
             regional_mask_hints: None,
             ever_connected: Arc::new(AtomicBool::new(false)),
             polymorphic_confirmed: Arc::new(AtomicBool::new(false)),
+            terminal_rejected: false,
+            reject_reason: 0,
+            mgmt: MgmtClient::new(),
         })
     }
 
@@ -656,7 +729,58 @@ impl AivpnClient {
         tokio::spawn(async move {
             for _ in 0..4u8 {
                 tokio::time::sleep(Duration::from_millis(100)).await;
-                let _ = tx.send(ControlPayload::Keepalive { send_ts: 0 }).await;
+                // Stamp the real send time: the server acks EVERY keepalive,
+                // and an ack with echo_ts=0 makes the RTT handler fall back to
+                // the last periodic keepalive's timestamp — each warmup ack
+                // then measured as 100..400 ms of fake RTT, poisoning the
+                // quality EWMA (and the server's adaptive hint) right at
+                // session start.
+                let _ = tx
+                    .send(ControlPayload::Keepalive {
+                        send_ts: epoch_ms(),
+                    })
+                    .await;
+            }
+        });
+    }
+
+    /// B2/D2 fix: periodic `NodeEnrollment` resend for the embedded
+    /// `control_only` pool-peer dialer (see `ClientConfig::node_identity`'s
+    /// doc comment). Spawned once per real ratchet from the `ServerHello`
+    /// handler, after the initial send. Rebuilds the proof with a fresh
+    /// `time_window` on every tick but the SAME `server_eph_pub`/
+    /// `client_eph_pub` — both fixed for the life of this session — so a
+    /// peer whose `NodeRegistry` restarted (or that missed our initial
+    /// enrollment) re-learns/re-verifies us without waiting for a fresh
+    /// dial. Exits as soon as `tx.send` fails (the session ended — the
+    /// caller's `AivpnClient`/task is gone, no separate shutdown signal
+    /// needed).
+    fn spawn_node_enrollment_resend(
+        tx: mpsc::Sender<ControlPayload>,
+        node_identity: ed25519_dalek::SigningKey,
+        node_id: String,
+        node_pub: [u8; 32],
+        server_eph_pub: [u8; 32],
+        client_eph_pub: [u8; 32],
+    ) {
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(NODE_ENROLLMENT_RESEND_INTERVAL);
+            // The first tick fires immediately; skip it here since the
+            // caller already sent one right before spawning this task.
+            interval.tick().await;
+            loop {
+                interval.tick().await;
+                let enrollment = build_node_enrollment_payload(
+                    &node_identity,
+                    &node_id,
+                    &node_pub,
+                    &server_eph_pub,
+                    &client_eph_pub,
+                );
+                if tx.send(enrollment).await.is_err() {
+                    // Session gone — nothing left to resend to.
+                    break;
+                }
             }
         });
     }
@@ -666,8 +790,9 @@ impl AivpnClient {
         info!("Connecting to AIVPN server...");
         self.state = ClientState::Connecting;
 
-        // Create TUN device first (skipped in proxy mode)
-        if self.config.proxy_listen.is_none() {
+        // Create TUN device first (skipped in proxy mode and in headless
+        // control-only mode, where there is no OS network stack to route).
+        if self.config.proxy_listen.is_none() && !self.config.control_only {
             self.tunnel.create().await?;
         }
 
@@ -696,6 +821,45 @@ impl AivpnClient {
             ))
         })?;
 
+        // A configured transport replaces the direct UDP socket entirely. The
+        // protocol above this point is unchanged either way — it only ever sees
+        // `DatagramTransport`.
+        if let Some(cfg) = self.config.transport.clone() {
+            let transport = self
+                .transport_registry
+                .open(&cfg, self.socket_guard.clone())
+                .await?;
+            info!(
+                "Session datagrams carried by transport '{}' (max datagram {} B)",
+                cfg.name(),
+                transport.max_datagram()
+            );
+            self.transport = Some(transport);
+            return self.finish_connect(server_addr).await;
+        }
+
+        self.open_udp_socket(server_addr).await?;
+        self.finish_connect(server_addr).await
+    }
+
+    /// Install the set of transports this build can open, and the platform hook
+    /// that keeps their sockets out of this tunnel.
+    ///
+    /// Called from `main` with whatever that binary registered. The client does
+    /// not construct registries itself and never names a transport: everything
+    /// it knows comes through the registry and `config.transport`.
+    pub fn set_transport_registry(
+        &mut self,
+        registry: Arc<aivpn_common::transport::TransportRegistry>,
+        guard: aivpn_common::transport::SharedGuard,
+    ) {
+        self.transport_registry = registry;
+        self.socket_guard = guard;
+    }
+
+    /// Create the connected UDP socket this client has always used, and install
+    /// it as the session transport.
+    async fn open_udp_socket(&mut self, server_addr: SocketAddr) -> Result<()> {
         // Create UDP socket with 4MB OS buffers (OPTIMIZATION)
         let domain = if server_addr.is_ipv4() {
             socket2::Domain::IPV4
@@ -750,8 +914,17 @@ impl AivpnClient {
         let std_sock: std::net::UdpSocket = socket2_sock.into();
         let socket = UdpSocket::from_std(std_sock).map_err(Error::Io)?;
 
-        self.udp_socket = Some(Arc::new(socket));
+        self.transport = Some(aivpn_common::transport::udp_transport(Arc::new(socket)));
+        Ok(())
+    }
 
+    /// Everything `connect()` does once a transport exists, regardless of which
+    /// transport it is.
+    ///
+    /// `server_addr` stays a parameter even when the datagrams never travel to
+    /// it directly: the tunnel still needs the server's address for its own
+    /// routing (the host route and the kill-switch exemption are keyed on it).
+    async fn finish_connect(&mut self, server_addr: SocketAddr) -> Result<()> {
         // Auto-detect kernel acceleration (Linux only).
         #[cfg(target_os = "linux")]
         {
@@ -786,7 +959,8 @@ impl AivpnClient {
             let kernel_rx_enabled = std::env::var("AIVPN_CLIENT_KERNEL_RX")
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 .unwrap_or(false);
-            if self.config.proxy_listen.is_some() || !kernel_rx_enabled {
+            if self.config.proxy_listen.is_some() || self.config.control_only || !kernel_rx_enabled
+            {
                 // Proxy mode (no TUN to inject into) or not opted in: user-space
                 // data path exactly as before.
                 self.kernel_accel = None;
@@ -814,7 +988,7 @@ impl AivpnClient {
             debug_assert!(self.xdp_iface.is_none());
         }
 
-        if self.config.proxy_listen.is_none() {
+        if self.config.proxy_listen.is_none() && !self.config.control_only {
             self.tunnel.set_server_ip(server_addr.ip().to_string());
             // Enable full tunnel only after the server UDP path is established.
             if self.config.tun_config.full_tunnel {
@@ -846,15 +1020,11 @@ impl AivpnClient {
                 "absent"
             }
         );
-        self.session_keys = Some({
-            let mut k = crypto::derive_session_keys(
-                &dh_result,
-                self.config.preshared_key.as_ref(),
-                &self.keypair.public_key_bytes(),
-            );
-            apply_legacy_key_scheme(&mut k, self.legacy_wire());
-            k
-        });
+        self.session_keys = Some(crypto::derive_session_keys(
+            &dh_result,
+            self.config.preshared_key.as_ref(),
+            &self.keypair.public_key_bytes(),
+        ));
         // Fresh zero-RTT keys mean any prior PFS ratchet no longer applies —
         // the next ServerHello (for this new connection) must be allowed to
         // ratchet again.
@@ -891,6 +1061,29 @@ impl AivpnClient {
         self.ever_connected.load(Ordering::Relaxed)
     }
 
+    /// 3f: true when the server sent an authenticated `HandshakeReject`
+    /// during this run. `main.rs`'s reconnect loop checks this after
+    /// `run()` returns and, when true, stops the reconnect loop instead of
+    /// backing off and retrying — see `handshake_reject_message` for the
+    /// human-readable reason (via `reject_reason()`).
+    pub fn terminal_rejected(&self) -> bool {
+        self.terminal_rejected
+    }
+
+    /// Reason code the server sent with the terminal `HandshakeReject` (only
+    /// meaningful when `terminal_rejected()` is true). See
+    /// `handshake_reject_message` for the mapping.
+    pub fn reject_reason(&self) -> u8 {
+        self.reject_reason
+    }
+
+    /// Latest observed round-trip time in milliseconds (0 if never measured).
+    /// Consulted by `main.rs`'s reconnect loop to feed `ServerPool::update_rtt`
+    /// for `PoolMode::LatencyBased` selection.
+    pub fn last_rtt_ms(&self) -> u16 {
+        self.quality_tracker.rtt_ms()
+    }
+
     async fn apply_server_network_override(
         &mut self,
         network_config: ClientNetworkConfig,
@@ -915,216 +1108,29 @@ impl AivpnClient {
                 .apply_network_config(network_config.clone())
                 .await?;
         }
+        // Ipv4Addr is Copy — capture before `network_config` moves into
+        // `from_network_config` below.
+        let new_client_ip = network_config.client_ip;
         self.config.tun_config =
             TunnelConfig::from_network_config(tun_name, network_config, full_tunnel);
+
+        // HIGH #2 (client parity): this override just applied a genuinely
+        // different network config — either the first server confirmation of
+        // this session, or a pool re-home to a different server-assigned VPN
+        // IP than the one derived from the static key. Publish the new IP on
+        // both channels the GUIs consume: the shared value read by the
+        // stats-writer task's traffic.stats `ip:` field (Windows pipes the
+        // child's stdout to Stdio::null(), so it can only observe this via
+        // the stats file), and the "AIVPN-STATUS connected <ip>" stdout line
+        // the Linux GUI already parses (previously never emitted — it only
+        // had an unreachable doc comment describing this exact protocol).
+        *self
+            .current_vpn_ip
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = new_client_ip.to_string();
+        println!("AIVPN-STATUS connected {}", new_client_ip);
+
         Ok(())
-    }
-
-    /// K6: install (or re-install after a rekey/mask change) the client's
-    /// in-kernel DOWNLINK session so aivpn.ko decrypts server→client Data
-    /// packets and injects them straight into the TUN device.
-    ///
-    /// Key/layout choices (mirroring `decode_downlink_any_mdh_len`, the
-    /// user-space downlink decoder this offloads):
-    /// * kernel decrypt key (`session_key` field) = the session's **s2c** key
-    ///   — the client's incoming downlink is encrypted with it;
-    /// * `tag_offset = u16::MAX` — server→client downlink always uses the
-    ///   legacy tag-prefix framing `tag(8) || mdh || ciphertext` (the embedded
-    ///   Variant A layout is uplink-only);
-    /// * `mdh_len` = the current primary downlink MDH length
-    ///   (`recv_mdh_len`). Packets framed with a different mask length fail
-    ///   AEAD auth in the kernel (-EBADMSG) and fall back to user-space, whose
-    ///   multi-length decoder handles them — correctness never depends on this
-    ///   value, only the kernel-offload hit rate does.
-    ///
-    /// Ordering matters: TUN first (inject target), then the session + tags,
-    /// then — exactly once per socket — the UDP hook, so no packet is ever
-    /// intercepted before the kernel can actually consume it (a hook with no
-    /// session was the 13984c5 starvation regression).
-    ///
-    /// `session_add` is idempotent by `session_id` (the kernel evicts a
-    /// same-id entry first) and `kernel_session_id` is constant for this
-    /// client instance, so a rekey re-install atomically replaces the old-key
-    /// session instead of leaking it.
-    ///
-    /// All failures are soft: the user-space path keeps working, at worst the
-    /// kernel simply never accelerates.
-    #[cfg(target_os = "linux")]
-    fn kernel_install_session(&mut self) {
-        use std::os::unix::io::AsRawFd;
-        let Some(ka) = self.kernel_accel.clone() else {
-            return;
-        };
-        // Re-checked full-tunnel gate (belt and braces — connect() already
-        // leaves `kernel_accel = None` in proxy mode).
-        if self.config.proxy_listen.is_some() {
-            return;
-        }
-        let Some(keys) = self.session_keys.as_ref() else {
-            return;
-        };
-        let (session_key_s2c, tag_secret) = (keys.session_key_s2c, keys.tag_secret);
-        let Some(udp) = self.udp_socket.clone() else {
-            return;
-        };
-
-        // 1. Point the module at our TUN device (once). A TUN that cannot be
-        //    resolved means the kernel path is unusable — drop the handle so
-        //    the hook is never installed.
-        if !self.kernel_tun_set {
-            let tun_name = self.tunnel.name();
-            let ifindex = std::ffi::CString::new(tun_name)
-                .map(|c| unsafe { libc::if_nametoindex(c.as_ptr()) })
-                .unwrap_or(0);
-            if ifindex == 0 {
-                warn!(
-                    "kernel accel: cannot resolve TUN ifindex for {tun_name} — \
-                     staying on the user-space path"
-                );
-                self.kernel_accel = None;
-                return;
-            }
-            if let Err(e) = ka.set_tun(ifindex) {
-                warn!("kernel accel: set_tun failed: {e} — staying on the user-space path");
-                self.kernel_accel = None;
-                return;
-            }
-            self.kernel_tun_set = true;
-            info!("kernel accel: TUN {tun_name} (ifindex={ifindex}) registered");
-        }
-
-        // 2. Install the downlink-decrypt session.
-        let mdh_len = self.recv_mdh_len;
-        // Peer address / own VPN IP: not used by the RX+inject path (they feed
-        // the egress fast path, which the client never arms via SET_EGRESS) —
-        // filled in sanely anyway.
-        let mut client_addr_bytes = [0u8; 28];
-        if let Ok(peer) = udp.peer_addr() {
-            match peer {
-                SocketAddr::V4(v4) => {
-                    client_addr_bytes[0..2].copy_from_slice(&(libc::AF_INET as u16).to_ne_bytes());
-                    client_addr_bytes[2..4].copy_from_slice(&v4.port().to_be_bytes());
-                    client_addr_bytes[4..8].copy_from_slice(&v4.ip().octets());
-                }
-                SocketAddr::V6(v6) => {
-                    client_addr_bytes[0..2].copy_from_slice(&(libc::AF_INET6 as u16).to_ne_bytes());
-                    client_addr_bytes[2..4].copy_from_slice(&v6.port().to_be_bytes());
-                    client_addr_bytes[8..24].copy_from_slice(&v6.ip().octets());
-                }
-            }
-        }
-        let client_ip = self
-            .config
-            .tun_config
-            .tun_addr
-            .parse::<std::net::Ipv4Addr>()
-            .map(u32::from)
-            .unwrap_or(0);
-        let add = SessionAdd {
-            session_id: self.kernel_session_id,
-            // The kernel's RX path decrypts with `session_key`; for the
-            // client's downlink that MUST be the s2c key.
-            session_key: session_key_s2c,
-            // Egress-encrypt key — never used (client never calls SET_EGRESS);
-            // keep it the true s2c key so the field's meaning stays honest.
-            session_key_s2c,
-            tag_secret,
-            // The AIVPN nonce is counter_LE(8) || zeros(4) in both directions —
-            // no per-session suffix (see the server's identical comment).
-            nonce_suffix: [0u8; 4],
-            tag_offset: u16::MAX, // downlink is always legacy tag-prefix framing
-            mdh_len: mdh_len as u16,
-            _reserved: [0u8; 24],
-            // Only seeds the egress tx_counter (unused on the client); the RX
-            // anti-replay window starts at zero regardless.
-            counter_base: self.recv_window.highest().map(|h| h + 1).unwrap_or(0),
-            client_ip,
-            client_addr: client_addr_bytes,
-            window_ms: crypto::DEFAULT_WINDOW_MS,
-        };
-        if let Err(e) = ka.session_add(&add) {
-            warn!("kernel accel: session_add failed: {e} — staying on the user-space path");
-            return;
-        }
-        self.kernel_installed = true;
-        self.kernel_installed_mdh_len = mdh_len;
-
-        // 3. Push the expected downlink tag window before any packet can hit
-        //    the hook.
-        self.kernel_push_tags(true);
-
-        // 4. Hook the UDP socket — exactly once per socket (the kernel install
-        //    is not idempotent; see `kernel_hooked`). From here on, in-window
-        //    downlink Data is consumed in softirq; everything else falls back
-        //    to this loop via the hook's re-queue + original data_ready wake.
-        if !self.kernel_hooked {
-            if let Err(e) = ka.set_udp_sock(udp.as_raw_fd()) {
-                warn!("kernel accel: set_udp_sock failed: {e} — kernel session installed but idle");
-                return;
-            }
-            self.kernel_hooked = true;
-        }
-        info!(
-            "kernel accel: downlink session installed (mdh_len={mdh_len}, legacy framing) — \
-             server→client Data now decrypted in-kernel"
-        );
-    }
-
-    /// K6: (re)compute and push the client's expected downlink resonance-tag
-    /// window `[base, base + 256)` to the kernel, where `base` is one past the
-    /// highest downlink counter user-space has validated. Exactly the tag
-    /// derivation the server uses to CREATE downlink tags
-    /// (`generate_resonance_tag(tag_secret, counter, time_window)`), so the
-    /// kernel's byte-exact tag lookup matches the wire.
-    ///
-    /// Unless `force`d (fresh install/rekey), the push is skipped while the
-    /// 10 s resonance time window is unchanged AND the observed counter has
-    /// advanced less than `KERNEL_TAG_REFRESH_STRIDE` — callers can therefore
-    /// invoke this opportunistically (per fallback packet + 5 s watchdog tick)
-    /// at negligible cost.
-    ///
-    /// Known coverage limitation (same class as the server's K7 note): only
-    /// fallback packets advance user-space's view of the downlink counter, so
-    /// under sustained downlink the kernel window is consumed and traffic
-    /// falls back to user-space until the next refresh re-bases it. That is a
-    /// throughput ceiling, never a correctness issue.
-    #[cfg(target_os = "linux")]
-    fn kernel_push_tags(&mut self, force: bool) {
-        if !self.kernel_installed {
-            return;
-        }
-        let Some(ka) = self.kernel_accel.clone() else {
-            return;
-        };
-        let Some(keys) = self.session_keys.as_ref() else {
-            return;
-        };
-        let tag_secret = keys.tag_secret;
-        let base = self.recv_window.highest().map(|h| h + 1).unwrap_or(0);
-        let tw =
-            crypto::compute_time_window(crypto::current_timestamp_ms(), crypto::DEFAULT_WINDOW_MS);
-        if !force
-            && tw == self.kernel_tags_tw
-            && base.saturating_sub(self.kernel_tags_base) < KERNEL_TAG_REFRESH_STRIDE
-        {
-            return;
-        }
-        // Safety: UpdateTagsPayload is a plain C struct of integers and byte
-        // arrays; zeroed is valid for all fields.
-        let mut payload: UpdateTagsPayload = unsafe { std::mem::zeroed() };
-        payload.session_id = self.kernel_session_id;
-        for i in 0..KERNEL_TAG_WINDOW as u64 {
-            let counter = base + i;
-            let tag = crypto::generate_resonance_tag(&tag_secret, counter, tw);
-            payload.entries[i as usize] = TagWindowEntry { tag, counter };
-        }
-        payload.count = KERNEL_TAG_WINDOW as u32;
-        if let Err(e) = ka.session_update_tags(&payload) {
-            warn!("kernel accel: session_update_tags failed: {e}");
-            return;
-        }
-        self.kernel_tags_base = base;
-        self.kernel_tags_tw = tw;
     }
 
     /// Disconnect from server
@@ -1158,7 +1164,7 @@ impl AivpnClient {
             self.kernel_tun_set = false;
         }
 
-        self.udp_socket = None;
+        self.transport = None;
 
         // Detach XDP filter (Linux only, best-effort)
         #[cfg(target_os = "linux")]
@@ -1172,1596 +1178,45 @@ impl AivpnClient {
         self.transition_recv_keys = None;
         self.transition_recv_deadline = None;
         self.transition_grace_hard = None;
+        self.pending_upload_keys = None;
     }
 
-    /// Run the client main loop
-    pub async fn run(&mut self, shutdown: Arc<AtomicBool>) -> Result<()> {
-        self.connect().await?;
-
-        // Send initial handshake packet with eph_pub to establish session
-        self.send_init().await?;
-
-        info!("Starting client main loop");
-        info!("Routing traffic through AIVPN tunnel...");
-
-        // Create channels for TUN -> upload pipeline and UDP -> main loop
-        let (tun_to_udp_tx, tun_to_udp_rx) = mpsc::channel::<Vec<u8>>(512);
-        let (udp_to_tun_tx, mut udp_to_tun_rx) = mpsc::channel::<Bytes>(512);
-        let (admin_tx, mut admin_rx) = mpsc::channel::<String>(16);
-        let (control_tx, control_rx) = mpsc::channel::<ControlPayload>(32);
-        self.control_tx = Some(control_tx.clone());
-
-        // mTLS ClientCert is sent inside the ServerHello handler, after the PFS
-        // ratchet completes, so it is protected by the ratcheted session keys.
-
-        // Spawn local IPC listener for CLI commands. Stored in AbortOnDrop so the task
-        // (and its bound UDP socket) is cancelled when run() returns. Without this,
-        // the orphaned task keeps 127.0.0.1:44301 bound across reconnect iterations,
-        // causing the next run() call to fail with "Address already in use".
-        let admin_token = crate::record_cmd::ensure_admin_token();
-        let _admin_task = AbortOnDrop(tokio::spawn(async move {
-            match tokio::net::UdpSocket::bind("127.0.0.1:44301").await {
-                Ok(socket) => {
-                    let mut buf = [0u8; 1024];
-                    loop {
-                        if let Ok((len, _addr)) = socket.recv_from(&mut buf).await {
-                            if let Ok(raw) = std::str::from_utf8(&buf[..len]) {
-                                match raw.split_once(':').and_then(|(tok, rest)| {
-                                    crate::record_cmd::tokens_match(tok, &admin_token)
-                                        .then(|| rest.to_string())
-                                }) {
-                                    Some(cmd) => {
-                                        let _ = admin_tx.send(cmd).await;
-                                    }
-                                    None => {
-                                        warn!(
-                                            "Rejected admin command: missing or invalid auth token"
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    error!(
-                        "Failed to bind local admin UDP socket 127.0.0.1:44301: {}",
-                        e
-                    );
-                }
-            }
-        }));
-
-        // Proxy mode: start smoltcp + SOCKS5 instead of creating a TUN device
-        if let Some(listen_addr) = self.config.proxy_listen {
-            let vpn_ip = self
-                .config
-                .tun_config
-                .tun_addr
-                .parse::<std::net::Ipv4Addr>()
-                .map_err(|e| Error::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, e)))?;
-            let gateway_ip = self
-                .config
-                .tun_config
-                .server_vpn_ip
-                .parse::<std::net::Ipv4Addr>()
-                .map_err(|e| Error::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, e)))?;
-            let proxy_cfg = crate::proxy::ProxyConfig {
-                listen_addr,
-                vpn_ip,
-                gateway_ip,
-                prefix_len: self.config.tun_config.prefix_len,
-            };
-            let handle = crate::proxy::spawn_proxy(proxy_cfg, tun_to_udp_tx.clone())
-                .await
-                .map_err(Error::Io)?;
-            self.proxy_handle = Some(handle);
-        }
-
-        // Take the TUN reader for the spawned task (skipped in proxy mode)
-        let tun_task = if self.config.proxy_listen.is_none() {
-            let mut tun_reader = self
-                .tunnel
-                .take_reader()
-                .ok_or(Error::Session("TUN reader not available".into()))?;
-            let tun_to_udp_tx_clone = tun_to_udp_tx.clone();
-            let shutdown_for_tasks = shutdown.clone();
-            tokio::spawn(async move {
-                let mut buf = vec![0u8; UDP_RECV_BUF_SIZE];
-                loop {
-                    if shutdown_for_tasks.load(Ordering::SeqCst) {
-                        break;
-                    }
-
-                    match tun_reader.read(&mut buf).await {
-                        Ok(n) => {
-                            if n > 0 {
-                                debug!("TUN read {} bytes", n);
-
-                                #[cfg(target_os = "macos")]
-                                let payload: Vec<u8> = if n > 4 && buf[0] == 0 && buf[1] == 0 {
-                                    buf[4..n].to_vec()
-                                } else {
-                                    buf[..n].to_vec()
-                                };
-
-                                #[cfg(not(target_os = "macos"))]
-                                let payload: Vec<u8> = buf[..n].to_vec();
-
-                                let _ = tun_to_udp_tx_clone.send(payload).await;
-                            }
-                        }
-                        Err(e) => {
-                            error!("TUN read error: {}", e);
-                            tokio::time::sleep(Duration::from_millis(10)).await;
-                        }
-                    }
-                }
-            })
+    /// Obtain an outbound control-channel handle, usable to push
+    /// `ControlPayload`s (e.g. `PoolStateDigest`, `PoolSync`) through this
+    /// client's masked session while `run(&mut self, ..)` is executing.
+    ///
+    /// MUST be called BEFORE `run()`: once `run()` starts it holds `&mut
+    /// self` for the life of the session, so an embedder (the aivpn server,
+    /// running this client as a pool-peer dialer in `control_only` mode)
+    /// cannot otherwise reach `control_tx` concurrently. Calling this first
+    /// presets the receiver `run()` will pick up, and shares the same sender
+    /// clone the client's own internal `send_control` uses — so embedder
+    /// sends and the client's own control traffic are interleaved onto one
+    /// upload task via one channel.
+    ///
+    /// Calling this more than once returns clones of the same sender; it
+    /// does not create additional channels.
+    pub fn control_handle(&mut self) -> mpsc::Sender<ControlPayload> {
+        if self.preset_control_rx.is_none() {
+            // BUG C2 mitigation: this channel also carries the masked exit's
+            // per-packet data plane (the server multiplexes every forwarded
+            // client IP packet onto it as `ControlPayload::ChainForward` via
+            // `pool_dialer.rs`'s `send_to_peer` -> `try_send`), not just the
+            // low-rate pool-sync control beacons a plain client sends. A
+            // capacity of 32 overflows under load and `try_send` silently
+            // drops data packets. 1024 is a cheap, low-risk bump to absorb
+            // bursts; an operator-chosen mimicry-vs-throughput tradeoff. The
+            // fuller fix would be a dedicated data channel separate from
+            // control traffic.
+            let (tx, rx) = mpsc::channel::<ControlPayload>(1024);
+            self.preset_control_rx = Some(rx);
+            self.control_tx = Some(tx.clone());
+            tx
         } else {
-            tokio::spawn(std::future::pending::<()>())
-        };
-
-        // Spawn UDP reader task
-        let udp_socket = self
-            .udp_socket
-            .as_ref()
-            .ok_or(Error::Session(
-                "UDP socket not initialized before run()".into(),
-            ))?
-            .clone();
-        let udp_to_tun_tx_clone = udp_to_tun_tx.clone();
-        let shutdown_for_tasks = shutdown.clone();
-        let udp_task = tokio::spawn(async move {
-            let mut buf = vec![0u8; UDP_RECV_BUF_SIZE];
-            let mut consecutive_errors: u32 = 0;
-
-            loop {
-                if shutdown_for_tasks.load(Ordering::SeqCst) {
-                    break;
-                }
-
-                match udp_socket.recv(&mut buf).await {
-                    Ok(n) => {
-                        consecutive_errors = 0;
-                        if n > 0 {
-                            let _ = udp_to_tun_tx_clone
-                                .send(Bytes::copy_from_slice(&buf[..n]))
-                                .await;
-                        }
-                    }
-                    Err(e) => {
-                        consecutive_errors += 1;
-                        error!("UDP recv error: {}", e);
-                        if consecutive_errors >= 20 {
-                            // Socket is likely dead; let the main loop handle reconnect.
-                            break;
-                        }
-                        tokio::time::sleep(Duration::from_millis(10)).await;
-                    }
-                }
-            }
-        });
-
-        // Spawn stats writer task
-        let stats_shutdown = shutdown.clone();
-        let stats_bytes_sent = self.bytes_sent.clone();
-        let stats_bytes_received = self.bytes_received.clone();
-        let stats_task = tokio::spawn(async move {
-            // Determine platform-appropriate stats paths
-            #[cfg(target_os = "windows")]
-            let stats_paths: Vec<std::path::PathBuf> = {
-                let mut paths = Vec::new();
-                if let Some(local_app) = std::env::var_os("LOCALAPPDATA") {
-                    let dir = std::path::PathBuf::from(local_app).join("AIVPN");
-                    let _ = tokio::fs::create_dir_all(&dir).await;
-                    paths.push(dir.join("traffic.stats"));
-                }
-                let tmp = std::env::temp_dir().join("aivpn-traffic.stats");
-                paths.push(tmp);
-                paths
-            };
-            #[cfg(not(target_os = "windows"))]
-            let stats_paths: Vec<std::path::PathBuf> = vec![
-                std::path::PathBuf::from("/var/run/aivpn/traffic.stats"),
-                std::path::PathBuf::from("/tmp/aivpn-traffic.stats"),
-            ];
-
-            // Write initial stats
-            for path in &stats_paths {
-                let _ = tokio::fs::write(path, "sent:0,received:0").await;
-            }
-            info!("Initial stats written");
-
-            let mut interval = tokio::time::interval(Duration::from_secs(1));
-            loop {
-                interval.tick().await;
-                if stats_shutdown.load(Ordering::SeqCst) {
-                    break;
-                }
-                let sent = stats_bytes_sent.load(Ordering::Relaxed);
-                let received = stats_bytes_received.load(Ordering::Relaxed);
-                let stats = format!("sent:{},received:{}", sent, received);
-                for path in &stats_paths {
-                    let _ = tokio::fs::write(path, &stats).await;
-                }
-            }
-        });
-
-        // ── Spawn upload task using the shared pipeline ──
-        let upload_udp = self
-            .udp_socket
-            .as_ref()
-            .ok_or(Error::Session(
-                "UDP socket not initialized before upload task".into(),
-            ))?
-            .clone();
-        let upload_keys = self
-            .session_keys
-            .clone()
-            .ok_or(Error::Session("No session keys".into()))?;
-        let upload_engine = self
-            .mimicry_engine
-            .take()
-            .ok_or(Error::Session("No mimicry engine".into()))?;
-        let upload_seq = self.send_seq as u16;
-        let upload_counter = self.counter;
-        let upload_bytes_sent = self.bytes_sent.clone();
-        let upload_state = Arc::new(Mutex::new(UploadCryptoState {
-            keys: upload_keys,
-            counter: upload_counter,
-            seq: upload_seq,
-            rekey_ack: VecDeque::new(),
-        }));
-        self.upload_state = Some(upload_state.clone());
-
-        let upload_pending_mask = self.pending_mask.clone();
-
-        let mut upload_task = tokio::spawn(Self::spawn_upload(
-            tun_to_udp_rx,
-            control_rx,
-            upload_udp,
-            upload_engine,
-            upload_state,
-            upload_bytes_sent,
-            upload_pending_mask,
-            self.keepalive_interval,
-            self.keepalive_sent_ms.clone(),
-            self.adaptive_level.fec_n(),
-            self.keepalive_interval_ms.clone(),
-            self.last_tx_ms.clone(),
-        ));
-
-        // Main loop: download + shutdown + upload health
-        let mut shutdown_tick = tokio::time::interval(Duration::from_secs(1));
-        shutdown_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
-        // RX silence watchdog: detect silent path failure (NAT rebind, carrier drop).
-        // The UDP socket stays open and recv() blocks indefinitely when the path dies,
-        // so we track the last received packet and reconnect on silence. The tick is
-        // 5 s because the asymmetric threshold below can be as low as 12 s (A4).
-        let mut rx_watchdog = tokio::time::interval(Duration::from_secs(5));
-        rx_watchdog.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        let mut last_rx = std::time::Instant::now();
-        // Reset the DATA-plane liveness markers for THIS connection: they are
-        // struct fields (stamped inside process_decoded) and would otherwise
-        // carry a stale stall over from a previous session.
-        self.last_data_rx = Instant::now();
-        self.upload_at_last_data_rx = self.bytes_sent.load(Ordering::Relaxed);
-        self.data_stall_started = None;
-        self.data_stall_strikes = 0;
-        self.data_plane_proven = false;
-        // First-contact anchor: a rejected/unmatched handshake (e.g. the client's
-        // cached bootstrap descriptor doesn't match the server's) gets NO server
-        // packets at all, so `last_rx` never moves off this instant. Detect that
-        // in ~10 s (matching the mobile cores' HANDSHAKE_TIMEOUT) instead of
-        // waiting the full 24–45 s RX-silence threshold, so main.rs's reconnect
-        // loop reaches the bootstrap_default fallback in ~30 s, not ~72 s.
-        let connect_instant = last_rx;
-        // A4: seed last_tx at loop start so a fresh connection isn't instantly
-        // treated as "TX stalled" before the first keepalive goes out.
-        self.last_tx_ms.store(epoch_ms(), Ordering::Relaxed);
-        // A4: rate-limit for the proactive warmup burst below.
-        let mut last_warmup = std::time::Instant::now();
-        // Set when the `join_res` select branch consumes upload_task's output,
-        // so the teardown below knows it must not poll the handle again.
-        let mut upload_joined = false;
-
-        let run_res: Result<()> = loop {
-            tokio::select! {
-                // Allow fast shutdown.
-                _ = shutdown_tick.tick() => {
-                    if shutdown.load(Ordering::SeqCst) {
-                        info!("Shutdown requested");
-                        stats_task.abort();
-                        break Ok(());
-                    }
-                }
-
-                _ = rx_watchdog.tick() => {
-                    // K6: periodic kernel tag-window upkeep. The resonance time
-                    // window rotates every 10 s and idle/quiet periods deliver
-                    // no fallback packets to drive the receive-path refresh, so
-                    // this 5 s tick bounds tag staleness at half a window.
-                    #[cfg(target_os = "linux")]
-                    self.kernel_push_tags(false);
-
-                    // A4 asymmetric silence detection. 45 s stays the ceiling
-                    // for an idle uplink, but when we are actively SENDING
-                    // (keepalives flow every interval) and the server has gone
-                    // quiet, the path is dead — NAT rebind or carrier drop —
-                    // and waiting the full 45 s only hurts interactivity. Cut
-                    // the threshold to ~3× the live keepalive interval, with a
-                    // 12 s floor so a server-pushed 1–2 s interval can't make
-                    // the watchdog trigger-happy. Satellite (15 s keepalive):
-                    // 3×15 = 45 s — behavior there is unchanged by design.
-                    const RX_SILENCE_MAX: Duration = Duration::from_secs(45);
-                    const RX_SILENCE_MIN: Duration = Duration::from_secs(12);
-                    let now_ms = epoch_ms();
-                    let ka = Duration::from_millis(
-                        self.keepalive_interval_ms.load(Ordering::Relaxed).max(1),
-                    );
-                    let tx_gap_ms =
-                        now_ms.saturating_sub(self.last_tx_ms.load(Ordering::Relaxed));
-                    // "Recently sent" = within 2 keepalive intervals (min 10 s).
-                    let uplink_active =
-                        tx_gap_ms <= (2 * ka.as_millis() as u64).max(10_000);
-                    let rx_silence = if uplink_active {
-                        (3 * ka).clamp(RX_SILENCE_MIN, RX_SILENCE_MAX)
-                    } else {
-                        RX_SILENCE_MAX
-                    };
-                    if last_rx.elapsed() > rx_silence {
-                        warn!(
-                            "No server traffic for {:?} (threshold {:?}, uplink_active={}) — reconnecting",
-                            last_rx.elapsed(),
-                            rx_silence,
-                            uplink_active
-                        );
-                        break Err(Error::Session("RX silence timeout".into()));
-                    }
-
-                    // Data-plane watchdog: clocked on DATA delivered to the
-                    // TUN/proxy, not on any decode — a downlink where only
-                    // keepalive-acks / KeyRotate retransmits still
-                    // authenticate is DEAD for the user and must reconnect in
-                    // tens of seconds (see `data_watchdog_verdict`). Skipped
-                    // while kernel RX offload is active: in-kernel-consumed
-                    // DATA never reaches process_decoded, so user-space data
-                    // liveness would be a false negative there.
-                    #[cfg(target_os = "linux")]
-                    let data_watchdog_active = !self.kernel_installed;
-                    #[cfg(not(target_os = "linux"))]
-                    let data_watchdog_active = true;
-                    if data_watchdog_active {
-                        let uploaded_total = self.bytes_sent.load(Ordering::Relaxed);
-                        let data_up_since =
-                            uploaded_total.saturating_sub(self.upload_at_last_data_rx);
-                        if data_up_since > 0 && self.data_stall_started.is_none() {
-                            self.data_stall_started = Some(Instant::now());
-                        }
-                        let stalled_for = if self.data_plane_proven {
-                            self.data_stall_started.map(|t| t.elapsed())
-                        } else {
-                            // Data plane never proven this session —
-                            // unanswerable TUN junk must not condemn a
-                            // healthy idle tunnel.
-                            None
-                        };
-                        let verdict = data_watchdog_verdict(stalled_for, data_up_since);
-                        let stall_pending = verdict.is_some();
-                        if let Some(reason) =
-                            data_stall_confirmed(&mut self.data_stall_strikes, verdict)
-                        {
-                            warn!(
-                                "{}: {} bytes of uplink data unanswered for {:?} \
-                                 (no downlink data for {:?}) — reconnecting",
-                                reason,
-                                data_up_since,
-                                stalled_for.unwrap_or_default(),
-                                self.last_data_rx.elapsed(),
-                            );
-                            break Err(Error::Session(format!("{reason} — reconnecting")));
-                        }
-                        // Window wash: the stall never reached the byte
-                        // threshold — background junk, not a dead downlink.
-                        // Forget it so trickle can never accumulate into a
-                        // false positive (see DATA_STALL_WINDOW). Never wash
-                        // while a strike is pending confirmation, or the
-                        // reset would erase the very stall the next tick must
-                        // re-observe.
-                        if !stall_pending
-                            && self
-                                .data_stall_started
-                                .is_some_and(|t| t.elapsed() >= DATA_STALL_WINDOW)
-                        {
-                            self.data_stall_started = None;
-                            self.upload_at_last_data_rx = uploaded_total;
-                        }
-                    }
-                    // First-contact fast fail: no server packet AT ALL since
-                    // connect (last_rx unmoved) within the handshake window means
-                    // the handshake was rejected — reconnect fast instead of
-                    // burning the full RX-silence threshold on a dead attempt.
-                    const HANDSHAKE_FIRST_CONTACT: Duration = Duration::from_secs(10);
-                    if last_rx == connect_instant
-                        && connect_instant.elapsed() > HANDSHAKE_FIRST_CONTACT
-                    {
-                        warn!(
-                            "No server response to handshake within {:?} — reconnecting fast",
-                            HANDSHAKE_FIRST_CONTACT
-                        );
-                        break Err(Error::Session("handshake first-contact timeout".into()));
-                    }
-
-                    // A4 proactive CGNAT warmup: if nothing has been sent for
-                    // ~20 s (keepalive stalled by doze/backpressure, or the
-                    // server pushed a long interval), refresh the NAT mapping
-                    // BEFORE it expires instead of reconnecting after. Satellite
-                    // is exempt, mirroring the keepalive cap exemption.
-                    if self.adaptive_level != AdaptiveLevel::Satellite
-                        && tx_gap_ms >= NAT_WARMUP_AFTER.as_millis() as u64
-                        && last_warmup.elapsed() >= KEEPALIVE_NAT_CAP
-                    {
-                        last_warmup = std::time::Instant::now();
-                        debug!(
-                            "TX idle for {} ms — proactive CGNAT warmup burst",
-                            tx_gap_ms
-                        );
-                        Self::spawn_warmup_burst(control_tx.clone());
-                    }
-                }
-
-                // Upload task completed (error or channel closed).
-                join_res = &mut upload_task => {
-                    // The handle's output is consumed here; awaiting it again
-                    // after the loop would panic ("polled after completion").
-                    upload_joined = true;
-                    break match join_res {
-                        Ok(Ok(())) => Err(Error::Channel("Upload loop ended unexpectedly".into())),
-                        Ok(Err(e)) => Err(e),
-                        Err(e) => Err(Error::Session(format!("Upload task panicked: {e}"))),
-                    };
-                }
-
-                cmd = admin_rx.recv() => {
-                    if let Some(cmd) = cmd {
-                        if let Some(service) = cmd.strip_prefix("record_start:") {
-                            crate::record_cmd::handle_recording_status(true, Some(service));
-                            let payload = ControlPayload::RecordingStart { service: service.to_string() };
-                            if let Err(e) = control_tx.send(payload).await {
-                                error!("Failed to send RecordingStart to upload task: {}", e);
-                            } else {
-                                info!("Sent RecordingStart for {}", service);
-                            }
-                        } else if cmd == "record_stop" {
-                            if let Some(session_id) = self.active_recording_session {
-                                let current_service = crate::record_cmd::read_local_status().and_then(|status| status.service);
-                                crate::record_cmd::mark_recording_stop_requested(current_service.as_deref());
-                                let payload = ControlPayload::RecordingStop { session_id };
-                                if let Err(e) = control_tx.send(payload).await {
-                                    error!("Failed to send RecordingStop to upload task: {}", e);
-                                } else {
-                                    info!("Sent RecordingStop");
-                                }
-                            } else {
-                                warn!("No active recording session to stop");
-                                crate::record_cmd::handle_recording_failed("No active recording session to stop");
-                            }
-                        } else if cmd == "record_status" {
-                            let payload = ControlPayload::RecordingStatusRequest;
-                            if let Err(e) = control_tx.send(payload).await {
-                                error!("Failed to send RecordingStatusRequest to upload task: {}", e);
-                            }
-                        }
-                    }
-                }
-
-                // UDP -> TUN (inbound traffic)
-                res = udp_to_tun_rx.recv() => {
-                    let packet = match res {
-                        Some(p) => p,
-                        None => break Err(Error::Channel("UDP->TUN channel closed".into())),
-                    };
-
-                    match self.receive_and_write_packet(&packet).await {
-                        // Advance last_rx only after the packet authenticated:
-                        // stamping it on ANY datagram would let a single
-                        // spoofed/garbage packet to the ephemeral port defeat
-                        // the first-contact fast-fail above and keep a dead
-                        // session alive through the RX-silence watchdog.
-                        Ok(()) => last_rx = std::time::Instant::now(),
-                        Err(e) => match &e {
-                            Error::InvalidPacket(_) => warn!("Receive invalid packet: {}", e),
-                            Error::Crypto(_) => warn!("Receive error (crypto): {}", e),
-                            _ => {
-                                warn!("Receive error: {}", e);
-                                break Err(e);
-                            }
-                        }
-                    }
-                }
-            }
-        };
-
-        // Stop background tasks before disconnecting. Abort `upload_task`
-        // unconditionally (it is only self-consumed on the `join_res` exit path;
-        // abort on an already-finished task is a no-op) so it never lingers as a
-        // zombie on a flappy connection. Aborting it also drops the control-plane
-        // receiver it owns, which closes the `control_tx` channel — that is what
-        // makes the two detached §2/§3 tasks (the MaskPreference retry and the
-        // jittered MaskFeedback send) reliably bail out via their "receiver gone"
-        // send-error paths instead of outliving `run()`.
-        stats_task.abort();
-        tun_task.abort();
-        udp_task.abort();
-        upload_task.abort();
-        let _ = stats_task.await;
-        let _ = tun_task.await;
-        let _ = udp_task.await;
-        // Await upload_task too: it holds an Arc<UdpSocket> clone, and the
-        // disconnect() below removes the K6 kernel session and drops the
-        // socket — the fd must not linger in a detached task past that point.
-        // Skip only if the `join_res` select branch already consumed the
-        // handle's output (re-polling a consumed JoinHandle panics).
-        if !upload_joined {
-            let _ = upload_task.await;
+            self.control_tx
+                .clone()
+                .expect("control_tx set alongside preset_control_rx")
         }
-
-        if self.state != ClientState::Disconnected {
-            self.disconnect().await;
-        }
-
-        run_res
-    }
-
-    /// Spawn the upload task using the shared pipeline.
-    async fn spawn_upload(
-        mut rx: mpsc::Receiver<Vec<u8>>,
-        mut control_rx: mpsc::Receiver<ControlPayload>,
-        udp: Arc<UdpSocket>,
-        engine: MimicryEngine,
-        upload_state: Arc<Mutex<UploadCryptoState>>,
-        bytes_sent: Arc<AtomicU64>,
-        pending_mask: Arc<Mutex<Option<aivpn_common::mask::MaskProfile>>>,
-        keepalive_interval: Duration,
-        keepalive_sent_ms: Arc<AtomicU64>,
-        fec_n: u8,
-        keepalive_interval_ms: Arc<AtomicU64>,
-        last_tx_ms: Arc<AtomicU64>,
-    ) -> Result<()> {
-        /// Wraps MimicryEngine to implement the shared PacketEncryptor trait.
-        struct MimicryEncryptor {
-            engine: MimicryEngine,
-            upload_state: Arc<Mutex<UploadCryptoState>>,
-            bytes_sent: Arc<AtomicU64>,
-            pending_mask: Arc<Mutex<Option<aivpn_common::mask::MaskProfile>>>,
-            keepalive_sent_ms: Arc<AtomicU64>,
-            /// A4: shared with the RX watchdog — every encrypted outbound
-            /// packet stamps this so silence detection knows the uplink is live.
-            last_tx_ms: Arc<AtomicU64>,
-            fec_encoder: Option<aivpn_common::fec::FecEncoder>,
-            pending_fec: Option<Vec<u8>>,
-        }
-
-        impl MimicryEncryptor {
-            fn check_mask(&mut self) {
-                if let Some(mask) = self
-                    .pending_mask
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .take()
-                {
-                    self.engine.update_mask(mask);
-                }
-            }
-        }
-
-        impl PacketEncryptor for MimicryEncryptor {
-            fn encrypt_data(&mut self, payload: &[u8]) -> Result<Vec<u8>> {
-                self.check_mask();
-                self.last_tx_ms.store(epoch_ms(), Ordering::Relaxed);
-                let mut state = self.upload_state.lock().unwrap_or_else(|e| e.into_inner());
-                let inner = build_inner_packet(InnerType::Data, state.seq, payload);
-                state.seq = state.seq.wrapping_add(1);
-                let keys = state.keys.clone();
-                let pkt = self
-                    .engine
-                    .build_packet(&inner, &keys, &mut state.counter, None)?;
-                self.engine.update_fsm();
-
-                // FEC: feed payload; if group complete, pre-encrypt repair datagram
-                if let Some(fec) = self.fec_encoder.as_mut() {
-                    if let Some(repair) = fec.feed(payload) {
-                        let repair_payload = repair.encode();
-                        let repair_inner =
-                            build_inner_packet(InnerType::FecRepair, state.seq, &repair_payload);
-                        state.seq = state.seq.wrapping_add(1);
-                        if let Ok(enc_repair) =
-                            self.engine
-                                .build_packet(&repair_inner, &keys, &mut state.counter, None)
-                        {
-                            self.pending_fec = Some(enc_repair);
-                        }
-                    }
-                }
-
-                Ok(pkt)
-            }
-
-            fn take_fec_repair(&mut self) -> Option<Vec<u8>> {
-                self.pending_fec.take()
-            }
-
-            fn encrypt_control(&mut self, payload: &ControlPayload) -> Result<Vec<u8>> {
-                self.check_mask();
-                self.last_tx_ms.store(epoch_ms(), Ordering::Relaxed);
-                let mut state = self.upload_state.lock().unwrap_or_else(|e| e.into_inner());
-                let bytes = payload.encode()?;
-                let inner = build_inner_packet(InnerType::Control, state.seq, &bytes);
-                state.seq = state.seq.wrapping_add(1);
-                let keys = state.keys.clone();
-                let pkt = self
-                    .engine
-                    .build_packet(&inner, &keys, &mut state.counter, None)?;
-                // Confirm to the inline-rekey handler (if waiting) that this
-                // KeyRotate response was just encrypted with the keys held
-                // above — i.e. still the OLD (pre-ratchet) keys, since the
-                // handler has not yet overwritten `state.keys` and is blocked
-                // on this exact rendezvous before it does. See `rekey_ack` doc
-                // comment on `UploadCryptoState`.
-                if matches!(payload, ControlPayload::KeyRotate { .. }) {
-                    if let Some(ack) = state.rekey_ack.pop_front() {
-                        let _ = ack.send(());
-                    }
-                }
-                Ok(pkt)
-            }
-
-            fn encrypt_keepalive(&mut self) -> Result<Vec<u8>> {
-                self.check_mask();
-                // Record send time for RTT measurement via KeepaliveAck.
-                let now_ms = epoch_ms();
-                self.keepalive_sent_ms.store(now_ms, Ordering::Relaxed);
-                self.last_tx_ms.store(now_ms, Ordering::Relaxed);
-                let mut state = self.upload_state.lock().unwrap_or_else(|e| e.into_inner());
-                let keepalive = ControlPayload::Keepalive { send_ts: now_ms }.encode()?;
-                let inner = build_inner_packet(InnerType::Control, state.seq, &keepalive);
-                state.seq = state.seq.wrapping_add(1);
-                let keys = state.keys.clone();
-                self.engine
-                    .build_packet(&inner, &keys, &mut state.counter, None)
-            }
-
-            fn on_data_sent(&mut self, payload_len: usize) {
-                self.bytes_sent
-                    .fetch_add(payload_len as u64, Ordering::Relaxed);
-            }
-        }
-
-        // R2 Phase D — client-side inline ML-DPI self-gate (opt-in, feature
-        // `client-dpi-gate`, OFF by default). Capture the active mask family
-        // BEFORE `engine` is moved into the encryptor, so a tunnel verdict can
-        // request a fresh variant of exactly the mask this session is shaping to.
-        #[cfg(feature = "client-dpi-gate")]
-        let base_mask_id = engine.mask().mask_id.clone();
-
-        let mut enc = MimicryEncryptor {
-            engine,
-            upload_state,
-            bytes_sent,
-            pending_mask,
-            keepalive_sent_ms,
-            last_tx_ms,
-            fec_encoder: if fec_n > 0 {
-                Some(aivpn_common::fec::FecEncoder::new(fec_n, 1500))
-            } else {
-                None
-            },
-            pending_fec: None,
-        };
-        let config = UploadConfig {
-            keepalive_interval,
-            keepalive_ms: Some(keepalive_interval_ms),
-            ..Default::default()
-        };
-
-        // Build the optional outbound inspector: `Some` only under the feature.
-        #[cfg(feature = "client-dpi-gate")]
-        let mut self_gate = aivpn_common::dpi_gate::ClientSelfGate::new(0.5, base_mask_id);
-        #[cfg(feature = "client-dpi-gate")]
-        let inspector: Option<&mut dyn upload_pipeline::OutboundInspector> = Some(&mut self_gate);
-        #[cfg(not(feature = "client-dpi-gate"))]
-        let inspector: Option<&mut dyn upload_pipeline::OutboundInspector> = None;
-
-        upload_pipeline::run_upload_loop(
-            &mut rx,
-            Some(&mut control_rx),
-            &udp,
-            &mut enc,
-            &config,
-            inspector,
-        )
-        .await
-    }
-
-    /// Receive packet from server and write to TUN (using pre-computed mdh_len)
-    async fn receive_and_write_packet(&mut self, packet: &[u8]) -> Result<()> {
-        if self
-            .transition_recv_deadline
-            .is_some_and(|deadline| Instant::now() >= deadline)
-        {
-            self.transition_recv_keys = None;
-            self.transition_recv_deadline = None;
-            self.transition_grace_hard = None;
-            self.transition_recv_window.reset();
-        }
-
-        let keys = self
-            .session_keys
-            .as_ref()
-            .ok_or(Error::Session("No session keys".into()))?;
-
-        // Try every MDH length this session has used, with the current session
-        // keys first. The server frames different downlink packets with
-        // different masks (bootstrap vs runtime vs polymorphic; DATA vs
-        // control/rekey), so a single fixed length silently drops any packet
-        // whose mask differs — the failure that strands the tunnel on the first
-        // rekey. See `decode_downlink_any_mdh_len`.
-        let decoded = match decode_downlink_any_mdh_len(
-            packet,
-            keys,
-            &mut self.recv_window,
-            &mut self.recv_mdh_candidates,
-        ) {
-            Ok(decoded) => decoded,
-            Err(primary_err) => {
-                // Fallback: PFS-ratchet transition keys (in-flight packets
-                // encrypted with the pre-rekey keys), same candidate lengths.
-                if let Some(fallback_keys) = self.transition_recv_keys.as_ref() {
-                    if let Ok(decoded) = decode_downlink_any_mdh_len(
-                        packet,
-                        fallback_keys,
-                        &mut self.transition_recv_window,
-                        &mut self.recv_mdh_candidates,
-                    ) {
-                        return self.process_decoded(decoded).await;
-                    }
-                }
-                return Err(primary_err);
-            }
-        };
-        self.process_decoded(decoded).await
-    }
-
-    /// Process a successfully decoded packet (shared by primary and fallback paths)
-    async fn process_decoded(&mut self, decoded: DecodedPacket) -> Result<()> {
-        // K6: every user-space-validated packet is a fresh observation of the
-        // downlink counter (kernel-consumed packets never reach here), so use
-        // it to opportunistically re-base the kernel tag window. No-op unless
-        // the counter advanced ≥ KERNEL_TAG_REFRESH_STRIDE or the 10 s
-        // resonance time window rotated.
-        #[cfg(target_os = "linux")]
-        self.kernel_push_tags(false);
-
-        let inner_header = decoded.header;
-        let ip_payload = decoded.payload;
-
-        match inner_header.inner_type {
-            InnerType::Data => {
-                if ip_payload.is_empty() || (ip_payload[0] >> 4 != 4 && ip_payload[0] >> 4 != 6) {
-                    return Err(Error::InvalidPacket("Invalid IP version in payload"));
-                }
-                if let Some(h) = &self.proxy_handle {
-                    {
-                        let mut q = h.rx_queue.lock().unwrap_or_else(|e| e.into_inner());
-                        // Bound the queue: drop-oldest past the cap so a stalled
-                        // SOCKS consumer cannot grow memory without limit
-                        // (inner TCP retransmit recovers the dropped packet).
-                        while q.len() >= PROXY_RX_QUEUE_MAX {
-                            q.pop_front();
-                        }
-                        q.push_back(ip_payload.to_vec());
-                    }
-                    let _ = h.wake_tx.try_send(());
-                } else {
-                    self.tunnel.write_packet_async(&ip_payload).await?;
-                }
-                self.bytes_received
-                    .fetch_add(ip_payload.len() as u64, Ordering::Relaxed);
-                // DATA-plane liveness stamp: only here — control traffic must
-                // not mask a dead data downlink (see `data_watchdog_verdict`).
-                self.last_data_rx = Instant::now();
-                self.upload_at_last_data_rx = self.bytes_sent.load(Ordering::Relaxed);
-                self.data_stall_started = None;
-                self.data_stall_strikes = 0;
-                self.data_plane_proven = true;
-                debug!(
-                    "Received {} bytes from server, wrote to TUN",
-                    ip_payload.len()
-                );
-            }
-            InnerType::Control => {
-                let control = ControlPayload::decode(&ip_payload)?;
-                self.handle_server_control(control).await?;
-            }
-            _ => {
-                debug!(
-                    "Received non-data packet type: {:?}",
-                    inner_header.inner_type
-                );
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Handle control messages from server
-    async fn handle_server_control(&mut self, control: ControlPayload) -> Result<()> {
-        match control {
-            ControlPayload::MaskUpdate {
-                mask_data,
-                signature,
-            } => {
-                // The server signs the raw mask_data bytes (sign_mask() in session.rs).
-                // Verify before deserialising so a bad signature is caught immediately.
-                if let Some(signing_key) = &self.config.server_signing_key {
-                    use ed25519_dalek::{Signature, Verifier, VerifyingKey};
-                    match VerifyingKey::from_bytes(signing_key) {
-                        Ok(vk) => {
-                            let sig = Signature::from_bytes(&signature);
-                            if vk.verify(&mask_data, &sig).is_err() {
-                                warn!("MaskUpdate rejected: invalid ed25519 signature");
-                                return Ok(());
-                            }
-                        }
-                        Err(e) => {
-                            warn!("MaskUpdate rejected: bad signing key in config: {}", e);
-                            return Ok(());
-                        }
-                    }
-                }
-                match rmp_serde::from_slice::<MaskProfile>(&mask_data) {
-                    Ok(new_mask) => {
-                        // R2 Phase B: artifact-level operator signature check,
-                        // in ADDITION to the transport check above. Transport
-                        // auth proves "pushed by my server"; artifact auth
-                        // proves "gated + signed by the operator". Derived
-                        // per-session variants are exempt: they arrive only
-                        // over the AEAD-authenticated session channel and are
-                        // not independently verifiable (their perturbation
-                        // shifts signature-covered fields).
-                        if !new_mask.is_derived_variant() {
-                            let verdict = aivpn_common::mask::verify_mask_artifact(
-                                &new_mask,
-                                self.config.mask_operator_pubkey.as_ref(),
-                                self.config.mask_verify_mode,
-                            );
-                            if !verdict.accept {
-                                warn!(
-                                    "MaskUpdate '{}' REJECTED (mask_verify_mode=enforce): {:?}",
-                                    new_mask.mask_id, verdict.detail
-                                );
-                                return Ok(());
-                            }
-                            if verdict.is_failure() && self.config.mask_operator_pubkey.is_some() {
-                                warn!(
-                                    "MaskUpdate '{}' failed operator signature verification \
-                                     ({:?}) — accepted because mask_verify_mode=warn",
-                                    new_mask.mask_id, verdict.detail
-                                );
-                            }
-                        }
-                        // §3 F: once a polymorphic variant lands, signal the
-                        // MaskPreference retry task to stop resending.
-                        if new_mask.mask_id.starts_with("polymorphic:") {
-                            self.polymorphic_confirmed.store(true, Ordering::Relaxed);
-                        }
-                        self.update_mask(new_mask);
-                    }
-                    Err(e) => warn!("Failed to parse mask update: {}", e),
-                }
-            }
-            ControlPayload::BootstrapDescriptorUpdate { descriptor_data } => {
-                if descriptor_data.len() > 512 * 1024 {
-                    warn!(
-                        "BootstrapDescriptorUpdate rejected: payload too large ({} bytes)",
-                        descriptor_data.len()
-                    );
-                    return Ok(());
-                }
-                match rmp_serde::from_slice::<BootstrapDescriptor>(&descriptor_data) {
-                    Ok(descriptor) => {
-                        let trusted = self.config.server_signing_key.as_ref();
-                        if let Err(e) =
-                            bootstrap_cache::store_verified_descriptor(descriptor, trusted)
-                        {
-                            warn!("Failed to store bootstrap descriptor: {}", e);
-                        }
-                    }
-                    Err(e) => warn!("Failed to parse bootstrap descriptor update: {}", e),
-                }
-            }
-            ControlPayload::KeyRotate { new_eph_pub } => {
-                // Same class of bug as the ServerHello duplicate-processing fix:
-                // a duplicated/redelivered KeyRotate request (plain UDP
-                // duplication, no server-side resend needed to trigger it) used
-                // to be reprocessed unconditionally — generating a fresh random
-                // keypair and re-deriving new_keys from the already-once-
-                // rotated current key. The server only ever commits the FIRST
-                // response it receives (its own pending_rekey_keypair is
-                // consumed on first commit), so this second, independently-
-                // derived key is one the server never agrees to or learns
-                // about — a permanent, unrecoverable desync. Skip entirely if
-                // we already ratcheted for this exact server_eph_pub.
-                if self.ratcheted_rekey_eph_pub == Some(new_eph_pub) {
-                    // A KeyRotate for an eph_pub we ALREADY ratcheted against
-                    // can only be a genuine server RETRANSMIT: a plain
-                    // network-duplicated copy of the original packet carries
-                    // the same transport counter and is dropped by the replay
-                    // window before ever reaching this handler, while a
-                    // retransmit is a fresh packet under the OLD keys (it
-                    // decoded via transition_recv_keys to get here). The
-                    // server retransmits because our rekey RESPONSE was lost:
-                    // it is still on the old keys with the rekey pending —
-                    // silently ignoring the retransmit deadlocked the tunnel
-                    // (client on new keys, server on old) until the client's
-                    // RX-silence watchdog forced a full reconnect. Re-send
-                    // the SAME response (same client eph — never a fresh
-                    // keypair, so whichever copy the server commits yields
-                    // exactly the keys we already switched to), encrypted
-                    // with the OLD keys the server can still read. The upload
-                    // counter is shared and monotonic across both keys, so
-                    // the temporary swap below cannot reuse a (key, nonce).
-                    let (Some(old_keys), Some(response_eph)) =
-                        (self.transition_recv_keys.clone(), self.rekey_response_eph)
-                    else {
-                        debug!(
-                            "Duplicate KeyRotate for already-ratcheted eph_pub — \
-                             no stored response/old keys, ignoring"
-                        );
-                        return Ok(());
-                    };
-                    warn!(
-                        "Retransmitted KeyRotate for already-ratcheted eph_pub — \
-                         our rekey response was likely lost; re-sending the same \
-                         response under the previous keys"
-                    );
-                    let response = ControlPayload::KeyRotate {
-                        new_eph_pub: response_eph,
-                    };
-                    // Same rendezvous dance as the initial response: swap the
-                    // OLD keys into the upload state, block until the upload
-                    // task confirms it encrypted THIS response with them, then
-                    // restore the committed (new) keys.
-                    let rekey_ack_rx = self.upload_state.as_ref().map(|upload_state| {
-                        let (ack_tx, ack_rx) = oneshot::channel();
-                        let mut state = upload_state.lock().unwrap_or_else(|e| e.into_inner());
-                        state.keys = old_keys;
-                        state.rekey_ack.push_back(ack_tx);
-                        ack_rx
-                    });
-                    let send_result = self.send_control(&response).await;
-                    if let Some(ack_rx) = rekey_ack_rx {
-                        if send_result.is_ok() {
-                            // Bounded wait: if the upload task died between
-                            // dequeuing the KeyRotate and firing the ack, the
-                            // sender is stranded in the shared queue and would
-                            // never resolve — remove it and move on instead of
-                            // hanging the receive loop forever.
-                            if tokio::time::timeout(REKEY_ACK_TIMEOUT, ack_rx)
-                                .await
-                                .is_err()
-                            {
-                                if let Some(upload_state) = &self.upload_state {
-                                    upload_state
-                                        .lock()
-                                        .unwrap_or_else(|e| e.into_inner())
-                                        .rekey_ack
-                                        .pop_back();
-                                }
-                                warn!(
-                                    "Inline rekey: no old-key re-send confirmation within {:?} — upload task presumed dead",
-                                    REKEY_ACK_TIMEOUT
-                                );
-                            }
-                        } else {
-                            // Nothing was enqueued — drop the unused rendezvous
-                            // so it cannot mis-fire on a future KeyRotate.
-                            if let Some(upload_state) = &self.upload_state {
-                                upload_state
-                                    .lock()
-                                    .unwrap_or_else(|e| e.into_inner())
-                                    .rekey_ack
-                                    .pop_back();
-                            }
-                        }
-                    }
-                    if let (Some(upload_state), Some(keys)) =
-                        (&self.upload_state, self.session_keys.as_ref())
-                    {
-                        upload_state.lock().unwrap_or_else(|e| e.into_inner()).keys = keys.clone();
-                    }
-                    if let Err(e) = send_result {
-                        warn!("Inline rekey: failed to re-send response: {}", e);
-                        return Ok(());
-                    }
-                    // Keep accepting old-key downlink until the server commits
-                    // (or retransmits again) — but never past the hard cap
-                    // armed at the key switch: unbounded re-arms let a never-
-                    // converging rekey defer recovery forever.
-                    let next = Instant::now() + REKEY_TRANSITION_GRACE;
-                    self.transition_recv_deadline = Some(
-                        self.transition_grace_hard
-                            .map_or(next, |hard| next.min(hard)),
-                    );
-                    return Ok(());
-                }
-                let client_rekey_kp = crypto::KeyPair::generate();
-                let dh_rekey = match client_rekey_kp.compute_shared(&new_eph_pub) {
-                    Ok(dh) => dh,
-                    Err(e) => {
-                        warn!("Inline rekey: DH failed: {}", e);
-                        return Ok(());
-                    }
-                };
-                let current_sk = match self.session_keys.as_ref() {
-                    Some(k) => k.session_key,
-                    None => {
-                        warn!("Inline rekey: no session keys");
-                        return Ok(());
-                    }
-                };
-                let new_keys = {
-                    let mut k = crypto::derive_session_keys(
-                        &dh_rekey,
-                        Some(&current_sk),
-                        &client_rekey_kp.public_key_bytes(),
-                    );
-                    apply_legacy_key_scheme(&mut k, self.legacy_wire());
-                    k
-                };
-                // Send response with OLD keys before switching.
-                //
-                // send_control() only enqueues the payload onto an mpsc
-                // channel to the independently-running upload task — it does
-                // NOT wait for that task to actually dequeue and encrypt it.
-                // Register a rendezvous first so we can block until the
-                // upload task confirms it encrypted THIS response using the
-                // still-current (old) keys, before we touch `session_keys` /
-                // `upload_state.keys` below. Without this, there is no
-                // .await between the enqueue and the key-swap, so the swap
-                // would routinely win the race and the response would go out
-                // encrypted with the NEW key — a key the server does not yet
-                // recognize, permanently desyncing the ratchet.
-                let response = ControlPayload::KeyRotate {
-                    new_eph_pub: client_rekey_kp.public_key_bytes(),
-                };
-                let rekey_ack_rx = self.upload_state.as_ref().map(|upload_state| {
-                    let (ack_tx, ack_rx) = oneshot::channel();
-                    upload_state
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .rekey_ack
-                        .push_back(ack_tx);
-                    ack_rx
-                });
-                if let Err(e) = self.send_control(&response).await {
-                    warn!("Inline rekey: failed to send response: {}", e);
-                    return Ok(());
-                }
-                if let Some(ack_rx) = rekey_ack_rx {
-                    match tokio::time::timeout(REKEY_ACK_TIMEOUT, ack_rx).await {
-                        Ok(Ok(())) => {}
-                        Ok(Err(_)) => {
-                            warn!(
-                                "Inline rekey: upload task ended before confirming old-key send, aborting rekey to avoid desync"
-                            );
-                            return Ok(());
-                        }
-                        Err(_) => {
-                            // Timed out: the upload task died between dequeuing
-                            // the KeyRotate and firing the ack, leaving the
-                            // sender stranded in the shared queue. Remove it so
-                            // it cannot mis-fire on a future KeyRotate and
-                            // abort like the task-gone branch instead of
-                            // hanging the receive loop forever.
-                            if let Some(upload_state) = &self.upload_state {
-                                upload_state
-                                    .lock()
-                                    .unwrap_or_else(|e| e.into_inner())
-                                    .rekey_ack
-                                    .pop_back();
-                            }
-                            warn!(
-                                "Inline rekey: no old-key send confirmation within {:?}, aborting rekey to avoid desync",
-                                REKEY_ACK_TIMEOUT
-                            );
-                            return Ok(());
-                        }
-                    }
-                }
-                // Keep old keys for 2 s to accept in-flight server packets.
-                // The transition window is a CLONE (not a move) so the primary
-                // downlink recv-window keeps its `highest` counter across the
-                // rekey. The server keeps its s2c send counter monotonic, so
-                // post-rekey downlink packets continue from that counter with the
-                // new tag_secret and land inside the primary window's synced
-                // forward span — which slides with the stream. Resetting the
-                // window here (highest = -1) put it in the unsynced state whose
-                // fixed [0, RECV_FUTURE_SEARCH_WINDOW) search cannot advance,
-                // stranding sustained downlink after the first rekey.
-                // The uplink (c2s) send counter ALSO stays monotonic across the
-                // rekey (only the key changes, so no nonce reuse). Resetting it to
-                // 0 mirrored the downlink bug on the server side: the server's c2s
-                // expected-tag band is ±TAG_WINDOW_SIZE around the highest received
-                // counter, so a from-zero restart under a heavy simultaneous upload
-                // (first c2s packets lost, client racing past 511) left the server
-                // unable to match any uplink tag — killing uplink, then the
-                // download's inner-TCP ACKs, then downlink, then the tunnel.
-                self.transition_recv_keys = self.session_keys.clone();
-                // Grace must outlive the server's KeyRotate retransmit horizon
-                // (lost-response self-heal), not just in-flight packets — see
-                // REKEY_TRANSITION_GRACE.
-                self.transition_recv_deadline = Some(Instant::now() + REKEY_TRANSITION_GRACE);
-                // Absolute re-arm ceiling for THIS rekey (see
-                // REKEY_TRANSITION_HARD_CAP).
-                self.transition_grace_hard = Some(Instant::now() + REKEY_TRANSITION_HARD_CAP);
-                self.transition_recv_window = self.recv_window.clone();
-                self.session_keys = Some(new_keys);
-                self.ratcheted_rekey_eph_pub = Some(new_eph_pub);
-                self.rekey_response_eph = Some(client_rekey_kp.public_key_bytes());
-                if let Some(upload_state) = &self.upload_state {
-                    let mut state = upload_state.lock().unwrap_or_else(|e| e.into_inner());
-                    if let Some(ref keys) = self.session_keys {
-                        state.keys = keys.clone();
-                    } else {
-                        warn!("ratchet: session_keys missing, skipping upload key update");
-                    }
-                    // state.counter kept monotonic — do NOT reset to 0.
-                }
-                info!("Inline PFS rekey complete — new session keys active");
-
-                // K6: re-install the in-kernel downlink session under the
-                // rotated s2c key (idempotent same-id replace) and re-push the
-                // tag window from the reset downlink counter. Old-key
-                // in-flight packets fall back to user-space transition keys.
-                #[cfg(target_os = "linux")]
-                self.kernel_install_session();
-            }
-            ControlPayload::ServerHello {
-                server_eph_pub,
-                signature,
-                network_config,
-            } => {
-                // Verify ed25519 signature over (server_eph_pub || client_eph_pub).
-                // The server signs this tuple in session.rs create_session().
-                if let Some(signing_key) = &self.config.server_signing_key {
-                    use ed25519_dalek::{Signature, Verifier, VerifyingKey};
-                    match VerifyingKey::from_bytes(signing_key) {
-                        Ok(vk) => {
-                            let mut msg = Vec::with_capacity(64);
-                            msg.extend_from_slice(&server_eph_pub);
-                            msg.extend_from_slice(&self.keypair.public_key_bytes());
-                            let sig = Signature::from_bytes(&signature);
-                            if vk.verify(&msg, &sig).is_err() {
-                                error!(
-                                    "ServerHello rejected: ed25519 signature verification failed \
-                                     — possible MITM attack"
-                                );
-                                return Err(Error::Crypto("ServerHello signature invalid".into()));
-                            }
-                        }
-                        Err(e) => {
-                            error!("ServerHello: invalid signing key in config: {}", e);
-                            return Err(Error::Crypto(format!(
-                                "Invalid server signing key: {}",
-                                e
-                            )));
-                        }
-                    }
-                }
-
-                if let Some(network_config) = network_config {
-                    if let Some(ka) = network_config.keepalive_secs.filter(|&s| s > 0) {
-                        // NAT-safe cap (A4, Satellite exempt) + propagation to
-                        // the already-running upload task via the shared atomic
-                        // (previously the override never reached it).
-                        self.set_keepalive_interval(Duration::from_secs(ka as u64));
-                    }
-                    self.apply_server_network_override(network_config).await?;
-                }
-
-                // The server resends ServerHello whenever it sees a
-                // non-ratcheted Keepalive while it still believes the client
-                // hasn't switched (its own reliability measure for a lost
-                // original ServerHello). If we already completed the ratchet
-                // for THIS server_eph_pub, this is that resend arriving after
-                // our own confirmation packet was the one actually lost — not
-                // a new ratchet event. Re-deriving keys here would use our
-                // already-ratcheted session_key as PSK instead of the
-                // original pre-ratchet key, permanently diverging from the
-                // server's (single) ratchet. So: skip the crypto, just prod
-                // the server again with fresh confirmation traffic.
-                let is_duplicate_hello = self.ratcheted_server_eph_pub == Some(server_eph_pub);
-                // Receiving ANY ServerHello is the real proof the server answered
-                // — this is the §2 L2 failure-attribution signal. The optimistic
-                // zero-RTT "Connected" transition in connect() happens with no
-                // server contact at all (UDP connect never round-trips), so a
-                // DPI-blocked mask (server silently dropped) must NOT be counted
-                // as a success. Mark here, matching the iOS/Android cores which
-                // set EVER_CONNECTED only after processing a ServerHello.
-                self.ever_connected.store(true, Ordering::Relaxed);
-                if is_duplicate_hello {
-                    debug!(
-                        "Duplicate ServerHello for already-ratcheted eph_pub — \
-                         resending confirmation without re-ratcheting"
-                    );
-                } else {
-                    info!("ServerHello received — completing PFS ratchet");
-
-                    // Compute DH2 = client_eph * server_eph for PFS (CRIT-3)
-                    let dh2 = self.keypair.compute_shared(&server_eph_pub)?;
-
-                    // Derive ratcheted keys using current session_key as PSK
-                    let current_key = self
-                        .session_keys
-                        .as_ref()
-                        .ok_or(Error::Session("No session keys for ratchet".into()))?
-                        .session_key;
-                    let ratcheted = {
-                        let mut k = crypto::derive_session_keys(
-                            &dh2,
-                            Some(&current_key),
-                            &self.keypair.public_key_bytes(),
-                        );
-                        apply_legacy_key_scheme(&mut k, self.legacy_wire());
-                        k
-                    };
-
-                    // Keep accepting old inbound keys until the server proves it has
-                    // switched too. Outbound traffic moves to ratcheted keys now.
-                    self.transition_recv_keys = self.session_keys.clone();
-                    self.transition_recv_deadline = Some(Instant::now() + Duration::from_secs(2));
-                    // Not an inline rekey — no retransmit re-arm loop here, so
-                    // no hard cap (and a stale one from a previous rekey must
-                    // not clip this fresh window).
-                    self.transition_grace_hard = None;
-                    self.transition_recv_window = std::mem::take(&mut self.recv_window);
-
-                    // Switch to ratcheted keys — outbound uses the new keys immediately.
-                    self.session_keys = Some(ratcheted);
-                    self.ratcheted_server_eph_pub = Some(server_eph_pub);
-                    self.counter = 0;
-                    self.recv_window.reset();
-                    if let Some(upload_state) = &self.upload_state {
-                        let mut state = upload_state.lock().unwrap_or_else(|e| e.into_inner());
-                        if let Some(ref keys) = self.session_keys {
-                            state.keys = keys.clone();
-                        } else {
-                            warn!("ratchet: session_keys missing, skipping upload key update");
-                        }
-                        state.counter = 0;
-                        info!("Outbound ratchet activated — upload switched to new keys");
-                    }
-                    info!("PFS ratchet complete — forward secrecy established");
-
-                    // K6: keys are now stable — install (or, on a mid-session
-                    // re-ratchet, atomically replace) the in-kernel downlink
-                    // session with the NEW s2c key and a fresh tag window.
-                    // In-flight old-key packets miss the new kernel tags and
-                    // fall back to user-space, where `transition_recv_keys`
-                    // still decodes them.
-                    #[cfg(target_os = "linux")]
-                    self.kernel_install_session();
-                }
-
-                // Send mTLS ClientCert now that the PFS ratchet is complete.
-                // Sending it here ensures the cert is protected by the ratcheted
-                // session keys, not the initial zero-RTT keys.
-                if let Some(cert) = self.config.mtls_cert.clone() {
-                    if let Err(e) = self
-                        .send_control(&ControlPayload::ClientCert {
-                            cert_bytes: cert.clone(),
-                        })
-                        .await
-                    {
-                        warn!("mTLS: failed to queue ClientCert after ratchet: {}", e);
-                    } else {
-                        debug!(
-                            "mTLS: ClientCert queued after PFS ratchet ({} bytes)",
-                            cert.len()
-                        );
-                    }
-                }
-
-                let _ = self
-                    .send_control(&ControlPayload::RecordingStatusRequest)
-                    .await;
-
-                // Device enrollment: prove static key ownership to server.
-                // Sent after ratchet so it is protected by PFS session keys.
-                if let Some(ref skp) = self.static_keypair {
-                    match skp.compute_shared(&self.config.server_public_key) {
-                        Ok(dh_proof) => {
-                            let enrollment = ControlPayload::DeviceEnrollment {
-                                static_pub: skp.public_key_bytes(),
-                                dh_proof,
-                            };
-                            if let Err(e) = self.send_control(&enrollment).await {
-                                warn!("DeviceEnrollment send failed: {}", e);
-                            }
-                        }
-                        Err(e) => warn!("DeviceEnrollment DH failed: {}", e),
-                    }
-                }
-
-                // The §2/§3 control messages below must fire ONCE per real
-                // ratchet, not on every ServerHello: the server resends
-                // ServerHello to recover a lost first copy (normal on lossy
-                // mobile links), and re-sending MaskPreference each time makes
-                // the server re-push a MaskUpdate whose `update_mask` resets the
-                // mimicry FSM mid-connection — an observable disruption to the
-                // very traffic fingerprint §3 protects. Gate on the first
-                // ratchet only (the pre-existing ClientCert/DeviceEnrollment
-                // re-sends above are intentionally left as reliability resends).
-                if !is_duplicate_hello {
-                    // Polymorphic mask request: ask the server to derive and push
-                    // a per-session perturbed variant of the requested base mask.
-                    // The server's reply arrives as a normal MaskUpdate, handled
-                    // by the existing ControlPayload::MaskUpdate arm below.
-                    //
-                    // Reliability (§3 F): a single lost MaskPreference packet
-                    // would silently disable polymorphic masks for the whole
-                    // session. Spawn a bounded retry task that resends until the
-                    // client observes its active mask become a `polymorphic:`
-                    // variant (`polymorphic_confirmed`, set in the MaskUpdate
-                    // arm) — or gives up after a few attempts. The server side is
-                    // idempotent (it skips re-pushing a MaskUpdate when the
-                    // session mask is already the derived variant), so a resend
-                    // that races an already-applied variant does NOT reset the
-                    // mimicry FSM. Runs only once per real ratchet (this block is
-                    // gated on `!is_duplicate_hello`).
-                    if let Some(base_mask_id) = self.config.polymorphic_base.clone() {
-                        if let (Some(tx), confirmed) =
-                            (self.control_tx.clone(), self.polymorphic_confirmed.clone())
-                        {
-                            tokio::spawn(async move {
-                                // Up to 5 sends over ~5s: immediate, then 0.5s,
-                                // 1s, 1.5s, 2s spacing.
-                                for attempt in 0..5u8 {
-                                    if confirmed.load(Ordering::Relaxed) {
-                                        return;
-                                    }
-                                    if tx
-                                        .send(ControlPayload::MaskPreference {
-                                            base_mask_id: base_mask_id.clone(),
-                                        })
-                                        .await
-                                        .is_err()
-                                    {
-                                        // Receiver gone — run() returned; stop.
-                                        return;
-                                    }
-                                    tokio::time::sleep(Duration::from_millis(
-                                        500 * (attempt as u64 + 1),
-                                    ))
-                                    .await;
-                                }
-                            });
-                        }
-                    }
-
-                    // §2 crowdsourced blocking feedback (opt-in, OFF by default):
-                    // the session is now confirmed connected (PFS ratchet done),
-                    // so record a success outcome for the mask this connection is
-                    // using and, if enabled, report the batched buffer to the
-                    // server. See `record_mask_outcome` / `maybe_send_mask_feedback`
-                    // for the privacy-preserving design notes (hour-granularity
-                    // timestamps, opt-in only, no effect unless country_code is
-                    // also configured).
-                    // Report the base mask FAMILY, not the per-session id. A
-                    // cached bootstrap id is `bootstrap:{desc}:{base}:{slot}:{seed}`
-                    // whose seed is PSK-derived (a stable quasi-identifier), and a
-                    // polymorphic id is `polymorphic:{base}:{hex}`. Sending either
-                    // raw would leak identity AND fragment the server's k-anon
-                    // buckets so they never reach the threshold. Collapse to the
-                    // base preset id so feedback aggregates per protocol family.
-                    //
-                    // Attribute the outcome to the mask family ACTUALLY being
-                    // exercised. In polymorphic mode (`--polymorphic-base`) the
-                    // initial mask is deliberately the bootstrap-fallback family
-                    // (so the opening burst isn't a named preset) while the mask
-                    // the session really runs is the server-pushed per-session
-                    // variant of `polymorphic_base`. Reporting the fallback family
-                    // here would silently attribute every §3 session's success to
-                    // the wrong family, defeating §2. So prefer the configured
-                    // polymorphic base when set; otherwise fall back to the
-                    // bootstrap/initial mask family as before.
-                    //
-                    // A legitimate mid-session RE-ratchet arrives with a NEW
-                    // `server_eph_pub`, so `!is_duplicate_hello` is true again —
-                    // guard the append with `mask_success_recorded` so success is
-                    // recorded exactly once per connection, not once per ratchet.
-                    if !self.mask_success_recorded {
-                        let active_mask_id = self.active_feedback_family();
-                        self.record_mask_outcome(active_mask_id, true);
-                        self.mask_success_recorded = true;
-                    }
-                    self.maybe_send_mask_feedback().await;
-                }
-
-                // Warmup: 4 keepalives (100 ms apart) to force CGNAT to refresh
-                // its inbound port mapping after reconnect. Fallback for carriers
-                // that delay updating the entry even after local-port reuse.
-                //
-                // Spawned as a background task (not awaited inline) so this
-                // ~400ms sequence doesn't stall the packet-receive loop right
-                // during the most sensitive part of the connection — the
-                // exact window where the server may also be sending the
-                // initial MaskUpdate and the first data packets. Blocking
-                // here previously let a backlog build up in the UDP->TUN
-                // channel, which then drained in one burst as soon as this
-                // handler returned.
-                // Only warm up on a real (re)connect, and never on Satellite —
-                // matching the proactive watchdog warmup. A lossy link makes the
-                // server re-send ServerHello as its reliability mechanism, so
-                // firing a 4-keepalive burst on every duplicate would amplify
-                // traffic on exactly the worst links (and needlessly on the
-                // deliberately-slow Satellite profile).
-                if !is_duplicate_hello && self.adaptive_level != AdaptiveLevel::Satellite {
-                    if let Some(tx) = self.control_tx.clone() {
-                        Self::spawn_warmup_burst(tx);
-                    } else {
-                        warn!("control_tx not initialized, skipping keepalive warmup");
-                    }
-                }
-            }
-            ControlPayload::Keepalive { .. } => {
-                debug!("Keepalive from server");
-            }
-            ControlPayload::TimeSync { server_ts_ms } => {
-                debug!("Time sync: server_ts={}", server_ts_ms);
-            }
-            ControlPayload::Shutdown { reason } => {
-                info!("Server requested shutdown (reason: {})", reason);
-                self.disconnect().await;
-                return Err(Error::Session(format!("server shutdown: {}", reason)));
-            }
-            ControlPayload::RecordingAck { session_id, status } => {
-                if status == "started" {
-                    self.active_recording_session = Some(session_id);
-                } else if status == "analyzing" {
-                    self.active_recording_session = None;
-                }
-                crate::record_cmd::handle_recording_ack(&session_id, &status);
-            }
-            ControlPayload::RecordingComplete {
-                service,
-                mask_id,
-                confidence,
-            } => {
-                self.active_recording_session = None;
-                crate::record_cmd::handle_recording_complete(&service, &mask_id, confidence);
-            }
-            ControlPayload::RecordingFailed { reason } => {
-                self.active_recording_session = None;
-                crate::record_cmd::handle_recording_failed(&reason);
-            }
-            ControlPayload::RecordingStatus {
-                can_record,
-                active_service,
-            } => {
-                crate::record_cmd::handle_recording_status(can_record, active_service.as_deref());
-            }
-            ControlPayload::CertRejected {} => {
-                warn!("mTLS: server rejected the certificate — re-provision your mTLS cert");
-            }
-            ControlPayload::KeepaliveAck { echo_ts } => {
-                // Use echoed client timestamp for RTT when available (server ≥ 0.9.0),
-                // fall back to the stored send-time for older servers.
-                let sent_ms = if echo_ts > 0 {
-                    echo_ts
-                } else {
-                    self.keepalive_sent_ms.load(Ordering::Relaxed)
-                };
-                if sent_ms > 0 {
-                    let now_ms = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_millis() as u64;
-                    let rtt_us = now_ms.saturating_sub(sent_ms).saturating_mul(1000);
-                    self.quality_tracker.record_rtt(rtt_us);
-                    let score = self.quality_tracker.score();
-                    Self::write_quality_file(
-                        score,
-                        self.quality_tracker.rtt_ms(),
-                        self.quality_tracker.jitter_ms(),
-                        self.adaptive_level as u8,
-                    );
-                    let new_level = AdaptiveLevel::suggest(score);
-                    if new_level != self.adaptive_level {
-                        self.adaptive_level = new_level;
-                        self.set_keepalive_interval(Duration::from_secs(
-                            new_level.keepalive_secs(),
-                        ));
-                        info!(
-                            "Adaptive level → {:?} (score={}), keepalive={}s",
-                            new_level,
-                            score,
-                            self.keepalive_interval.as_secs()
-                        );
-                    }
-                    let _ = self
-                        .send_control(&ControlPayload::QualityReport {
-                            quality: score,
-                            rtt_ms: self.quality_tracker.rtt_ms(),
-                            loss_ppm: self.quality_tracker.loss_ppm(),
-                            jitter_ms: self.quality_tracker.jitter_ms(),
-                        })
-                        .await;
-                }
-            }
-            ControlPayload::AdaptiveHint { level } => {
-                let new_level = AdaptiveLevel::from_u8(level);
-                if new_level != self.adaptive_level {
-                    self.adaptive_level = new_level;
-                    self.set_keepalive_interval(Duration::from_secs(new_level.keepalive_secs()));
-                    info!("Server adaptive hint → {:?}", new_level);
-                }
-            }
-            ControlPayload::RegionalMaskHints {
-                country_code,
-                masks,
-            } => {
-                // §2 crowdsourced blocking feedback — opt-in. The server only
-                // ever sends this after k-anonymity-gated aggregation (see
-                // aivpn-server's mask_feedback.rs); ignore entirely unless
-                // the client asked to receive hints.
-                if !self.config.receive_mask_hints {
-                    debug!("RegionalMaskHints received but receive_mask_hints=false — ignoring");
-                    return Ok(());
-                }
-                info!(
-                    "RegionalMaskHints for {}{}: {} masks",
-                    country_code[0] as char,
-                    country_code[1] as char,
-                    masks.len()
-                );
-                // Keep an in-memory copy for `regional_mask_hints()` and
-                // ALSO persist per-region (§2 L3). Mask selection happens in
-                // `main.rs`'s reconnect loop on a fresh client instance one
-                // iteration later, so the bias must read the hints back from
-                // disk (`RegionalHintsStore`).
-                let mut store = RegionalHintsStore::load_default();
-                store.set_region(country_code, masks.clone());
-                self.regional_mask_hints = Some(masks);
-            }
-            ControlPayload::FeedbackConfig {
-                report_failure_threshold,
-                report_interval_secs,
-            } => {
-                // §2 M3 server-pushed config. Persist the tuning so the
-                // reconnect loop (a different client instance) honors it. Only
-                // meaningful to an opted-in client; the server only sends this
-                // in reply to a MaskFeedback, which only opted-in clients emit.
-                info!(
-                    "FeedbackConfig from server: failure_threshold={}, interval={}s",
-                    report_failure_threshold, report_interval_secs
-                );
-                self.feedback_log
-                    .set_tuning(report_failure_threshold, report_interval_secs);
-            }
-            ControlPayload::MaskCatalog { masks } => {
-                // Server pushed the selectable-mask list. Persist it so the GUI
-                // pickers (separate processes) render a live list and mark
-                // auto-generated masks "(авто)".
-                info!("MaskCatalog from server: {} masks", masks.len());
-                crate::mask_catalog::write_mask_catalog(&masks);
-            }
-            _ => {}
-        }
-        Ok(())
     }
 
     /// Send initial handshake packet with eph_pub to establish server-side session
@@ -2790,10 +1245,10 @@ impl AivpnClient {
         let aivpn_packet =
             mimicry.build_packet(&inner_payload, keys, &mut self.counter, Some(&obf))?;
 
-        let socket = self.udp_socket.as_ref().ok_or(Error::Session(
+        let transport = self.transport.as_ref().ok_or(Error::Session(
             "UDP socket not initialized before send_init".into(),
         ))?;
-        socket.send(&aivpn_packet).await?;
+        transport.send(&aivpn_packet).await.map_err(Error::Io)?;
 
         info!("Sent init handshake ({} bytes)", aivpn_packet.len());
         Ok(())
@@ -2808,6 +1263,47 @@ impl AivpnClient {
         } else {
             Err(Error::Session("control_tx not initialized".into()))
         }
+    }
+
+    /// Current server-assigned role (0=User, 1=Viewer, 2=Admin), cached from
+    /// the last `Capabilities` control message. Defaults to 0 (User) until
+    /// one arrives (i.e. before the post-ratchet `Capabilities` push, or for
+    /// a server build that predates it). Delegates to the shared
+    /// `aivpn_common::mgmt::MgmtClient` (P2.R).
+    pub fn cached_role(&self) -> u8 {
+        self.mgmt.cached_role()
+    }
+
+    /// P2.1/P2.R: issue an in-tunnel management API call and await the
+    /// correlated `MgmtResponse`. `method`: 0=GET, 1=POST, 2=PATCH, 3=DELETE,
+    /// 4=PUT (see `ControlPayload::MgmtRequest`). `path` is a curated
+    /// REST-shaped path (e.g. "/api/v1/clients"); `body` is an optional JSON
+    /// payload.
+    ///
+    /// Takes `&self` (not `&mut self`) so it can be called concurrently and
+    /// from an embedder holding only a shared reference (FFI, admin-socket
+    /// bridge) while `run()` holds the exclusive `&mut self` borrow for the
+    /// session loop — this is exactly why the outbound sender
+    /// (`control_tx`, a plain cloneable `mpsc::Sender`) and the correlation
+    /// state (`self.mgmt`, an `aivpn_common::mgmt::MgmtClient`) are
+    /// `Arc`-wrapped / cheaply cloneable rather than requiring exclusive
+    /// access. Works on a normal (non-`control_only`) session: it uses the
+    /// same `control_tx` that `run()`'s upload task drains for every other
+    /// outbound control payload (keepalives, MaskFeedback, ...), so
+    /// `MgmtRequest` rides the identical encrypted path.
+    ///
+    /// Resolves to `(status, body)` on a timely response. Returns an error
+    /// if the outbound control channel isn't initialized yet, the channel is
+    /// closed, or no response arrives within 10s — on timeout the pending
+    /// entry is removed so a very late/duplicate response is dropped by
+    /// `MgmtClient::on_mgmt_response` instead of being misdelivered.
+    pub async fn mgmt_call(&self, method: u8, path: &str, body: Vec<u8>) -> Result<(u16, Vec<u8>)> {
+        let Some(tx) = self.control_tx.as_ref() else {
+            return Err(Error::Session("control_tx not initialized".into()));
+        };
+        self.mgmt
+            .mgmt_call(tx, method, path, body, Duration::from_secs(10))
+            .await
     }
 
     /// Update mask profile
@@ -3007,6 +1503,22 @@ impl AivpnClient {
         self.state == ClientState::Connected
     }
 
+    /// Stable, neutral identifier of the transport carrying this session, for a
+    /// status line ("connected via …").
+    ///
+    /// It is the transport's own `kind` string, nothing more: a build that
+    /// registers no alternative transport can only ever return `"udp"`, so this
+    /// says nothing about how — or whether — any other transport works. There
+    /// is deliberately no separate label for an alternative transport here; any
+    /// distinction a UI needs comes from the transport name in configuration,
+    /// not from this string. `"udp"` before the first connection, too.
+    pub fn transport_kind(&self) -> &'static str {
+        self.transport
+            .as_ref()
+            .map(|t| t.kind().as_str())
+            .unwrap_or(aivpn_common::transport::TransportKind::Udp.as_str())
+    }
+
     /// Get traffic statistics
     pub fn bytes_sent(&self) -> u64 {
         self.bytes_sent.load(Ordering::Relaxed)
@@ -3021,30 +1533,32 @@ impl AivpnClient {
             r#"{{"quality":{},"rtt_ms":{},"jitter_ms":{},"adaptive":{}}}"#,
             score, rtt_ms, jitter_ms, adaptive_level
         );
+        // O_NOFOLLOW/create_new-hardened atomic write (secure_write.rs): this
+        // falls back to a predictable world-writable /tmp path, which a
+        // local attacker could pre-plant as a symlink to a file this
+        // (possibly root-run) process can write.
         #[cfg(windows)]
         {
             let path = std::env::temp_dir().join("aivpn-quality.json");
-            if let Err(e) = std::fs::write(&path, &content) {
-                debug!("quality file write failed: {e}");
+            if !crate::secure_write::write_status_best_effort(&path, content.as_bytes()) {
+                debug!("quality file write failed");
             }
         }
         #[cfg(not(windows))]
         {
             let primary = std::path::PathBuf::from("/var/run/aivpn/quality.json");
             let fallback = std::path::PathBuf::from("/tmp/aivpn-quality.json");
-            let wrote = if let Some(dir) = primary.parent() {
-                if std::fs::create_dir_all(dir).is_ok() {
-                    std::fs::write(&primary, &content).is_ok()
-                } else {
-                    false
-                }
-            } else {
-                false
-            };
-            if !wrote {
-                if let Err(e) = std::fs::write(&fallback, &content) {
-                    debug!("quality file write failed: {e}");
-                }
+            let dir_ok = primary
+                .parent()
+                .map(std::fs::create_dir_all)
+                .map(|r| r.is_ok())
+                .unwrap_or(false);
+            let wrote = dir_ok
+                && crate::secure_write::write_status_best_effort(&primary, content.as_bytes());
+            if !wrote
+                && !crate::secure_write::write_status_best_effort(&fallback, content.as_bytes())
+            {
+                debug!("quality file write failed");
             }
         }
     }
@@ -3165,6 +1679,13 @@ mod tests {
             country_code: None,
             mask_operator_pubkey: None,
             mask_verify_mode: aivpn_common::mask::MaskVerifyMode::default(),
+            network_change_notify: None,
+            is_bootstrap_fallback: false,
+            control_only: false,
+            inbound_control_tap: None,
+            node_identity: None,
+            pool_node_id: None,
+            transport: None,
         }
     }
 
@@ -3281,6 +1802,111 @@ mod tests {
         let config = make_test_config();
         let client = AivpnClient::new(config).expect("new() must not fail");
         assert_eq!(client.bytes_received(), 0);
+    }
+
+    // ── P2.1/P2.R: in-tunnel mgmt client (MgmtRequest/Response correlation) ────
+    // Low-level correlation behavior (pending-map insert/remove, timeout
+    // race, unknown req_id) is exercised directly against
+    // `aivpn_common::mgmt::MgmtClient` in `aivpn-common/src/mgmt.rs`'s own
+    // tests now that P2.R hoisted the implementation there. These tests stay
+    // to prove `AivpnClient` still delegates correctly end-to-end.
+
+    #[test]
+    fn cached_role_defaults_to_user_before_any_capabilities_message() {
+        let config = make_test_config();
+        let client = AivpnClient::new(config).expect("new() must not fail");
+        assert_eq!(client.cached_role(), 0);
+    }
+
+    #[tokio::test]
+    async fn capabilities_control_message_updates_cached_role() {
+        let config = make_test_config();
+        let mut client = AivpnClient::new(config).expect("new() must not fail");
+        assert_eq!(client.cached_role(), 0);
+
+        client
+            .handle_server_control(ControlPayload::Capabilities {
+                role: 2,
+                features: 0,
+            })
+            .await
+            .expect("handle_server_control must not fail on Capabilities");
+
+        assert_eq!(client.cached_role(), 2);
+    }
+
+    #[tokio::test]
+    async fn mgmt_call_sends_request_and_resolves_on_matching_response() {
+        let config = make_test_config();
+        let mut client = AivpnClient::new(config).expect("new() must not fail");
+        let (control_tx, mut control_rx) = mpsc::channel::<ControlPayload>(4);
+        client.control_tx = Some(control_tx);
+
+        // Stand in for the server: receive the MgmtRequest and immediately
+        // hand a MgmtResponse back through the same shared `MgmtClient`
+        // (cloned — internally `Arc`-wrapped) that `handle_server_control`
+        // would deliver a real inbound `MgmtResponse` through.
+        let mgmt = client.mgmt.clone();
+        let responder = tokio::spawn(async move {
+            let sent = control_rx.recv().await.expect("MgmtRequest must be sent");
+            match sent {
+                ControlPayload::MgmtRequest {
+                    req_id,
+                    method,
+                    path,
+                    body,
+                } => {
+                    assert_eq!(method, 0);
+                    assert_eq!(path, "/api/v1/clients");
+                    assert!(body.is_empty());
+                    mgmt.on_mgmt_response(req_id, 200, b"[]".to_vec());
+                }
+                other => panic!("expected MgmtRequest, got {:?}", other),
+            }
+        });
+
+        let (status, body) = client
+            .mgmt_call(0, "/api/v1/clients", vec![])
+            .await
+            .expect("mgmt_call must resolve once the response is delivered");
+
+        responder.await.expect("responder task must not panic");
+        assert_eq!(status, 200);
+        assert_eq!(body, b"[]".to_vec());
+    }
+
+    #[tokio::test]
+    async fn mgmt_call_times_out_when_no_response_arrives() {
+        // Paused virtual time: `mgmt_call`'s internal 10s
+        // `tokio::time::timeout` auto-advances past its deadline as soon as
+        // the runtime is idle, instead of the test waiting 10 real seconds
+        // (same pattern used by the mask-feedback jitter tests above).
+        tokio::time::pause();
+        let config = make_test_config();
+        let mut client = AivpnClient::new(config).expect("new() must not fail");
+        let (control_tx, mut control_rx) = mpsc::channel::<ControlPayload>(4);
+        client.control_tx = Some(control_tx);
+        // Drain the outbound MgmtRequest so the bounded channel never fills,
+        // but never send a MgmtResponse back.
+        let _drainer = tokio::spawn(async move {
+            let _ = control_rx.recv().await;
+        });
+
+        let result = client.mgmt_call(0, "/api/v1/clients", vec![]).await;
+
+        assert!(
+            result.is_err(),
+            "mgmt_call must return an error when no MgmtResponse arrives within the timeout"
+        );
+    }
+
+    #[tokio::test]
+    async fn mgmt_call_errors_immediately_without_control_tx() {
+        let config = make_test_config();
+        let client = AivpnClient::new(config).expect("new() must not fail");
+        // control_tx is None until control_handle()/run() sets it.
+        let result = client.mgmt_call(0, "/api/v1/clients", vec![]).await;
+        assert!(result.is_err());
     }
 
     // ── packet_mdh_len_for_mask ───────────────────────────────────────────────
@@ -4252,7 +2878,10 @@ mod tests {
         // deadlocked the tunnel until the RX-silence watchdog reconnected.
         // The handler must RE-SEND the SAME response (same client eph — the
         // server may commit either copy) encrypted with the OLD keys the
-        // server can still read, then restore the new keys for the uplink.
+        // server can still read — and (M3) the uplink must STAY on the old
+        // keys until the server proves the commit, so the server's inbound
+        // counter keeps sliding with the data stream and every re-sent
+        // response lands inside its ±TAG_WINDOW_SIZE tag band.
         let sent = sent_responses.lock().unwrap_or_else(|e| e.into_inner());
         assert_eq!(
             sent.len(),
@@ -4271,7 +2900,61 @@ mod tests {
             "re-sent response must be encrypted with the OLD keys — the \
              server never committed and cannot read the new ones"
         );
+        let client_rekey_eph_pub = sent[0].0;
         drop(sent);
+        // M3: after the re-send the upload keys must be restored to the OLD
+        // keys (the rekey is still unconfirmed) — the committed new keys sit
+        // staged in `pending_upload_keys` until the server's first new-key
+        // downlink packet proves the commit.
+        assert_eq!(
+            upload_state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .keys
+                .session_key,
+            old_keys.session_key,
+            "while the rekey is unconfirmed the upload must stay on the OLD keys (M3)"
+        );
+        assert_eq!(
+            client.pending_upload_keys.as_ref().map(|k| k.session_key),
+            Some(keys_after_first.session_key),
+            "the committed new keys must be STAGED for the upload path, not yet live"
+        );
+
+        // Simulate the server committing the re-sent response: it derives the
+        // same keys (mirrors session.rs commit_session_rekey) and its first
+        // post-commit downlink packet authenticates under them — which must
+        // promote the staged upload keys.
+        let server_dh_rekey = server_rekey_kp
+            .compute_shared(&client_rekey_eph_pub)
+            .expect("server DH must succeed");
+        let server_new_keys = crypto::derive_session_keys(
+            &server_dh_rekey,
+            Some(&old_keys.session_key),
+            &client_rekey_eph_pub,
+        );
+        let server_new_dl = {
+            let mut k = server_new_keys.clone();
+            k.session_key = server_new_keys.session_key_s2c;
+            k
+        };
+        let mdh_len = client.recv_mdh_len;
+        let control = ControlPayload::Keepalive { send_ts: 0 };
+        let encoded = control.encode().unwrap();
+        let inner = build_inner_packet(InnerType::Control, 0, &encoded);
+        let mut server_send_counter = 0u64;
+        let packet = aivpn_common::client_wire::build_random_mdh_packet(
+            &server_new_dl,
+            &mut server_send_counter,
+            &inner,
+            None,
+            mdh_len,
+        )
+        .unwrap();
+        client
+            .receive_and_write_packet(&packet)
+            .await
+            .expect("post-commit new-key downlink must decode");
         assert_eq!(
             upload_state
                 .lock()
@@ -4279,8 +2962,227 @@ mod tests {
                 .keys
                 .session_key,
             keys_after_first.session_key,
-            "after the re-send the upload keys must be restored to the \
-             committed (new) session keys"
+            "the server's first new-key downlink packet proves the commit — \
+             the staged upload keys must be promoted"
+        );
+        assert!(
+            client.pending_upload_keys.is_none(),
+            "staging must be cleared once promoted"
+        );
+
+        drain_task.abort();
+    }
+
+    /// M3 regression: while the rekey is unconfirmed the client must keep its
+    /// UPLOAD on the old keys — no matter how many data packets it sends — so
+    /// the server's inbound counter keeps sliding with the stream and a
+    /// re-sent rekey response always lands inside the server's
+    /// ±TAG_WINDOW_SIZE tag band. Pre-fix the client switched TX to the new
+    /// keys immediately: at ~170 pps over the server's 3 s retransmit cadence
+    /// the re-sent response's counter was ≥511 past the server's frozen
+    /// old-key counter, every retransmit was dropped on tag lookup, and the
+    /// tunnel only healed via the RX-silence reconnect. The upload counter
+    /// must also stay monotonic across the final switch — resetting it would
+    /// reuse (key, nonce) pairs the old key already consumed.
+    #[tokio::test]
+    async fn test_rekey_upload_stays_on_old_keys_until_server_commits() {
+        let config = make_test_config();
+        let mut client = AivpnClient::new(config).expect("new() must not fail");
+
+        let old_client_kp = crypto::KeyPair::generate();
+        let old_server_kp = crypto::KeyPair::generate();
+        let dh_old = old_client_kp
+            .compute_shared(&old_server_kp.public_key_bytes())
+            .unwrap();
+        let mut old_keys =
+            crypto::derive_session_keys(&dh_old, None, &old_client_kp.public_key_bytes());
+        // Equalise directional keys: these tests build server-sim packets with the
+        // C2S encode helper and decode them client-side; the split itself is
+        // covered by `directional_keys_differ` + the live tunnel.
+        old_keys.session_key_s2c = old_keys.session_key;
+        client.session_keys = Some(old_keys.clone());
+
+        let (control_tx, mut control_rx) = mpsc::channel::<ControlPayload>(4);
+        client.control_tx = Some(control_tx);
+        let upload_state = Arc::new(Mutex::new(UploadCryptoState {
+            keys: old_keys.clone(),
+            counter: 0,
+            seq: 0,
+            rekey_ack: VecDeque::new(),
+        }));
+        client.upload_state = Some(upload_state.clone());
+        let captured_client_eph: Arc<Mutex<Option<[u8; 32]>>> = Arc::new(Mutex::new(None));
+        let drain_capture = captured_client_eph.clone();
+        let drain_upload_state = upload_state.clone();
+        let drain_task = tokio::spawn(async move {
+            while let Some(payload) = control_rx.recv().await {
+                let mut state = drain_upload_state.lock().unwrap_or_else(|e| e.into_inner());
+                if let ControlPayload::KeyRotate { new_eph_pub } = payload {
+                    *drain_capture.lock().unwrap_or_else(|e| e.into_inner()) = Some(new_eph_pub);
+                    if let Some(ack) = state.rekey_ack.pop_front() {
+                        let _ = ack.send(());
+                    }
+                }
+            }
+        });
+
+        let server_rekey_kp = crypto::KeyPair::generate();
+        client
+            .handle_server_control(ControlPayload::KeyRotate {
+                new_eph_pub: server_rekey_kp.public_key_bytes(),
+            })
+            .await
+            .expect("KeyRotate handling must not fail");
+
+        let new_session_key = client.session_keys.as_ref().unwrap().session_key;
+        assert_ne!(new_session_key, old_keys.session_key);
+        assert_eq!(
+            upload_state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .keys
+                .session_key,
+            old_keys.session_key,
+            "M3: upload must STAY on the old keys until the server proves the commit"
+        );
+
+        // Simulate a heavy upload burst while the server's retransmit is in
+        // flight: 1000 data packets go out under the STILL-OLD keys, each
+        // bumping the shared monotonic upload counter (the server keeps
+        // validating them, so its expected-tag band slides along).
+        {
+            let mut state = upload_state.lock().unwrap_or_else(|e| e.into_inner());
+            state.counter += 1000;
+            assert_eq!(
+                state.keys.session_key, old_keys.session_key,
+                "upload volume must not force a key switch while unconfirmed"
+            );
+        }
+
+        // The server commits (it received a re-sent response) and switches its
+        // downlink to the new keys — the first such packet promotes the staged
+        // upload keys.
+        let client_rekey_eph_pub = captured_client_eph
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .expect("response must have been observed by the simulated upload task");
+        let server_dh_rekey = server_rekey_kp
+            .compute_shared(&client_rekey_eph_pub)
+            .expect("server DH must succeed");
+        let server_new_keys = crypto::derive_session_keys(
+            &server_dh_rekey,
+            Some(&old_keys.session_key),
+            &client_rekey_eph_pub,
+        );
+        let server_new_dl = {
+            let mut k = server_new_keys.clone();
+            k.session_key = server_new_keys.session_key_s2c;
+            k
+        };
+        assert_eq!(new_session_key, server_new_keys.session_key);
+        let mdh_len = client.recv_mdh_len;
+        let control = ControlPayload::Keepalive { send_ts: 0 };
+        let encoded = control.encode().unwrap();
+        let inner = build_inner_packet(InnerType::Control, 0, &encoded);
+        let mut server_send_counter = 0u64;
+        let packet = aivpn_common::client_wire::build_random_mdh_packet(
+            &server_new_dl,
+            &mut server_send_counter,
+            &inner,
+            None,
+            mdh_len,
+        )
+        .unwrap();
+        client
+            .receive_and_write_packet(&packet)
+            .await
+            .expect("post-commit new-key downlink must decode");
+
+        let state = upload_state.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(
+            state.keys.session_key, new_session_key,
+            "commit proof must promote the staged upload keys"
+        );
+        assert_eq!(
+            state.counter, 1000,
+            "upload counter must stay monotonic across the key switch — no (key, nonce) reuse"
+        );
+        drop(state);
+        assert!(client.pending_upload_keys.is_none());
+
+        drain_task.abort();
+    }
+
+    /// M3 fallback: if the server never proves the commit before the
+    /// transition window closes (e.g. every retransmit was lost AND its final
+    /// give-up leaves it on the old keys), the staged upload keys are still
+    /// promoted when the window closes, so TX matches the RX keys — a truly
+    /// unconverged rekey then falls through to the data watchdog and a clean
+    /// reconnect instead of lingering with divergent directions.
+    #[tokio::test]
+    async fn test_rekey_pending_upload_keys_promoted_at_transition_deadline() {
+        let config = make_test_config();
+        let mut client = AivpnClient::new(config).expect("new() must not fail");
+
+        let old_client_kp = crypto::KeyPair::generate();
+        let old_server_kp = crypto::KeyPair::generate();
+        let dh_old = old_client_kp
+            .compute_shared(&old_server_kp.public_key_bytes())
+            .unwrap();
+        let mut old_keys =
+            crypto::derive_session_keys(&dh_old, None, &old_client_kp.public_key_bytes());
+        old_keys.session_key_s2c = old_keys.session_key;
+        client.session_keys = Some(old_keys.clone());
+
+        let (control_tx, mut control_rx) = mpsc::channel::<ControlPayload>(4);
+        client.control_tx = Some(control_tx);
+        let upload_state = Arc::new(Mutex::new(UploadCryptoState {
+            keys: old_keys.clone(),
+            counter: 0,
+            seq: 0,
+            rekey_ack: VecDeque::new(),
+        }));
+        client.upload_state = Some(upload_state.clone());
+        let drain_upload_state = upload_state.clone();
+        let drain_task = tokio::spawn(async move {
+            while let Some(payload) = control_rx.recv().await {
+                if matches!(payload, ControlPayload::KeyRotate { .. }) {
+                    let mut state = drain_upload_state.lock().unwrap_or_else(|e| e.into_inner());
+                    if let Some(ack) = state.rekey_ack.pop_front() {
+                        let _ = ack.send(());
+                    }
+                }
+            }
+        });
+
+        let server_rekey_kp = crypto::KeyPair::generate();
+        client
+            .handle_server_control(ControlPayload::KeyRotate {
+                new_eph_pub: server_rekey_kp.public_key_bytes(),
+            })
+            .await
+            .expect("KeyRotate handling must not fail");
+        let new_session_key = client.session_keys.as_ref().unwrap().session_key;
+        assert!(client.pending_upload_keys.is_some());
+
+        // Force the transition window shut; any received packet trips the
+        // deadline cleanup — even an undecodable one.
+        client.transition_recv_deadline = Some(Instant::now() - Duration::from_secs(1));
+        let garbage = vec![0xABu8; 64];
+        let _ = client.receive_and_write_packet(&garbage).await;
+
+        assert!(
+            client.pending_upload_keys.is_none(),
+            "staging must be flushed when the transition window closes"
+        );
+        assert_eq!(
+            upload_state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .keys
+                .session_key,
+            new_session_key,
+            "deadline fallback must align TX with the RX keys"
         );
 
         drain_task.abort();
@@ -4438,7 +3340,7 @@ mod tests {
         let server_dh_rekey = server_rekey_kp
             .compute_shared(&client_new_eph_pub)
             .expect("server DH must succeed");
-        let mut server_new_keys = crypto::derive_session_keys(
+        let server_new_keys = crypto::derive_session_keys(
             &server_dh_rekey,
             Some(&old_keys.session_key),
             &client_new_eph_pub,

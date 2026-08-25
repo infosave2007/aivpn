@@ -12,7 +12,10 @@
 
   const deleteMut = createMutation({
     mutationFn: (name: string) => masksApi.delete(name),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ['masks'] }),
+    onSuccess: () => { uploadError = ''; qc.invalidateQueries({ queryKey: ['masks'] }); },
+    // masksApi.delete now throws on non-2xx (e.g. 403 for viewer role, 502
+    // daemon-down) — surface it instead of silently keeping the row.
+    onError: (e: Error) => { uploadError = e.message; },
   });
 
   async function handleUpload(e: Event) {
@@ -111,7 +114,7 @@
                   {#if mask.generated}
                     <span
                       class="px-1.5 py-0.5 rounded text-[10px] font-medium bg-indigo-100 text-indigo-700 dark:bg-indigo-900/40 dark:text-indigo-300"
-                      title="Auto-generated from a recording">(авто)</span
+                      title="Auto-generated from a recording">(auto)</span
                     >
                   {/if}
                 </div>

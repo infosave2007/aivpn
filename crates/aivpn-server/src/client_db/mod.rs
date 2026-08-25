@@ -10,84 +10,16 @@ use chrono::{DateTime, Utc};
 use parking_lot::{Mutex, RwLock};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
 use aivpn_common::error::{Error, Result};
 use aivpn_common::network_config::VpnNetworkConfig;
 
-/// Client configuration and credentials
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ClientConfig {
-    /// Unique client ID (UUID-like hex string)
-    pub id: String,
-    /// Human-readable name
-    pub name: String,
-    /// Pre-shared key (32 bytes, base64-encoded in JSON).
-    /// SECURITY: never return `ClientConfig` directly from API handlers — use `ClientResponse`
-    /// instead, which explicitly excludes this field.
-    #[serde(with = "base64_bytes")]
-    pub psk: [u8; 32],
-    /// Assigned static VPN IP
-    pub vpn_ip: Ipv4Addr,
-    /// Whether client is enabled
-    pub enabled: bool,
-    /// Creation timestamp
-    pub created_at: DateTime<Utc>,
-    /// Traffic and connection statistics
-    pub stats: ClientStats,
-    /// Per-client QoS / bandwidth settings (0.8.0+, optional for backward compat)
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub qos: Option<crate::qos::ClientQos>,
-    /// Static X25519 device public key bound to this client (0.9.0+).
-    /// None = any device may connect; Some = only the enrolled device may connect.
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        with = "opt_base64_bytes"
-    )]
-    pub device_pubkey: Option<[u8; 32]>,
-    /// When true, the first connecting device's static key is auto-bound (one-time enrollment).
-    #[serde(default)]
-    pub one_time: bool,
-    /// Optional expiry timestamp. When set and in the past, the client cannot connect.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub expires_at: Option<DateTime<Utc>>,
-    /// Last-modified timestamp, used for last-writer-wins conflict resolution
-    /// in pool sync (`merge_from_json`). `None` on records written by older
-    /// versions — treated as "older than any timestamped record".
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub updated_at: Option<DateTime<Utc>>,
-    /// Tombstone: the client was deleted locally. The record is kept (and
-    /// synced) so the deletion propagates convergently through the pool — a
-    /// peer's stale live copy must not resurrect a revoked client. Tombstoned
-    /// clients are invisible to all lookup/list paths.
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub deleted: bool,
-}
+mod model;
+pub use model::*;
 
-fn is_false(b: &bool) -> bool {
-    !*b
-}
-
-/// How long a tombstone (deleted client record) is kept before being hard-
-/// deleted. Must be well beyond any plausible pool-node downtime so every
-/// peer receives the revocation first — a peer that was offline less than
-/// this still converges on the tombstone via pool sync. Without a TTL,
-/// tombstones accumulate forever: `clients.json` and every 5-second sync
-/// payload grow unbounded, and revoked records would otherwise pin state
-/// permanently.
-const TOMBSTONE_TTL: chrono::Duration = chrono::Duration::days(30);
-
-/// Drop tombstones older than [`TOMBSTONE_TTL`] (by `updated_at`, i.e. the
-/// deletion time). Untimestamped tombstones (written by pre-`updated_at`
-/// versions) are kept — they cannot be aged, and are rare enough not to
-/// matter for growth. Returns `true` if anything was removed.
-fn reap_expired_tombstones(clients: &mut Vec<ClientConfig>) -> bool {
-    let cutoff = Utc::now() - TOMBSTONE_TTL;
-    let before = clients.len();
-    clients.retain(|c| !(c.deleted && c.updated_at.is_some_and(|t| t < cutoff)));
-    before != clients.len()
-}
+mod merge;
+pub use merge::*;
 
 /// Parameters for `ClientDatabase::update_client`.
 /// Fields set to `None` are left unchanged.
@@ -100,21 +32,24 @@ pub struct UpdateClientParams {
     pub qos: Option<Option<crate::qos::ClientQos>>,
     /// None = leave unchanged; Some(None) = clear; Some(Some(dt)) = set expiry
     pub expires_at: Option<Option<DateTime<Utc>>>,
-}
-
-/// Per-client traffic statistics
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct ClientStats {
-    pub bytes_in: u64,
-    pub bytes_out: u64,
-    pub last_connected: Option<DateTime<Utc>>,
-    pub total_connections: u64,
-    pub last_handshake: Option<DateTime<Utc>>,
+    /// None = leave unchanged. Setting `Viewer`/`Admin` requires the client
+    /// to already be (or be simultaneously, via `device_pubkey` — not
+    /// exposed here, see `update_client`) device-bound; enforced atomically
+    /// in `update_client`.
+    pub role: Option<ClientRole>,
+    /// None = leave unchanged; Some(None) = clear (fall back to the global
+    /// default `pool.exit_node`); Some(Some(addr)) = set this client's
+    /// exit-node override. `addr` must be `host:port` — validated in
+    /// `update_client` via `validate_exit_node_addr`. Unlike `role`, this
+    /// carries NO device-binding requirement: it's a routing preference an
+    /// Admin sets on behalf of a client, not a privilege the client itself
+    /// is granted.
+    pub exit_node: Option<Option<String>>,
 }
 
 /// Persistent client database
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct ClientDbFile {
+pub(crate) struct ClientDbFile {
     clients: Vec<ClientConfig>,
     /// Next host offset within the configured VPN subnet to assign.
     #[serde(default = "default_next_host_offset", alias = "next_octet")]
@@ -134,12 +69,29 @@ impl Default for ClientDbFile {
     }
 }
 
+mod ip_allocation;
+pub use ip_allocation::*;
+
 /// Thread-safe client database with file persistence
 pub struct ClientDatabase {
     data: RwLock<ClientDbFile>,
     file_path: PathBuf,
     network_config: VpnNetworkConfig,
+    /// This node's hard VPN-IP partition, if pool sync is configured — see
+    /// `set_node_partition`. `None` (default / single-node / legacy) means
+    /// `allocate_vpn_ip` uses the whole subnet, exactly as before Wave B-IP.
+    partition: RwLock<Option<PartitionBounds>>,
     last_mtime: Mutex<Option<std::time::SystemTime>>,
+    /// data-plane H4: `save()`'s temp file name is PID-only, so two
+    /// concurrent `save()` calls in the SAME process (e.g. an admin update
+    /// racing a pool-sync merge or a batched stats flush — all take only a
+    /// shared read lock on `data`, so nothing stops them overlapping) write
+    /// the identical temp path and race on rename order. Whichever rename
+    /// lands last wins even if its snapshot was taken first — a silent lost
+    /// update. Serializing the full read → serialize → write → rename
+    /// sequence behind this mutex makes concurrent saves happen in a strict
+    /// order matching call order, so the most recent save always wins.
+    save_lock: Mutex<()>,
 }
 
 impl ClientDatabase {
@@ -174,12 +126,18 @@ impl ClientDatabase {
             data: RwLock::new(data),
             file_path: file_path.to_path_buf(),
             network_config,
+            partition: RwLock::new(None),
             last_mtime,
+            save_lock: Mutex::new(()),
         })
     }
 
     /// Save database to file
     pub fn save(&self) -> Result<()> {
+        // data-plane H4: serialize the whole read → write → rename sequence
+        // so concurrent callers (admin API update, pool-sync merge, batched
+        // stats flush) can never race the same temp file / rename target.
+        let _save_guard = self.save_lock.lock();
         let data = self.data.read();
         let content = serde_json::to_string_pretty(&*data)
             .map_err(|e| Error::Session(format!("Failed to serialize client DB: {}", e)))?;
@@ -190,6 +148,21 @@ impl ClientDatabase {
             .with_extension(format!("{}.tmp", std::process::id()));
         std::fs::write(&tmp_path, &content)
             .map_err(|e| Error::Session(format!("Failed to write client DB: {}", e)))?;
+        // server-sec HIGH4: clients.json holds every client's PSK in
+        // plaintext (base64). std::fs::write() creates the file with the
+        // process umask (commonly 0644 under root) — world/group readable.
+        // Harden the temp file BEFORE the rename makes it visible at the
+        // real path, so there is no window where the final file is
+        // reachable with lax permissions.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Err(e) =
+                std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o600))
+            {
+                warn!("Failed to set clients DB permissions to 0600: {}", e);
+            }
+        }
         std::fs::rename(&tmp_path, &self.file_path)
             .map_err(|e| Error::Session(format!("Failed to rename client DB: {}", e)))?;
 
@@ -201,8 +174,42 @@ impl ClientDatabase {
         Ok(())
     }
 
+    /// Validate that `content` deserializes as a well-formed clients-DB JSON
+    /// document, without loading it into a live database. Used by backup
+    /// import (`backup.rs`) to reject a corrupt or malicious `clients.json`
+    /// BEFORE it is ever written into the live, hot-reloaded config
+    /// directory (data-plane H5).
+    pub(crate) fn validate_json(content: &[u8]) -> Result<()> {
+        if content.iter().all(|b| b.is_ascii_whitespace()) {
+            return Ok(()); // treated as an empty DB, same as `load()`
+        }
+        serde_json::from_slice::<ClientDbFile>(content)
+            .map(|_| ())
+            .map_err(|e| Error::Session(format!("Failed to parse client DB: {}", e)))
+    }
+
     /// Add a new client, returns the generated config
     pub fn add_client(&self, name: &str) -> Result<ClientConfig> {
+        self.add_client_inner(name, None)
+    }
+
+    /// Add a new client already bound to `device_pubkey` at creation time.
+    ///
+    /// Unlike `add_client`, the returned (and persisted) record has
+    /// `device_pubkey: Some(..)` from the start, so it can be elevated to
+    /// `Viewer`/`Admin` via `update_client` immediately — no separate
+    /// `enroll_device` round trip needed. Used by the SSH installer
+    /// (Phase C) to create a device-bound admin client for the installing
+    /// app in one shot.
+    pub fn add_client_bound(&self, name: &str, device_pubkey: [u8; 32]) -> Result<ClientConfig> {
+        self.add_client_inner(name, Some(device_pubkey))
+    }
+
+    fn add_client_inner(
+        &self,
+        name: &str,
+        device_pubkey: Option<[u8; 32]>,
+    ) -> Result<ClientConfig> {
         let mut data = self.data.write();
 
         // Check name uniqueness (tombstones don't hold their name)
@@ -233,11 +240,13 @@ impl ClientDatabase {
             created_at: Utc::now(),
             stats: ClientStats::default(),
             qos: None,
-            device_pubkey: None,
+            device_pubkey,
             one_time: false,
             expires_at: None,
             updated_at: Some(Utc::now()),
             deleted: false,
+            role: ClientRole::User,
+            exit_node: None,
         };
 
         data.clients.push(client.clone());
@@ -250,6 +259,28 @@ impl ClientDatabase {
     /// Add a new one-time enrollment client — the first device to connect will be auto-bound.
     pub fn add_client_one_time(&self, name: &str) -> Result<ClientConfig> {
         let mut client = self.add_client(name)?;
+        {
+            let mut data = self.data.write();
+            if let Some(c) = data.clients.iter_mut().find(|c| c.id == client.id) {
+                c.one_time = true;
+                client.one_time = true;
+            }
+        }
+        self.save()?;
+        Ok(client)
+    }
+
+    /// Add a new one-time enrollment client already bound to `device_pubkey`
+    /// at creation time. Combines `add_client_bound` with the `one_time`
+    /// flag: since the device is already known, this mainly buys strict
+    /// per-device mismatch enforcement on re-enroll (same as a client that
+    /// was auto-bound via the classic one-time flow).
+    pub fn add_client_one_time_bound(
+        &self,
+        name: &str,
+        device_pubkey: [u8; 32],
+    ) -> Result<ClientConfig> {
+        let mut client = self.add_client_bound(name, device_pubkey)?;
         {
             let mut data = self.data.write();
             if let Some(c) = data.clients.iter_mut().find(|c| c.id == client.id) {
@@ -491,19 +522,26 @@ impl ClientDatabase {
         let mut data = self.data.write();
 
         // Check if anything actually changed in the client configuration.
-        // PSK must be part of the signature so secret rotation takes effect
-        // without requiring a full server restart.
-        let old_sig: std::collections::HashSet<(String, String, [u8; 32], Ipv4Addr, bool)> = data
+        // The signature must cover EVERY synced field (via the same
+        // canonical-field digest pool sync uses — see
+        // `merge::client_record_digest`), not just (id, name, psk, vpn_ip,
+        // enabled): otherwise an external edit that touches only
+        // device_pubkey / one_time / qos / role / expires_at / exit_node
+        // (e.g. a sibling `aivpn-server --reset-device` / `--set-client-qos`
+        // process) is never applied, AND `reload_if_changed` still consumes
+        // the mtime, so the change would never be picked up at all.
+        // vpn_ip rides alongside the digest because it is deliberately not
+        // part of the pool-sync canonical field set (re-homed on conflict).
+        let old_sig: std::collections::HashMap<String, ([u8; 32], Ipv4Addr)> = data
             .clients
             .iter()
-            .map(|c| (c.id.clone(), c.name.clone(), c.psk, c.vpn_ip, c.enabled))
+            .map(|c| (c.id.clone(), (merge::client_record_digest(c), c.vpn_ip)))
             .collect();
-        let new_sig: std::collections::HashSet<(String, String, [u8; 32], Ipv4Addr, bool)> =
-            new_data
-                .clients
-                .iter()
-                .map(|c| (c.id.clone(), c.name.clone(), c.psk, c.vpn_ip, c.enabled))
-                .collect();
+        let new_sig: std::collections::HashMap<String, ([u8; 32], Ipv4Addr)> = new_data
+            .clients
+            .iter()
+            .map(|c| (c.id.clone(), (merge::client_record_digest(c), c.vpn_ip)))
+            .collect();
         let changed = old_sig != new_sig;
 
         if !changed {
@@ -537,130 +575,6 @@ impl ClientDatabase {
         Ok(true)
     }
 
-    /// Log an error for any duplicate VPN IPs found in the client list.
-    /// Does not modify the list — the caller decides how to handle duplicates.
-    fn warn_duplicate_vpn_ips(clients: &[ClientConfig]) {
-        let mut seen: std::collections::HashMap<Ipv4Addr, &str> = std::collections::HashMap::new();
-        for client in clients {
-            // Tombstones don't hold their IP (it may have been legitimately
-            // reassigned by allocate_vpn_ip) and never get a session.
-            if client.deleted {
-                continue;
-            }
-            if let Some(first_name) = seen.get(&client.vpn_ip) {
-                error!(
-                    "Duplicate VPN IP {} assigned to clients '{}' and '{}'. \
-                     The second connecting client will evict the first session. \
-                     Fix clients.json to resolve this conflict.",
-                    client.vpn_ip, first_name, client.name
-                );
-            } else {
-                seen.insert(client.vpn_ip, &client.name);
-            }
-        }
-    }
-
-    /// Merge clients received from a pool peer into the local database.
-    /// Upserts by client ID — adds new clients, updates existing ones if PSK matches.
-    ///
-    /// Convergent revocation: local deletions are tombstones (see
-    /// `remove_client`) and revocation is STICKY — an incoming tombstone
-    /// always beats a live local record, and a local tombstone is never
-    /// overwritten by a live incoming record, regardless of timestamps (a
-    /// clock-skewed or later admin edit on a peer must not un-revoke).
-    /// Between records of the same liveness, conflicts are resolved
-    /// last-writer-wins on `updated_at`. Records without `updated_at` (older
-    /// peer versions) are treated as older than any timestamped record;
-    /// between two untimestamped live records the legacy overwrite behavior
-    /// is kept.
-    ///
-    /// Tombstones past `TOMBSTONE_TTL` are reaped at the end of every merge
-    /// (and at load), so `clients.json` and the sync payload stay bounded.
-    ///
-    /// Returns the number of clients merged.
-    pub fn merge_from_json(&self, json: &str) -> Result<usize> {
-        let incoming: Vec<ClientConfig> = serde_json::from_str(json)
-            .map_err(|e| Error::Session(format!("merge_from_json parse: {}", e)))?;
-        let mut data = self.data.write();
-        let mut merged = 0usize;
-        for inc in incoming {
-            if let Some(existing) = data.clients.iter_mut().find(|c| c.id == inc.id) {
-                // Only update if PSK matches (same logical client)
-                if existing.psk == inc.psk {
-                    // Revocation is STICKY: timestamps decide only between two
-                    // records of the same liveness. A tombstone always beats a
-                    // live record — otherwise a peer's later admin edit (or a
-                    // fast-skewed clock) could out-timestamp the tombstone and
-                    // silently un-revoke the client pool-wide. Concretely:
-                    //  - local tombstone: only a strictly-newer incoming
-                    //    tombstone (a re-issued deletion) may replace it;
-                    //  - incoming tombstone vs live local: always wins;
-                    //  - live vs live: normal last-writer-wins on `updated_at`.
-                    let strictly_newer = match (inc.updated_at, existing.updated_at) {
-                        (Some(i), Some(e)) => i > e,
-                        (Some(_), None) => true,
-                        (None, _) => false,
-                    };
-                    let incoming_wins = match (existing.deleted, inc.deleted) {
-                        (true, false) => false,
-                        (false, true) => true,
-                        (true, true) => strictly_newer,
-                        // Between two untimestamped live records the legacy
-                        // overwrite behavior is kept.
-                        (false, false) => {
-                            strictly_newer
-                                || (inc.updated_at.is_none() && existing.updated_at.is_none())
-                        }
-                    };
-                    if !incoming_wins {
-                        continue;
-                    }
-                    existing.name = inc.name;
-                    // A deleted record is never "enabled", whatever the peer sent.
-                    existing.enabled = inc.enabled && !inc.deleted;
-                    existing.qos = inc.qos;
-                    existing.deleted = inc.deleted;
-                    existing.updated_at = inc.updated_at;
-                    merged += 1;
-                }
-            } else if inc.deleted {
-                // Unknown id arriving already tombstoned: keep the tombstone so
-                // the deletion keeps propagating through the pool. No IP
-                // conflict check — tombstones are invisible to lookups.
-                data.clients.push(inc);
-                merged += 1;
-            } else {
-                // H-S-2: Reject incoming records whose vpn_ip is already
-                // assigned to a *different* client — prevents pool sync from
-                // overwriting IP assignments and causing routing collisions.
-                // Tombstones don't hold their IP (allocate_vpn_ip may have
-                // reassigned it), so they don't conflict.
-                let ip_conflict = data
-                    .clients
-                    .iter()
-                    .any(|c| c.vpn_ip == inc.vpn_ip && c.id != inc.id && !c.deleted);
-                if ip_conflict {
-                    warn!(
-                        "merge_from_json: skipping client '{}' — vpn_ip {} already assigned to another client",
-                        inc.id, inc.vpn_ip
-                    );
-                    continue;
-                }
-                data.clients.push(inc);
-                merged += 1;
-            }
-        }
-        // Reap AFTER the merge loop: an expired tombstone a peer still
-        // advertises is re-added above and immediately dropped here, so it
-        // can't ping-pong back into the database forever.
-        let reaped = reap_expired_tombstones(&mut data.clients);
-        drop(data);
-        if merged > 0 || reaped {
-            self.save()?;
-        }
-        Ok(merged)
-    }
-
     /// Export the full client list as JSON (for pool sync or backup).
     pub fn export_json(&self) -> Result<String> {
         let data = self.data.read();
@@ -681,6 +595,9 @@ impl ClientDatabase {
                 return Err(Error::Session("Client name must not be empty".into()));
             }
         }
+        if let Some(Some(ref addr)) = params.exit_node {
+            validate_exit_node_addr(addr)?;
+        }
         let mut data = self.data.write();
         if let Some(ref new_name) = params.name {
             if data
@@ -699,6 +616,18 @@ impl ClientDatabase {
             .iter_mut()
             .find(|c| c.id == client_id && !c.deleted)
             .ok_or_else(|| Error::Session(format!("Client '{}' not found", client_id)))?;
+        // Elevating to Viewer/Admin requires the client to already be
+        // device-bound: role is only ever authenticated via the connecting
+        // device's static key during the handshake, so granting it to a
+        // PSK-only (not-yet-bound) client would be a privilege that can
+        // never actually be proven to belong to whoever shows up with the
+        // PSK. Checked against the CURRENT `device_pubkey` — this call never
+        // sets one, so there is no ordering trick to bypass it.
+        if let Some(role) = params.role {
+            if role != ClientRole::User && client.device_pubkey.is_none() {
+                return Err(Error::Session("role requires device binding".into()));
+            }
+        }
         if let Some(name) = params.name {
             client.name = name;
         }
@@ -713,6 +642,12 @@ impl ClientDatabase {
         }
         if let Some(expires_at) = params.expires_at {
             client.expires_at = expires_at;
+        }
+        if let Some(role) = params.role {
+            client.role = role;
+        }
+        if let Some(exit_node) = params.exit_node {
+            client.exit_node = exit_node;
         }
         client.updated_at = Some(Utc::now());
         let updated = client.clone();
@@ -738,139 +673,18 @@ impl ClientDatabase {
             None => Err(Error::Session(format!("Client '{}' not found", client_id))),
         }
     }
-
-    fn allocate_vpn_ip(&self, data: &mut ClientDbFile) -> Result<Ipv4Addr> {
-        let max_host_offset = self.network_config.max_host_offset();
-        if max_host_offset < 1 {
-            return Err(Error::Session(
-                "Configured VPN subnet has no usable host addresses".into(),
-            ));
-        }
-
-        let mut candidate_offset = if data.next_host_offset == 0 {
-            default_next_host_offset()
-        } else {
-            data.next_host_offset
-        };
-
-        for _ in 0..max_host_offset {
-            if let Some(candidate_ip) = self.network_config.ip_for_host_offset(candidate_offset) {
-                // Tombstoned (revoked) clients don't hold their VPN IP:
-                // counting them would permanently leak one address per
-                // lifetime revocation and eventually exhaust the subnet with
-                // zero active clients. All data-plane lookups
-                // (find_by_vpn_ip / find_by_psk) already ignore tombstones,
-                // and merge_from_json's IP-conflict check does too, so
-                // reusing the address is safe.
-                let already_used = data
-                    .clients
-                    .iter()
-                    .any(|client| client.vpn_ip == candidate_ip && !client.deleted);
-                if candidate_ip != self.network_config.server_vpn_ip && !already_used {
-                    data.next_host_offset = if candidate_offset >= max_host_offset {
-                        1
-                    } else {
-                        candidate_offset + 1
-                    };
-                    return Ok(candidate_ip);
-                }
-            }
-
-            candidate_offset = if candidate_offset >= max_host_offset {
-                1
-            } else {
-                candidate_offset + 1
-            };
-        }
-
-        Err(Error::Session(
-            "No more VPN IPs available in configured subnet".into(),
-        ))
-    }
 }
 
-/// Custom serde for Option<[u8; 32]> as base64 string or null
-mod opt_base64_bytes {
-    use serde::{Deserialize, Deserializer, Serialize, Serializer};
-
-    pub fn serialize<S: Serializer>(
-        bytes: &Option<[u8; 32]>,
-        serializer: S,
-    ) -> std::result::Result<S::Ok, S::Error> {
-        use base64::Engine;
-        match bytes {
-            Some(b) => {
-                let b64 = base64::engine::general_purpose::STANDARD.encode(b);
-                b64.serialize(serializer)
-            }
-            None => serializer.serialize_none(),
-        }
-    }
-
-    pub fn deserialize<'de, D: Deserializer<'de>>(
-        deserializer: D,
-    ) -> std::result::Result<Option<[u8; 32]>, D::Error> {
-        use base64::Engine;
-        let opt: Option<String> = Option::deserialize(deserializer)?;
-        match opt {
-            None => Ok(None),
-            Some(s) => {
-                let bytes = base64::engine::general_purpose::STANDARD
-                    .decode(&s)
-                    .map_err(serde::de::Error::custom)?;
-                if bytes.len() != 32 {
-                    return Err(serde::de::Error::custom(format!(
-                        "device_pubkey must be 32 bytes, got {}",
-                        bytes.len()
-                    )));
-                }
-                let mut arr = [0u8; 32];
-                arr.copy_from_slice(&bytes);
-                Ok(Some(arr))
-            }
-        }
-    }
-}
-
-/// Custom serde module for [u8; 32] as base64
-mod base64_bytes {
-    use serde::{Deserialize, Deserializer, Serialize, Serializer};
-
-    pub fn serialize<S: Serializer>(
-        bytes: &[u8; 32],
-        serializer: S,
-    ) -> std::result::Result<S::Ok, S::Error> {
-        use base64::Engine;
-        let b64 = base64::engine::general_purpose::STANDARD.encode(bytes);
-        b64.serialize(serializer)
-    }
-
-    pub fn deserialize<'de, D: Deserializer<'de>>(
-        deserializer: D,
-    ) -> std::result::Result<[u8; 32], D::Error> {
-        use base64::Engine;
-        let s = String::deserialize(deserializer)?;
-        let bytes = base64::engine::general_purpose::STANDARD
-            .decode(&s)
-            .map_err(serde::de::Error::custom)?;
-        if bytes.len() != 32 {
-            return Err(serde::de::Error::custom(format!(
-                "PSK must be 32 bytes, got {}",
-                bytes.len()
-            )));
-        }
-        let mut arr = [0u8; 32];
-        arr.copy_from_slice(&bytes);
-        Ok(arr)
-    }
-}
-
+/// Shared test fixtures used by `client_db` and all of its submodules
+/// (`model`, `ip_allocation`, `merge`) — a single source of truth so every
+/// submodule's tests build against the identical network config instead of
+/// N duplicated copies drifting apart. See `mgmt_service::test_support` for
+/// the same pattern used by that module's decomposition.
 #[cfg(test)]
-mod tests {
+pub(crate) mod test_support {
     use super::*;
-    use std::time::Duration;
 
-    fn test_network_config() -> VpnNetworkConfig {
+    pub(crate) fn test_network_config() -> VpnNetworkConfig {
         VpnNetworkConfig {
             server_vpn_ip: Ipv4Addr::new(10, 99, 0, 1),
             prefix_len: 24,
@@ -879,6 +693,13 @@ mod tests {
             ..Default::default()
         }
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_support::test_network_config;
+    use super::*;
+    use std::time::Duration;
 
     #[test]
     fn load_treats_empty_file_as_empty_database() {
@@ -948,139 +769,292 @@ mod tests {
         assert_eq!(reloaded.stats.bytes_out, 222);
     }
 
-    /// MED-2 regression: a peer's later (or clock-skewed) live edit must not
-    /// out-timestamp and silently reverse a revocation.
+    /// Regression: the reload change-signature must cover ALL synced fields,
+    /// not just (id, name, psk, vpn_ip, enabled). A sibling process running
+    /// `--reset-device` (device_pubkey + one_time) or `--set-client-qos`
+    /// (qos), or a manual edit of role/expires_at/exit_node, used to leave
+    /// the signature unchanged — and since `reload_if_changed` consumes the
+    /// mtime anyway, the edit would NEVER be applied without a restart.
     #[test]
-    fn merge_never_unrevokes_a_local_tombstone() {
+    fn reload_if_changed_applies_external_qos_role_and_device_edits() {
         let dir = tempfile::tempdir().unwrap();
-        let db =
-            ClientDatabase::load(&dir.path().join("clients.json"), test_network_config()).unwrap();
+        let db_path = dir.path().join("clients.json");
+        let db = ClientDatabase::load(&db_path, test_network_config()).unwrap();
 
         let client = db.add_client("alice").unwrap();
-        db.remove_client(&client.id).unwrap();
 
-        // Peer record: same client, live, timestamped WELL AFTER the tombstone
-        // (e.g. a QoS edit on a peer with a fast clock).
-        let mut incoming = db.list_clients_including_deleted()[0].clone();
-        incoming.deleted = false;
-        incoming.enabled = true;
-        incoming.updated_at = Some(Utc::now() + chrono::Duration::minutes(10));
-        let json = serde_json::to_string(&vec![incoming]).unwrap();
-        db.merge_from_json(&json).unwrap();
+        let mut on_disk: ClientDbFile =
+            serde_json::from_str(&std::fs::read_to_string(&db_path).unwrap()).unwrap();
+        on_disk.clients[0].device_pubkey = Some([0x42; 32]);
+        on_disk.clients[0].one_time = false;
+        on_disk.clients[0].role = ClientRole::Admin;
+        on_disk.clients[0].exit_node = Some("10.0.9.9:51820".to_string());
+        on_disk.clients[0].qos = Some(crate::qos::ClientQos {
+            bandwidth_limit_up: Some(1_000_000),
+            ..Default::default()
+        });
 
+        let original_mtime = std::fs::metadata(&db_path).unwrap().modified().unwrap();
+        let updated_json = serde_json::to_string_pretty(&on_disk).unwrap();
+        let mut mtime_changed = false;
+        for _ in 0..20 {
+            std::fs::write(&db_path, &updated_json).unwrap();
+            let new_mtime = std::fs::metadata(&db_path).unwrap().modified().unwrap();
+            if new_mtime != original_mtime {
+                mtime_changed = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(60));
+        }
         assert!(
-            db.find_by_id(&client.id).is_none(),
-            "revocation must be sticky: a newer live record must not un-delete"
-        );
-        assert!(db.list_clients_including_deleted()[0].deleted);
-    }
-
-    /// MED-2 regression (other direction): an incoming tombstone revokes even
-    /// when its timestamp is OLDER than the local live record's.
-    #[test]
-    fn merge_incoming_tombstone_beats_newer_live_record() {
-        let dir = tempfile::tempdir().unwrap();
-        let db =
-            ClientDatabase::load(&dir.path().join("clients.json"), test_network_config()).unwrap();
-
-        let client = db.add_client("bob").unwrap();
-
-        let mut incoming = db.list_clients_including_deleted()[0].clone();
-        incoming.deleted = true;
-        incoming.enabled = false;
-        incoming.updated_at = Some(Utc::now() - chrono::Duration::hours(1));
-        let json = serde_json::to_string(&vec![incoming]).unwrap();
-        db.merge_from_json(&json).unwrap();
-
-        assert!(
-            db.find_by_id(&client.id).is_none(),
-            "an incoming revocation must apply regardless of timestamp order"
-        );
-    }
-
-    /// MED-1 regression: expired tombstones are reaped (bounded clients.json /
-    /// sync payload) while fresh ones are kept for propagation.
-    #[test]
-    fn expired_tombstones_are_reaped_on_merge() {
-        let dir = tempfile::tempdir().unwrap();
-        let db =
-            ClientDatabase::load(&dir.path().join("clients.json"), test_network_config()).unwrap();
-
-        let old = db.add_client("old").unwrap();
-        let fresh = db.add_client("fresh").unwrap();
-        db.remove_client(&old.id).unwrap();
-        db.remove_client(&fresh.id).unwrap();
-
-        // Age the first tombstone beyond the TTL.
-        db.data
-            .write()
-            .clients
-            .iter_mut()
-            .find(|c| c.id == old.id)
-            .unwrap()
-            .updated_at = Some(Utc::now() - TOMBSTONE_TTL - chrono::Duration::days(1));
-
-        // Any merge (even empty) runs the reaper.
-        db.merge_from_json("[]").unwrap();
-
-        let all = db.list_clients_including_deleted();
-        assert!(
-            !all.iter().any(|c| c.id == old.id),
-            "expired tombstone must be hard-deleted"
-        );
-        assert!(
-            all.iter().any(|c| c.id == fresh.id && c.deleted),
-            "fresh tombstone must be kept so the revocation still propagates"
+            mtime_changed,
+            "test setup failed to advance client DB mtime"
         );
 
-        // A peer still advertising the expired tombstone must not resurrect
-        // it past the same merge call.
-        let mut stale = old.clone();
-        stale.deleted = true;
-        stale.updated_at = Some(Utc::now() - TOMBSTONE_TTL - chrono::Duration::days(1));
-        db.merge_from_json(&serde_json::to_string(&vec![stale]).unwrap())
-            .unwrap();
         assert!(
-            !db.list_clients_including_deleted()
-                .iter()
-                .any(|c| c.id == old.id),
-            "re-advertised expired tombstone must be reaped in the same merge"
+            db.reload_if_changed(),
+            "device_pubkey/one_time/role/exit_node/qos edits must trigger reload"
         );
-    }
-
-    /// MED-1 regression: a tombstone no longer pins its VPN IP — the address
-    /// is reusable by allocation, and pool sync accepts a live record on it.
-    #[test]
-    fn tombstoned_vpn_ip_is_reusable() {
-        let dir = tempfile::tempdir().unwrap();
-        let db =
-            ClientDatabase::load(&dir.path().join("clients.json"), test_network_config()).unwrap();
-
-        let a = db.add_client("a").unwrap(); // gets 10.99.0.2
-        db.remove_client(&a.id).unwrap();
-
-        // Rewind the allocation cursor so the tombstone's address is the
-        // first candidate again.
-        db.data.write().next_host_offset = 2;
-        let b = db.add_client("b").unwrap();
+        let reloaded = db.find_by_id(&client.id).unwrap();
+        assert_eq!(reloaded.device_pubkey, Some([0x42; 32]));
+        assert!(!reloaded.one_time);
+        assert_eq!(reloaded.role, ClientRole::Admin);
+        assert_eq!(reloaded.exit_node.as_deref(), Some("10.0.9.9:51820"));
         assert_eq!(
-            b.vpn_ip, a.vpn_ip,
-            "a revoked client's IP must be allocatable again"
+            reloaded.qos.as_ref().and_then(|q| q.bandwidth_limit_up),
+            Some(1_000_000)
         );
 
-        // And merge must not treat the tombstone as an IP conflict for an
-        // incoming live client either.
-        let mut peer_client = b.clone();
-        peer_client.id = "peer-new-id".to_string();
-        peer_client.name = "peer-new".to_string();
-        peer_client.psk = [0x42; 32];
-        // Remove b locally first so the IP is only held by the tombstone.
-        db.remove_client(&b.id).unwrap();
-        db.merge_from_json(&serde_json::to_string(&vec![peer_client]).unwrap())
-            .unwrap();
+        // And a second reload with no further edits must report "unchanged"
+        // (the digest covers the same field set on both sides).
         assert!(
-            db.find_by_id("peer-new-id").is_some(),
-            "tombstone must not block an incoming live client on the same IP"
+            !db.reload_if_changed(),
+            "no on-disk change must not be reported as changed"
+        );
+    }
+
+    #[test]
+    fn update_client_rejects_elevated_role_without_device_binding() {
+        let dir = tempfile::tempdir().unwrap();
+        let db =
+            ClientDatabase::load(&dir.path().join("clients.json"), test_network_config()).unwrap();
+        let client = db.add_client("no-device").unwrap();
+        assert!(client.device_pubkey.is_none());
+
+        for role in [ClientRole::Viewer, ClientRole::Admin] {
+            let err = db
+                .update_client(
+                    &client.id,
+                    UpdateClientParams {
+                        role: Some(role),
+                        ..Default::default()
+                    },
+                )
+                .unwrap_err();
+            assert!(
+                err.to_string().contains("device binding"),
+                "unexpected error for {:?}: {}",
+                role,
+                err
+            );
+        }
+        // Role must remain unchanged (User) after the rejected attempts.
+        assert_eq!(db.find_by_id(&client.id).unwrap().role, ClientRole::User);
+
+        // Once device-bound, elevation succeeds.
+        db.enroll_device(&client.id, &[0x33; 32]).unwrap();
+        db.update_client(
+            &client.id,
+            UpdateClientParams {
+                role: Some(ClientRole::Admin),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(db.find_by_id(&client.id).unwrap().role, ClientRole::Admin);
+    }
+
+    // --- Wave C1a: device-bound client creation -------------------------
+
+    #[test]
+    fn add_client_bound_sets_device_pubkey() {
+        let dir = tempfile::tempdir().unwrap();
+        let db =
+            ClientDatabase::load(&dir.path().join("clients.json"), test_network_config()).unwrap();
+        let pubkey = [0x44u8; 32];
+        let client = db.add_client_bound("installer-admin", pubkey).unwrap();
+        assert_eq!(client.device_pubkey, Some(pubkey));
+        assert_eq!(client.role, ClientRole::User);
+
+        // Persisted record must also carry the binding (not just the
+        // in-memory return value).
+        let reloaded = db.find_by_id(&client.id).unwrap();
+        assert_eq!(reloaded.device_pubkey, Some(pubkey));
+    }
+
+    #[test]
+    fn add_client_bound_can_be_elevated_to_admin_immediately() {
+        let dir = tempfile::tempdir().unwrap();
+        let db =
+            ClientDatabase::load(&dir.path().join("clients.json"), test_network_config()).unwrap();
+        let client = db
+            .add_client_bound("installer-admin", [0x55u8; 32])
+            .unwrap();
+
+        // Unlike an unbound client, elevation must succeed right away —
+        // no separate enroll_device() round trip needed.
+        db.update_client(
+            &client.id,
+            UpdateClientParams {
+                role: Some(ClientRole::Admin),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(db.find_by_id(&client.id).unwrap().role, ClientRole::Admin);
+    }
+
+    #[test]
+    fn add_client_still_creates_unbound_client_and_rejects_elevation() {
+        // Regression: plain add_client() must remain device-UNBOUND, and
+        // elevating it without a prior enroll_device() must still fail.
+        let dir = tempfile::tempdir().unwrap();
+        let db =
+            ClientDatabase::load(&dir.path().join("clients.json"), test_network_config()).unwrap();
+        let client = db.add_client("plain").unwrap();
+        assert!(client.device_pubkey.is_none());
+
+        let err = db
+            .update_client(
+                &client.id,
+                UpdateClientParams {
+                    role: Some(ClientRole::Admin),
+                    ..Default::default()
+                },
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("device binding"));
+    }
+
+    #[test]
+    fn add_client_bound_rejects_duplicate_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let db =
+            ClientDatabase::load(&dir.path().join("clients.json"), test_network_config()).unwrap();
+        db.add_client("dup").unwrap();
+        let err = db.add_client_bound("dup", [0x66u8; 32]).unwrap_err();
+        assert!(err.to_string().contains("already exists"));
+    }
+
+    #[test]
+    fn add_client_one_time_bound_sets_pubkey_and_one_time_flag() {
+        let dir = tempfile::tempdir().unwrap();
+        let db =
+            ClientDatabase::load(&dir.path().join("clients.json"), test_network_config()).unwrap();
+        let client = db
+            .add_client_one_time_bound("installer-admin", [0x77u8; 32])
+            .unwrap();
+        assert_eq!(client.device_pubkey, Some([0x77u8; 32]));
+        assert!(client.one_time);
+
+        // A different device presenting the PSK is still rejected.
+        let err = db.enroll_device(&client.id, &[0x88u8; 32]).unwrap_err();
+        assert!(err.to_string().contains("mismatch"));
+
+        // The actual bound device re-enrolling is fine (already matches).
+        assert_eq!(db.enroll_device(&client.id, &[0x77u8; 32]).unwrap(), false);
+    }
+
+    // --- Wave B2a: per-client exit_node config layer -------------------
+
+    #[test]
+    fn update_client_sets_and_clears_exit_node_double_option() {
+        let dir = tempfile::tempdir().unwrap();
+        let db =
+            ClientDatabase::load(&dir.path().join("clients.json"), test_network_config()).unwrap();
+        let client = db.add_client("exit-node-client").unwrap();
+        assert_eq!(client.exit_node, None);
+
+        // None (leave unchanged) — a no-op update must not touch exit_node.
+        db.update_client(
+            &client.id,
+            UpdateClientParams {
+                name: Some("exit-node-client".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(db.find_by_id(&client.id).unwrap().exit_node, None);
+
+        // Some(Some(addr)) — set.
+        let updated = db
+            .update_client(
+                &client.id,
+                UpdateClientParams {
+                    exit_node: Some(Some("10.0.9.9:51820".to_string())),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(updated.exit_node, Some("10.0.9.9:51820".to_string()));
+        assert_eq!(
+            db.find_by_id(&client.id).unwrap().exit_node,
+            Some("10.0.9.9:51820".to_string())
+        );
+
+        // Some(None) — clear.
+        let cleared = db
+            .update_client(
+                &client.id,
+                UpdateClientParams {
+                    exit_node: Some(None),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(cleared.exit_node, None);
+        assert_eq!(db.find_by_id(&client.id).unwrap().exit_node, None);
+    }
+
+    #[test]
+    fn update_client_rejects_malformed_exit_node() {
+        let dir = tempfile::tempdir().unwrap();
+        let db =
+            ClientDatabase::load(&dir.path().join("clients.json"), test_network_config()).unwrap();
+        let client = db.add_client("bad-exit-node").unwrap();
+
+        for bad in ["no-port-here", "", ":51820", "host:not-a-port", "host:"] {
+            let err = db
+                .update_client(
+                    &client.id,
+                    UpdateClientParams {
+                        exit_node: Some(Some(bad.to_string())),
+                        ..Default::default()
+                    },
+                )
+                .unwrap_err();
+            assert!(
+                err.to_string().contains("exit_node"),
+                "unexpected error for {:?}: {}",
+                bad,
+                err
+            );
+        }
+        // Must remain unset after all rejected attempts.
+        assert_eq!(db.find_by_id(&client.id).unwrap().exit_node, None);
+
+        // A well-formed value succeeds.
+        db.update_client(
+            &client.id,
+            UpdateClientParams {
+                exit_node: Some(Some("exit.example.com:443".to_string())),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            db.find_by_id(&client.id).unwrap().exit_node,
+            Some("exit.example.com:443".to_string())
         );
     }
 }

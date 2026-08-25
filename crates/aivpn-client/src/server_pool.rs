@@ -104,6 +104,76 @@ impl ServerPool {
         })
     }
 
+    /// Async variant of [`ServerPool::new`] that additionally resolves
+    /// hostname endpoints (e.g. "node2.example.com:443") via the system
+    /// resolver. `new`'s `parse::<SocketAddr>()` filter silently drops every
+    /// non-"IP:port" entry — a pool of hostnames ends up with zero nodes and
+    /// failover quietly dead, even though the main connect path supports
+    /// hostnames (client/mod.rs uses lookup_host). Unresolvable entries are
+    /// skipped with a warning; if nothing resolves at all the pool is empty
+    /// and callers fall back to the primary server address, exactly as with
+    /// an empty pool before.
+    pub async fn resolve_and_new(
+        primary: &str,
+        peers: Vec<ServerEntry>,
+        mode: PoolMode,
+    ) -> Arc<Self> {
+        let mut entries = vec![ServerEntry {
+            endpoint: primary.to_string(),
+            priority: 0,
+            weight: 1,
+            region: None,
+        }];
+        entries.extend(peers);
+        entries.sort_by_key(|e| e.priority);
+
+        let mut nodes = Vec::with_capacity(entries.len());
+        for e in entries {
+            let addr = match e.endpoint.parse::<SocketAddr>() {
+                Ok(addr) => Some(addr),
+                Err(_) => {
+                    // Mirror the 10 s cap the main connect path puts on DNS
+                    // (client/mod.rs) so a hung resolver can't stall startup.
+                    match tokio::time::timeout(
+                        Duration::from_secs(10),
+                        tokio::net::lookup_host(&e.endpoint),
+                    )
+                    .await
+                    {
+                        Ok(Ok(mut addrs)) => addrs.next(),
+                        Ok(Err(err)) => {
+                            warn!("Pool: failed to resolve {}: {}", e.endpoint, err);
+                            None
+                        }
+                        Err(_) => {
+                            warn!("Pool: DNS lookup timed out for {}", e.endpoint);
+                            None
+                        }
+                    }
+                }
+            };
+            match addr {
+                Some(addr) => nodes.push(NodeState {
+                    addr,
+                    weight: e.weight,
+                    failures: 0,
+                    last_failure: None,
+                    rtt_ms: None,
+                }),
+                None => warn!(
+                    "Pool: skipping {} — not an IP:port endpoint and DNS resolution failed",
+                    e.endpoint
+                ),
+            }
+        }
+
+        Arc::new(Self {
+            nodes: Mutex::new(nodes),
+            mode,
+            rr_idx: AtomicUsize::new(0),
+        })
+    }
+
     pub fn next_server(&self) -> Option<SocketAddr> {
         let nodes = self.nodes.lock().unwrap_or_else(|e| e.into_inner());
         if nodes.is_empty() {
@@ -209,5 +279,64 @@ pub async fn probe_all(pool: Arc<ServerPool>) {
             pool.update_rtt(addr, rtt);
             info!("Pool probe {}: {:.1} ms", addr, rtt);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(endpoint: &str) -> ServerEntry {
+        ServerEntry {
+            endpoint: endpoint.to_string(),
+            priority: 1,
+            weight: 1,
+            region: None,
+        }
+    }
+
+    #[test]
+    fn new_drops_hostname_endpoints() {
+        // Documents the sync constructor's limitation that resolve_and_new
+        // exists to fix: hostname endpoints don't survive parse::<SocketAddr>.
+        let pool = ServerPool::new(
+            "127.0.0.1:443",
+            vec![entry("node2.example.com:443")],
+            PoolMode::Failover,
+        );
+        assert_eq!(pool.node_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn resolve_and_new_keeps_hostname_endpoints() {
+        // Regression test: a pool built from hostname endpoints must not end
+        // up empty (failover silently dead).
+        let pool = ServerPool::resolve_and_new(
+            "localhost:443",
+            vec![entry("localhost:444"), entry("127.0.0.1:445")],
+            PoolMode::Failover,
+        )
+        .await;
+        assert_eq!(pool.node_count(), 3);
+        let ports: Vec<u16> = pool.all_servers().iter().map(|a| a.port()).collect();
+        assert!(ports.contains(&443));
+        assert!(ports.contains(&444));
+        assert!(ports.contains(&445));
+        // Failover must actually be able to hand out a node.
+        assert!(pool.next_server().is_some());
+    }
+
+    #[tokio::test]
+    async fn resolve_and_new_skips_unresolvable_endpoints() {
+        let pool = ServerPool::resolve_and_new(
+            "127.0.0.1:443",
+            vec![entry("nonexistent-host.invalid:443")],
+            PoolMode::Failover,
+        )
+        .await;
+        // Only the resolvable primary survives; the pool degrades instead of
+        // failing startup.
+        assert_eq!(pool.node_count(), 1);
+        assert_eq!(pool.next_server().unwrap().port(), 443);
     }
 }

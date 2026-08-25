@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 # Build multi-arch aivpn-mikrotik images and push a Docker Hub manifest.
-# Usage: ./aivpn-mikrotik/build-mikrotik.sh [registry/image:tag]
+# Usage: ./platforms/mikrotik/build-mikrotik.sh [registry/image:tag]
 #   Default image: infosave2007/aivpn-mikrotik:latest
 
 set -euo pipefail
 
 IMAGE="${1:-infosave2007/aivpn-mikrotik:latest}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cd "$SCRIPT_DIR/.."
+# Repo root (script lives in platforms/mikrotik/)
+cd "$SCRIPT_DIR/../.."
 
 require_command() { command -v "$1" >/dev/null 2>&1 || { echo "Error: '$1' not installed" >&2; exit 1; }; }
 require_command docker
@@ -19,23 +20,25 @@ echo ""
 TAGS_FILE="$(mktemp)"
 
 build_arch() {
-    local ARCH="$1" MUSL_TAG="$2" TARGET="$3"
+    local ARCH="$1" MUSL_TAG="$2" TARGET="$3" PLATFORM="$4"
     local TAG="${IMAGE%:*}:${IMAGE##*:}-${ARCH}"
     echo "--- Building ${ARCH} (${TARGET}) ---"
+    # --platform selects the RUNTIME (alpine) stage arch; the builder stage is
+    # pinned to linux/amd64 inside the Dockerfile (cross-compile via musl).
     docker build \
-        --platform linux/amd64 \
+        --platform "${PLATFORM}" \
         --build-arg MUSL_IMAGE_TAG="${MUSL_TAG}" \
         --build-arg TARGET_TRIPLE="${TARGET}" \
         -t "${TAG}" \
-        -f aivpn-mikrotik/Dockerfile \
+        -f platforms/mikrotik/Dockerfile \
         .
     docker push "${TAG}"
     echo "${TAG}" >> "$TAGS_FILE"
 }
 
-build_arch arm64  aarch64-musl          aarch64-unknown-linux-musl
-build_arch armv7  armv7-musleabihf      armv7-unknown-linux-musleabihf
-build_arch amd64  x86_64-musl           x86_64-unknown-linux-musl
+build_arch arm64  aarch64-musl          aarch64-unknown-linux-musl      linux/arm64
+build_arch armv7  armv7-musleabihf      armv7-unknown-linux-musleabihf  linux/arm/v7
+build_arch amd64  x86_64-musl           x86_64-unknown-linux-musl       linux/amd64
 
 echo ""
 echo "--- Creating multi-arch manifest: ${IMAGE} ---"

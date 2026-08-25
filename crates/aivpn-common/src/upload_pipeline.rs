@@ -11,7 +11,7 @@ use crate::crypto::SessionKeys;
 use crate::error::{Error, Result};
 use crate::fec::FecEncoder;
 use crate::protocol::{ControlPayload, InnerType};
-use tokio::net::UdpSocket;
+use crate::transport::DatagramTransport;
 use tokio::sync::mpsc;
 use tokio::time;
 
@@ -208,8 +208,8 @@ fn is_transient_send_error(e: &std::io::Error) -> bool {
 /// Send helper that tolerates transient network errors (e.g. mid-switch on mobile).
 /// Returns Ok(()) on success or transient error (logged, packet dropped).
 /// Returns Err only on fatal errors (e.g. EBADF = socket closed).
-async fn send_tolerant(udp: &UdpSocket, data: &[u8]) -> Result<()> {
-    match udp.send(data).await {
+async fn send_tolerant(transport: &dyn DatagramTransport, data: &[u8]) -> Result<()> {
+    match transport.send(data).await {
         Ok(_) => Ok(()),
         Err(e) if is_transient_send_error(&e) => {
             tracing::debug!("upload: transient send error (dropped packet): {e}");
@@ -220,7 +220,7 @@ async fn send_tolerant(udp: &UdpSocket, data: &[u8]) -> Result<()> {
 }
 
 /// Run the upload loop: pull TUN packets from `rx`, encrypt via `enc`, send
-/// over `udp`. Uses biased `select!` to prioritise data over keepalives and a
+/// over `transport`. Uses biased `select!` to prioritise data over keepalives and a
 /// burst-drain after the first recv to amortise per-packet scheduler overhead.
 ///
 /// Control messages are drained opportunistically between every packet of
@@ -252,7 +252,7 @@ async fn send_tolerant(udp: &UdpSocket, data: &[u8]) -> Result<()> {
 pub async fn run_upload_loop(
     rx: &mut mpsc::Receiver<Vec<u8>>,
     mut control_rx: Option<&mut mpsc::Receiver<ControlPayload>>,
-    udp: &Arc<UdpSocket>,
+    transport: &Arc<dyn DatagramTransport>,
     enc: &mut impl PacketEncryptor,
     config: &UploadConfig,
     mut inspector: Option<&mut dyn OutboundInspector>,
@@ -265,14 +265,14 @@ pub async fn run_upload_loop(
     // `None` inspector (the default) is a no-op.
     async fn inspect_sent(
         inspector: &mut Option<&mut dyn OutboundInspector>,
-        udp: &Arc<UdpSocket>,
+        transport: &Arc<dyn DatagramTransport>,
         enc: &mut impl PacketEncryptor,
         wire: &[u8],
     ) -> Result<()> {
         if let Some(insp) = inspector.as_deref_mut() {
             if let Some(req) = insp.observe(wire) {
                 let enc_req = enc.encrypt_control(&req)?;
-                send_tolerant(udp, &enc_req).await?;
+                send_tolerant(transport.as_ref(), &enc_req).await?;
             }
         }
         Ok(())
@@ -292,7 +292,7 @@ pub async fn run_upload_loop(
     // can never be starved by a continuous run of data packets.
     async fn drain_pending_control(
         control_rx: &mut Option<&mut mpsc::Receiver<ControlPayload>>,
-        udp: &Arc<UdpSocket>,
+        transport: &Arc<dyn DatagramTransport>,
         enc: &mut impl PacketEncryptor,
     ) -> Result<()> {
         if let Some(crx) = control_rx.as_mut() {
@@ -300,7 +300,7 @@ pub async fn run_upload_loop(
                 match crx.try_recv() {
                     Ok(payload) => {
                         let encrypted = enc.encrypt_control(&payload)?;
-                        send_tolerant(udp, &encrypted).await?;
+                        send_tolerant(transport.as_ref(), &encrypted).await?;
                     }
                     Err(mpsc::error::TryRecvError::Empty) => break,
                     Err(mpsc::error::TryRecvError::Disconnected) => break,
@@ -322,10 +322,10 @@ pub async fn run_upload_loop(
                 };
 
                 let encrypted = enc.encrypt_data(&pkt_data)?;
-                send_tolerant(udp, &encrypted).await?;
-                inspect_sent(&mut inspector, udp, enc, &encrypted).await?;
+                send_tolerant(transport.as_ref(), &encrypted).await?;
+                inspect_sent(&mut inspector, transport, enc, &encrypted).await?;
                 if let Some(repair) = enc.take_fec_repair() {
-                    send_tolerant(udp, &repair).await?;
+                    send_tolerant(transport.as_ref(), &repair).await?;
                 }
                 data_packet_count = data_packet_count.wrapping_add(1);
                 enc.on_data_sent(pkt_data.len());
@@ -336,14 +336,14 @@ pub async fn run_upload_loop(
                 // is never stuck behind a long, continuous run of data
                 // traffic — see the starvation note on this function.
                 for _ in 0..config.burst_size {
-                    drain_pending_control(&mut control_rx, udp, enc).await?;
+                    drain_pending_control(&mut control_rx, transport, enc).await?;
                     match rx.try_recv() {
                         Ok(pkt) => {
                             let encrypted = enc.encrypt_data(&pkt)?;
-                            send_tolerant(udp, &encrypted).await?;
-                            inspect_sent(&mut inspector, udp, enc, &encrypted).await?;
+                            send_tolerant(transport.as_ref(), &encrypted).await?;
+                            inspect_sent(&mut inspector, transport, enc, &encrypted).await?;
                             if let Some(repair) = enc.take_fec_repair() {
-                                send_tolerant(udp, &repair).await?;
+                                send_tolerant(transport.as_ref(), &repair).await?;
                             }
                             data_packet_count = data_packet_count.wrapping_add(1);
                             enc.on_data_sent(pkt.len());
@@ -356,7 +356,7 @@ pub async fn run_upload_loop(
                 }
                 // Final check: pick up anything queued during the very last
                 // burst-drain packet before looping back to the outer select.
-                drain_pending_control(&mut control_rx, udp, enc).await?;
+                drain_pending_control(&mut control_rx, transport, enc).await?;
                 // Suppress the next keepalive tick ONLY when one went out
                 // recently: a keepalive right after real data wastes bandwidth and
                 // the server's ACK resets the peer's rx-silence timer anyway. But do
@@ -380,7 +380,7 @@ pub async fn run_upload_loop(
                     }
                 }
                 let encrypted = enc.encrypt_keepalive()?;
-                send_tolerant(udp, &encrypted).await?;
+                send_tolerant(transport.as_ref(), &encrypted).await?;
                 last_keepalive = tokio::time::Instant::now();
             }
 
@@ -392,10 +392,19 @@ pub async fn run_upload_loop(
                     std::future::pending().await
                 }
             } => {
-                if let Some(payload) = maybe_ctrl {
-                    let encrypted = enc.encrypt_control(&payload)?;
-                    send_tolerant(udp, &encrypted).await?;
-                }
+                let payload = match maybe_ctrl {
+                    Some(p) => p,
+                    // All control senders are gone: the session is tearing
+                    // down (the receive loop dropped its sender). Returning
+                    // `None` here used to be IGNORED, and since a closed
+                    // channel's recv() resolves immediately on every poll,
+                    // this arm kept winning the select! — a 100% CPU busy
+                    // spin for the rest of the session. Exit like the data
+                    // channel does ("TUN->UDP channel closed" above).
+                    None => return Err(Error::Channel("control channel closed".into())),
+                };
+                let encrypted = enc.encrypt_control(&payload)?;
+                send_tolerant(transport.as_ref(), &encrypted).await?;
             }
         }
     }
@@ -405,6 +414,7 @@ pub async fn run_upload_loop(
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+    use tokio::net::UdpSocket;
 
     /// Minimal `PacketEncryptor` test double: no real crypto, just tags each
     /// outgoing datagram with a marker byte (0 = data, 1 = control, 2 =
@@ -437,6 +447,49 @@ mod tests {
         fn on_data_sent(&mut self, _payload_len: usize) {}
     }
 
+    /// Regression test for the control-channel busy-spin: when every control
+    /// sender is dropped, `control_rx.recv()` resolves to `None` on EVERY
+    /// poll, and ignoring that used to keep the `select!` hot — a 100% CPU
+    /// spin for the rest of the session. The loop must instead terminate with
+    /// an error, exactly like a closed data channel does.
+    #[tokio::test]
+    async fn test_closed_control_channel_terminates_upload_loop() {
+        let server_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = server_sock.local_addr().unwrap();
+        let client_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        client_sock.connect(server_addr).await.unwrap();
+
+        let config = UploadConfig::default();
+        // Data channel stays open (sender alive) so the ONLY closed channel is
+        // the control one — the error must be the control-channel close.
+        let (_data_tx, mut data_rx) = mpsc::channel::<Vec<u8>>(4);
+        let (control_tx, mut control_rx) = mpsc::channel::<ControlPayload>(4);
+        drop(control_tx);
+
+        let mut enc = MarkerEncryptor { next_seq: 0 };
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            run_upload_loop(
+                &mut data_rx,
+                Some(&mut control_rx),
+                &crate::transport::udp_transport(client_sock.clone()),
+                &mut enc,
+                &config,
+                None,
+            ),
+        )
+        .await;
+
+        match result {
+            Ok(Err(e)) => assert!(
+                e.to_string().contains("control channel closed"),
+                "expected the control-channel-close error, got: {e}"
+            ),
+            Ok(Ok(())) => panic!("run_upload_loop must not return Ok on a closed control channel"),
+            Err(_) => panic!("run_upload_loop did not terminate within 2s — busy-spin regression"),
+        }
+    }
+
     /// Regression test for the control-starvation bug: under `biased`
     /// `select!`, a continuous run of data packets used to be able to starve
     /// `control_rx` indefinitely, since the burst-drain loop only checked
@@ -466,6 +519,7 @@ mod tests {
         let server_addr = server_sock.local_addr().unwrap();
         let client_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         client_sock.connect(server_addr).await.unwrap();
+        let client_tx: Arc<dyn DatagramTransport> = crate::transport::udp_transport(client_sock);
 
         let config = UploadConfig::default();
         // Comfortably more than one burst-drain cycle's worth of data,
@@ -494,7 +548,7 @@ mod tests {
         let upload_fut = run_upload_loop(
             &mut data_rx,
             Some(&mut control_rx),
-            &client_sock,
+            &client_tx,
             &mut enc,
             &config,
             None,

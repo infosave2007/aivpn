@@ -8,6 +8,11 @@
     <string name="status_reconnecting">Reconnecting…</string>
     <string name="status_error">Error: %s</string>
     <string name="status_native_lib_unavailable">Error: native library unavailable — reinstall the app</string>
+    <string name="status_cert_rejected">Server rejected the certificate — re-provisioning required</string>
+    <string name="status_handshake_reject_one_time_used">This one-time key has already been used</string>
+    <string name="status_handshake_reject_expired">This client key has expired</string>
+    <string name="status_handshake_reject_disabled">This client has been disabled by the server</string>
+    <string name="status_handshake_reject_unspecified">Server refused the connection</string>
     <string name="btn_connect">Connect</string>
     <string name="btn_disconnect">Disconnect</string>
     <string name="hint_server">Server address</string>
@@ -163,9 +168,18 @@
     <string name="mask_country_code_hint">DE</string>
     <string name="mask_country_code_invalid">Country code must be exactly 2 letters</string>
 
+    <!-- Modular transport settings (edition-specific providers; entry hidden when none) -->
+    <string name="transport_settings_title">Connection transport</string>
+    <string name="desc_transport_settings">Additional connection transport settings for this edition.</string>
+    <string name="transport_apply">Apply</string>
+    <string name="transport_applied">Transport settings applied — takes effect on the next connect</string>
+
     <!-- Event notification channel -->
     <string name="notification_event_channel">AIVPN Events</string>
     <string name="notification_event_channel_desc">Connection state change notifications</string>
+
+    <!-- Auto-reconnect worker channel (quiet progress stub, API < 31 expedited work) -->
+    <string name="notification_reconnect_channel">AIVPN Auto-reconnect</string>
 
     <!-- Security alerts: unexpected VPN death (traffic no longer protected) -->
     <string name="notification_alert_channel">AIVPN Security Alerts</string>
@@ -206,4 +220,165 @@
     <string name="bg_health_oem_generic">Some devices also require enabling “Autostart” for AIVPN in the manufacturer’s battery/security app.</string>
     <string name="bg_health_hint_ok">Background: protected</string>
     <string name="bg_health_hint_risk">Background: at risk — tap to fix</string>
+
+    <!-- In-app admin: client management (P3.1) -->
+    <string name="admin_menu_title">Client management</string>
+    <string name="desc_admin_menu">View clients, pool, and audit log — add/edit/revoke for Admin only</string>
+    <string name="admin_title">Client Management</string>
+    <string name="admin_refresh">Refresh</string>
+    <string name="admin_not_connected">Not connected — connect to the VPN to manage clients</string>
+    <string name="admin_no_clients">No clients yet</string>
+    <string name="admin_add_client">Add client</string>
+    <string name="admin_action_key">Key</string>
+    <string name="admin_action_edit">Edit</string>
+    <string name="admin_action_reset">Reset device</string>
+    <string name="admin_action_revoke">Revoke</string>
+    <string name="admin_dialog_add_title">Add client</string>
+    <string name="admin_dialog_edit_title">Edit client</string>
+    <string name="admin_hint_name">Client name</string>
+    <string name="admin_hint_expiry">Expires at (ISO 8601, optional)</string>
+    <string name="admin_one_time">One-time key</string>
+    <string name="admin_enabled">Enabled</string>
+    <string name="admin_status_enabled">Enabled</string>
+    <string name="admin_status_disabled">Disabled</string>
+    <string name="admin_status_one_time">One-time</string>
+    <string name="admin_status_expires">Expires: %s</string>
+    <string name="admin_revoke_confirm_title">Revoke client?</string>
+    <string name="admin_revoke_confirm_msg">This permanently revokes \"%s\" and disconnects it. Continue?</string>
+    <string name="admin_reset_confirm_title">Reset device binding?</string>
+    <string name="admin_reset_confirm_msg">\"%s\" will need to re-enroll its device on next connect. Continue?</string>
+    <string name="admin_share">Share</string>
+    <string name="admin_copy">Copy</string>
+    <string name="admin_copied">Copied</string>
+    <string name="admin_reject_reason_prefix">Rejected: %s</string>
+    <string name="admin_error_generic">Request failed (%d)</string>
+    <string name="admin_error_with_reason">Request failed (%1$d): %2$s</string>
+    <string name="admin_hint_exit_node">Exit node (optional, host:port — empty = global default)</string>
+    <string name="admin_hint_exit_node_live">Per-client exit applies live, without reconnecting. The global default only applies after a server restart.</string>
+    <string name="admin_exit_option_default">(default)</string>
+    <string name="admin_exit_option_custom">Custom…</string>
+    <string name="admin_exit_node_prefix">Exit: %s</string>
+    <string name="admin_title_viewer">Client Management (Viewer, read-only)</string>
+
+    <!-- Pool topology (Wave B3) -->
+    <string name="pool_title">Pool topology</string>
+    <string name="pool_no_nodes">No pool nodes</string>
+    <string name="pool_health_transport">Transport: %s</string>
+    <string name="pool_health_nodes">Total nodes: %d</string>
+    <string name="pool_health_connected">Connected peers: %d</string>
+    <string name="pool_health_converged">Converged peers: %d</string>
+    <string name="pool_health_diverged">Some connected peers are out of sync</string>
+    <string name="pool_warning_partition_conflict">Warning: VPN-IP partition conflict with a peer</string>
+    <string name="pool_warning_subnet_mismatch">Warning: VPN subnet mismatch with a peer</string>
+    <string name="pool_node_revoked">Revoked</string>
+    <string name="pool_node_no_address">No address</string>
+    <string name="pool_node_verified">Verified</string>
+    <string name="pool_node_unverified">Unverified</string>
+    <string name="pool_node_connected">Connected</string>
+    <string name="pool_node_disconnected">Disconnected</string>
+    <string name="pool_node_last_seen">Last seen: %s</string>
+    <string name="pool_node_never">never</string>
+
+    <!-- Server settings apply-with-rollback (Wave 2 / G-A3): Admin-only -->
+    <string name="server_settings_title">Server settings</string>
+    <string name="server_settings_mask_title">Active mask</string>
+    <string name="server_settings_mask_caption">Applies live, immediately — no server restart needed. Confirm within the window below or it reverts automatically.</string>
+    <string name="server_settings_mask_client_label">Client (the mask override is per-client)</string>
+    <string name="server_settings_mask_label">Mask</string>
+    <string name="server_settings_mask_no_clients">Client list unavailable — connect to the VPN and tap refresh.</string>
+    <string name="server_settings_mask_id_hint">Enter mask id</string>
+    <string name="server_settings_mask_none_loaded">No mask list available yet — connect to the VPN and reopen this screen, or enter a mask id manually.</string>
+    <string name="server_settings_exit_title">Global default exit (pool)</string>
+    <string name="server_settings_exit_caption">Applies after a server RESTART — not live. This is the fallback used by any client without its own per-client exit-node override.</string>
+    <string name="server_settings_exit_hint">host:port — empty = none</string>
+    <string name="server_settings_apply">Apply</string>
+    <string name="server_settings_confirm">Confirm</string>
+    <string name="server_settings_pending_banner">Confirm within %ds or this change reverts automatically</string>
+    <string name="server_settings_confirmed">Confirmed — change is now permanent</string>
+    <string name="server_settings_reverted">Not confirmed in time — the server already reverted this change</string>
+
+    <!-- Audit log (G-A2): hash-chain-verified admin action log, Viewer + Admin -->
+    <string name="audit_title">Audit Log</string>
+    <string name="audit_no_entries">No audit entries</string>
+    <string name="audit_chain_verified">Chain verified</string>
+    <string name="audit_chain_broken">Chain integrity BROKEN at entry #%d</string>
+    <string name="audit_entry_target_prefix">Target: %s</string>
+    <string name="audit_entry_actor_prefix">%1$s · %2$s</string>
+
+    <!-- SSH server-install wizard (C3) -->
+    <string name="install_menu_title">Install server</string>
+    <string name="desc_install_menu">Install a new aivpn-server over SSH</string>
+    <string name="install_title">Install server</string>
+    <string name="install_step_next">Next</string>
+    <string name="install_step1_title">Target</string>
+    <string name="install_step2_title">Host key</string>
+    <string name="install_step3_title">Installing</string>
+    <string name="install_hint_host">Host or IP</string>
+    <string name="install_hint_port">SSH port</string>
+    <string name="install_hint_user">SSH user</string>
+    <string name="install_hint_auth">Authentication</string>
+    <string name="install_auth_password">Password</string>
+    <string name="install_auth_key_pem">Private key</string>
+    <string name="install_hint_password">SSH password</string>
+    <string name="install_hint_key_pem">Private key (PEM)</string>
+    <string name="install_hint_key_passphrase">Key passphrase (optional)</string>
+    <string name="install_hint_binary_source">Server binary</string>
+    <string name="install_binary_default">Default (GitHub Releases)</string>
+    <string name="install_binary_url">Custom URL</string>
+    <string name="install_binary_file">Local file</string>
+    <string name="install_hint_binary_url">https://.../aivpn-server</string>
+    <string name="install_pick_binary_file">Pick file…</string>
+    <string name="install_no_file_selected">No file selected</string>
+    <string name="install_error_need_binary_url">Enter the binary URL</string>
+    <string name="install_error_need_binary_file">Pick a local aivpn-server binary file</string>
+    <string name="install_error_file_read_failed">Could not read the selected file</string>
+    <string name="install_hint_mode">Install mode</string>
+    <string name="install_mode_systemd">systemd</string>
+    <string name="install_mode_docker">Docker</string>
+    <string name="install_hint_server_ip">Public server IP (optional — for auto-admin client)</string>
+    <string name="install_hint_server_port">Public server port (optional)</string>
+    <string name="install_device_binding">Bind admin client to this device</string>
+    <string name="install_device_binding_hint">This device\'s enrollment key will be sent to the server so it creates a device-bound admin client — only this device will be able to use it.</string>
+    <string name="install_device_binding_failed">Could not derive this device\'s public key for binding — install aborted. Uncheck \"Bind admin client to this device\" and try again to install without binding.</string>
+    <string name="install_error_bad_port">Enter a valid SSH port (1–65535)</string>
+    <string name="install_error_need_password">Enter the SSH password</string>
+    <string name="install_error_need_key">Paste the private key (PEM)</string>
+    <string name="install_error_core_unavailable">Native core unavailable — cannot start install</string>
+    <string name="install_tofu_probing">Connecting to %s…</string>
+    <string name="install_tofu_error">Connection failed: %s</string>
+    <string name="install_tofu_error_generic">Could not connect or read the host key</string>
+    <string name="install_tofu_retry">Retry</string>
+    <string name="install_tofu_fingerprint_label">Host key fingerprint</string>
+    <string name="install_tofu_confirm_hint">Verify this fingerprint out-of-band before trusting it</string>
+    <string name="install_show_script">Show install script</string>
+    <string name="install_script_sha256">SHA256: %s</string>
+    <string name="install_trust">Trust &amp; install</string>
+    <string name="install_running">Installing…</string>
+    <string name="install_success">Server installed successfully</string>
+    <string name="install_import_profile">Import profile</string>
+    <string name="install_failed">Install failed (exit code %d)</string>
+    <string name="install_error_bad_params">Internal error: invalid install parameters</string>
+    <string name="install_log_connected">Connected, host key: %s</string>
+    <string name="install_log_uploading">Uploading %s…</string>
+    <string name="install_log_finished">Finished, exit code %d</string>
+    <string name="install_profile_imported">Profile imported</string>
+    <string name="install_profile_auto_imported">Profile imported automatically:</string>
+    <string name="install_marker_port_busy">Target port is already in use by another process</string>
+    <string name="install_marker_no_masks">No mask profiles available to install</string>
+    <string name="install_marker_template_missing">Server config template is missing from the install bundle</string>
+    <string name="install_marker_unit_template_missing">systemd unit template is missing from the install bundle</string>
+    <string name="install_marker_no_local_device_key">No device key available — the admin client was created without device binding</string>
+    <string name="install_marker_root_required">The installer requires root privileges on the target</string>
+    <string name="install_marker_missing_server_ip">Public server IP is required to create the admin client</string>
+    <string name="install_marker_add_client_failed">Failed to create the admin client on the server</string>
+    <string name="install_marker_key_not_found">Admin client created but no connection key was returned</string>
+    <string name="install_marker_unsupported_arch">Target CPU architecture is not supported</string>
+    <string name="install_marker_download_failed">Failed to download the aivpn-server binary</string>
+    <string name="install_marker_checksum_mismatch">Downloaded binary failed checksum verification</string>
+    <string name="install_marker_service_not_active">aivpn-server service did not become active</string>
+    <string name="install_marker_port_not_listening">aivpn-server did not start listening on the expected port</string>
+    <string name="install_marker_port_owned_by_other">The listening port is owned by a different process</string>
+    <string name="install_marker_docker_missing">Docker is not installed on the target</string>
+    <string name="install_marker_compose_missing">docker compose is not available on the target</string>
+    <string name="install_marker_container_not_running">aivpn-server container did not report as running</string>
 </resources>

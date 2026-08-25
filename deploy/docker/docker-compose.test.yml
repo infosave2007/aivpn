@@ -1,25 +1,32 @@
 # Docker Compose для тестирования AIVPN (сервер + клиент в одной bridge-сети)
-version: "3.8"
+# Запуск из корня репозитория: make test-docker AIVPN_TEST_KEY=aivpn://...
+# Build-контексты указывают на корень репозитория (../..), т.к. Dockerfile
+# копируют Cargo.toml/crates/assets относительно корня.
 
 services:
   aivpn-server:
     build:
-      context: .
+      context: ../..
       dockerfile: Dockerfile
     container_name: aivpn-test-server
+    cap_drop:
+      - ALL
     cap_add:
+      # NET_ADMIN only: TUN device management. NET_RAW was dropped — no code
+      # path in this repo opens a raw/packet socket.
       - NET_ADMIN
-      - NET_RAW
+    security_opt:
+      - "no-new-privileges:true"
     devices:
       - /dev/net/tun:/dev/net/tun
     tmpfs:
-      - /run:mode=1777,size=64M
-      - /tmp:mode=1777,size=128M
+      - /run:mode=0700,size=64M
+      - /tmp:mode=0700,size=128M
     environment:
       - RUST_LOG=info
       - RUST_BACKTRACE=1
     volumes:
-      - ./config:/etc/aivpn
+      - ../config:/etc/aivpn
     networks:
       aivpn-test:
         aliases:
@@ -33,8 +40,8 @@ services:
 
   aivpn-client:
     build:
-      context: .
-      dockerfile: Dockerfile.client
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile.client
     container_name: aivpn-test-client
     cap_add:
       - NET_ADMIN
@@ -42,16 +49,19 @@ services:
     devices:
       - /dev/net/tun:/dev/net/tun
     tmpfs:
-      - /run:mode=1777,size=64M
-      - /tmp:mode=1777,size=128M
+      - /run:mode=0700,size=64M
+      - /tmp:mode=0700,size=128M
     environment:
       - RUST_LOG=info
+    # Ключ подключения передаётся через AIVPN_TEST_KEY (см. make test-docker).
+    # Без ключа клиент завершится с ошибкой — тест упадёт явно, а не пройдёт
+    # вхолостую.
+    command: ["--connection-key", "${AIVPN_TEST_KEY:-}"]
     depends_on:
       aivpn-server:
         condition: service_healthy
     networks:
       - aivpn-test
-    # Ключ будет передан через environment или command
 
 networks:
   aivpn-test:

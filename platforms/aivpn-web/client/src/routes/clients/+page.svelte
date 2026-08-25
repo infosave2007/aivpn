@@ -1,7 +1,8 @@
 <script lang="ts">
   import { goto } from '$app/navigation';
+  import { toStore } from 'svelte/store';
   import { createQuery, createMutation, useQueryClient } from '@tanstack/svelte-query';
-  import { clients as clientsApi } from '$lib/api';
+  import { clients as clientsApi, type ClientRole } from '$lib/api';
   import ClientTable from '$lib/components/ClientTable.svelte';
   import QrModal from '$lib/components/QrModal.svelte';
   import ConnectionKeyModal from '$lib/components/ConnectionKeyModal.svelte';
@@ -22,20 +23,49 @@
     return () => clearTimeout(debounceTimer);
   });
 
-  const query = createQuery({
+  // Changing the status filter re-queries a different result set, so the
+  // current page number is meaningless for it — reset it exactly like the
+  // search debounce above does. Without this, applying a narrow filter from
+  // page 3 shows zero rows AND hides the pager (totalPages drops to 1),
+  // leaving no control to navigate back.
+  $effect(() => {
+    void filterEnabled; // tracked: this effect exists to react to it
+    page = 0;
+  });
+
+  // The options object MUST be a store: createQuery wraps a plain value in
+  // `readable(...)` (createBaseQuery.ts), which never re-emits, so the query
+  // key would be frozen at its mount-time value and search / status filter /
+  // pagination would never refetch. `toStore` bridges the runes above into
+  // the store the library expects.
+  const query = createQuery(toStore(() => ({
     queryKey: ['clients', searchDebounced, filterEnabled, page],
     queryFn: () => clientsApi.list({ search: searchDebounced || undefined, enabled: filterEnabled, page, limit: PAGE_SIZE }),
-  });
+  })));
 
   const createMut = createMutation({
     mutationFn: (data: { name: string; one_time: boolean; expires_at: string | null }) =>
       clientsApi.create({ name: data.name, one_time: data.one_time, expires_at: data.expires_at || null }),
     onSuccess: () => { qc.invalidateQueries({ queryKey: ['clients'] }); showAddModal = false; newName = ''; newOneTime = false; newExpiresAt = ''; },
+    onError: (err: Error) => { alert(`Create failed: ${err.message}`); },
   });
 
   const deleteMut = createMutation({
     mutationFn: (id: string) => clientsApi.delete(id),
     onSuccess: () => qc.invalidateQueries({ queryKey: ['clients'] }),
+    onError: (err: Error) => { alert(`Delete failed: ${err.message}`); },
+  });
+
+  const revokeMut = createMutation({
+    mutationFn: (id: string) => clientsApi.revoke(id),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['clients'] }),
+    onError: (err: Error) => { alert(`Revoke failed: ${err.message}`); },
+  });
+
+  const roleMut = createMutation({
+    mutationFn: (vars: { id: string; role: ClientRole }) => clientsApi.update(vars.id, { role: vars.role }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['clients'] }),
+    onError: (err: Error) => { alert(`Role change failed: ${err.message}`); qc.invalidateQueries({ queryKey: ['clients'] }); },
   });
 
   let showAddModal = $state(false);
@@ -48,12 +78,19 @@
   let connKeyOpen = $state(false);
   let connKey = $state('');
 
+  /** Surface key-fetch failures (403 for viewer role, 404, daemon down) the
+   *  same way this page reports mutation errors — swallowing them left the
+   *  operator clicking a dead button with zero feedback. */
+  function keyError(e: unknown) {
+    alert(`Failed to load connection key: ${e instanceof Error ? e.message : String(e)}`);
+  }
+
   async function handleViewKey(id: string) {
     try {
       const res = await clientsApi.connectionKey(id);
       connKey = res.connection_key;
       connKeyOpen = true;
-    } catch { /* ignore */ }
+    } catch (e) { keyError(e); }
   }
 
   async function handleViewQr(id: string) {
@@ -61,7 +98,7 @@
       const res = await clientsApi.connectionKey(id);
       qrData = res.connection_key;
       qrOpen = true;
-    } catch { /* ignore */ }
+    } catch (e) { keyError(e); }
   }
 
   function handleEdit(id: string) {
@@ -69,9 +106,19 @@
   }
 
   async function handleDelete(id: string) {
-    if (confirm('Delete this client?')) {
+    if (confirm('Delete this client? This cannot be undone.')) {
       $deleteMut.mutate(id);
     }
+  }
+
+  async function handleRevoke(id: string) {
+    if (confirm('Permanently revoke and disconnect this client? This cannot be undone.')) {
+      $revokeMut.mutate(id);
+    }
+  }
+
+  function handleRoleChange(id: string, role: ClientRole) {
+    $roleMut.mutate({ id, role });
   }
 
   const clientList = $derived($query.data?.items ?? []);
@@ -122,6 +169,8 @@
       clients={clientList}
       onEdit={handleEdit}
       onDelete={handleDelete}
+      onRevoke={handleRevoke}
+      onRoleChange={handleRoleChange}
       onViewKey={handleViewKey}
       onViewQr={handleViewQr}
     />

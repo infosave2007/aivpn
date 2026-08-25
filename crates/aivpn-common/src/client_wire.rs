@@ -628,6 +628,12 @@ pub fn decode_downlink_any_mdh_len(
 /// key is configured (signature verification there is opt-in, not
 /// mandatory), so this stays backward compatible with callers that have not
 /// yet been wired up to supply a trusted key.
+///
+/// Returns `(network_config, server_eph_pub)` on success. Callers need
+/// `server_eph_pub` after the handshake loop exits to build the
+/// session-bound `DeviceEnrollment` proof (see
+/// `crypto::device_enrollment_proof`), which must hash the exact
+/// `server_eph_pub || client_eph_pub` pair this ratchet used.
 pub fn process_server_hello_with_mdh_len(
     packet: &[u8],
     keys: &mut SessionKeys,
@@ -636,7 +642,7 @@ pub fn process_server_hello_with_mdh_len(
     send_counter: &mut u64,
     mdh_len: usize,
     server_signing_key: Option<&[u8; 32]>,
-) -> Result<Option<crate::network_config::ClientNetworkConfig>> {
+) -> Result<(Option<crate::network_config::ClientNetworkConfig>, [u8; 32])> {
     let decoded = decode_packet_with_mdh_len(packet, keys, recv_window, mdh_len)?;
 
     if decoded.header.inner_type != InnerType::Control {
@@ -673,7 +679,7 @@ pub fn process_server_hello_with_mdh_len(
             *keys = derive_session_keys(&dh2, Some(&old_session_key), &keypair.public_key_bytes());
             *send_counter = 0;
             recv_window.reset();
-            Ok(network_config)
+            Ok((network_config, server_eph_pub))
         }
         _ => Err(Error::InvalidPacket("Expected ServerHello control payload")),
     }

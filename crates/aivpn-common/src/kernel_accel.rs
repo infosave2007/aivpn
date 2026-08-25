@@ -9,13 +9,16 @@ use std::io;
 use std::os::unix::io::{AsRawFd, RawFd};
 
 // ── UAPI ioctl numbers (must match include/uapi/aivpn.h) ─────────────────────
+// Kernel _IOC convention (asm-generic/ioctl.h): _IOC_WRITE = 1, _IOC_READ = 2.
+// MUST stay identical to platforms/linux-kernel/src/dev.rs (kernel side) —
+// change both together or the production data path breaks.
 
 const MAGIC: u64 = 0xAE;
 const fn iow(nr: u64, sz: u64) -> u64 {
-    (2u64 << 30) | (MAGIC << 8) | nr | (sz << 16)
+    (1u64 << 30) | (MAGIC << 8) | nr | (sz << 16)
 }
 const fn ior(nr: u64, sz: u64) -> u64 {
-    (1u64 << 30) | (MAGIC << 8) | nr | (sz << 16)
+    (2u64 << 30) | (MAGIC << 8) | nr | (sz << 16)
 }
 const fn iowr(nr: u64, sz: u64) -> u64 {
     (3u64 << 30) | (MAGIC << 8) | nr | (sz << 16)
@@ -35,6 +38,12 @@ const IOC_GET_VERSION: u64 = ior(7, 4);
 const IOC_SESSION_UPDATE_TAGS: u64 = iow(8, 4116);
 const IOC_SESSION_DOWNLINK: u64 = iow(9, 4184);
 const IOC_SET_EGRESS: u64 = iow(10, 12);
+
+// Encoding anchors: numeric values the C _IOW/_IOR macros produce for two
+// representative commands. If iow()/ior() ever drift from the kernel _IOC
+// convention again, the build breaks here instead of the data path.
+const _: () = assert!(IOC_SESSION_ADD == 0x40C0_AE01);
+const _: () = assert!(IOC_GET_VERSION == 0x8004_AE07);
 
 pub const API_VERSION: u32 = 5;
 

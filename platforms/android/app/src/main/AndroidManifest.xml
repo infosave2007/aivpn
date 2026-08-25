@@ -43,10 +43,53 @@
             android:exported="false"
             android:parentActivityName=".MainActivity" />
 
+        <!-- Modular transport settings (TransportSettingsRegistry). Generic
+             renderer only: with no registered provider (public edition) it
+             finishes immediately and its MainActivity entry point is hidden. -->
+        <activity
+            android:name=".TransportSettingsActivity"
+            android:exported="false"
+            android:parentActivityName=".MainActivity" />
+
         <!-- Background reliability & permissions health check -->
         <activity
             android:name=".BackgroundHealthActivity"
             android:exported="false"
+            android:parentActivityName=".MainActivity" />
+
+        <!-- In-app admin: client management (Admin/Viewer role gated) -->
+        <activity
+            android:name=".AdminActivity"
+            android:exported="false"
+            android:parentActivityName=".MainActivity" />
+
+        <!-- In-app admin: pool topology view (Admin/Viewer role gated, read-only) -->
+        <activity
+            android:name=".PoolActivity"
+            android:exported="false"
+            android:parentActivityName=".AdminActivity" />
+
+        <!-- In-app admin: audit-log view (G-A2, Admin/Viewer role gated, read-only) -->
+        <activity
+            android:name=".AuditLogActivity"
+            android:exported="false"
+            android:parentActivityName=".AdminActivity" />
+
+        <!-- In-app admin: server settings apply-with-rollback (G-A3, Admin-only) -->
+        <activity
+            android:name=".ServerSettingsActivity"
+            android:exported="false"
+            android:parentActivityName=".AdminActivity" />
+
+        <!-- C3: SSH server-install wizard (always reachable — no tunnel/role required).
+             configChanges (same set as MainActivity): a rotation mid-install would
+             otherwise destroy the Activity — cancelling the poll loop and freeing the
+             Rust-side event queue (sshInstallFree) — leaving a still-running install
+             permanently unobservable and dropping all typed wizard state. -->
+        <activity
+            android:name=".InstallServerActivity"
+            android:exported="false"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboard|keyboardHidden"
             android:parentActivityName=".MainActivity" />
 
         <service

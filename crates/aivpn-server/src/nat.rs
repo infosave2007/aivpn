@@ -462,35 +462,62 @@ impl NatForwarder {
             info!("Firewall backend: {:?}", backend);
             match backend {
                 FwBackend::Nftables => {
-                    self.setup_nftables()?;
-                    // See `iptables_forward_compat_chain`: on a host where Docker
-                    // set `-P FORWARD DROP`, nft accepts alone are not enough.
-                    if let Some(chain) = iptables_forward_compat_chain() {
-                        let tun = self.tun_name.clone();
-                        ipt_ensure("filter", chain, &["-i", &tun, "-j", "ACCEPT"]);
-                        ipt_ensure(
-                            "filter",
-                            chain,
-                            &[
-                                "-o",
-                                &tun,
-                                "-m",
-                                "conntrack",
-                                "--ctstate",
-                                "ESTABLISHED,RELATED",
-                                "-j",
-                                "ACCEPT",
-                            ],
-                        );
-                        info!(
-                            "iptables: FORWARD policy is DROP — added {chain} accepts for {tun} \
-                             so nftables-forwarded client traffic is not dropped by the legacy hook"
-                        );
+                    match self.setup_nftables() {
+                        Ok(()) => {
+                            // See `iptables_forward_compat_chain`: on a host where Docker
+                            // set `-P FORWARD DROP`, nft accepts alone are not enough.
+                            if let Some(chain) = iptables_forward_compat_chain() {
+                                let tun = self.tun_name.clone();
+                                ipt_ensure("filter", chain, &["-i", &tun, "-j", "ACCEPT"]);
+                                ipt_ensure(
+                                    "filter",
+                                    chain,
+                                    &[
+                                        "-o",
+                                        &tun,
+                                        "-m",
+                                        "conntrack",
+                                        "--ctstate",
+                                        "ESTABLISHED,RELATED",
+                                        "-j",
+                                        "ACCEPT",
+                                    ],
+                                );
+                                info!(
+                                    "iptables: FORWARD policy is DROP — added {chain} accepts for {tun} \
+                                     so nftables-forwarded client traffic is not dropped by the legacy hook"
+                                );
+                            }
+                            self.fw_backend = Some(FwBackend::Nftables);
+                        }
+                        Err(e) => {
+                            // The nft binary exists but the ruleset did not apply
+                            // (no CAP_NET_ADMIN, kernel without nf_tables, seccomp).
+                            // detect_fw_backend() only probes the binary, so without
+                            // this fallback the server would start with NO masquerade/
+                            // forward rules at all and every client would be offline.
+                            // `nft -f -` is atomic, so a failed apply leaves no
+                            // partial `aivpn` table behind for the iptables path to
+                            // conflict with.
+                            warn!("nftables setup failed ({}) — falling back to iptables", e);
+                            self.setup_iptables().map_err(|ipt_e| {
+                                Error::Io(io::Error::new(
+                                    io::ErrorKind::Other,
+                                    format!(
+                                        "firewall setup failed on both backends: nftables: {}; iptables: {}",
+                                        e, ipt_e
+                                    ),
+                                ))
+                            })?;
+                            self.fw_backend = Some(FwBackend::Iptables);
+                        }
                     }
                 }
-                FwBackend::Iptables => self.setup_iptables()?,
+                FwBackend::Iptables => {
+                    self.setup_iptables()?;
+                    self.fw_backend = Some(FwBackend::Iptables);
+                }
             }
-            self.fw_backend = Some(backend);
         }
 
         Ok(())
@@ -599,14 +626,33 @@ impl NatForwarder {
 
         if out.status.success() {
             info!("nftables: aivpn table installed (NAT + forward + MSS clamp)");
+            Ok(())
         } else {
-            warn!(
-                "nftables setup failed: {}",
-                String::from_utf8_lossy(&out.stderr)
-            );
+            // stderr alone can be empty (e.g. nft killed by a seccomp SIGSYS in
+            // a container) — always include the exit status and stdout so the
+            // failure is diagnosable from the log. Returning Err (instead of
+            // swallowing the failure) lets create() fall back to iptables —
+            // mirroring setup_nat66, which already fails hard here.
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            Err(Error::Io(io::Error::new(
+                io::ErrorKind::Other,
+                format!(
+                    "nftables setup failed (status: {}): {}{}",
+                    out.status,
+                    if stderr.trim().is_empty() {
+                        "<no stderr>"
+                    } else {
+                        stderr.trim()
+                    },
+                    if stdout.trim().is_empty() {
+                        String::new()
+                    } else {
+                        format!(" | stdout: {}", stdout.trim())
+                    }
+                ),
+            )))
         }
-
-        Ok(())
     }
 
     /// Install iptables rules with check-before-add idempotency.

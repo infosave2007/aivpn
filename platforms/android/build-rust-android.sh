@@ -6,7 +6,9 @@
 #   cargo install cargo-ndk
 #   rustup target add aarch64-linux-android armv7-linux-androideabi x86_64-linux-android
 #
-# Optional release signing via keystore.properties in aivpn-android/:
+# Optional release signing via keystore.properties next to this script
+# (platforms/android/keystore.properties — that is where both this script and
+# app/build.gradle actually look):
 #   storeFile=/absolute/path/to/release.jks
 #   storePassword=...
 #   keyAlias=...
@@ -35,6 +37,24 @@ export PATH="${HOME}/.cargo/bin:${PATH}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+
+# --exclude-libs hides the symbols of static archives. For this .so that is
+# lethal and silent: the 35 JNI exports arrive here from aivpn-android-core,
+# which an extended build links as an rlib — with this flag not one of them
+# survives. The .so still links; System.loadLibrary then fails with
+# UnsatisfiedLinkError on the device, far from the cause.
+#
+# Measured 2026-08-20: --gc-sections is harmless (symbols are dynamic-table
+# roots and survive bfd, lld, strip and LTO alike); --exclude-libs,ALL takes
+# them to zero. This tree sets no linker flags today, and cargo-ndk adds none
+# on its own. The gate is here so it stays that way.
+if grep -rq 'exclude-libs' "${REPO_ROOT}/.cargo" "${REPO_ROOT}/Cargo.toml" 2>/dev/null \
+   || [[ "${RUSTFLAGS:-}" == *exclude-libs* ]]; then
+    echo "FATAL: --exclude-libs is present in the build configuration." >&2
+    echo "It strips the JNI symbols from the .so; the failure appears only at" >&2
+    echo "runtime, as UnsatisfiedLinkError. See docs/design/2026-08-20-*.md §8.1." >&2
+    exit 1
+fi
 CRATE_DIR="${REPO_ROOT}/crates/aivpn-android-core"
 JNI_LIBS_DIR="${SCRIPT_DIR}/app/src/main/jniLibs"
 RELEASES_DIR="${REPO_ROOT}/releases"

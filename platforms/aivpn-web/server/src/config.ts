@@ -64,6 +64,11 @@ const envSchema = z.object({
   // hostile oversized body. Default 1 MiB. Raise only if a legitimate payload
   // (e.g. a very large backup import) needs it.
   PROXY_MAX_BODY_BYTES: z.coerce.number().int().min(1024).default(1024 * 1024),
+  // Separate, larger cap for POST /api/v1/backup/import ONLY: a real backup
+  // (client DB + keys) is routinely several MiB and the management daemon
+  // itself accepts up to 50 MB — the general 1 MiB cap made any non-trivial
+  // backup import fail with 413. Default 64 MiB.
+  PROXY_MAX_BACKUP_BODY_BYTES: z.coerce.number().int().min(1024).default(64 * 1024 * 1024),
 })
 
 const parsed = envSchema.safeParse(process.env)

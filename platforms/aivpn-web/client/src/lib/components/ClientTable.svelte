@@ -1,38 +1,34 @@
 <script lang="ts">
-  import type { Client } from '$lib/api';
+  import type { Client, ClientRole } from '$lib/api';
+  import { authStore } from '$lib/stores/auth.svelte';
   import StatusBadge from './StatusBadge.svelte';
-  import { Key, QrCode, Edit, Trash2 } from 'lucide-svelte';
+  import { Key, QrCode, Edit, Trash2, ShieldOff } from 'lucide-svelte';
 
   let {
     clients,
     onEdit,
     onDelete,
+    onRevoke,
+    onRoleChange,
     onViewKey,
     onViewQr,
   }: {
     clients: Client[];
     onEdit: (id: string) => void;
     onDelete: (id: string) => void;
+    onRevoke: (id: string) => void;
+    onRoleChange: (id: string, role: ClientRole) => void;
     onViewKey: (id: string) => void;
     onViewQr: (id: string) => void;
   } = $props();
 
-  let selected = $state<Set<string>>(new Set());
+  // Role assignment is a web-panel ADMIN-only action (never available over the
+  // tunnel). The panel's own login role — not the VPN client's role field —
+  // gates whether the editor is shown; the server independently enforces this
+  // too (viewers can't reach PATCH at all, see proxy.ts requireReadAccess).
+  const isAdmin = $derived(authStore.user?.role === 'admin');
 
-  function toggleAll() {
-    if (selected.size === clients.length) {
-      selected = new Set();
-    } else {
-      selected = new Set(clients.map((c) => c.id));
-    }
-  }
-
-  function toggle(id: string) {
-    const next = new Set(selected);
-    if (next.has(id)) next.delete(id);
-    else next.add(id);
-    selected = next;
-  }
+  const ROLES: ClientRole[] = ['user', 'viewer', 'admin'];
 
   function formatBytes(b: number): string {
     if (b < 1024) return `${b} B`;
@@ -40,23 +36,21 @@
     if (b < 1024 * 1024 * 1024) return `${(b / 1024 / 1024).toFixed(1)} MB`;
     return `${(b / 1024 / 1024 / 1024).toFixed(2)} GB`;
   }
+
+  function handleRoleChange(id: string, e: Event) {
+    const value = (e.target as HTMLSelectElement).value as ClientRole;
+    onRoleChange(id, value);
+  }
 </script>
 
 <div class="overflow-x-auto rounded-xl border border-gray-200 dark:border-gray-700">
   <table class="w-full text-sm">
     <thead class="bg-gray-50 dark:bg-gray-800 text-gray-500 dark:text-gray-400">
       <tr>
-        <th class="px-4 py-3 text-left w-10">
-          <input
-            type="checkbox"
-            checked={selected.size === clients.length && clients.length > 0}
-            onchange={toggleAll}
-            class="rounded"
-          />
-        </th>
         <th class="px-4 py-3 text-left font-medium">Name</th>
         <th class="px-4 py-3 text-left font-medium">VPN IP</th>
         <th class="px-4 py-3 text-left font-medium">Status</th>
+        <th class="px-4 py-3 text-left font-medium">Role</th>
         <th class="px-4 py-3 text-left font-medium">Traffic</th>
         <th class="px-4 py-3 text-left font-medium">Last Connected</th>
         <th class="px-4 py-3 text-right font-medium">Actions</th>
@@ -65,14 +59,6 @@
     <tbody class="divide-y divide-gray-100 dark:divide-gray-700 bg-white dark:bg-gray-900">
       {#each clients as client (client.id)}
         <tr class="hover:bg-gray-50 dark:hover:bg-gray-800/50 transition-colors">
-          <td class="px-4 py-3">
-            <input
-              type="checkbox"
-              checked={selected.has(client.id)}
-              onchange={() => toggle(client.id)}
-              class="rounded"
-            />
-          </td>
           <td class="px-4 py-3 font-medium text-gray-900 dark:text-white">
             {client.name}
             {#if client.one_time}
@@ -86,6 +72,11 @@
                 exp {new Date(client.expires_at).toLocaleDateString()}
               </span>
             {/if}
+            {#if client.exit_node}
+              <span class="ml-1 text-xs text-purple-500 font-mono" title="Exit node override: {client.exit_node}">
+                exit: {client.exit_node}
+              </span>
+            {/if}
           </td>
           <td class="px-4 py-3 text-gray-600 dark:text-gray-400 font-mono text-xs">{client.vpn_ip}</td>
           <td class="px-4 py-3">
@@ -93,6 +84,22 @@
               status={client.enabled ? 'enabled' : 'disabled'}
               variant={client.enabled ? 'success' : 'error'}
             />
+          </td>
+          <td class="px-4 py-3">
+            {#if isAdmin}
+              <select
+                value={client.role ?? 'user'}
+                onchange={(e) => handleRoleChange(client.id, e)}
+                title="Change client role"
+                class="px-2 py-1 border border-gray-300 dark:border-gray-600 rounded bg-white dark:bg-gray-800 text-xs text-gray-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-indigo-500"
+              >
+                {#each ROLES as r (r)}
+                  <option value={r}>{r}</option>
+                {/each}
+              </select>
+            {:else}
+              <span class="capitalize text-gray-600 dark:text-gray-400 text-xs">{client.role ?? 'user'}</span>
+            {/if}
           </td>
           <td class="px-4 py-3 text-gray-600 dark:text-gray-400 text-xs">
             ↑{formatBytes(client.stats?.bytes_out ?? 0)} ↓{formatBytes(client.stats?.bytes_in ?? 0)}
@@ -130,6 +137,15 @@
               >
                 <Trash2 size={15} />
               </button>
+              {#if isAdmin}
+                <button
+                  onclick={() => onRevoke(client.id)}
+                  class="p-1.5 text-gray-400 hover:text-red-600 dark:hover:text-red-400 rounded"
+                  title="Revoke (tombstone + force-disconnect)"
+                >
+                  <ShieldOff size={15} />
+                </button>
+              {/if}
             </div>
           </td>
         </tr>

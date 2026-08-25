@@ -68,6 +68,19 @@ object AivpnJni {
         staticPrivkey: ByteArray?,
         maskProfile: String?,
         serverSigningKey: ByteArray?,
+        /**
+         * R2 Phase B: 32-byte ed25519 verifying key for artifact-level MaskUpdate
+         * signature verification (the "mop" connection-key field, mirrors desktop's
+         * `--mask-operator-pubkey`), or null to skip. Distinct from [serverSigningKey]:
+         * that authenticates "pushed by my server" (transport); this authenticates
+         * "gated + signed by the operator" (artifact).
+         */
+        maskOperatorPubkey: ByteArray?,
+        /**
+         * Matching verification strictness: 0=off, 1=warn, 2=enforce (mirrors desktop's
+         * `--mask-verify-mode`). Any other value is treated as warn.
+         */
+        maskVerifyMode: Int,
         /** §3 Polymorphic masks: base mask id to request a per-session unique variant of, or null. */
         polymorphicBase: String?,
         /** §2 crowdsourced blocking feedback (opt-in): report mask success/fail outcomes. */
@@ -95,6 +108,14 @@ object AivpnJni {
          * preset.
          */
         cachedDescriptorsJson: String?,
+        /**
+         * Optional transport override from the modular settings seam
+         * ([TransportSettingsRegistry]): a short transport name the native core
+         * understands, or null for the built-in default transport.
+         */
+        transportName: String?,
+        /** JSON parameter object accompanying [transportName], or null. */
+        transportParamsJson: String?,
     ): String
 
     /**
@@ -110,9 +131,10 @@ object AivpnJni {
      * `true` when the last session proved its cached bootstrap descriptors are
      * unusable against this server: the handshake was accepted but not a single
      * downlink DATA packet ever arrived. The persisted blob for that server must
-     * then be deleted, otherwise the next cold start reloads the same descriptor
-     * and reconnects into the same dead data plane (issue #71 — today only
-     * clearing app data breaks the loop, and only for one connection).
+     * then be replaced with the `"distrusted"` sentinel — deleting it is not
+     * enough, because the server re-pushes fresh descriptors during the very
+     * session that recovers the tunnel, so the next connect would adopt one
+     * again and break again.
      *
      * Poll once after [runTunnel] returns; reading clears the flag.
      */
@@ -140,8 +162,42 @@ object AivpnJni {
     /** Connection quality score 0–100 from last KeepaliveAck RTT. 0 = no data yet. */
     external fun getQualityScore(): Int
 
-    /** Adaptive level hint from server (0–3). 0 = no hint received. Takes effect on next reconnect. */
+    /**
+     * Adaptive level hint from server: 0–3 (0 = server says adaptive Off — a real
+     * downgrade), or -1 when no hint has been received this session. Takes effect
+     * on next reconnect.
+     */
     external fun getAdaptiveLevelHint(): Int
+
+    /**
+     * VPN IPv4 the server assigned to this session in its ServerHello (dotted
+     * quad), or "" when the current session has not received one. Differs from
+     * the key-embedded IP after a pool re-home — the TUN must then be rebuilt
+     * with this address or the server's anti-spoof check drops all uplink data.
+     */
+    external fun getAssignedVpnIp(): String
+
+    /**
+     * Returns `true` (and atomically clears the flag) if the server sent CertRejected
+     * (mTLS client certificate rejected) at any point since the last call. Poll this
+     * live during a session, like [getAssignedVpnIp] — the server keeps the tunnel up
+     * while rejecting the cert rather than tearing it down, so waiting for [runTunnel]
+     * to return would never observe it. A `true` result means the current certificate
+     * will never be accepted by this server; prompt the user to re-provision.
+     */
+    external fun certRejected(): Boolean
+
+    /**
+     * Returns the `HandshakeReject` reason code (0=unspecified, 1=one-time key
+     * already used, 2=client expired, 3=client disabled) and atomically clears
+     * the pending flag, or -1 if no `HandshakeReject` has been observed since
+     * the last call. Unlike [certRejected], this is a TERMINAL, authenticated
+     * refusal — the server only ever sends it to a peer that already proved
+     * PSK knowledge during the handshake — so the caller must STOP the
+     * reconnect loop instead of backing off and retrying under the same
+     * credential.
+     */
+    external fun handshakeRejectReason(): Int
 
     // ──────────── §2 crowdsourced blocking feedback getters ────────────
     //
@@ -246,4 +302,121 @@ object AivpnJni {
         signingPublicKey: ByteArray,
         nowUnixSecs: Long,
     ): Boolean
+
+    // ──────────── In-app admin: client management (P3.1) ────────────
+    //
+    // These three exports back the curated management-API client used by
+    // [AdminApi] / [AdminActivity]. They operate on the currently-active tunnel
+    // session (process-global, like the getters above) — there is no separate
+    // "admin connection". Callers MUST check [isAvailable] first, same as any
+    // other `external fun` on this object.
+
+    /**
+     * This device's role on the currently-configured identity: 0=User,
+     * 1=Viewer, 2=Admin. Role is bound to the client's cryptographic identity
+     * (set server-side) and is NOT assignable over the tunnel — there is no
+     * corresponding setter here.
+     */
+    external fun getRole(): Int
+
+    /**
+     * Issues one request against the curated management API
+     * (`/api/v1/clients`, `/api/v1/status`, `/api/v1/audit-log`, ...) over the
+     * active tunnel session and blocks for up to ~10s waiting for the reply.
+     *
+     * @param method HTTP method byte: 0=GET, 1=POST, 2=PATCH, 3=DELETE, 4=PUT.
+     * @param path   Request path, e.g. "/api/v1/clients/{id}".
+     * @param body   Request body bytes (JSON), or an empty array for methods
+     *               without a body.
+     * @return       `[status_hi, status_lo, ...response_body]` — a 2-byte
+     *               big-endian HTTP status prefix followed by the response
+     *               body bytes. An EMPTY array means the call did not
+     *               complete (not connected / timed out) — callers must
+     *               check `size < 2` before indexing. NULLABLE like the
+     *               `String?` getters above: the Rust `make_bytes` helper
+     *               returns a null jbyteArray rather than panicking across
+     *               the FFI boundary when the JVM cannot allocate the array.
+     */
+    external fun mgmtRequest(method: Int, path: String, body: ByteArray): ByteArray?
+
+    /**
+     * Renders `text` (typically an `aivpn://...` connection key) as a PNG QR
+     * code and returns the raw PNG bytes, or an empty array on failure (null
+     * if the JVM array allocation itself failed — see [mgmtRequest]).
+     * Decode with [android.graphics.BitmapFactory.decodeByteArray].
+     */
+    external fun qrPng(text: String): ByteArray?
+
+    // ──────────── C2b: in-app SSH server installer (ssh-install feature) ────────────
+    //
+    // Backed by `aivpn-common::ssh_install` via the JNI bridge in
+    // `aivpn-android-core/src/lib.rs` (`ssh-install` is a default feature of
+    // that crate, so it ships in the standard .so build). These calls are
+    // completely independent of the tunnel session used by [mgmtRequest] —
+    // they open their own outbound SSH connection to the target host.
+
+    /**
+     * Connects to `host:port` as `user`, completes just enough of the SSH
+     * handshake to read the server's host key, and returns its fingerprint
+     * for TOFU confirmation before [sshInstallStart] is called with it.
+     * Blocks the calling thread (spins up a throwaway single-thread tokio
+     * runtime) — call off the UI thread.
+     *
+     * @return `"SHA256:..."` fingerprint, or `null` on any error (DNS/TCP/
+     *         protocol failure, invalid port, bad UTF-8 in `host`/`user`).
+     */
+    external fun sshProbeHostkey(host: String, port: Int, user: String): String?
+
+    /** SHA256 (hex) of the embedded `install-server.sh`, for display before running it. */
+    external fun sshInstallScriptSha256(): String
+
+    /** Full text of the embedded `install-server.sh`. */
+    external fun sshInstallScript(): String
+
+    /**
+     * Parses `paramsJson` (host/port/user/auth/fingerprint/binary/mode/...
+     * — see [AdminApi]/[InstallServerActivity] callers for the exact shape)
+     * and, if valid, spawns a background thread that runs the installer,
+     * returning immediately with a job handle to poll via [sshInstallPoll].
+     *
+     * @return job handle (>=1), or `-1` if `paramsJson` is malformed —
+     *         in that case no job is created; nothing to poll or free.
+     */
+    external fun sshInstallStart(paramsJson: String): Long
+
+    /**
+     * Pops the next queued progress event for `handle` (JSON, one of the
+     * `InstallEvent` shapes: `connected`/`uploading`/`line`/`marker`/`finished`).
+     *
+     * - An event is queued -> that event's JSON string.
+     * - No event queued, job still running -> `null` — poll again later (~300ms).
+     * - No event queued, job finished, OR `handle` unknown -> `""` — safe to
+     *   call [sshInstallFree].
+     */
+    external fun sshInstallPoll(handle: Long): String?
+
+    /**
+     * Forgets `handle`, freeing its queued-events storage. Does NOT cancel an
+     * in-flight install — if the background thread is still running it keeps
+     * going, just becomes unobservable.
+     *
+     * @return `0` if a job was removed, `-1` if `handle` was already unknown.
+     */
+    external fun sshInstallFree(handle: Long): Int
+
+    /**
+     * Derives this device's X25519 public key from `privkeyB64` — the same 32-byte
+     * device static private key ([SecureStorage.loadDeviceKey], base64 STANDARD-encoded
+     * by the caller) already passed as `staticPrivkey` into [runTunnel] for JIT device
+     * enrollment. Used by [InstallServerActivity] to populate `sshInstallStart`'s params
+     * JSON `device_pubkey_b64` field when the user opts into device-bound admin install
+     * (mirrors the desktop CLI's `--device-pubkey`).
+     *
+     * @param privkeyB64 32 raw bytes, base64 STANDARD (NOT `android.util.Base64.DEFAULT`,
+     *                   which may insert newlines — re-encode if the source used a
+     *                   different variant).
+     * @return the base64 STANDARD-encoded public key, or `null` if `privkeyB64` is not
+     *         valid base64 or does not decode to exactly 32 bytes. Never throws.
+     */
+    external fun devicePubkey(privkeyB64: String): String?
 }

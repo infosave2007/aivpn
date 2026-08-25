@@ -104,7 +104,7 @@ class VpnReconnectWorker(context: Context, params: WorkerParameters) :
         nm.createNotificationChannel(
             NotificationChannel(
                 CHANNEL_ID,
-                ctx.getString(R.string.notification_event_channel),
+                ctx.getString(R.string.notification_reconnect_channel),
                 NotificationManager.IMPORTANCE_LOW
             )
         )
@@ -119,8 +119,15 @@ class VpnReconnectWorker(context: Context, params: WorkerParameters) :
     companion object {
         private const val TAG = "VpnReconnectWorker"
         private const val UNIQUE_NAME = "aivpn_reconnect"
-        /** Reuses AivpnService's events channel id (same channel, no proliferation). */
-        private const val CHANNEL_ID = "aivpn_events"
+        /**
+         * L1: the worker's OWN channel. It previously reused AivpnService's
+         * "aivpn_events" id but created it with IMPORTANCE_LOW — and Android
+         * keeps the LOWEST importance a channel was ever created with, so one
+         * expedited-work run on API < 31 permanently silenced every future
+         * connect/disconnect event notification. A quiet LOW-importance channel
+         * is exactly right for this progress stub, so it gets a dedicated id.
+         */
+        private const val CHANNEL_ID = "aivpn_reconnect"
         private const val NOTIFICATION_ID = 4
 
         /** Enqueue (replacing any pending instance) an expedited reconnect attempt. */

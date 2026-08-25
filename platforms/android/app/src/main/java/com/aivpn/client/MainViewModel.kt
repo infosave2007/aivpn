@@ -50,12 +50,17 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         adaptiveLevel.value = level
     }
 
-    fun setConnected(statusMsg: String) {
+    /**
+     * [startTime] comes from AivpnService.connectedAtMillis — the service-side
+     * per-session stamp. The ViewModel only mirrors it for LiveData observers;
+     * it no longer invents its own timestamp (an Activity-scoped stamp reset
+     * the timer to "now" whenever the Activity was recreated over a live
+     * tunnel, and went stale across silent reconnects).
+     */
+    fun setConnected(statusMsg: String, startTime: Long) {
         connectionState.value = ConnectionState.CONNECTED
         statusText.value = statusMsg
-        if ((connectionStartTime.value ?: 0L) == 0L) {
-            connectionStartTime.value = System.currentTimeMillis()
-        }
+        connectionStartTime.value = startTime
     }
 
     fun setConnecting(statusMsg: String) {

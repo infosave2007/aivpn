@@ -53,6 +53,13 @@ class MainActivity : AppCompatActivity() {
     private var profiles = mutableListOf<SecureStorage.ConnectionProfile>()
     private var activeProfileId: String? = null
 
+    /**
+     * False until onCreate's asynchronous SecureStorage load (A5) has populated
+     * [profiles] / [activeProfileId]. Guards every path that PERSISTS the list:
+     * saving the not-yet-loaded (empty) list would overwrite every stored profile.
+     */
+    private var profilesLoaded = false
+
     private val vpnPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult()
     ) { result ->
@@ -144,30 +151,61 @@ class MainActivity : AppCompatActivity() {
         binding.profileList.layoutManager = LinearLayoutManager(this)
         binding.profileList.adapter = profilesAdapter
 
-        // Migrate legacy single connection key to profiles
-        migrateLegacyKey()
+        // A5: the legacy-key migration, the profile list and the saved language
+        // all live in EncryptedSharedPreferences — Keystore + real disk I/O,
+        // hundreds of ms on a cold start — which BootReceiver already refuses to
+        // run on its calling thread (see its goAsync() comment). Load them on
+        // Dispatchers.IO and apply the result here on the main thread; until it
+        // lands [profilesLoaded] keeps the persisting paths (connect, profile
+        // dialog) from writing the still-empty list back over stored profiles.
+        lifecycleScope.launch {
+            data class LoadResult(
+                val profiles: MutableList<SecureStorage.ConnectionProfile>,
+                val activeId: String?,
+                val legacyKey: String,
+                val language: String?,
+            )
 
-        // Load profiles
-        profiles = SecureStorage.loadProfiles(this).toMutableList()
-        activeProfileId = SecureStorage.loadActiveProfileId(this)
+            val loaded = withContext(Dispatchers.IO) {
+                // Migrate legacy single connection key to profiles
+                migrateLegacyKey()
+                val list = SecureStorage.loadProfiles(this@MainActivity).toMutableList()
+                LoadResult(
+                    profiles = list,
+                    activeId = SecureStorage.loadActiveProfileId(this@MainActivity),
+                    // Only read for the no-profiles fallback below.
+                    legacyKey = if (list.isEmpty()) SecureStorage.loadConnectionKey(this@MainActivity) else "",
+                    language = SecureStorage.loadLanguage(this@MainActivity),
+                )
+            }
+            profiles = loaded.profiles
+            activeProfileId = loaded.activeId
+            profilesLoaded = true
 
-        // If we have an active profile, load its key into the field
-        val active = profiles.find { it.id == activeProfileId }
-        if (active != null) {
-            binding.editConnectionKey.setText(active.key)
-        } else if (profiles.isNotEmpty()) {
-            activeProfileId = profiles[0].id
-            binding.editConnectionKey.setText(profiles[0].key)
-            SecureStorage.saveActiveProfileId(this, profiles[0].id)
-        } else {
-            // Fallback: try legacy key
-            binding.editConnectionKey.setText(SecureStorage.loadConnectionKey(this))
+            // If we have an active profile, load its key into the field
+            val active = profiles.find { it.id == activeProfileId }
+            if (active != null) {
+                binding.editConnectionKey.setText(active.key)
+            } else if (profiles.isNotEmpty()) {
+                activeProfileId = profiles[0].id
+                binding.editConnectionKey.setText(profiles[0].key)
+                withContext(Dispatchers.IO) {
+                    SecureStorage.saveActiveProfileId(this@MainActivity, profiles[0].id)
+                }
+            } else {
+                // Fallback: try legacy key
+                binding.editConnectionKey.setText(loaded.legacyKey)
+            }
+
+            renderProfiles()
+
+            // Update language button label
+            updateLanguageButton(loaded.language)
+
+            // The Connect label carries the active profile name, which was still
+            // unknown when the resync at the end of onCreate rendered the state.
+            resyncFromService()
         }
-
-        renderProfiles()
-
-        // Update language button label
-        updateLanguageButton()
 
         binding.btnConnect.setOnClickListener {
             if (AivpnService.isServiceActive) disconnect() else connect()
@@ -268,6 +306,9 @@ class MainActivity : AppCompatActivity() {
 
     private fun showProfileDialog(existing: SecureStorage.ConnectionProfile?) {
         if (isConnected) return
+        // Saving from this dialog persists the whole list — not before it loaded
+        // (see [profilesLoaded]).
+        if (!profilesLoaded) return
 
         // Use the dialog's theme context so EditText fields inherit proper colours
         // (white text, grey hints) instead of defaulting to the dark-on-dark activity theme.
@@ -477,15 +518,23 @@ class MainActivity : AppCompatActivity() {
     private val Int.dp: Int get() = (this * resources.displayMetrics.density).toInt()
 
     private fun updateSplitTunnelHint() {
-        val appCount = SecureStorage.loadAllowedApps(this).size
-        val siteCount = SecureStorage.loadExcludedDomains(this).size
-        binding.textSplitTunnelHint.text = when {
-            appCount > 0 && siteCount > 0 -> getString(R.string.split_tunnel_hint_combined,
-                getString(R.string.split_tunnel_hint_apps, appCount),
-                getString(R.string.split_tunnel_hint_sites, siteCount))
-            appCount > 0 -> getString(R.string.split_tunnel_vpn_count, appCount)
-            siteCount > 0 -> getString(R.string.split_tunnel_bypass_count, siteCount)
-            else -> getString(R.string.split_tunnel_desc)
+        // A5: same Keystore-backed store as the onCreate load — and this one runs
+        // again on EVERY onResume, so it must not block the main thread either.
+        // Purely a label, so applying it a frame late is invisible.
+        lifecycleScope.launch {
+            val counts = withContext(Dispatchers.IO) {
+                SecureStorage.loadAllowedApps(this@MainActivity).size to
+                    SecureStorage.loadExcludedDomains(this@MainActivity).size
+            }
+            val (appCount, siteCount) = counts
+            binding.textSplitTunnelHint.text = when {
+                appCount > 0 && siteCount > 0 -> getString(R.string.split_tunnel_hint_combined,
+                    getString(R.string.split_tunnel_hint_apps, appCount),
+                    getString(R.string.split_tunnel_hint_sites, siteCount))
+                appCount > 0 -> getString(R.string.split_tunnel_vpn_count, appCount)
+                siteCount > 0 -> getString(R.string.split_tunnel_bypass_count, siteCount)
+                else -> getString(R.string.split_tunnel_desc)
+            }
         }
     }
 
@@ -512,6 +561,14 @@ class MainActivity : AppCompatActivity() {
 
         AivpnService.recordingCallback = { feedbackJson ->
             runOnUiThread { handleRecordingFeedback(feedbackJson) }
+        }
+
+        // L3: the core hands each recording-feedback message out exactly once;
+        // one polled while this Activity was paused was buffered by the service
+        // instead of dropped. Deliver it now (take-once).
+        AivpnService.pendingRecordingFeedback?.let { buffered ->
+            AivpnService.pendingRecordingFeedback = null
+            handleRecordingFeedback(buffered)
         }
 
         // Restore UI state from the service tri-state (e.g. after returning from
@@ -556,6 +613,12 @@ class MainActivity : AppCompatActivity() {
     private fun parseConnectionKey(key: String): ParsedConnectionKey? = ConnectionKeyParser.parse(key)
 
     private fun connect() {
+        // The profile list is still loading (onCreate, off the main thread): the
+        // in-memory list is empty, so the saveProfiles() below would wipe every
+        // stored profile. A no-op is safe — the window is a few milliseconds and
+        // the next tap goes through.
+        if (!profilesLoaded) return
+
         val connectionKey = binding.editConnectionKey.text.toString().trim()
         if (connectionKey.isEmpty()) {
             Toast.makeText(this, getString(R.string.error_fill_fields), Toast.LENGTH_SHORT).show()
@@ -661,12 +724,25 @@ class MainActivity : AppCompatActivity() {
         binding.btnAddProfile.isEnabled = !serviceActive
         renderProfiles()
 
-        // Timer management — connectionStartTime is persisted in ViewModel and survives rotation.
+        // Timer management — the service's connectedAtMillis is the single source
+        // of truth: stamped per session in onTunnelReady, it survives Activity
+        // recreation (no more "timer restarts at app open" over a live tunnel)
+        // and restamps on every silent reconnect (timer and the per-session
+        // traffic counters now reset together instead of drifting apart).
         if (connected) {
-            val isFreshConnect = connectionStartTime == 0L
-            viewModel.setConnected(statusText)  // idempotent: only stamps startTime when it is 0
-            // connectionStartTime is synced synchronously from ViewModel via observer above
-            if (isFreshConnect) {
+            val serviceStart = AivpnService.connectedAtMillis
+            val isFreshSession = serviceStart != connectionStartTime
+            viewModel.setConnected(statusText, serviceStart)
+            // L2: LiveData observers registered in onCreate only become ACTIVE at
+            // onStart, so during onCreate's resyncFromService() the setConnected()
+            // above is NOT delivered synchronously — connectionStartTime stayed 0,
+            // the timerRunnable posted below bailed on its `> 0` guard, and the
+            // timer/start-time fields stayed blank until onResume re-synced. Sync
+            // directly; the observer still restores it on rotation.
+            if (serviceStart > 0) {
+                connectionStartTime = serviceStart
+            }
+            if (isFreshSession) {
                 binding.textUpload.text = "0 B"
                 binding.textDownload.text = "0 B"
             }
@@ -704,9 +780,9 @@ class MainActivity : AppCompatActivity() {
         recreate()
     }
 
-    private fun updateLanguageButton() {
+    /** [savedLang] comes from onCreate's off-main-thread SecureStorage load (A5). */
+    private fun updateLanguageButton(savedLang: String?) {
         // Apply saved language on startup
-        val savedLang = SecureStorage.loadLanguage(this)
         if (savedLang != null && savedLang != "en") {
             val localeList = LocaleListCompat.forLanguageTags(savedLang)
             AppCompatDelegate.setApplicationLocales(localeList)
@@ -740,8 +816,17 @@ class MainActivity : AppCompatActivity() {
             ": " + if (autoConnect) getString(R.string.auto_connect_state_on)
                    else getString(R.string.auto_connect_state_off)
 
+        // In-app admin entry: visible for Admin (full read/write) and Viewer
+        // (read-only list inside AdminActivity), hidden entirely for role
+        // User(0) or when the role can't be determined (e.g. .so not loaded).
+        val mgmtRole = try {
+            if (AivpnJni.isAvailable) AivpnJni.getRole() else -1
+        } catch (_: Throwable) {
+            -1
+        }
+
         data class Item(val title: String, val desc: String, val id: Int)
-        val items = listOf(
+        val items = mutableListOf(
             Item(getString(R.string.adaptive_mode) + ": " + levelNames[currentLevel],
                  getString(R.string.desc_adaptive_mode), MENU_ADAPTIVE),
             Item(autoConnectLabel,                   getString(R.string.desc_auto_connect),  MENU_AUTO_CONNECT),
@@ -752,6 +837,23 @@ class MainActivity : AppCompatActivity() {
             Item(getString(R.string.bootstrap_discovery), getString(R.string.desc_bootstrap_discovery), MENU_BOOTSTRAP_DISCOVERY),
             Item(getString(R.string.mask_privacy), getString(R.string.desc_mask_privacy), MENU_MASK_PRIVACY),
         )
+        // Modular transport settings: only an edition that ships a descriptor
+        // asset has anything to configure. The public build ships none, so the
+        // entry never appears.
+        if (loadTransportDescriptor(this) != null) {
+            items.add(Item(getString(R.string.transport_settings_title),
+                getString(R.string.desc_transport_settings), MENU_TRANSPORT_SETTINGS))
+        }
+        if (mgmtRole == 1 || mgmtRole == 2) {
+            items.add(Item(getString(R.string.admin_menu_title), getString(R.string.desc_admin_menu), MENU_ADMIN))
+        }
+        // Installing a server is the base "set up your first server" flow, so unlike
+        // MENU_ADMIN it is NOT gated on role or an active tunnel: a fresh install with
+        // no profiles yet has mgmtRole == -1 (nothing connected), and this must still be
+        // reachable. It opens its own outbound SSH connection independent of any tunnel
+        // session (see InstallServerActivity's class doc comment) — nothing here exposes
+        // admin-only client-management functionality to a non-admin.
+        items.add(Item(getString(R.string.install_menu_title), getString(R.string.desc_install_menu), MENU_INSTALL_SERVER))
 
         val dialogCtx = android.view.ContextThemeWrapper(this, R.style.Theme_AIVPN_Dialog)
         val container = LinearLayout(dialogCtx).apply {
@@ -839,6 +941,9 @@ class MainActivity : AppCompatActivity() {
             MENU_OS_KILL_SWITCH -> startActivity(Intent(android.provider.Settings.ACTION_VPN_SETTINGS))
             MENU_BOOTSTRAP_DISCOVERY -> showBootstrapDiscoveryDialog()
             MENU_MASK_PRIVACY -> showMaskPrivacyDialog()
+            MENU_ADMIN -> startActivity(Intent(this, AdminActivity::class.java))
+            MENU_INSTALL_SERVER -> startActivity(Intent(this, InstallServerActivity::class.java))
+            MENU_TRANSPORT_SETTINGS -> startActivity(Intent(this, TransportSettingsActivity::class.java))
         }
     }
 
@@ -1377,6 +1482,9 @@ class MainActivity : AppCompatActivity() {
         private const val MENU_AUTO_CONNECT = 1006
         private const val MENU_BOOTSTRAP_DISCOVERY = 1007
         private const val MENU_MASK_PRIVACY = 1008
+        private const val MENU_ADMIN = 1009
+        private const val MENU_INSTALL_SERVER = 1010
+        private const val MENU_TRANSPORT_SETTINGS = 1011
 
         val MASK_OPTIONS = arrayOf(
             "auto",

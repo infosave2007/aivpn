@@ -2,16 +2,14 @@
 // AIVPN TC egress QoS program — per-client token bucket rate limiting + DSCP marking.
 //
 // Attached to the TUN egress path (tc qdisc add ... bpf obj tc_qos_prog.o sec tc).
-// BPF map `qos_rules` (LRU_HASH): key = client VPN IP (u32 BE), value = QosRule.
-// Graceful degradation: if the map is absent the kernel refuses to load — server
-// falls back to userspace-only enforcement (no crash).
+// BPF map `aivpn_qos_rules` (LRU_HASH): key = client VPN IP (u32 BE), value =
+// struct qos_rule. Graceful degradation: if the map is absent the kernel refuses
+// to load — server falls back to userspace-only enforcement (no crash).
 
 #include <linux/bpf.h>
 #include <linux/pkt_cls.h>
 #include <linux/ip.h>
-#include <linux/if_ether.h>
 #include <bpf/bpf_helpers.h>
-#include <bpf/bpf_endian.h>
 
 #define NS_PER_SEC  1000000000ULL
 #define MAX_CLIENTS 512
@@ -29,37 +27,39 @@ struct {
     __uint(max_entries, MAX_CLIENTS);
     __type(key, __u32);          // client VPN IP (network byte order)
     __type(value, struct qos_rule);
-} qos_rules SEC(".maps");
+    // Pin at /sys/fs/bpf/aivpn_qos_rules so the userspace loader (bpftool map
+    // update pinned ...) can reach the map after `tc` loads the program.
+    __uint(pinning, LIBBPF_PIN_BY_NAME);
+} aivpn_qos_rules SEC(".maps");
 
 SEC("tc")
 int tc_qos_egress(struct __sk_buff *skb) {
     void *data     = (void *)(long)skb->data;
     void *data_end = (void *)(long)skb->data_end;
 
-    struct ethhdr *eth = data;
-    if ((void *)(eth + 1) > data_end)
-        return TC_ACT_OK;
-    if (eth->h_proto != bpf_htons(ETH_P_IP))
-        return TC_ACT_OK;
-
-    struct iphdr *iph = (void *)(eth + 1);
+    // This program is attached to a TUN device (ARPHRD_NONE, hard_header_len=0):
+    // on tc egress skb->data points directly at the L3 header — there is NO
+    // Ethernet header to skip. Parse IPv4 straight from skb->data and pass
+    // anything that is not IPv4 (e.g. IPv6) untouched.
+    struct iphdr *iph = data;
     if ((void *)(iph + 1) > data_end)
+        return TC_ACT_OK;
+    if (iph->version != 4)
         return TC_ACT_OK;
 
     // Egress: destination IP = client VPN IP
     __u32 dst_ip = iph->daddr;
-    struct qos_rule *rule = bpf_map_lookup_elem(&qos_rules, &dst_ip);
+    struct qos_rule *rule = bpf_map_lookup_elem(&aivpn_qos_rules, &dst_ip);
     if (!rule)
         return TC_ACT_OK;
 
     __u64 now = bpf_ktime_get_ns();
 
-    // DSCP marking
+    // DSCP marking (tos is byte 1 of the IP header — no Ethernet offset here)
     if (rule->dscp) {
         __u8 new_tos = (iph->tos & 0x03) | (rule->dscp << 2);
         if (iph->tos != new_tos) {
-            bpf_skb_store_bytes(skb,
-                sizeof(struct ethhdr) + offsetof(struct iphdr, tos),
+            bpf_skb_store_bytes(skb, offsetof(struct iphdr, tos),
                 &new_tos, 1, BPF_F_RECOMPUTE_CSUM);
         }
     }

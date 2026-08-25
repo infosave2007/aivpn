@@ -3,13 +3,15 @@
 # Stops any existing helper daemon and cleans up orphaned processes
 
 # Kill ALL aivpn-client processes (from old DMG runs, direct launches, etc.)
+# -x matches the exact process name; -f would match the pattern anywhere in
+# the full argv and kill innocent bystanders (e.g. `tail -f .../aivpn-client.log`).
 echo "Stopping all aivpn-client processes..."
-pkill -9 -f "aivpn-client" 2>/dev/null || true
+pkill -9 -x "aivpn-client" 2>/dev/null || true
 sleep 1
 
 # Kill any running helper
 echo "Stopping existing helper..."
-pkill -9 -f "aivpn-helper" 2>/dev/null || true
+pkill -9 -x "aivpn-helper" 2>/dev/null || true
 sleep 1
 
 # Unload LaunchDaemon (try both old and new API)

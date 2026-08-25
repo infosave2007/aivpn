@@ -14,6 +14,14 @@ struct ConnectionKey: Identifiable, Codable, Equatable {
     /// key's `sk` field (embedded by the server), falling back to an explicit
     /// value passed to the initializer.
     var serverSigningKey: String?
+    /// R2 Phase B: operator's ed25519 mask-verifying public key (base64, 32
+    /// bytes) used to check the embedded operator signature on mask artifacts
+    /// pushed via MaskUpdate. Sourced purely from the aivpn:// connection
+    /// key's `mop` field — like `vpnIP`/`canRecord` below, it is re-derived
+    /// from `keyValue` on every init rather than persisted separately, since
+    /// it always stays in sync with the key it came from (mirrors desktop
+    /// main.rs's `mop` connection-key field / `--mask-operator-pubkey`).
+    let maskOperatorPubkey: String?
 
     init(id: String = UUID().uuidString, name: String, keyValue: String, mtlsCert: String? = nil,
          serverSigningKey: String? = nil) {
@@ -27,6 +35,7 @@ struct ConnectionKey: Identifiable, Codable, Equatable {
         var server: String? = nil
         var ip: String? = nil
         var record: Bool? = nil
+        var mop: String? = nil
 
         // Metadata extraction is deliberately NOT gated on the `k` format check:
         // even if `k` is malformed, the server address / VPN IP / can_record /
@@ -43,10 +52,16 @@ struct ConnectionKey: Identifiable, Codable, Equatable {
                let sk = json["sk"] as? String, !sk.isEmpty {
                 self.serverSigningKey = sk
             }
+            // R2 Phase B: operator mask-verifying pubkey ("mop"), same shape/
+            // precedent as "sk" above (embedded, public, non-secret).
+            if let m = json["mop"] as? String, !m.isEmpty {
+                mop = m
+            }
         }
 
         self.serverAddress = server
         self.vpnIP = ip
+        self.maskOperatorPubkey = mop
         self.canRecord = record
     }
 
@@ -412,6 +427,13 @@ class KeychainStorage: ObservableObject {
             kSecAttrAccessible: kSecAttrAccessibleWhenUnlockedThisDeviceOnly,
             kSecValueData:      data,
         ]
-        SecItemAdd(attrs as CFDictionary, nil)
+        // Unlike keychainAdd/keychainUpdate above, this status used to be
+        // discarded entirely: a refused write (device locked mid-write)
+        // silently loses the selection, and the app then quietly falls back
+        // to another key on next launch. Log it instead of dropping it.
+        let status = SecItemAdd(attrs as CFDictionary, nil)
+        if status != errSecSuccess {
+            NSLog("AIVPN: failed to persist selected key id to Keychain (OSStatus %d)", status)
+        }
     }
 }

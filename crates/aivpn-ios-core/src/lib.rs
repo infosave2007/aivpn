@@ -6,18 +6,20 @@
 #![allow(non_snake_case)]
 
 mod ios_tunnel;
+#[cfg(feature = "ssh-install")]
+mod ssh_install_ffi;
 
 use std::sync::atomic::Ordering;
 
 use aivpn_common::mask::BootstrapDescriptor;
 use aivpn_common::protocol::ControlPayload;
 use ios_tunnel::{
-    clear_pending_stop, get_active_download_bytes, get_active_upload_bytes, run_tunnel_ios,
-    send_control_payload, stop_active_tunnel, OnReadyFn, RecordingFeedback, SendCtx,
-    ACTIVE_ADAPTIVE_LEVEL, ACTIVE_FEEDBACK_INTERVAL, ACTIVE_FEEDBACK_THRESHOLD,
-    ACTIVE_QUALITY_SCORE, ACTIVE_RECORDING_FEEDBACK, ACTIVE_REGIONAL_HINTS_JSON,
-    ATTEMPTED_MASK_FAMILY, EVER_CONNECTED, MASK_FEEDBACK_SENT, RECORDING_FEEDBACK_SEQ,
-    REGIONAL_HINTS_SEQ,
+    clear_pending_stop, get_active_connected_since_ms, get_active_download_bytes,
+    get_active_upload_bytes, run_tunnel_ios, send_control_payload, stop_active_tunnel, OnReadyFn,
+    RecordingFeedback, SendCtx, ACTIVE_ADAPTIVE_LEVEL, ACTIVE_FEEDBACK_INTERVAL,
+    ACTIVE_FEEDBACK_THRESHOLD, ACTIVE_QUALITY_SCORE, ACTIVE_RECORDING_FEEDBACK,
+    ACTIVE_REGIONAL_HINTS_JSON, ASSIGNED_VPN_IP, ATTEMPTED_MASK_FAMILY, EVER_CONNECTED,
+    HANDSHAKE_FAIL_STREAK, MASK_FEEDBACK_SENT, RECORDING_FEEDBACK_SEQ, REGIONAL_HINTS_SEQ,
 };
 
 /// Runs the full VPN tunnel session on the calling thread.
@@ -79,6 +81,18 @@ pub unsafe extern "C" fn aivpn_run_tunnel(
     // descriptor mask instead of a public preset. Mirrors Android's
     // `cachedDescriptorsJson`; persistence lives in the Swift App Group layer.
     cached_descriptors_json: *const libc::c_char,
+    // R2 Phase B: operator's ed25519 mask-verifying public key (32 bytes), or
+    // NULL to leave mask artifact verification unconfigured (mirrors
+    // desktop's --mask-operator-pubkey / config-file / connection-key `mop`
+    // field precedence — the Swift layer resolves which one wins before this
+    // call). NULL means `verify_mask_artifact` sees `NoOperatorKey`, matching
+    // desktop's own behavior with no operator key configured.
+    mask_operator_pubkey: *const u8,
+    // R2 Phase B: NUL-terminated verification mode string ("off"|"warn"|
+    // "enforce", case-insensitive), or NULL/empty/unrecognized for the
+    // default ("warn" — mirrors `MaskVerifyMode::default()`, the same
+    // default desktop uses with no --mask-verify-mode/config override).
+    mask_verify_mode: *const libc::c_char,
 ) -> libc::c_int {
     if server_host.is_null() || server_key.is_null() {
         return -1;
@@ -202,6 +216,32 @@ pub unsafe extern "C" fn aivpn_run_tunnel(
             .map(str::to_owned)
     };
 
+    // R2 Phase B: mirrors server_signing_key_opt above — 32 raw bytes, no
+    // encoding to worry about.
+    let mask_operator_pubkey_opt: Option<[u8; 32]> = if mask_operator_pubkey.is_null() {
+        None
+    } else {
+        // SAFETY: mask_operator_pubkey points to 32 bytes passed by Swift.
+        let mut arr = [0u8; 32];
+        unsafe { arr.copy_from_slice(std::slice::from_raw_parts(mask_operator_pubkey, 32)) };
+        Some(arr)
+    };
+
+    // R2 Phase B: parse the mode string the same way desktop's
+    // `MaskVerifyMode::from_str` does (off|warn|enforce, case-insensitive);
+    // NULL/empty/unrecognized all collapse to the default (`Warn`) rather
+    // than erroring — this FFI boundary must never fail closed on a typo.
+    let mask_verify_mode_val: aivpn_common::mask::MaskVerifyMode = if mask_verify_mode.is_null() {
+        aivpn_common::mask::MaskVerifyMode::default()
+    } else {
+        // SAFETY: mask_verify_mode is a NUL-terminated C string from Swift.
+        unsafe { std::ffi::CStr::from_ptr(mask_verify_mode) }
+            .to_str()
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or_default()
+    };
+
     let rt = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -233,6 +273,8 @@ pub unsafe extern "C" fn aivpn_run_tunnel(
             prior_outcomes_json_opt,
             preferred_mask_opt,
             cached_descriptors_json_opt,
+            mask_operator_pubkey_opt,
+            mask_verify_mode_val,
         ))
     }));
     match outcome {
@@ -269,6 +311,14 @@ pub extern "C" fn aivpn_get_download_bytes() -> i64 {
     get_active_download_bytes() as i64
 }
 
+/// Wall-clock epoch milliseconds at which the current session became
+/// established, or 0 when no session is active. Same session scope as the
+/// byte counters, so the UI stopwatch can never desync from them.
+#[no_mangle]
+pub extern "C" fn aivpn_get_connected_since_ms() -> i64 {
+    get_active_connected_since_ms() as i64
+}
+
 /// Current connection quality score (0–100). Returns 0 when no session is active.
 #[no_mangle]
 pub extern "C" fn aivpn_get_quality_score() -> libc::c_int {
@@ -276,9 +326,56 @@ pub extern "C" fn aivpn_get_quality_score() -> libc::c_int {
 }
 
 /// Most recent AdaptiveHint level received from the server (0–3).
+///
+/// The shared tunnel core stores the hint as `level + 1` so that 0 can mean
+/// "no hint received this session" — a distinction Android's JNI getter needs
+/// (it reports -1 for "no hint"). `saturating_sub(1)` undoes the shift here,
+/// so every value Swift observes is byte-identical to what this getter
+/// returned before the shift existed: a real hint maps back to its raw level,
+/// and "no hint" still reports 0 (indistinguishable from Off, exactly as
+/// before — deliberately NOT changed to a sentinel Swift has never handled).
 #[no_mangle]
 pub extern "C" fn aivpn_get_adaptive_level_hint() -> libc::c_int {
-    ACTIVE_ADAPTIVE_LEVEL.load(Ordering::Relaxed) as libc::c_int
+    ACTIVE_ADAPTIVE_LEVEL
+        .load(Ordering::Relaxed)
+        .saturating_sub(1) as libc::c_int
+}
+
+/// VPN IPv4 the server assigned to this session in its ServerHello network
+/// config, as a host-order u32 (e.g. 10.0.0.3 = 0x0A000003), or 0 when the
+/// current session has not received one. When it differs from the
+/// connection-key IP the server re-homed this client (pool IP-collision
+/// resolution) and the tunnel network settings must be re-applied with this
+/// address — otherwise the server's anti-spoof check silently drops all
+/// uplink data while keepalives keep flowing.
+#[no_mangle]
+pub extern "C" fn aivpn_get_assigned_vpn_ip() -> libc::c_uint {
+    ASSIGNED_VPN_IP.load(Ordering::Relaxed) as libc::c_uint
+}
+
+/// Seed the process-global consecutive handshake-fail streak from a
+/// platform-persisted value. The streak drives the descriptor→builtin-preset
+/// fallback at `HANDSHAKE_FALLBACK_THRESHOLD`; it lives in a process-global
+/// static, but iOS tears the Network Extension process down between failed
+/// starts, so without re-seeding it the threshold could never be reached and
+/// a poisoned cached descriptor would block connecting until it expires.
+/// Call ONCE per extension process, before the first `aivpn_run_tunnel`
+/// attempt, with the value previously read via
+/// `aivpn_get_handshake_fail_streak` and persisted per server (App Group).
+/// Clamped to a sane bound so a corrupted persisted value cannot wedge the
+/// counter near overflow.
+#[no_mangle]
+pub extern "C" fn aivpn_seed_handshake_fail_streak(streak: libc::c_uint) {
+    HANDSHAKE_FAIL_STREAK.store(streak.min(1_000), Ordering::Relaxed);
+}
+
+/// Current consecutive handshake-fail streak (see
+/// `aivpn_seed_handshake_fail_streak`). Read after each `aivpn_run_tunnel`
+/// return and persist per server; reset to 0 internally when a session's PFS
+/// ratchet completes and when the server key changes.
+#[no_mangle]
+pub extern "C" fn aivpn_get_handshake_fail_streak() -> libc::c_uint {
+    HANDSHAKE_FAIL_STREAK.load(Ordering::Relaxed)
 }
 
 /// §2 crowdsourced blocking feedback — whether the most recently completed
@@ -291,6 +388,39 @@ pub extern "C" fn aivpn_get_adaptive_level_hint() -> libc::c_int {
 #[no_mangle]
 pub extern "C" fn aivpn_ever_connected() -> libc::c_int {
     EVER_CONNECTED.load(Ordering::Relaxed) as libc::c_int
+}
+
+/// Whether the server sent `CertRejected` (mTLS certificate rejected) during
+/// the most recently completed `aivpn_run_tunnel` call. `0` = not rejected
+/// (or no mTLS cert was configured). The platform should poll this alongside
+/// `get_traffic` and, when `1`, prompt the user to re-provision their mTLS
+/// cert instead of silently retrying forever — desktop only logs this
+/// server-pushed signal (client.rs); mobile has no console the user will
+/// ever see it in.
+#[no_mangle]
+pub extern "C" fn aivpn_cert_was_rejected() -> libc::c_int {
+    crate::ios_tunnel::CERT_REJECTED.load(Ordering::Relaxed) as libc::c_int
+}
+
+/// Whether the server sent `HandshakeReject` — an AEAD-authenticated,
+/// handshake-time refusal sent only to a peer that already proved knowledge
+/// of the PSK — during the most recently completed `aivpn_run_tunnel` call.
+/// `0` = not rejected. Unlike a timeout or a transient disconnect, this is a
+/// TERMINAL refusal: the platform must stop its reconnect loop instead of
+/// retrying (see `aivpn_get_handshake_reject_reason` for why).
+#[no_mangle]
+pub extern "C" fn aivpn_handshake_was_rejected() -> libc::c_int {
+    crate::ios_tunnel::HANDSHAKE_REJECTED.load(Ordering::Relaxed) as libc::c_int
+}
+
+/// Reason code for the most recent `HandshakeReject` (only meaningful when
+/// `aivpn_handshake_was_rejected` returns non-zero). `0` = unspecified,
+/// `1` = one-time key already used, `2` = client expired, `3` = client
+/// disabled — matches `ControlPayload::HandshakeReject`'s `reason` field in
+/// aivpn-common's protocol.rs.
+#[no_mangle]
+pub extern "C" fn aivpn_get_handshake_reject_reason() -> libc::c_int {
+    crate::ios_tunnel::HANDSHAKE_REJECT_REASON.load(Ordering::Relaxed) as libc::c_int
 }
 
 /// §2 crowdsourced blocking feedback — whether a `MaskFeedback` control
@@ -448,6 +578,23 @@ pub unsafe extern "C" fn aivpn_get_bootstrap_descriptors_json(
     copy_string_getter(Some(json.as_str()), buf, buf_len)
 }
 
+/// `true` when the last session proved its cached bootstrap descriptors are
+/// unusable against this server: the handshake was accepted but not a single
+/// downlink DATA packet ever arrived. Swift must then delete the App Group blob
+/// for that server, otherwise the next cold start reloads the same descriptor
+/// and reconnects into the same dead data plane.
+///
+/// The verdict must ALSO be remembered: pass the literal `"distrusted"` as
+/// `cached_descriptors_json` on subsequent connects to this server, or an
+/// extension restart re-adopts the server's freshly pushed descriptors and
+/// breaks its first reconnect again.
+///
+/// Poll once after `aivpn_run_tunnel` returns; reading clears the flag.
+#[no_mangle]
+pub extern "C" fn aivpn_take_discard_persisted_descriptors() -> bool {
+    aivpn_common::mobile_tunnel::take_discard_persisted_descriptors()
+}
+
 /// Shared helper for the `Option<String>`-backed string getters above:
 /// copies `value` (if any) into `buf` as a NUL-terminated UTF-8 string,
 /// truncated to fit. Returns the number of bytes written excluding the NUL
@@ -487,7 +634,9 @@ unsafe fn copy_string_getter(
 /// poll tick.
 #[no_mangle]
 pub extern "C" fn aivpn_get_recording_feedback_seq() -> i64 {
-    RECORDING_FEEDBACK_SEQ.load(Ordering::Relaxed) as i64
+    // catch_unwind so no panic can ever unwind across the FFI boundary and
+    // abort the Network Extension process (LOW-2 pattern, mirrors android-core).
+    std::panic::catch_unwind(|| RECORDING_FEEDBACK_SEQ.load(Ordering::Relaxed) as i64).unwrap_or(0)
 }
 
 /// Kind of the most recent mask-recording feedback message received from the
@@ -495,29 +644,37 @@ pub extern "C" fn aivpn_get_recording_feedback_seq() -> i64 {
 /// 3 = RecordingFailed, 4 = RecordingStatus.
 #[no_mangle]
 pub extern "C" fn aivpn_get_recording_feedback_kind() -> libc::c_int {
-    let guard = ACTIVE_RECORDING_FEEDBACK
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    match guard.as_ref() {
-        None => 0,
-        Some(RecordingFeedback::Ack { .. }) => 1,
-        Some(RecordingFeedback::Complete { .. }) => 2,
-        Some(RecordingFeedback::Failed { .. }) => 3,
-        Some(RecordingFeedback::Status { .. }) => 4,
-    }
+    // catch_unwind: never unwind across FFI into the Network Extension.
+    std::panic::catch_unwind(|| {
+        let guard = ACTIVE_RECORDING_FEEDBACK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        match guard.as_ref() {
+            None => 0,
+            Some(RecordingFeedback::Ack { .. }) => 1,
+            Some(RecordingFeedback::Complete { .. }) => 2,
+            Some(RecordingFeedback::Failed { .. }) => 3,
+            Some(RecordingFeedback::Status { .. }) => 4,
+        }
+    })
+    .unwrap_or(0)
 }
 
 /// Confidence score (0.0-1.0) from the most recent RecordingComplete message.
 /// Returns 0.0 if the current feedback is not a RecordingComplete.
 #[no_mangle]
 pub extern "C" fn aivpn_get_recording_confidence() -> f32 {
-    let guard = ACTIVE_RECORDING_FEEDBACK
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    match guard.as_ref() {
-        Some(RecordingFeedback::Complete { confidence, .. }) => *confidence,
-        _ => 0.0,
-    }
+    // catch_unwind: never unwind across FFI into the Network Extension.
+    std::panic::catch_unwind(|| {
+        let guard = ACTIVE_RECORDING_FEEDBACK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        match guard.as_ref() {
+            Some(RecordingFeedback::Complete { confidence, .. }) => *confidence,
+            _ => 0.0,
+        }
+    })
+    .unwrap_or(0.0)
 }
 
 /// Whether the current authenticated session may record masks, from the most
@@ -525,13 +682,17 @@ pub extern "C" fn aivpn_get_recording_confidence() -> f32 {
 /// has been received yet.
 #[no_mangle]
 pub extern "C" fn aivpn_recording_can_record() -> libc::c_int {
-    let guard = ACTIVE_RECORDING_FEEDBACK
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    match guard.as_ref() {
-        Some(RecordingFeedback::Status { can_record, .. }) => *can_record as libc::c_int,
-        _ => 0,
-    }
+    // catch_unwind: never unwind across FFI into the Network Extension.
+    std::panic::catch_unwind(|| {
+        let guard = ACTIVE_RECORDING_FEEDBACK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        match guard.as_ref() {
+            Some(RecordingFeedback::Status { can_record, .. }) => *can_record as libc::c_int,
+            _ => 0,
+        }
+    })
+    .unwrap_or(0)
 }
 
 /// Copies the 16-byte recording session id from the most recent RecordingAck
@@ -542,21 +703,25 @@ pub extern "C" fn aivpn_recording_can_record() -> libc::c_int {
 /// `out16` must point to at least 16 writable bytes.
 #[no_mangle]
 pub unsafe extern "C" fn aivpn_get_recording_session_id(out16: *mut u8) -> libc::c_int {
-    if out16.is_null() {
-        return 0;
-    }
-    let guard = ACTIVE_RECORDING_FEEDBACK
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    match guard.as_ref() {
-        Some(RecordingFeedback::Ack { session_id, .. }) => {
-            // SAFETY: caller guarantees out16 points to 16 writable bytes;
-            // session_id is always exactly 16 bytes.
-            unsafe { std::ptr::copy_nonoverlapping(session_id.as_ptr(), out16, 16) };
-            1
+    // catch_unwind: never unwind across FFI into the Network Extension.
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if out16.is_null() {
+            return 0;
         }
-        _ => 0,
-    }
+        let guard = ACTIVE_RECORDING_FEEDBACK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        match guard.as_ref() {
+            Some(RecordingFeedback::Ack { session_id, .. }) => {
+                // SAFETY: caller guarantees out16 points to 16 writable bytes;
+                // session_id is always exactly 16 bytes.
+                unsafe { std::ptr::copy_nonoverlapping(session_id.as_ptr(), out16, 16) };
+                1
+            }
+            _ => 0,
+        }
+    }))
+    .unwrap_or(0)
 }
 
 /// Copies the service name associated with the most recent recording
@@ -575,35 +740,39 @@ pub unsafe extern "C" fn aivpn_get_recording_service(
     buf: *mut libc::c_char,
     buf_len: libc::c_int,
 ) -> libc::c_int {
-    if buf.is_null() || buf_len <= 0 {
-        return -1;
-    }
-    let guard = ACTIVE_RECORDING_FEEDBACK
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    let svc: String = match guard.as_ref() {
-        Some(RecordingFeedback::Complete { service, .. }) => service.clone(),
-        Some(RecordingFeedback::Status { active_service, .. }) => {
-            active_service.clone().unwrap_or_default()
+    // catch_unwind: never unwind across FFI into the Network Extension.
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if buf.is_null() || buf_len <= 0 {
+            return -1;
         }
-        Some(RecordingFeedback::Ack { .. }) | Some(RecordingFeedback::Failed { .. }) => {
-            String::new()
-        }
-        None => return -1,
-    };
-    drop(guard);
+        let guard = ACTIVE_RECORDING_FEEDBACK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let svc: String = match guard.as_ref() {
+            Some(RecordingFeedback::Complete { service, .. }) => service.clone(),
+            Some(RecordingFeedback::Status { active_service, .. }) => {
+                active_service.clone().unwrap_or_default()
+            }
+            Some(RecordingFeedback::Ack { .. }) | Some(RecordingFeedback::Failed { .. }) => {
+                String::new()
+            }
+            None => return -1,
+        };
+        drop(guard);
 
-    let bytes = svc.as_bytes();
-    let cap = (buf_len as usize).saturating_sub(1);
-    let n = bytes.len().min(cap);
-    // SAFETY: caller guarantees `buf` points to `buf_len` writable bytes
-    // (checked non-null and > 0 above); `n <= buf_len - 1`, so writing `n`
-    // bytes followed by a NUL at offset `n` stays within `buf_len` bytes.
-    unsafe {
-        std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf as *mut u8, n);
-        *buf.add(n) = 0;
-    }
-    n as libc::c_int
+        let bytes = svc.as_bytes();
+        let cap = (buf_len as usize).saturating_sub(1);
+        let n = bytes.len().min(cap);
+        // SAFETY: caller guarantees `buf` points to `buf_len` writable bytes
+        // (checked non-null and > 0 above); `n <= buf_len - 1`, so writing `n`
+        // bytes followed by a NUL at offset `n` stays within `buf_len` bytes.
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf as *mut u8, n);
+            *buf.add(n) = 0;
+        }
+        n as libc::c_int
+    }))
+    .unwrap_or(-1)
 }
 
 /// Copies a human-readable message for the most recent recording feedback
@@ -624,34 +793,38 @@ pub unsafe extern "C" fn aivpn_get_recording_message(
     buf: *mut libc::c_char,
     buf_len: libc::c_int,
 ) -> libc::c_int {
-    if buf.is_null() || buf_len <= 0 {
-        return -1;
-    }
-    let guard = ACTIVE_RECORDING_FEEDBACK
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    let msg: String = match guard.as_ref() {
-        Some(RecordingFeedback::Ack { status, .. }) => status.clone(),
-        Some(RecordingFeedback::Complete { mask_id, .. }) => mask_id.clone(),
-        Some(RecordingFeedback::Failed { reason }) => reason.clone(),
-        Some(RecordingFeedback::Status { active_service, .. }) => {
-            active_service.clone().unwrap_or_default()
+    // catch_unwind: never unwind across FFI into the Network Extension.
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if buf.is_null() || buf_len <= 0 {
+            return -1;
         }
-        None => return -1,
-    };
-    drop(guard);
+        let guard = ACTIVE_RECORDING_FEEDBACK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let msg: String = match guard.as_ref() {
+            Some(RecordingFeedback::Ack { status, .. }) => status.clone(),
+            Some(RecordingFeedback::Complete { mask_id, .. }) => mask_id.clone(),
+            Some(RecordingFeedback::Failed { reason }) => reason.clone(),
+            Some(RecordingFeedback::Status { active_service, .. }) => {
+                active_service.clone().unwrap_or_default()
+            }
+            None => return -1,
+        };
+        drop(guard);
 
-    let bytes = msg.as_bytes();
-    let cap = (buf_len as usize).saturating_sub(1); // reserve room for the NUL terminator
-    let n = bytes.len().min(cap);
-    // SAFETY: caller guarantees `buf` points to `buf_len` writable bytes
-    // (checked non-null and > 0 above); `n <= buf_len - 1`, so writing `n`
-    // bytes followed by a NUL at offset `n` stays within `buf_len` bytes.
-    unsafe {
-        std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf as *mut u8, n);
-        *buf.add(n) = 0;
-    }
-    n as libc::c_int
+        let bytes = msg.as_bytes();
+        let cap = (buf_len as usize).saturating_sub(1); // reserve room for the NUL terminator
+        let n = bytes.len().min(cap);
+        // SAFETY: caller guarantees `buf` points to `buf_len` writable bytes
+        // (checked non-null and > 0 above); `n <= buf_len - 1`, so writing `n`
+        // bytes followed by a NUL at offset `n` stays within `buf_len` bytes.
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf as *mut u8, n);
+            *buf.add(n) = 0;
+        }
+        n as libc::c_int
+    }))
+    .unwrap_or(-1)
 }
 
 /// Send a RecordingStart control payload to the active tunnel.
@@ -739,6 +912,199 @@ pub unsafe extern "C" fn aivpn_verify_bootstrap_descriptor(
         Ok(true) => 1,
         _ => 0,
     }
+}
+
+/// Current server-assigned role (0=User, 1=Viewer, 2=Admin) cached from the
+/// most recent `Capabilities` control message this session, or 0 (User)
+/// before one has arrived. Backed by the shared `MgmtClient` in
+/// `ios_tunnel`, reset at the start of each `aivpn_run_tunnel` attempt.
+#[no_mangle]
+pub extern "C" fn aivpn_get_role() -> u8 {
+    crate::ios_tunnel::active_mgmt().cached_role()
+}
+
+/// Issue an in-tunnel management API call (Phase A in-app admin) and block
+/// until the correlated response arrives or `path` — a curated REST-shaped
+/// path (e.g. "/api/v1/clients") — this call times out (10s).
+///
+/// `method`: 0=GET, 1=POST, 2=PATCH, 3=DELETE, 4=PUT. `body`/`body_len` is an
+/// optional JSON request payload (pass NULL/0 for none).
+///
+/// Blocking convention: the async `MgmtClient::mgmt_call` response is
+/// awaited by spinning up a private single-thread Tokio runtime local to
+/// this call and calling `block_on` on it — NOT the tunnel's own runtime.
+/// The `MgmtRequest` is sent over the tunnel's control channel and the
+/// matching `MgmtResponse` resolves the shared `MgmtClient`'s oneshot from
+/// the tunnel's own task; this call's private runtime only drives the
+/// `mgmt_call` future itself (the timeout timer + awaiting that oneshot),
+/// so blocking a synchronous FFI thread here never blocks the tunnel.
+///
+/// Response-buffer convention (shared with `aivpn_qr_png`): on success,
+/// `*out_status` receives the response status code and the return value is
+/// the number of response-body bytes written into `out_buf`. If the
+/// response body is larger than `out_cap`, `out_buf` is left untouched and
+/// the return value is the *needed* length instead — always `> out_cap` in
+/// that case, so the caller distinguishes "written N bytes" from "need a
+/// bigger buffer" by comparing the return value against the `out_cap` it
+/// passed in, then retries with a buffer of at least that size. Returns -1
+/// on any error: NULL/invalid `path`, no active tunnel session, the control
+/// channel is closed, or the call times out awaiting a response.
+///
+/// # Safety
+/// `path` must be a NUL-terminated, valid-UTF-8 C string. `body` (if
+/// non-NULL) must point to at least `body_len` readable bytes. `out_status`
+/// must point to a writable `u16`. `out_buf` must point to at least
+/// `out_cap` writable bytes (may be NULL only if `out_cap` is 0).
+#[no_mangle]
+pub unsafe extern "C" fn aivpn_mgmt_request(
+    method: u8,
+    path: *const libc::c_char,
+    body: *const u8,
+    body_len: usize,
+    out_status: *mut u16,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    // catch_unwind so a panic (e.g. a poisoned MgmtClient mutex) never unwinds
+    // across the FFI boundary and aborts the whole Network Extension process —
+    // mirrors every android-core JNI wrapper (LOW-2 pattern).
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        aivpn_mgmt_request_impl(method, path, body, body_len, out_status, out_buf, out_cap)
+    }))
+    .unwrap_or(-1)
+}
+
+unsafe fn aivpn_mgmt_request_impl(
+    method: u8,
+    path: *const libc::c_char,
+    body: *const u8,
+    body_len: usize,
+    out_status: *mut u16,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    if path.is_null() || out_status.is_null() {
+        return -1;
+    }
+    // SAFETY: caller guarantees `path` is a NUL-terminated C string valid for
+    // the duration of this call.
+    let path_str = match unsafe { std::ffi::CStr::from_ptr(path) }.to_str() {
+        Ok(s) => s,
+        Err(_) => return -1,
+    };
+    // SAFETY: caller guarantees `body` points to `body_len` readable bytes
+    // when non-NULL; copied into an owned Vec immediately.
+    let body_vec: Vec<u8> = if body.is_null() || body_len == 0 {
+        Vec::new()
+    } else {
+        unsafe { std::slice::from_raw_parts(body, body_len) }.to_vec()
+    };
+
+    let Some(control_tx) = crate::ios_tunnel::active_control_tx() else {
+        return -1; // not connected
+    };
+
+    let rt = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(_) => return -1,
+    };
+
+    let result = rt.block_on(crate::ios_tunnel::active_mgmt().mgmt_call(
+        &control_tx,
+        method,
+        path_str,
+        body_vec,
+        std::time::Duration::from_secs(10),
+    ));
+
+    match result {
+        Ok((status, resp_body)) => {
+            // SAFETY: caller guarantees out_status points to a writable u16.
+            unsafe {
+                *out_status = status;
+            }
+            unsafe { copy_bytes_getter(&resp_body, out_buf, out_cap) }
+        }
+        Err(_) => -1,
+    }
+}
+
+/// Render `text` (typically an `aivpn://...` connection key) as a QR code
+/// PNG and copy the encoded bytes into `out_buf`.
+///
+/// Uses the same written-len-or-needed-len buffer convention as
+/// `aivpn_mgmt_request` (see its doc comment): the return value is the
+/// number of PNG bytes written when `out_cap` was large enough, or the
+/// needed length (always `> out_cap`, `out_buf` left untouched) otherwise.
+/// Returns -1 if `text` is NULL/not valid UTF-8/empty, or PNG encoding
+/// fails.
+///
+/// # Safety
+/// `text` must be a NUL-terminated, valid-UTF-8 C string. `out_buf` must
+/// point to at least `out_cap` writable bytes (may be NULL only if
+/// `out_cap` is 0).
+#[no_mangle]
+pub unsafe extern "C" fn aivpn_qr_png(
+    text: *const libc::c_char,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    // catch_unwind so a panic in the QR/PNG encoder never aborts the Network
+    // Extension process across the FFI boundary (LOW-2 pattern).
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        aivpn_qr_png_impl(text, out_buf, out_cap)
+    }))
+    .unwrap_or(-1)
+}
+
+unsafe fn aivpn_qr_png_impl(text: *const libc::c_char, out_buf: *mut u8, out_cap: usize) -> isize {
+    if text.is_null() {
+        return -1;
+    }
+    // SAFETY: caller guarantees `text` is a NUL-terminated C string valid for
+    // the duration of this call.
+    let text_str = match unsafe { std::ffi::CStr::from_ptr(text) }.to_str() {
+        Ok(s) => s,
+        Err(_) => return -1,
+    };
+    match aivpn_common::qr::png_for(text_str) {
+        Ok(bytes) => unsafe { copy_bytes_getter(&bytes, out_buf, out_cap) },
+        Err(_) => -1,
+    }
+}
+
+/// Shared helper for raw-byte FFI getters that use the
+/// written-len-or-needed-len convention (see `aivpn_mgmt_request` /
+/// `aivpn_qr_png` doc comments): if `data` fits in `out_cap` bytes, copies
+/// it into `out_buf` and returns `data.len()` (always `<= out_cap`, so
+/// unambiguous "bytes written"); otherwise leaves `out_buf` untouched and
+/// returns `data.len()` anyway (in this branch always `> out_cap`, so the
+/// caller recognizes it as "needed length, retry with a bigger buffer").
+/// Never returns a negative value; NULL `out_buf` is only tolerated when
+/// nothing needs to be written (`out_cap` too small, or `data` empty).
+///
+/// # Safety
+/// `out_buf` must point to at least `out_cap` writable bytes whenever a
+/// non-empty copy is about to happen (i.e. whenever this returns a value
+/// `<= out_cap` and `data` is non-empty).
+unsafe fn copy_bytes_getter(data: &[u8], out_buf: *mut u8, out_cap: usize) -> isize {
+    if data.len() > out_cap {
+        return data.len() as isize;
+    }
+    if !data.is_empty() {
+        if out_buf.is_null() {
+            return -1;
+        }
+        // SAFETY: caller guarantees out_buf points to out_cap writable bytes
+        // when a copy is needed; data.len() <= out_cap was just checked.
+        unsafe {
+            std::ptr::copy_nonoverlapping(data.as_ptr(), out_buf, data.len());
+        }
+    }
+    data.len() as isize
 }
 
 /// Pure, allocation-owning verification helper with no raw pointers, so it's

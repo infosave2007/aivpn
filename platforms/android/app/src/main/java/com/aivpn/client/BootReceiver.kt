@@ -27,6 +27,9 @@ class BootReceiver : BroadcastReceiver() {
 
     companion object {
         private const val TAG = "BootReceiver"
+
+        /** Single background lane for boot handling (L5) — at most one boot at a time anyway. */
+        private val EXECUTOR = java.util.concurrent.Executors.newSingleThreadExecutor()
     }
 
     override fun onReceive(context: Context, intent: Intent?) {
@@ -34,11 +37,21 @@ class BootReceiver : BroadcastReceiver() {
         if (action != Intent.ACTION_BOOT_COMPLETED &&
             action != Intent.ACTION_LOCKED_BOOT_COMPLETED) return
 
-        // Belt-and-braces: a crash inside a boot receiver would repeat on EVERY reboot.
-        try {
-            handleBoot(context, action)
-        } catch (e: Exception) {
-            Log.e(TAG, "Boot auto-connect failed: ${e.message}", e)
+        // L5: handleBoot() hits EncryptedSharedPreferences/Keystore (real disk +
+        // Binder I/O, hundreds of ms cold) — onReceive runs on the MAIN thread,
+        // where that risks an ANR during the post-boot stampede. goAsync() keeps
+        // the receiver alive (~10 s budget) while the work runs on an executor.
+        val pending = goAsync()
+        val appContext = context.applicationContext
+        EXECUTOR.execute {
+            // Belt-and-braces: a crash inside a boot receiver would repeat on EVERY reboot.
+            try {
+                handleBoot(appContext, action)
+            } catch (e: Exception) {
+                Log.e(TAG, "Boot auto-connect failed: ${e.message}", e)
+            } finally {
+                pending.finish()
+            }
         }
     }
 

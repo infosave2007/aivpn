@@ -11,7 +11,10 @@
 
 /**
  * aivpn_decrypt - decrypt an inbound skb, leaving the plaintext in @skb.
- * @s:        session (s->lock held by caller with BH disabled).
+ * @s:        session. Caller holds rcu_read_lock() (which keeps @s alive) but
+ *            NOT s->lock — only the immutable fields (tfm, nonce_suffix) are
+ *            read here, so the AEAD runs without serializing the session.
+ *            RX stats are accounted by the caller under s->lock afterwards.
  * @skb:      full wire packet; the ciphertext + 16-byte Poly1305 tag begin at
  *            byte offset @ct_start (Variant A layout, per session).
  * @counter:  counter from the tag-window lookup (NOT extracted from wire bytes).

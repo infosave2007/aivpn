@@ -24,6 +24,21 @@ pub struct TrafficStats {
     pub bytes_received: u64,
     pub quality_score: u8,
     pub server_adaptive_level: u8,
+    /// Client's currently-effective VPN IP, from the `ip:` key the client's
+    /// stats writer adds to traffic.stats. Unlike the connection key's own
+    /// (static, one-time-parsed) `vpn_ip`, this reflects a server-assigned IP
+    /// after a pool re-home. `None` before the first stats write with an
+    /// `ip:` field arrives, or if that field failed to parse as an IPv4
+    /// address (e.g. a torn read of the non-atomic stats write).
+    pub vpn_ip: Option<String>,
+    /// 3c: true when the client's `fallback:1` key in traffic.stats says
+    /// this session is running on the built-in default mask (bootstrap
+    /// resilience fallback after repeated dead handshakes) rather than a
+    /// normal bootstrap-derived one. Unlike Linux (which also gets the
+    /// "AIVPN-STATUS bootstrap-fallback" stdout line), this GUI's child
+    /// stdout is piped to `Stdio::null()` (see `connect()`), so the stats
+    /// file is the only channel — same reason `vpn_ip` above exists.
+    pub fallback: bool,
 }
 
 // ── Recording ───────────────────────────────────────────────────────────────
@@ -55,6 +70,26 @@ pub struct BenchResult {
     pub quality_score: u8,
 }
 
+/// True for a well-formed mask id. Bounded length, ASCII alphanumerics plus
+/// `_ : . -`  — a superset of both the server's own on-disk filename guard
+/// (`mask_store::safe_mask_path`: alnum + `_` + `-`) and the macOS helper's
+/// `isAcceptableMaskId` (`^[a-z0-9_]{1,64}$`), so it accepts every id either
+/// component can legitimately emit while still rejecting anything that could
+/// smuggle a second argv token, a shell metacharacter, or a path-traversal
+/// sequence: no whitespace, quotes, slashes, backslashes, or control chars.
+/// mask_id values are server-sourced (pushed via mask_catalog.json) and reach
+/// this process's argv for a connection that may run UAC-elevated
+/// (full-tunnel mode) — this is the last line of defense before Command::arg.
+pub fn is_acceptable_mask_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 64
+        && id != "."
+        && id != ".."
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | ':' | '.' | '-'))
+}
+
 pub struct VpnManager {
     state: ConnectionState,
     child: Option<Child>,
@@ -75,6 +110,13 @@ pub struct VpnManager {
     /// Timestamp when we entered Connected state — used to detect a stalled tunnel
     /// (process alive but Wintun failing in its reconnect loop).
     connected_since: Option<Instant>,
+    /// Session epoch (unix ms) from the stats file's `since:` key — stamped by
+    /// the client child once per session. A CHANGE here means the child
+    /// silently reconnected (new session): counters legitimately reset to
+    /// lower values and the displayed uptime must restart with them. None
+    /// until a session's first stats write arrives (or with an old-format
+    /// client binary that writes no `since`).
+    session_since_ms: Option<u64>,
     /// Whether the current session was started with --kill-switch. Used to run
     /// `kill-switch clear` after TerminateProcess so firewall rules don't stay active.
     kill_switch_active: bool,
@@ -85,22 +127,56 @@ pub struct VpnManager {
     /// on the next launch. Best-effort: None means fall back to unmanaged child spawning.
     #[cfg(windows)]
     job_handle: Option<usize>,
+    /// Per-session child supervision thread (HIGH-2): watches the client PID
+    /// from a background thread so a child crash is detected — and the
+    /// kill-switch cleared — even while SW_HIDE has paused the egui update
+    /// loop (poll_status() only runs inside update()).
+    #[cfg(windows)]
+    supervisor: Option<SupervisorHandle>,
+    /// Wakes the egui event loop (ctx.request_repaint) from background
+    /// threads. Set once by the GUI right after startup, before any connect.
+    wake_cb: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
+}
+
+/// Shared state between VpnManager (UI thread) and its per-session child
+/// supervision thread.
+#[cfg(windows)]
+struct SupervisorHandle {
+    /// Set by the UI thread before an INTENTIONAL kill (disconnect/Drop) so
+    /// the supervisor doesn't misread it as a crash.
+    shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// swap(true) before running `kill-switch clear` — whichever side
+    /// (supervisor or UI-thread poll) gets there first runs it exactly once.
+    cleared_kill_switch: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Drop for VpnManager {
     fn drop(&mut self) {
+        // Intentional teardown — stop the supervisor before killing the child
+        // so it doesn't treat the kill as a crash.
+        #[cfg(windows)]
+        if let Some(s) = self.supervisor.as_ref() {
+            s.shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
         if let Some(ref mut c) = self.child {
             let _ = c.kill();
             let _ = c.wait();
         }
         if self.kill_switch_active {
-            Self::run_kill_switch_clear(&self.client_binary);
+            self.clear_kill_switch_once();
         }
     }
 }
 
 impl VpnManager {
     pub fn new() -> Self {
+        let client_binary = Self::find_client_binary();
+        // MEDIUM-1: a GUI crash skips every kill-switch cleanup path (Drop,
+        // disconnect, poll) and leaves the block-all firewall rules active
+        // with no process that remembers them — detect that via the marker
+        // file the previous session left behind and clear the rules now.
+        #[cfg(windows)]
+        Self::clear_orphaned_kill_switch(&client_binary);
         Self {
             state: ConnectionState::Disconnected,
             child: None,
@@ -109,9 +185,16 @@ impl VpnManager {
                 bytes_received: 0,
                 quality_score: 0,
                 server_adaptive_level: 0,
+                // Pre-existing field (`vpn_ip`) was missing from this
+                // literal in the working tree before this change — a latent
+                // compile error this crate can't be built to catch on a
+                // non-Windows host. Filled in here alongside the new
+                // `fallback` field (3c) since both are being touched.
+                vpn_ip: None,
+                fallback: false,
             },
             last_poll: None,
-            client_binary: Self::find_client_binary(),
+            client_binary,
             server_addr: None,
             recording_state: RecordingState::Idle,
             can_record_masks: false,
@@ -124,10 +207,21 @@ impl VpnManager {
                 false,
             )),
             connected_since: None,
+            session_since_ms: None,
             kill_switch_active: false,
             #[cfg(windows)]
             job_handle: create_kill_on_close_job(),
+            #[cfg(windows)]
+            supervisor: None,
+            wake_cb: None,
         }
+    }
+
+    /// Register the callback that wakes the egui event loop
+    /// (`ctx.request_repaint()`). Called once by the GUI at startup, before
+    /// any connect, so every session's supervision thread can poke the UI.
+    pub fn set_wake_callback(&mut self, cb: impl Fn() + Send + Sync + 'static) {
+        self.wake_cb = Some(std::sync::Arc::new(cb));
     }
 
     pub fn state(&self) -> ConnectionState {
@@ -171,6 +265,7 @@ impl VpnManager {
         share_mask_feedback: bool,
         receive_mask_hints: bool,
         country_code: Option<&str>,
+        transport: Option<&aivpn_common::transport::TransportConfig>,
     ) -> Result<(), String> {
         if self.child.is_some() {
             return Err("Already running".to_string());
@@ -191,6 +286,31 @@ impl VpnManager {
             }
         }
 
+        // HIGH: mask_id is server-sourced — it arrives via the client-written
+        // mask_catalog.json (populated from the server's mask catalog push) and
+        // the UI only offers ids read straight out of that file. Both
+        // preferred_mask and polymorphic_base ultimately flow into this
+        // process's argv (`--preferred-mask` / `--polymorphic-base` below), and
+        // when full_tunnel is set that argv belongs to a process launched via
+        // the UAC-elevated --elevated-connect hop. A hostile/MITM server could
+        // otherwise hide an attacker-controlled token behind a benign-looking
+        // catalog label and have it land in an elevated child's command line.
+        // Reject anything outside a strict charset before it ever reaches
+        // Command::arg — mirrors isAcceptableMaskId() in the macOS helper
+        // (platforms/macos/aivpn-helper/main.swift), which guards the same
+        // data at the same boundary. "auto"/empty are the sentinel values that
+        // never reach argv at all (see the branch below), so they're exempt.
+        if let Some(mask) = preferred_mask {
+            if !mask.is_empty() && mask != "auto" && !is_acceptable_mask_id(mask) {
+                return Err(format!("Invalid mask profile id: {mask}"));
+            }
+        }
+        if let Some(base) = polymorphic_base {
+            if !base.is_empty() && base != "auto" && !is_acceptable_mask_id(base) {
+                return Err(format!("Invalid polymorphic mask base: {base}"));
+            }
+        }
+
         self.state = ConnectionState::Connecting;
         self.server_addr = extract_server_addr(connection_key);
         // Reset all per-session state on new connection
@@ -203,9 +323,23 @@ impl VpnManager {
         // Delete stale stats files so the first Connected poll reads zeros
         let _ = std::fs::remove_file(Self::stats_file_path());
         let _ = std::fs::remove_file(std::env::temp_dir().join("aivpn-traffic.stats"));
+        // LOW-3: aivpn-quality.json is also per-session — a stale one from the
+        // previous session would show its quality/FEC badge as current.
+        let _ = std::fs::remove_file(std::env::temp_dir().join("aivpn-quality.json"));
 
         let mut cmd = Command::new(&self.client_binary);
         cmd.env("AIVPN_CONNECTION_KEY", connection_key);
+        // An extension may have selected an alternative transport. Pass it
+        // neutrally: a name plus a base64 blob the client forwards to the
+        // factory unparsed. Absent → direct UDP.
+        if let Some(cfg) = transport {
+            use base64::Engine as _;
+            cmd.env("AIVPN_TRANSPORT", cfg.name());
+            cmd.env(
+                "AIVPN_TRANSPORT_PARAMS",
+                base64::engine::general_purpose::STANDARD.encode(cfg.params()),
+            );
+        }
 
         if full_tunnel {
             cmd.arg("--full-tunnel");
@@ -332,6 +466,7 @@ impl VpnManager {
 
         match cmd.spawn() {
             Ok(child) => {
+                let child_pid = child.id();
                 // Assign the client to the kill-on-close Job Object so it dies with the
                 // GUI even on an abnormal exit that skips Drop. Best-effort — on failure
                 // the child still runs, just without the crash-cleanup guarantee.
@@ -341,18 +476,35 @@ impl VpnManager {
                     use winapi::um::jobapi2::AssignProcessToJobObject;
                     let h = child.as_raw_handle();
                     if unsafe { AssignProcessToJobObject(job as _, h as _) } == 0 {
-                        eprintln!(
-                            "job: AssignProcessToJobObject failed; client will not be                              auto-killed if the GUI crashes"
+                        gui_log(
+                            "job: AssignProcessToJobObject failed; client will not be \
+                             auto-killed if the GUI crashes",
                         );
                     }
                 }
                 self.child = Some(child);
                 self.kill_switch_active = kill_switch;
+                if kill_switch {
+                    // MEDIUM-1: persist a marker (contents: child PID) so a
+                    // GUI crash that skips every cleanup path is detected on
+                    // the next launch and the orphaned rules cleared. Deleted
+                    // whenever `kill-switch clear` is actually spawned.
+                    let marker = Self::kill_switch_marker_path();
+                    if let Some(dir) = marker.parent() {
+                        let _ = std::fs::create_dir_all(dir);
+                    }
+                    let _ = std::fs::write(&marker, child_pid.to_string());
+                }
+                #[cfg(windows)]
+                self.spawn_child_supervisor(child_pid, kill_switch);
                 // Stay in Connecting — poll_status() transitions to Connected once
                 // the process survives its first liveness check, preventing the UI
                 // from briefly showing Connected before the TUN device is up.
                 self.stats.bytes_sent = 0;
                 self.stats.bytes_received = 0;
+                self.stats.vpn_ip = None;
+                self.stats.fallback = false;
+                self.session_since_ms = None;
                 // Request initial recording status
                 self.request_recording_status_refresh();
                 Ok(())
@@ -381,14 +533,158 @@ impl VpnManager {
             const CREATE_NO_WINDOW: u32 = 0x08000000;
             cmd.creation_flags(CREATE_NO_WINDOW);
         }
-        if let Err(e) = cmd.spawn() {
-            eprintln!("kill-switch clear: spawn failed: {e}");
+        match cmd.spawn() {
+            Ok(_) => {
+                // Rules are being cleared — the crash-recovery marker no
+                // longer applies (kept on spawn failure so the next launch
+                // retries via clear_orphaned_kill_switch()).
+                let _ = std::fs::remove_file(Self::kill_switch_marker_path());
+            }
+            Err(e) => gui_log(&format!("kill-switch clear: spawn failed: {e}")),
         }
+    }
+
+    /// Run `kill-switch clear` at most once per session: the supervision
+    /// thread and the UI-thread paths (disconnect/poll/Drop) race to the
+    /// shared `cleared_kill_switch` flag; whoever swaps it first clears.
+    fn clear_kill_switch_once(&mut self) {
+        #[cfg(windows)]
+        let already = self
+            .supervisor
+            .as_ref()
+            .map(|s| {
+                s.cleared_kill_switch
+                    .swap(true, std::sync::atomic::Ordering::SeqCst)
+            })
+            .unwrap_or(false);
+        #[cfg(not(windows))]
+        let already = false;
+        if !already {
+            Self::run_kill_switch_clear(&self.client_binary);
+        }
+        self.kill_switch_active = false;
+    }
+
+    /// Marker recording that a client session was started with --kill-switch
+    /// (contents: the child PID). Deleted whenever `kill-switch clear` is
+    /// spawned; its survival across a GUI crash triggers the startup cleanup
+    /// in `clear_orphaned_kill_switch()`.
+    fn kill_switch_marker_path() -> PathBuf {
+        dirs::data_local_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("AIVPN")
+            .join("kill-switch.active")
+    }
+
+    /// Startup recovery (MEDIUM-1): if a previous session's kill-switch
+    /// marker survived (GUI crashed with rules active) and its client is no
+    /// longer running, clear the rules. Blocking on purpose — a fire-and-
+    /// forget clear could race a connect_on_startup session started
+    /// milliseconds later and wipe the NEW session's freshly-added rules.
+    #[cfg(windows)]
+    fn clear_orphaned_kill_switch(binary: &std::path::Path) {
+        let marker = Self::kill_switch_marker_path();
+        let Ok(content) = std::fs::read_to_string(&marker) else {
+            return;
+        };
+        if let Ok(pid) = content.trim().parse::<u32>() {
+            if pid != 0 && process_is_aivpn_client(pid) {
+                // A client from a previous session is still alive and owns
+                // the rules — leave both it and the marker alone.
+                return;
+            }
+        }
+        gui_log("kill-switch: stale marker from a previous session — clearing orphaned rules");
+        let mut cmd = Command::new(binary);
+        cmd.args(["kill-switch", "clear"]);
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x08000000;
+            cmd.creation_flags(CREATE_NO_WINDOW);
+        }
+        match cmd.status() {
+            Ok(_) => {
+                let _ = std::fs::remove_file(&marker);
+            }
+            Err(e) => gui_log(&format!("kill-switch clear (startup): spawn failed: {e}")),
+        }
+    }
+
+    /// HIGH-2: per-session supervision thread. poll_status() only runs inside
+    /// egui's update(), which SW_HIDE pauses — so while the window is hidden
+    /// a client crash would go undetected and, with kill-switch on, leave the
+    /// user without internet indefinitely. This thread watches the child PID
+    /// independently, clears the kill-switch the moment the child dies, and
+    /// pokes the event loop so poll_status() reconciles the UI state.
+    #[cfg(windows)]
+    fn spawn_child_supervisor(&mut self, pid: u32, kill_switch: bool) {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        // connect() rejects while a child exists, so any previous supervisor
+        // is already gone — belt and braces.
+        if let Some(prev) = self.supervisor.take() {
+            prev.shutdown.store(true, Ordering::SeqCst);
+        }
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let cleared = Arc::new(AtomicBool::new(false));
+        self.supervisor = Some(SupervisorHandle {
+            shutdown: Arc::clone(&shutdown),
+            cleared_kill_switch: Arc::clone(&cleared),
+        });
+        let binary = self.client_binary.clone();
+        let wake = self.wake_cb.clone();
+        std::thread::spawn(move || {
+            use winapi::shared::winerror::WAIT_TIMEOUT;
+            use winapi::um::handleapi::CloseHandle;
+            use winapi::um::processthreadsapi::OpenProcess;
+            use winapi::um::synchapi::WaitForSingleObject;
+            use winapi::um::winbase::WAIT_OBJECT_0;
+            use winapi::um::winnt::SYNCHRONIZE;
+            let handle = unsafe { OpenProcess(SYNCHRONIZE, 0, pid) };
+            if handle.is_null() {
+                gui_log(
+                    "supervisor: OpenProcess failed — hidden-window crash detection \
+                     disabled for this session",
+                );
+                return;
+            }
+            loop {
+                if shutdown.load(Ordering::SeqCst) {
+                    break;
+                }
+                let r = unsafe { WaitForSingleObject(handle, 1000) };
+                if r == WAIT_TIMEOUT {
+                    continue;
+                }
+                if r == WAIT_OBJECT_0 && !shutdown.load(Ordering::SeqCst) {
+                    // Child died while the update loop may be paused: clear
+                    // the kill-switch NOW (dedup'd against the UI thread via
+                    // the shared flag) instead of waiting for the user to
+                    // reopen the window, then wake the UI to reconcile.
+                    if kill_switch && !cleared.swap(true, Ordering::SeqCst) {
+                        gui_log("supervisor: client exited — clearing kill-switch");
+                        Self::run_kill_switch_clear(&binary);
+                    }
+                    if let Some(w) = &wake {
+                        w();
+                    }
+                }
+                break;
+            }
+            unsafe { CloseHandle(handle) };
+        });
     }
 
     /// Disconnect — kill the client process
     pub fn disconnect(&mut self) {
         self.state = ConnectionState::Disconnecting;
+
+        // Intentional kill — signal the supervision thread BEFORE killing so
+        // it doesn't misread the exit as a crash and double-handle it.
+        #[cfg(windows)]
+        if let Some(s) = self.supervisor.as_ref() {
+            s.shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
 
         if let Some(ref mut child) = self.child {
             let _ = child.kill();
@@ -400,13 +696,19 @@ impl VpnManager {
         // in the client. Run `kill-switch clear` explicitly so the user is not left without
         // internet access after clicking Disconnect while kill-switch was enabled.
         if self.kill_switch_active {
-            Self::run_kill_switch_clear(&self.client_binary.clone());
-            self.kill_switch_active = false;
+            self.clear_kill_switch_once();
+        }
+        #[cfg(windows)]
+        {
+            self.supervisor = None;
         }
 
         self.state = ConnectionState::Disconnected;
         self.stats.bytes_sent = 0;
         self.stats.bytes_received = 0;
+        self.stats.vpn_ip = None;
+        self.stats.fallback = false;
+        self.session_since_ms = None;
         self.connected_since = None;
         self.last_error = None;
         // Reset recording
@@ -434,18 +736,18 @@ impl VpnManager {
         let out = match cmd.output() {
             Ok(o) => o,
             Err(e) => {
-                eprintln!("bench: spawn failed: {e}");
+                gui_log(&format!("bench: spawn failed: {e}"));
                 return None;
             }
         };
         if !out.status.success() {
-            eprintln!("bench: exit {}", out.status);
+            gui_log(&format!("bench: exit {}", out.status));
             return None;
         }
         match serde_json::from_slice(&out.stdout) {
             Ok(r) => Some(r),
             Err(e) => {
-                eprintln!("bench: JSON parse error: {e}");
+                gui_log(&format!("bench: JSON parse error: {e}"));
                 None
             }
         }
@@ -484,13 +786,19 @@ impl VpnManager {
                     }
                     self.child = None;
                     if self.kill_switch_active {
-                        Self::run_kill_switch_clear(&self.client_binary);
-                        self.kill_switch_active = false;
+                        self.clear_kill_switch_once();
+                    }
+                    #[cfg(windows)]
+                    if let Some(s) = self.supervisor.take() {
+                        s.shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
                     }
                     self.state = ConnectionState::Disconnected;
                     self.connected_since = None;
                     self.stats.bytes_sent = 0;
                     self.stats.bytes_received = 0;
+                    self.stats.vpn_ip = None;
+                    self.stats.fallback = false;
+                    self.session_since_ms = None;
                     return;
                 }
                 Ok(None) => {
@@ -504,11 +812,22 @@ impl VpnManager {
                     self.last_error = Some(format!("Connection lost (OS error): {e}"));
                     self.child = None;
                     if self.kill_switch_active {
-                        Self::run_kill_switch_clear(&self.client_binary);
-                        self.kill_switch_active = false;
+                        self.clear_kill_switch_once();
+                    }
+                    #[cfg(windows)]
+                    if let Some(s) = self.supervisor.take() {
+                        s.shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
                     }
                     self.state = ConnectionState::Disconnected;
                     self.connected_since = None;
+                    // LOW-4: mirror the Ok(Some) reset — otherwise stale
+                    // counters and a stale session epoch survive into the
+                    // next session's display.
+                    self.stats.bytes_sent = 0;
+                    self.stats.bytes_received = 0;
+                    self.stats.vpn_ip = None;
+                    self.stats.fallback = false;
+                    self.session_since_ms = None;
                     return;
                 }
             }
@@ -615,14 +934,14 @@ impl VpnManager {
             }
             match cmd.output() {
                 Ok(out) if !out.status.success() => {
-                    eprintln!(
+                    gui_log(&format!(
                         "record subcommand failed (exit {}): {}",
                         out.status,
                         String::from_utf8_lossy(&out.stderr)
-                    );
+                    ));
                 }
                 Err(e) => {
-                    eprintln!("record subcommand spawn error: {e}");
+                    gui_log(&format!("record subcommand spawn error: {e}"));
                 }
                 _ => {}
             }
@@ -760,13 +1079,65 @@ impl VpnManager {
 
         for path in &paths {
             if let Ok(content) = std::fs::read_to_string(path) {
-                if let Some((sent, recv)) = Self::parse_stats(&content) {
-                    // Only update if new values are >= current (avoid jumps down)
-                    if sent >= self.stats.bytes_sent || self.stats.bytes_sent == 0 {
-                        self.stats.bytes_sent = sent;
+                if let Some((sent, recv, since, ip, fallback)) = Self::parse_stats(&content) {
+                    // 3c: direct overwrite, no monotonic/plausibility gate —
+                    // this is a live boolean flag (like `ip` above), not a
+                    // counter; a rare torn-read misfire self-corrects within
+                    // one more 500ms poll tick. Absent key (old client
+                    // binary, or a not-currently-falling-back session) reads
+                    // as `false`.
+                    self.stats.fallback = fallback;
+                    // Plausibility gate (torn-read hardening, mirrors the
+                    // `since` gate below): only accept an `ip` that parses as
+                    // IPv4 — a partial/interleaved read of the non-atomic
+                    // stats write could otherwise surface truncated garbage.
+                    // Never clear a previously-good value on a bad read; the
+                    // 4 explicit reset sites (connect/disconnect/exit) own
+                    // clearing it back to None.
+                    if let Some(ip) = ip.filter(|s| s.parse::<std::net::Ipv4Addr>().is_ok()) {
+                        self.stats.vpn_ip = Some(ip);
                     }
-                    if recv >= self.stats.bytes_received || self.stats.bytes_received == 0 {
-                        self.stats.bytes_received = recv;
+                    // Plausibility gate (MEDIUM-2, torn-read hardening): the
+                    // client's stats write is not atomic, so a partial read
+                    // can yield a truncated/garbage `since` that would fake a
+                    // session change — flashing an absurd uptime and
+                    // re-arming the stall window. Accept the epoch only if
+                    // it is a sane wall-clock value: after ~Sep 2020
+                    // (1.6e12 ms) and at most 60 s in the future.
+                    let since = since.filter(|&s| {
+                        s > 1_600_000_000_000 && s <= current_timestamp_ms().saturating_add(60_000)
+                    });
+                    match since {
+                        Some(s) if self.session_since_ms != Some(s) => {
+                            // The `since` epoch appeared or changed: the client
+                            // child started a NEW session (silent in-process
+                            // reconnect). Accept the lower counters — the old
+                            // monotonic guard would freeze the display at the
+                            // previous session's totals, masking a dead tunnel
+                            // from the 2 s stall heuristic in poll_status().
+                            self.session_since_ms = Some(s);
+                            self.stats.bytes_sent = sent;
+                            self.stats.bytes_received = recv;
+                            // Re-arm the stall heuristic: the new session's
+                            // counters start at zero, which must not count as
+                            // "stalled since the ORIGINAL connect" — give the
+                            // fresh tunnel its own 2 s window.
+                            if self.state == ConnectionState::Connected {
+                                self.connected_since = Some(Instant::now());
+                            }
+                        }
+                        _ => {
+                            // Same session — or an old-format file with no
+                            // `since` (backward compat): keep the monotonic
+                            // guard so a stale/partial read can't jump the
+                            // display down.
+                            if sent >= self.stats.bytes_sent || self.stats.bytes_sent == 0 {
+                                self.stats.bytes_sent = sent;
+                            }
+                            if recv >= self.stats.bytes_received || self.stats.bytes_received == 0 {
+                                self.stats.bytes_received = recv;
+                            }
+                        }
                     }
                     let (qs, sal) = Self::read_quality_json();
                     self.stats.quality_score = qs;
@@ -777,13 +1148,21 @@ impl VpnManager {
         }
     }
 
+    /// Session epoch (unix ms) of the client child's CURRENT session, parsed
+    /// from the stats file. The GUI derives displayed uptime from this
+    /// (wall-clock now − since) so the timer resets together with the
+    /// per-session counters on a silent reconnect.
+    pub fn session_since_ms(&self) -> Option<u64> {
+        self.session_since_ms
+    }
+
     fn read_quality_json() -> (u8, u8) {
         let path = std::env::temp_dir().join("aivpn-quality.json");
         let content = match std::fs::read_to_string(&path) {
             Ok(s) => s,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (0, 0),
             Err(e) => {
-                eprintln!("read_quality_json: {e}");
+                gui_log(&format!("read_quality_json: {e}"));
                 return (0, 0);
             }
         };
@@ -795,23 +1174,39 @@ impl VpnManager {
         (0, 0)
     }
 
-    fn parse_stats(content: &str) -> Option<(u64, u64)> {
-        // Format: "sent:12345,received:67890"
+    fn parse_stats(content: &str) -> Option<(u64, u64, Option<u64>, Option<String>, bool)> {
+        // Format: "sent:12345,received:67890[,since:<unix-ms>][,ip:<vpn-ip>][,fallback:0|1]"
+        // — `since` is the session epoch, absent in pre-session zero-writes
+        // and in files from old client binaries. `ip` is the client's
+        // currently-effective VPN IP (HIGH #2, client parity): absent in the
+        // same cases as `since`, and re-written on every tick so a pool
+        // re-home to a different server-assigned IP shows up here even
+        // though the GUI's own child stdout is piped to Stdio::null(). `fallback`
+        // (3c) is 1 while this session is running on the built-in default
+        // mask (bootstrap resilience fallback); absent/anything-but-"1"
+        // reads as not-falling-back — same absent-key backward compat as
+        // `since`/`ip`.
         let content = content.trim();
         let mut sent = None;
         let mut recv = None;
+        let mut since = None;
+        let mut ip = None;
+        let mut fallback = false;
 
         for part in content.split(',') {
             let mut kv = part.splitn(2, ':');
             match (kv.next(), kv.next()) {
                 (Some("sent"), Some(v)) => sent = v.trim().parse().ok(),
                 (Some("received"), Some(v)) => recv = v.trim().parse().ok(),
+                (Some("since"), Some(v)) => since = v.trim().parse().ok(),
+                (Some("ip"), Some(v)) => ip = Some(v.trim().to_string()),
+                (Some("fallback"), Some(v)) => fallback = v.trim() == "1",
                 _ => {}
             }
         }
 
         match (sent, recv) {
-            (Some(s), Some(r)) => Some((s, r)),
+            (Some(s), Some(r)) => Some((s, r, since, ip, fallback)),
             _ => None,
         }
     }
@@ -951,6 +1346,62 @@ fn create_kill_on_close_job() -> Option<usize> {
             return None;
         }
         Some(job as usize)
+    }
+}
+
+/// Whether `pid` is a live process whose image is aivpn-client.exe. Used by
+/// the MEDIUM-1 startup recovery to distinguish "previous session's client
+/// still running" from "stale marker after a crash" (a bare liveness check
+/// would false-positive on PID reuse and strand the user behind orphaned
+/// block-all rules).
+#[cfg(windows)]
+fn process_is_aivpn_client(pid: u32) -> bool {
+    use winapi::um::handleapi::CloseHandle;
+    use winapi::um::processthreadsapi::OpenProcess;
+    use winapi::um::winbase::QueryFullProcessImageNameW;
+    use winapi::um::winnt::PROCESS_QUERY_LIMITED_INFORMATION;
+    unsafe {
+        let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if h.is_null() {
+            return false;
+        }
+        let mut buf = [0u16; 1024];
+        let mut len = buf.len() as u32;
+        let ok = QueryFullProcessImageNameW(h, 0, buf.as_mut_ptr(), &mut len);
+        CloseHandle(h);
+        if ok == 0 {
+            return false;
+        }
+        String::from_utf16_lossy(&buf[..len as usize])
+            .to_ascii_lowercase()
+            .ends_with("aivpn-client.exe")
+    }
+}
+
+/// Log a GUI-side diagnostic line (LOW-5). `eprintln!` alone is invisible
+/// under `windows_subsystem = "windows"` (there is no console), so every
+/// message is also appended to %LOCALAPPDATA%\AIVPN\gui.log where it can
+/// actually be read. Truncates the log when it grows past ~1 MB.
+pub fn gui_log(msg: &str) {
+    eprintln!("{msg}");
+    if let Some(dir) = dirs::data_local_dir() {
+        use std::io::Write;
+        let dir = dir.join("AIVPN");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("gui.log");
+        let too_big = std::fs::metadata(&path)
+            .map(|m| m.len() > 1_000_000)
+            .unwrap_or(false);
+        let mut opts = std::fs::OpenOptions::new();
+        opts.create(true);
+        if too_big {
+            opts.write(true).truncate(true);
+        } else {
+            opts.append(true);
+        }
+        if let Ok(mut f) = opts.open(&path) {
+            let _ = writeln!(f, "{msg}");
+        }
     }
 }
 

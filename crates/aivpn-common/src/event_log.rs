@@ -131,9 +131,21 @@ pub struct EventBus {
     inner: Arc<EventBusInner>,
 }
 
+/// Optional downstream sink for serialized (JSON-lines) events. The common
+/// crate deliberately stays transport-agnostic — the HTTP/webhook delivery
+/// itself lives in `aivpn-server` (which owns an HTTP client); it installs a
+/// closure here via [`EventBus::set_event_sink`].
+pub type EventSink = Arc<dyn Fn(&str) + Send + Sync>;
+
 struct EventBusInner {
     stdout: bool,
     stdout_lock: Mutex<()>,
+    /// The configured `AIVPN_EVENT_WEBHOOK` URL, if any. The bus itself does
+    /// not POST — it only advertises the URL so the embedding binary can wire
+    /// a sink (see [`EventBus::set_event_sink`]); without an installed sink
+    /// the URL has no effect.
+    webhook_url: Option<String>,
+    sink: Mutex<Option<EventSink>>,
 }
 
 impl EventBus {
@@ -142,6 +154,8 @@ impl EventBus {
             inner: Arc::new(EventBusInner {
                 stdout: cfg.stdout,
                 stdout_lock: Mutex::new(()),
+                webhook_url: cfg.webhook_url,
+                sink: Mutex::new(None),
             }),
         }
     }
@@ -153,8 +167,27 @@ impl EventBus {
         })
     }
 
+    /// The configured webhook URL (`AIVPN_EVENT_WEBHOOK`), if any.
+    pub fn webhook_url(&self) -> Option<&str> {
+        self.inner.webhook_url.as_deref()
+    }
+
+    /// Install the downstream sink invoked with each serialized event line
+    /// (JSON). Called once at startup by the embedding binary (the server
+    /// uses it to forward events to the configured webhook). Replacing an
+    /// existing sink is allowed but not expected.
+    pub fn set_event_sink(&self, sink: EventSink) {
+        *self.inner.sink.lock().unwrap_or_else(|e| e.into_inner()) = Some(sink);
+    }
+
     pub fn emit(&self, event: AivpnEvent) {
-        if !self.inner.stdout {
+        let sink = self
+            .inner
+            .sink
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if !self.inner.stdout && sink.is_none() {
             return;
         }
         let logged = LoggedEvent {
@@ -162,8 +195,13 @@ impl EventBus {
             event,
         };
         if let Ok(line) = serde_json::to_string(&logged) {
-            let _guard = self.inner.stdout_lock.lock();
-            let _ = writeln!(std::io::stdout(), "{}", line);
+            if self.inner.stdout {
+                let _guard = self.inner.stdout_lock.lock();
+                let _ = writeln!(std::io::stdout(), "{}", line);
+            }
+            if let Some(sink) = sink {
+                sink(&line);
+            }
         }
     }
 }

@@ -11,6 +11,11 @@
 #[cfg(test)]
 pub(crate) static TEST_HOME_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+// Тело клиента переехало сюда из main.rs и обращается к своему же крейту по
+// имени (`aivpn_client::…`, 32 места). Псевдоним позволяет этим путям
+// продолжать работать изнутри библиотеки, не переписывая их на `crate::`.
+extern crate self as aivpn_client;
+
 pub mod adaptive;
 pub mod bench;
 pub mod bootstrap_cache;
@@ -20,11 +25,29 @@ pub mod dns_proxy;
 pub mod kill_switch;
 pub mod mask_catalog;
 pub mod mask_feedback_log;
+pub mod net_change;
 pub mod proxy;
 pub mod record_cmd;
+pub mod run;
+pub mod secure_write;
 pub mod server_pool;
+#[cfg(feature = "ssh-install")]
+pub mod ssh_install_cmd;
 pub mod tunnel;
 
 pub use aivpn_common::mimicry::MimicryEngine;
+// P2.R: QR generation lives in aivpn-common (shared with the mobile FFI
+// cores) — re-exported here so existing `crate::qr::...` / `aivpn_client::qr`
+// callers keep working unchanged.
+pub use aivpn_common::qr;
+// Wave C2a/C2b: the SSH-install client (+ embedded installer bundle,
+// high-level orchestration) lives in aivpn-common (shared with the mobile
+// FFI cores) — re-exported here so `crate::ssh_install::...` /
+// `aivpn_client::ssh_install` callers keep working unchanged. Gated so the
+// default build (and the mobile FFI cores, which don't enable this feature)
+// never pull in `russh`/`russh-sftp`.
+#[cfg(feature = "ssh-install")]
+pub use aivpn_common::ssh_install;
 pub use client::AivpnClient;
+pub use run::run;
 pub use tunnel::Tunnel;

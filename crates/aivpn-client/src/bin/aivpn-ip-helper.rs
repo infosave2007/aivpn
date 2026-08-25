@@ -64,6 +64,9 @@ const MAX_STDIN_BYTES: usize = 64 * 1024;
 enum Verb {
     /// `ip addr replace <CIDR> dev <IFACE>`
     AddrReplaceDev,
+    /// `ip addr del <CIDR> dev <IFACE>` — removes the stale address after a
+    /// server-pushed network override moved the client to a new VPN IP
+    AddrDelDev,
     /// `ip route replace <CIDR> dev <IFACE>`
     RouteReplaceDev,
     /// `ip route replace <IP> via <GW> dev <IFACE>`
@@ -81,12 +84,28 @@ enum Verb {
     /// `ip -6 route replace blackhole default` (no fields — a fixed command
     /// that blackholes IPv6 so it cannot leak outside a full tunnel).
     RouteReplaceIpv6BlackholeDefault,
+    /// `ip route del <CIDR>` — teardown of full-tunnel / bypass / split
+    /// routes added by the verbs above (also matches a plain IPv4 address,
+    /// e.g. the server bypass host route).
+    RouteDel,
+    /// `ip route add default via <GW>` — restore the original default route
+    /// on disconnect.
+    RouteAddDefaultVia,
+    /// `ip route add default via <GW> dev <IFACE>`
+    RouteAddDefaultViaDev,
+    /// `ip -6 route del blackhole default` (fixed command, no fields) —
+    /// removes the blackhole installed by RouteReplaceIpv6BlackholeDefault.
+    RouteDelIpv6BlackholeDefault,
+    /// `ip -6 route del ::/0` (fixed command, no fields) — belt-and-suspenders
+    /// cleanup of any non-blackhole v6 default we may have left.
+    RouteDelIpv6Default,
 }
 
 impl Verb {
     fn parse(s: &str) -> Option<Verb> {
         Some(match s {
             "addr_replace" => Verb::AddrReplaceDev,
+            "addr_del" => Verb::AddrDelDev,
             "route_replace_dev" => Verb::RouteReplaceDev,
             "route_replace_via_dev" => Verb::RouteReplaceViaDev,
             "route_replace_via_dev_onlink" => Verb::RouteReplaceViaDevOnlink,
@@ -95,6 +114,11 @@ impl Verb {
             "route_replace_fulltunnel_upper" => Verb::RouteReplaceFulltunnelUpper,
             "route_replace_via" => Verb::RouteReplaceVia,
             "route_replace_ipv6_blackhole" => Verb::RouteReplaceIpv6BlackholeDefault,
+            "route_del" => Verb::RouteDel,
+            "route_add_default_via" => Verb::RouteAddDefaultVia,
+            "route_add_default_via_dev" => Verb::RouteAddDefaultViaDev,
+            "route_del_ipv6_blackhole" => Verb::RouteDelIpv6BlackholeDefault,
+            "route_del_ipv6_default" => Verb::RouteDelIpv6Default,
             _ => return None,
         })
     }
@@ -104,6 +128,7 @@ impl Verb {
     fn field_count(self) -> usize {
         match self {
             Verb::AddrReplaceDev => 2,                   // CIDR, IFACE
+            Verb::AddrDelDev => 2,                       // CIDR, IFACE
             Verb::RouteReplaceDev => 2,                  // CIDR, IFACE
             Verb::RouteReplaceViaDev => 3,               // IP, GW, IFACE
             Verb::RouteReplaceViaDevOnlink => 3,         // IP, GW, IFACE
@@ -112,6 +137,11 @@ impl Verb {
             Verb::RouteReplaceFulltunnelUpper => 1,      // IFACE
             Verb::RouteReplaceVia => 2,                  // CIDR, GW
             Verb::RouteReplaceIpv6BlackholeDefault => 0, // fixed command, no fields
+            Verb::RouteDel => 1,                         // CIDR
+            Verb::RouteAddDefaultVia => 1,               // GW
+            Verb::RouteAddDefaultViaDev => 2,            // GW, IFACE
+            Verb::RouteDelIpv6BlackholeDefault => 0,     // fixed command, no fields
+            Verb::RouteDelIpv6Default => 0,              // fixed command, no fields
         }
     }
 }
@@ -215,7 +245,7 @@ fn parse_line(line: &str, line_no: usize) -> Result<ParsedCommand, String> {
     }
 
     let argv = match verb {
-        Verb::AddrReplaceDev => {
+        Verb::AddrReplaceDev | Verb::AddrDelDev => {
             let (cidr, iface) = (rest[0], rest[1]);
             if !is_valid_cidr(cidr) {
                 return Err(format!("line {line_no}: invalid CIDR {cidr:?}"));
@@ -223,9 +253,14 @@ fn parse_line(line: &str, line_no: usize) -> Result<ParsedCommand, String> {
             if !is_valid_iface(iface) {
                 return Err(format!("line {line_no}: invalid interface {iface:?}"));
             }
+            let action = if verb == Verb::AddrDelDev {
+                "del"
+            } else {
+                "replace"
+            };
             vec![
                 "addr".to_string(),
-                "replace".to_string(),
+                action.to_string(),
                 cidr.to_string(),
                 "dev".to_string(),
                 iface.to_string(),
@@ -338,6 +373,46 @@ fn parse_line(line: &str, line_no: usize) -> Result<ParsedCommand, String> {
                 "blackhole".to_string(),
                 "default".to_string(),
             ]
+        }
+        Verb::RouteDel => {
+            let cidr = rest[0];
+            if !is_valid_cidr(cidr) {
+                return Err(format!("line {line_no}: invalid CIDR {cidr:?}"));
+            }
+            vec!["route".to_string(), "del".to_string(), cidr.to_string()]
+        }
+        Verb::RouteAddDefaultVia | Verb::RouteAddDefaultViaDev => {
+            let gw = rest[0];
+            if !is_valid_ipv4(gw) {
+                return Err(format!("line {line_no}: invalid gateway {gw:?}"));
+            }
+            let mut argv = vec![
+                "route".to_string(),
+                "add".to_string(),
+                "default".to_string(),
+                "via".to_string(),
+                gw.to_string(),
+            ];
+            if verb == Verb::RouteAddDefaultViaDev {
+                let iface = rest[1];
+                if !is_valid_iface(iface) {
+                    return Err(format!("line {line_no}: invalid interface {iface:?}"));
+                }
+                argv.push("dev".to_string());
+                argv.push(iface.to_string());
+            }
+            argv
+        }
+        Verb::RouteDelIpv6BlackholeDefault | Verb::RouteDelIpv6Default => {
+            // Fixed literals only (field_count is 0) — nothing to validate.
+            let target = if verb == Verb::RouteDelIpv6BlackholeDefault {
+                vec!["blackhole".to_string(), "default".to_string()]
+            } else {
+                vec!["::/0".to_string()]
+            };
+            let mut argv = vec!["-6".to_string(), "route".to_string(), "del".to_string()];
+            argv.extend(target);
+            argv
         }
     };
 
@@ -690,6 +765,65 @@ mod tests {
             cmd.argv,
             vec!["route", "replace", "192.168.1.0/24", "via", "10.0.0.1"]
         );
+    }
+
+    #[test]
+    fn accepts_route_del_for_cidr_and_plain_ipv4() {
+        let cmd = parse_line("del_ft_0\troute_del\t0.0.0.0/1", 1).unwrap();
+        assert_eq!(cmd.argv, vec!["route", "del", "0.0.0.0/1"]);
+
+        // The server bypass route is a plain IPv4 address (no prefix) —
+        // is_valid_cidr accepts that form too.
+        let cmd = parse_line("del_bypass\troute_del\t203.0.113.5", 1).unwrap();
+        assert_eq!(cmd.argv, vec!["route", "del", "203.0.113.5"]);
+    }
+
+    #[test]
+    fn accepts_route_add_default_via_with_and_without_dev() {
+        let cmd = parse_line("restore_default\troute_add_default_via\t192.168.1.1", 1).unwrap();
+        assert_eq!(
+            cmd.argv,
+            vec!["route", "add", "default", "via", "192.168.1.1"]
+        );
+
+        let cmd = parse_line(
+            "restore_default\troute_add_default_via_dev\t192.168.1.1\teth0",
+            1,
+        )
+        .unwrap();
+        assert_eq!(
+            cmd.argv,
+            vec![
+                "route",
+                "add",
+                "default",
+                "via",
+                "192.168.1.1",
+                "dev",
+                "eth0"
+            ]
+        );
+    }
+
+    #[test]
+    fn accepts_ipv6_delete_verbs_as_fixed_argv() {
+        let cmd = parse_line("del_v6_blackhole\troute_del_ipv6_blackhole", 1).unwrap();
+        assert_eq!(cmd.argv, ["-6", "route", "del", "blackhole", "default"]);
+
+        let cmd = parse_line("del_v6_default\troute_del_ipv6_default", 1).unwrap();
+        assert_eq!(cmd.argv, ["-6", "route", "del", "::/0"]);
+
+        // Fixed commands take no fields — a trailing field must be rejected.
+        assert!(parse_line("n\troute_del_ipv6_blackhole\teth0", 1).is_err());
+        assert!(parse_line("n\troute_del_ipv6_default\tx", 1).is_err());
+    }
+
+    #[test]
+    fn route_del_rejects_ipv6_and_garbage() {
+        // The helper's CIDR validator is IPv4-only by design; IPv6 deletes
+        // are served by the fixed-argv verbs above, not by route_del.
+        assert!(parse_line("n\troute_del\t2001:db8::/128", 1).is_err());
+        assert!(parse_line("n\troute_del\t10.0.0.0/24; rm -rf /", 1).is_err());
     }
 
     // ── adversarial / malformed inputs: must all be rejected ───────────

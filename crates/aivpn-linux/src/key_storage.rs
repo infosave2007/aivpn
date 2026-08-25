@@ -166,10 +166,14 @@ impl KeyStorage {
             return;
         }
         self.keys.remove(idx);
-        self.selected = if self.keys.is_empty() {
-            None
-        } else {
-            Some(self.selected.unwrap_or(0).min(self.keys.len() - 1))
+        // Keep the selection pointing at the SAME profile: indices above the
+        // removed slot shift down by one; removing the selected profile
+        // falls back to the nearest remaining one.
+        self.selected = match self.selected {
+            Some(s) if s > idx => Some(s - 1),
+            Some(s) if s == idx && self.keys.is_empty() => None,
+            Some(s) if s == idx => Some(s.min(self.keys.len() - 1)),
+            keep => keep,
         };
         self.save();
     }

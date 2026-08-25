@@ -7,8 +7,8 @@ export type DbClient = SqliteDb | PgDb
 
 // We use a discriminated-union approach so callers can always narrow by IS_SQLITE.
 
-export type SqliteDb = import('drizzle-orm/bun-sqlite').BunSQLiteDatabase<SqliteSchema>
-export type PgDb = import('drizzle-orm/postgres-js').PostgresJsDatabase<PgSchema>
+type SqliteDb = import('drizzle-orm/bun-sqlite').BunSQLiteDatabase<SqliteSchema>
+type PgDb = import('drizzle-orm/postgres-js').PostgresJsDatabase<PgSchema>
 
 import type {
   sqliteUsers,
@@ -21,14 +21,14 @@ import type {
   pgWebAudit,
 } from './schema'
 
-export type SqliteSchema = {
+type SqliteSchema = {
   users: typeof sqliteUsers
   sessions: typeof sqliteSessions
   passkeys: typeof sqlitePasskeys
   web_audit: typeof sqliteWebAudit
 }
 
-export type PgSchema = {
+type PgSchema = {
   users: typeof pgUsers
   sessions: typeof pgSessions
   passkeys: typeof pgPasskeys

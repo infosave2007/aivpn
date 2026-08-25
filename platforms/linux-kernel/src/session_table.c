@@ -254,8 +254,7 @@ int aivpn_session_insert(const struct aivpn_session_add *add)
 int aivpn_session_tags_update(const struct aivpn_session_update_tags *upd)
 {
 	struct aivpn_kern_session *s, *candidate;
-	struct aivpn_tag_entry *new_entries[AIVPN_TAG_WINDOW_SLOTS];
-	struct aivpn_tag_entry *old_entries[AIVPN_TAG_WINDOW_SLOTS];
+	struct aivpn_tag_entry **new_entries;
 	int old_count = 0;
 	u32 count, i;
 
@@ -263,12 +262,21 @@ int aivpn_session_tags_update(const struct aivpn_session_update_tags *upd)
 	if (count > AIVPN_TAG_WINDOW_SLOTS)
 		return -EINVAL;
 
+	/* 256 pointers = 2 KiB: too much to stack on an ioctl path whose Rust
+	 * dispatcher already carries the 4 KiB payload copy on its stack, so
+	 * keep the pre-allocation array off-stack. */
+	new_entries = kcalloc(AIVPN_TAG_WINDOW_SLOTS, sizeof(*new_entries),
+			      GFP_KERNEL);
+	if (!new_entries)
+		return -ENOMEM;
+
 	/* Pre-allocate all new tag entries before acquiring any lock */
 	for (i = 0; i < count; i++) {
 		new_entries[i] = kzalloc(sizeof(*new_entries[i]), GFP_KERNEL);
 		if (!new_entries[i]) {
 			while (i--)
 				kfree(new_entries[i]);
+			kfree(new_entries);
 			return -ENOMEM;
 		}
 		memcpy(new_entries[i]->tag, upd->entries[i].tag, AIVPN_TAG_SIZE);
@@ -289,15 +297,19 @@ int aivpn_session_tags_update(const struct aivpn_session_update_tags *upd)
 		spin_unlock_bh(&aivpn_table_lock);
 		for (i = 0; i < count; i++)
 			kfree(new_entries[i]);
+		kfree(new_entries);
 		return -ENOENT;
 	}
 
-	/* Unlink old tag entries from the RCU table */
+	/* Unlink old tag entries from the RCU table.  Freeing is deferred to
+	 * call_rcu (safe under the spinlock — it never sleeps), which removes
+	 * the need for a second on-stack pointer snapshot. */
 	old_count = s->tag_entry_count;
 	for (i = 0; i < (u32)old_count; i++) {
-		old_entries[i] = s->tag_entries[i];
-		if (old_entries[i])
-			hash_del_rcu(&old_entries[i]->hnode);
+		if (s->tag_entries[i]) {
+			hash_del_rcu(&s->tag_entries[i]->hnode);
+			call_rcu(&s->tag_entries[i]->rcu, tag_entry_free_rcu);
+		}
 	}
 
 	/* Link new entries into the RCU table and update session bookkeeping */
@@ -312,11 +324,7 @@ int aivpn_session_tags_update(const struct aivpn_session_update_tags *upd)
 	s->tag_entry_count = (int)count;
 	spin_unlock_bh(&aivpn_table_lock);
 
-	/* Free old entries after an RCU grace period */
-	for (i = 0; i < (u32)old_count; i++) {
-		if (old_entries[i])
-			call_rcu(&old_entries[i]->rcu, tag_entry_free_rcu);
-	}
+	kfree(new_entries);
 	return 0;
 }
 
@@ -483,8 +491,7 @@ void aivpn_counter_update(struct aivpn_kern_session *s, u64 counter)
 int aivpn_session_remove(const u8 *session_id)
 {
 	struct aivpn_kern_session *s, *candidate;
-	struct aivpn_tag_entry *saved[AIVPN_TAG_WINDOW_SLOTS];
-	int saved_count, i;
+	int i;
 
 	spin_lock_bh(&aivpn_table_lock);
 	s = NULL;
@@ -504,31 +511,35 @@ int aivpn_session_remove(const u8 *session_id)
 	if (!hlist_unhashed(&s->ip_node))
 		hash_del_rcu(&s->ip_node);
 	atomic_dec(&aivpn_session_count);
-	saved_count = s->tag_entry_count;
-	for (i = 0; i < saved_count; i++) {
-		saved[i] = s->tag_entries[i];
-		if (saved[i])
-			hash_del_rcu(&saved[i]->hnode);
+	/* Unlink the tag entries and hand each to call_rcu (safe under the
+	 * spinlock): they are freed after a grace period, exactly as the old
+	 * kfree_sensitive-after-synchronize_rcu did, but without a 2 KiB
+	 * on-stack pointer snapshot and without any allocation that could
+	 * fail the remove path. */
+	for (i = 0; i < s->tag_entry_count; i++) {
+		if (s->tag_entries[i]) {
+			hash_del_rcu(&s->tag_entries[i]->hnode);
+			call_rcu(&s->tag_entries[i]->rcu, tag_entry_free_rcu);
+			s->tag_entries[i] = NULL;
+		}
 	}
+	s->tag_entry_count = 0;
 	spin_unlock_bh(&aivpn_table_lock);
 
-	/* Wait for all in-flight RCU readers before freeing */
+	/* Wait for all in-flight RCU readers before freeing.  The RX fast path
+	 * holds rcu_read_lock() across its whole tag-lookup → decrypt → window
+	 * update sequence, so after this returns no data-path CPU can still
+	 * hold a pointer to this session. */
 	synchronize_rcu();
 
 	/*
-	 * After synchronize_rcu() no new data-path thread can obtain a pointer
-	 * to this session, but a thread that got the pointer just before we
-	 * removed the tag entries may still be holding session->lock (decrypt
-	 * in progress).  Acquire and immediately release the lock to drain any
-	 * such in-flight operation before freeing.
+	 * Belt and braces: any straggler that took session->lock just before
+	 * the grace period completed has long released it, but draining the
+	 * lock is free and keeps the invariant obvious.
 	 */
 	spin_lock_bh(&s->lock);
 	spin_unlock_bh(&s->lock);
 
-	for (i = 0; i < saved_count; i++) {
-		if (saved[i])
-			kfree_sensitive(saved[i]);
-	}
 	session_free(s);
 	return 0;
 }

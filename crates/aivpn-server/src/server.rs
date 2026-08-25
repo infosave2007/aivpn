@@ -62,6 +62,25 @@ pub struct ServerArgs {
     #[arg(long, value_name = "NAME_OR_ID")]
     pub reset_device: Option<String>,
 
+    /// Management role to assign a client created with `--add-client`
+    /// (one of: user, viewer, admin; default: user). Elevating to
+    /// `viewer`/`admin` requires the client to already be device-bound,
+    /// so this only applies to already-bound clients re-added by name —
+    /// for a fresh client, add it first and elevate the role afterwards
+    /// once its device has enrolled.
+    #[arg(long, value_name = "ROLE")]
+    pub role: Option<String>,
+
+    /// Base64-encoded 32-byte X25519 device public key to bind at creation
+    /// time, used with `--add-client` (and `--add-client-one-time`). When
+    /// given, the new client is created device-bound immediately, so it can
+    /// be combined with `--role admin` (or `--role viewer`) to create a
+    /// fully elevated client in one shot — no separate enrollment step.
+    /// Same base64 alphabet/padding as `device_pubkey` in clients.json
+    /// (standard base64, not URL-safe).
+    #[arg(long, value_name = "BASE64")]
+    pub device_pubkey: Option<String>,
+
     /// Public IP of this server (embedded into connection keys).
     /// Required when using --add-client or --show-client to generate connection keys.
     #[arg(long, env = "AIVPN_SERVER_IP")]
@@ -90,13 +109,21 @@ pub struct ServerArgs {
     #[arg(long, value_name = "PATH")]
     pub validate_mask: Option<String>,
 
-    // ── Pool / Enroll ──────────────────────────────────────────────────────────
-    /// Enroll a peer server into the pool.
-    /// Verifies that the peer shares the same server.key fingerprint, then
-    /// pushes the full clients.json and adds the peer to the local pool config.
-    #[arg(long, value_name = "PEER_ADDR")]
-    pub enroll: Option<String>,
+    /// List all pool nodes bound in the node identity registry
+    /// (`pool_nodes.json`, sibling to --clients-db), one node_id + base64
+    /// pubkey per line. These are the crypto-proven identities (via
+    /// NodeEnrollment) that site-to-site RouteSync authorization trusts.
+    #[arg(long)]
+    pub list_nodes: bool,
 
+    /// Revoke a bound pool node's identity by node_id, removing it from the
+    /// node registry (`pool_nodes.json`, sibling to --clients-db). A
+    /// revoked node must re-bind (TOFU, if still allowed) before its
+    /// RouteSync adverts are trusted again.
+    #[arg(long, value_name = "NODE_ID")]
+    pub revoke_node: Option<String>,
+
+    // ── Pool ─────────────────────────────────────────────────────────────────
     /// Pool configuration JSON file path.
     /// Contains: {"peers": ["host:port", ...], "sync_port": 444, "sync_key": "hex"}
     #[arg(long, env = "AIVPN_POOL_CONFIG")]
@@ -131,6 +158,37 @@ pub struct ServerArgs {
     /// DSCP traffic class name. Examples: EF, AF41, CS1, BE.
     #[arg(long, value_name = "CLASS")]
     pub dscp: Option<String>,
+
+    /// Priority hint for --set-client-qos: 0 = default, 1 = high, 2 = low.
+    #[arg(long, value_name = "0-N")]
+    pub priority: Option<u8>,
+
+    // ── Per-client management (enable/disable/rename/expiry) ───────────────────
+    /// Enable an existing client (by name or ID).
+    #[arg(long, value_name = "NAME_OR_ID")]
+    pub enable_client: Option<String>,
+
+    /// Disable an existing client (by name or ID). Disabled clients are
+    /// rejected at handshake but keep their record (unlike --remove-client).
+    #[arg(long, value_name = "NAME_OR_ID")]
+    pub disable_client: Option<String>,
+
+    /// Rename an existing client (by name or ID). Use with --new-name.
+    #[arg(long, value_name = "NAME_OR_ID")]
+    pub set_client_name: Option<String>,
+
+    /// New name to apply with --set-client-name.
+    #[arg(long, value_name = "NAME")]
+    pub new_name: Option<String>,
+
+    /// Set or clear an existing client's expiry (by name or ID). Use with --expiry.
+    #[arg(long, value_name = "NAME_OR_ID")]
+    pub set_client_expiry: Option<String>,
+
+    /// Expiry timestamp in RFC3339 (e.g. 2026-12-31T00:00:00Z) for --set-client-expiry.
+    /// Pass an empty string to clear an existing expiry.
+    #[arg(long, value_name = "RFC3339-OR-EMPTY")]
+    pub expiry: Option<String>,
 
     // ── Audit Log ──────────────────────────────────────────────────────────────
     /// Path to the append-only admin audit log (JSONL format).
@@ -223,6 +281,14 @@ pub struct ServerArgs {
     /// Write --export-bootstrap-descriptor output to this file instead of stdout.
     #[arg(long, value_name = "PATH")]
     pub bootstrap_output: Option<String>,
+
+    /// Downlink padding covertness↔throughput tradeoff: off | light | full
+    /// (default full). `full` pads every server→client DATA packet to the
+    /// session mask's size distribution (max covertness); `light` pads with a
+    /// small capped budget; `off` disables downlink padding (max throughput).
+    /// Overrides server.json "downlink_shaping".
+    #[arg(long, value_name = "LEVEL", env = "AIVPN_SHAPING_LEVEL")]
+    pub shaping_level: Option<String>,
 }
 
 /// AIVPN Server instance
@@ -261,9 +327,75 @@ impl AivpnServer {
         self.gateway.bootstrap_descriptors()
     }
 
+    /// Return a shared handle to the P1.5 apply-with-rollback tracker, kept
+    /// swept by the gateway's periodic cleanup task — for the management
+    /// API's `POST /api/v1/config/apply` / `/config/confirm` handlers to
+    /// share the SAME `PendingConfigManager` the tunnel path uses. Mirrors
+    /// `bootstrap_descriptors()`: must be called before `run()` consumes
+    /// the gateway.
+    pub fn pending_config(&self) -> Arc<crate::pending_config::PendingConfigManager> {
+        self.gateway.pending_config()
+    }
+
+    /// B2b (per-client exit routing): shared handle to the gateway's
+    /// exit-resolution cache, for callers outside `Gateway`/`AivpnServer`
+    /// (`main.rs`'s SIGHUP client-DB-reload handler) that need to
+    /// invalidate it after an out-of-band DB change. See
+    /// `Gateway::exit_route_cache`'s doc comment.
+    pub fn exit_route_cache(&self) -> Arc<dashmap::DashMap<std::net::Ipv4Addr, Option<String>>> {
+        self.gateway.exit_route_cache()
+    }
+
+    /// P1 REST parity fix: shared handle to the gateway's live
+    /// `masked_exit_addr` cell, for `main.rs`'s REST `ServeConfig` — see
+    /// `Gateway::masked_exit_addr`'s doc comment. Mirrors
+    /// `exit_route_cache()`'s existing sharing pattern.
+    pub fn masked_exit_addr(&self) -> Arc<parking_lot::RwLock<Option<String>>> {
+        self.gateway.masked_exit_addr()
+    }
+
     /// Set multi-hop chain forwarder.  Must be called before `run()`.
     pub fn set_chain_forwarder(&mut self, cf: Arc<crate::chain_forwarder::ChainForwarder>) {
         self.gateway.set_chain_forwarder(cf);
+    }
+
+    /// PHASE 3 (exit / chain-forward over masked transport): wire the
+    /// masked pool-client exit route in place of the legacy chain forwarder.
+    /// Must be called before `run()`. See `Gateway::set_masked_exit`.
+    pub fn set_masked_exit(
+        &mut self,
+        dialer: Arc<crate::pool_dialer::PoolDialer>,
+        exit_addr: String,
+    ) {
+        self.gateway.set_masked_exit(dialer, exit_addr);
+    }
+
+    /// P1.3 (priority pool beacon): install a `PoolDialer` handle for the
+    /// admin-revoke immediate beacon, independent of whether this node
+    /// dials an exit. See `Gateway::set_pool_dialer`. Must be called
+    /// before `run()`.
+    pub fn set_pool_dialer(&mut self, dialer: Arc<crate::pool_dialer::PoolDialer>) {
+        self.gateway.set_pool_dialer(dialer);
+    }
+
+    /// PHASE 4 (reverse chain-forward): hand out a clone of the sender an
+    /// exit node's reverse-direction `ChainForward` reply should be pushed
+    /// into on this (entry) node. See `Gateway::chain_reverse_downlink_sender`.
+    pub fn chain_reverse_downlink_sender(&self) -> tokio::sync::mpsc::Sender<Vec<u8>> {
+        self.gateway.chain_reverse_downlink_sender()
+    }
+
+    /// PHASE 4 (per-node identity): install the pool-node identity registry.
+    /// Must be called before `run()`. See `Gateway::set_node_registry`.
+    pub fn set_node_registry(&mut self, registry: Arc<crate::node_registry::NodeRegistry>) {
+        self.gateway.set_node_registry(registry);
+    }
+
+    /// D1 (Phase 4): enforce crypto-proven node identity in route
+    /// authorization (`pool.require_node_enrollment`). See
+    /// `Gateway::set_require_node_enrollment`.
+    pub fn set_require_node_enrollment(&mut self, require: bool) {
+        self.gateway.set_require_node_enrollment(require);
     }
 
     /// Return a shared handle to the live Prometheus metrics collector, for

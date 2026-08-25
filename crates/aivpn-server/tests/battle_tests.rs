@@ -5,21 +5,15 @@
 
 use std::collections::HashSet;
 use std::net::SocketAddr;
-use std::sync::Arc;
 
 use aivpn_common::crypto::{
     self, compute_time_window, current_timestamp_ms, decrypt_payload, derive_session_keys,
-    encrypt_payload, generate_resonance_tag, KeyPair, SessionKeys, CHACHA20_KEY_SIZE,
-    DEFAULT_WINDOW_MS, NONCE_SIZE, TAG_SIZE, X25519_PUBLIC_KEY_SIZE,
+    encrypt_payload, generate_resonance_tag, KeyPair, DEFAULT_WINDOW_MS, NONCE_SIZE, TAG_SIZE,
 };
 use aivpn_common::mask::preset_masks::webrtc_zoom_v3;
 use aivpn_common::protocol::{ControlPayload, InnerHeader, InnerType};
-use subtle::ConstantTimeEq;
 
-use aivpn_server::session::{
-    ReplayWindow, Session, SessionManager, SessionState, IDLE_TIMEOUT, MAX_SESSIONS,
-    TAG_WINDOW_SIZE,
-};
+use aivpn_server::session::{ReplayWindow, SessionManager, SessionState};
 
 fn make_session_manager() -> (SessionManager, KeyPair) {
     let server_kp = KeyPair::generate();
@@ -28,7 +22,6 @@ fn make_session_manager() -> (SessionManager, KeyPair) {
     let mgr = SessionManager::new(server_kp.clone(), signing_key, mask);
     // We need to return server keypair separately for DH
     // But SessionManager takes ownership - create a duplicate
-    let server_kp2 = KeyPair::from_private_key([0x42u8; 32]); // placeholder; we derive from mgr
     (mgr, server_kp)
 }
 
@@ -766,7 +759,7 @@ fn battle_cross_session_isolation() {
     assert_ne!(found_id, session2_id);
 
     // Client 1's encrypted data can't be decrypted with client 2's key
-    let mut nonce = [0u8; NONCE_SIZE];
+    let nonce = [0u8; NONCE_SIZE];
     let ct = encrypt_payload(&keys1.session_key, &nonce, b"secret").unwrap();
     let result = decrypt_payload(&keys2.session_key, &nonce, &ct);
     assert!(result.is_err(), "Cross-session decryption must fail");
@@ -931,7 +924,7 @@ fn battle_complete_ratchet() {
         .unwrap();
 
     // Save initial and ratcheted key material
-    let (initial_key, ratcheted_key, session_id, initial_tag_secret, ratcheted_tag_secret) = {
+    let (_initial_key, ratcheted_key, session_id, initial_tag_secret, ratcheted_tag_secret) = {
         let sess = session.lock();
         (
             sess.keys.session_key,
@@ -1110,7 +1103,7 @@ fn battle_ratchet_full_crypto_pipeline() {
         .unwrap();
 
     // Client-side: derive ratcheted keys (simulating ServerHello processing)
-    let (server_eph_pub, server_hello_sig, initial_session_key) = {
+    let (server_eph_pub, server_hello_sig, _initial_session_key) = {
         let sess = session.lock();
         (
             sess.server_eph_pub.unwrap(),
@@ -1147,7 +1140,7 @@ fn battle_ratchet_full_crypto_pipeline() {
 
     // Encrypt a packet with ratcheted keys (as client would)
     let payload = b"PFS-protected data";
-    let mut nonce = [0u8; NONCE_SIZE];
+    let nonce = [0u8; NONCE_SIZE];
     // counter = 0 for ratcheted session
     let ciphertext = encrypt_payload(&client_ratcheted.session_key, &nonce, payload).unwrap();
 
@@ -1174,7 +1167,7 @@ fn battle_ratchet_full_crypto_pipeline() {
 // ============================================================================
 
 use aivpn_server::gateway::MaskCatalog;
-use aivpn_server::neural::{NeuralConfig, NeuralResonanceModule, ResonanceResult, ResonanceStatus};
+use aivpn_server::neural::{NeuralConfig, NeuralResonanceModule, ResonanceStatus};
 
 #[test]
 fn test_neural_module_init() {
@@ -1391,7 +1384,7 @@ fn test_mask_catalog_compromised() {
     catalog.register_mask(mask1);
     let mask2 = aivpn_common::mask::preset_masks::quic_https_v2();
     catalog.register_mask(mask2);
-    catalog.mark_compromised("webrtc_zoom_v3");
+    catalog.mark_compromised_with_fallback("webrtc_zoom_v3");
     assert_eq!(
         catalog.available_count(),
         1,
@@ -1423,18 +1416,39 @@ fn test_mask_catalog_select_fallback() {
     );
 }
 
+// H1 fix: compromising a mask is now refused when doing so would leave the
+// catalog with nothing to fall back to. The old behavior (asserted by this
+// test before the fix) let the catalog empty out entirely once every mask
+// had tripped a detector, which permanently locked out every future
+// handshake — see MaskCatalog::mark_compromised_with_fallback's doc comment.
 #[test]
-fn test_mask_catalog_no_fallback_when_all_compromised() {
+fn test_mask_catalog_second_compromise_refused_when_it_would_empty_catalog() {
     let catalog = MaskCatalog::new();
     let mask1 = webrtc_zoom_v3();
     catalog.register_mask(mask1);
     let mask2 = aivpn_common::mask::preset_masks::quic_https_v2();
     catalog.register_mask(mask2);
-    catalog.mark_compromised("webrtc_zoom_v3");
-    catalog.mark_compromised("quic_https_v2");
-    let fallback = catalog.select_fallback("anything");
-    assert!(fallback.is_none(), "No fallback when all masks compromised");
-    assert_eq!(catalog.available_count(), 0);
+
+    let first = catalog.mark_compromised_with_fallback("webrtc_zoom_v3");
+    assert_eq!(
+        first.map(|m| m.mask_id),
+        Some("quic_https_v2".to_string()),
+        "first compromise succeeds — a fallback exists"
+    );
+    assert_eq!(catalog.available_count(), 1);
+
+    // Compromising the LAST remaining mask must be refused, not empty the
+    // catalog down to zero.
+    let second = catalog.mark_compromised_with_fallback("quic_https_v2");
+    assert!(
+        second.is_none(),
+        "compromising the last mask must be refused"
+    );
+    assert_eq!(
+        catalog.available_count(),
+        1,
+        "the last mask must remain available — the server must never go fully deaf"
+    );
 }
 
 // ============================================================================

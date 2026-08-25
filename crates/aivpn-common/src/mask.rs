@@ -337,7 +337,7 @@ pub fn accept_persisted_descriptors(
             None => true,
         })
         .collect();
-    out.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    out.sort_by_key(|d| std::cmp::Reverse(d.created_at));
     out
 }
 
@@ -375,6 +375,27 @@ pub fn accept_persisted_descriptors(
 /// (validity is the caller's responsibility). Pass an empty slice when the
 /// core has no descriptor store yet — behaviour then matches the legacy
 /// preset/PSK path exactly, with no regression.
+/// Collapse a per-session mask id to its base protocol-family preset id for
+/// §2 crowdsourced feedback. `bootstrap:{desc}:{base}:{slot}:{seed}` and
+/// `polymorphic:{base}:{hex}` both carry per-session/PSK-derived entropy that
+/// would leak a quasi-identifier and fragment the server's k-anonymity buckets;
+/// only the stable `{base}` family is meaningful (and safe) to report.
+///
+/// Single shared implementation for the desktop client and both mobile cores
+/// (previously three manually-kept-in-sync copies in `aivpn-client::client`,
+/// `aivpn-ios-core::ios_tunnel`, and `aivpn-android-core::android_tunnel`).
+pub fn base_mask_family(mask_id: &str) -> String {
+    if let Some(rest) = mask_id.strip_prefix("bootstrap:") {
+        // desc:base:slot:seed → the base is the 2nd colon-delimited field.
+        rest.split(':').nth(1).unwrap_or(rest).to_string()
+    } else if let Some(rest) = mask_id.strip_prefix("polymorphic:") {
+        // base:hex → the base is the 1st field.
+        rest.split(':').next().unwrap_or(rest).to_string()
+    } else {
+        mask_id.to_string()
+    }
+}
+
 pub fn resolve_handshake_mask(
     preferred: Option<&str>,
     descriptors: &[BootstrapDescriptor],
@@ -468,38 +489,12 @@ pub fn resolve_handshake_mask_resilient(
     preshared_key: Option<&[u8; 32]>,
     fail_streak: u32,
 ) -> MaskProfile {
-    let mut mask = if fail_streak >= HANDSHAKE_FALLBACK_THRESHOLD {
+    if fail_streak >= HANDSHAKE_FALLBACK_THRESHOLD {
         resolve_handshake_mask(preferred, &[], preshared_key)
     } else {
         resolve_handshake_mask(preferred, descriptors, preshared_key)
-    };
-    if fail_streak >= LEGACY_LAYOUT_THRESHOLD {
-        mask.tag_offset = LEGACY_TAG_OFFSET;
     }
-    mask
 }
-
-/// `tag_offset` value that selects the pre-Variant-A wire layout: an 8-byte
-/// resonance tag PREFIX at packet offset 0, then the MDH, then the ephemeral
-/// key. Every builder and decoder in the crate already keys off this sentinel.
-pub const LEGACY_TAG_OFFSET: u16 = u16::MAX;
-
-/// Consecutive never-connected handshakes after which the client abandons the
-/// embedded-tag wire layout for [`LEGACY_TAG_OFFSET`].
-///
-/// A server older than the embedded-tag layout ("Variant A") reads the tag at
-/// packet offset 0 and the ephemeral key `TAG_SIZE` bytes into the MDH. Every
-/// modern handshake therefore yields a wrong ephemeral key, wrong session keys
-/// and a tag mismatch, for EVERY mask — the covert→preset rung above cannot
-/// help because presets are embedded-tag too. Without this rung an app updated
-/// past that change can never reach an older server, which is the endless
-/// reconnect in issues #70 and #68. Measured against a live pre-Variant-A
-/// server: all five presets and all descriptor candidates are rejected in the
-/// embedded layout and accepted in this one.
-///
-/// Set above [`HANDSHAKE_FALLBACK_THRESHOLD`] so the cheaper covert→preset rung
-/// is exhausted first; the streak resets on the first completed ratchet.
-pub const LEGACY_LAYOUT_THRESHOLD: u32 = 6;
 
 /// BLAKE3 derive-key context for polymorphic-mask perturbation seeds.
 const POLYMORPHIC_SEED_CONTEXT: &str = "aivpn-polymorphic-mask-v1";
@@ -1782,6 +1777,41 @@ impl MaskProfile {
         }
     }
 
+    /// SINGLE source of truth for the embedded-vs-legacy wire-layout decision.
+    ///
+    /// Returns `true` when a packet whose mimicry header is `mdh_len` bytes long
+    /// hides the 8-byte resonance tag INSIDE that header (no separate tag
+    /// prefix); `false` when the mask falls back to the legacy layout that
+    /// carries the tag as an 8-byte prefix before the header.
+    ///
+    /// The embedded layout is used only when the tag slot fits within the
+    /// header AND does not overlap the embedded ephemeral key. The client
+    /// encoder ([`crate::mimicry`]) and the server uplink decoder
+    /// (`aivpn-server` gateway) MUST both route through this method: deciding it
+    /// independently on each side is what produced the non-QUIC-mask AEAD
+    /// failures (an embedded-tag mask whose tag did not fit `mdh_len` was
+    /// encoded with a legacy prefix by the client but decoded at the embedded
+    /// offset by the server, so every uplink packet failed authentication).
+    pub fn uses_embedded_layout(&self, mdh_len: usize) -> bool {
+        use crate::crypto::TAG_SIZE;
+        match self.embedded_tag_offset() {
+            Some(off) => off + TAG_SIZE <= mdh_len && !self.tag_overlaps_eph_pub(TAG_SIZE),
+            None => false,
+        }
+    }
+
+    /// Effective tag-prefix byte length for a packet with header length
+    /// `mdh_len`: `0` for the embedded layout, `TAG_SIZE` for the legacy
+    /// prefix layout. Companion to [`Self::uses_embedded_layout`] and the one
+    /// value the ciphertext offset must be computed from on both wire ends.
+    pub fn effective_tag_prefix_len(&self, mdh_len: usize) -> usize {
+        if self.uses_embedded_layout(mdh_len) {
+            0
+        } else {
+            crate::crypto::TAG_SIZE
+        }
+    }
+
     /// Get initial FSM state
     pub fn initial_state(&self) -> u16 {
         self.fsm_initial_state
@@ -1977,6 +2007,44 @@ pub mod preset_masks {
 
     pub fn bootstrap_default() -> MaskProfile {
         webrtc_zoom_v3()
+    }
+
+    // Regression: the embedded-vs-legacy wire-layout decision must be
+    // length-aware and identical on both wire ends. An embedded-tag mask whose
+    // tag does not fit the header length (or overlaps the ephemeral key) is
+    // encoded with the 8-byte legacy prefix; before the shared
+    // `uses_embedded_layout` fix the server decoded it at the embedded offset
+    // and every uplink packet failed AEAD (the Jul-14 aead::Error class).
+    #[test]
+    fn embedded_layout_decision_is_length_aware() {
+        use crate::crypto::TAG_SIZE;
+        let mut mask = load_webrtc_vk_teams_v1();
+
+        // Disjoint embedded tag at offset 8, eph key well clear of it.
+        mask.tag_offset = 8;
+        mask.eph_pub_offset = 40;
+        mask.eph_pub_length = 32;
+
+        // Fits (8 + 8 <= 20): embedded layout, no tag prefix.
+        assert!(mask.uses_embedded_layout(20));
+        assert_eq!(mask.effective_tag_prefix_len(20), 0);
+
+        // Does NOT fit (8 + 8 > 12): legacy fallback, 8-byte prefix — the exact
+        // case the client encoder falls back on, so the server must too.
+        assert!(!mask.uses_embedded_layout(12));
+        assert_eq!(mask.effective_tag_prefix_len(12), TAG_SIZE);
+
+        // Overlaps eph_pub ([10,18) vs tag [8,16)): legacy fallback even though
+        // it would fit lengthwise.
+        mask.eph_pub_offset = 10;
+        mask.eph_pub_length = 8;
+        assert!(!mask.uses_embedded_layout(64));
+        assert_eq!(mask.effective_tag_prefix_len(64), TAG_SIZE);
+
+        // Legacy mask (no embedded tag): always the 8-byte prefix.
+        mask.tag_offset = u16::MAX;
+        assert!(!mask.uses_embedded_layout(64));
+        assert_eq!(mask.effective_tag_prefix_len(64), TAG_SIZE);
     }
 }
 

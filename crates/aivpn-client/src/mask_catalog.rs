@@ -63,7 +63,10 @@ pub fn write_mask_catalog(masks: &[(String, String, bool)]) {
         Err(_) => return,
     };
     for path in mask_catalog_paths() {
-        let _ = std::fs::write(&path, &json);
+        // O_NOFOLLOW/create_new-hardened atomic write: this can fall back to
+        // a predictable world-writable /tmp path, which a local attacker
+        // could pre-plant as a symlink to a file this process can write.
+        crate::secure_write::write_status_best_effort(&path, &json);
     }
 }
 

@@ -216,7 +216,10 @@ app.get('/callback', async (c) => {
   })
   await d.update(users).set({ last_login: new Date() }).where(eq(users.id, user.id))
 
-  c.header('Set-Cookie', buildRefreshCookieHeader(refreshRaw, expiresAt))
+  // append: true — Hono's c.header() REPLACES by default, which silently
+  // dropped the oidc_pkce-clearing Set-Cookie emitted above and left the
+  // single-use PKCE state cookie in the browser for its full 10-minute TTL.
+  c.header('Set-Cookie', buildRefreshCookieHeader(refreshRaw, expiresAt), { append: true })
   return c.html(ssoLandingPage())
 })
 

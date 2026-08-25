@@ -1,76 +1,15 @@
 //! AIVPN Server Binary
 
-use aivpn_common::crypto;
-use aivpn_common::event_log::{EventBus, EventSinkConfig};
-use aivpn_common::mask::{IATDistType, MaskProfile, SizeDistType};
-use aivpn_common::network_config::{netmask_to_prefix_len, ClientNetworkConfig, VpnNetworkConfig};
-use aivpn_server::audit_log::AuditLogger;
-use aivpn_server::backup::{export_server, import_server, ExportOptions};
-use aivpn_server::bootstrap_publish::BootstrapPublishConfig;
-#[cfg(feature = "dns")]
-use aivpn_server::dns_proxy::DnsProxyConfig;
-use aivpn_server::gateway::GatewayConfig;
-use aivpn_server::mtls::MtlsConfig;
-use aivpn_server::neural::NeuralConfig;
-use aivpn_server::pool_sync::{PeerSyncer, PoolSyncConfig};
-use aivpn_server::qos::{dscp_by_name, parse_bandwidth, ClientQos, QosEnforcer};
-use aivpn_server::site_sync::SiteToSiteConfig;
-use aivpn_server::{AivpnServer, ClientDatabase, ServerArgs};
+use aivpn_server::server_config::MtuSetting;
+use aivpn_server::{ClientDatabase, ServerArgs};
 use clap::Parser;
-use serde::{Deserialize, Deserializer};
-use std::net::{Ipv4Addr, SocketAddr};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
-use tracing::{error, info};
+use tracing::info;
 
-const DEFAULT_SERVER_CONFIG_PATH: &str = "/etc/aivpn/server.json";
-const LOCAL_SERVER_CONFIG_PATH: &str = "deploy/config/server.json";
-const DEFAULT_LISTEN_ADDR: &str = "0.0.0.0:443";
-
-/// `"auto"` or a fixed number in `server.json` `tun_mtu` field.
-#[derive(Debug, Clone)]
-enum MtuSetting {
-    Auto,
-    Fixed(u16),
-}
-
-impl<'de> Deserialize<'de> for MtuSetting {
-    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        use serde::de::Error;
-        let v = serde_json::Value::deserialize(d)?;
-        match v {
-            serde_json::Value::String(s) if s == "auto" => Ok(MtuSetting::Auto),
-            serde_json::Value::Number(n) => n
-                .as_u64()
-                .and_then(|n| if n <= 65535 { Some(n as u16) } else { None })
-                .map(MtuSetting::Fixed)
-                .ok_or_else(|| D::Error::custom("tun_mtu must be 0–65535")),
-            _ => Err(D::Error::custom("tun_mtu must be a number or \"auto\"")),
-        }
-    }
-}
-
-/// JSON-only representation of `network_config` that allows `"mtu": "auto"`.
-/// Converted to `VpnNetworkConfig` (with a concrete `u16` MTU) in `resolve_network_config`.
-/// Using a separate struct avoids touching `VpnNetworkConfig` which is also used on the wire.
-#[derive(Debug, Clone, Default, Deserialize)]
-struct JsonNetworkConfig {
-    server_vpn_ip: Option<Ipv4Addr>,
-    prefix_len: Option<u8>,
-    /// `"auto"` or absent → follow `tun_mtu`; a number → fixed (clamped to ≤ tun_mtu).
-    #[serde(default)]
-    mtu: Option<MtuSetting>,
-    #[serde(default)]
-    keepalive_secs: Option<u8>,
-    #[serde(default)]
-    ipv6_enabled: bool,
-    #[serde(default = "default_ipv6_prefix_str")]
-    ipv6_prefix: String,
-}
-
-fn default_ipv6_prefix_str() -> String {
-    "fd10:cafe::/48".to_string()
-}
+mod bootstrap;
+mod cli;
+mod config_resolve;
 
 /// Probe the outbound-interface MTU via `/sys/class/net` and subtract VPN overhead.
 /// Falls back to `DEFAULT_TUN_MTU` on any error.
@@ -102,9 +41,33 @@ fn detect_mtu() -> u16 {
         Some(mtu) => {
             // 20 IP + 8 UDP + 8 tag + 1 pad_len + 2 inner_hdr + 16 poly1305 = 55; round to 64
             let overhead: u16 = 64;
-            let effective = mtu
-                .saturating_sub(overhead)
-                .clamp(1200, aivpn_server::nat::DEFAULT_TUN_MTU);
+            let usable = mtu.saturating_sub(overhead);
+            if usable < 576 {
+                // Physical MTU below the IPv4 minimum after overhead — almost
+                // certainly a mis-detected interface; treat like detection
+                // failure rather than configuring an unusable TUN MTU.
+                info!(
+                    "MTU auto-detection: physical={} (dev={}) leaves only {} usable — \
+                     ignoring, using default {}",
+                    mtu,
+                    iface.as_deref().unwrap_or("?"),
+                    usable,
+                    aivpn_server::nat::DEFAULT_TUN_MTU
+                );
+                return aivpn_server::nat::DEFAULT_TUN_MTU;
+            }
+            // Cap at the default, but never floor ABOVE the usable size: a
+            // small physical MTU used to be clamped UP to 1200, producing
+            // tunnel packets that could not fit the physical link.
+            let effective = usable.min(aivpn_server::nat::DEFAULT_TUN_MTU);
+            if effective < 1200 {
+                tracing::warn!(
+                    "MTU auto-detected below the typical 1200 floor (physical={}, tun={}) — \
+                     small-MTU link, throughput may suffer",
+                    mtu,
+                    effective
+                );
+            }
             info!(
                 "MTU auto-detected: physical={} (dev={}) → tun={}",
                 mtu,
@@ -124,97 +87,6 @@ fn detect_mtu() -> u16 {
     }
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
-struct ServerFileConfig {
-    listen_addr: Option<String>,
-    tun_name: Option<String>,
-    tun_addr: Option<Ipv4Addr>,
-    tun_netmask: Option<Ipv4Addr>,
-    network_config: Option<JsonNetworkConfig>,
-    mask_dir: Option<String>,
-    bootstrap_mask_files: Option<Vec<String>>,
-    session_timeout_secs: Option<u64>,
-    idle_timeout_secs: Option<u64>,
-    tun_mtu: Option<MtuSetting>,
-    #[serde(default)]
-    pool: Option<PoolSyncConfig>,
-    #[serde(default)]
-    site_to_site: Option<SiteToSiteConfig>,
-    #[serde(default)]
-    mtls: Option<MtlsConfig>,
-    #[cfg(feature = "dns")]
-    #[serde(default)]
-    dns: Option<DnsProxyConfig>,
-    #[serde(default)]
-    allow_peer_routing: Option<bool>,
-    /// A7 downlink shaping parity. Absent = enabled (pad server→client DATA to
-    /// the session mask's own size distribution). Set `false` for the
-    /// throughput-first profile.
-    #[serde(default)]
-    downlink_shaping: Option<bool>,
-    /// Neural Resonance master switch. Absent = enabled (the default). Set
-    /// `false` to turn off compromise detection entirely: the gateway skips the
-    /// periodic resonance loop, so neither the per-mask autoencoder (MSE) nor
-    /// its sibling inline ML-DPI "reads-as-tunnel" gate runs and neither can
-    /// trigger a mask rotation. Useful for debugging, perf profiling, or
-    /// silencing false positives without a rebuild.
-    #[serde(default)]
-    neural_enabled: Option<bool>,
-    /// Neural Resonance / ML-DPI gate tuning. A `"neural"` block whose fields
-    /// override `NeuralConfig` defaults (thresholds, check interval, rotation
-    /// cooldown). Absent = built-in defaults. Lets operators calibrate detection
-    /// (Part 6) and lets tests force a rotation by dropping the thresholds.
-    #[serde(default)]
-    neural: Option<NeuralConfig>,
-    #[serde(default)]
-    bootstrap_publish: Option<BootstrapPublishConfig>,
-    /// §2 crowdsourced-feedback tuning, pushed to opted-in clients via
-    /// `FeedbackConfig` so thresholds can change without a client release.
-    #[serde(default)]
-    feedback: Option<FeedbackFileConfig>,
-    /// §3 F "every session polymorphic" server policy — see
-    /// `PolymorphicFileConfig`. Absent = disabled (opt-in `MaskPreference`
-    /// remains the only way a client gets a polymorphic mask).
-    #[serde(default)]
-    polymorphic: Option<PolymorphicFileConfig>,
-    /// R2 Phase B: path to the operator Ed25519 mask-signing key (32-byte
-    /// seed, raw or base64). Signs auto-generated masks post self-test.
-    #[serde(default)]
-    mask_signing_key: Option<String>,
-    /// R2 Phase B: operator Ed25519 verifying public key (base64, 32 bytes)
-    /// for mask-load verification. Derived from `mask_signing_key` if absent.
-    #[serde(default)]
-    mask_operator_pubkey: Option<String>,
-    /// R2 Phase B: mask verification mode on disk load: "off" | "warn"
-    /// (default) | "enforce".
-    #[serde(default)]
-    mask_verify_mode: Option<String>,
-}
-
-/// server.json `"feedback"` block (§2 M3). All optional; omitted keys fall back
-/// to the gateway defaults.
-#[derive(Debug, Clone, Default, Deserialize)]
-struct FeedbackFileConfig {
-    /// Min consecutive failures for a mask before a client records a failure.
-    report_failure_threshold: Option<u8>,
-    /// Min spacing (seconds) between a client's successive feedback sends.
-    report_interval_secs: Option<u32>,
-}
-
-/// server.json `"polymorphic"` block (§3 F). Example:
-/// ```json
-/// "polymorphic": { "all_sessions": true, "base_mask": "webrtc_zoom_v3" }
-/// ```
-/// `all_sessions` defaults to `false` (feature disabled) when the block or
-/// key is omitted. `base_mask` is optional — when absent, each session uses
-/// its own current mask as the polymorphic base instead of a fixed preset.
-#[derive(Debug, Clone, Default, Deserialize)]
-struct PolymorphicFileConfig {
-    #[serde(default)]
-    all_sessions: bool,
-    base_mask: Option<String>,
-}
-
 #[tokio::main]
 async fn main() {
     // Parse arguments first (before logging for CLI commands)
@@ -222,55 +94,57 @@ async fn main() {
 
     // Mask validation doesn't need the server config or client DB.
     if let Some(ref path) = args.validate_mask {
-        handle_validate_mask(path);
+        cli::mask::handle_validate_mask(path);
         return;
     }
 
     // mTLS CA management — no config or client DB needed.
     if args.gen_ca {
-        handle_gen_ca();
+        cli::cert::handle_gen_ca();
         return;
     }
     // R2 Phase B: operator mask-signing key generation — no config needed.
     if let Some(ref path) = args.gen_mask_signing_key {
-        handle_gen_mask_signing_key(path);
+        cli::mask::handle_gen_mask_signing_key(path);
         return;
     }
     // R2 Phase B: sign a mask corpus in place, then exit.
     if let Some(ref dir) = args.sign_mask_dir {
-        handle_sign_mask_dir(dir, &args);
+        cli::mask::handle_sign_mask_dir(dir, &args);
         return;
     }
     if let Some(ref pubkey_hex) = args.issue_cert {
-        handle_issue_cert(pubkey_hex, &args);
+        cli::cert::handle_issue_cert(pubkey_hex, &args);
         return;
     }
 
-    let config_path = resolve_config_path(&args);
-    let file_config = load_server_file_config(config_path.as_deref());
+    let config_path = config_resolve::resolve_config_path(&args);
+    let file_config = config_resolve::load_server_file_config(config_path.as_deref());
     let effective_tun_mtu: u16 = match file_config.as_ref().and_then(|c| c.tun_mtu.as_ref()) {
         Some(MtuSetting::Fixed(v)) => *v,
         Some(MtuSetting::Auto) | None => detect_mtu(),
     };
-    let network_config = resolve_network_config(file_config.as_ref(), effective_tun_mtu)
-        .unwrap_or_else(|e| {
-            eprintln!("Failed to resolve VPN network config: {}", e);
+    let network_config =
+        config_resolve::resolve_network_config(file_config.as_ref(), effective_tun_mtu)
+            .unwrap_or_else(|e| {
+                eprintln!("Failed to resolve VPN network config: {}", e);
+                std::process::exit(1);
+            });
+    let bootstrap_masks =
+        cli::mask::load_bootstrap_masks(file_config.as_ref()).unwrap_or_else(|e| {
+            eprintln!("Failed to load bootstrap masks: {}", e);
             std::process::exit(1);
         });
-    let bootstrap_masks = load_bootstrap_masks(file_config.as_ref()).unwrap_or_else(|e| {
-        eprintln!("Failed to load bootstrap masks: {}", e);
-        std::process::exit(1);
-    });
 
     // --list-masks: scan mask directory and print names (no DB needed)
     if args.list_masks {
-        handle_list_masks(&args, file_config.as_ref());
+        cli::mask::handle_list_masks(&args, file_config.as_ref());
         return;
     }
 
     // --export-bootstrap-descriptor: print signed descriptors, no DB needed
     if args.export_bootstrap_descriptor {
-        handle_export_bootstrap_descriptor(&args, &bootstrap_masks);
+        cli::mask::handle_export_bootstrap_descriptor(&args, &bootstrap_masks);
         return;
     }
 
@@ -286,1645 +160,97 @@ async fn main() {
 
     // Handle CLI management commands (no logging needed)
     if let Some(ref name) = args.add_client {
-        handle_add_client(&client_db, name, &args);
+        cli::client::handle_add_client(&client_db, name, &args);
         return;
     }
     if let Some(ref name) = args.add_client_one_time {
-        handle_add_client_one_time(&client_db, name, &args);
+        cli::client::handle_add_client_one_time(&client_db, name, &args);
         return;
     }
     if let Some(ref name_or_id) = args.reset_device.clone() {
-        handle_reset_device(&client_db, &name_or_id);
+        cli::client::handle_reset_device(&client_db, &name_or_id);
         return;
     }
     if let Some(ref id) = args.remove_client {
-        handle_remove_client(&client_db, id);
+        cli::client::handle_remove_client(&client_db, id);
         return;
     }
     if args.list_clients {
-        handle_list_clients(&client_db);
+        cli::client::handle_list_clients(&client_db);
         return;
     }
     if let Some(ref id) = args.show_client {
-        handle_show_client(&client_db, id, &args);
+        cli::client::handle_show_client(&client_db, id, &args);
         return;
     }
-    if let Some(ref peer_addr) = args.enroll.clone() {
-        handle_enroll(&client_db, peer_addr, &args);
+    // PHASE 4 (per-node crypto identity): --list-nodes / --revoke-node
+    // operate on the pool-node identity registry (`pool_nodes.json`,
+    // resolved as a sibling of --clients-db — same convention `main()`
+    // itself uses when wiring up the masked-transport NodeRegistry). These
+    // are CLI-only management commands: run, print, and exit before the
+    // gateway starts, exactly like --add-client/--show-client above.
+    if args.list_nodes {
+        let pool_nodes_path = Path::new(&args.clients_db).with_file_name("pool_nodes.json");
+        cli::node::handle_list_nodes(&pool_nodes_path);
+        return;
+    }
+    if let Some(ref node_id) = args.revoke_node {
+        let pool_nodes_path = Path::new(&args.clients_db).with_file_name("pool_nodes.json");
+        cli::node::handle_revoke_node(&pool_nodes_path, node_id);
         return;
     }
     if let Some(ref output_path) = args.export.clone() {
-        handle_export(&args, output_path);
+        cli::backup::handle_export(&args, output_path);
         return;
     }
     if let Some(ref archive_path) = args.import.clone() {
-        handle_import(archive_path, args.dry_run, &args);
+        cli::backup::handle_import(archive_path, args.dry_run, &args);
         return;
     }
     if let Some(ref name_or_id) = args.set_client_qos.clone() {
-        handle_set_client_qos(&client_db, name_or_id, &args);
+        cli::client::handle_set_client_qos(&client_db, name_or_id, &args);
+        return;
+    }
+    if let Some(ref name_or_id) = args.enable_client.clone() {
+        cli::client::handle_set_client_enabled(&client_db, name_or_id, true);
+        return;
+    }
+    if let Some(ref name_or_id) = args.disable_client.clone() {
+        cli::client::handle_set_client_enabled(&client_db, name_or_id, false);
+        return;
+    }
+    if let Some(ref name_or_id) = args.set_client_name.clone() {
+        cli::client::handle_set_client_name(&client_db, name_or_id, &args);
+        return;
+    }
+    if let Some(ref name_or_id) = args.set_client_expiry.clone() {
+        cli::client::handle_set_client_expiry(&client_db, name_or_id, &args);
         return;
     }
     if let Some(ref name_or_id) = args.set_mask.clone() {
-        handle_set_mask(&client_db, name_or_id, &args, file_config.as_ref());
+        cli::mask::handle_set_mask(&client_db, name_or_id, &args, file_config.as_ref());
         return;
     }
 
-    // Initialize logging (only for server mode)
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("aivpn_server=debug".parse().unwrap())
-                .add_directive("aivpn_common=debug".parse().unwrap()),
-        )
-        .init();
-
-    info!("AIVPN Server v{}", env!("CARGO_PKG_VERSION"));
-    info!("Starting server...");
-    info!("Listening on: {}", args.listen);
-    info!("Registered clients: {}", client_db.list_clients().len());
-    info!(
-        "Authoritative VPN subnet: {} (server {}, mtu {})",
-        network_config.cidr_string(),
-        network_config.server_vpn_ip,
-        network_config.mtu,
-    );
-
-    // Load server private key from file if provided (HIGH-11)
-    let server_private_key = if let Some(ref key_file) = args.key_file {
-        let key_data = std::fs::read(key_file).unwrap_or_else(|e| {
-            error!("Failed to read key file '{}': {}", key_file, e);
-            std::process::exit(1);
-        });
-        if key_data.len() != 32 {
-            error!("Key file must be exactly 32 bytes, got {}", key_data.len());
-            std::process::exit(1);
-        }
-        let mut key = [0u8; 32];
-        key.copy_from_slice(&key_data);
-        info!("Loaded server key from file");
-        let kp = crypto::KeyPair::from_private_key(key);
-        let pub_bytes = kp.public_key_bytes();
-        info!(
-            "Server public key (hex): {}",
-            pub_bytes
-                .iter()
-                .map(|b| format!("{:02x}", b))
-                .collect::<String>()
-        );
-        key
-    } else {
-        info!("No --key-file provided, server key will be ephemeral");
-        [0u8; 32]
-    };
-
-    // Generate random TUN name if not specified (MED-1: avoids fingerprinting)
-    let tun_name = args
-        .tun_name
-        .clone()
-        .or_else(|| {
-            file_config
-                .as_ref()
-                .and_then(|config| config.tun_name.clone())
-        })
-        .unwrap_or_else(|| {
-            use rand::Rng;
-            format!("tun{:04x}", rand::thread_rng().gen::<u16>())
-        });
-
-    let listen_addr = resolve_listen_addr(&args, file_config.as_ref());
-
-    // Clone client_db for management API before moving into GatewayConfig
-    #[cfg(all(feature = "management-api", unix))]
-    let mgmt_db = client_db.clone();
-    #[cfg(all(feature = "management-api", unix))]
-    let mgmt_socket = args.management_socket.clone();
-    #[cfg(all(feature = "management-api", unix))]
-    let mgmt_pub_key = if server_private_key != [0u8; 32] {
-        Some(crypto::KeyPair::from_private_key(server_private_key).public_key_bytes())
-    } else {
-        None
-    };
-    #[cfg(all(feature = "management-api", unix))]
-    let mgmt_server_addr = args.server_ip.as_ref().map(|ip| {
-        if ip.parse::<SocketAddr>().is_ok() {
-            ip.clone()
-        } else {
-            let port = listen_addr
-                .parse::<SocketAddr>()
-                .map(|a| a.port())
-                .unwrap_or(443);
-            format!("{}:{}", ip, port)
-        }
-    });
-    #[cfg(all(feature = "management-api", unix))]
-    let mgmt_config_path = config_path.as_ref().map(std::path::PathBuf::from);
-    #[cfg(all(feature = "management-api", unix))]
-    let mgmt_clients_db_path = Some(std::path::PathBuf::from(&args.clients_db));
-    #[cfg(all(feature = "management-api", unix))]
-    let mgmt_mask_dir = resolve_mask_dir(&args, file_config.as_ref());
-    #[cfg(all(feature = "management-api", unix))]
-    let mgmt_audit_log_path = Some(std::path::PathBuf::from(&args.audit_log));
-    #[cfg(all(feature = "management-api", unix))]
-    let mgmt_mask_operator_pubkey = resolve_mask_operator_pubkey(&args, file_config.as_ref());
-    #[cfg(all(feature = "management-api", unix))]
-    let mgmt_mask_verify_mode = resolve_mask_verify_mode(&args, file_config.as_ref());
-
-    // Build structured event bus (stdout JSONL sink)
-    let event_bus = EventBus::new(EventSinkConfig {
-        stdout: true,
-        webhook_url: None,
-    });
-
-    // Audit logger
-    let audit_logger = AuditLogger::new(std::path::Path::new(&args.audit_log));
-
-    // Pool sync — start listener + outbound tasks if pool is configured
-    let pool_sync_config: Option<PoolSyncConfig> = args
-        .pool_config
-        .as_deref()
-        .and_then(|p| std::fs::read_to_string(p).ok())
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .or_else(|| file_config.as_ref().and_then(|c| c.pool.clone()));
-
-    // Clone client_db for pool sync before it is consumed by GatewayConfig.
-    let client_db_for_sync: Option<Arc<ClientDatabase>> =
-        pool_sync_config.as_ref().map(|_| client_db.clone());
-
-    // Build per-client QoS enforcer, pre-loaded from the client DB
-    let qos_enforcer = {
-        let enforcer = Arc::new(QosEnforcer::new());
-        for client in client_db.list_clients() {
-            if let Some(qos) = client.qos {
-                enforcer.set_client(&client.id, &qos);
-            }
-        }
-        enforcer
-    };
-
-    // Extract values needed after GatewayConfig consumes its inputs
-    #[cfg(feature = "dns")]
-    let vpn_gateway_ip = std::net::IpAddr::V4(network_config.server_vpn_ip);
-    #[cfg(feature = "dns")]
-    let tun_iface_for_dns = tun_name.clone();
-    let s2s_config: Option<SiteToSiteConfig> =
-        file_config.as_ref().and_then(|c| c.site_to_site.clone());
-    #[cfg(feature = "dns")]
-    let dns_config: Option<DnsProxyConfig> = file_config.as_ref().and_then(|c| c.dns.clone());
-
-    // Create config
-    let config = GatewayConfig {
-        listen_addr,
-        per_ip_pps_limit: args.per_ip_pps_limit,
-        tun_name,
-        tun_addr: network_config.server_ip_string(),
-        tun_netmask: network_config.netmask_string(),
+    bootstrap::run_server(
+        args,
+        config_path,
+        file_config,
+        effective_tun_mtu,
         network_config,
-        server_private_key,
-        signing_key: [0u8; 64],
-        enable_nat: true,
-        // Neural Resonance (+ inline ML-DPI gate) on unless server.json
-        // explicitly sets "neural_enabled": false.
-        enable_neural: file_config
-            .as_ref()
-            .and_then(|c| c.neural_enabled)
-            .unwrap_or(true),
-        // Neural/ML-DPI tuning: server.json "neural" block overrides defaults.
-        neural_config: file_config
-            .as_ref()
-            .and_then(|c| c.neural.clone())
-            .unwrap_or_default(),
-        client_db: Some(client_db),
-        mask_dir: resolve_mask_dir(&args, file_config.as_ref()),
-        session_timeout_secs: file_config.as_ref().and_then(|c| c.session_timeout_secs),
-        idle_timeout_secs: file_config.as_ref().and_then(|c| c.idle_timeout_secs),
         bootstrap_masks,
-        tun_mtu: effective_tun_mtu,
-        event_bus: event_bus.clone(),
-        qos_enforcer,
-        chain_forwarder: None,
-        mtls: file_config.as_ref().and_then(|c| c.mtls.clone()),
-        exit_node_enabled: file_config
-            .as_ref()
-            .and_then(|c| c.pool.as_ref())
-            .map_or(false, |p| p.exit_node_enabled.unwrap_or(false)),
-        audit_log: audit_logger, // H-S-8: wire audit logger into gateway
-        allow_peer_routing: file_config
-            .as_ref()
-            .and_then(|c| c.allow_peer_routing)
-            .unwrap_or(args.allow_peer_routing),
-        feedback_report_failure_threshold: file_config
-            .as_ref()
-            .and_then(|c| c.feedback.as_ref())
-            .and_then(|f| f.report_failure_threshold)
-            .unwrap_or(aivpn_server::gateway::DEFAULT_FEEDBACK_FAILURE_THRESHOLD),
-        feedback_report_interval_secs: file_config
-            .as_ref()
-            .and_then(|c| c.feedback.as_ref())
-            .and_then(|f| f.report_interval_secs)
-            .unwrap_or(aivpn_server::gateway::DEFAULT_FEEDBACK_REPORT_INTERVAL_SECS),
-        bootstrap_publish: file_config
-            .as_ref()
-            .and_then(|c| c.bootstrap_publish.clone()),
-        polymorphic_all_sessions: file_config
-            .as_ref()
-            .and_then(|c| c.polymorphic.as_ref())
-            .map(|p| p.all_sessions)
-            .unwrap_or(false),
-        polymorphic_base_mask: file_config
-            .as_ref()
-            .and_then(|c| c.polymorphic.as_ref())
-            .and_then(|p| p.base_mask.clone()),
-        downlink_shaping: file_config
-            .as_ref()
-            .and_then(|c| c.downlink_shaping)
-            .unwrap_or(true),
-        // R2 Phase B: operator mask signing + config-gated verification.
-        mask_signing_key: resolve_mask_signing_key(&args, file_config.as_ref()),
-        mask_operator_pubkey: resolve_mask_operator_pubkey(&args, file_config.as_ref()),
-        mask_verify_mode: resolve_mask_verify_mode(&args, file_config.as_ref()),
-    };
-
-    // Create and run server
-    match AivpnServer::new(config) {
-        Ok(mut server) => {
-            // Spawn management API (Unix socket, optional). Placed after
-            // AivpnServer::new() so ServeConfig can share the SAME live
-            // bootstrap_descriptors Arc as the gateway's rotation task —
-            // building a separate copy here would silently go stale after
-            // the first rotation.
-            #[cfg(all(feature = "management-api", unix))]
-            {
-                let bootstrap_descriptors = Some(server.bootstrap_descriptors());
-                #[cfg(feature = "metrics")]
-                let mgmt_metrics = Some(server.metrics());
-                if mgmt_socket.is_some() {
-                    let db = mgmt_db.clone();
-                    let socket = mgmt_socket.clone();
-                    let handle = tokio::spawn(async move {
-                        aivpn_server::management_api::serve(
-                            aivpn_server::management_api::ServeConfig {
-                                db: Some(db),
-                                socket_path: socket,
-                                server_pub_key: mgmt_pub_key,
-                                server_addr: mgmt_server_addr,
-                                config_path: mgmt_config_path,
-                                clients_db_path: mgmt_clients_db_path,
-                                mask_dir: mgmt_mask_dir,
-                                audit_log_path: mgmt_audit_log_path,
-                                bootstrap_descriptors,
-                                mask_operator_pubkey: mgmt_mask_operator_pubkey,
-                                mask_verify_mode: mgmt_mask_verify_mode,
-                                #[cfg(feature = "metrics")]
-                                metrics: mgmt_metrics,
-                            },
-                        )
-                        .await;
-                    });
-                    // Keep handle alive; log if the task exits unexpectedly
-                    tokio::spawn(async move {
-                        if handle.await.is_err() {
-                            error!("Management API task exited unexpectedly");
-                        }
-                    });
-                }
-
-                // SIGHUP → reload client database
-                {
-                    let db = mgmt_db;
-                    tokio::spawn(async move {
-                        use tokio::signal::unix::{signal, SignalKind};
-                        let mut sighup = match signal(SignalKind::hangup()) {
-                            Ok(s) => s,
-                            Err(e) => {
-                                tracing::warn!("Failed to register SIGHUP handler: {}", e);
-                                return;
-                            }
-                        };
-                        loop {
-                            sighup.recv().await;
-                            info!("SIGHUP received — reloading client database");
-                            let db = db.clone();
-                            let _ =
-                                tokio::task::spawn_blocking(move || db.reload_if_changed()).await;
-                        }
-                    });
-                }
-            }
-
-            // Start pool sync after session_manager and mask catalog are initialised.
-            // Sync packets ride the existing VPN UDP port — no extra TCP port needed.
-            if let (Some(ref pool_cfg), Some(db)) = (&pool_sync_config, client_db_for_sync) {
-                if let Some(syncer) = PeerSyncer::new(db, pool_cfg, event_bus.clone()) {
-                    syncer.start(server.session_manager());
-                    info!(
-                        "Pool sync active ({} peers, in-protocol UDP)",
-                        pool_cfg.peers.len()
-                    );
-                }
-            }
-            // Multi-hop: create chain forwarder if exit_node is configured
-            if let Some(ref pool_cfg) = pool_sync_config {
-                if let Some(ref exit_node) = pool_cfg.exit_node {
-                    use base64::Engine as _;
-                    let sync_key_opt: Option<[u8; 32]> = pool_cfg
-                        .sync_key
-                        .as_deref()
-                        .and_then(|k| base64::engine::general_purpose::STANDARD.decode(k).ok())
-                        .and_then(|b| b.try_into().ok())
-                        .filter(|k: &[u8; 32]| k != &[0u8; 32]);
-                    match sync_key_opt {
-                        None => {
-                            tracing::error!(
-                                "Multi-hop: pool.sync_key is missing, invalid, or all-zero \
-                                 — chain forwarder NOT started (exit_node={})",
-                                exit_node
-                            );
-                        }
-                        Some(sync_key) => {
-                            if let Some(cf) = aivpn_server::chain_forwarder::ChainForwarder::new(
-                                exit_node,
-                                sync_key,
-                                pool_cfg.node_id.as_deref(),
-                            )
-                            .await
-                            {
-                                server.set_chain_forwarder(cf);
-                                info!("Multi-hop: chain forwarding to exit node {}", exit_node);
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Start site-to-site route sync — pass session_manager so peer sessions are registered.
-            if let Some(ref s2s_cfg) = s2s_config {
-                aivpn_server::site_sync::start(s2s_cfg, server.session_manager());
-                info!("Site-to-site active ({} peers)", s2s_cfg.peers.len());
-            }
-
-            // Start DNS-over-HTTPS proxy
-            #[cfg(feature = "dns")]
-            if let Some(dns_cfg) = dns_config {
-                let gw_ip = vpn_gateway_ip;
-                let iface = tun_iface_for_dns;
-                tokio::spawn(async move {
-                    aivpn_server::dns_proxy::run(dns_cfg, gw_ip, iface).await;
-                });
-            }
-
-            info!("Server initialized successfully");
-            if let Err(e) = server.run().await {
-                error!("Server error: {}", e);
-                std::process::exit(1);
-            }
-        }
-        Err(e) => {
-            error!("Failed to create server: {}", e);
-            std::process::exit(1);
-        }
-    }
-}
-
-fn load_server_public_key(args: &ServerArgs) -> Option<[u8; 32]> {
-    args.key_file.as_ref().and_then(|key_file| {
-        let key_data = std::fs::read(key_file).ok()?;
-        if key_data.len() != 32 {
-            return None;
-        }
-        let mut key = [0u8; 32];
-        key.copy_from_slice(&key_data);
-        let kp = crypto::KeyPair::from_private_key(key);
-        Some(kp.public_key_bytes())
-    })
-}
-
-/// The server's ed25519 signing (verifying) public key, base64-standard encoded,
-/// derived deterministically from the server private key. Embedded in connection
-/// keys as the `sk` field so clients can verify signed server messages.
-fn load_server_signing_public_key(args: &ServerArgs) -> Option<String> {
-    use base64::Engine;
-    let key_file = args.key_file.as_ref()?;
-    let key_data = std::fs::read(key_file).ok()?;
-    if key_data.len() != 32 {
-        return None;
-    }
-    let mut key = [0u8; 32];
-    key.copy_from_slice(&key_data);
-    let signing = aivpn_server::gateway::derive_server_signing_key(&key);
-    let verifying = signing.verifying_key().to_bytes();
-    Some(base64::engine::general_purpose::STANDARD.encode(verifying))
-}
-
-// ─── R2 Phase B: operator mask-signing key handling ──────────────────────────
-
-/// Load the operator Ed25519 mask-signing key seed from a file. Accepts raw
-/// 32 bytes, or base64-encoded 32 bytes (whitespace-trimmed). Exits with a
-/// clear error on a configured-but-unreadable key: silently skipping it would
-/// silently ship unsigned masks.
-fn load_mask_signing_seed(path: &str) -> [u8; 32] {
-    use base64::Engine;
-    let data = std::fs::read(path).unwrap_or_else(|e| {
-        eprintln!("Failed to read mask signing key '{}': {}", path, e);
-        std::process::exit(1);
-    });
-    let bytes: Vec<u8> = if data.len() == 32 {
-        data
-    } else {
-        let text = String::from_utf8_lossy(&data);
-        base64::engine::general_purpose::STANDARD
-            .decode(text.trim())
-            .unwrap_or_else(|e| {
-                eprintln!(
-                    "Mask signing key '{}' is neither raw 32 bytes nor base64: {}",
-                    path, e
-                );
-                std::process::exit(1);
-            })
-    };
-    if bytes.len() != 32 {
-        eprintln!(
-            "Mask signing key '{}' must decode to 32 bytes, got {}",
-            path,
-            bytes.len()
-        );
-        std::process::exit(1);
-    }
-    let mut seed = [0u8; 32];
-    seed.copy_from_slice(&bytes);
-    seed
-}
-
-/// Resolve the operator mask-signing key seed: CLI/env → server.json.
-fn resolve_mask_signing_key(
-    args: &ServerArgs,
-    file_config: Option<&ServerFileConfig>,
-) -> Option<[u8; 32]> {
-    args.mask_signing_key
-        .clone()
-        .or_else(|| file_config.and_then(|c| c.mask_signing_key.clone()))
-        .map(|path| load_mask_signing_seed(&path))
-}
-
-/// Resolve the operator mask-verifying public key: CLI/env → server.json →
-/// derived from the signing key. Exits on a malformed configured value.
-fn resolve_mask_operator_pubkey(
-    args: &ServerArgs,
-    file_config: Option<&ServerFileConfig>,
-) -> Option<[u8; 32]> {
-    use base64::Engine;
-    let explicit = args
-        .mask_operator_pubkey
-        .clone()
-        .or_else(|| file_config.and_then(|c| c.mask_operator_pubkey.clone()));
-    if let Some(b64) = explicit {
-        let bytes = base64::engine::general_purpose::STANDARD
-            .decode(b64.trim())
-            .unwrap_or_else(|e| {
-                eprintln!("Invalid --mask-operator-pubkey (not base64): {}", e);
-                std::process::exit(1);
-            });
-        if bytes.len() != 32 {
-            eprintln!(
-                "--mask-operator-pubkey must be 32 bytes, got {}",
-                bytes.len()
-            );
-            std::process::exit(1);
-        }
-        let mut key = [0u8; 32];
-        key.copy_from_slice(&bytes);
-        return Some(key);
-    }
-    // Derive from the signing key so a single-host setup needs only one flag.
-    resolve_mask_signing_key(args, file_config).map(|seed| {
-        ed25519_dalek::SigningKey::from_bytes(&seed)
-            .verifying_key()
-            .to_bytes()
-    })
-}
-
-/// Resolve the mask verification mode: CLI/env → server.json → default (warn).
-fn resolve_mask_verify_mode(
-    args: &ServerArgs,
-    file_config: Option<&ServerFileConfig>,
-) -> aivpn_common::mask::MaskVerifyMode {
-    let raw = args
-        .mask_verify_mode
-        .clone()
-        .or_else(|| file_config.and_then(|c| c.mask_verify_mode.clone()));
-    match raw {
-        None => aivpn_common::mask::MaskVerifyMode::default(),
-        Some(s) => s.parse().unwrap_or_else(|e| {
-            eprintln!("{}", e);
-            std::process::exit(1);
-        }),
-    }
-}
-
-/// `--gen-mask-signing-key PATH`: generate a fresh operator Ed25519 seed,
-/// write it base64-encoded to PATH (0600), print the base64 public key.
-fn handle_gen_mask_signing_key(path: &str) {
-    use base64::Engine;
-    use rand::RngCore;
-    let mut seed = [0u8; 32];
-    rand::rngs::OsRng.fill_bytes(&mut seed);
-    let b64 = base64::engine::general_purpose::STANDARD.encode(seed);
-    if std::path::Path::new(path).exists() {
-        eprintln!("Refusing to overwrite existing key file '{}'", path);
-        std::process::exit(1);
-    }
-    if let Err(e) = std::fs::write(path, &b64) {
-        eprintln!("Failed to write '{}': {}", path, e);
-        std::process::exit(1);
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
-    }
-    let pubkey = ed25519_dalek::SigningKey::from_bytes(&seed)
-        .verifying_key()
-        .to_bytes();
-    println!("✅ Operator mask-signing key written to {}", path);
-    println!(
-        "   Public key (base64) — distribute to servers (--mask-operator-pubkey)\n   and clients (--mask-operator-pubkey / config mask_operator_pubkey):\n   {}",
-        base64::engine::general_purpose::STANDARD.encode(pubkey)
-    );
-}
-
-/// `--sign-mask-dir DIR`: sign every `*.json` mask in DIR in place (and its
-/// nested reverse profile) with the operator key from `--mask-signing-key`, so
-/// the corpus survives `mask_verify_mode=enforce`. The reverse profile is signed
-/// first because the outer signature covers it.
-fn handle_sign_mask_dir(dir: &str, args: &ServerArgs) {
-    let seed = match resolve_mask_signing_key(args, None) {
-        Some(s) => s,
-        None => {
-            eprintln!("--sign-mask-dir requires --mask-signing-key (or config mask_signing_key)");
-            std::process::exit(1);
-        }
-    };
-    let key = ed25519_dalek::SigningKey::from_bytes(&seed);
-    let entries = match std::fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(e) => {
-            eprintln!("Cannot read directory '{dir}': {e}");
-            std::process::exit(1);
-        }
-    };
-    let mut signed = 0usize;
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("json") {
-            continue;
-        }
-        let data = match std::fs::read_to_string(&path) {
-            Ok(d) => d,
-            Err(e) => {
-                eprintln!("  skip {}: read failed: {e}", path.display());
-                continue;
-            }
-        };
-        let mut profile: aivpn_common::mask::MaskProfile = match serde_json::from_str(&data) {
-            Ok(p) => p,
-            Err(e) => {
-                eprintln!("  skip {}: not a MaskProfile: {e}", path.display());
-                continue;
-            }
-        };
-        if let Some(rev) = profile.reverse_profile.as_deref_mut() {
-            rev.sign(&key);
-        }
-        profile.sign(&key);
-        match serde_json::to_string_pretty(&profile) {
-            Ok(out) => match std::fs::write(&path, out) {
-                Ok(()) => {
-                    signed += 1;
-                    println!("  signed {}", path.display());
-                }
-                Err(e) => eprintln!("  FAILED {}: write: {e}", path.display()),
-            },
-            Err(e) => eprintln!("  FAILED {}: serialize: {e}", path.display()),
-        }
-    }
-    println!("✅ Signed {signed} mask(s) in '{dir}' with the operator key.");
-}
-
-/// Build a connection key: aivpn://BASE64({"s":"host:port","k":"...","p":"...","i":"...","n":{...}})
-fn build_connection_key(
-    args: &ServerArgs,
-    server_ip: &str,
-    server_pub_b64: &str,
-    psk_b64: &str,
-    client_network_config: ClientNetworkConfig,
-) -> String {
-    use base64::Engine;
-    let server_addr = build_connection_server_addr(args, server_ip);
-    let mut json = serde_json::json!({
-        "s": server_addr,
-        "k": server_pub_b64,
-        "p": psk_b64,
-        "i": client_network_config.client_ip,
-        "n": client_network_config,
-    });
-    // Embed the server's ed25519 signing (verifying) public key so the client can
-    // authenticate bootstrap descriptors / ServerHello / MaskUpdate out of the box
-    // (previously verification was unreachable without a manual --server-signing-key).
-    if let Some(sk) = load_server_signing_public_key(args) {
-        json["sk"] = serde_json::Value::String(sk);
-    }
-    // R2 Phase B: embed the operator mask-verifying public key (`mop`) so
-    // clients can verify the embedded MaskProfile.signature of pushed masks
-    // out of the box (default client mode is `warn` — log-only).
-    {
-        use base64::Engine as _;
-        let config_path = resolve_config_path(args);
-        let file_config = load_server_file_config(config_path.as_deref());
-        if let Some(mop) = resolve_mask_operator_pubkey(args, file_config.as_ref()) {
-            json["mop"] =
-                serde_json::Value::String(base64::engine::general_purpose::STANDARD.encode(mop));
-        }
-    }
-    let json_bytes = serde_json::to_string(&json).unwrap();
-    let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(json_bytes.as_bytes());
-    format!("aivpn://{}", encoded)
-}
-
-fn build_connection_server_addr(args: &ServerArgs, server_ip: &str) -> String {
-    if server_ip.parse::<SocketAddr>().is_ok() {
-        return server_ip.to_string();
-    }
-
-    let config_path = resolve_config_path(args);
-    let file_config = load_server_file_config(config_path.as_deref());
-    let listen_addr = resolve_listen_addr(args, file_config.as_ref());
-
-    let port = listen_addr
-        .parse::<SocketAddr>()
-        .map(|addr| addr.port())
-        .unwrap_or(443);
-
-    format!("{}:{}", server_ip, port)
-}
-
-fn handle_add_client(db: &ClientDatabase, name: &str, args: &ServerArgs) {
-    match db.add_client(name) {
-        Ok(client) => {
-            use base64::Engine;
-            let psk_b64 = base64::engine::general_purpose::STANDARD.encode(&client.psk);
-            let server_pub = load_server_public_key(args);
-            let client_network_config = db.network_config().client_config(client.vpn_ip).unwrap();
-
-            println!("✅ Client '{}' created!", name);
-            println!("   ID:     {}", client.id);
-            println!("   VPN IP: {}", client.vpn_ip);
-            println!();
-
-            if let (Some(pub_key), Some(ref server_ip)) = (server_pub, &args.server_ip) {
-                let pub_b64 = base64::engine::general_purpose::STANDARD.encode(&pub_key);
-                let conn_key = build_connection_key(
-                    args,
-                    server_ip,
-                    &pub_b64,
-                    &psk_b64,
-                    client_network_config,
-                );
-                println!("══ Connection Key (paste into app) ══");
-                println!();
-                println!("{}", conn_key);
-                println!();
-            } else {
-                if server_pub.is_none() {
-                    eprintln!("⚠  --key-file not provided, cannot generate connection key");
-                }
-                if args.server_ip.is_none() {
-                    eprintln!("⚠  --server-ip not provided, cannot generate connection key");
-                    eprintln!("   Use: --server-ip YOUR_PUBLIC_IP or set AIVPN_SERVER_IP env var");
-                }
-            }
-        }
-        Err(e) => {
-            eprintln!("❌ Failed to add client: {}", e);
-            std::process::exit(1);
-        }
-    }
-}
-
-fn handle_add_client_one_time(db: &ClientDatabase, name: &str, args: &ServerArgs) {
-    match db.add_client_one_time(name) {
-        Ok(client) => {
-            use base64::Engine;
-            let psk_b64 = base64::engine::general_purpose::STANDARD.encode(&client.psk);
-            let server_pub = load_server_public_key(args);
-            let client_network_config = db.network_config().client_config(client.vpn_ip).unwrap();
-
-            println!("✅ One-time enrollment client '{}' created!", name);
-            println!("   ID:     {}", client.id);
-            println!("   VPN IP: {}", client.vpn_ip);
-            println!("   Mode:   One-time (first device to connect will be bound)");
-            println!();
-
-            if let (Some(pub_key), Some(ref server_ip)) = (server_pub, &args.server_ip) {
-                let pub_b64 = base64::engine::general_purpose::STANDARD.encode(&pub_key);
-                let conn_key = build_connection_key(
-                    args,
-                    server_ip,
-                    &pub_b64,
-                    &psk_b64,
-                    client_network_config,
-                );
-                println!("══ Connection Key (single-use — share with one device only) ══");
-                println!();
-                println!("{}", conn_key);
-                println!();
-            } else {
-                if server_pub.is_none() {
-                    eprintln!("⚠  --key-file not provided, cannot generate connection key");
-                }
-                if args.server_ip.is_none() {
-                    eprintln!("⚠  --server-ip not provided, cannot generate connection key");
-                }
-            }
-        }
-        Err(e) => {
-            eprintln!("❌ Failed to add one-time client: {}", e);
-            std::process::exit(1);
-        }
-    }
-}
-
-fn handle_reset_device(db: &ClientDatabase, name_or_id: &str) {
-    let client = db
-        .list_clients()
-        .into_iter()
-        .find(|c| c.id == name_or_id || c.name == name_or_id);
-
-    match client {
-        Some(c) => match db.reset_device_binding(&c.id) {
-            Ok(()) => {
-                println!("✅ Device binding reset for '{}'.", name_or_id);
-                println!("   Next connecting device will be auto-bound (one-time enrollment).");
-            }
-            Err(e) => {
-                eprintln!("❌ Failed to reset device binding: {}", e);
-                std::process::exit(1);
-            }
-        },
-        None => {
-            eprintln!("❌ Client '{}' not found.", name_or_id);
-            std::process::exit(1);
-        }
-    }
-}
-
-fn handle_remove_client(db: &ClientDatabase, id: &str) {
-    // Allow removal by name too
-    let actual_id = db
-        .list_clients()
-        .iter()
-        .find(|c| c.id == id || c.name == id)
-        .map(|c| c.id.clone());
-
-    match actual_id {
-        Some(cid) => match db.remove_client(&cid) {
-            Ok(()) => println!("✅ Client '{}' removed.", id),
-            Err(e) => {
-                eprintln!("❌ Failed to remove: {}", e);
-                std::process::exit(1);
-            }
-        },
-        None => {
-            eprintln!("❌ Client '{}' not found.", id);
-            std::process::exit(1);
-        }
-    }
-}
-
-fn handle_list_clients(db: &ClientDatabase) {
-    let clients = db.list_clients();
-    if clients.is_empty() {
-        println!("No registered clients.");
-        println!();
-        println!(
-            "Add a client: aivpn-server --add-client \"Phone\" --key-file /etc/aivpn/server.key"
-        );
-        return;
-    }
-
-    println!(
-        "{:<18} {:<20} {:<12} {:<8} {:<12} {:<12} {}",
-        "ID", "NAME", "VPN IP", "STATUS", "UPLOAD", "DOWNLOAD", "LAST SEEN"
-    );
-    println!("{}", "-".repeat(100));
-
-    for client in &clients {
-        let status = if client.enabled { "active" } else { "disabled" };
-        let upload = format_bytes(client.stats.bytes_out);
-        let download = format_bytes(client.stats.bytes_in);
-        let last_seen = client
-            .stats
-            .last_connected
-            .map(|t| t.format("%Y-%m-%d %H:%M").to_string())
-            .unwrap_or_else(|| "never".to_string());
-
-        println!(
-            "{:<18} {:<20} {:<12} {:<8} {:<12} {:<12} {}",
-            client.id, client.name, client.vpn_ip, status, upload, download, last_seen
-        );
-    }
-    println!();
-    println!("Total: {} client(s)", clients.len());
-}
-
-fn handle_show_client(db: &ClientDatabase, id: &str, args: &ServerArgs) {
-    let client = db
-        .list_clients()
-        .into_iter()
-        .find(|c| c.id == id || c.name == id);
-
-    match client {
-        Some(client) => {
-            use base64::Engine;
-            let psk_b64 = base64::engine::general_purpose::STANDARD.encode(&client.psk);
-            let server_pub = load_server_public_key(args);
-            let client_network_config = db.network_config().client_config(client.vpn_ip);
-
-            println!("Client: {} ({})", client.name, client.id);
-            println!("  VPN IP:      {}", client.vpn_ip);
-            println!(
-                "  Status:      {}",
-                if client.enabled { "active" } else { "disabled" }
-            );
-            println!(
-                "  Created:     {}",
-                client.created_at.format("%Y-%m-%d %H:%M")
-            );
-            println!("  Connections: {}", client.stats.total_connections);
-            println!("  Upload:      {}", format_bytes(client.stats.bytes_out));
-            println!("  Download:    {}", format_bytes(client.stats.bytes_in));
-            println!(
-                "  Last seen:   {}",
-                client
-                    .stats
-                    .last_connected
-                    .map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string())
-                    .unwrap_or_else(|| "never".to_string())
-            );
-
-            if let (Some(pub_key), Some(ref server_ip)) = (server_pub, &args.server_ip) {
-                match client_network_config {
-                    Ok(client_network_config) => {
-                        let pub_b64 = base64::engine::general_purpose::STANDARD.encode(&pub_key);
-                        let conn_key = build_connection_key(
-                            args,
-                            server_ip,
-                            &pub_b64,
-                            &psk_b64,
-                            client_network_config,
-                        );
-                        println!();
-                        println!("══ Connection Key ══");
-                        println!();
-                        println!("{}", conn_key);
-                        println!();
-                    }
-                    Err(err) => {
-                        eprintln!("⚠  Cannot generate connection key for this client under the current VPN subnet: {}", err);
-                        eprintln!("   Client VPN IP: {}", client.vpn_ip);
-                        eprintln!(
-                            "   Current server subnet: {}",
-                            db.network_config().cidr_string()
-                        );
-                        eprintln!("   Reissue this client in the active subnet to get a new key.");
-                    }
-                }
-            } else if args.server_ip.is_none() {
-                eprintln!("⚠  --server-ip not provided, cannot generate connection key");
-            }
-        }
-        None => {
-            eprintln!("Client '{}' not found.", id);
-            std::process::exit(1);
-        }
-    }
-}
-
-fn format_bytes(bytes: u64) -> String {
-    if bytes < 1024 {
-        format!("{} B", bytes)
-    } else if bytes < 1024 * 1024 {
-        format!("{:.1} KB", bytes as f64 / 1024.0)
-    } else if bytes < 1024 * 1024 * 1024 {
-        format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
-    } else {
-        format!("{:.1} GB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
-    }
-}
-
-fn load_server_file_config(path: Option<&str>) -> Option<ServerFileConfig> {
-    let path = path?;
-    let content = std::fs::read_to_string(path).unwrap_or_else(|e| {
-        eprintln!("Failed to read config file '{}': {}", path, e);
-        std::process::exit(1);
-    });
-    Some(serde_json::from_str(&content).unwrap_or_else(|e| {
-        eprintln!("Failed to parse config file '{}': {}", path, e);
-        std::process::exit(1);
-    }))
-}
-
-fn resolve_config_path(args: &ServerArgs) -> Option<String> {
-    if let Some(path) = &args.config {
-        return Some(path.clone());
-    }
-
-    // Only auto-select a config file that can actually be opened; an existing
-    // but unreadable file (e.g. /etc/aivpn/server.json owned by root) must not
-    // trigger a hard exit — the server falls back to defaults instead.
-    [DEFAULT_SERVER_CONFIG_PATH, LOCAL_SERVER_CONFIG_PATH]
-        .iter()
-        .find(|path| std::fs::File::open(path).is_ok())
-        .map(|path| path.to_string())
-}
-
-fn resolve_network_config(
-    file_config: Option<&ServerFileConfig>,
-    effective_tun_mtu: u16,
-) -> aivpn_common::error::Result<VpnNetworkConfig> {
-    let config = if let Some(file_config) = file_config {
-        if let Some(jnc) = &file_config.network_config {
-            // Resolve MTU: "auto"/absent → follow tun_mtu; fixed → clamp to tun_mtu.
-            let raw_mtu = match &jnc.mtu {
-                Some(MtuSetting::Fixed(v)) => *v,
-                Some(MtuSetting::Auto) | None => effective_tun_mtu,
-            };
-            let mtu = if raw_mtu > effective_tun_mtu {
-                tracing::warn!(
-                    "network_config.mtu {} > tun_mtu {}, clamping to tun_mtu",
-                    raw_mtu,
-                    effective_tun_mtu
-                );
-                effective_tun_mtu
-            } else {
-                raw_mtu
-            };
-            VpnNetworkConfig {
-                server_vpn_ip: jnc.server_vpn_ip.unwrap_or(Ipv4Addr::new(10, 0, 0, 1)),
-                prefix_len: jnc.prefix_len.unwrap_or(24),
-                mtu,
-                keepalive_secs: jnc.keepalive_secs,
-                ipv6_enabled: jnc.ipv6_enabled,
-                ipv6_prefix: jnc.ipv6_prefix.clone(),
-            }
-        } else {
-            VpnNetworkConfig {
-                server_vpn_ip: file_config.tun_addr.unwrap_or(Ipv4Addr::new(10, 0, 0, 1)),
-                prefix_len: netmask_to_prefix_len(
-                    file_config
-                        .tun_netmask
-                        .unwrap_or(Ipv4Addr::new(255, 255, 255, 0)),
-                )?,
-                mtu: effective_tun_mtu,
-                keepalive_secs: None,
-                ipv6_enabled: false,
-                ipv6_prefix: "fd10:cafe::/48".to_string(),
-            }
-        }
-    } else {
-        VpnNetworkConfig::default()
-    };
-
-    config.validate()?;
-    Ok(config)
-}
-
-fn resolve_listen_addr(args: &ServerArgs, file_config: Option<&ServerFileConfig>) -> String {
-    if args.listen == DEFAULT_LISTEN_ADDR {
-        file_config
-            .and_then(|config| config.listen_addr.clone())
-            .unwrap_or_else(|| args.listen.clone())
-    } else {
-        args.listen.clone()
-    }
-}
-
-fn load_bootstrap_masks(
-    file_config: Option<&ServerFileConfig>,
-) -> Result<Vec<MaskProfile>, String> {
-    let Some(files) = file_config.and_then(|config| config.bootstrap_mask_files.clone()) else {
-        return Ok(Vec::new());
-    };
-
-    let mut masks = Vec::new();
-    for file in files {
-        let content = std::fs::read_to_string(&file).map_err(|e| format!("{}: {}", file, e))?;
-
-        // Trim whitespace to check if file is empty
-        let trimmed = content.trim();
-        if trimmed.is_empty() {
-            // Skip empty files silently
-            continue;
-        }
-
-        // Try to parse as a single MaskProfile first
-        if let Ok(mask) = serde_json::from_str::<MaskProfile>(trimmed) {
-            masks.push(mask);
-            continue;
-        }
-
-        // Try to parse as an array of MaskProfile
-        if let Ok(arr) = serde_json::from_str::<Vec<MaskProfile>>(trimmed) {
-            masks.extend(arr);
-            continue;
-        }
-
-        // If both fail, return an error
-        return Err(format!(
-            "{}: invalid JSON format, expected MaskProfile object or array of MaskProfile objects",
-            file
-        ));
-    }
-    Ok(masks)
-}
-
-/// --list-masks: print mask JSON filenames from mask-dir
-fn handle_list_masks(args: &ServerArgs, file_config: Option<&ServerFileConfig>) {
-    let mask_dir = resolve_mask_dir(args, file_config);
-    let mut names: Vec<String> = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(&mask_dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) == Some("json") {
-                if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                    names.push(stem.to_string());
-                }
-            }
-        }
-    }
-    names.sort();
-    if names.is_empty() {
-        println!("No masks found in {}", mask_dir.display());
-    } else {
-        println!(
-            "Available masks in {} ({}):",
-            mask_dir.display(),
-            names.len()
-        );
-        for name in &names {
-            println!("  {}", name);
-        }
-    }
-}
-
-/// --export-bootstrap-descriptor: print the current signed descriptors as a
-/// JSON array (identical shape to what already-connected clients receive),
-/// for an operator to manually publish to a CDN/GitHub/Telegram/other
-/// channel. Requires --key-file: an ephemeral key would produce a descriptor
-/// signed by a key nobody's client trusts, so unlike normal server startup
-/// (which tolerates an ephemeral key with just a warning), this exits.
-fn handle_export_bootstrap_descriptor(args: &ServerArgs, bootstrap_masks: &[MaskProfile]) {
-    let Some(ref key_file) = args.key_file else {
-        eprintln!("--export-bootstrap-descriptor requires --key-file (an ephemeral server key cannot be exported — no client trusts it)");
-        std::process::exit(1);
-    };
-    let key_data = std::fs::read(key_file).unwrap_or_else(|e| {
-        eprintln!("Failed to read key file '{}': {}", key_file, e);
-        std::process::exit(1);
-    });
-    if key_data.len() != 32 {
-        eprintln!("Key file must be exactly 32 bytes, got {}", key_data.len());
-        std::process::exit(1);
-    }
-    let mut server_private_key = [0u8; 32];
-    server_private_key.copy_from_slice(&key_data);
-
-    let signing_key = aivpn_server::gateway::derive_server_signing_key(&server_private_key);
-    let descriptors = aivpn_server::gateway::build_bootstrap_descriptors(
-        &server_private_key,
-        &signing_key,
-        bootstrap_masks,
-    );
-    let json = serde_json::to_string_pretty(&descriptors).unwrap_or_else(|e| {
-        eprintln!("Failed to serialize bootstrap descriptors: {}", e);
-        std::process::exit(1);
-    });
-
-    match &args.bootstrap_output {
-        Some(path) => {
-            if let Err(e) = std::fs::write(path, &json) {
-                eprintln!("Failed to write {}: {}", path, e);
-                std::process::exit(1);
-            }
-            eprintln!(
-                "Wrote {} signed bootstrap descriptor(s) to {}",
-                descriptors.len(),
-                path
-            );
-        }
-        None => println!("{}", json),
-    }
-}
-
-/// --set-mask NAME_OR_ID --mask-name MASK_NAME: write a mask override file
-fn handle_set_mask(
-    client_db: &ClientDatabase,
-    name_or_id: &str,
-    args: &ServerArgs,
-    file_config: Option<&ServerFileConfig>,
-) {
-    let mask_name = match args.mask_name.as_deref() {
-        Some(n) if !n.is_empty() => n,
-        _ => {
-            eprintln!("--mask-name is required with --set-mask");
-            std::process::exit(1);
-        }
-    };
-    // Validate client exists
-    let client = client_db
-        .find_by_name(name_or_id)
-        .or_else(|| client_db.find_by_id(name_or_id));
-    let client = match client {
-        Some(c) => c,
-        None => {
-            eprintln!("Client '{}' not found", name_or_id);
-            std::process::exit(1);
-        }
-    };
-    // Validate mask exists (on disk or as a built-in preset)
-    let mask_dir = resolve_mask_dir(args, file_config);
-    let on_disk = mask_dir.join(format!("{}.json", mask_name)).exists();
-    let is_preset = aivpn_common::mask::preset_masks::by_id(mask_name).is_some();
-    if !on_disk && !is_preset {
-        eprintln!(
-            "Mask '{}' not found in {} or built-in presets",
-            mask_name,
-            mask_dir.display()
-        );
-        std::process::exit(1);
-    }
-    // Write override: <mask_dir>/.overrides/<client-id>.mask
-    let overrides_dir = mask_dir.join(".overrides");
-    if let Err(e) = std::fs::create_dir_all(&overrides_dir) {
-        eprintln!("Failed to create overrides dir: {}", e);
-        std::process::exit(1);
-    }
-    let override_path = overrides_dir.join(format!("{}.mask", client.id));
-    if let Err(e) = std::fs::write(&override_path, mask_name) {
-        eprintln!("Failed to write mask override: {}", e);
-        std::process::exit(1);
-    }
-    println!(
-        "Mask override set: client '{}' ({}) → '{}'",
-        client.name, client.id, mask_name
-    );
-}
-
-/// Resolve mask directory: CLI --mask-dir / env AIVPN_MASK_DIR → server.json "mask_dir" → default
-const DEFAULT_MASK_DIR: &str = "/var/lib/aivpn/masks";
-
-fn resolve_mask_dir(args: &ServerArgs, file_config: Option<&ServerFileConfig>) -> PathBuf {
-    // CLI/env already handled by clap (env = "AIVPN_MASK_DIR")
-    if let Some(ref dir) = args.mask_dir {
-        return PathBuf::from(dir);
-    }
-    // server.json
-    if let Some(ref dir) = file_config.and_then(|c| c.mask_dir.clone()) {
-        return PathBuf::from(dir);
-    }
-    PathBuf::from(DEFAULT_MASK_DIR)
-}
-
-fn handle_enroll(db: &ClientDatabase, peer_addr: &str, args: &ServerArgs) {
-    use std::io::{Read, Write};
-    use std::net::TcpStream;
-    use std::time::Duration;
-
-    let stream = TcpStream::connect_timeout(
-        &peer_addr.parse().unwrap_or_else(|_| {
-            eprintln!("❌ Invalid peer address: {}", peer_addr);
-            std::process::exit(1);
-        }),
-        Duration::from_secs(10),
-    );
-    let mut stream = match stream {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("❌ Cannot connect to peer {}: {}", peer_addr, e);
-            std::process::exit(1);
-        }
-    };
-
-    // Send enroll probe: our server public key fingerprint
-    let pub_key = load_server_public_key(args);
-    let probe = serde_json::json!({
-        "action": "enroll",
-        "pub_key": pub_key.map(|k| hex::encode(k)).unwrap_or_default(),
-    })
-    .to_string();
-    let len = (probe.len() as u32).to_le_bytes();
-    let _ = stream.write_all(&len);
-    let _ = stream.write_all(probe.as_bytes());
-
-    // Read peer response
-    let mut len_buf = [0u8; 4];
-    if stream.read_exact(&mut len_buf).is_err() {
-        eprintln!("❌ Peer did not respond to enroll probe");
-        std::process::exit(1);
-    }
-    let msg_len = u32::from_le_bytes(len_buf) as usize;
-    let mut msg_buf = vec![0u8; msg_len.min(1 << 20)];
-    if stream.read_exact(&mut msg_buf).is_err() {
-        eprintln!("❌ Failed to read peer response");
-        std::process::exit(1);
-    }
-    let resp: serde_json::Value = serde_json::from_slice(&msg_buf).unwrap_or_default();
-
-    if resp.get("status").and_then(|v| v.as_str()) != Some("ok") {
-        eprintln!(
-            "❌ Peer rejected enroll: {}",
-            resp.get("message")
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown error")
-        );
-        std::process::exit(1);
-    }
-
-    // Push our client database to the peer
-    let clients_json = match db.export_json() {
-        Ok(j) => j,
-        Err(e) => {
-            eprintln!("❌ Failed to export client DB: {}", e);
-            std::process::exit(1);
-        }
-    };
-    let push = serde_json::json!({
-        "action": "push_clients",
-        "clients": serde_json::from_str::<serde_json::Value>(&clients_json).unwrap_or_default(),
-    })
-    .to_string();
-    let len = (push.len() as u32).to_le_bytes();
-    let _ = stream.write_all(&len);
-    let _ = stream.write_all(push.as_bytes());
-
-    println!(
-        "✅ Peer {} enrolled. Clients pushed: {}",
-        peer_addr,
-        db.list_clients().len()
-    );
-    println!("   Add '{}' to your pool config to enable sync.", peer_addr);
-}
-
-fn handle_export(args: &ServerArgs, output_path: &str) {
-    let opts = ExportOptions {
-        include_clients: true,
-        include_masks: true,
-        include_config: true,
-        config_path: Some(PathBuf::from(
-            args.config.as_deref().unwrap_or("/etc/aivpn/server.json"),
-        )),
-        mask_dir: Some(PathBuf::from(
-            args.mask_dir.as_deref().unwrap_or("/var/lib/aivpn/masks"),
-        )),
-        clients_db: Some(PathBuf::from(&args.clients_db)),
-    };
-    match export_server(&opts, std::path::Path::new(output_path)) {
-        Ok(()) => println!("✅ Export complete: {}", output_path),
-        Err(e) => {
-            eprintln!("❌ Export failed: {}", e);
-            std::process::exit(1);
-        }
-    }
-}
-
-fn handle_import(archive_path: &str, dry_run: bool, args: &ServerArgs) {
-    let target_dir = args
-        .config
-        .as_deref()
-        .and_then(|p| std::path::Path::new(p).parent())
-        .unwrap_or(std::path::Path::new("/etc/aivpn"));
-    match import_server(std::path::Path::new(archive_path), target_dir, dry_run) {
-        Ok(()) => {
-            if dry_run {
-                println!("✅ Dry-run complete. No files written.");
-            } else {
-                println!("✅ Import complete.");
-            }
-        }
-        Err(e) => {
-            eprintln!("❌ Import failed: {}", e);
-            std::process::exit(1);
-        }
-    }
-}
-
-fn handle_set_client_qos(db: &ClientDatabase, name_or_id: &str, args: &ServerArgs) {
-    let client = db
-        .list_clients()
-        .into_iter()
-        .find(|c| c.id == name_or_id || c.name == name_or_id);
-    let client = match client {
-        Some(c) => c,
-        None => {
-            eprintln!("❌ Client '{}' not found", name_or_id);
-            std::process::exit(1);
-        }
-    };
-
-    let bw_up = args.bw_up.as_deref().and_then(parse_bandwidth);
-    let bw_down = args.bw_down.as_deref().and_then(parse_bandwidth);
-    let dscp = args.dscp.as_deref().and_then(dscp_by_name);
-
-    if bw_up.is_none() && bw_down.is_none() && dscp.is_none() && args.dscp.is_none() {
-        eprintln!("⚠  No QoS parameters specified. Use --bw-up, --bw-down, and/or --dscp.");
-        std::process::exit(1);
-    }
-
-    let qos = ClientQos {
-        bandwidth_limit_up: bw_up,
-        bandwidth_limit_down: bw_down,
-        dscp_class: dscp,
-        priority: None,
-    };
-
-    match db.set_client_qos(&client.id, qos) {
-        Ok(()) => {
-            println!("✅ QoS updated for '{}' ({})", client.name, client.id);
-            if let Some(bw) = args.bw_up.as_deref() {
-                println!("   Upload limit:   {}", bw);
-            }
-            if let Some(bw) = args.bw_down.as_deref() {
-                println!("   Download limit: {}", bw);
-            }
-            if let Some(d) = args.dscp.as_deref() {
-                println!("   DSCP class:     {}", d);
-            }
-        }
-        Err(e) => {
-            eprintln!("❌ Failed to set QoS: {}", e);
-            std::process::exit(1);
-        }
-    }
-}
-
-fn handle_gen_ca() {
-    use ed25519_dalek::SigningKey;
-    use rand::RngCore;
-    let mut seed = [0u8; 32];
-    rand::rngs::OsRng.fill_bytes(&mut seed);
-    let sk = SigningKey::from_bytes(&seed);
-    let pk = sk.verifying_key();
-    let priv_hex = hex::encode(sk.to_bytes());
-    let pub_hex = hex::encode(pk.to_bytes());
-    println!("ca_private_key_hex: {priv_hex}");
-    println!("ca_public_key_hex:  {pub_hex}");
-    println!();
-    println!("Add to server.json:");
-    println!("  \"mtls\": {{");
-    println!("    \"ca_public_key_hex\": \"{pub_hex}\",");
-    println!("    \"required\": false");
-    println!("  }}");
-    println!();
-    println!("Keep ca_private_key_hex offline — it is only needed to run --issue-cert.");
-}
-
-fn handle_issue_cert(pubkey_hex: &str, args: &ServerArgs) {
-    let pk_bytes: [u8; 32] = match hex::decode(pubkey_hex) {
-        Ok(b) if b.len() == 32 => {
-            let mut arr = [0u8; 32];
-            arr.copy_from_slice(&b);
-            arr
-        }
-        _ => {
-            eprintln!(
-                "error: --issue-cert expects a 64-char hex string (32 bytes), got {pubkey_hex:?}"
-            );
-            std::process::exit(1);
-        }
-    };
-
-    let ca_key_hex = match args.ca_key.as_deref() {
-        Some(h) => h,
-        None => {
-            eprintln!("error: --ca-key <HEX> is required with --issue-cert");
-            std::process::exit(1);
-        }
-    };
-
-    let ca_bytes: [u8; 32] = match hex::decode(ca_key_hex) {
-        Ok(b) if b.len() == 32 => {
-            let mut arr = [0u8; 32];
-            arr.copy_from_slice(&b);
-            arr
-        }
-        _ => {
-            eprintln!("error: --ca-key must be a 64-char hex string (32 bytes)");
-            std::process::exit(1);
-        }
-    };
-
-    let expiry_ts = aivpn_common::crypto::current_timestamp_ms() / 1000 + args.days * 86_400;
-    let cert = aivpn_server::mtls::issue_cert(pk_bytes, expiry_ts, &ca_bytes);
-    let cert_hex = hex::encode(cert.to_bytes());
-    println!("{cert_hex}");
-    println!();
-    println!(
-        "cert_hex ({} chars) — pass to aivpn-client via --mtls-cert",
-        cert_hex.len()
-    );
-    println!("or base64-encode for mobile platforms.");
-    println!("Expires: {expiry_ts} unix ({} days)", args.days);
-}
-
-fn handle_validate_mask(path: &str) {
-    let content = match std::fs::read_to_string(path) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("error: cannot read {path}: {e}");
-            std::process::exit(1);
-        }
-    };
-    let profile: MaskProfile = match serde_json::from_str(&content) {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("error: JSON parse failed in {path}: {e}");
-            std::process::exit(1);
-        }
-    };
-
-    let mut issues: Vec<String> = Vec::new();
-    let mut warnings: Vec<String> = Vec::new();
-
-    // signature_vector
-    let sig_len = profile.signature_vector.len();
-    if sig_len != 64 {
-        issues.push(format!("signature_vector: {sig_len} floats (expected 64)"));
-    } else if !profile.signature_vector.iter().all(|v| v.is_finite()) {
-        issues.push("signature_vector: contains NaN or Inf".to_string());
-    } else {
-        let l2: f32 = profile
-            .signature_vector
-            .iter()
-            .map(|v| v * v)
-            .sum::<f32>()
-            .sqrt();
-        if l2 == 0.0 {
-            warnings.push(
-                "signature_vector is all-zeros — neural resonance inactive for this mask"
-                    .to_string(),
-            );
-        }
-    }
-
-    // header_template vs eph_pub_offset
-    let hdr_len = profile.header_template.len();
-    if hdr_len != profile.eph_pub_offset as usize {
-        issues.push(format!(
-            "header_template length ({hdr_len}) != eph_pub_offset ({})",
-            profile.eph_pub_offset
-        ));
-    }
-    if profile.eph_pub_length != 32 {
-        warnings.push(format!(
-            "eph_pub_length = {} (expected 32 for X25519)",
-            profile.eph_pub_length
-        ));
-    }
-    let eph_end = profile.eph_pub_offset as u32 + profile.eph_pub_length as u32;
-    if eph_end > 1350 {
-        issues.push(format!(
-            "eph region ends at byte {eph_end}, which exceeds 1350"
-        ));
-    }
-
-    // size distribution bins sum
-    if matches!(profile.size_distribution.dist_type, SizeDistType::Histogram) {
-        let sum: f32 = profile.size_distribution.bins.iter().map(|b| b.2).sum();
-        if (sum - 1.0).abs() > 0.02 {
-            issues.push(format!(
-                "size_distribution bins sum = {sum:.4} (expected 1.0 ± 0.02)"
-            ));
-        }
-    }
-
-    // FSM integrity
-    let state_ids: std::collections::HashSet<u16> =
-        profile.fsm_states.iter().map(|s| s.state_id).collect();
-    if !state_ids.contains(&profile.fsm_initial_state) {
-        issues.push(format!(
-            "fsm_initial_state {} not found in fsm_states",
-            profile.fsm_initial_state
-        ));
-    }
-    for state in &profile.fsm_states {
-        for t in &state.transitions {
-            if !state_ids.contains(&t.next_state) {
-                issues.push(format!(
-                    "FSM state {}: transition to unknown state {}",
-                    state.state_id, t.next_state
-                ));
-            }
-        }
-    }
-
-    // expiry
-    let now_secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    let expires_str = if profile.expires_at == u64::MAX {
-        "never".to_string()
-    } else if profile.expires_at < now_secs {
-        let days = (now_secs - profile.expires_at) / 86400;
-        issues.push(format!("mask expired {days} day(s) ago"));
-        format!("EXPIRED ({days} days ago)")
-    } else {
-        let days = (profile.expires_at - now_secs) / 86400;
-        format!("{days} days remaining")
-    };
-
-    // ── Report ────────────────────────────────────────────────────────────
-    println!("═══════════════════════════════════════════════════════");
-    println!("Mask:     {} (v{})", profile.mask_id, profile.version);
-    println!("Protocol: {:?}", profile.spoof_protocol);
-    println!(
-        "Header:   {} bytes, eph_pub @ {}..{}",
-        hdr_len, profile.eph_pub_offset, eph_end
-    );
-    println!("Expires:  {expires_str}");
-
-    let l2: f32 = if sig_len == 64 {
-        profile
-            .signature_vector
-            .iter()
-            .map(|v| v * v)
-            .sum::<f32>()
-            .sqrt()
-    } else {
-        0.0
-    };
-    println!("Sig vec:  {sig_len} floats, L2={l2:.3}");
-
-    println!("───────────────────────────────────────────────────────");
-
-    match profile.size_distribution.dist_type {
-        SizeDistType::Histogram => {
-            let bins = &profile.size_distribution.bins;
-            let sum: f32 = bins.iter().map(|b| b.2).sum();
-            println!("Size:     Histogram ({} bins), sum={sum:.3}", bins.len());
-            for (lo, hi, p) in bins {
-                println!("          [{lo}–{hi}]: {:.1}%", p * 100.0);
-            }
-        }
-        SizeDistType::Parametric => {
-            println!(
-                "Size:     Parametric ({:?})",
-                profile.size_distribution.parametric_type
-            );
-        }
-    }
-
-    let (jlo, jhi) = profile.iat_distribution.jitter_range_ms;
-    let iat_type = match profile.iat_distribution.dist_type {
-        IATDistType::Exponential => "Exponential",
-        IATDistType::LogNormal => "LogNormal",
-        IATDistType::Empirical => "Empirical",
-        IATDistType::Gamma => "Gamma",
-        IATDistType::Gmm => "GMM",
-    };
-    println!(
-        "IAT:      {} params={:?} jitter=[{jlo:.1}, {jhi:.1}] ms",
-        iat_type, profile.iat_distribution.params
-    );
-
-    println!(
-        "FSM:      {} states, initial={}",
-        profile.fsm_states.len(),
-        profile.fsm_initial_state
-    );
-    println!("───────────────────────────────────────────────────────");
-
-    for w in &warnings {
-        println!("WARN:  {w}");
-    }
-    if issues.is_empty() {
-        if warnings.is_empty() {
-            println!("Result: PASS");
-        } else {
-            println!("Result: PASS (with warnings)");
-        }
-    } else {
-        for issue in &issues {
-            println!("FAIL:  {issue}");
-        }
-        println!("Result: FAIL ({} issue(s))", issues.len());
-        std::process::exit(1);
-    }
+        client_db,
+    )
+    .await;
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aivpn_common::network_config::VpnNetworkConfig;
+    use aivpn_server::server_config::{JsonNetworkConfig, ServerFileConfig};
     use base64::Engine;
+    use std::net::Ipv4Addr;
 
     fn test_args(listen: &str) -> ServerArgs {
         ServerArgs {
@@ -1941,9 +267,10 @@ mod tests {
             per_ip_pps_limit: 1000,
             mask_dir: None,
             validate_mask: None,
+            list_nodes: false,
+            revoke_node: None,
             #[cfg(all(feature = "management-api", unix))]
             management_socket: None,
-            enroll: None,
             pool_config: None,
             export: None,
             import: None,
@@ -1952,6 +279,13 @@ mod tests {
             bw_up: None,
             bw_down: None,
             dscp: None,
+            priority: None,
+            enable_client: None,
+            disable_client: None,
+            set_client_name: None,
+            new_name: None,
+            set_client_expiry: None,
+            expiry: None,
             audit_log: "/dev/null".to_string(),
             gen_ca: false,
             issue_cert: None,
@@ -1970,14 +304,45 @@ mod tests {
             sign_mask_dir: None,
             export_bootstrap_descriptor: false,
             bootstrap_output: None,
+            shaping_level: None,
+            role: None,
+            device_pubkey: None,
         }
+    }
+
+    #[test]
+    fn decode_device_pubkey_arg_accepts_valid_32_byte_base64() {
+        let raw = [0x42u8; 32];
+        let b64 = base64::engine::general_purpose::STANDARD.encode(raw);
+        assert_eq!(cli::client::decode_device_pubkey_arg(&b64).unwrap(), raw);
+    }
+
+    #[test]
+    fn decode_device_pubkey_arg_trims_whitespace() {
+        let raw = [0x99u8; 32];
+        let b64 = base64::engine::general_purpose::STANDARD.encode(raw);
+        let padded = format!("  {}\n", b64);
+        assert_eq!(cli::client::decode_device_pubkey_arg(&padded).unwrap(), raw);
+    }
+
+    #[test]
+    fn decode_device_pubkey_arg_rejects_wrong_length() {
+        let b64 = base64::engine::general_purpose::STANDARD.encode([0x11u8; 16]);
+        let err = cli::client::decode_device_pubkey_arg(&b64).unwrap_err();
+        assert!(err.contains("32 bytes"), "unexpected error: {}", err);
+    }
+
+    #[test]
+    fn decode_device_pubkey_arg_rejects_invalid_base64() {
+        let err = cli::client::decode_device_pubkey_arg("not!!valid==base64??").unwrap_err();
+        assert!(err.contains("base64"), "unexpected error: {}", err);
     }
 
     #[test]
     fn build_connection_server_addr_keeps_explicit_port() {
         let args = test_args("0.0.0.0:443");
         assert_eq!(
-            build_connection_server_addr(&args, "203.0.113.10:8443"),
+            cli::client::build_connection_server_addr(&args, "203.0.113.10:8443"),
             "203.0.113.10:8443"
         );
     }
@@ -1986,7 +351,7 @@ mod tests {
     fn build_connection_server_addr_adds_listen_port_once() {
         let args = test_args("0.0.0.0:443");
         assert_eq!(
-            build_connection_server_addr(&args, "203.0.113.10"),
+            cli::client::build_connection_server_addr(&args, "203.0.113.10"),
             "203.0.113.10:443"
         );
     }
@@ -1994,21 +359,25 @@ mod tests {
     #[test]
     fn build_connection_key_embeds_normalized_server_addr() {
         let args = test_args("0.0.0.0:443");
-        let key = build_connection_key(
+        let dir = tempfile::tempdir().unwrap();
+        let network_config = VpnNetworkConfig {
+            server_vpn_ip: Ipv4Addr::new(10, 0, 0, 1),
+            prefix_len: 24,
+            mtu: 1346,
+            keepalive_secs: None,
+            ..Default::default()
+        };
+        let db = ClientDatabase::load(&dir.path().join("clients.json"), network_config).unwrap();
+        let client = db.add_client("alice").unwrap();
+
+        let key = cli::client::build_connection_key(
+            &db,
             &args,
+            &client.id,
             "203.0.113.10:8443",
-            "server-key",
-            "psk",
-            ClientNetworkConfig {
-                client_ip: Ipv4Addr::new(10, 0, 0, 2),
-                server_vpn_ip: Ipv4Addr::new(10, 0, 0, 1),
-                prefix_len: 24,
-                mtu: 1346,
-                mdh_len: 20,
-                keepalive_secs: None,
-                ipv6_address: None,
-            },
-        );
+            [7u8; 32],
+        )
+        .expect("build_connection_key should succeed for a freshly created client");
         let payload = key.strip_prefix("aivpn://").unwrap();
         let json_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .decode(payload)
@@ -2042,7 +411,7 @@ mod tests {
         };
 
         // effective_tun_mtu=1400 so fixed 1400 is not clamped.
-        let resolved = resolve_network_config(Some(&file_config), 1400).unwrap();
+        let resolved = config_resolve::resolve_network_config(Some(&file_config), 1400).unwrap();
         assert_eq!(resolved.server_vpn_ip, Ipv4Addr::new(10, 150, 0, 1));
         assert_eq!(resolved.mtu, 1400);
     }
@@ -2059,7 +428,7 @@ mod tests {
             ..Default::default()
         };
         // When MTU is absent (auto), network_config.mtu == effective_tun_mtu.
-        let resolved = resolve_network_config(Some(&file_config), 1280).unwrap();
+        let resolved = config_resolve::resolve_network_config(Some(&file_config), 1280).unwrap();
         assert_eq!(resolved.mtu, 1280);
     }
 
@@ -2075,7 +444,7 @@ mod tests {
             ..Default::default()
         };
         // Fixed 1400 exceeds effective_tun_mtu=1280 → clamped to 1280.
-        let resolved = resolve_network_config(Some(&file_config), 1280).unwrap();
+        let resolved = config_resolve::resolve_network_config(Some(&file_config), 1280).unwrap();
         assert_eq!(resolved.mtu, 1280);
     }
 
@@ -2106,7 +475,7 @@ mod tests {
             ..Default::default()
         };
 
-        let result = load_bootstrap_masks(Some(&file_config));
+        let result = cli::mask::load_bootstrap_masks(Some(&file_config));
         assert!(result.is_ok());
         assert!(result.unwrap().is_empty());
 
@@ -2140,7 +509,7 @@ mod tests {
             ..Default::default()
         };
 
-        let result = load_bootstrap_masks(Some(&file_config));
+        let result = cli::mask::load_bootstrap_masks(Some(&file_config));
         assert!(result.is_ok());
         assert!(result.unwrap().is_empty());
 
@@ -2211,7 +580,7 @@ mod tests {
             ..Default::default()
         };
 
-        let result = load_bootstrap_masks(Some(&file_config));
+        let result = cli::mask::load_bootstrap_masks(Some(&file_config));
         assert!(result.is_ok());
         let masks = result.unwrap();
         assert_eq!(masks.len(), 1);
@@ -2312,7 +681,7 @@ mod tests {
             ..Default::default()
         };
 
-        let result = load_bootstrap_masks(Some(&file_config));
+        let result = cli::mask::load_bootstrap_masks(Some(&file_config));
         assert!(result.is_ok());
         let masks = result.unwrap();
         assert_eq!(masks.len(), 2);

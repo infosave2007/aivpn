@@ -87,6 +87,11 @@ struct HelperResponse: Codable {
 
 var managedPID: pid_t = 0
 var isConnected = false
+// Set by the child-reap handler when the MANAGED client exits: the handler
+// clears managedPID immediately (so a recycled pid can never be signalled or
+// reported), and this flag preserves the one-shot "Process exited" + last
+// error line report that getStatus owes the GUI's next status poll.
+var clientExited = false
 var childReapSources: [pid_t: DispatchSourceProcess] = [:]
 
 // Serial queue that serialises all connection state mutations (managedPID,
@@ -108,20 +113,46 @@ func shellEscape(_ str: String) -> String {
     return "'" + str.replacingOccurrences(of: "'", with: "'\"'\"'") + "'"
 }
 
+// MARK: - Mask Id Validation
+
+/// True for a well-formed mask id: lowercase alphanumerics + underscore,
+/// bounded length. Matches every id the server catalog can emit (presets,
+/// generated "gen_…" masks, recorded masks) without pinning a preset list.
+func isAcceptableMaskId(_ id: String) -> Bool {
+    return id.range(of: #"^[a-z0-9_]{1,64}$"#, options: .regularExpression) != nil
+}
+
 // MARK: - Process Management
 
 /// Kill any existing aivpn-client process
 func killExistingClient() {
+    // Deliberate stop/restart: any pending exit notice is obsolete.
+    clientExited = false
     if managedPID > 0 {
-        if kill(managedPID, 0) == 0 {
-            log("Stopping aivpn-client (PID: \(managedPID))")
-            kill(managedPID, SIGTERM)
+        let pid = managedPID
+        // Exited but not yet reaped? The reap source targets this same serial
+        // queue and cannot run while we're on it, so reap directly. kill(pid, 0)
+        // keeps returning 0 for a zombie — the old poll loop always burned its
+        // full 1s here and finished with a pointless SIGKILL.
+        if waitpid(pid, nil, WNOHANG) == pid {
+            log("Reaped already-exited aivpn-client (PID: \(pid))")
+        } else if kill(pid, 0) == 0, pidIsAivpnClient(pid) {
+            // Identity-gate before signalling: managedPID could be stale after a
+            // missed reap, and a root helper must never SIGTERM a recycled pid
+            // that now belongs to an unrelated process.
+            log("Stopping aivpn-client (PID: \(pid))")
+            kill(pid, SIGTERM)
+            var gone = false
             for _ in 0..<10 {
                 usleep(100_000)
-                if kill(managedPID, 0) != 0 { break }
+                // Our own child: reap the zombie. Adopted (non-child) pid:
+                // waitpid never matches, but kill(pid, 0) fails once it dies.
+                if waitpid(pid, nil, WNOHANG) == pid { gone = true; break }
+                if kill(pid, 0) != 0 { gone = true; break }
             }
-            if kill(managedPID, 0) == 0 {
-                kill(managedPID, SIGKILL)
+            if !gone {
+                kill(pid, SIGKILL)
+                _ = waitpid(pid, nil, WNOHANG)
             }
         }
         managedPID = 0
@@ -351,13 +382,15 @@ func startClient(key: String, fullTunnel: Bool, binaryPath: String?, mtlsCertPat
         args.append("--exclude-routes")
         args.append(tokens.joined(separator: ","))
     }
-    // Shared allow-list for both --preferred-mask and --polymorphic-base — the
-    // latter is a per-session variant of one of the same base presets.
-    let allowedMasks = ["webrtc_zoom_v3", "quic_https_v2",
-                        "webrtc_yandex_telemost_v1", "webrtc_vk_teams_v1",
-                        "webrtc_sberjazz_v1"]
+    // Shared validation for both --preferred-mask and --polymorphic-base.
+    // Mask ids come from the server-pushed catalog — including auto-generated
+    // masks and user-recorded ones — so a fixed preset allow-list rejected
+    // valid ids and hard-failed the whole connect. posix_spawn passes argv
+    // directly (no shell), so a conservative character/length pattern is the
+    // right gate: it excludes anything malformed while accepting every
+    // catalog-shaped id.
     if let polyBase = polymorphicBase, !polyBase.isEmpty, polyBase != "auto" {
-        guard allowedMasks.contains(polyBase) else {
+        guard isAcceptableMaskId(polyBase) else {
             log("ERROR: invalid polymorphicBase '\(polyBase)' — rejected")
             return HelperResponse(status: "error", message: "Invalid polymorphic mask base")
         }
@@ -365,7 +398,7 @@ func startClient(key: String, fullTunnel: Bool, binaryPath: String?, mtlsCertPat
         args.append("--polymorphic-base")
         args.append(polyBase)
     } else if let mask = preferredMask, !mask.isEmpty, mask != "auto" {
-        guard allowedMasks.contains(mask) else {
+        guard isAcceptableMaskId(mask) else {
             log("ERROR: invalid preferredMask '\(mask)' — rejected")
             return HelperResponse(status: "error", message: "Invalid mask profile name")
         }
@@ -455,14 +488,30 @@ func startClient(key: String, fullTunnel: Bool, binaryPath: String?, mtlsCertPat
     var envp: [UnsafeMutablePointer<CChar>?] = []
     
     // Copy current environment, stripping variables we set explicitly below.
-    let reservedEnvKeys = ["RUST_LOG", "AIVPN_CONNECTION_KEY", "AIVPN_BOOTSTRAP_TELEGRAM_TOKEN"]
+    let reservedEnvKeys = ["RUST_LOG", "AIVPN_CONNECTION_KEY", "AIVPN_BOOTSTRAP_TELEGRAM_TOKEN",
+                           "HOME"]
     let currentEnv = ProcessInfo.processInfo.environment
     for (envKey, value) in currentEnv where !reservedEnvKeys.contains(envKey) {
         envp.append(strdup("\(envKey)=\(value)"))
     }
 
+    // Pin HOME to a fixed root-owned directory. The client derives its device
+    // identity (device.key) from a path under $HOME — but this daemon's own
+    // HOME is unset (launchd) or whatever the installer session had (the
+    // postinstall nohup fallback), so the identity silently changed between
+    // launch paths and the server saw a "second device" and dropped the peer.
+    let stateHome = "/Library/Application Support/AIVPN"
+    if !FileManager.default.fileExists(atPath: stateHome) {
+        try? FileManager.default.createDirectory(
+            atPath: stateHome,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700]
+        )
+    }
+
     // Force RUST_LOG=info — prevents leaked debug/trace output to the log file
     envp.append(strdup("RUST_LOG=info"))
+    envp.append(strdup("HOME=\(stateHome)"))
     // Secrets via env, not argv (see comment at the args declaration above).
     envp.append(strdup("AIVPN_CONNECTION_KEY=\(key)"))
     if let telegramToken = telegramTokenEnv {
@@ -517,9 +566,36 @@ func startClient(key: String, fullTunnel: Bool, binaryPath: String?, mtlsCertPat
         waitpid(pid, nil, WNOHANG)
         childSource.cancel()
         childReapSources.removeValue(forKey: pid)
+        // Forget the dead client immediately. Leaving managedPID set meant
+        // getStatus kept "verifying" a pid that the kernel could recycle, and a
+        // later disconnect would SIGTERM/SIGKILL an innocent process as root.
+        // clientExited preserves the one-shot "Process exited" report for the
+        // GUI's next status poll (see getStatus).
+        if pid == managedPID {
+            managedPID = 0
+            isConnected = false
+            clientExited = true
+            try? FileManager.default.removeItem(atPath: PID_PATH)
+        }
     }
     childSource.resume()
     childReapSources[pid] = childSource
+
+    // A client that exits INSTANTLY (bad key, spawn into a broken env, …) can
+    // be dead before the process source above was registered — a process source
+    // does not fire for an already-exited pid, so the zombie would never be
+    // reaped and status would say "Connecting..." forever. One synchronous
+    // WNOHANG check closes the gap; the event handler cannot have run yet
+    // (it targets this same serial queue), so reaping here is race-free.
+    if waitpid(pid, nil, WNOHANG) == pid {
+        childSource.cancel()
+        childReapSources.removeValue(forKey: pid)
+        managedPID = 0
+        isConnected = false
+        clientExited = true
+        try? FileManager.default.removeItem(atPath: PID_PATH)
+        log("aivpn-client (PID: \(pid)) exited immediately after spawn")
+    }
 
     return HelperResponse(status: "ok", message: "Client started", pid: Int(pid))
 }
@@ -550,14 +626,47 @@ func runClientCommand(args: [String], binaryPath: String?) -> HelperResponse {
     task.standardOutput = outputPipe
     task.standardError = outputPipe
 
+    // Drain the pipe CONCURRENTLY with the child's execution. Reading only
+    // after waitUntilExit deadlocks once the child writes more than the pipe
+    // buffer (~64KB): the child blocks on write, we block on wait — and this
+    // runs on the helper's single serial queue, wedging the daemon forever.
+    var outputData = Data()
+    let drainDone = DispatchSemaphore(value: 0)
+    let readHandle = outputPipe.fileHandleForReading
+    DispatchQueue.global(qos: .utility).async {
+        outputData = readHandle.readDataToEndOfFile()
+        drainDone.signal()
+    }
+
     do {
         try task.run()
-        task.waitUntilExit()
     } catch {
+        // Unblock the drain: with no child holding the write end, EOF only
+        // arrives after we close our own copy.
+        outputPipe.fileHandleForWriting.closeFile()
+        _ = drainDone.wait(timeout: .now() + 1)
         return HelperResponse(status: "error", message: "Failed to run client command: \(error.localizedDescription)")
     }
 
-    let outputData = outputPipe.fileHandleForReading.readDataToEndOfFile()
+    // Bounded wait: record subcommands are a local control-socket round-trip
+    // and complete in well under a second. If the child hangs, kill it rather
+    // than blocking the helper's serial queue indefinitely.
+    let deadline = Date().addingTimeInterval(10)
+    while task.isRunning && Date() < deadline {
+        usleep(100_000)
+    }
+    if task.isRunning {
+        log("WARNING: client command timed out — terminating")
+        task.terminate()
+        usleep(500_000)
+        if task.isRunning {
+            kill(task.processIdentifier, SIGKILL)
+        }
+    }
+    task.waitUntilExit()
+    // After exit every write end is closed, so the drain finishes promptly;
+    // the timeout is a belt-and-braces bound, not an expected path.
+    _ = drainDone.wait(timeout: .now() + 2)
     let output = String(data: outputData, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
 
     if task.terminationStatus == 0 {
@@ -576,19 +685,92 @@ func stopClient() -> HelperResponse {
                           message: wasConnected ? "Disconnected" : "No active connection")
 }
 
+/// True while the client's data-plane evidence is FRESH: the traffic.stats
+/// file carries a session `since:` epoch (the pre-session zero-writes in the
+/// client's reconnect loop deliberately omit it) and was rewritten recently —
+/// the client's stats task rewrites it once per second while a session is up.
+/// Stale/absent evidence means the client is between sessions (in-process
+/// reconnect loop), even though historic log lines still say "Connected".
+func connectionEvidenceFresh(maxAgeSeconds: TimeInterval = 10) -> Bool {
+    let statsPath = "/var/run/aivpn/traffic.stats"
+    guard let attrs = try? FileManager.default.attributesOfItem(atPath: statsPath),
+          let mtime = attrs[.modificationDate] as? Date,
+          Date().timeIntervalSince(mtime) <= maxAgeSeconds else { return false }
+    guard let stats = try? String(contentsOfFile: statsPath, encoding: .utf8),
+          stats.contains("since:") else { return false }
+    return true
+}
+
+/// G-A4: scans `logContent` (most recent line first) for the client's
+/// machine-readable `"AIVPN-STATUS rejected <token>"` stdout line — printed
+/// exactly once, right before the client exits, by the `HandshakeReject`
+/// arm in crates/aivpn-client/src/client.rs (`handshake_reject_token()`
+/// there defines the token set: one_time_used/expired/disabled/
+/// unspecified). Returns the raw token (never the surrounding line) so the
+/// GUI (VPNManager.pollStatus) can localize it without depending on the
+/// client's English log wording — mirrors how the Linux/Windows GUIs parse
+/// the same line straight off the child process's stdout; this daemon
+/// instead redirects that stdout into `LOG_PATH` (see `startClient`), so
+/// `getStatus()` has to recover the line from the log file instead.
+func rejectToken(in logContent: String) -> String? {
+    let prefix = "AIVPN-STATUS rejected "
+    for line in logContent.components(separatedBy: "\n").reversed() {
+        let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.hasPrefix(prefix) {
+            let token = String(trimmed.dropFirst(prefix.count))
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            return token.isEmpty ? "unspecified" : token
+        }
+    }
+    return nil
+}
+
+/// Decides Connected/not from the MOST RECENT transition line in the log.
+/// A `contains` over the whole log latched Connected forever once any historic
+/// line matched — even while the client was midway through its in-process
+/// reconnect loop ("Client run failed … Reconnecting in …").
+func lastLogTransitionIsConnected(_ logContent: String) -> Bool {
+    let connectedMarkers = ["Connected to server", "PFS ratchet complete",
+                            "forward secrecy established"]
+    let disconnectedMarkers = ["Reconnecting in", "Client run failed",
+                               "Failed to create client", "Shutdown requested"]
+    for line in logContent.components(separatedBy: "\n").reversed() {
+        if connectedMarkers.contains(where: { line.contains($0) }) { return true }
+        if disconnectedMarkers.contains(where: { line.contains($0) }) { return false }
+    }
+    return false
+}
+
 /// Get current connection status
 func getStatus() -> HelperResponse {
     if managedPID > 0 && kill(managedPID, 0) == 0 {
         if isConnected {
-            return HelperResponse(status: "ok", message: "Connected",
-                                  connected: true, pid: Int(managedPID),
-                                  version: HELPER_VERSION)
+            if connectionEvidenceFresh() {
+                return HelperResponse(status: "ok", message: "Connected",
+                                      connected: true, pid: Int(managedPID),
+                                      version: HELPER_VERSION)
+            }
+            // Data-plane evidence went stale: the client is re-establishing
+            // in-process. Demote instead of reporting a stale Connected, and
+            // fall through to the log-derived state below.
+            isConnected = false
         }
         // Check log for connection status
         if let logContent = try? String(contentsOfFile: LOG_PATH, encoding: .utf8) {
-            if logContent.contains("Connected to server") ||
-               logContent.contains("PFS ratchet complete") ||
-               logContent.contains("forward secrecy established") {
+            // G-A4: an authenticated terminal refusal takes priority over
+            // both the Connected-transition check and the generic
+            // error-line fallback below. The client always exits right
+            // after printing this line (see rejectToken's doc comment), so
+            // by the time this poll runs the process may already be gone —
+            // checking here (while the pid was still recognized alive a few
+            // lines up) catches it the SAME poll cycle instead of racing the
+            // "process exited" branch further down for one extra 2s tick.
+            if let token = rejectToken(in: logContent) {
+                return HelperResponse(status: "ok", message: "AIVPN-STATUS rejected \(token)",
+                                      connected: false, pid: Int(managedPID),
+                                      version: HELPER_VERSION)
+            }
+            if lastLogTransitionIsConnected(logContent), connectionEvidenceFresh() {
                 isConnected = true
                 return HelperResponse(status: "ok", message: "Connected",
                                       connected: true, pid: Int(managedPID),
@@ -628,23 +810,36 @@ func getStatus() -> HelperResponse {
                               version: HELPER_VERSION)
     }
 
-    // Process not running
-    if managedPID > 0 {
+    // Process not running. clientExited covers the (normal) case where the
+    // child-reap handler already cleared managedPID: the one-shot
+    // "Process exited" + last-error report below is what lets the GUI turn
+    // "Connecting…" into a visible failure.
+    if managedPID > 0 || clientExited {
         managedPID = 0
         isConnected = false
+        clientExited = false
         try? FileManager.default.removeItem(atPath: PID_PATH)
 
         var errorMsg = "Process exited"
         if let logContent = try? String(contentsOfFile: LOG_PATH, encoding: .utf8) {
-            let lines = logContent.components(separatedBy: "\n").filter { !$0.isEmpty }
-            if let last = lines.last {
-                let cleanLast = last.replacingOccurrences(
-                    of: "\u{001b}\\[[0-9;]*m", with: "", options: .regularExpression
-                )
-                // Level-token match only — a plain substring "error" would
-                // misreport ordinary INFO lines (URLs, counters) as failures.
-                if isErrorLogLine(cleanLast) {
-                    errorMsg = String(cleanLast.prefix(200))
+            // G-A4: same priority as the still-alive branch above — this is
+            // the path that normally wins the race (the client's own
+            // `terminal_rejected` break in main.rs exits the process right
+            // after printing the line, so by the next poll it's usually
+            // already reaped here rather than caught above).
+            if let token = rejectToken(in: logContent) {
+                errorMsg = "AIVPN-STATUS rejected \(token)"
+            } else {
+                let lines = logContent.components(separatedBy: "\n").filter { !$0.isEmpty }
+                if let last = lines.last {
+                    let cleanLast = last.replacingOccurrences(
+                        of: "\u{001b}\\[[0-9;]*m", with: "", options: .regularExpression
+                    )
+                    // Level-token match only — a plain substring "error" would
+                    // misreport ordinary INFO lines (URLs, counters) as failures.
+                    if isErrorLogLine(cleanLast) {
+                        errorMsg = String(cleanLast.prefix(200))
+                    }
                 }
             }
         }
@@ -721,7 +916,11 @@ func getTrafficStats() -> HelperResponse {
         }
     }
     
-    // Fallback: parse last 100 lines of log
+    // Fallback: parse last 100 lines of log. APPROXIMATE by construction —
+    // the same historical "Sent N"/"received N" lines are re-summed on every
+    // poll, so totals can double-count and jump around. Only used when the
+    // stats file is missing entirely (very old client); the fresh stats file
+    // above is always preferred.
     guard let logContent = try? String(contentsOfFile: LOG_PATH, encoding: .utf8) else {
         return HelperResponse(status: "ok", message: "sent:0,received:0")
     }
@@ -762,12 +961,51 @@ func getTrafficStats() -> HelperResponse {
     return HelperResponse(status: "ok", message: "sent:\(totalSent),received:\(totalReceived)\(readQualityScore())")
 }
 
+/// Reads a small status file with symlink hardening: opens with O_NOFOLLOW
+/// (refuses to follow a symlink at the final path component) and O_CLOEXEC,
+/// verifies the opened fd is a plain regular file via fstat (rejects FIFOs/
+/// devices/sockets too), and caps the read at maxBytes. Needed specifically
+/// for RECORDING_STATUS_FALLBACK_PATH, which lives directly under the
+/// world-writable /tmp: without this, a local console-user attacker could
+/// pre-create that path as a symlink to any root-readable file (e.g.
+/// another user's SSH key) and have this root helper read it back and echo
+/// it over the IPC socket via a hand-crafted record_info request. Also used
+/// for the root-owned primary path for defense-in-depth/consistency, even
+/// though /var/run/aivpn is not attacker-writable.
+func readRegularFileNoFollow(_ path: String, maxBytes: Int = 65536) -> Data? {
+    let fd = open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
+    guard fd >= 0 else { return nil }
+    defer { close(fd) }
+
+    var st = stat()
+    // st.st_mode is mode_t; wrap the S_IFMT/S_IFREG macros in mode_t(...) so
+    // this compiles regardless of which integer type the Clang importer
+    // picked for them (both are small enough to convert losslessly either way).
+    guard fstat(fd, &st) == 0, (st.st_mode & mode_t(S_IFMT)) == mode_t(S_IFREG) else {
+        log("WARNING: refusing to read \(path) — not a regular file (symlink or other special file)")
+        return nil
+    }
+    guard st.st_size >= 0 && st.st_size <= Int64(maxBytes) else {
+        log("WARNING: refusing to read \(path) — size \(st.st_size) exceeds \(maxBytes)-byte cap")
+        return nil
+    }
+
+    let toRead = Int(st.st_size)
+    guard toRead > 0 else { return Data() }
+    var buf = [UInt8](repeating: 0, count: toRead)
+    let n = buf.withUnsafeMutableBytes { bytes -> Int in
+        read(fd, bytes.baseAddress, toRead)
+    }
+    guard n > 0 else { return nil }
+    return Data(buf[0..<n])
+}
+
 func getRecordingInfo() -> HelperResponse {
-    if let data = try? Data(contentsOf: URL(fileURLWithPath: RECORDING_STATUS_PATH)),
+    if let data = readRegularFileNoFollow(RECORDING_STATUS_PATH),
        let json = String(data: data, encoding: .utf8) {
         return HelperResponse(status: "ok", message: json)
     }
-    if let data = try? Data(contentsOf: URL(fileURLWithPath: RECORDING_STATUS_FALLBACK_PATH)),
+    if let data = readRegularFileNoFollow(RECORDING_STATUS_FALLBACK_PATH),
        let json = String(data: data, encoding: .utf8) {
         return HelperResponse(status: "ok", message: json)
     }
@@ -877,22 +1115,82 @@ let AIVPN_SOL_LOCAL: Int32 = 0          // SOL_LOCAL
 let AIVPN_LOCAL_PEERTOKEN: Int32 = 0x006 // LOCAL_PEERTOKEN — "retrieve peer audit token"
 
 // SECURITY(TODO): set to the REAL Apple Developer Team ID that signs
-// AIVPN.app before any production distribution. The Team ID is not
-// discoverable from this repository (the app is signed outside the repo).
-// While this is EMPTY the code-signature gate is SKIPPED — with a loud log
-// line — so unsigned/ad-hoc development builds keep working and only the
-// euid gate applies. Shipping with it empty leaves H1 (any console-user
-// process can drive the root helper) unmitigated.
+// AIVPN.app before any production distribution, once that identity is known
+// (it is not discoverable from this repository — the app is signed outside
+// the repo). Setting it here is the recommended path for Developer-ID/App
+// Store distribution: it pins peers to a specific, operator-chosen identity
+// independent of whatever key happened to sign the running helper binary.
 let REQUIRED_PEER_TEAM_ID = ""
 let REQUIRED_PEER_BUNDLE_ID = "com.aivpn.client" // CFBundleIdentifier of AIVPN.app
 
+/// Reads the Team Identifier from the CURRENTLY RUNNING helper binary's own
+/// code signature (SecCodeCopySelf → SecCodeCopyStaticCode →
+/// SecCodeCopySigningInformation, keyed on kSecCodeInfoTeamIdentifier — API
+/// shapes verified against apple-oss-distributions/Security SecCode.h).
+/// Used only as the fallback peer-pinning identity when
+/// REQUIRED_PEER_TEAM_ID above is left unconfigured: it lets the helper
+/// self-configure to "peer must be signed by whoever signed me" instead of
+/// requiring a hardcoded constant. Returns nil (and logs why) if the helper
+/// itself is unsigned/ad-hoc-signed (e.g. `codesign --sign -`, which is what
+/// build.sh currently produces) or on any Security API failure — callers
+/// must treat nil as "no identity available", not as "skip the check".
+func selfTeamIdentifier() -> String? {
+    var selfCode: SecCode?
+    guard SecCodeCopySelf(SecCSFlags(), &selfCode) == errSecSuccess, let code = selfCode else {
+        log("WARNING: SecCodeCopySelf failed — cannot determine helper's own Team ID")
+        return nil
+    }
+    var staticCode: SecStaticCode?
+    guard SecCodeCopyStaticCode(code, SecCSFlags(), &staticCode) == errSecSuccess,
+          let sCode = staticCode else {
+        log("WARNING: SecCodeCopyStaticCode failed — cannot determine helper's own Team ID")
+        return nil
+    }
+    var info: CFDictionary?
+    // kSecCSSigningInformation is declared as a bare (untyped) enum constant
+    // in SecCode.h, not pre-typed as SecCSFlags — go through
+    // SecCSFlags.RawValue(...) rather than assuming its imported Swift type
+    // matches SecCSFlags.RawValue (UInt32) exactly.
+    guard SecCodeCopySigningInformation(sCode, SecCSFlags(rawValue: SecCSFlags.RawValue(kSecCSSigningInformation)),
+                                        &info) == errSecSuccess,
+          let dict = info as? [String: Any] else {
+        log("WARNING: SecCodeCopySigningInformation failed — cannot determine helper's own Team ID")
+        return nil
+    }
+    guard let teamID = dict[kSecCodeInfoTeamIdentifier as String] as? String, !teamID.isEmpty else {
+        log("WARNING: running helper binary has no Team ID in its own code signature (unsigned or ad-hoc signed) — cannot self-pin peer identity")
+        return nil
+    }
+    return teamID
+}
+
+/// The Team ID actually enforced against socket peers: the operator-set
+/// REQUIRED_PEER_TEAM_ID if non-empty, else the helper's own signing Team ID
+/// (resolved once, at first use). nil means NO identity is available, in
+/// which case peerCodeSignatureIsValid fails closed — this constant is never
+/// allowed to silently disable the check the way the old empty-string
+/// short-circuit did.
+let EFFECTIVE_PEER_TEAM_ID: String? = {
+    if !REQUIRED_PEER_TEAM_ID.isEmpty {
+        return REQUIRED_PEER_TEAM_ID
+    }
+    if let own = selfTeamIdentifier() {
+        log("Peer code-signature check: REQUIRED_PEER_TEAM_ID not set — pinning peers to the helper's own Team ID (\(own)).")
+        return own
+    }
+    log("WARNING: peer code-signature check has NO Team ID to enforce (REQUIRED_PEER_TEAM_ID unset and the helper binary itself is unsigned/ad-hoc). Failing CLOSED: every peer connection will be rejected until the helper is signed with a real Developer ID (or REQUIRED_PEER_TEAM_ID is set).")
+    return nil
+}()
+
 /// Verifies the socket peer's code signature against a requirement pinning
-/// the AIVPN.app bundle id + Team ID. Fails closed on every error path
-/// (except the explicitly-unconfigured Team ID case documented above).
+/// the AIVPN.app bundle id + Team ID. Fails closed on every error path,
+/// INCLUDING when no Team ID is configured/available at all (see
+/// EFFECTIVE_PEER_TEAM_ID) — an unconfigured Team ID no longer disables this
+/// check, it makes it reject everyone.
 func peerCodeSignatureIsValid(_ fd: Int32) -> Bool {
-    guard !REQUIRED_PEER_TEAM_ID.isEmpty else {
-        log("WARNING: REQUIRED_PEER_TEAM_ID is not set — peer code-signature check SKIPPED (euid gate only). Set the real Team ID before production use.")
-        return true
+    guard let requiredTeamID = EFFECTIVE_PEER_TEAM_ID else {
+        log("WARNING: rejecting connection — no Team ID configured to verify the peer against (fail closed).")
+        return false
     }
 
     var token = audit_token_t()
@@ -920,7 +1218,7 @@ func peerCodeSignatureIsValid(_ fd: Int32) -> Bool {
         "(certificate leaf[field.1.2.840.113635.100.6.1.9] /* App Store */ or " +
         "certificate 1[field.1.2.840.113635.100.6.2.6] /* Developer ID CA */ and " +
         "certificate leaf[field.1.2.840.113635.100.6.1.13] /* Developer ID leaf */ and " +
-        "certificate leaf[subject.OU] = \"\(REQUIRED_PEER_TEAM_ID)\")"
+        "certificate leaf[subject.OU] = \"\(requiredTeamID)\")"
     var requirement: SecRequirement?
     guard SecRequirementCreateWithString(requirementText as CFString, SecCSFlags(),
                                          &requirement) == errSecSuccess,
@@ -1035,8 +1333,13 @@ func handleConnection(_ clientFD: Int32) {
         response = getStatus()
 
     case "ping":
+        // pid is included whenever a managed client process exists (even if
+        // not connected yet) so the GUI can decide whether status polling is
+        // worthwhile — an idle helper (no pid) needs no 2s poll loop.
+        let clientAlive = managedPID > 0 && kill(managedPID, 0) == 0
         response = HelperResponse(status: "ok", message: "pong",
-                                  connected: isConnected && managedPID > 0 && kill(managedPID, 0) == 0,
+                                  connected: isConnected && clientAlive,
+                                  pid: clientAlive ? Int(managedPID) : nil,
                                   version: HELPER_VERSION)
 
     case "log":
@@ -1059,6 +1362,14 @@ func handleConnection(_ clientFD: Int32) {
 
     case "record_stop":
         response = runClientCommand(args: ["record", "stop"], binaryPath: request.binaryPath)
+
+    case "record_status":
+        // Asks the running client daemon to refresh recording.status. Must be
+        // executed BY this root helper: the record CLI authenticates against a
+        // per-uid admin token/socket (/tmp/aivpn-<uid>), and the full-tunnel
+        // client runs as uid 0 — a console-user invocation targets
+        // /tmp/aivpn-501 where no daemon listens and is always rejected.
+        response = runClientCommand(args: ["record", "status"], binaryPath: request.binaryPath)
 
     case "record_info":
         response = getRecordingInfo()

@@ -6,9 +6,10 @@
   interface FieldDef {
     key: string;
     label: string;
-    type: 'text' | 'number' | 'checkbox';
+    type: 'text' | 'number' | 'checkbox' | 'select';
     hint: string;
     placeholder?: string;
+    options?: { value: string; label: string }[];
   }
 
   const FIELDS: FieldDef[] = [
@@ -21,9 +22,28 @@
     { key: 'idle_timeout_secs', label: 'Idle Timeout (s)', type: 'number', hint: 'Disconnect idle sessions after N seconds. 0 = disabled.' },
     { key: 'tun_mtu', label: 'TUN MTU', type: 'number', hint: 'TUN interface MTU. Default 1420. Reduce if downstream links fragment packets.' },
     { key: 'allow_peer_routing', label: 'Allow Peer Routing', type: 'checkbox', hint: 'Route traffic between VPN peers (site-to-site mesh). Disable to isolate peers.' },
+    { key: 'downlink_shaping', label: 'Downlink Shaping', type: 'select', hint: 'Balance level for downlink traffic-shape padding. Off = no shaping, Light = reduced overhead, Full = maximum shaping (default). Older servers store this as a bool (true=full/false=off) — it is normalized to a level here and sent back as a level.', options: [
+      { value: 'off', label: 'Off' },
+      { value: 'light', label: 'Light' },
+      { value: 'full', label: 'Full (default)' },
+    ] },
   ];
 
-  const ADVANCED_KEYS = ['network_config', 'site_to_site', 'mtls', 'dns'];
+  // Complex sub-objects editable as raw JSON. bootstrap_publish is a valid
+  // server key (management_api.rs CONFIG_KNOWN_KEYS) with no dedicated form
+  // section — without it here it was impossible to edit AND (before the
+  // merge-based apply below) got silently destroyed on every Apply. Same
+  // reasoning applies to neural_enabled/neural/feedback/polymorphic — valid
+  // keys with no form control, previously rejected by the advanced-JSON
+  // whitelist. downlink_shaping now has its own dedicated select field above
+  // (FIELDS) and is deliberately NOT listed here: buildConfig() applies the
+  // FIELDS merge first and the advanced-JSON merge last, so if the same key
+  // were in both, a stale cached value in the advanced JSON textarea would
+  // silently clobber a change made through the dedicated select on Apply.
+  const ADVANCED_KEYS = [
+    'network_config', 'site_to_site', 'mtls', 'dns', 'bootstrap_publish',
+    'neural_enabled', 'neural', 'feedback', 'polymorphic',
+  ];
 
   // Simple field values
   let fv = $state<Record<string, string | number | boolean>>({});
@@ -31,9 +51,11 @@
   // Pool section
   let poolEnabled = $state(false);
   let poolPeers = $state('');
+  let poolNodeId = $state('');
   let poolSyncKey = $state('');
   let showSyncKey = $state(false); // sync_key is a shared secret — masked by default
   let poolExitNode = $state('');
+  let poolExitNodeEnabled = $state(false);
 
   // Bootstrap mask files
   let bootstrapMasks = $state('');
@@ -42,6 +64,12 @@
   let advancedJson = $state('{}');
   let advancedError = $state('');
   let showAdvanced = $state(false);
+  // Advanced keys that were actually present when the textarea was seeded.
+  // Only these may be DELETED by an Apply: the textarea is seeded once (see
+  // `initialized`), so a key added server-side afterwards (CLI, installer)
+  // was never in it — its absence is not an operator removal and must not
+  // wipe the key.
+  let advancedSeededKeys = $state<string[]>([]);
 
   // UI
   let toast = $state('');
@@ -58,63 +86,106 @@
       for (const f of FIELDS) {
         if (cfg[f.key] !== undefined) fv[f.key] = cfg[f.key] as string | number | boolean;
       }
-      const pool = cfg['pool'] as { peers?: string[]; sync_key?: string; exit_node?: string } | undefined;
+      // downlink_shaping predates the level enum: a server that hasn't been
+      // upgraded yet still returns a bool (true=full/false=off) here. Fold it
+      // into the level string so the select above always has a level value,
+      // and so the next Apply sends the level form back (forward migration).
+      // If the field is absent entirely, leave fv unset — buildConfig() then
+      // omits it from the PUT, and the server's own default (Full) applies.
+      if (typeof fv['downlink_shaping'] === 'boolean') {
+        fv['downlink_shaping'] = fv['downlink_shaping'] ? 'full' : 'off';
+      }
+      const pool = cfg['pool'] as {
+        peers?: string[]; sync_key?: string; exit_node?: string;
+        node_id?: string; exit_node_enabled?: boolean;
+      } | undefined;
       if (pool) {
         poolEnabled = true;
         poolPeers = (pool.peers ?? []).join('\n');
+        poolNodeId = pool.node_id ?? '';
         poolSyncKey = pool.sync_key ?? '';
         poolExitNode = pool.exit_node ?? '';
+        poolExitNodeEnabled = pool.exit_node_enabled ?? false;
       }
       const bm = cfg['bootstrap_mask_files'];
       if (Array.isArray(bm)) bootstrapMasks = bm.join('\n');
       const adv: Record<string, unknown> = {};
       for (const k of ADVANCED_KEYS) if (cfg[k] !== undefined) adv[k] = cfg[k];
-      if (Object.keys(adv).length > 0) advancedJson = JSON.stringify(adv, null, 2);
+      advancedSeededKeys = Object.keys(adv);
+      if (advancedSeededKeys.length > 0) advancedJson = JSON.stringify(adv, null, 2);
     }
   });
 
-  function buildConfig(): Record<string, unknown> {
-    const out: Record<string, unknown> = {};
+  /**
+   * Build the config to PUT by merging the form over `base` — the config the
+   * server currently has. PUT /api/v1/config REPLACES the whole file, so any
+   * key the form does not manage (or a key added server-side after this UI
+   * shipped) must round-trip verbatim; the old whitelist-rebuild silently
+   * destroyed such keys (that was the bootstrap_publish wipe) on every Apply.
+   */
+  function buildConfig(base: Record<string, unknown>): Record<string, unknown> {
+    const out: Record<string, unknown> = { ...base };
     for (const f of FIELDS) {
       const v = fv[f.key];
       if (v !== undefined && v !== '') out[f.key] = v;
+      else delete out[f.key];
     }
     if (poolEnabled) {
       const peers = poolPeers.split('\n').map(s => s.trim()).filter(Boolean);
-      const pool: Record<string, unknown> = { peers };
+      // Merge over the fetched base pool object (not a wholesale replace) so
+      // any pool field this form doesn't manage — e.g. the deprecated
+      // sync_port, or a key added server-side after this UI shipped — still
+      // round-trips instead of being silently deleted on every Apply (the
+      // same class of bug as the bootstrap_publish wipe).
+      const basePool = (base['pool'] as Record<string, unknown> | undefined) ?? {};
+      const pool: Record<string, unknown> = { ...basePool, peers };
+      if (poolNodeId.trim()) pool['node_id'] = poolNodeId.trim();
+      else delete pool['node_id'];
       if (poolSyncKey.trim()) pool['sync_key'] = poolSyncKey.trim();
+      else delete pool['sync_key'];
       if (poolExitNode.trim()) pool['exit_node'] = poolExitNode.trim();
+      else delete pool['exit_node'];
+      pool['exit_node_enabled'] = poolExitNodeEnabled;
       out['pool'] = pool;
+    } else {
+      delete out['pool'];
     }
     const masks = bootstrapMasks.split('\n').map(s => s.trim()).filter(Boolean);
     if (masks.length) out['bootstrap_mask_files'] = masks;
-    if (advancedJson.trim() !== '{}') {
-      try {
-        const adv = JSON.parse(advancedJson) as Record<string, unknown>;
-        // Only whitelisted sub-objects may come from the advanced editor —
-        // a stray "listen_addr" pasted in here must not silently override
-        // the corresponding form field above.
-        const unknown = Object.keys(adv).filter((k) => !ADVANCED_KEYS.includes(k));
-        if (unknown.length > 0) {
-          advancedError = `Unsupported key(s) in advanced JSON: ${unknown.join(', ')}. Allowed: ${ADVANCED_KEYS.join(', ')}. Use the form fields above for everything else.`;
-          throw advancedError;
-        }
-        for (const k of ADVANCED_KEYS) {
-          if (adv[k] !== undefined) out[k] = adv[k];
-        }
-        advancedError = '';
-      } catch (e: unknown) {
-        if (typeof e !== 'string') {
-          advancedError = e instanceof Error ? e.message : 'Invalid JSON';
-        }
-        throw advancedError;
+    else delete out['bootstrap_mask_files'];
+    try {
+      const adv = JSON.parse(advancedJson) as Record<string, unknown>;
+      // Only whitelisted sub-objects may come from the advanced editor —
+      // a stray "listen_addr" pasted in here must not silently override
+      // the corresponding form field above.
+      const unknown = Object.keys(adv).filter((k) => !ADVANCED_KEYS.includes(k));
+      if (unknown.length > 0) {
+        advancedError = `Unsupported key(s) in advanced JSON: ${unknown.join(', ')}. Allowed: ${ADVANCED_KEYS.join(', ')}. Use the form fields above for everything else.`;
+        throw new Error(advancedError);
       }
+      for (const k of ADVANCED_KEYS) {
+        if (adv[k] !== undefined) out[k] = adv[k];
+        // A key missing from the textarea is only a deletion when it was
+        // there to begin with. Deleting unconditionally wiped keys that
+        // appeared server-side while this page was open (the textarea is
+        // seeded once) — reported as a successful Apply.
+        else if (advancedSeededKeys.includes(k)) delete out[k];
+      }
+      advancedError = '';
+    } catch (e: unknown) {
+      if (!advancedError) {
+        advancedError = e instanceof Error ? e.message : 'Invalid JSON';
+      }
+      // Always an Error object — onError reads .message (a thrown string has none).
+      throw e instanceof Error ? e : new Error(advancedError);
     }
     return out;
   }
 
   const updateMut = createMutation({
-    mutationFn: () => configApi.update(buildConfig()),
+    // Re-fetch the CURRENT server config right before applying, so unknown
+    // keys are merged from fresh state (not a possibly-stale cached query).
+    mutationFn: async () => configApi.update(buildConfig(await configApi.get())),
     onSuccess: () => showToast('Configuration saved'),
     onError: (e: Error) => showToast(e.message, true),
   });
@@ -163,6 +234,14 @@
     <div class="flex justify-center py-12">
       <div class="w-8 h-8 border-2 border-indigo-500 border-t-transparent rounded-full animate-spin"></div>
     </div>
+  {:else if $query.error}
+    <!-- Surface access/load errors instead of rendering an empty form a
+         viewer could "Apply" (wiping the config they cannot even read). -->
+    <div class="p-4 bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-800 rounded-xl text-sm text-amber-800 dark:text-amber-300">
+      {($query.error as Error).message.includes('403') || ($query.error as Error).message.toLowerCase().includes('forbidden')
+        ? 'Your role does not have access to the server config (admin only).'
+        : ($query.error as Error).message}
+    </div>
   {:else}
 
   <!-- Simple fields -->
@@ -191,10 +270,26 @@
               class="rounded text-indigo-600 focus:ring-indigo-500" />
             <span class="text-sm text-gray-600 dark:text-gray-400">{fv[f.key] ? 'Enabled' : 'Disabled'}</span>
           </label>
+        {:else if f.type === 'select'}
+          <select id={f.key}
+            value={(fv[f.key] as string) ?? 'full'}
+            onchange={(e) => { fv[f.key] = (e.target as HTMLSelectElement).value; }}
+            class="w-44 px-3 py-1.5 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-white text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500">
+            {#each f.options ?? [] as opt (opt.value)}
+              <option value={opt.value}>{opt.label}</option>
+            {/each}
+          </select>
         {:else if f.type === 'number'}
           <input id={f.key} type="number"
             value={fv[f.key] as number ?? ''}
-            oninput={(e) => { fv[f.key] = Number((e.target as HTMLInputElement).value); }}
+            oninput={(e) => {
+              // An empty field must OMIT the key (buildConfig deletes it),
+              // not store Number('') === 0 — clearing TUN MTU to restore the
+              // default used to write `tun_mtu: 0` and break the data path.
+              const raw = (e.target as HTMLInputElement).value;
+              if (raw === '') delete fv[f.key];
+              else fv[f.key] = Number(raw);
+            }}
             class="w-36 px-3 py-1.5 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-white text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500" />
         {:else}
           <input id={f.key} type="text"
@@ -240,6 +335,19 @@
         </div>
         <div>
           <div class="flex items-center gap-1.5 mb-1">
+            <label class="text-xs font-medium text-gray-600 dark:text-gray-400" for="pool-node-id">Node ID</label>
+            <div class="relative" data-tip>
+              <button type="button" onclick={() => tip('pool-node-id')} class="text-gray-400 hover:text-indigo-500"><Info size={12} /></button>
+              {#if openTip === 'pool-node-id'}
+                <div class="absolute left-0 top-5 z-20 w-64 bg-gray-900 text-white text-xs rounded-lg px-3 py-2 shadow-xl">This node's own identifier as the OTHER nodes reference it in their peers lists (recommended: this node's public host:vpn_port). Required — pool sync is disabled while this is empty.</div>
+              {/if}
+            </div>
+          </div>
+          <input id="pool-node-id" type="text" bind:value={poolNodeId} placeholder="node1.example.com:443"
+            class="w-full px-3 py-1.5 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-white text-sm font-mono focus:outline-none focus:ring-2 focus:ring-indigo-500" />
+        </div>
+        <div>
+          <div class="flex items-center gap-1.5 mb-1">
             <label class="text-xs font-medium text-gray-600 dark:text-gray-400" for="pool-sync-key">Sync Key (base64)</label>
             <div class="relative" data-tip>
               <button type="button" onclick={() => tip('pool-sync-key')} class="text-gray-400 hover:text-indigo-500"><Info size={12} /></button>
@@ -273,6 +381,16 @@
           <input id="pool-exit-node" type="text" bind:value={poolExitNode} placeholder="exit.example.com:443"
             class="w-full px-3 py-1.5 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-white text-sm font-mono focus:outline-none focus:ring-2 focus:ring-indigo-500" />
         </div>
+        <div class="flex items-center gap-2">
+          <input type="checkbox" id="pool-exit-node-enabled" bind:checked={poolExitNodeEnabled} class="rounded text-indigo-600" />
+          <label class="text-xs font-medium text-gray-600 dark:text-gray-400 flex-1 cursor-pointer" for="pool-exit-node-enabled">This node acts as the exit point</label>
+          <div class="relative" data-tip>
+            <button type="button" onclick={() => tip('pool-exit-node-enabled')} class="text-gray-400 hover:text-indigo-500"><Info size={12} /></button>
+            {#if openTip === 'pool-exit-node-enabled'}
+              <div class="absolute right-0 top-5 z-20 w-64 bg-gray-900 text-white text-xs rounded-lg px-3 py-2 shadow-xl">Guards multi-hop routing. When off (default), incoming ChainForward relay requests from other nodes are rejected, preventing this node from being used as an open relay.</div>
+            {/if}
+          </div>
+        </div>
       </div>
     {/if}
   </div>
@@ -297,7 +415,7 @@
   <div class="bg-white dark:bg-gray-800 rounded-xl border border-gray-200 dark:border-gray-700 overflow-hidden">
     <button type="button" onclick={() => { showAdvanced = !showAdvanced; }}
       class="w-full flex items-center justify-between px-4 py-3 text-sm font-medium text-gray-600 dark:text-gray-400 hover:bg-gray-50 dark:hover:bg-gray-700/50 transition-colors">
-      <span>Advanced — raw JSON (<code class="font-mono text-xs">network_config</code>, <code class="font-mono text-xs">dns</code>, <code class="font-mono text-xs">site_to_site</code>, <code class="font-mono text-xs">mtls</code>)</span>
+      <span>Advanced — raw JSON (<code class="font-mono text-xs">network_config</code>, <code class="font-mono text-xs">dns</code>, <code class="font-mono text-xs">site_to_site</code>, <code class="font-mono text-xs">mtls</code>, <code class="font-mono text-xs">bootstrap_publish</code>, <code class="font-mono text-xs">neural_enabled</code>, <code class="font-mono text-xs">neural</code>, <code class="font-mono text-xs">feedback</code>, <code class="font-mono text-xs">polymorphic</code>)</span>
       <span>{showAdvanced ? '▲' : '▼'}</span>
     </button>
     {#if showAdvanced}

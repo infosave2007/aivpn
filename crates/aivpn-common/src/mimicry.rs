@@ -187,13 +187,13 @@ impl MimicryEngine {
         // We only take the embedded path when the header is long enough to hold
         // the tag AND the tag slot does not overlap the embedded ephemeral key;
         // a malformed mask falls back to the byte-identical legacy layout.
-        let embed_tag_offset = match self.mask.embedded_tag_offset() {
-            Some(off)
-                if off + TAG_SIZE <= mdh.len() && !self.mask.tag_overlaps_eph_pub(TAG_SIZE) =>
-            {
-                Some(off)
-            }
-            Some(off) => {
+        // Embedded-vs-legacy decision goes through the shared MaskProfile method
+        // so the server decoder computes the identical ciphertext offset (see
+        // `MaskProfile::uses_embedded_layout`).
+        let embed_tag_offset = if self.mask.uses_embedded_layout(mdh.len()) {
+            self.mask.embedded_tag_offset()
+        } else {
+            if let Some(off) = self.mask.embedded_tag_offset() {
                 debug!(
                     "mask {} has malformed tag_offset {} (header len {}, eph_pub {}..{}); \
                      falling back to legacy tag-prefix layout",
@@ -203,9 +203,8 @@ impl MimicryEngine {
                     self.mask.eph_pub_offset,
                     self.mask.eph_pub_offset as usize + self.mask.eph_pub_length as usize,
                 );
-                None
             }
-            None => None,
+            None
         };
         // Legacy layout carries an extra TAG_SIZE prefix; the embedded layout does not.
         let tag_prefix_len = if embed_tag_offset.is_some() {
@@ -218,6 +217,29 @@ impl MimicryEngine {
         let base_overhead = tag_prefix_len + mdh.len() + 2 + plaintext.len() + POLY1305_TAG_SIZE;
         let requested_pad_len = self.calc_padding(base_overhead, target_size);
         let packet_budget = SAFE_OUTER_PACKET_BUDGET.min(MAX_PACKET_SIZE);
+
+        let proto = MimicProtocol::for_spoof(self.mask.spoof_protocol);
+        // The constructed (QUIC) layout hard-codes the resonance tag at DCID
+        // offset 6 (`quic_initial::QUIC_TAG_OFFSET`) — and so does the
+        // server's `parse_quic_initial`, while its tag LOOKUP honours the
+        // mask's own `tag_offset`. Deciding on `spoof_protocol` alone let an
+        // operator QUIC mask with `tag_offset != 6` shape the handshake by one
+        // layout and the data by another — a silent break. Only masks that
+        // explicitly declare the DCID tag offset take the constructed path;
+        // anything else falls back to the embedded/legacy `[mdh][ciphertext]`
+        // layout, which both wire ends derive from the SAME MaskProfile
+        // methods (`uses_embedded_layout` / `effective_tag_prefix_len`).
+        let constructed_ok = proto.is_constructed()
+            && self.mask.embedded_tag_offset() == Some(crate::quic_initial::QUIC_TAG_OFFSET);
+        if proto.is_constructed() && !constructed_ok {
+            debug!(
+                "mask {} is QUIC-constructed but declares tag_offset {:?} (!= {}) — \
+                 falling back to the embedded/legacy layout",
+                self.mask.mask_id,
+                self.mask.embedded_tag_offset(),
+                crate::quic_initial::QUIC_TAG_OFFSET,
+            );
+        }
 
         // Budget correction for *constructed* (QUIC) masks. A QUIC DATA packet
         // (`eph_pub` is None → the `proto.emit()` path below is taken) is NOT
@@ -233,8 +255,7 @@ impl MimicryEngine {
         // 1200-byte QUIC floor) is `quic_overhead + ciphertext_len`, where
         // `ciphertext_len = 2 + plaintext.len() + pad_len + POLY1305_TAG_SIZE`;
         // solving `<= packet_budget` for `pad_len` gives this reserved overhead.
-        let emits_quic = eph_pub.is_none()
-            && MimicProtocol::for_spoof(self.mask.spoof_protocol).is_constructed();
+        let emits_quic = eph_pub.is_none() && constructed_ok;
         let budget_overhead = if emits_quic {
             crate::quic_initial::quic_initial_overhead() + 2 + plaintext.len() + POLY1305_TAG_SIZE
         } else {
@@ -274,8 +295,7 @@ impl MimicryEngine {
         // to establish the session, so it keeps the standard layout. The flow
         // still classifies as QUIC because steady-state data packets are valid
         // RFC 9001 Initials (nDPI's `may_be_initial_pkt` runs per packet).
-        let proto = MimicProtocol::for_spoof(self.mask.spoof_protocol);
-        if eph_pub.is_none() {
+        if eph_pub.is_none() && constructed_ok {
             if let Some(datagram) = proto.emit(&tag, &ciphertext) {
                 return Ok(datagram);
             }
@@ -363,6 +383,14 @@ impl MimicryEncryptor {
     /// the counter never reuses a (key, nonce) pair.
     pub fn update_keys(&mut self, keys: SessionKeys) {
         self.keys = keys;
+    }
+
+    /// Clone of the session keys currently in use. The mobile rekey-resend
+    /// path snapshots these before its one-packet old-key override so the
+    /// restore always returns to the LIVE keys — old while the rekey commit
+    /// is still unconfirmed (staged TX switch), new after the promote.
+    pub fn current_keys(&self) -> SessionKeys {
+        self.keys.clone()
     }
 
     pub fn set_fec_group(&mut self, group_size: u8) {
@@ -610,6 +638,52 @@ mod tests {
             decode_packet_with_layout(&pkt, &keys, &mut win, layout.payload_offset, tag_offset)
                 .unwrap();
         assert_eq!(decoded.payload, b"quic-inner");
+    }
+
+    #[test]
+    fn quic_mask_with_non_dcid_tag_offset_falls_back_to_legacy_layout() {
+        use crate::client_wire::{decode_packet_with_mdh_len, RecvWindow};
+        use crate::crypto::{
+            compute_time_window, current_timestamp_ms, generate_resonance_tag, DEFAULT_WINDOW_MS,
+        };
+        use crate::mask::preset_masks::quic_https_v2;
+        use crate::protocol::InnerType;
+
+        // Operator QUIC mask declaring a tag_offset other than the DCID offset
+        // (6): the constructed emit() path hard-codes the tag into the DCID and
+        // the server's `parse_quic_initial` reads it there too, so taking the
+        // constructed path here would make handshake and data disagree. The
+        // engine must instead fall back to the `[mdh][ciphertext]` layout
+        // (legacy tag prefix, since offset 10 does not fit the 14-byte MDH),
+        // which the server's tag-offset scan (always includes 0) still finds.
+        let mut mask = quic_https_v2();
+        mask.tag_offset = 10;
+        let mdh_len = mask.header_spec.as_ref().unwrap().min_length();
+        assert_eq!(mdh_len, 14);
+
+        let mut engine = MimicryEngine::new(mask);
+        let keys = SessionKeys {
+            session_key: [1u8; 32],
+            session_key_s2c: [1u8; 32],
+            tag_secret: [2u8; 32],
+            prng_seed: [0u8; 32],
+        };
+        let mut counter = 0u64;
+        let inner = build_inner_packet(InnerType::Data, 0, b"quic-fallback");
+        let pkt = engine
+            .build_packet(&inner, &keys, &mut counter, None)
+            .unwrap();
+
+        // NOT a constructed Initial: the datagram does not parse as one, and
+        // the tag rides as the legacy prefix at offset 0.
+        assert!(crate::quic_initial::parse_quic_initial(&pkt).is_none());
+        let tw = compute_time_window(current_timestamp_ms(), DEFAULT_WINDOW_MS);
+        let expected = generate_resonance_tag(&keys.tag_secret, 0, tw);
+        assert_eq!(&pkt[0..TAG_SIZE], &expected);
+
+        let mut win = RecvWindow::new();
+        let decoded = decode_packet_with_mdh_len(&pkt, &keys, &mut win, mdh_len).unwrap();
+        assert_eq!(decoded.payload, b"quic-fallback");
     }
 
     #[test]

@@ -41,18 +41,88 @@ portable-atomic = "1"
 # Async (optional — needed for upload_pipeline)
 tokio = { workspace = true, optional = true }
 
+# Object-safe async traits (optional — only pulled in by the `transport`
+# feature, i.e. by the client-side datagram transport abstraction).
+async-trait = { workspace = true, optional = true }
+
+# Logging (optional — only pulled in by the shared mobile tunnel core, which
+# was hoisted from the mobile FFI crates where `log` is the established
+# facade; the rest of aivpn-common uses `tracing`).
+log = { version = "0.4", optional = true }
+
 # Concurrency — optional, only pulled in by the inline ML-DPI gate (dpi-gate).
 dashmap = { workspace = true, optional = true }
+
+# QR-code rendering (optional — only pulled in by the `qr` feature). Local
+# rendering of `aivpn://...` connection keys, shared by all client
+# implementations (desktop + mobile FFI). `qrcode`'s own `image` integration
+# is used to avoid hand-rolled pixel-buffer code; both crates pin
+# `image = "0.25"` with default features disabled so Cargo unifies to a
+# single image build with only the `png` codec compiled in (kept light on
+# purpose — this crate compiles into mobile targets).
+qrcode = { version = "0.14", default-features = false, features = ["image"], optional = true }
+image = { version = "0.25", default-features = false, features = ["png"], optional = true }
+anyhow = { version = "1", optional = true }
+
+# Pure-Rust SSH client for the in-app server installer (optional — only
+# pulled in by the `ssh-install` feature). Hoisted here (from aivpn-client)
+# so the mobile FFI cores (aivpn-android-core / aivpn-ios-core), which
+# depend only on aivpn-common, can also drive the installer. MUST NOT bloat
+# the default aivpn-common build or any dependent that doesn't opt in.
+# Ring avoids aws-lc-sys's NASM-only Windows cross-build path. RSA support is
+# intentionally disabled because the transitive `rsa` crate has an unpatched
+# network-observable timing side channel (RUSTSEC-2023-0071); password,
+# Ed25519, and ECDSA authentication remain available.
+russh = { version = "0.62", default-features = false, features = ["flate2", "ring"], optional = true }
+russh-sftp = { version = "2.3", optional = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+[dev-dependencies]
+# `test-util` is not part of the workspace `tokio` "full" feature set — needed
+# by mgmt.rs tests that pause/advance virtual time to deterministically
+# exercise `MgmtClient::mgmt_call`'s timeout without a real 10s sleep
+# (mirrors aivpn-client's dev-dependency of the same shape).
+tokio = { workspace = true, features = ["test-util"] }
+
 [features]
 default = []
-client-upload = ["tokio"]
+# Datagram-transport abstraction (`trait DatagramTransport` + `UdpTransport`).
+# Everything above "send/receive one datagram" — crypto, resonance tags, MDH,
+# masks — is transport-agnostic and lives above this seam. Today the only
+# implementation is `UdpTransport`, a thin wrapper over the connected
+# `tokio::net::UdpSocket` the clients already used.
+transport = ["tokio", "dep:async-trait"]
+# Descriptor-driven extra settings sections for the desktop GUIs. Off by
+# default; the public GUI holds no descriptor and renders nothing extra.
+ui-ext = ["transport"]
+client-upload = ["tokio", "transport"]
+# Shared mobile VPN tunnel core (state/encryptor/io) hoisted from
+# aivpn-ios-core / aivpn-android-core. Unix-only in practice (libc, eventfd /
+# pipe stop signal); only the mobile FFI crates enable it.
+mobile-tunnel = ["client-upload", "dep:log"]
 # Inline ML-DPI "reads-as-tunnel" GBDT gate (R2 Phase D). Pure: dashmap + std,
 # no async. Shared by the server (`neural` feature) and the client self-gate.
 dpi-gate = ["dep:dashmap"]
 # Client-side inline self-detection gate: the `ClientSelfGate` outbound inspector
 # wired into `run_upload_loop`. Needs the pipeline + tokio (control-plane types).
 client-dpi-gate = ["dpi-gate", "client-upload"]
+# Local QR-code PNG rendering for `aivpn://...` connection keys (P2.R), shared
+# by every client implementation (desktop + mobile FFI).
+qr = ["dep:qrcode", "dep:image", "dep:anyhow"]
+# Wave C2b — pure-Rust SSH client + embedded installer bundle for the in-app
+# server installer (connect via password/private key, TOFU host-key verify,
+# sftp upload, streamed remote exec, high-level run_install orchestration).
+# OFF by default: pulls in `russh`/`russh-sftp`, which must NOT bloat the
+# default aivpn-common build or the mobile FFI cores (aivpn-android-core /
+# aivpn-ios-core), neither of which enables this feature.
+ssh-install = ["dep:russh", "dep:russh-sftp", "tokio"]
+
+# The descriptor contract test needs the module it tests. Without
+# `required-features` a plain `cargo test --workspace` — which does not enable
+# `ui-ext`, since no dependent asks for it — would try to compile this target
+# against an absent module and fail.
+[[test]]
+name = "ui_ext_descriptor"
+required-features = ["ui-ext"]

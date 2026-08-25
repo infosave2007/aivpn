@@ -1,13 +1,14 @@
 module("luci.controller.aivpn", package.seeall)
 
 function index()
-    if not nixio.fs.access("/etc/config/aivpn") then return end
-
     local page = entry({"admin", "services", "aivpn"}, firstchild(), "AIVPN", 60)
     page.dependent = false
 
+    -- Client-side JS view (htdocs/luci-static/resources/view/aivpn/status.js);
+    -- there is no server-side Lua template, so this must be view(), not
+    -- template().
     entry({"admin", "services", "aivpn", "status"},
-          template("aivpn/status"), "Status", 10).leaf = true
+          view("aivpn/status"), "Status", 10).leaf = true
 
     entry({"admin", "services", "aivpn", "config"},
           cbi("aivpn"), "Configuration", 20).leaf = true

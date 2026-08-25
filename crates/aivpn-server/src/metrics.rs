@@ -708,8 +708,8 @@ impl MetricsCollector {
             let mut p50_ms = 0.0f64;
             let mut p95_ms = 0.0f64;
             for bucket in hist.get_bucket() {
-                let cumulative = bucket.get_cumulative_count();
-                let upper_ms = bucket.get_upper_bound() * 1000.0;
+                let cumulative = bucket.cumulative_count();
+                let upper_ms = bucket.upper_bound() * 1000.0;
                 if p50_ms == 0.0 && cumulative >= p50_target {
                     p50_ms = upper_ms;
                 }

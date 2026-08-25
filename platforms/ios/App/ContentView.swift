@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 import NetworkExtension
 
 // MARK: - Helpers
@@ -31,6 +32,8 @@ private struct KeyRowView: View {
     let onDelete: () -> Void
     let onAddNew: () -> Void
 
+    @EnvironmentObject private var loc: LocalizationManager
+
     var body: some View {
         HStack(spacing: 12) {
             Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
@@ -55,10 +58,10 @@ private struct KeyRowView: View {
                     .font(.caption)
             }
             Menu {
-                Button { onAddNew() } label: { Label("Add Key", systemImage: "plus.circle") }
+                Button { onAddNew() } label: { Label(loc.t("add_key"), systemImage: "plus.circle") }
                 Divider()
-                Button { onEdit() } label: { Label("Edit", systemImage: "pencil") }
-                Button(role: .destructive) { onDelete() } label: { Label("Delete", systemImage: "trash") }
+                Button { onEdit() } label: { Label(loc.t("menu_edit"), systemImage: "pencil") }
+                Button(role: .destructive) { onDelete() } label: { Label(loc.t("menu_delete"), systemImage: "trash") }
             } label: {
                 Image(systemName: "ellipsis.circle")
                     .foregroundColor(.secondary)
@@ -68,9 +71,9 @@ private struct KeyRowView: View {
         .contentShape(Rectangle())
         .onTapGesture { onSelect() }
         .contextMenu {
-            Button { onAddNew() } label: { Label("Add Key", systemImage: "plus.circle") }
-            Button { onEdit() } label: { Label("Edit", systemImage: "pencil") }
-            Button(role: .destructive) { onDelete() } label: { Label("Delete", systemImage: "trash") }
+            Button { onAddNew() } label: { Label(loc.t("add_key"), systemImage: "plus.circle") }
+            Button { onEdit() } label: { Label(loc.t("menu_edit"), systemImage: "pencil") }
+            Button(role: .destructive) { onDelete() } label: { Label(loc.t("menu_delete"), systemImage: "trash") }
         }
     }
 }
@@ -315,6 +318,13 @@ struct ContentView: View {
     @State private var showDeleteConfirm: Bool = false
     @State private var showSplitTunnel: Bool = false
     @State private var showBootstrapDiscovery: Bool = false
+    @State private var showAdmin: Bool = false
+    // C3-iOS: SSH server-install wizard. Entry point is intentionally NOT
+    // gated on vpn.isConnected/AdminApi.role() — installing a brand-new
+    // first server is the base case, and there is nothing to be "admin of"
+    // yet at that point (see the "Advanced" DisclosureGroup in keysCard,
+    // where the ungated button lives). See InstallServerView.swift.
+    @State private var showInstallWizard: Bool = false
 
     var body: some View {
         NavigationStack {
@@ -368,6 +378,24 @@ struct ContentView: View {
                         Image(systemName: "network")
                     }
                 }
+                // In-app admin (P3.2, widened G-A1): Viewer (1) and Admin
+                // (2) roles both reach the admin screen — User (0) never
+                // sees the button at all. Viewer gets read-only access
+                // (AdminView/AdminClientDetailView hide every mutating
+                // control behind `canMutate`); Admin is unchanged.
+                // `vpn.adminRole` is polled from the TUNNEL EXTENSION
+                // process via get_traffic (the app process's own
+                // aivpn_get_role() global never sees the session — see
+                // AdminApi.swift's header) and is @Published, so this
+                // toolbar re-evaluates the moment the post-handshake
+                // Capabilities role lands, with no extra polling here.
+                if vpn.isConnected && vpn.adminRole >= 1 {
+                    ToolbarItem(placement: .navigationBarTrailing) {
+                        Button { showAdmin = true } label: {
+                            Image(systemName: "person.badge.key.fill")
+                        }
+                    }
+                }
             }
             .toolbarBackground(Color(.secondarySystemBackground), for: .navigationBar)
             .toolbarBackground(.visible, for: .navigationBar)
@@ -382,7 +410,17 @@ struct ContentView: View {
                     }
                     guard vpn.addKey(name: name, keyValue: val, mtlsCert: cert,
                                      serverSigningKey: signingKey) else {
-                        return loc.t("duplicate_key")
+                        // KeychainStorage.addKey returns nil for TWO distinct
+                        // reasons (ConnectionKey.swift): an exact duplicate
+                        // keyValue, or a REFUSED Keychain write (e.g.
+                        // errSecInteractionNotAllowed because the phone locked
+                        // itself mid-flow). Reporting the latter as "duplicate"
+                        // sends the user hunting for a problem with the key.
+                        let norm = val.trimmingCharacters(in: .whitespacesAndNewlines)
+                            .replacingOccurrences(of: "aivpn://", with: "")
+                        return vpn.keys.contains(where: { $0.keyValue == norm })
+                            ? loc.t("duplicate_key")
+                            : loc.t("key_save_failed")
                     }
                     showAddKey = false
                     return nil
@@ -425,6 +463,15 @@ struct ContentView: View {
         }
         .sheet(isPresented: $showBootstrapDiscovery) {
             BootstrapDiscoveryView()
+                .environmentObject(vpn)
+                .environmentObject(loc)
+        }
+        .sheet(isPresented: $showAdmin) {
+            AdminView()
+                .environmentObject(loc)
+        }
+        .sheet(isPresented: $showInstallWizard) {
+            InstallServerView()
                 .environmentObject(vpn)
                 .environmentObject(loc)
         }
@@ -495,7 +542,15 @@ struct ContentView: View {
                     .controlSize(.small)
 
                     Button {
-                        if let url = URL(string: "prefs:root=VPN") { openURL(url) }
+                        // `prefs:root=VPN` is a PRIVATE URL scheme: modern iOS
+                        // does not honor it from third-party apps (and shipping
+                        // it is an App Store rejection trigger), so the button
+                        // did nothing — openURL has no completion handler, so
+                        // the failure was silent, exactly when the user had
+                        // just denied the VPN permission. `openSettingsURLString`
+                        // is the public API and lands on this app's own
+                        // Settings page, where the VPN prompt can be retried.
+                        if let url = URL(string: UIApplication.openSettingsURLString) { openURL(url) }
                     } label: {
                         Label(loc.t("open_settings"), systemImage: "gear")
                             .font(.caption)
@@ -619,6 +674,27 @@ struct ContentView: View {
                         .foregroundColor(.secondary)
                     Button(loc.t("bootstrap_open_discovery")) {
                         showBootstrapDiscovery = true
+                    }
+                    .buttonStyle(.bordered)
+
+                    Divider()
+
+                    // C3-iOS / G2: setting up a brand-new server from
+                    // scratch is the base case — no existing connection or
+                    // admin role to gate on. Deliberately NOT wrapped in
+                    // the `vpn.isConnected && AdminApi.role() == 2` check
+                    // used for the client-management (showAdmin) entry
+                    // point above; that gate stays as-is because managing
+                    // an EXISTING server's clients does require being an
+                    // authenticated admin of it, but installing a fresh
+                    // server over SSH does not.
+                    Text(loc.t("install_wizard_hint"))
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                    Button {
+                        showInstallWizard = true
+                    } label: {
+                        Label(loc.t("install_wizard_title"), systemImage: "server.rack")
                     }
                     .buttonStyle(.bordered)
                 }

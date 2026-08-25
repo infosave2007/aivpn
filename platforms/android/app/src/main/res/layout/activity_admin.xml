@@ -1,0 +1,128 @@
+<?xml version="1.0" encoding="utf-8"?>
+<FrameLayout
+    xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="@color/background">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:orientation="vertical">
+
+        <!-- Compact toolbar: back + title + refresh (same pattern as SplitTunnelActivity /
+             BackgroundHealthActivity) -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="48dp"
+            android:orientation="horizontal"
+            android:gravity="center_vertical"
+            android:paddingHorizontal="8dp">
+
+            <ImageButton
+                android:id="@+id/btnBack"
+                android:layout_width="40dp"
+                android:layout_height="40dp"
+                android:src="@android:drawable/ic_menu_revert"
+                android:background="?attr/selectableItemBackgroundBorderless"
+                android:contentDescription="@string/btn_cancel"
+                android:scaleType="centerInside"
+                app:tint="@color/text_primary" />
+
+            <TextView
+                android:id="@+id/textTitle"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:text="@string/admin_title"
+                android:textSize="18sp"
+                android:textStyle="bold"
+                android:textColor="@color/text_primary"
+                android:paddingStart="4dp" />
+
+            <ImageButton
+                android:id="@+id/btnPool"
+                android:layout_width="40dp"
+                android:layout_height="40dp"
+                android:src="@android:drawable/ic_menu_mapmode"
+                android:background="?attr/selectableItemBackgroundBorderless"
+                android:contentDescription="@string/pool_title"
+                android:scaleType="centerInside"
+                app:tint="@color/text_primary" />
+
+            <ImageButton
+                android:id="@+id/btnAudit"
+                android:layout_width="40dp"
+                android:layout_height="40dp"
+                android:src="@android:drawable/ic_menu_recent_history"
+                android:background="?attr/selectableItemBackgroundBorderless"
+                android:contentDescription="@string/audit_title"
+                android:scaleType="centerInside"
+                app:tint="@color/text_primary" />
+
+            <!-- Admin-only (G-A3): visibility toggled in AdminActivity#onCreate, mirrors fabAdd -->
+            <ImageButton
+                android:id="@+id/btnSettings"
+                android:layout_width="40dp"
+                android:layout_height="40dp"
+                android:src="@android:drawable/ic_menu_manage"
+                android:background="?attr/selectableItemBackgroundBorderless"
+                android:contentDescription="@string/server_settings_title"
+                android:scaleType="centerInside"
+                app:tint="@color/text_primary" />
+
+            <ImageButton
+                android:id="@+id/btnRefresh"
+                android:layout_width="40dp"
+                android:layout_height="40dp"
+                android:src="@android:drawable/ic_popup_sync"
+                android:background="?attr/selectableItemBackgroundBorderless"
+                android:contentDescription="@string/admin_refresh"
+                android:scaleType="centerInside"
+                app:tint="@color/text_primary" />
+        </LinearLayout>
+
+        <TextView
+            android:id="@+id/textNotConnected"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="@string/admin_not_connected"
+            android:textSize="13sp"
+            android:textColor="@color/accent_lemon"
+            android:padding="14dp"
+            android:visibility="gone" />
+
+        <TextView
+            android:id="@+id/textEmpty"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="@string/admin_no_clients"
+            android:textSize="13sp"
+            android:textColor="@color/text_secondary"
+            android:gravity="center"
+            android:padding="32dp"
+            android:visibility="gone" />
+
+        <androidx.recyclerview.widget.RecyclerView
+            android:id="@+id/recyclerClients"
+            android:layout_width="match_parent"
+            android:layout_height="0dp"
+            android:layout_weight="1"
+            android:clipToPadding="false"
+            android:paddingTop="4dp"
+            android:paddingBottom="84dp" />
+    </LinearLayout>
+
+    <com.google.android.material.floatingactionbutton.FloatingActionButton
+        android:id="@+id/fabAdd"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="bottom|end"
+        android:layout_margin="20dp"
+        android:src="@android:drawable/ic_input_add"
+        app:backgroundTint="@color/accent"
+        app:tint="@color/text_primary"
+        android:contentDescription="@string/admin_add_client" />
+
+</FrameLayout>

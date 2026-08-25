@@ -271,6 +271,11 @@
     return `${bytesPerSec.toFixed(0)} B/s`;
   }
 
+  // /api/v1/status has NO connected-clients field — live connection counts
+  // only exist on the SSE `state` event (`clients_connected`), which already
+  // feeds chartData. The "Connected" card reads the latest sample from there.
+  let liveConnected = $derived(chartData.at(-1)?.value ?? null);
+
   let latestBandwidthIn = $derived(bandwidthData.at(-1)?.a ?? 0);
   let latestBandwidthOut = $derived(bandwidthData.at(-1)?.b ?? 0);
   let latestPacketRateIn = $derived(packetRateData.at(-1)?.a ?? 0);
@@ -287,19 +292,19 @@
   <div class="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-4">
     <MetricCard
       title="Uptime"
-      value={$statusQuery.data ? formatUptime($statusQuery.data.uptime_seconds) : '—'}
+      value={$statusQuery.data ? formatUptime($statusQuery.data.uptime_secs) : '—'}
       subtitle={$statusQuery.data?.version ?? ''}
       icon={Server}
     />
     <MetricCard
       title="Total Clients"
-      value={$statusQuery.data?.total_clients ?? '—'}
+      value={$statusQuery.data?.clients_total ?? '—'}
       subtitle="registered"
       icon={Users}
     />
     <MetricCard
       title="Connected"
-      value={$statusQuery.data?.connected_clients ?? '—'}
+      value={liveConnected ?? '—'}
       subtitle="active sessions"
       icon={Activity}
     />

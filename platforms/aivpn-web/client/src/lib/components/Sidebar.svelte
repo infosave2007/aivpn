@@ -5,18 +5,32 @@
   import { auth } from '$lib/api';
   import {
     LayoutDashboard, Users, Settings2, Shield, Archive,
-    ScrollText, Settings, LogOut, Radio
+    ScrollText, Settings, LogOut, Radio, Network
   } from 'lucide-svelte';
 
+  // adminOnly mirrors the server-side viewer allowlist (proxy.ts
+  // VIEWER_ALLOWED): config, backup and the audit log 403 for viewers, so
+  // don't offer them dead links. This is display-only — access is enforced
+  // server-side regardless, and the pages also surface 403s themselves.
+  // /api/v1/pool/* is a plain GET proxied route, allowed for viewers too
+  // (requireReadAccess), so Pool is adminOnly: false like Dashboard/Clients.
   const navItems = [
-    { href: '/dashboard', label: 'Dashboard', icon: LayoutDashboard },
-    { href: '/clients', label: 'Clients', icon: Users },
-    { href: '/config', label: 'Config', icon: Settings2 },
-    { href: '/masks', label: 'Masks', icon: Shield },
-    { href: '/backup', label: 'Backup', icon: Archive },
-    { href: '/logs', label: 'Logs', icon: ScrollText },
-    { href: '/settings', label: 'Settings', icon: Settings },
+    { href: '/dashboard', label: 'Dashboard', icon: LayoutDashboard, adminOnly: false },
+    { href: '/clients', label: 'Clients', icon: Users, adminOnly: false },
+    { href: '/pool', label: 'Pool', icon: Network, adminOnly: false },
+    { href: '/config', label: 'Config', icon: Settings2, adminOnly: true },
+    { href: '/masks', label: 'Masks', icon: Shield, adminOnly: false },
+    { href: '/backup', label: 'Backup', icon: Archive, adminOnly: true },
+    { href: '/logs', label: 'Logs', icon: ScrollText, adminOnly: true },
+    { href: '/settings', label: 'Settings', icon: Settings, adminOnly: false },
   ];
+
+  // Hide admin-only entries only for a CONFIRMED viewer role (the user object
+  // loads async from /web/auth/me — a brief null must not flash-hide links
+  // for admins).
+  const visibleItems = $derived(
+    authStore.user?.role === 'viewer' ? navItems.filter((i) => !i.adminOnly) : navItems,
+  );
 
   async function handleLogout() {
     try {
@@ -38,7 +52,7 @@
   </div>
 
   <nav class="flex-1 px-3 py-4 space-y-1 overflow-y-auto">
-    {#each navItems as item}
+    {#each visibleItems as item}
       {@const active = $page.url.pathname.startsWith(item.href)}
       <a
         href={item.href}

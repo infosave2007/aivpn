@@ -128,6 +128,11 @@ dependencies {
     // EncryptedSharedPreferences for secure key storage
     implementation 'androidx.security:security-crypto:1.1.0-alpha06'
 
+    // JVM unit tests. `org.json` is an Android platform class stubbed out in
+    // unit tests, so the real implementation has to be on the test classpath —
+    // otherwise every parser test fails with "not mocked".
+    testImplementation 'junit:junit:4.13.2'
+    testImplementation 'org.json:json:20240303'
     androidTestImplementation 'androidx.test.ext:junit:1.1.5'
     androidTestImplementation 'androidx.test:runner:1.5.2'
     androidTestImplementation 'androidx.test:rules:1.5.0'

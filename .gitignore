@@ -2,7 +2,11 @@
 target/
 **/target/
 *.rs.bk
-Cargo.lock
+# Cargo.lock is deliberately NOT ignored. This workspace ships binaries, not
+# libraries, and the release images build with `cargo build --locked`, which
+# needs the lock file present in the build context — with it ignored, a clean
+# clone could not build Dockerfile at all ("/Cargo.lock: not found"), and the
+# "reproducible release builds" the Dockerfile claims were never reproducible.
 
 # ── Build output ─────────────────────────────────────────────────────────────
 /releases/
@@ -103,3 +107,22 @@ docs/
 aivpn-android/
 *.jks
 *.keystore
+
+# Kernel-module build output (out-of-tree build leaves these in place)
+platforms/linux-kernel/*.ko
+platforms/linux-kernel/*.mod
+platforms/linux-kernel/*.mod.c
+platforms/linux-kernel/*.o
+platforms/linux-kernel/.*.cmd
+platforms/linux-kernel/src/.*.cmd
+platforms/linux-kernel/Module.symvers
+platforms/linux-kernel/modules.order
+# Stray busybox binary occasionally dropped by stand tooling
+/busybox
+
+# Dependency trees — regenerable, must never be committed
+node_modules/
+# Python virtualenvs used by the research tooling
+vngvenv/
+venv/
+.venv/
