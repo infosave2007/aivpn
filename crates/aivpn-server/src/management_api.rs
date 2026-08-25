@@ -1593,7 +1593,7 @@ pub async fn serve(cfg: ServeConfig) {
     // The staging name carries pid + an in-process sequence number so
     // concurrent serve() calls (e.g. the integration tests, which spawn one
     // API per test in the same process and directory) never share a dir.
-    static STAGING_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    static STAGING_SEQ: portable_atomic::AtomicU64 = portable_atomic::AtomicU64::new(0);
     let staging_dir = std::path::Path::new(&path)
         .parent()
         .unwrap_or_else(|| std::path::Path::new("."))
