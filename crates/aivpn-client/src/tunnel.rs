@@ -366,6 +366,12 @@ impl Tunnel {
             // using the correct "-netmask" syntax.
             config_builder.platform_config(|config| {
                 config.enable_routing(false);
+                // Keep packet-information handling inside `tun`. Its macOS
+                // reader strips the 4-byte AF_INET/AF_INET6 prefix and its
+                // writer adds it back. Adding the prefix again in our write
+                // path makes DeviceWriter inspect the leading zero byte as an
+                // IP header and fail every downlink with "IP version 0".
+                config.packet_information(true);
             });
         }
 
@@ -2225,25 +2231,11 @@ impl Tunnel {
             ))
         })?;
 
-        // macOS utun devices require a 4-byte address-family prefix before every packet
-        // (AF_INET = 2, AF_INET6 = 30, both as big-endian u32). The read path strips this
-        // prefix; we must re-add it symmetrically on the write path.
-        #[cfg(target_os = "macos")]
-        let to_write: std::borrow::Cow<[u8]> = {
-            let af: u32 = if !packet.is_empty() && (packet[0] >> 4) == 6 {
-                30
-            } else {
-                2
-            };
-            let mut framed = Vec::with_capacity(4 + packet.len());
-            framed.extend_from_slice(&af.to_be_bytes());
-            framed.extend_from_slice(packet);
-            std::borrow::Cow::Owned(framed)
-        };
-        #[cfg(not(target_os = "macos"))]
-        let to_write: std::borrow::Cow<[u8]> = std::borrow::Cow::Borrowed(packet);
-
-        writer.write_all(&to_write).await?;
+        // DeviceWriter owns platform packet-information framing. In
+        // particular, macOS `utun` needs a 4-byte address-family prefix and
+        // `tun` adds it because packet_information is enabled above. Always
+        // pass the raw IPv4/IPv6 packet here.
+        writer.write_all(packet).await?;
         writer.flush().await?;
 
         debug!("Wrote {} bytes to TUN", packet.len());
