@@ -106,6 +106,17 @@ pub const REKEY_RETRANSMIT_SECS: u64 = 3;
 /// to cap the per-refresh tag precompute and `tag_map` memory.
 const REKEY_TAG_LOOKAHEAD: u64 = 4096;
 
+/// Minimum lifetime of the old client-to-server keys after an inline rekey.
+///
+/// Mobile and desktop clients deliberately keep transmitting with the old
+/// keys until a packet under the new server-to-client keys proves that the
+/// server committed their response. Their transition window is 20 seconds;
+/// expiring the server's old-key grace after the generic 2-second in-flight
+/// floor can therefore reject the client's next idle keepalive (normally 4–8
+/// seconds later), preventing the very confirmation packet that would finish
+/// the transition. Keep this aligned with the clients' transition grace.
+const INLINE_REKEY_GRACE_MIN: Duration = Duration::from_secs(20);
+
 /// Session state
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionState {
@@ -843,6 +854,13 @@ impl Session {
         }
         let scaled = Duration::from_millis(self.client_srtt_ms as u64 * 4);
         scaled.clamp(FLOOR, CAP)
+    }
+
+    /// Old-key grace for an inline rekey. Unlike the initial ratchet, the
+    /// client intentionally keeps TX on the previous keys until a new-key
+    /// downlink confirms commit, so the grace must cover that protocol window.
+    pub fn inline_rekey_grace(&self) -> Duration {
+        self.rekey_grace().max(INLINE_REKEY_GRACE_MIN)
     }
 
     /// Complete PFS ratchet: switch to ratcheted keys, zeroize old ones
@@ -2323,7 +2341,7 @@ impl SessionManager {
         }
 
         // Preserve old keys for an RTT-scaled grace window (in-flight packets from client).
-        let grace = sess.rekey_grace();
+        let grace = sess.inline_rekey_grace();
         sess.pre_ratchet_tags = std::mem::take(&mut sess.expected_tags);
         sess.pre_ratchet_expire = Some(Instant::now() + grace);
         sess.pre_ratchet_received.clear();
@@ -2427,6 +2445,22 @@ mod tests {
         let mut s = make_session();
         s.observe_client_rtt(20_000); // 4×20s = 80s, capped to 30s
         assert_eq!(s.rekey_grace(), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn inline_rekey_grace_covers_client_commit_transition() {
+        let mut s = Session::new(
+            [0u8; 16],
+            "127.0.0.1:1".parse().unwrap(),
+            make_keys(1),
+            [0u8; 32],
+        );
+        s.client_srtt_ms = 100;
+        assert_eq!(s.rekey_grace(), Duration::from_secs(2));
+        assert_eq!(s.inline_rekey_grace(), Duration::from_secs(20));
+
+        s.client_srtt_ms = 10_000;
+        assert_eq!(s.inline_rekey_grace(), Duration::from_secs(30));
     }
 
     #[test]
