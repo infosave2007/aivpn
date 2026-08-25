@@ -2173,11 +2173,23 @@ mod tests {
         // The tag resolves at the embedded offset, and NOT at offset 0 (which is
         // the real STUN header, not a resonance tag) — no misattribution.
         let tag_at_8 = super::extract_tag_for_layout(&packet, mask.tag_offset).unwrap();
+        let tag_at_0 = super::extract_tag_for_layout(&packet, u16::MAX).unwrap();
+
+        // Session setup and packet construction normally happen in the same
+        // 5-second resonance-tag bucket.  A preempted CI runner can straddle
+        // the bucket boundary, though, in which case production first misses
+        // the fast map, refreshes stale session windows with the legacy-offset
+        // candidate, and then re-probes every layout offset (packet_demux.rs).
+        // Exercise that real fallback instead of making this test depend on
+        // the wall-clock instant at which the runner happened to schedule it.
+        if sm.get_session_by_tag(&tag_at_8).is_none() {
+            let client_ip = "203.0.113.7".parse().unwrap();
+            let _ = sm.refresh_and_find_by_tag(&tag_at_0, &client_ip);
+        }
         assert!(
             sm.get_session_by_tag(&tag_at_8).is_some(),
             "embedded tag@8 must resolve to the session"
         );
-        let tag_at_0 = super::extract_tag_for_layout(&packet, u16::MAX).unwrap();
         assert!(
             sm.get_session_by_tag(&tag_at_0).is_none(),
             "offset-0 bytes are the STUN header, not a tag — must NOT match"
