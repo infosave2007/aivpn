@@ -843,11 +843,9 @@ impl super::App {
     /// G-A1: `can_mutate` (`true` only for a confirmed Admin, `false` for
     /// Viewer) gates every mutating control inside — the add-client form
     /// and each client's Edit/Enable-Disable/Reset-device/Revoke buttons.
-    /// "Key"/"Show QR" stay available to both roles: both are plain GETs
-    /// the server's `authorize()` already permits a Viewer
-    /// (`connection-key` is a curated GET route; QR generation never goes
-    /// through the mgmt API at all — it's the client daemon's own admin
-    /// socket, unrelated to the server-assigned role).
+    /// "Key"/"Show QR" are also Admin-only: the GET response contains a
+    /// live client PSK, so it is credential issuance rather than ordinary
+    /// read-only metadata.
     fn view_admin_section(&self, can_mutate: bool) -> Element<'_, Message> {
         let lang = self.settings.lang.as_str();
         let is_dark = self.settings.dark_mode;

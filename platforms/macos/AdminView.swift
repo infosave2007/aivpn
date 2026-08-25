@@ -972,7 +972,9 @@ struct AdminClientDetailSheet: View {
 
                 Divider()
 
-                connectionKeySection
+                if store.canMutate {
+                    connectionKeySection
+                }
 
                 Divider()
 

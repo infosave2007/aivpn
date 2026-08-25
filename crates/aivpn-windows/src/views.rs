@@ -120,11 +120,8 @@ impl super::AivpnApp {
     /// Viewer and Admin (G-A1); `can_mutate` (`true` only for a confirmed
     /// Admin) gates every mutating control inside — the "+ add" button,
     /// the add/edit forms, and each row's Edit/Reset-device/Revoke
-    /// buttons. "Key / QR" stays available to both: it's a plain GET the
-    /// server's `authorize()` already permits a Viewer (`connection-key`
-    /// is a curated GET route; QR rendering never touches the mgmt API at
-    /// all — it's the client daemon's own admin-socket protocol,
-    /// independent of the server-assigned role).
+    /// buttons. "Key / QR" is also Admin-only: although fetched with GET,
+    /// the response contains a live client credential (the PSK).
     pub(crate) fn draw_admin_clients_section(
         &mut self,
         ui: &mut eframe::egui::Ui,
@@ -230,31 +227,34 @@ impl super::AivpnApp {
                                 );
                             }
                             ui.horizontal(|ui| {
-                                if ui
-                                    .add_enabled(!busy, egui::Button::new(t(lang, "admin_key_qr")))
-                                    .clicked()
-                                {
-                                    self.admin_key_id = Some(c.id.clone());
-                                    self.admin_key_name = c.name.clone();
-                                    self.admin_key_value = None;
-                                    self.admin_key_error = None;
-                                    self.admin_key_saved_msg = None;
-                                    self.admin_key_loading = true;
-                                    self.admin_qr_png = None;
-                                    self.admin_qr_texture = None;
-                                    self.admin_qr_error = None;
-                                    self.admin_qr_saved_msg = None;
-                                    admin::spawn(
-                                        self.vpn.client_binary.clone(),
-                                        AdminRequest::ConnectionKey { id: c.id.clone() },
-                                        self.admin_tx.clone(),
-                                    );
-                                }
                                 // G-A1: Edit/Reset-device/Revoke all mutate
                                 // server state — hidden entirely for a
                                 // Viewer rather than shown-disabled, same
                                 // treatment as the "+ add" button above.
                                 if can_mutate {
+                                    if ui
+                                        .add_enabled(
+                                            !busy,
+                                            egui::Button::new(t(lang, "admin_key_qr")),
+                                        )
+                                        .clicked()
+                                    {
+                                        self.admin_key_id = Some(c.id.clone());
+                                        self.admin_key_name = c.name.clone();
+                                        self.admin_key_value = None;
+                                        self.admin_key_error = None;
+                                        self.admin_key_saved_msg = None;
+                                        self.admin_key_loading = true;
+                                        self.admin_qr_png = None;
+                                        self.admin_qr_texture = None;
+                                        self.admin_qr_error = None;
+                                        self.admin_qr_saved_msg = None;
+                                        admin::spawn(
+                                            self.vpn.client_binary.clone(),
+                                            AdminRequest::ConnectionKey { id: c.id.clone() },
+                                            self.admin_tx.clone(),
+                                        );
+                                    }
                                     if ui
                                         .add_enabled(!busy, egui::Button::new(t(lang, "edit")))
                                         .clicked()

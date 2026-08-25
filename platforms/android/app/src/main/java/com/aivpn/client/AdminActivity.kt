@@ -38,10 +38,9 @@ import org.json.JSONObject
  *
  * Visibility of the entry point in [MainActivity] and the role check here
  * are both driven by [AivpnJni.getRole]: 2=Admin gets full read/write,
- * 1=Viewer gets a read-only list PLUS the non-mutating connection-key/QR
- * view (server-side `authorize()` allows any GET route, including
- * `connection-key`, to Viewer — only the mutating routes add/edit/
- * reset-device/revoke are Admin-only), 0=User never sees this screen at
+ * 1=Viewer gets a read-only list. Connection-key/QR is Admin-only even
+ * though it uses GET because the response contains a live client PSK.
+ * Mutating routes are likewise Admin-only. 0=User never sees this screen at
  * all. Role assignment itself is server-side only and is intentionally not
  * exposed anywhere in this screen.
  */
@@ -54,7 +53,7 @@ class AdminActivity : AppCompatActivity() {
     /** Role == 2 (Admin): full read/write, all mutating actions enabled. */
     private var canMutate = false
 
-    /** Role == 1 (Viewer): read-only — list, connection-key/QR, pool, audit log. */
+    /** Role == 1 (Viewer): read-only — list, pool, and audit log. */
     private var isViewer = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -639,23 +638,20 @@ class AdminActivity : AppCompatActivity() {
             }
             holder.rowActions.visibility = View.VISIBLE
 
-            // "Key" (connection-key/QR) is a GET request — non-mutating —
-            // so it stays available to Viewer, unlike the rest of the row.
-            holder.btnKey.visibility = View.VISIBLE
-            holder.btnKey.setOnClickListener { showKeyDialog(id, name) }
-
-            // Edit/reset-device/revoke are mutating (PATCH/POST/DELETE) and
-            // 403 server-side for Viewer — hide rather than let the user
-            // tap into a guaranteed-failing request.
+            // Connection-key/QR contains a live PSK, so it is credential
+            // issuance and Admin-only despite being transported via GET.
             val mutateVisibility = if (canMutate) View.VISIBLE else View.GONE
+            holder.btnKey.visibility = mutateVisibility
             holder.btnEdit.visibility = mutateVisibility
             holder.btnReset.visibility = mutateVisibility
             holder.btnRevoke.visibility = mutateVisibility
             if (canMutate) {
+                holder.btnKey.setOnClickListener { showKeyDialog(id, name) }
                 holder.btnEdit.setOnClickListener { showEditDialog(c) }
                 holder.btnReset.setOnClickListener { confirmReset(id, name) }
                 holder.btnRevoke.setOnClickListener { confirmRevoke(id, name) }
             } else {
+                holder.btnKey.setOnClickListener(null)
                 holder.btnEdit.setOnClickListener(null)
                 holder.btnReset.setOnClickListener(null)
                 holder.btnRevoke.setOnClickListener(null)

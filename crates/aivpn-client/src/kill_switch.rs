@@ -611,6 +611,7 @@ impl KillSwitch {
         let ks = KillSwitch {
             tun_name: String::new(),
             server_ip: String::new(),
+            mark: None,
             active: true,
         };
         ks.deactivate_impl();

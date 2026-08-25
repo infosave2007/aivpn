@@ -481,7 +481,9 @@ seed_config() {
     local listen_esc
     listen_esc="$(sed_escape_replacement "$LISTEN_ADDR")"
     sed -i "s#\"listen_addr\": *\"[^\"]*\"#\"listen_addr\": \"${listen_esc}\"#" "$CONFIG_PATH"
-    chmod 644 "$CONFIG_PATH"
+    # server.json can contain pool sync keys and publication/webhook tokens.
+    # Keep it private from the first moment it exists.
+    chmod 600 "$CONFIG_PATH"
     emit_marker "seed_config" "ok" "created" "$CONFIG_PATH created from template (listen_addr=${LISTEN_ADDR})"
 }
 

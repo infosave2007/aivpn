@@ -69,7 +69,11 @@ anyhow = { version = "1", optional = true }
 # so the mobile FFI cores (aivpn-android-core / aivpn-ios-core), which
 # depend only on aivpn-common, can also drive the installer. MUST NOT bloat
 # the default aivpn-common build or any dependent that doesn't opt in.
-russh = { version = "0.62", optional = true }
+# Ring avoids aws-lc-sys's NASM-only Windows cross-build path. RSA support is
+# intentionally disabled because the transitive `rsa` crate has an unpatched
+# network-observable timing side channel (RUSTSEC-2023-0071); password,
+# Ed25519, and ECDSA authentication remain available.
+russh = { version = "0.62", default-features = false, features = ["flate2", "ring"], optional = true }
 russh-sftp = { version = "2.3", optional = true }
 
 [target.'cfg(unix)'.dependencies]

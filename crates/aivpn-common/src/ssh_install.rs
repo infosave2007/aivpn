@@ -53,7 +53,9 @@ pub struct SshTarget {
 pub enum SshAuth {
     Password(String),
     PrivateKey {
-        /// PEM-encoded private key (OpenSSH or PKCS#8 format).
+        /// PEM-encoded Ed25519 or ECDSA private key (OpenSSH or PKCS#8
+        /// format). RSA keys are deliberately unsupported until the
+        /// upstream implementation has a constant-time private-key path.
         pem: String,
         passphrase: Option<String>,
     },

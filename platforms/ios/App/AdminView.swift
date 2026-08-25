@@ -16,9 +16,10 @@ import UIKit
 // never sees a control that would just bounce off a 403: the "add client"
 // toolbar button, the swipe-to-revoke action, and the entire edit /
 // reset-device / revoke sections of the detail sheet are hidden, not
-// merely disabled, for Viewer. Read-only surfaces (client list, detail
-// info, connection-key display/QR/share, pool topology, audit log) stay
-// available to both roles.
+// merely disabled, for Viewer. Connection-key display/QR/share is also
+// Admin-only because it exposes a live PSK. Other read-only surfaces
+// (client list, detail info, pool topology, audit log) stay available to
+// both roles.
 
 // MARK: - Small formatting helpers (file-scoped, mirror ContentView.swift's
 // private helpers of the same shape but kept separate since those are
@@ -607,55 +608,57 @@ private struct AdminClientDetailView: View {
                     LabeledContent(loc.t("admin_exit_node"), value: exitNodeDisplayValue)
                 }
 
-                Section(header: Text(loc.t("admin_connection_key"))) {
-                    if let connectionKey {
-                        Text(connectionKey)
-                            .font(.system(size: 11, design: .monospaced))
-                            .textSelection(.enabled)
-                            .lineLimit(4)
-                        if let qrImage {
-                            Image(uiImage: qrImage)
-                                .interpolation(.none)
-                                .resizable()
-                                .aspectRatio(1, contentMode: .fit)
-                                .frame(maxWidth: 220)
+                if canMutate {
+                    Section(header: Text(loc.t("admin_connection_key"))) {
+                        if let connectionKey {
+                            Text(connectionKey)
+                                .font(.system(size: 11, design: .monospaced))
+                                .textSelection(.enabled)
+                                .lineLimit(4)
+                            if let qrImage {
+                                Image(uiImage: qrImage)
+                                    .interpolation(.none)
+                                    .resizable()
+                                    .aspectRatio(1, contentMode: .fit)
+                                    .frame(maxWidth: 220)
+                                    .frame(maxWidth: .infinity)
+                            }
+                            HStack {
+                                Button {
+                                    // A live, redeemable connection key. `.string`
+                                    // would leave it on the general pasteboard
+                                    // indefinitely — readable by every app the user
+                                    // next foregrounds and mirrored to other devices
+                                    // via Universal Clipboard. `.localOnly` keeps it
+                                    // on this device and `.expirationDate` has the
+                                    // system drop it after the paste window.
+                                    UIPasteboard.general.setItems(
+                                        [["public.utf8-plain-text": connectionKey]],
+                                        options: [
+                                            .localOnly: true,
+                                            .expirationDate: Date().addingTimeInterval(120),
+                                        ]
+                                    )
+                                } label: {
+                                    Label(loc.t("admin_copy"), systemImage: "doc.on.doc")
+                                }
+                                Spacer()
+                                ShareLink(item: connectionKey) {
+                                    Label(loc.t("admin_share"), systemImage: "square.and.arrow.up")
+                                }
+                            }
+                            .buttonStyle(.bordered)
+                        } else if isLoadingKey {
+                            ProgressView()
                                 .frame(maxWidth: .infinity)
-                        }
-                        HStack {
-                            Button {
-                                // A live, redeemable connection key. `.string`
-                                // would leave it on the general pasteboard
-                                // indefinitely — readable by every app the user
-                                // next foregrounds and mirrored to other devices
-                                // via Universal Clipboard. `.localOnly` keeps it
-                                // on this device and `.expirationDate` has the
-                                // system drop it after the paste window.
-                                UIPasteboard.general.setItems(
-                                    [["public.utf8-plain-text": connectionKey]],
-                                    options: [
-                                        .localOnly: true,
-                                        .expirationDate: Date().addingTimeInterval(120),
-                                    ]
-                                )
-                            } label: {
-                                Label(loc.t("admin_copy"), systemImage: "doc.on.doc")
-                            }
-                            Spacer()
-                            ShareLink(item: connectionKey) {
-                                Label(loc.t("admin_share"), systemImage: "square.and.arrow.up")
+                        } else {
+                            Button(loc.t("admin_show_connection_key")) {
+                                Task { await loadConnectionKey() }
                             }
                         }
-                        .buttonStyle(.bordered)
-                    } else if isLoadingKey {
-                        ProgressView()
-                            .frame(maxWidth: .infinity)
-                    } else {
-                        Button(loc.t("admin_show_connection_key")) {
-                            Task { await loadConnectionKey() }
+                        if let keyError {
+                            Text(keyError).font(.caption).foregroundColor(.red)
                         }
-                    }
-                    if let keyError {
-                        Text(keyError).font(.caption).foregroundColor(.red)
                     }
                 }
 

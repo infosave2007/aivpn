@@ -26,6 +26,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
+use parking_lot::{Mutex, MutexGuard};
 
 /// Default confirm window: how long an applied heavy change stays
 /// "pending" before an unconfirmed change is auto-rolled-back by the
@@ -119,13 +120,25 @@ impl PendingConfig {
 #[derive(Default)]
 pub struct PendingConfigManager {
     inner: DashMap<String, PendingConfig>,
+    /// Serializes the complete read/write/register transaction for a heavy
+    /// config apply with confirmation and timeout rollback. The map alone
+    /// cannot protect the target file: REST and tunnel requests may mutate
+    /// the same path concurrently, while the cleanup task can restore it.
+    mutation_lock: Mutex<()>,
 }
 
 impl PendingConfigManager {
     pub fn new() -> Self {
         Self {
             inner: DashMap::new(),
+            mutation_lock: Mutex::new(()),
         }
+    }
+
+    /// Acquire the transaction lock used by apply and rollback callers while
+    /// they also touch a target file.
+    pub(crate) fn lock_mutation(&self) -> MutexGuard<'_, ()> {
+        self.mutation_lock.lock()
     }
 
     /// Register a newly-applied heavy change.
@@ -144,7 +157,14 @@ impl PendingConfigManager {
     /// pre-chain original, not an intermediate step) and drops the older
     /// token entirely, so there is only ever one live token — and one
     /// correct rollback value — per `target_path`.
-    pub fn begin(&self, mut pending: PendingConfig) {
+    pub fn begin(&self, pending: PendingConfig) {
+        let guard = self.lock_mutation();
+        self.begin_locked(pending, &guard);
+    }
+
+    /// [`Self::begin`] for callers already holding the mutation lock across
+    /// the target-file read/write transaction.
+    pub(crate) fn begin_locked(&self, mut pending: PendingConfig, _guard: &MutexGuard<'_, ()>) {
         // Deliberately NOT `if let Some(tok) = self.inner.iter().find(...) {
         // self.inner.remove(&tok) }` — under Rust 2021's temporary-lifetime
         // rules, a temporary created in an `if let` scrutinee (here,
@@ -185,6 +205,7 @@ impl PendingConfigManager {
     /// must not take an unrelated, still-pending `server.json` exit-node
     /// change live).
     pub fn confirm_and_take(&self, token: &str) -> Option<PendingConfig> {
+        let _guard = self.lock_mutation();
         self.inner.remove(token).map(|(_, v)| v)
     }
 
@@ -193,6 +214,7 @@ impl PendingConfigManager {
     /// detect "THIS request confirmed a change to that file" as
     /// pending-before ∧ gone-after.
     pub fn has_pending_for_path(&self, path: &Path) -> bool {
+        let _guard = self.lock_mutation();
         self.inner.iter().any(|e| e.value().target_path == path)
     }
 
@@ -202,6 +224,17 @@ impl PendingConfigManager {
     /// already returned by a previous `tick()` call is gone from the map
     /// and so is never returned twice.
     pub fn tick(&self, now: Instant) -> Vec<PendingConfig> {
+        let guard = self.lock_mutation();
+        self.tick_locked(now, &guard)
+    }
+
+    /// [`Self::tick`] for the cleanup task, which keeps the same guard held
+    /// until every returned entry has been restored on disk.
+    pub(crate) fn tick_locked(
+        &self,
+        now: Instant,
+        _guard: &MutexGuard<'_, ()>,
+    ) -> Vec<PendingConfig> {
         let expired_tokens: Vec<String> = self
             .inner
             .iter()
@@ -217,10 +250,12 @@ impl PendingConfigManager {
     /// Number of currently-tracked (unconfirmed, unexpired-as-of-last-tick)
     /// pending changes — test/observability helper.
     pub fn len(&self) -> usize {
+        let _guard = self.lock_mutation();
         self.inner.len()
     }
 
     pub fn is_empty(&self) -> bool {
+        let _guard = self.lock_mutation();
         self.inner.is_empty()
     }
 }
@@ -299,6 +334,38 @@ mod tests {
             "a confirmed token must never be returned by tick(), even long past its deadline"
         );
         assert!(mgr.is_empty());
+    }
+
+    #[test]
+    fn manager_begin_waits_for_an_in_progress_file_transaction() {
+        let start = Instant::now();
+        let mgr = std::sync::Arc::new(PendingConfigManager::new());
+        let transaction = mgr.lock_mutation();
+        let worker_mgr = mgr.clone();
+        let (attempted_tx, attempted_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+
+        let worker = std::thread::spawn(move || {
+            attempted_tx.send(()).unwrap();
+            worker_mgr.begin(pc(start, Duration::from_secs(120)));
+            done_tx.send(()).unwrap();
+        });
+
+        attempted_rx.recv().unwrap();
+        assert!(
+            matches!(
+                done_rx.recv_timeout(Duration::from_millis(50)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ),
+            "begin must not register while another caller is mutating the target file"
+        );
+
+        drop(transaction);
+        done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("begin should complete after the file transaction releases its lock");
+        worker.join().unwrap();
+        assert_eq!(mgr.len(), 1);
     }
 
     #[test]

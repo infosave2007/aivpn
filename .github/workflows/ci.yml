@@ -32,6 +32,17 @@ jobs:
     - name: Build
       run: cargo build --workspace --exclude aivpn-windows --verbose
 
+    - name: Build release server (all production features)
+      run: cargo build --locked --release -p aivpn-server --features "management-api,metrics,neural"
+
+    - name: Upload release server
+      uses: actions/upload-artifact@v4
+      with:
+        name: aivpn-server-linux-x86_64-1.1.0
+        path: target/release/aivpn-server
+        if-no-files-found: error
+        retention-days: 7
+
     - name: Run tests
       run: cargo test --workspace --exclude aivpn-windows --verbose
 
@@ -72,9 +83,6 @@ jobs:
 
   cargo-audit:
     runs-on: ubuntu-latest
-    # Advisory-only: reports known vulnerabilities in Cargo.lock without
-    # gating the build (no `-D` / deny-on-warnings equivalent yet). Promote
-    # to a hard failure once the workspace's advisory backlog is triaged.
     steps:
     - uses: actions/checkout@v4
     - name: Setup Rust
@@ -88,8 +96,23 @@ jobs:
     - name: Install cargo-audit
       run: cargo install cargo-audit --locked
 
-    - name: cargo audit (advisory, non-blocking)
-      run: cargo audit || echo "::warning::cargo audit reported findings — see job log"
+    - name: cargo audit
+      run: cargo audit
+
+  windows-check:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Setup Rust (Windows GNU target)
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        targets: x86_64-pc-windows-gnu
+
+    - name: Install Windows resource compiler
+      run: sudo apt-get update && sudo apt-get install -y binutils-mingw-w64-x86-64 gcc-mingw-w64-x86-64
+
+    - name: Check Windows client
+      run: cargo check --locked -p aivpn-client --features ssh-install --target x86_64-pc-windows-gnu
 
   ios-swift:
     runs-on: macos-15

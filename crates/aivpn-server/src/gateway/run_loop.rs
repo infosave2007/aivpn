@@ -466,31 +466,39 @@ impl super::Gateway {
                     // writes the prior content back, `None` means the file
                     // didn't exist before the change, so it's removed.
                     let mut rolled_back_any = false;
-                    for entry in pending_config_cleanup.tick(Instant::now()) {
-                        let path = entry.target_path().to_path_buf();
-                        let restore_result = match entry.rollback_value() {
-                            Some(prior_bytes) => std::fs::write(&path, prior_bytes),
-                            None => match std::fs::remove_file(&path) {
-                                Ok(()) => Ok(()),
-                                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                                Err(e) => Err(e),
-                            },
-                        };
-                        match restore_result {
-                            Ok(()) => {
-                                rolled_back_any = true;
-                                warn!(
-                                    "Pending config auto-rolled-back (unconfirmed within window): {}",
-                                    entry.descriptor()
-                                );
-                            }
-                            Err(e) => {
-                                error!(
-                                    "Pending config rollback FAILED for '{}' (path {}): {}",
-                                    entry.descriptor(),
-                                    path.display(),
-                                    e
-                                );
+                    {
+                        // Keep the same transaction lock through the restore:
+                        // removing an expired entry and writing its prior value
+                        // must not interleave with a new apply to that path.
+                        let mutation_guard = pending_config_cleanup.lock_mutation();
+                        for entry in
+                            pending_config_cleanup.tick_locked(Instant::now(), &mutation_guard)
+                        {
+                            let path = entry.target_path().to_path_buf();
+                            let restore_result = match entry.rollback_value() {
+                                Some(prior_bytes) => std::fs::write(&path, prior_bytes),
+                                None => match std::fs::remove_file(&path) {
+                                    Ok(()) => Ok(()),
+                                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                                    Err(e) => Err(e),
+                                },
+                            };
+                            match restore_result {
+                                Ok(()) => {
+                                    rolled_back_any = true;
+                                    warn!(
+                                        "Pending config auto-rolled-back (unconfirmed within window): {}",
+                                        entry.descriptor()
+                                    );
+                                }
+                                Err(e) => {
+                                    error!(
+                                        "Pending config rollback FAILED for '{}' (path {}): {}",
+                                        entry.descriptor(),
+                                        path.display(),
+                                        e
+                                    );
+                                }
                             }
                         }
                     }

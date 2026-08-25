@@ -172,8 +172,9 @@ fn classify_route(method: u8, path: &str) -> Option<Route> {
 ///
 /// - User (0): denied everything — a `User`-role client has no
 ///   management access at all.
-/// - Viewer (1): every curated route, but GET only (read-only monitoring
-///   — status/clients/single-client/connection-key/audit-log).
+/// - Viewer (1): curated read-only monitoring routes, except connection-key
+///   issuance. A connection key contains the client's PSK and is therefore a
+///   credential, not ordinary read-only metadata.
 /// - Admin (2): the full curated allowlist, both reads and mutations.
 ///
 /// A path/method combination outside the curated allowlist (see
@@ -181,12 +182,12 @@ fn classify_route(method: u8, path: &str) -> Option<Route> {
 /// allowlist itself, not just the role check, is what keeps `PUT
 /// /config`, `backup/import`, and role assignment off the tunnel.
 pub fn authorize(role_u8: u8, method: u8, path: &str) -> bool {
-    if classify_route(method, path).is_none() {
+    let Some(route) = classify_route(method, path) else {
         return false;
-    }
+    };
     match role_u8 {
         2 => true,
-        1 => method == METHOD_GET,
+        1 => method == METHOD_GET && !matches!(route, Route::ClientConnectionKey(_)),
         _ => false,
     }
 }
@@ -514,6 +515,16 @@ mod tests {
     fn authorize_viewer_get_ok_post_denied() {
         assert!(authorize(ROLE_VIEWER, METHOD_GET, "/api/v1/clients"));
         assert!(!authorize(ROLE_VIEWER, METHOD_POST, "/api/v1/clients"));
+    }
+    #[test]
+    fn authorize_connection_key_is_admin_only() {
+        let path = "/api/v1/clients/abc/connection-key";
+        assert!(!authorize(ROLE_USER, METHOD_GET, path));
+        assert!(
+            !authorize(ROLE_VIEWER, METHOD_GET, path),
+            "Viewer must not be able to obtain a client PSK"
+        );
+        assert!(authorize(ROLE_ADMIN, METHOD_GET, path));
     }
     #[test]
     fn authorize_user_denied_everything() {

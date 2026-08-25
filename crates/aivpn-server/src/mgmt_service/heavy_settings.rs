@@ -214,6 +214,12 @@ pub fn apply_heavy(
         MgmtError::Internal("pending-config manager not configured on this node".into())
     })?;
 
+    // The target-file read/write and pending-entry registration are one
+    // transaction. Without this guard, concurrent REST/tunnel applies can
+    // associate a token with another request's file contents, and the timeout
+    // sweeper can restore a superseded value between rename and begin().
+    let mutation_guard = manager.lock_mutation();
+
     let resolved = match resolve_heavy_setting(ctx, &setting) {
         Ok(r) => r,
         Err(e) => {
@@ -283,14 +289,17 @@ pub fn apply_heavy(
     }
 
     let token = generate_token();
-    manager.begin(PendingConfig::begin(
-        token.clone(),
-        resolved.target_path,
-        prior,
-        resolved.descriptor.clone(),
-        now,
-        PENDING_CONFIG_TIMEOUT,
-    ));
+    manager.begin_locked(
+        PendingConfig::begin(
+            token.clone(),
+            resolved.target_path,
+            prior,
+            resolved.descriptor.clone(),
+            now,
+            PENDING_CONFIG_TIMEOUT,
+        ),
+        &mutation_guard,
+    );
 
     audit(
         ctx,
