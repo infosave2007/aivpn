@@ -28,10 +28,11 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 
 use base64::Engine as _;
 use parking_lot::{Mutex, RwLock};
+use portable_atomic::AtomicU64;
 use serde::{Deserialize, Serialize};
 use tracing::{error, info, warn};
 
