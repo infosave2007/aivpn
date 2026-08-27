@@ -1067,17 +1067,13 @@ impl super::App {
                     .spacing(4)
                     .align_y(Alignment::Center),
                 );
-            } else {
-                // Viewer: only the read-only "Key" affordance (a plain GET
-                // the server allows a Viewer) — every mutating control is
-                // omitted entirely rather than disabled.
-                card = card.push(
-                    row![button(t(lang, "Key"))
-                        .on_press_maybe((!busy).then_some(Message::AdminShowKey(c.id.clone())))]
-                    .spacing(4)
-                    .align_y(Alignment::Center),
-                );
             }
+            // Viewer: no row actions at all. "Key" used to be offered here as
+            // a read-only affordance, but `connection-key` returns a live
+            // client PSK and the server's `authorize()` now refuses it for a
+            // Viewer — leaving the button would only produce a guaranteed 403,
+            // the same reason every mutating control is omitted rather than
+            // shown disabled.
 
             if let Some((kid, key)) = &self.admin_key_view {
                 if kid == &c.id {
