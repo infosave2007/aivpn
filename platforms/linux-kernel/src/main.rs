@@ -1,8 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 //! aivpn kernel module — entry point (Rust control plane)
 
-#![no_std]
-
 use kernel::prelude::*;
 
 mod dev;

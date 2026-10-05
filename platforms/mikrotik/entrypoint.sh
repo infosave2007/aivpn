@@ -32,12 +32,14 @@ echo "[aivpn-mikrotik] Starting aivpn-client (full-tunnel=${FULL_TUNNEL})"
 
 # Client crashes must not kill the restart loop (script runs under set -e),
 # so capture the exit status explicitly.
+export AIVPN_CONNECTION_KEY="$AIVPN_KEY"
+unset AIVPN_KEY
 while true; do
     rc=0
     if [ "${FULL_TUNNEL}" = "true" ]; then
-        /usr/local/bin/aivpn-client --connection-key "${AIVPN_KEY}" --full-tunnel || rc=$?
+        /usr/local/bin/aivpn-client --full-tunnel || rc=$?
     else
-        /usr/local/bin/aivpn-client --connection-key "${AIVPN_KEY}" || rc=$?
+        /usr/local/bin/aivpn-client || rc=$?
     fi
     echo "[aivpn-mikrotik] aivpn-client exited (rc=${rc}), restarting in 5s..."
     sleep 5

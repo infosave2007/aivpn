@@ -17,6 +17,7 @@
 #include <linux/skbuff.h>
 #include <linux/socket.h>
 #include <linux/mutex.h>
+#include <linux/slab.h>
 #include <net/sock.h>
 #include "udp_hook.h"
 #include "session_table.h"
@@ -158,89 +159,97 @@ static void aivpn_sk_data_ready(struct sock *sk)
 		 * keeps the BH-disabled critical section short and lets
 		 * packets of the same session decrypt in parallel.
 		 *
-		 * Anti-replay, WireGuard ordering: CHECK the window here but only
-		 * ADVANCE it after the packet authenticates as Data.  Control/Ack/
-		 * keepalive packets (-ENOMSG) and auth failures (-EBADMSG) are
-		 * handed to user-space and must NOT burn counters in the kernel
-		 * window — otherwise the kernel and user-space windows diverge
-		 * over the same counter space and legitimate reordered Data
-		 * packets get judged "too old".
-		 *
-		 * A check failure is likewise routed to the fallback queue, not
-		 * dropped: user-space owns the authoritative replay window and may
-		 * still accept a packet the kernel-only window has slid past.
-		 * True replays are then rejected there.  Fallback skbs keep their
-		 * rmem charge (recvmsg releases it).
+		 * Окно смотрим до расшифровки и не двигаем его. Повтор (бит уже
+		 * стоит) отбрасываем: userspace не должен принять его второй раз.
+		 * Слишком старый счетчик и невооруженная политика уходят в fallback,
+		 * skb остается проводом. Отзыв отбрасывается даже без armed.
 		 */
 		spin_lock_bh(&session->lock);
-		if (!aivpn_counter_check(session, counter)) {
+		{
+			int replay_dup = 0;
+			int verdict = aivpn_session_rx_prepare(session, counter,
+							       &replay_dup);
 			spin_unlock_bh(&session->lock);
-			rcu_read_unlock();
-			aivpn_stat_inc(AIVPN_STAT_REPLAY_DROP);
-			__skb_queue_tail(&fallback_q, skb);
-			continue;
+			if (verdict != AIVPN_VERDICT_ACCEPT) {
+				rcu_read_unlock();
+				if (verdict == AIVPN_VERDICT_DROP) {
+					aivpn_stat_inc(replay_dup ? AIVPN_STAT_REPLAY_DROP
+								  : AIVPN_STAT_POLICY_DROP);
+					aivpn_udp_skb_uncharge(sk, rmem_charge);
+					kfree_skb(skb);
+				} else {
+					aivpn_stat_inc(AIVPN_STAT_POLICY_FALLBACK);
+					__skb_queue_tail(&fallback_q, skb);
+				}
+				continue;
+			}
 		}
-		spin_unlock_bh(&session->lock);
 
-		ret = aivpn_decrypt(session, skb, counter, ct_start);
-		if (!ret) {
-			/*
-			 * Re-validate under the lock: another CPU may have
-			 * authenticated the same counter while we were
-			 * decrypting.  If the check fails now the packet is a
-			 * concurrent duplicate — and the skb has already been
-			 * overwritten with plaintext, so it can no longer fall
-			 * back to user-space; drop it.
-			 */
+		{
+			u8 *plain = NULL;
+			unsigned int plain_len = 0;
+
+			ret = aivpn_decrypt(session, skb, counter, ct_start,
+					    &plain, &plain_len);
+			if (ret) {
+				rcu_read_unlock();
+				/*
+				 * skb все еще провод. -EBADMSG и -ENOMSG не отмечают
+				 * replay и возвращаются в userspace.
+				 */
+				if (ret == -EBADMSG) {
+					aivpn_stat_inc(AIVPN_STAT_DECRYPT_FAIL);
+					__skb_queue_tail(&fallback_q, skb);
+				} else if (ret == -ENOMSG) {
+					aivpn_stat_inc(AIVPN_STAT_CTRL_FALLBACK);
+					__skb_queue_tail(&fallback_q, skb);
+				} else {
+					aivpn_stat_inc(AIVPN_STAT_DECRYPT_FAIL);
+					aivpn_udp_skb_uncharge(sk, rmem_charge);
+					kfree_skb(skb);
+				}
+				continue;
+			}
+
 			spin_lock_bh(&session->lock);
-			if (!aivpn_counter_check(session, counter)) {
+			{
+				int replay_dup = 0;
+				int verdict = aivpn_session_rx_finish(session, counter,
+								      plain, plain_len,
+								      skb->len, &replay_dup);
 				spin_unlock_bh(&session->lock);
 				rcu_read_unlock();
-				aivpn_stat_inc(AIVPN_STAT_REPLAY_DROP);
+				if (verdict != AIVPN_VERDICT_ACCEPT) {
+					kfree_sensitive(plain);
+					if (verdict == AIVPN_VERDICT_FALLBACK) {
+						aivpn_stat_inc(AIVPN_STAT_POLICY_FALLBACK);
+						__skb_queue_tail(&fallback_q, skb);
+					} else {
+						aivpn_stat_inc(replay_dup ? AIVPN_STAT_REPLAY_DROP
+									  : AIVPN_STAT_POLICY_DROP);
+						aivpn_udp_skb_uncharge(sk, rmem_charge);
+						kfree_skb(skb);
+					}
+					continue;
+				}
+			}
+
+			/* ACCEPT: только теперь кладем внутренний IP в skb. */
+			if (skb_linearize(skb) ||
+			    (skb->len < plain_len &&
+			     (pskb_expand_head(skb, 0, plain_len - skb->len, GFP_ATOMIC) ||
+			      !skb_put(skb, plain_len - skb->len)))) {
+				kfree_sensitive(plain);
+				aivpn_stat_inc(AIVPN_STAT_INJECT_FAIL);
 				aivpn_udp_skb_uncharge(sk, rmem_charge);
 				kfree_skb(skb);
 				continue;
 			}
-			aivpn_counter_update(session, counter);
-			/* Accepted: account RX stats under the same lock hold
-			 * (moved out of aivpn_decrypt, which now runs without
-			 * the session lock).  skb->len is the inner IP length
-			 * after the decrypt commit trimmed the skb. */
-			session->rx_packets++;
-			session->rx_bytes += skb->len;
-			spin_unlock_bh(&session->lock);
-		}
-		rcu_read_unlock();
-
-		if (ret) {
-			/*
-			 * The skb is still the untouched wire packet (decrypt runs
-			 * out of place), so both recoverable cases fall back to
-			 * user-space rather than drop:
-			 *   -EBADMSG: authentication failed — user-space has decode
-			 *             paths (quic-initial, ratchet, catalog mask) the
-			 *             fast path does not replicate.
-			 *   -ENOMSG:  decrypted fine but it is not a Data packet
-			 *             (Control / Ack / keepalive) — user-space owns
-			 *             the control plane.
-			 * Any other error is a malformed/short packet — drop it.
-			 */
-			if (ret == -EBADMSG) {
-				aivpn_stat_inc(AIVPN_STAT_DECRYPT_FAIL);
-				__skb_queue_tail(&fallback_q, skb);
-			} else if (ret == -ENOMSG) {
-				aivpn_stat_inc(AIVPN_STAT_CTRL_FALLBACK);
-				__skb_queue_tail(&fallback_q, skb);
-			} else {
-				aivpn_stat_inc(AIVPN_STAT_DECRYPT_FAIL);
-				aivpn_udp_skb_uncharge(sk, rmem_charge);
-				kfree_skb(skb);
-			}
-			continue;
+			memcpy(skb->data, plain, plain_len);
+			skb_trim(skb, plain_len);
+			kfree_sensitive(plain);
 		}
 
-		/* Consumed from here on — release the UDP rmem charge before the
-		 * skb leaves our hands (netif_rx may free it at any point). */
 		aivpn_udp_skb_uncharge(sk, rmem_charge);
 		if (aivpn_tun_inject(skb)) {
 			aivpn_stat_inc(AIVPN_STAT_INJECT_FAIL);

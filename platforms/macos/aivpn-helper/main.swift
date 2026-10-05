@@ -31,6 +31,32 @@ let RECORDING_STATUS_PATH = "/var/run/aivpn/recording.status"
 let RECORDING_STATUS_FALLBACK_PATH = "/tmp/aivpn-recording.status"
 let HELPER_VERSION = "1.1.0"
 
+// Открываем каждый компонент относительно дескриптора родителя. Подмена
+// каталога или файла ссылкой не меняет уже открытый путь.
+func openCertificate(_ path: String) -> Int32 {
+    let parts = path.split(separator: "/").map(String.init)
+    guard path.hasPrefix("/"), !parts.isEmpty else { return -1 }
+    var parent = open("/", O_RDONLY | O_DIRECTORY | O_CLOEXEC)
+    guard parent >= 0 else { return -1 }
+    for part in parts.dropLast() {
+        let next = openat(parent, part, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+        close(parent)
+        guard next >= 0 else { return -1 }
+        parent = next
+    }
+    let fd = openat(parent, parts.last!, O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK)
+    close(parent)
+    guard fd >= 0 else { return -1 }
+    var metadata = stat()
+    guard fstat(fd, &metadata) == 0,
+          (metadata.st_mode & mode_t(S_IFMT)) == mode_t(S_IFREG),
+          metadata.st_size > 0, metadata.st_size <= 4096 else {
+        close(fd)
+        return -1
+    }
+    return fd
+}
+
 // MARK: - Protocol Types
 
 struct HelperRequest: Codable {
@@ -179,29 +205,6 @@ func killExistingClient() {
 
     try? FileManager.default.removeItem(atPath: PID_PATH)
     
-    // Restore IPv6 after stopping client
-    restoreIPv6()
-}
-
-/// Restore IPv6 routing after VPN disconnect.
-/// The Rust client's Drop impl already removes the blackhole and restores the
-/// saved interface on clean exit.  This function is a safety net for cases where
-/// the client process is killed externally (e.g. `killall`).
-/// We only remove the blackhole here — we do NOT try to add the default route
-/// back because we don't know which interface was active (that knowledge lives
-/// in the Rust process).  macOS re-discovers the IPv6 gateway automatically
-/// via ND/SLAAC once the blackhole is gone.
-func restoreIPv6() {
-    log("Clearing IPv6 blackhole (safety net)...")
-
-    // Remove the blackhole if it still exists.
-    let removed = runCommand("/sbin/route",
-                             args: ["-n", "delete", "-inet6", "-net", "::/0", "-blackhole"])
-    if removed {
-        log("IPv6 blackhole removed — macOS will auto-restore via ND/SLAAC")
-    } else {
-        log("No IPv6 blackhole found (already removed by Rust client on clean exit)")
-    }
 }
 
 /// Run a command and return success
@@ -298,6 +301,9 @@ func startClient(key: String, fullTunnel: Bool, binaryPath: String?, mtlsCertPat
     // reads the env var when -k is absent (crates/aivpn-client/src/main.rs)
     // and removes it from its own environment immediately after parsing.
     var args: [String] = [clientPath]
+    var certificateFd: Int32 = -1
+    defer { if certificateFd >= 0 { close(certificateFd) } }
+
     if fullTunnel {
         args.append("--full-tunnel")
     }
@@ -344,8 +350,12 @@ func startClient(key: String, fullTunnel: Bool, binaryPath: String?, mtlsCertPat
             log("ERROR: invalid mtlsCertPath '\(certPath)' — rejected")
             return HelperResponse(status: "error", message: "Invalid mTLS cert path")
         }
+        certificateFd = openCertificate(resolvedCertPath)
+        guard certificateFd >= 0 else {
+            return HelperResponse(status: "error", message: "Cannot safely open mTLS cert")
+        }
         args.append("--mtls-cert")
-        args.append(resolvedCertPath)
+        args.append("/dev/fd/198")
     }
     if adaptiveLevel > 0 {
         args.append("--adaptive-level")
@@ -472,6 +482,14 @@ func startClient(key: String, fullTunnel: Bool, binaryPath: String?, mtlsCertPat
     guard posix_spawn_file_actions_init(&fileActions) == 0 else {
         log("ERROR: posix_spawn_file_actions_init failed")
         return HelperResponse(status: "error", message: "Internal spawn setup failure")
+    }
+
+    // Клиент читает уже открытый файл, не разрешая пользовательский путь повторно.
+    if certificateFd >= 0 {
+        guard posix_spawn_file_actions_adddup2(&fileActions, certificateFd, 198) == 0 else {
+            posix_spawn_file_actions_destroy(&fileActions)
+            return HelperResponse(status: "error", message: "Cannot pass mTLS cert descriptor")
+        }
     }
 
     // Redirect stdout/stderr to log file (root-only for security)

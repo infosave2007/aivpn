@@ -20,7 +20,7 @@ use tracing::{debug, error, info, warn};
 use aivpn_common::crypto::{self, decrypt_payload, encrypt_payload_into, NONCE_SIZE, TAG_SIZE};
 use aivpn_common::error::{Error, Result};
 use aivpn_common::fec::FecRepair;
-use aivpn_common::kernel_accel::KernelAccel;
+use aivpn_common::kernel_accel::{KernelAccel, QOS_DIR_DOWN, QOS_DIR_UP};
 use aivpn_common::mask::{
     current_unix_secs, derive_bootstrap_candidates, BootstrapDescriptor, MaskProfile,
 };
@@ -68,8 +68,10 @@ use security::{hash_addr, verify_device_enrollment_proof};
 
 mod kernel_offload;
 use kernel_offload::{
-    kernel_session_sig, kernel_wire_layout, make_kernel_downlink, make_kernel_session_add,
-    make_kernel_update_tags, KERNEL_DOWNLINK_ARMED,
+    harvest_kernel_counters, kernel_claim_deliver, kernel_clear_offload, kernel_client_key,
+    kernel_input_from_session, kernel_maintain, kernel_note_rejected, kernel_qos_decide,
+    kernel_wire_layout, make_kernel_downlink, make_kernel_update_tags, QosGate, ReplayGate,
+    KERNEL_DOWNLINK_ARMED,
 };
 
 mod recording;
@@ -235,7 +237,6 @@ pub struct Gateway {
     /// Per-client QoS enforcer (token bucket + DSCP marking).
     qos_enforcer: Arc<QosEnforcer>,
     /// Multi-hop exit node forwarder (None = local NAT).
-    chain_forwarder: Option<Arc<crate::chain_forwarder::ChainForwarder>>,
     /// PHASE 3 (exit / chain-forward over masked transport): the
     /// `PoolDialer` this node uses to reach `masked_exit_addr` as a masked
     /// pool-peer session, instead of the legacy dedicated-socket
@@ -314,7 +315,7 @@ pub struct Gateway {
     /// `is_pool_peer`/`is_site_peer` roles, which relay over a fixed UDP
     /// socket with no session-based return path to record here. Empty and
     /// inert on any node that never acts as a masked-transport exit.
-    chain_reverse_routes: Arc<DashMap<Ipv4Addr, ([u8; 16], Instant)>>,
+    chain_reverse_routes: Arc<DashMap<std::net::IpAddr, ([u8; 16], Instant)>>,
     /// BUG C3 fix: monotonic count of calls to `chain_reverse_route_insert`,
     /// driving its opportunistic TTL sweep instead of `chain_reverse_routes.len()`
     /// (which plateaus — and so stops firing the sweep — once the map's
@@ -376,16 +377,15 @@ pub struct Gateway {
     pool_server_keypair: Option<aivpn_common::crypto::KeyPair>,
     /// FORK-B pool-sync: mirrors `GatewayConfig::pool_client_psk`.
     pool_client_psk: Option<[u8; 32]>,
-    /// BUG D1 fix (route-auth identity enforcement): when `true`, a masked
-    /// pool-peer session's `RouteSync` announcement is dropped unless the
-    /// session has a crypto-verified `verified_node_id` (see the
-    /// `ControlPayload::RouteSync` arm in `handle_control_message` and
-    /// `pool_sync::PoolSyncConfig::require_node_enrollment`, which this is
-    /// meant to mirror). Currently hardcoded to `false` at construction
-    /// (see `Gateway::new`'s doc comment there) rather than sourced from
-    /// `GatewayConfig`, since `main.rs` builds `GatewayConfig` with an
-    /// exhaustive struct literal and threading this through it is a
-    /// separate, out-of-scope task.
+    /// Дополнительные masked-ключи площадок. Пуловый ключ сюда не дублируем.
+    extra_masked_peer_keys: Vec<(aivpn_common::crypto::KeyPair, [u8; 32], Vec<String>)>,
+    /// Свой Ed25519 ключ узла для обратного NodeEnrollment.
+    local_node_identity: Option<ed25519_dalek::SigningKey>,
+    local_node_id: Option<String>,
+    /// Принятый SiteData пишется в локальный TUN, не в client downlink.
+    site_data_tx: mpsc::Sender<Vec<u8>>,
+    site_data_rx: Option<mpsc::Receiver<Vec<u8>>>,
+    /// Проверять доказательство идентичности межсерверного узла.
     require_node_enrollment: bool,
     /// P1.5 (apply-with-rollback): shared tracker for in-flight
     /// "commit-confirmed" heavy config changes. Read from
@@ -429,6 +429,49 @@ const MAX_FALLBACK_SCANS_PER_SEC: u64 = 20;
 const MAX_HANDSHAKE_SCANS_PER_SEC: u64 = 100;
 
 impl Gateway {
+    /// Сохранить отложенные счетчики перед удалением сессии.
+    pub(super) fn flush_session_traffic(&self, session: &Arc<parking_lot::Mutex<Session>>) {
+        let (client_id, received, sent) = {
+            let mut sess = session.lock();
+            let (rx, tx) = self
+                .kernel_accel
+                .as_ref()
+                .map(|ka| harvest_kernel_counters(ka, &mut sess))
+                .unwrap_or((0, 0));
+            let received = std::mem::take(&mut sess.pending_bytes_in).saturating_add(rx);
+            let sent = std::mem::take(&mut sess.pending_bytes_out).saturating_add(tx);
+            (sess.client_id.clone(), received, sent)
+        };
+        if let (Some(db), Some(id)) = (self.client_db.as_ref(), client_id) {
+            if received != 0 || sent != 0 {
+                db.record_traffic(&id, received, sent);
+            }
+        }
+    }
+
+    pub fn mask_store(&self) -> Option<Arc<crate::mask_store::MaskStore>> {
+        self.mask_store.clone()
+    }
+
+    fn session_for_inner_ip(
+        &self,
+        address: std::net::IpAddr,
+    ) -> Option<Arc<parking_lot::Mutex<Session>>> {
+        let ipv4 = inner_client_ipv4(&self.config.network_config, address)?;
+        self.session_manager.get_session_by_vpn_ip(&ipv4)
+    }
+
+    fn session_allows_source(&self, session: &Session, address: std::net::IpAddr) -> bool {
+        match address {
+            std::net::IpAddr::V4(ip) => session.allows_data_source(ip),
+            std::net::IpAddr::V6(ip) => self
+                .config
+                .network_config
+                .client_ip_for_ipv6(ip)
+                .is_some_and(|assigned| session.vpn_ip == Some(assigned)),
+        }
+    }
+
     /// Resolve a session's server-assigned management role:
     /// `client_id -> client_db.find_by_id -> ClientConfig::role`, defaulting
     /// to `ClientRole::User` when the session has no `client_id` yet
@@ -598,6 +641,9 @@ impl Gateway {
             })
             .collect();
 
+        if let Some(ref ka) = self.kernel_accel {
+            let _ = ka.client_revoke(&kernel_client_key(client_id));
+        }
         for (session_id, session) in targets {
             let shutdown = ControlPayload::Shutdown { reason: 4 };
             // `send_control_message` (not `_via` with the CATALOG mdh):
@@ -611,6 +657,10 @@ impl Gateway {
                     "force_disconnect_client: Shutdown send failed for revoked client {}: {}",
                     client_id, e
                 );
+            }
+            self.flush_session_traffic(&session);
+            if let Some(ref ka) = self.kernel_accel {
+                kernel_clear_offload(ka, &session_id);
             }
             self.session_manager.remove_session(&session_id);
             warn!(
@@ -634,12 +684,7 @@ impl Gateway {
     /// way — this just gets that round started immediately instead of on
     /// the peer's own schedule.
     ///
-    /// No-op (and no error) when no `PoolDialer` is installed — the common
-    /// case for a single-node deployment, or a node still on the legacy
-    /// mask-independent `PeerSyncer` transport, which has no equivalent
-    /// "beacon now" hook and keeps propagating tombstones on its existing
-    /// periodic push schedule (out of scope here — see the design's Phase-
-    /// out-of-legacy-transport plan).
+    /// На одиночном узле без PoolDialer уведомлять некого.
     fn trigger_priority_pool_beacon(&self) {
         let (Some(dialer), Some(db)) = (self.pool_dialer.as_ref(), self.client_db.as_ref()) else {
             return;
@@ -653,6 +698,9 @@ impl Gateway {
     }
 
     pub fn new(config: GatewayConfig) -> Result<Self> {
+        if config.client_db.is_none() {
+            return Err(Error::Session("Client database is required".into()));
+        }
         // Create server keypair (use config key if provided, otherwise generate ephemeral)
         let server_keys = if config.server_private_key != [0u8; 32] {
             crypto::KeyPair::from_private_key(config.server_private_key)
@@ -766,11 +814,13 @@ impl Gateway {
             mask_catalog.available_count()
         );
 
-        let kernel_accel: Option<Arc<KernelAccel>> = KernelAccel::try_open().map(Arc::new);
-        if kernel_accel.is_some() {
-            info!("Kernel acceleration: active (aivpn.ko loaded — /dev/aivpn ready)");
+        // Модуль старой версии или отсутствие /dev/aivpn оставляют userspace.
+        let kernel_accel = KernelAccel::try_open().map(Arc::new);
+        if let Some(kernel) = kernel_accel.as_ref() {
+            session_manager.attach_kernel(kernel);
+            info!("Kernel acceleration enabled");
         } else {
-            info!("Kernel acceleration: not available — using built-in user-space data path");
+            info!("Kernel acceleration unavailable, traffic stays on the user-space path");
         }
 
         let event_bus = config.event_bus.clone();
@@ -782,6 +832,7 @@ impl Gateway {
         // `chain_reverse_downlink_sender` needs no `Option` handling at the
         // call site. See the fields' doc comments.
         let (chain_reverse_tx, chain_reverse_rx) = mpsc::channel::<Vec<u8>>(4096);
+        let (site_data_tx, site_data_rx) = mpsc::channel::<Vec<u8>>(4096);
 
         Ok(Self {
             config: config.clone(),
@@ -809,7 +860,6 @@ impl Gateway {
             kernel_accel,
             event_bus,
             qos_enforcer,
-            chain_forwarder: config.chain_forwarder.clone(),
             pool_dialer: None,
             masked_exit_addr: Arc::new(parking_lot::RwLock::new(None)),
             exit_route_cache: Arc::new(DashMap::new()),
@@ -826,19 +876,12 @@ impl Gateway {
             mgmt_request_throttle: Arc::new(DashMap::new()),
             pool_server_keypair: config.pool_server_keypair,
             pool_client_psk: config.pool_client_psk,
-            // BUG D1 fix: NOT sourced from `GatewayConfig` — `main.rs`
-            // constructs `GatewayConfig` with an exhaustive struct literal
-            // (no `..Default::default()`), so adding a field there would
-            // require an out-of-scope edit to `main.rs` (this task is
-            // scoped to `gateway.rs`/`pool_sync.rs` only). Hardcoded to
-            // `false` here — migration-safe, byte-for-byte unchanged
-            // default behavior. TODO(main.rs wiring, separate task): thread
-            // `pool.require_node_enrollment()` (see
-            // `pool_sync::PoolSyncConfig::require_node_enrollment`) through
-            // `GatewayConfig` (alongside the existing
-            // `pool_server_keypair`/`pool_client_psk` wiring at the
-            // `GatewayConfig { .. }` literal in `main.rs`) and read it here
-            // instead of the literal `false`.
+            extra_masked_peer_keys: Vec::new(),
+            local_node_identity: None,
+            local_node_id: None,
+            site_data_tx,
+            site_data_rx: Some(site_data_rx),
+            // Bootstrap применяет политику enrollment после создания gateway.
             require_node_enrollment: false,
             pending_config: Arc::new(crate::pending_config::PendingConfigManager::new()),
         })
@@ -854,21 +897,7 @@ impl Gateway {
         self.pending_config.clone()
     }
 
-    /// Set (or replace) the multi-hop chain forwarder after server construction.
-    pub fn set_chain_forwarder(&mut self, cf: Arc<crate::chain_forwarder::ChainForwarder>) {
-        self.chain_forwarder = Some(cf);
-    }
-
-    /// PHASE 3 (exit / chain-forward over masked transport): wire the
-    /// masked pool-client exit route in place of the legacy `ChainForwarder`.
-    /// `dialer` must already be dialing `exit_addr` (see the `main.rs`
-    /// wiring site, which appends the exit node to the `PoolDialer`'s dial
-    /// set when it isn't already one of `pool.peers`); `exit_addr` must be
-    /// the exact same string used as that dial-set entry, since it doubles
-    /// as the `PoolDialer::send_to_peer` lookup key. Must be called before
-    /// `run()`. `main.rs` selects exactly one of `set_chain_forwarder` /
-    /// `set_masked_exit` per `pool.transport` — the client-data-path sites
-    /// prefer the masked route whenever `masked_exit_addr` is `Some`.
+    /// Назначить exit через межсерверный masked transport.
     pub fn set_masked_exit(
         &mut self,
         dialer: Arc<crate::pool_dialer::PoolDialer>,
@@ -1076,17 +1105,7 @@ impl Gateway {
         self.pool_dialer.clone()
     }
 
-    /// BUG D1 fix (route-auth identity enforcement): install the
-    /// `require_node_enrollment` policy — when `true`, a masked pool-peer's
-    /// `RouteSync` is dropped unless its session has already proven a
-    /// crypto-verified identity via `NodeEnrollment`. Defaults to `false`
-    /// (set at construction) for migration-safe, byte-for-byte unchanged
-    /// behavior. TODO(main.rs wiring, separate task): once `main.rs` reads
-    /// `pool.require_node_enrollment()` from the parsed `PoolSyncConfig`
-    /// (see `pool_sync::PoolSyncConfig::require_node_enrollment`), it should
-    /// call this setter post-construction — the same pattern already used
-    /// for `set_node_registry` above — rather than needing a new field on
-    /// `GatewayConfig`'s exhaustive struct literal.
+    /// Требовать проверенную идентичность узла для межсерверного обмена.
     pub fn set_require_node_enrollment(&mut self, require: bool) {
         self.require_node_enrollment = require;
     }
@@ -1105,6 +1124,50 @@ impl Gateway {
     /// anything sent into it.
     pub fn chain_reverse_downlink_sender(&self) -> mpsc::Sender<Vec<u8>> {
         self.chain_reverse_tx.clone()
+    }
+
+    /// Ключ площадки для входящего masked handshake. Не заменяет pool key.
+    pub fn add_masked_peer_key(
+        &mut self,
+        keypair: aivpn_common::crypto::KeyPair,
+        psk: [u8; 32],
+        node_id: String,
+    ) -> Result<()> {
+        if self.pool_client_psk == Some(psk)
+            && self
+                .pool_server_keypair
+                .as_ref()
+                .is_some_and(|pool| pool.public_key_bytes() == keypair.public_key_bytes())
+        {
+            return Err(Error::Session(
+                "Ключ площадки должен отличаться от ключа пула".into(),
+            ));
+        }
+        if let Some((_, _, names)) =
+            self.extra_masked_peer_keys
+                .iter_mut()
+                .find(|(key, secret, _)| {
+                    *secret == psk && key.public_key_bytes() == keypair.public_key_bytes()
+                })
+        {
+            if !names.contains(&node_id) {
+                names.push(node_id);
+            }
+        } else {
+            self.extra_masked_peer_keys
+                .push((keypair, psk, vec![node_id]));
+        }
+        Ok(())
+    }
+
+    /// Свой identity для обратного NodeEnrollment после проверки звонящего.
+    pub fn set_local_node_identity(&mut self, key: ed25519_dalek::SigningKey, node_id: String) {
+        self.local_node_identity = Some(key);
+        self.local_node_id = Some(node_id);
+    }
+
+    pub fn site_data_sender(&self) -> mpsc::Sender<Vec<u8>> {
+        self.site_data_tx.clone()
     }
 
     async fn send_bootstrap_descriptors(
@@ -1231,10 +1294,9 @@ mod tests {
     use super::GatewayConfig;
     use super::Session;
     use aivpn_common::mask::preset_masks::webrtc_zoom_v3;
-    use dashmap::DashMap;
     use std::net::{Ipv4Addr, SocketAddr};
     use std::sync::Arc;
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     /// `resolve_client_exit_addr` must: (1) return a client's own
     /// `exit_node` when set, (2) return `None` for a client with no
@@ -1854,7 +1916,7 @@ mod tests {
     /// mask, which therefore becomes the catalog's primary mask.
     fn make_test_gateway_config_with_mask(
         label: &str,
-        mask: aivpn_common::mask::MaskProfile,
+        mut mask: aivpn_common::mask::MaskProfile,
     ) -> GatewayConfig {
         use std::sync::atomic::{AtomicU64, Ordering};
         static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -1866,104 +1928,98 @@ mod tests {
             id
         ));
         std::fs::create_dir_all(&mask_dir).expect("create temp mask dir");
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[71; 32]);
+        mask.sign(&signing_key);
         let json = serde_json::to_string_pretty(&mask).expect("serialize preset mask");
         std::fs::write(mask_dir.join(format!("{}.json", mask.mask_id)), &json)
             .expect("write mask json");
         std::fs::write(mask_dir.join(format!("{}.stats", mask.mask_id)), "{}")
             .expect("write mask stats");
         let mut config = GatewayConfig::default();
+        config.client_db = Some(Arc::new(
+            crate::client_db::ClientDatabase::load(
+                &mask_dir.join("clients.json"),
+                config.network_config.clone(),
+            )
+            .unwrap(),
+        ));
         config.mask_dir = mask_dir;
+        config.mask_signing_key = Some([71; 32]);
+        config.mask_operator_pubkey = Some(signing_key.verifying_key().to_bytes());
         config.enable_neural = false;
         config
     }
 
-    /// BUG regression (pool-sync transport): a REAL PoolSync packet built by
-    /// `PeerSyncer::build_sync_packet` must decode through the REAL gateway
-    /// RECEIVE path (`handle_packet`) — not just a build→decode round-trip,
-    /// which bypasses the gateway's mask-layout logic and is exactly the gap
-    /// that let the bug escape unit tests. Before the fix the gateway derived
-    /// the pool session's payload offset from the node's PRIMARY mask
-    /// (`tag_prefix_len(mask.tag_offset) + mdh_len`): with an embedded-tag
-    /// primary (8 of the 11 bundled masks) every pool packet failed AEAD and
-    /// the peer's clients DB never synced.
+    /// Масочный PoolSync проходит реальный decrypt/dispatch и изоляцию ролей.
     async fn pool_packet_through_gateway(label: &str, mask: aivpn_common::mask::MaskProfile) {
-        use crate::client_db::ClientDatabase;
-        use crate::pool_sync::{PeerSyncer, PoolSyncConfig};
-        use aivpn_common::event_log::{EventBus, EventSinkConfig};
-        use aivpn_common::protocol::ControlPayload;
-        use base64::Engine as _;
-        use std::sync::Arc;
-
-        fn make_syncer(
-            dir: &std::path::Path,
-            node_id: &str,
-            peer: &str,
-        ) -> (Arc<ClientDatabase>, Arc<PeerSyncer>) {
-            let network = aivpn_common::network_config::VpnNetworkConfig {
-                server_vpn_ip: std::net::Ipv4Addr::new(10, 88, 0, 1),
-                prefix_len: 24,
-                mtu: 1400,
-                ..Default::default()
-            };
-            let db = Arc::new(ClientDatabase::load(&dir.join("clients.json"), network).unwrap());
-            let cfg = PoolSyncConfig {
-                peers: vec![peer.to_string()],
-                node_id: Some(node_id.to_string()),
-                sync_port: None,
-                sync_key: Some(base64::engine::general_purpose::STANDARD.encode([7u8; 32])),
-                exit_node: None,
-                exit_node_enabled: None,
-                sync_beacon_secs: None,
-                transport: None,
-                allow_auto_add: None,
-                node_identity_key: None,
-                require_node_enrollment: None,
-                node_ip_partition: None,
-            };
-            let events = EventBus::new(EventSinkConfig {
-                stdout: false,
-                webhook_url: None,
-            });
-            let syncer = PeerSyncer::new(db.clone(), &cfg, events).unwrap();
-            (db, syncer)
-        }
-
-        // Receiving node "B": a gateway whose ONLY (and therefore primary)
-        // mask is `mask`, with a client DB so the merge result is observable.
-        let dir_b = tempfile::tempdir().unwrap();
-        let (db_b, b_syncer) = make_syncer(dir_b.path(), "node-b:443", "node-a:443");
-        let mut config = make_test_gateway_config_with_mask(label, mask);
-        config.client_db = Some(db_b.clone());
-        let gateway = Gateway::new(config).expect("gateway constructs");
-        // Register B's receive session for the A→B link, exactly like
-        // `PeerSyncer::start` does on a live node.
-        let sentinel: std::net::SocketAddr = "0.0.0.0:0".parse().unwrap();
-        gateway
-            .session_manager()
-            .create_pool_peer_session(&b_syncer.test_peer_recv_root(0), sentinel);
-
-        // Sending node "A": one real client record, pushed in a REAL sync
-        // packet (byte-identical to what `push_to_peer` puts on the wire).
-        let dir_a = tempfile::tempdir().unwrap();
-        let (db_a, a_syncer) = make_syncer(dir_a.path(), "node-a:443", "node-b:443");
-        db_a.add_client("pool-test-client").unwrap();
-        let clients_json = serde_json::to_vec(&db_a.list_clients_including_deleted()).unwrap();
-        let payload = ControlPayload::PoolSync { clients_json };
-        let packet = a_syncer.test_build_packet_for_peer(&payload, 0).unwrap();
-
-        // The REAL receive path (tag lookup → layout → decrypt → dispatch).
-        let from: std::net::SocketAddr = "203.0.113.7:40000".parse().unwrap();
-        gateway
-            .handle_packet(&packet, from)
-            .await
-            .expect("pool sync packet must decode through the gateway receive path");
-
-        assert!(
-            db_b.list_clients()
-                .iter()
-                .any(|c| c.name == "pool-test-client"),
-            "peer's client record must be merged into the receiving node's DB"
-        );
+        use super::packet_layout_for_mask;
+        use aivpn_common::client_wire::{
+            build_inner_packet, build_random_mdh_packet_with_tag_offset,
+        };
+        use aivpn_common::{
+            crypto,
+            protocol::{ControlPayload, InnerType},
+        };
+        let config = make_test_gateway_config_with_mask(label, mask.clone());
+        let db = config.client_db.clone().unwrap();
+        let gateway = Gateway::new(config).unwrap();
+        let sender_dir = tempfile::tempdir().unwrap();
+        let sender_db = crate::client_db::ClientDatabase::load(
+            &sender_dir.path().join("clients.json"),
+            db.network_config(),
+        )
+        .unwrap();
+        sender_db.add_client("pool-test-client").unwrap();
+        let payload = ControlPayload::PoolSync {
+            clients_json: serde_json::to_vec(&sender_db.list_clients_including_deleted()).unwrap(),
+        };
+        let from = "203.0.113.7:40000".parse().unwrap();
+        let kp = crypto::pool_server_keypair(&[7; 32]);
+        let psk = crypto::pool_client_psk(&[7; 32]);
+        let session = gateway
+            .session_manager
+            .create_masked_pool_peer_session(
+                from,
+                crypto::KeyPair::generate().public_key_bytes(),
+                &kp,
+                &psk,
+            )
+            .unwrap();
+        let keys = {
+            let mut state = session.lock();
+            state.mask = Some(mask.clone());
+            state.keys.clone()
+        };
+        let inner = build_inner_packet(InnerType::Control, 0, &payload.encode().unwrap());
+        let mut counter = 0;
+        let packet = build_random_mdh_packet_with_tag_offset(
+            &keys,
+            &mut counter,
+            &inner,
+            None,
+            packet_layout_for_mask(&mask).0,
+            mask.tag_offset,
+        )
+        .unwrap();
+        // Тот же криптографический канал площадки не имеет права изменять БД.
+        session.lock().is_site_peer = true;
+        gateway.handle_packet(&packet, from).await.unwrap();
+        assert!(db.list_clients().is_empty());
+        session.lock().is_site_peer = false;
+        let packet = build_random_mdh_packet_with_tag_offset(
+            &keys,
+            &mut counter,
+            &inner,
+            None,
+            packet_layout_for_mask(&mask).0,
+            mask.tag_offset,
+        )
+        .unwrap();
+        gateway.handle_packet(&packet, from).await.unwrap();
+        assert!(db
+            .list_clients()
+            .iter()
+            .any(|c| c.name == "pool-test-client"));
     }
 
     #[tokio::test]
@@ -2507,5 +2563,15 @@ mod tests {
         assert!(authorize(ClientRole::Viewer.as_u8(), 0, "/api/v1/clients"));
         assert!(!authorize(ClientRole::Viewer.as_u8(), 1, "/api/v1/clients"));
         assert!(authorize(ClientRole::Admin.as_u8(), 1, "/api/v1/clients"));
+    }
+}
+
+pub(crate) fn inner_client_ipv4(
+    network: &aivpn_common::network_config::VpnNetworkConfig,
+    address: std::net::IpAddr,
+) -> Option<Ipv4Addr> {
+    match address {
+        std::net::IpAddr::V4(ip) => Some(ip),
+        std::net::IpAddr::V6(ip) => network.client_ip_for_ipv6(ip),
     }
 }

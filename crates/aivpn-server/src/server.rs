@@ -297,6 +297,10 @@ pub struct AivpnServer {
 }
 
 impl AivpnServer {
+    pub fn mask_store(&self) -> Option<Arc<crate::mask_store::MaskStore>> {
+        self.gateway.mask_store()
+    }
+
     /// Create new server instance
     pub fn new(config: GatewayConfig) -> Result<Self> {
         let gateway = Gateway::new(config)?;
@@ -354,11 +358,6 @@ impl AivpnServer {
         self.gateway.masked_exit_addr()
     }
 
-    /// Set multi-hop chain forwarder.  Must be called before `run()`.
-    pub fn set_chain_forwarder(&mut self, cf: Arc<crate::chain_forwarder::ChainForwarder>) {
-        self.gateway.set_chain_forwarder(cf);
-    }
-
     /// PHASE 3 (exit / chain-forward over masked transport): wire the
     /// masked pool-client exit route in place of the legacy chain forwarder.
     /// Must be called before `run()`. See `Gateway::set_masked_exit`.
@@ -383,6 +382,23 @@ impl AivpnServer {
     /// into on this (entry) node. See `Gateway::chain_reverse_downlink_sender`.
     pub fn chain_reverse_downlink_sender(&self) -> tokio::sync::mpsc::Sender<Vec<u8>> {
         self.gateway.chain_reverse_downlink_sender()
+    }
+
+    pub fn add_masked_peer_key(
+        &mut self,
+        keypair: aivpn_common::crypto::KeyPair,
+        psk: [u8; 32],
+        node_id: String,
+    ) -> Result<()> {
+        self.gateway.add_masked_peer_key(keypair, psk, node_id)
+    }
+
+    pub fn set_local_node_identity(&mut self, key: ed25519_dalek::SigningKey, node_id: String) {
+        self.gateway.set_local_node_identity(key, node_id);
+    }
+
+    pub fn site_data_sender(&self) -> tokio::sync::mpsc::Sender<Vec<u8>> {
+        self.gateway.site_data_sender()
     }
 
     /// PHASE 4 (per-node identity): install the pool-node identity registry.
@@ -431,15 +447,26 @@ mod tests {
     #[test]
     fn test_server_creation() {
         // Create temp mask dir with a preset mask for the test
-        let mask_dir = std::path::PathBuf::from("/tmp/aivpn-test-server-masks");
+        let temp = tempfile::tempdir().unwrap();
+        let mask_dir = temp.path().join("masks");
         let _ = std::fs::create_dir_all(&mask_dir);
-        let mask = aivpn_common::mask::preset_masks::webrtc_zoom_v3();
+        let mut mask = aivpn_common::mask::preset_masks::webrtc_zoom_v3();
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[72; 32]);
+        mask.sign(&signing_key);
         let json = serde_json::to_string_pretty(&mask).unwrap();
         std::fs::write(mask_dir.join(format!("{}.json", mask.mask_id)), &json).unwrap();
         std::fs::write(mask_dir.join(format!("{}.stats", mask.mask_id)), "{}").unwrap();
 
         let mut config = GatewayConfig::default();
+        config.client_db = Some(Arc::new(
+            crate::client_db::ClientDatabase::load(
+                &temp.path().join("clients.json"),
+                config.network_config.clone(),
+            )
+            .unwrap(),
+        ));
         config.mask_dir = mask_dir;
+        config.mask_signing_key = Some([72; 32]);
         let server = AivpnServer::new(config);
         assert!(server.is_ok());
     }

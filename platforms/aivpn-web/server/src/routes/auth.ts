@@ -370,7 +370,7 @@ auth.post('/refresh', async (c) => {
   // Rotate refresh token; remember the outgoing hash for the grace window.
   const { raw: newRaw, hash: newHash, expiresAt } = generateRefreshToken()
 
-  await d
+  const rotated = await d
     .update(sessions)
     .set({
       refresh_token_hash: newHash,
@@ -378,7 +378,31 @@ auth.post('/refresh', async (c) => {
       prev_token_hash: session.refresh_token_hash,
       prev_expires_at: new Date(Date.now() + REFRESH_ROTATION_GRACE_MS),
     })
-    .where(eq(sessions.id, session.id))
+    .where(and(
+      eq(sessions.id, session.id),
+      eq(sessions.refresh_token_hash, rtHash),
+      gt(sessions.expires_at, now),
+    ))
+    .returning({ id: sessions.id })
+
+  // Другая вкладка могла сменить токен после нашего SELECT.
+  // Проигравший запрос не должен перезаписывать токен или cookie победителя.
+  if (rotated.length === 0) {
+    const [current] = await d.select({ id: sessions.id }).from(sessions).where(and(
+      eq(sessions.id, session.id),
+      eq(sessions.prev_token_hash, rtHash),
+      gt(sessions.prev_expires_at, new Date()),
+      gt(sessions.expires_at, new Date()),
+    )).limit(1)
+    if (!current) return c.json({ error: 'Invalid or expired refresh token' }, 401)
+    const accessToken = await signAccessToken({
+      sub: String(user.id),
+      role: user.role as UserRole,
+      session_version: user.session_version,
+      session_id: session.id,
+    })
+    return c.json({ access_token: accessToken })
+  }
 
   const accessToken = await signAccessToken({
     sub: String(user.id),
@@ -790,7 +814,7 @@ auth.get('/passkeys', requireAuth(), async (c) => {
 // DELETE /web/auth/passkeys/:id
 auth.delete('/passkeys/:id', requireAuth(), async (c) => {
   const u = c.get('user')
-  const passkeyId = c.req.param('id')
+  const passkeyId = c.req.param('id')!
   const db = await getDb()
   const { passkeys, users, sessions } = tables()
   const d = db as any
@@ -836,7 +860,7 @@ auth.get('/sessions', requireAuth(), async (c) => {
 // DELETE /web/auth/sessions/:id
 auth.delete('/sessions/:id', requireAuth(), async (c) => {
   const u = c.get('user')
-  const sessionId = c.req.param('id')
+  const sessionId = c.req.param('id')!
   const db = await getDb()
   const { sessions } = tables()
   const d = db as any

@@ -321,8 +321,8 @@ pub(crate) fn handle_list_clients(db: &ClientDatabase) {
     }
 
     println!(
-        "{:<18} {:<20} {:<12} {:<8} {:<12} {:<12} {}",
-        "ID", "NAME", "VPN IP", "STATUS", "UPLOAD", "DOWNLOAD", "LAST SEEN"
+        "{:<18} {:<20} {:<12} {:<8} {:<12} {:<12} LAST SEEN",
+        "ID", "NAME", "VPN IP", "STATUS", "UPLOAD", "DOWNLOAD"
     );
     println!("{}", "-".repeat(100));
 

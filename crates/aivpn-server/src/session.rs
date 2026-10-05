@@ -2,7 +2,7 @@
 //!
 //! Manages active VPN sessions with O(1) tag validation
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 
@@ -131,6 +131,7 @@ pub enum SessionState {
 
 /// Session information
 pub struct Session {
+    pub fragment_rx: aivpn_common::fragment::Reassembler,
     pub session_id: [u8; 16],
     pub client_addr: SocketAddr,
     pub state: SessionState,
@@ -220,28 +221,11 @@ pub struct Session {
     /// creation; a valid `ClientCert` message flips it back to true.
     pub mtls_ok: bool,
 
-    /// True when this session was established via a site-to-site peer sync_key
-    /// (registered by `site_sync::start()`).  Only sessions with this flag set
-    /// are allowed to carry `ControlPayload::RouteSync` messages.
+    /// Сессия площадки с отдельным sync_key, без права менять клиентскую БД.
     pub is_site_peer: bool,
+    pub site_peer_names: Vec<String>,
 
-    /// True when this session was registered as a pool-sync peer via
-    /// `create_pool_peer_session()`.  Only pool peer sessions are allowed to
-    /// carry `ControlPayload::PoolSync` messages — any other session sending
-    /// PoolSync is an attempt to inject or overwrite client records.
-    pub is_pool_peer: bool,
-
-    /// True when this session was established via the masked pool-client
-    /// handshake — a sibling aivpn server dialed us as a control-only
-    /// pool-client (PSK = `pool_client_psk(sync_key)`, DH against the shared
-    /// `pool_server_keypair(sync_key)`) to run DB anti-entropy. FORK-B of the
-    /// pool-sync redesign. Unlike `is_pool_peer` (a synthetic static-key
-    /// cluster session forced onto FIXED cluster framing), this session rides
-    /// a NORMAL per-session masked handshake — ServerHello PFS ratchet and
-    /// MaskUpdate mask adoption both apply — so it uses normal mask framing,
-    /// never cluster framing. It has NO `vpn_ip` and is never NATed; it is
-    /// only permitted to exchange `ControlPayload::PoolSync` /
-    /// `PoolStateDigest` for DB anti-entropy.
+    /// Масочная handshake-сессия узла. Права площадки дополнительно ограничены.
     pub is_masked_pool_peer: bool,
 
     /// Crypto-authenticated pool-node identity (Phase 4 — per-node
@@ -255,6 +239,7 @@ pub struct Session {
     /// id alone is trivially spoofable by anyone who can complete the masked
     /// pool-client handshake.
     pub verified_node_id: Option<String>,
+    pub verified_node_pub: Option<[u8; 32]>,
 
     /// Wave B-IP.2: the last `pool_partition::PartitionCheck` decision
     /// computed for this session's peer (from an inbound
@@ -332,6 +317,8 @@ pub struct Session {
     /// catalog does; a role change takes effect on the client's next
     /// reconnect, when a fresh `Session` (and a fresh `false`) is created.
     pub capabilities_sent: bool,
+    /// Однократное объявление формата клиентского потока.
+    pub client_packet_features: Option<u32>,
 
     /// Signature of the session state last pushed to the kernel accelerator
     /// (c2s key + wire offsets). 0 = never installed. When the live state
@@ -347,6 +334,23 @@ pub struct Session {
     /// re-arm the reservation with fresh tags, or every kernel-egress downlink
     /// packet is rejected as "Invalid resonance tag". 0 = never armed.
     pub kernel_dl_window: u64,
+
+    /// Эпоха replay, которую ядро уже приняло. 0 значит, что rotate еще не было.
+    pub kernel_epoch: u32,
+    /// Потеря общего окна запрещает пакеты до нового handshake.
+    pub kernel_faulted: bool,
+    /// Предыдущая эпоха после ratchet или rekey. 0 значит, что ее нет.
+    pub kernel_prev_epoch: u32,
+    /// Первые 8 байт c2s ключа, под которым текущая эпоха привязана.
+    pub kernel_key_tag: [u8; 8],
+    /// Эпоха, с которой локальное окно уже согласовано. Чужую эпоху не сливать.
+    pub kernel_epoch_applied: u32,
+    /// Последняя квота uplink, записанная в политику. Повтор не поднимает ее выше остатка.
+    pub kernel_quota_up_left: Option<u64>,
+    /// Последняя квота downlink, записанная в политику.
+    pub kernel_quota_down_left: Option<u64>,
+    /// Отпечаток политики, уже принятой ядром. 0 значит, что политика еще не стоит.
+    pub kernel_policy_sig: u64,
 
     /// Time window (`current_timestamp_ms / DEFAULT_WINDOW_MS`) that
     /// `expected_tags` was last precomputed for. Lets the fallback scan skip
@@ -400,6 +404,14 @@ impl ReplayWindow {
         self.words[bit / 64] |= 1u64 << (bit % 64);
     }
 
+    #[cfg(test)]
+    pub(crate) fn bit_set(&self, bit: usize) -> bool {
+        if bit >= TAG_WINDOW_SIZE {
+            return false;
+        }
+        self.words[bit / 64] & (1u64 << (bit % 64)) != 0
+    }
+
     /// Shift all bits toward higher indices (older) by `shift` positions.
     /// Called when the newest counter advances: history slides down and the
     /// oldest bits fall off the end of the window.
@@ -448,6 +460,27 @@ impl ReplayWindow {
 }
 
 impl Session {
+    /// Влить окно текущей эпохи. Вызывать только если эпоха не менялась.
+    pub fn absorb_shared_replay(&mut self, hi: u64, words: [u64; 8]) {
+        aivpn_common::kernel_accel::merge_replay_window(
+            &mut self.counter,
+            &mut self.received_bitmap.words,
+            hi,
+            &words,
+        );
+    }
+
+    /// Заменить локальное окно окном новой эпохи, не смешивая со старым.
+    pub fn adopt_shared_replay(&mut self, hi: u64, words: [u64; 8]) {
+        self.counter = hi;
+        self.received_bitmap.words = words;
+    }
+
+    /// Обычный Data принадлежит конкретному клиенту; площадки передают SiteData.
+    pub(crate) fn allows_data_source(&self, source: std::net::Ipv4Addr) -> bool {
+        self.vpn_ip == Some(source)
+    }
+
     pub fn new(
         session_id: [u8; 16],
         client_addr: SocketAddr,
@@ -456,6 +489,7 @@ impl Session {
     ) -> Self {
         let now = Instant::now();
         Self {
+            fragment_rx: aivpn_common::fragment::Reassembler::default(),
             session_id,
             client_addr,
             state: SessionState::Pending,
@@ -491,9 +525,10 @@ impl Session {
             pre_ratchet_keys: None,
             mtls_ok: true,
             is_site_peer: false,
-            is_pool_peer: false,
+            site_peer_names: Vec::new(),
             is_masked_pool_peer: false,
             verified_node_id: None,
+            verified_node_pub: None,
             last_partition_check: None,
             bootstrap_descriptors_sent: false,
             pending_rekey_keypair: None,
@@ -510,8 +545,17 @@ impl Session {
             fec_repair_seq_hi: None,
             mask_catalog_version_sent: 0,
             capabilities_sent: false,
+            client_packet_features: None,
             kernel_install_sig: 0,
             kernel_dl_window: 0,
+            kernel_epoch: 0,
+            kernel_faulted: false,
+            kernel_prev_epoch: 0,
+            kernel_key_tag: [0u8; 8],
+            kernel_epoch_applied: 0,
+            kernel_quota_up_left: None,
+            kernel_quota_down_left: None,
+            kernel_policy_sig: 0,
             tag_window_tw: 0,
             mdh_pool: Vec::new(),
             mdh_pool_idx: 0,
@@ -882,8 +926,6 @@ impl Session {
             self.tag_window_base = self.counter;
             self.expected_tags = std::mem::take(&mut self.ratcheted_expected_tags);
             self.received_bitmap.clear();
-            self.pending_bytes_in = 0;
-            self.pending_bytes_out = 0;
             self.is_ratcheted = true;
             // Keep `server_eph_pub` (a PUBLIC key) — the client sends its
             // transcript-bound `DeviceEnrollment` proof immediately AFTER the
@@ -925,15 +967,14 @@ impl Session {
 
 /// Session Manager with O(1) tag lookup
 pub struct SessionManager {
+    /// Слабая ссылка не удерживает устройство после остановки gateway.
+    kernel: std::sync::OnceLock<std::sync::Weak<aivpn_common::kernel_accel::KernelAccel>>,
     /// Sessions by ID
     sessions: DashMap<[u8; 16], Arc<Mutex<Session>>>,
     /// Tag -> Session ID mapping for O(1) lookup
     tag_map: DashMap<[u8; TAG_SIZE], [u8; 16]>,
     /// VPN IP -> Session ID mapping for TUN return routing
     vpn_ip_map: DashMap<Ipv4Addr, [u8; 16]>,
-    /// Next VPN IP to assign (last octet)
-    /// Pool of free VPN IP octets (2..=254). IPs are returned when sessions end.
-    ip_pool: Mutex<BTreeSet<u8>>,
     /// Server's long-term keypair
     server_keys: KeyPair,
     /// Server's signing key (Ed25519)
@@ -947,6 +988,10 @@ pub struct SessionManager {
 }
 
 impl SessionManager {
+    pub(crate) fn attach_kernel(&self, kernel: &Arc<aivpn_common::kernel_accel::KernelAccel>) {
+        let _ = self.kernel.set(Arc::downgrade(kernel));
+    }
+
     pub fn new(
         server_keys: KeyPair,
         signing_key: ed25519_dalek::SigningKey,
@@ -969,10 +1014,10 @@ impl SessionManager {
             .map(|s| Duration::from_secs(s))
             .unwrap_or(IDLE_TIMEOUT);
         Self {
+            kernel: std::sync::OnceLock::new(),
             sessions: DashMap::new(),
             tag_map: DashMap::new(),
             vpn_ip_map: DashMap::new(),
-            ip_pool: Mutex::new((2..=254u8).collect()),
             server_keys,
             signing_key,
             default_mask,
@@ -1009,13 +1054,6 @@ impl SessionManager {
         self.handshake_tag_precheck_inner(eph_pub, preshared_key, cand_tag, &dh1)
     }
 
-    /// FORK-B of the pool-sync redesign: identical cheap pre-check as
-    /// `handshake_tag_precheck`, but for a sibling aivpn server dialing us as
-    /// a masked pool-client. The DH uses the shared pool server keypair
-    /// (`static_kp`, derived from `sync_key` via `crypto::pool_server_keypair`)
-    /// instead of `self.server_keys`, since the dialer computed its side of
-    /// DH1 against that shared keypair's public key, not our real long-term
-    /// server static key.
     pub fn handshake_tag_precheck_with_static(
         &self,
         eph_pub: &[u8; X25519_PUBLIC_KEY_SIZE],
@@ -1076,22 +1114,6 @@ impl SessionManager {
         preshared_key: Option<[u8; 32]>,
         static_vpn_ip: Option<Ipv4Addr>,
     ) -> Result<Arc<Mutex<Session>>> {
-        // Look for a reusable VPN IP from an existing session for the same
-        // client IP, but do NOT remove the old session yet — the caller
-        // will do that only after the handshake tag validates.
-        let reused_vpn_ip: Option<Ipv4Addr> = self
-            .sessions
-            .iter()
-            .filter_map(|entry| {
-                let session = entry.value().lock();
-                if session.client_addr.ip() == client_addr.ip() {
-                    session.vpn_ip
-                } else {
-                    None
-                }
-            })
-            .next();
-
         if self.sessions.len() >= MAX_SESSIONS {
             return Err(Error::Session("Max sessions reached".into()));
         }
@@ -1137,19 +1159,8 @@ impl SessionManager {
             self.build_and_insert_session(client_addr, eph_pub, dh1, preshared_key, false)?;
         let session_id = session.lock().session_id;
 
-        // Assign VPN IP and register mapping.
-        // Priority: 1) static IP from client config, 2) reused IP, 3) auto-assign
-        let vpn_ip = if let Some(ip) = static_vpn_ip.or(reused_vpn_ip) {
-            // Static or reused IP — ensure it's removed from the free pool
-            self.ip_pool.lock().remove(&ip.octets()[3]);
-            Some(ip)
-        } else {
-            // Allocate the lowest available IP from the pool
-            self.ip_pool
-                .lock()
-                .pop_first()
-                .map(|octet| Ipv4Addr::new(10, 0, 0, octet))
-        };
+        // Адрес приходит из БД. Совпадение внешнего IP не доказывает личность.
+        let vpn_ip = static_vpn_ip;
 
         if let Some(vpn_ip) = vpn_ip {
             session.lock().vpn_ip = Some(vpn_ip);
@@ -1160,25 +1171,8 @@ impl SessionManager {
         Ok(session)
     }
 
-    /// FORK-B of the pool-sync redesign: register a session for a sibling
-    /// aivpn server that dialed us as a control-only masked pool-client, to
-    /// run DB anti-entropy (`ControlPayload::PoolSync` / `PoolStateDigest`).
-    ///
-    /// Unlike `create_pool_peer_session` (a synthetic, handshake-free,
-    /// static-key cluster session forced onto FIXED cluster framing), this
-    /// rides the SAME masked-handshake machinery as `create_session` — DH1
-    /// against the shared `pool_kp` (= `crypto::pool_server_keypair(sync_key)`)
-    /// with `pool_psk` (= `crypto::pool_client_psk(sync_key)`) as the initial
-    /// PSK, followed by the identical PFS ratchet prep + ServerHello signature
-    /// + tag-window population — so the dialer's normal ServerHello/ratchet/
-    /// MaskUpdate flow works completely unchanged and the session uses normal
-    /// mask framing, not cluster framing.
-    ///
-    /// No VPN IP is assigned (no `ip_pool`/`vpn_ip_map` touched) and the
-    /// per-IP (5) / per-subnet (10) caps in `create_session` are bypassed —
-    /// those caps defend against unauthenticated, spoofable client floods,
-    /// whereas this peer is already authenticated by the pool-client PSK.
-    /// The `MAX_SESSIONS` guard is still enforced.
+    /// Масочная сессия узла: свежий DH, PSK и PFS, без клиентского VPN-адреса.
+    /// Трафик площадок и синхронизация БД передаются отдельными Control-сообщениями.
     pub fn create_masked_pool_peer_session(
         &self,
         client_addr: SocketAddr,
@@ -1318,63 +1312,48 @@ impl SessionManager {
         removed
     }
 
-    /// B1 fix companion: dedup masked pool-client peer sessions from the same
-    /// source IP. Unlike `cleanup_old_sessions_for_ip`, this ONLY removes
-    /// sessions with `is_masked_pool_peer == true` — ordinary client, pool-peer
-    /// (`is_pool_peer`), and site-peer (`is_site_peer`) sessions from that same
-    /// IP are never touched, since a masked pool-client dialer's source IP can
-    /// legitimately be a sibling aivpn node that also happens to be a normal
-    /// client's egress (or vice versa) and those session kinds have entirely
-    /// separate dedup rules already.
-    ///
-    /// `create_masked_pool_peer_session` gives every dialer handshake a fresh
-    /// random session_id (`build_and_insert_session`, unlike the deterministic
-    /// `create_pool_peer_session`), and masked peers have neither a `vpn_ip`
-    /// nor a `client_id`, so none of the existing dedup paths
-    /// (`cleanup_old_sessions_for_ip`/`_vpn_ip`/`_client_id`) ever fire for
-    /// them. Without an explicit dedup call, every reconnect from a legitimate
-    /// dialer (backoff 2–30 s, see `pool_dialer.rs`) — or every handshake from
-    /// anyone who knows the pool-client PSK — piles up a new permanent session
-    /// instead of replacing the old one. The caller (gateway, after a masked
-    /// handshake validates) is expected to call this right after
-    /// `create_masked_pool_peer_session` succeeds, mirroring how
-    /// `create_session` callers must call `cleanup_old_sessions_for_ip`.
-    ///
-    /// Returns the list of removed session IDs (for stopping recordings, etc.,
-    /// mirroring the other `cleanup_*` helpers — masked peers never have
-    /// recordings in practice, but the shape stays consistent).
-    pub fn cleanup_masked_peer_sessions_for_ip(
+    /// До проверки личности заменяем только незавершенный сеанс того же endpoint.
+    pub fn cleanup_masked_peer_handshakes(
         &self,
-        ip: &std::net::IpAddr,
+        addr: &SocketAddr,
         keep_session_id: &[u8; 16],
     ) -> Vec<[u8; 16]> {
-        let to_remove: Vec<[u8; 16]> = self
+        self.cleanup_masked_peers(keep_session_id, |session| {
+            session.client_addr == *addr && session.verified_node_id.is_none()
+        })
+    }
+
+    /// Переподключение подтвержденного узла не затрагивает соседей за одним NAT.
+    pub fn cleanup_masked_peer_identity(
+        &self,
+        node_id: &str,
+        keep_session_id: &[u8; 16],
+    ) -> Vec<[u8; 16]> {
+        self.cleanup_masked_peers(keep_session_id, |session| {
+            session.verified_node_id.as_deref() == Some(node_id)
+        })
+    }
+
+    fn cleanup_masked_peers(
+        &self,
+        keep_session_id: &[u8; 16],
+        matches: impl Fn(&Session) -> bool,
+    ) -> Vec<[u8; 16]> {
+        let to_remove: Vec<_> = self
             .sessions
             .iter()
             .filter_map(|entry| {
-                let session = entry.value().lock();
-                if session.is_masked_pool_peer
-                    && session.client_addr.ip() == *ip
-                    && entry.key() != keep_session_id
-                {
-                    Some(*entry.key())
-                } else {
-                    None
+                if entry.key() == keep_session_id {
+                    return None;
                 }
+                let session = entry.value().lock();
+                (session.is_masked_pool_peer && matches(&session)).then_some(*entry.key())
             })
             .collect();
-
-        let mut removed = Vec::new();
-        for session_id in to_remove {
-            info!(
-                "Removing stale masked pool-peer session for IP {} after successful re-handshake",
-                ip
-            );
-            if self.remove_session(&session_id).is_some() {
-                removed.push(session_id);
-            }
-        }
-        removed
+        to_remove
+            .into_iter()
+            .filter(|id| self.remove_session(id).is_some())
+            .collect()
     }
 
     /// Remove old sessions for the same VPN IP (same client) except the
@@ -1466,138 +1445,8 @@ impl SessionManager {
                 let sess = entry.value().lock();
                 if sess.vpn_ip == Some(vpn_ip) {
                     self.vpn_ip_map.insert(vpn_ip, *entry.key());
-                    self.ip_pool.lock().remove(&vpn_ip.octets()[3]);
                     break;
                 }
-            }
-        }
-    }
-
-    /// Register a synthetic "cluster session" used for pool-node synchronisation.
-    ///
-    /// All pool nodes derive identical `SessionKeys` from the shared `sync_key`
-    /// (same blake3 KDF domain strings) and the resonance counter is pinned to
-    /// a 5-second wall-clock bucket, so every node independently computes the
-    /// same expected tag for the same 5-second window — no handshake required.
-    pub fn create_pool_peer_session(
-        &self,
-        sync_key: &[u8; 32],
-        peer_addr: std::net::SocketAddr,
-    ) -> [u8; 16] {
-        let keys = aivpn_common::crypto::SessionKeys {
-            session_key: blake3::derive_key("aivpn-pool-enc-v1", sync_key),
-            session_key_s2c: blake3::derive_key("aivpn-pool-enc-v1", sync_key),
-            tag_secret: blake3::derive_key("aivpn-pool-tag-v1", sync_key),
-            prng_seed: blake3::derive_key("aivpn-pool-prng-v1", sync_key),
-        };
-
-        // Deterministic session_id — all pool nodes agree on the same value.
-        let id_hash = blake3::hash(sync_key);
-        let mut session_id = [0u8; 16];
-        session_id.copy_from_slice(&id_hash.as_bytes()[..16]);
-
-        let counter = crypto::current_timestamp_ms() / 5_000;
-
-        let session_arc = {
-            let mut s = Session::new(session_id, peer_addr, keys, [0u8; X25519_PUBLIC_KEY_SIZE]);
-            s.state = SessionState::Active;
-            s.counter = counter;
-            s.is_pool_peer = true;
-            s.update_tag_window();
-            Arc::new(Mutex::new(s))
-        };
-
-        {
-            let sess = session_arc.lock();
-            for tag in sess.expected_tags.values() {
-                self.tag_map.insert(*tag, session_id);
-            }
-        }
-
-        // Bypass MAX_SESSIONS cap — synthetic sessions don't count against client quota.
-        self.sessions.insert(session_id, session_arc);
-        info!(
-            "pool_sync: cluster session registered ({} tag slots)",
-            TAG_WINDOW_SIZE * 2 - 1
-        );
-        session_id
-    }
-
-    /// Register a synthetic session for an authenticated site-to-site peer.
-    /// Identical to `create_pool_peer_session` but marks `is_site_peer = true`
-    /// so the gateway will accept `RouteSync` messages from this session.
-    /// Like pool peers, site peers bypass the `MAX_SESSIONS` cap — synthetic sessions
-    /// must not consume the client quota.
-    pub fn create_site_peer_session(
-        &self,
-        sync_key: &[u8; 32],
-        peer_addr: std::net::SocketAddr,
-        peer_name: &str,
-    ) -> [u8; 16] {
-        let keys = aivpn_common::crypto::SessionKeys {
-            session_key: blake3::derive_key("aivpn-pool-enc-v1", sync_key),
-            session_key_s2c: blake3::derive_key("aivpn-pool-enc-v1", sync_key),
-            tag_secret: blake3::derive_key("aivpn-pool-tag-v1", sync_key),
-            prng_seed: blake3::derive_key("aivpn-pool-prng-v1", sync_key),
-        };
-
-        // Deterministic session_id per (sync_key, peer_name) pair.
-        let mut id_input = sync_key.to_vec();
-        id_input.extend_from_slice(peer_name.as_bytes());
-        let id_hash = blake3::hash(&id_input);
-        let mut session_id = [0u8; 16];
-        session_id.copy_from_slice(&id_hash.as_bytes()[..16]);
-
-        let counter = crypto::current_timestamp_ms() / 5_000;
-
-        let session_arc = {
-            let mut s = Session::new(session_id, peer_addr, keys, [0u8; X25519_PUBLIC_KEY_SIZE]);
-            s.state = SessionState::Active;
-            s.counter = counter;
-            s.is_site_peer = true;
-            s.update_tag_window();
-            Arc::new(Mutex::new(s))
-        };
-
-        {
-            let sess = session_arc.lock();
-            for tag in sess.expected_tags.values() {
-                self.tag_map.insert(*tag, session_id);
-            }
-        }
-
-        self.sessions.insert(session_id, session_arc);
-        info!(
-            "site_sync: peer session registered for '{}' ({} tag slots)",
-            peer_name,
-            TAG_WINDOW_SIZE * 2 - 1
-        );
-        session_id
-    }
-
-    /// Advance the synthetic cluster session's tag window to the current 5-second
-    /// time bucket.  Call every ≤60 s to keep expected-tag map aligned with wall
-    /// time and to refresh `last_seen` so the session is not idle-evicted.
-    pub fn refresh_pool_peer_tags(&self, session_id: &[u8; 16]) {
-        if let Some(entry) = self.sessions.get(session_id) {
-            let old_tags: Vec<[u8; TAG_SIZE]> = {
-                entry
-                    .value()
-                    .lock()
-                    .expected_tags
-                    .values()
-                    .cloned()
-                    .collect()
-            };
-            for t in &old_tags {
-                self.tag_map.remove(t);
-            }
-            let mut sess = entry.value().lock();
-            sess.counter = crypto::current_timestamp_ms() / 5_000;
-            sess.last_seen = std::time::Instant::now();
-            sess.update_tag_window();
-            for t in sess.expected_tags.values() {
-                self.tag_map.insert(*t, *session_id);
             }
         }
     }
@@ -1828,7 +1677,8 @@ impl SessionManager {
     /// The returned session_id can be used to stop active recording.
     pub fn remove_session(&self, session_id: &[u8; 16]) -> Option<[u8; 16]> {
         if let Some((_, session)) = self.sessions.remove(session_id) {
-            let sess = session.lock();
+            let mut sess = session.lock();
+            sess.kernel_faulted = true;
             // Remove all tags from tag map (initial + ratcheted + pre-ratchet grace)
             for tag in sess.expected_tags.values() {
                 self.tag_map.remove(tag);
@@ -1842,17 +1692,12 @@ impl SessionManager {
             // Remove VPN IP mapping only if it still points to THIS session.
             // A newer session may have already claimed the same VPN IP.
             if let Some(vpn_ip) = sess.vpn_ip {
-                if self
-                    .vpn_ip_map
-                    .remove_if(&vpn_ip, |_, sid| sid == session_id)
-                    .is_some()
-                {
-                    // No other session owns this IP — return it to the free pool
-                    let octet = vpn_ip.octets()[3];
-                    if octet >= 2 {
-                        self.ip_pool.lock().insert(octet);
-                    }
-                }
+                self.vpn_ip_map
+                    .remove_if(&vpn_ip, |_, sid| sid == session_id);
+            }
+            drop(sess);
+            if let Some(kernel) = self.kernel.get().and_then(std::sync::Weak::upgrade) {
+                let _ = kernel.session_remove(session_id);
             }
             Some(*session_id)
         } else {
@@ -1969,9 +1814,6 @@ impl SessionManager {
                 // dedup path fires for these (no vpn_ip, no client_id) and
                 // nothing else ever removes them — exhausting MAX_SESSIONS
                 // in seconds. A dead/gone dialer now ages out normally.
-                if sess.is_pool_peer || sess.is_site_peer {
-                    return false;
-                }
                 sess.last_seen.elapsed() > self.idle_timeout
                     || (self.hard_timeout > Duration::ZERO
                         && sess.created_at.elapsed() > self.hard_timeout)
@@ -2177,7 +2019,7 @@ impl SessionManager {
             // sessions have real ratchet state and should rotate keys like
             // any other session instead of running on a single static key
             // for the session's entire (potentially days-long) lifetime.
-            if sess.is_pool_peer || sess.is_site_peer || !sess.is_ratcheted {
+            if !sess.is_ratcheted {
                 continue;
             }
 
@@ -2657,6 +2499,42 @@ mod tests {
         )
     }
 
+    #[test]
+    fn masked_peer_handshakes_use_fresh_sessions_and_reject_replay() {
+        let manager = make_manager();
+        let server = crypto::pool_server_keypair(&[7; 32]);
+        let psk = crypto::pool_client_psk(&[7; 32]);
+        let first = manager
+            .create_masked_pool_peer_session(
+                "127.0.0.1:443".parse().unwrap(),
+                crypto::KeyPair::generate().public_key_bytes(),
+                &server,
+                &psk,
+            )
+            .unwrap();
+        let second = manager
+            .create_masked_pool_peer_session(
+                "127.0.0.1:444".parse().unwrap(),
+                crypto::KeyPair::generate().public_key_bytes(),
+                &server,
+                &psk,
+            )
+            .unwrap();
+        let mut first = first.lock();
+        let second = second.lock();
+        assert_ne!(first.keys.session_key, second.keys.session_key);
+        assert_ne!(first.session_id, second.session_id);
+        first.mark_tag_received(1);
+        first.update_tag_window();
+        let tag = crypto::generate_resonance_tag(
+            &first.keys.tag_secret,
+            1,
+            crypto::compute_time_window(crypto::current_timestamp_ms(), crypto::DEFAULT_WINDOW_MS),
+        );
+        assert!(first.validate_tag(&tag).is_none());
+        assert!(!first.allows_data_source("10.0.0.2".parse().unwrap()));
+    }
+
     /// A live peer must be recognised by its exact address, so a stale packet
     /// that misses the tag lookup is never charged to the handshake cooldown —
     /// and a neighbour sharing its public IP behind NAT is never mistaken for it.
@@ -3089,17 +2967,17 @@ mod tests {
         );
     }
 
-    // ── B1 fix: cleanup_masked_peer_sessions_for_ip dedup scoping ──────────
+    // ── B1 fix: cleanup_masked_peer_handshakes dedup scoping ──────────
 
     #[test]
-    fn cleanup_masked_peer_sessions_for_ip_only_removes_matching_masked_peers() {
+    fn cleanup_masked_peer_handshakes_only_removes_matching_masked_peers() {
         let sm = make_manager();
         let sync_key = [42u8; 32];
         let pool_kp = crypto::pool_server_keypair(&sync_key);
         let pool_psk = crypto::pool_client_psk(&sync_key);
 
         let addr_a: SocketAddr = "127.0.0.1:6001".parse().unwrap();
-        let addr_b: SocketAddr = "127.0.0.2:6002".parse().unwrap();
+        let addr_b: SocketAddr = "127.0.0.1:6002".parse().unwrap();
 
         // Two masked pool-peer sessions from the SAME source IP — simulates a
         // reconnecting (or attacking) dialer whose earlier session was never
@@ -3125,7 +3003,7 @@ mod tests {
         let other_ip_id = other_ip_session.lock().session_id;
 
         // An ORDINARY client session sharing the SAME source IP must survive:
-        // cleanup_masked_peer_sessions_for_ip must be scoped to
+        // cleanup_masked_peer_handshakes must be scoped to
         // `is_masked_pool_peer` sessions only, never touching real clients
         // (or pool_peer/site_peer synthetic sessions) that happen to share an
         // address with a dialer.
@@ -3135,7 +3013,7 @@ mod tests {
             .expect("ordinary client session must be created");
         let client_id = client_session.lock().session_id;
 
-        let removed = sm.cleanup_masked_peer_sessions_for_ip(&addr_a.ip(), &keep_id);
+        let removed = sm.cleanup_masked_peer_handshakes(&addr_a, &keep_id);
 
         assert_eq!(
             removed,
@@ -3161,6 +3039,27 @@ mod tests {
     }
 
     // ── Pre-ratchet grace: keys must outlive the tags ─────────────────────────
+
+    #[test]
+    fn removal_closes_references_held_by_packet_workers() {
+        let (manager, session, _) = make_manager_with_session();
+        let id = session.lock().session_id;
+        assert!(!session.lock().kernel_faulted);
+        assert_eq!(manager.remove_session(&id), Some(id));
+        assert!(manager.get_session(&id).is_none());
+        assert!(session.lock().kernel_faulted);
+    }
+
+    #[test]
+    fn ratchet_preserves_unflushed_traffic() {
+        let mut session = make_session();
+        session.pending_bytes_in = 701;
+        session.pending_bytes_out = 503;
+        session.ratcheted_keys = Some(make_keys(9));
+        session.complete_ratchet();
+        assert_eq!(session.pending_bytes_in, 701);
+        assert_eq!(session.pending_bytes_out, 503);
+    }
 
     #[test]
     fn complete_ratchet_retains_pre_ratchet_keys_for_the_grace_window() {

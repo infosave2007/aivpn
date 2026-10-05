@@ -75,19 +75,33 @@ impl QosEnforcer {
         // see `tc_loader::TcQosRule`), not "block everything": a TokenBucket
         // with refill rate 0 would let ~1500 bytes through and then drop
         // every packet forever.
-        let entry = ClientBuckets {
-            up: qos
-                .bandwidth_limit_up
-                .filter(|&r| r > 0)
-                .map(TokenBucket::new),
-            down: qos
-                .bandwidth_limit_down
-                .filter(|&r| r > 0)
-                .map(TokenBucket::new),
-            dscp: qos.dscp_class,
-        };
-        self.buckets
-            .insert(client_id.to_string(), parking_lot::Mutex::new(entry));
+        fn update_bucket(bucket: &mut Option<TokenBucket>, rate: Option<u64>) {
+            let rate = rate.filter(|&value| value > 0);
+            match (bucket.as_mut(), rate) {
+                (Some(current), Some(rate)) => {
+                    // Повторная загрузка БД не выдает клиенту новую порцию трафика.
+                    current.try_consume(0);
+                    current.rate_bps = rate;
+                    current.capacity = (rate / 10).max(1500);
+                    current.tokens = current.tokens.min(current.capacity as f64);
+                }
+                (_, rate) => *bucket = rate.map(TokenBucket::new),
+            }
+        }
+        let entry = self
+            .buckets
+            .entry(client_id.to_string())
+            .or_insert_with(|| {
+                parking_lot::Mutex::new(ClientBuckets {
+                    up: None,
+                    down: None,
+                    dscp: None,
+                })
+            });
+        let mut current = entry.lock();
+        update_bucket(&mut current.up, qos.bandwidth_limit_up);
+        update_bucket(&mut current.down, qos.bandwidth_limit_down);
+        current.dscp = qos.dscp_class;
     }
 
     pub fn remove_client(&self, client_id: &str) {
@@ -148,7 +162,11 @@ impl Default for QosEnforcer {
 
 /// Apply DSCP to an IPv4 packet payload (modifies TOS byte in-place).
 pub fn apply_dscp_ipv4(pkt: &mut [u8], dscp: u8) -> bool {
-    if pkt.len() < 20 {
+    if pkt.len() < 20 || pkt[0] >> 4 != 4 {
+        return false;
+    }
+    let header_len = usize::from(pkt[0] & 15) * 4;
+    if header_len < 20 || header_len > pkt.len() || dscp > 63 {
         return false;
     }
     let dscp = dscp & 0x3F;
@@ -156,10 +174,28 @@ pub fn apply_dscp_ipv4(pkt: &mut [u8], dscp: u8) -> bool {
     pkt[1] = (dscp << 2) | ecn;
     pkt[10] = 0;
     pkt[11] = 0;
-    let sum = ipv4_checksum(&pkt[..20]);
+    let sum = ipv4_checksum(&pkt[..header_len]);
     pkt[10] = (sum >> 8) as u8;
     pkt[11] = (sum & 0xff) as u8;
     true
+}
+
+/// IPv6 хранит Traffic Class в двух байтах; ECN и Flow Label сохраняются.
+pub fn apply_dscp_ipv6(pkt: &mut [u8], dscp: u8) -> bool {
+    if pkt.len() < 40 || pkt[0] >> 4 != 6 || dscp > 63 {
+        return false;
+    }
+    pkt[0] = (pkt[0] & 0xf0) | (dscp >> 2);
+    pkt[1] = (pkt[1] & 0x3f) | ((dscp & 3) << 6);
+    true
+}
+
+pub fn apply_dscp(pkt: &mut [u8], dscp: u8) -> bool {
+    match pkt.first().map(|byte| byte >> 4) {
+        Some(4) => apply_dscp_ipv4(pkt, dscp),
+        Some(6) => apply_dscp_ipv6(pkt, dscp),
+        _ => false,
+    }
 }
 
 fn ipv4_checksum(header: &[u8]) -> u16 {
@@ -186,7 +222,11 @@ pub fn parse_bandwidth(s: &str) -> Option<u64> {
     } else {
         (s, 1u64)
     };
-    num.parse::<f64>().ok().map(|n| (n * mul as f64) as u64)
+    let rate = num.parse::<f64>().ok()? * mul as f64;
+    if !rate.is_finite() || rate < 0.0 || rate >= u64::MAX as f64 {
+        return None;
+    }
+    Some(rate as u64)
 }
 
 /// DSCP class name → numeric value.
@@ -213,13 +253,57 @@ pub fn dscp_by_name(name: &str) -> Option<u8> {
         "CS5" => Some(40),
         "CS6" => Some(48),
         "CS7" => Some(56),
-        _ => name.parse::<u8>().ok(),
+        _ => name.parse::<u8>().ok().filter(|value| *value <= 63),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn refreshing_qos_does_not_refill_consumed_tokens() {
+        let enforcer = QosEnforcer::new();
+        let qos = ClientQos {
+            bandwidth_limit_up: Some(1),
+            bandwidth_limit_down: Some(1),
+            dscp_class: None,
+            priority: None,
+        };
+        enforcer.set_client("client", &qos);
+        assert!(enforcer.check_upstream("client", 1500));
+        assert!(enforcer.check_downstream("client", 1500));
+        enforcer.set_client("client", &qos);
+        assert!(!enforcer.check_upstream("client", 100));
+        assert!(!enforcer.check_downstream("client", 100));
+    }
+
+    #[test]
+    fn dscp_preserves_ipv4_options_checksum_and_ipv6_flow_bits() {
+        let mut packet = vec![0; 28];
+        packet[0] = 0x47;
+        packet[1] = 3;
+        packet[20..28].copy_from_slice(&[1, 1, 1, 1, 0, 0, 0, 0]);
+        assert!(apply_dscp(&mut packet, 46));
+        assert_eq!(packet[1], (46 << 2) | 3);
+        assert_eq!(ipv4_checksum(&packet), 0);
+        let mut packet = vec![0; 40];
+        packet[0] = 0x60;
+        packet[1] = 0x3b;
+        assert!(apply_dscp(&mut packet, 46));
+        assert_eq!(packet[0], 0x6b);
+        assert_eq!(packet[1], 0xbb);
+        assert!(!apply_dscp(&mut packet, 64));
+    }
+
+    #[test]
+    fn invalid_qos_numbers_are_rejected() {
+        for value in ["NaN", "inf", "-1", "1e100", "18446744073709551616"] {
+            assert_eq!(parse_bandwidth(value), None);
+        }
+        assert_eq!(dscp_by_name("64"), None);
+        assert_eq!(dscp_by_name("63"), Some(63));
+    }
 
     #[test]
     fn token_bucket_allows_within_capacity() {

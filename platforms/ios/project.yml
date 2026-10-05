@@ -60,6 +60,7 @@ targets:
     platform: iOS
     deploymentTarget: "16.0"
     sources:
+      - path: Identity
       - path: Tunnel
         excludes:
           - "*.entitlements"

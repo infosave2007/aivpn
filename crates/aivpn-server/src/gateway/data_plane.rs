@@ -14,18 +14,21 @@ impl super::Gateway {
         tun_writer: tokio::sync::mpsc::Sender<Vec<u8>>,
         sessions: Arc<SessionManager>,
         socket: Arc<UdpSocket>,
-        chain_reverse_routes: Arc<DashMap<Ipv4Addr, ([u8; 16], Instant)>>,
+        chain_reverse_routes: Arc<DashMap<std::net::IpAddr, ([u8; 16], Instant)>>,
         chain_reverse_rx: Option<mpsc::Receiver<Vec<u8>>>,
         mask: MaskProfile,
-        server_vpn_ip: Ipv4Addr,
+        network: aivpn_common::network_config::VpnNetworkConfig,
         recorder: Option<Arc<RecordingManager>>,
         client_db: Option<Arc<ClientDatabase>>,
         qos_enforcer: Arc<crate::qos::QosEnforcer>,
         allow_peer_routing: bool,
         downlink_shaping: ShapingLevel,
+        pool_dialer: Option<Arc<crate::pool_dialer::PoolDialer>>,
+        site_data_rx: Option<mpsc::Receiver<Vec<u8>>>,
+        kernel_accel: Option<Arc<KernelAccel>>,
     ) {
         let mut buf = vec![0u8; MAX_PACKET_SIZE];
-        let server_ip = server_vpn_ip;
+        let server_ip = network.server_vpn_ip;
 
         // A1: shard the downlink across workers by destination VPN IP so
         // encryption for different clients runs in parallel. One dst IP always
@@ -49,6 +52,8 @@ impl super::Gateway {
                 client_db.clone(),
                 qos_enforcer.clone(),
                 downlink_shaping,
+                network.clone(),
+                kernel_accel.clone(),
             ));
         }
         info!("Downlink sharded across {} workers", worker_count);
@@ -71,11 +76,11 @@ impl super::Gateway {
             let reverse_worker_count = worker_count;
             tokio::spawn(async move {
                 while let Some(packet) = rx.recv().await {
-                    if packet.len() < 20 || (packet[0] >> 4) != 4 {
-                        continue; // Not IPv4
-                    }
-                    let dst_ip = Ipv4Addr::new(packet[16], packet[17], packet[18], packet[19]);
-                    let worker_idx = (u32::from(dst_ip) as usize) % reverse_worker_count;
+                    let Some(header) = aivpn_common::ip_packet::IpPacket::parse(&packet) else {
+                        continue;
+                    };
+                    let dst_ip = header.destination;
+                    let worker_idx = header.destination_shard(reverse_worker_count);
                     if reverse_worker_txs[worker_idx].send(packet).await.is_err() {
                         debug!(
                             "chain_reverse: downlink worker {} channel closed — dropping reply for {}",
@@ -87,20 +92,35 @@ impl super::Gateway {
             info!("chain_reverse: reverse-chain-forward downlink dispatch active");
         }
 
+        // SiteData принимается в локальный TUN. Это не ответ клиенту и не NAT.
+        if let Some(mut rx) = site_data_rx {
+            let tun_inject = tun_writer.clone();
+            tokio::spawn(async move {
+                while let Some(packet) = rx.recv().await {
+                    if tun_inject.send(packet).await.is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+
         loop {
             match tun_reader.read(&mut buf).await {
                 Ok(0) => continue,
                 Ok(n) => {
                     let packet = &buf[..n];
 
-                    // Parse destination IP from IP header
-                    if packet.len() < 20 || (packet[0] >> 4) != 4 {
-                        continue; // Not IPv4
-                    }
-                    let dst_ip = Ipv4Addr::new(packet[16], packet[17], packet[18], packet[19]);
+                    let Some(header) = aivpn_common::ip_packet::IpPacket::parse(packet) else {
+                        continue;
+                    };
+                    let packet = &packet[..header.length];
+                    let dst_ip = header.destination;
 
                     // Handle ICMP echo request to server's own IP (ping to gateway)
-                    if dst_ip == server_ip && packet.len() >= 28 && packet[9] == 1 {
+                    if dst_ip == std::net::IpAddr::V4(server_ip)
+                        && packet.len() >= 28
+                        && packet[9] == 1
+                    {
                         // ICMP packet to server — generate echo reply
                         if let Some(reply) = Self::build_icmp_echo_reply(packet, &server_ip) {
                             let _ = tun_writer.send(reply).await;
@@ -108,13 +128,42 @@ impl super::Gateway {
                         continue;
                     }
 
+                    // Адрес ровно одной площадки уходит SiteData и не попадает в NAT.
+                    // Две площадки или dialer молчит: пакет дропаем, наружу не выпускаем.
+                    {
+                        match crate::site_sync::site_destination_for(dst_ip) {
+                            Some(crate::site_sync::SiteDestination::Peer(endpoint)) => {
+                                if let Some(dialer) = pool_dialer.as_ref() {
+                                    let _ = dialer.send_to_peer(
+                                        &endpoint,
+                                        ControlPayload::SiteData {
+                                            payload: packet.to_vec(),
+                                        },
+                                    );
+                                }
+                                continue;
+                            }
+                            Some(crate::site_sync::SiteDestination::Ambiguous) => {
+                                debug!(
+                                    "TUN: site destination {} matches more than one peer",
+                                    dst_ip
+                                );
+                                continue;
+                            }
+                            None => {}
+                        }
+                    }
+
                     // Guard client-to-client relay (0.9.0+).
                     // If the packet's source IP belongs to a VPN client session,
                     // this is intra-VPN (peer-to-peer) traffic — only forward when
                     // allow_peer_routing is enabled.
                     if !allow_peer_routing {
-                        let src_ip = Ipv4Addr::new(packet[12], packet[13], packet[14], packet[15]);
-                        if sessions.get_session_by_vpn_ip(&src_ip).is_some() {
+                        let src_ip = header.source;
+                        if inner_client_ipv4(&network, src_ip)
+                            .and_then(|ip| sessions.get_session_by_vpn_ip(&ip))
+                            .is_some()
+                        {
                             debug!(
                                 "TUN: dropping peer packet {}->{} (allow_peer_routing=false)",
                                 src_ip, dst_ip
@@ -123,7 +172,7 @@ impl super::Gateway {
                         }
                     }
 
-                    let worker_idx = (u32::from(dst_ip) as usize) % worker_count;
+                    let worker_idx = header.destination_shard(worker_count);
                     if worker_txs[worker_idx].send(packet.to_vec()).await.is_err() {
                         warn!(
                             "Downlink worker {} channel closed — dropping packet for {}",
@@ -147,12 +196,14 @@ impl super::Gateway {
         worker_id: usize,
         sessions: Arc<SessionManager>,
         socket: Arc<UdpSocket>,
-        chain_reverse_routes: Arc<DashMap<Ipv4Addr, ([u8; 16], Instant)>>,
+        chain_reverse_routes: Arc<DashMap<std::net::IpAddr, ([u8; 16], Instant)>>,
         mask: MaskProfile,
         recorder: Option<Arc<RecordingManager>>,
         client_db: Option<Arc<ClientDatabase>>,
         qos_enforcer: Arc<crate::qos::QosEnforcer>,
         downlink_shaping: ShapingLevel,
+        network: aivpn_common::network_config::VpnNetworkConfig,
+        kernel_accel: Option<Arc<KernelAccel>>,
     ) {
         // A7: RNG for downlink padding size sampling + filler bytes. Per-worker
         // (not per-packet) to avoid re-seeding on the hot path.
@@ -197,10 +248,13 @@ impl super::Gateway {
             for packet_vec in drained.drain(..) {
                 let packet = packet_vec.as_slice();
                 let n = packet.len();
-                // Reader already validated this is an IPv4 header of >= 20 bytes.
-                let dst_ip = Ipv4Addr::new(packet[16], packet[17], packet[18], packet[19]);
-                // Find session by VPN IP
-                let session = match sessions.get_session_by_vpn_ip(&dst_ip) {
+                let Some(header) = aivpn_common::ip_packet::IpPacket::parse(packet) else {
+                    continue;
+                };
+                let dst_ip = header.destination;
+                let session = match inner_client_ipv4(&network, dst_ip)
+                    .and_then(|ip| sessions.get_session_by_vpn_ip(&ip))
+                {
                     Some(s) => s,
                     None => {
                         // PHASE 4 (reverse chain-forward): dst_ip may be an
@@ -256,12 +310,29 @@ impl super::Gateway {
                     }
                 };
 
-                // QoS: enforce downstream rate limit before expensive encryption
-                let qos_cid = { session.lock().client_id.clone() };
-                if let Some(ref cid) = qos_cid {
-                    if !qos_enforcer.check_downstream(cid, n as u64) {
-                        debug!("QoS: downstream rate limited, dropping packet for {}", cid);
+                // Общий qos_charge до шифрования. PassCharged уже списан ядром.
+                let (qos_cid, session_id) = {
+                    let session = session.lock();
+                    if session.kernel_faulted {
                         continue;
+                    }
+                    (session.client_id.clone(), session.session_id)
+                };
+                let nbytes = u32::try_from(n).unwrap_or(u32::MAX);
+                match kernel_qos_decide(kernel_accel.as_deref(), &session_id, QOS_DIR_DOWN, nbytes)
+                {
+                    QosGate::Drop => {
+                        debug!("QoS: kernel dropped downstream packet");
+                        continue;
+                    }
+                    QosGate::PassCharged => {}
+                    QosGate::Userspace => {
+                        if let Some(ref cid) = qos_cid {
+                            if !qos_enforcer.check_downstream(cid, n as u64) {
+                                debug!("QoS: downstream rate limited, dropping packet for {}", cid);
+                                continue;
+                            }
+                        }
                     }
                 }
 
@@ -342,9 +413,15 @@ impl super::Gateway {
                             }
                         }
                     };
-                    // Pre-accumulate downlink bytes estimate (IP packet + overhead)
-                    // This avoids a second lock after send_to
-                    let estimated_out = (n + 64) as u64; // packet + AIVPN overhead
+                    // Полный UDP payload: тег, заголовок маски, padding и AEAD.
+                    let estimated_out = (TAG_SIZE
+                        + session_mdh.len()
+                        + 2
+                        + 4
+                        + n
+                        + pad_len as usize
+                        + aivpn_common::crypto::POLY1305_TAG_SIZE)
+                        as u64;
                     sess.pending_bytes_out = sess.pending_bytes_out.saturating_add(estimated_out);
                     // Flush downlink-only traffic to client_db when threshold reached
                     let flush_out = if sess.pending_bytes_out >= 64 * 1024 {

@@ -8,11 +8,12 @@
 
 mod config;
 mod control_handler;
+mod device_identity;
 mod kernel_offload;
 mod reject;
 mod session;
 
-pub use config::{ClientConfig, ClientState};
+pub use config::{ClientConfig, ClientState, RemoteEnrollHook};
 pub use reject::handshake_reject_message;
 use reject::handshake_reject_token;
 
@@ -30,7 +31,7 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, error, info, warn};
 
 use aivpn_common::client_wire::{
-    build_inner_packet, decode_downlink_any_mdh_len, obfuscate_client_eph_pub, DecodedPacket,
+    build_inner_packet, decode_downlink_with_offsets, obfuscate_client_eph_pub, DecodedPacket,
     RecvWindow,
 };
 use aivpn_common::crypto::{self, KeyPair, SessionKeys, X25519_PUBLIC_KEY_SIZE};
@@ -472,6 +473,7 @@ pub struct AivpnClient {
     send_seq: u32,
     _recv_seq: u32,
     recv_window: RecvWindow,
+    fragment_rx: aivpn_common::fragment::Reassembler,
     transition_recv_window: RecvWindow,
     recv_mdh_len: usize,
     /// Every distinct downlink MDH length this session has used, most-recent
@@ -482,6 +484,7 @@ pub struct AivpnClient {
     /// rekey/mask rotation. Seeded with the bootstrap length; extended on every
     /// mask update.
     recv_mdh_candidates: Vec<usize>,
+    recv_tag_offsets: Vec<u16>,
     // Traffic counters
     bytes_sent: Arc<AtomicU64>,
     bytes_received: Arc<AtomicU64>,
@@ -593,6 +596,23 @@ pub struct AivpnClient {
     /// only valid within its 10 s window, so a rotation forces a re-push.
     #[cfg(target_os = "linux")]
     kernel_tags_tw: u64,
+    /// Эпоха ключа s2c в ядре. Ноль значит, что rotate еще не было.
+    #[cfg(target_os = "linux")]
+    kernel_epoch: u32,
+    /// Прошлая эпоха после смены ключа. Ноль значит, что старого окна в ядре нет.
+    #[cfg(target_os = "linux")]
+    kernel_prev_epoch: u32,
+    /// Ключ s2c текущей эпохи. Повтор маски с тем же ключом эпоху не меняет.
+    #[cfg(target_os = "linux")]
+    kernel_epoch_key: [u8; 32],
+    /// Ядро держит окно replay. Счетчик такого пакета берется только replay_claim.
+    #[cfg(target_os = "linux")]
+    kernel_replay_bound: bool,
+    #[cfg(target_os = "linux")]
+    kernel_faulted: bool,
+    /// Смещение тега последней установки. Смена смещения переставляет сессию.
+    #[cfg(target_os = "linux")]
+    kernel_installed_tag_offset: u16,
     /// Interface on which the XDP early-filter was attached (Linux only).
     #[cfg(target_os = "linux")]
     xdp_iface: Option<String>,
@@ -618,7 +638,13 @@ impl AivpnClient {
         let bytes_received = Arc::new(AtomicU64::new(0));
         let initial_vpn_ip = config.tun_config.tun_addr.clone();
 
-        let static_keypair = load_or_generate_static_keypair();
+        // Межсерверный канал доказывает node identity и не трогает ключ устройства.
+        let recv_tag_offsets = vec![config.initial_mask.tag_offset];
+        let static_keypair = if config.control_only {
+            None
+        } else {
+            load_or_generate_static_keypair()?
+        };
         let initial_adaptive_level = config.initial_adaptive_level;
         let initial_keepalive = keepalive_with_nat_cap(
             initial_adaptive_level,
@@ -654,6 +680,18 @@ impl AivpnClient {
             #[cfg(target_os = "linux")]
             kernel_tags_tw: 0,
             #[cfg(target_os = "linux")]
+            kernel_epoch: 0,
+            #[cfg(target_os = "linux")]
+            kernel_prev_epoch: 0,
+            #[cfg(target_os = "linux")]
+            kernel_epoch_key: [0u8; 32],
+            #[cfg(target_os = "linux")]
+            kernel_replay_bound: false,
+            #[cfg(target_os = "linux")]
+            kernel_faulted: false,
+            #[cfg(target_os = "linux")]
+            kernel_installed_tag_offset: u16::MAX,
+            #[cfg(target_os = "linux")]
             xdp_iface: None,
             upload_state: None,
             transition_recv_keys: None,
@@ -673,9 +711,11 @@ impl AivpnClient {
             send_seq: 0,
             _recv_seq: 0,
             recv_window: RecvWindow::new(),
+            fragment_rx: aivpn_common::fragment::Reassembler::default(),
             transition_recv_window: RecvWindow::new(),
             recv_mdh_len,
             recv_mdh_candidates: vec![recv_mdh_len],
+            recv_tag_offsets,
             bytes_sent: bytes_sent.clone(),
             bytes_received: bytes_received.clone(),
             current_vpn_ip: Arc::new(Mutex::new(initial_vpn_ip)),
@@ -945,36 +985,30 @@ impl AivpnClient {
             // packet through the softirq fallback path for zero benefit, the
             // exact regression removed in 13984c5.
             //
-            // OPT-IN and OFF by default (AIVPN_CLIENT_KERNEL_RX=1 to enable).
-            // Client-side kernel downlink RX offloads only in full-tunnel mode,
-            // but a tag-window miss drops the packet into the softirq fallback
-            // queue, and on the server the equivalent fallback-regime tag churn
-            // was observed to starve the downlink and stall the tunnel (the
-            // 13984c5 bug family). Client acceleration also has little upside —
-            // the client is not CPU-bound like a multi-client server — so it
-            // ships disabled and is enabled explicitly for testing/opt-in only.
+            // Обычный туннель сам открывает модуль. Хук ставится только после
+            // политики ROLE_CLIENT. Прокси и control-only без TUN остаются в userspace.
+            if let Some(old) = self.kernel_accel.take() {
+                if self.kernel_replay_bound || self.kernel_installed {
+                    let _ = old.session_remove(&self.kernel_session_id);
+                }
+            }
             self.kernel_installed = false;
             self.kernel_hooked = false;
             self.kernel_tun_set = false;
-            let kernel_rx_enabled = std::env::var("AIVPN_CLIENT_KERNEL_RX")
-                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-                .unwrap_or(false);
-            if self.config.proxy_listen.is_some() || self.config.control_only || !kernel_rx_enabled
-            {
-                // Proxy mode (no TUN to inject into) or not opted in: user-space
-                // data path exactly as before.
+            self.kernel_replay_bound = false;
+            self.kernel_faulted = false;
+            self.kernel_epoch = 0;
+            self.kernel_prev_epoch = 0;
+            self.kernel_epoch_key = [0u8; 32];
+            self.kernel_installed_tag_offset = u16::MAX;
+            self.kernel_installed_mdh_len = 0;
+            if self.config.proxy_listen.is_some() || self.config.control_only {
                 self.kernel_accel = None;
             } else {
                 self.kernel_accel = KernelAccel::try_open().map(Arc::new);
                 if self.kernel_accel.is_some() {
                     info!(
-                        "Kernel acceleration: aivpn.ko detected (AIVPN_CLIENT_KERNEL_RX=1) \
-                         — downlink decrypt will be offloaded after the PFS ratchet"
-                    );
-                } else {
-                    info!(
-                        "Kernel acceleration: requested but aivpn.ko not available \
-                         — using built-in user-space data path"
+                        "Kernel acceleration: aivpn.ko detected, downlink offload waits for client policy"
                     );
                 }
             }
@@ -1154,7 +1188,7 @@ impl AivpnClient {
         #[cfg(target_os = "linux")]
         {
             if let Some(ka) = self.kernel_accel.take() {
-                if self.kernel_installed {
+                if self.kernel_installed || self.kernel_replay_bound {
                     let _ = ka.session_remove(&self.kernel_session_id);
                 }
                 // KernelAccel::drop → IOC_FLUSH.
@@ -1162,6 +1196,12 @@ impl AivpnClient {
             self.kernel_installed = false;
             self.kernel_hooked = false;
             self.kernel_tun_set = false;
+            self.kernel_replay_bound = false;
+            self.kernel_faulted = false;
+            self.kernel_epoch = 0;
+            self.kernel_prev_epoch = 0;
+            self.kernel_epoch_key = [0u8; 32];
+            self.kernel_installed_tag_offset = u16::MAX;
         }
 
         self.transport = None;
@@ -1308,6 +1348,9 @@ impl AivpnClient {
 
     /// Update mask profile
     pub fn update_mask(&mut self, new_mask: MaskProfile) {
+        if !self.recv_tag_offsets.contains(&new_mask.tag_offset) {
+            self.recv_tag_offsets.push(new_mask.tag_offset);
+        }
         let new_mdh_len = packet_mdh_len_for_mask(&new_mask);
         self.recv_mdh_len = new_mdh_len;
         // Keep the new length as the primary (front) candidate but retain every
@@ -1319,16 +1362,19 @@ impl AivpnClient {
             "Updating mask to {} (mdh_len: {})",
             new_mask.mask_id, new_mdh_len
         );
-        // K6: the kernel session's ciphertext offset is frozen at install time;
-        // if the primary downlink MDH length changed, re-install so kernel
-        // offload keeps hitting (stale offset is safe — -EBADMSG falls back to
-        // user-space — but accelerates nothing).
-        #[cfg(target_os = "linux")]
-        if self.kernel_installed && self.kernel_installed_mdh_len != new_mdh_len {
-            self.kernel_install_session();
-        }
         if let Some(ref mut engine) = self.mimicry_engine {
             engine.update_mask(new_mask.clone());
+        }
+        // Движок уже на новой маске: insert увидит ее смещение тега.
+        // Тот же ключ оставляет окно replay, меняется только раскладка.
+        #[cfg(target_os = "linux")]
+        if self.kernel_accel.is_some() && (self.kernel_replay_bound || self.kernel_installed) {
+            let tag_offset = kernel_offload::kernel_tag_offset(&new_mask, new_mdh_len);
+            if self.kernel_installed_mdh_len != new_mdh_len
+                || self.kernel_installed_tag_offset != tag_offset
+            {
+                self.kernel_install_session();
+            }
         }
         let mut pending = self.pending_mask.lock().unwrap_or_else(|e| e.into_inner());
         *pending = Some(new_mask);
@@ -1487,8 +1533,7 @@ impl AivpnClient {
 
     /// §2 crowdsourced blocking feedback — most recent region hints received
     /// from the server (only populated when `receive_mask_hints` is on).
-    /// TODO(v1): mask selection does not yet consult this; it is stored here
-    /// as the integration point for a future selection-preference pass.
+    /// При переподключении выбор маски учитывает сохраненные оценки региона.
     pub fn regional_mask_hints(&self) -> Option<&[(String, f32)]> {
         self.regional_mask_hints.as_deref()
     }
@@ -1576,77 +1621,12 @@ impl Drop for AivpnClient {
     }
 }
 
-/// Load static X25519 keypair from `~/.config/aivpn/device.key` or generate and save a new one.
-/// Returns None when HOME is unset or on unrecoverable I/O errors — device binding is optional.
-fn load_or_generate_static_keypair() -> Option<KeyPair> {
-    use std::fs;
-    #[cfg(unix)]
-    use std::os::unix::fs::PermissionsExt;
-
-    let home = dirs_home()?; // skip persistence when HOME is unset
-    let dir = home.join(".config").join("aivpn");
-    let path = dir.join("device.key");
-
-    if path.exists() {
-        match fs::read(&path) {
-            Ok(bytes) if bytes.len() == 32 => {
-                let mut arr = [0u8; 32];
-                arr.copy_from_slice(&bytes);
-                return Some(KeyPair::from_private_key(arr));
-            }
-            Ok(_) => {
-                warn!("device.key has wrong size — regenerating");
-            }
-            Err(e) => {
-                warn!("Cannot read device.key: {}", e);
-                return None;
-            }
-        }
-    }
-
-    // Generate new keypair and persist atomically with correct permissions from the start.
-    let kp = KeyPair::generate();
-    let mut priv_bytes = kp.export_private_key();
-
-    if let Err(e) = fs::create_dir_all(&dir) {
-        warn!("Cannot create ~/.config/aivpn: {}", e);
-        return Some(kp); // proceed without persistence
-    }
-    // Tighten directory to owner-only (700) so siblings are not enumerable.
-    #[cfg(unix)]
-    let _ = fs::set_permissions(&dir, fs::Permissions::from_mode(0o700));
-
-    // Write to a temp sibling atomically, then rename.
-    let tmp_path = path.with_extension("tmp");
-    let write_result = (|| -> std::io::Result<()> {
-        #[cfg(unix)]
-        {
-            use std::io::Write;
-            use std::os::unix::fs::OpenOptionsExt;
-            let mut f = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(&tmp_path)?;
-            f.write_all(&priv_bytes)?;
-            f.sync_all()?;
-        }
-        #[cfg(not(unix))]
-        fs::write(&tmp_path, &priv_bytes)?;
-        fs::rename(&tmp_path, &path)
-    })();
-
-    // Zeroize key bytes regardless of write outcome before they leave scope.
-    priv_bytes.iter_mut().for_each(|b| *b = 0);
-
-    match write_result {
-        Ok(()) => info!("New device keypair generated and saved to {:?}", path),
-        Err(e) => {
-            warn!("Cannot write device.key: {}", e);
-            let _ = fs::remove_file(&tmp_path);
-        }
-    }
-    Some(kp)
+/// Загружает постоянный ключ устройства, не заменяя поврежденный файл.
+fn load_or_generate_static_keypair() -> Result<Option<KeyPair>> {
+    dirs_home()
+        .map(|home| device_identity::load_or_create(&home.join(".config").join("aivpn")))
+        .transpose()
+        .map_err(Error::Io)
 }
 
 fn dirs_home() -> Option<std::path::PathBuf> {
@@ -1671,6 +1651,7 @@ mod tests {
             initial_mask: mask,
             tun_config: crate::tunnel::TunnelConfig::default(),
             proxy_listen: None,
+            proxy_dns: vec![std::net::Ipv4Addr::new(1, 1, 1, 1)],
             mtls_cert: None,
             initial_adaptive_level: AdaptiveLevel::Off,
             polymorphic_base: None,
@@ -1685,6 +1666,8 @@ mod tests {
             inbound_control_tap: None,
             node_identity: None,
             pool_node_id: None,
+            remote_verified_node: None,
+            remote_enroll_hook: None,
             transport: None,
         }
     }
@@ -2882,26 +2865,28 @@ mod tests {
         // keys until the server proves the commit, so the server's inbound
         // counter keeps sliding with the data stream and every re-sent
         // response lands inside its ±TAG_WINDOW_SIZE tag band.
-        let sent = sent_responses.lock().unwrap_or_else(|e| e.into_inner());
-        assert_eq!(
-            sent.len(),
-            2,
-            "retransmitted KeyRotate must trigger a re-send of the response, \
+        let client_rekey_eph_pub = {
+            let sent = sent_responses.lock().unwrap_or_else(|e| e.into_inner());
+            assert_eq!(
+                sent.len(),
+                2,
+                "retransmitted KeyRotate must trigger a re-send of the response, \
              not a silent ignore"
-        );
-        assert_eq!(
-            sent[1].0, sent[0].0,
-            "re-sent response must carry the SAME client eph pub as the \
+            );
+            assert_eq!(
+                sent[1].0, sent[0].0,
+                "re-sent response must carry the SAME client eph pub as the \
              original — a fresh one could desync if the original response \
              was merely delayed and the server commits it first"
-        );
-        assert_eq!(
-            sent[1].1.session_key, old_keys.session_key,
-            "re-sent response must be encrypted with the OLD keys — the \
+            );
+            assert_eq!(
+                sent[1].1.session_key, old_keys.session_key,
+                "re-sent response must be encrypted with the OLD keys - the \
              server never committed and cannot read the new ones"
-        );
-        let client_rekey_eph_pub = sent[0].0;
-        drop(sent);
+            );
+            sent[0].0
+        };
+
         // M3: after the re-send the upload keys must be restored to the OLD
         // keys (the rekey is still unconfirmed) — the committed new keys sit
         // staged in `pending_upload_keys` until the server's first new-key

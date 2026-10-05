@@ -36,16 +36,69 @@ const IOC_SET_UDP_SOCK: u64 = iow(5, 4);
 const IOC_FLUSH: u64 = io_(6);
 const IOC_GET_VERSION: u64 = ior(7, 4);
 const IOC_SESSION_UPDATE_TAGS: u64 = iow(8, 4116);
-const IOC_SESSION_DOWNLINK: u64 = iow(9, 4184);
+const IOC_SESSION_DOWNLINK: u64 = iow(9, 4188);
 const IOC_SET_EGRESS: u64 = iow(10, 12);
+const IOC_SESSION_POLICY: u64 = iow(11, 104);
+const IOC_SESSION_SYNC: u64 = iowr(12, 160);
+const IOC_CLIENT_REVOKE: u64 = iow(13, 16);
+const IOC_REPLAY_CLAIM: u64 = iowr(14, 40);
+const IOC_REPLAY_ROTATE: u64 = iow(15, 24);
+const IOC_QOS_CHARGE: u64 = iowr(16, 48);
 
 // Encoding anchors: numeric values the C _IOW/_IOR macros produce for two
 // representative commands. If iow()/ior() ever drift from the kernel _IOC
 // convention again, the build breaks here instead of the data path.
 const _: () = assert!(IOC_SESSION_ADD == 0x40C0_AE01);
 const _: () = assert!(IOC_GET_VERSION == 0x8004_AE07);
+const _: () = assert!(IOC_SESSION_POLICY == 0x4068_AE0B);
+const _: () = assert!(IOC_SESSION_SYNC == 0xC0A0_AE0C);
+const _: () = assert!(IOC_CLIENT_REVOKE == 0x4010_AE0D);
+const _: () = assert!(IOC_SESSION_DOWNLINK == 0x505C_AE09);
+const _: () = assert!(IOC_REPLAY_CLAIM == 0xC028_AE0E);
+const _: () = assert!(IOC_REPLAY_ROTATE == 0x4018_AE0F);
+const _: () = assert!(IOC_QOS_CHARGE == 0xC030_AE10);
 
-pub const API_VERSION: u32 = 5;
+pub const API_VERSION: u32 = 7;
+
+pub const POLICY_VERSION: u32 = 1;
+pub const ROLE_NONE: u32 = 0;
+pub const ROLE_SERVER: u32 = 1;
+pub const ROLE_CLIENT: u32 = 2;
+
+pub const POL_IPV6: u32 = 1 << 0;
+pub const POL_PEER_ISOLATE: u32 = 1 << 1;
+pub const POL_QOS_UP: u32 = 1 << 2;
+pub const POL_QOS_DOWN: u32 = 1 << 3;
+pub const POL_QUOTA_UP: u32 = 1 << 4;
+pub const POL_QUOTA_DOWN: u32 = 1 << 5;
+pub const POL_REVOKED: u32 = 1 << 6;
+pub const POL_FALLBACK: u32 = 1 << 7;
+pub const POL_MTLS_WAIT: u32 = 1 << 8;
+pub const POL_EXIT: u32 = 1 << 9;
+pub const POL_ENROLL_WAIT: u32 = 1 << 10;
+pub const POL_SITE: u32 = 1 << 11;
+/// Явное пополнение квоты. Обычный refresh не увеличивает остаток.
+pub const POL_QUOTA_RESET: u32 = 1 << 12;
+/// Data с FEC остается в userspace; прочие направления могут ускоряться.
+pub const POL_RX_FALLBACK: u32 = 1 << 13;
+pub const POL_TX_FALLBACK: u32 = 1 << 14;
+
+pub const REPLAY_WORDS: usize = 8;
+pub const REPLAY_BITS: u64 = 512;
+pub const SYNC_PUSH_REPLAY: u32 = 1;
+pub const SYNC_ACK_STATS: u32 = 2;
+
+pub const CLAIM_OK: i32 = 0;
+pub const CLAIM_DUP: i32 = 1;
+pub const CLAIM_TOO_OLD: i32 = 2;
+pub const CLAIM_EPOCH: i32 = 3;
+pub const CLAIM_FALLBACK: i32 = 4;
+
+pub const QOS_ACCEPT: i32 = 0;
+pub const QOS_DROP: i32 = 1;
+pub const QOS_FALLBACK: i32 = 2;
+pub const QOS_DIR_UP: u32 = 0;
+pub const QOS_DIR_DOWN: u32 = 1;
 
 /// Max MDH (mask header) bytes the kernel downlink path carries inline. Must
 /// match `AIVPN_DL_MDH_MAX` in include/uapi/aivpn.h. A session whose downlink
@@ -97,7 +150,7 @@ pub struct UpdateTagsPayload {
     pub entries: [TagWindowEntry; 256],
 }
 
-/// Payload for AIVPN_IOC_SESSION_DOWNLINK (4184 bytes).
+/// Данные AIVPN_IOC_SESSION_DOWNLINK, 4188 байт.
 ///
 /// Arms/refreshes the kernel downlink fast path: `entries` are a block of
 /// (tag, counter) pairs the server has RESERVED exclusively for the kernel by
@@ -113,6 +166,102 @@ pub struct SessionDownlink {
     pub count: u32,
     pub mdh: [u8; DL_MDH_MAX],
     pub entries: [TagWindowEntry; 256],
+    /// 0xFFFF: tag перед mdh. Иное значение: tag внутри mdh. Ноль это встройка, не legacy.
+    pub dl_tag_pos: u16,
+    pub _pad_dl: u16,
+}
+
+/// Политика сессии. client_ipv4 это сырые байты адреса в порядке iph->saddr.
+#[repr(C, packed)]
+#[derive(Copy, Clone)]
+pub struct SessionPolicy {
+    pub session_id: [u8; 16],
+    pub policy_version: u32,
+    pub role: u32,
+    pub flags: u32,
+    pub client_ipv4: u32,
+    pub ipv6_prefix: [u8; 16],
+    pub ipv6_prefix_len: u8,
+    pub _pad: [u8; 3],
+    pub rate_up_bps: u64,
+    pub rate_down_bps: u64,
+    pub quota_up_bytes: u64,
+    pub quota_down_bytes: u64,
+    pub max_sessions: u32,
+    pub client_key: [u8; 16],
+}
+
+impl SessionPolicy {
+    pub fn zeroed() -> Self {
+        // Простая C структура из чисел и массивов байт. Ноль допустим для каждого поля.
+        unsafe { std::mem::zeroed() }
+    }
+}
+
+/// Окно текущей эпохи и дельта байт. Слова replay это родные u64.
+/// PUSH ядро игнорирует: захват счетчика делает replay_claim.
+#[repr(C, packed)]
+#[derive(Copy, Clone)]
+pub struct SessionSync {
+    pub session_id: [u8; 16],
+    pub flags: u32,
+    pub _pad: u32,
+    pub replay_hi: u64,
+    pub replay_words: [u64; REPLAY_WORDS],
+    pub rx_packets: u64,
+    pub tx_packets: u64,
+    pub rx_bytes: u64,
+    pub tx_bytes: u64,
+    pub rx_bytes_delta: u64,
+    pub tx_bytes_delta: u64,
+    pub quota_up_left: u64,
+    pub quota_down_left: u64,
+}
+
+impl SessionSync {
+    pub fn zeroed() -> Self {
+        unsafe { std::mem::zeroed() }
+    }
+}
+
+#[repr(C, packed)]
+#[derive(Copy, Clone)]
+pub struct ClientRevoke {
+    pub client_key: [u8; 16],
+}
+
+/// Атомарный захват счетчика. result заполняет ядро.
+#[repr(C, packed)]
+#[derive(Copy, Clone)]
+pub struct ReplayClaim {
+    pub session_id: [u8; 16],
+    pub epoch: u32,
+    pub _pad: u32,
+    pub counter: u64,
+    pub result: i32,
+    pub _pad2: u32,
+}
+
+/// Смена эпохи. Та же эпоха оставляет окно, меньшая отклоняется.
+#[repr(C, packed)]
+#[derive(Copy, Clone)]
+pub struct ReplayRotate {
+    pub session_id: [u8; 16],
+    pub epoch: u32,
+    pub _pad: u32,
+}
+
+/// Общее списание QoS. result: ACCEPT, DROP или FALLBACK.
+#[repr(C, packed)]
+#[derive(Copy, Clone)]
+pub struct QosCharge {
+    pub session_id: [u8; 16],
+    pub dir: u32,
+    pub nbytes: u32,
+    pub result: i32,
+    pub _pad: u32,
+    pub tokens_left: u64,
+    pub quota_left: u64,
 }
 
 /// Payload for AIVPN_IOC_SET_EGRESS (12 bytes).
@@ -129,8 +278,14 @@ pub struct SetEgress {
 const _: () = {
     assert!(std::mem::size_of::<SessionAdd>() == 192);
     assert!(std::mem::size_of::<UpdateTagsPayload>() == 4116);
-    assert!(std::mem::size_of::<SessionDownlink>() == 4184);
+    assert!(std::mem::size_of::<SessionDownlink>() == 4188);
     assert!(std::mem::size_of::<SetEgress>() == 12);
+    assert!(std::mem::size_of::<SessionPolicy>() == 104);
+    assert!(std::mem::size_of::<SessionSync>() == 160);
+    assert!(std::mem::size_of::<ClientRevoke>() == 16);
+    assert!(std::mem::size_of::<ReplayClaim>() == 40);
+    assert!(std::mem::size_of::<ReplayRotate>() == 24);
+    assert!(std::mem::size_of::<QosCharge>() == 48);
 };
 
 // ── KernelAccel handle ────────────────────────────────────────────────────────
@@ -240,6 +395,107 @@ impl KernelAccel {
         ioctl_void(self.fd(), IOC_FLUSH)?;
         Ok(())
     }
+
+    /// Установить политику. Не сбрасывает replay на стороне ядра.
+    pub fn session_policy(&self, policy: &SessionPolicy) -> io::Result<()> {
+        ioctl_ref(self.fd(), IOC_SESSION_POLICY, policy)?;
+        Ok(())
+    }
+
+    /// Прочитать окно текущей эпохи и счетчики. Ядро пишет ответ в тот же буфер.
+    /// PUSH не сливает bitmap: граница replay это replay_claim.
+    pub fn session_sync(&self, sync: &mut SessionSync) -> io::Result<()> {
+        ioctl_mut(self.fd(), IOC_SESSION_SYNC, sync)?;
+        Ok(())
+    }
+
+    /// Отозвать все сессии с ненулевым ключом клиента.
+    pub fn client_revoke(&self, client_key: &[u8; 16]) -> io::Result<()> {
+        let payload = ClientRevoke {
+            client_key: *client_key,
+        };
+        ioctl_ref(self.fd(), IOC_CLIENT_REVOKE, &payload)?;
+        Ok(())
+    }
+
+    /// Захватить счетчик в текущей или предыдущей эпохе. Возвращает код CLAIM_*.
+    pub fn replay_claim(&self, session_id: &[u8; 16], epoch: u32, counter: u64) -> io::Result<i32> {
+        let mut payload = ReplayClaim {
+            session_id: *session_id,
+            epoch,
+            _pad: 0,
+            counter,
+            result: 0,
+            _pad2: 0,
+        };
+        ioctl_mut(self.fd(), IOC_REPLAY_CLAIM, &mut payload)?;
+        Ok(payload.result)
+    }
+
+    /// Привязать эпоху. Эпоха 0 и откат назад возвращают ошибку ioctl.
+    pub fn replay_rotate(&self, session_id: &[u8; 16], epoch: u32) -> io::Result<()> {
+        let payload = ReplayRotate {
+            session_id: *session_id,
+            epoch,
+            _pad: 0,
+        };
+        ioctl_ref(self.fd(), IOC_REPLAY_ROTATE, &payload)?;
+        Ok(())
+    }
+
+    /// Списать общий бюджет. Возвращает код QOS_*.
+    pub fn qos_charge(&self, session_id: &[u8; 16], dir: u32, nbytes: u32) -> io::Result<i32> {
+        let mut payload = QosCharge {
+            session_id: *session_id,
+            dir,
+            nbytes,
+            result: 0,
+            _pad: 0,
+            tokens_left: 0,
+            quota_left: 0,
+        };
+        ioctl_mut(self.fd(), IOC_QOS_CHARGE, &mut payload)?;
+        Ok(payload.result)
+    }
+}
+
+fn replay_marked(hi: u64, words: &[u64; REPLAY_WORDS], counter: u64) -> bool {
+    if counter > hi {
+        return false;
+    }
+    let diff = hi - counter;
+    if diff >= REPLAY_BITS {
+        return false;
+    }
+    let bit = (diff % 64) as u32;
+    ((words[(diff / 64) as usize] >> bit) & 1) == 1
+}
+
+/// То же слияние, что aivpn_replay_merge в policy.h. Пустое окно остается пустым.
+pub fn merge_replay_window(
+    hi: &mut u64,
+    words: &mut [u64; REPLAY_WORDS],
+    other_hi: u64,
+    other: &[u64; REPLAY_WORDS],
+) {
+    let new_hi = (*hi).max(other_hi);
+    let mut out = [0u64; REPLAY_WORDS];
+    for i in 0..REPLAY_BITS {
+        if new_hi < i {
+            break;
+        }
+        let counter = new_hi - i;
+        if replay_marked(*hi, words, counter) || replay_marked(other_hi, other, counter) {
+            out[(i / 64) as usize] |= 1u64 << (i % 64);
+        }
+    }
+    *words = out;
+    *hi = new_hi;
+}
+
+/// Дельта абсолютного счетчика. Повтор снимка до ack дает ту же дельту.
+pub fn account_byte_delta(absolute: u64, synced: u64) -> u64 {
+    absolute.saturating_sub(synced)
 }
 
 impl Drop for KernelAccel {
@@ -461,5 +717,101 @@ fn ioctl_void(fd: RawFd, cmd: u64) -> io::Result<i32> {
         Err(io::Error::last_os_error())
     } else {
         Ok(ret)
+    }
+}
+
+#[cfg(test)]
+mod abi_tests {
+    use super::*;
+
+    fn field_off<T>(base: *const T, field: *const u8) -> usize {
+        (field as usize).wrapping_sub(base as usize)
+    }
+
+    #[test]
+    fn policy_layout_matches_uapi() {
+        let p = SessionPolicy::zeroed();
+        let base = &p as *const SessionPolicy;
+        assert_eq!(std::mem::size_of::<SessionPolicy>(), 104);
+        assert_eq!(
+            field_off(base, std::ptr::addr_of!(p.policy_version).cast()),
+            16
+        );
+        assert_eq!(field_off(base, std::ptr::addr_of!(p.role).cast()), 20);
+        assert_eq!(field_off(base, std::ptr::addr_of!(p.flags).cast()), 24);
+        assert_eq!(
+            field_off(base, std::ptr::addr_of!(p.client_ipv4).cast()),
+            28
+        );
+        assert_eq!(
+            field_off(base, std::ptr::addr_of!(p.ipv6_prefix).cast()),
+            32
+        );
+        assert_eq!(
+            field_off(base, std::ptr::addr_of!(p.ipv6_prefix_len).cast()),
+            48
+        );
+        assert_eq!(
+            field_off(base, std::ptr::addr_of!(p.rate_up_bps).cast()),
+            52
+        );
+        assert_eq!(
+            field_off(base, std::ptr::addr_of!(p.rate_down_bps).cast()),
+            60
+        );
+        assert_eq!(
+            field_off(base, std::ptr::addr_of!(p.quota_up_bytes).cast()),
+            68
+        );
+        assert_eq!(
+            field_off(base, std::ptr::addr_of!(p.quota_down_bytes).cast()),
+            76
+        );
+        assert_eq!(
+            field_off(base, std::ptr::addr_of!(p.max_sessions).cast()),
+            84
+        );
+        assert_eq!(field_off(base, std::ptr::addr_of!(p.client_key).cast()), 88);
+
+        let s = SessionSync::zeroed();
+        let sb = &s as *const SessionSync;
+        assert_eq!(std::mem::size_of::<SessionSync>(), 160);
+        assert_eq!(field_off(sb, std::ptr::addr_of!(s.replay_hi).cast()), 24);
+        assert_eq!(field_off(sb, std::ptr::addr_of!(s.replay_words).cast()), 32);
+        assert_eq!(field_off(sb, std::ptr::addr_of!(s.rx_packets).cast()), 96);
+        assert_eq!(
+            field_off(sb, std::ptr::addr_of!(s.quota_down_left).cast()),
+            152
+        );
+        assert_eq!(std::mem::size_of::<SessionDownlink>(), 4188);
+        assert_eq!(std::mem::size_of::<ReplayClaim>(), 40);
+        assert_eq!(std::mem::size_of::<ReplayRotate>(), 24);
+        assert_eq!(std::mem::size_of::<QosCharge>(), 48);
+        assert_eq!(API_VERSION, 7);
+    }
+
+    #[test]
+    fn replay_merge_matches_shared_vectors() {
+        let mut hi = 5u64;
+        let mut words = [1u64, 0, 0, 0, 0, 0, 0, 0];
+        let other = [1u64, 0, 0, 0, 0, 0, 0, 0];
+        merge_replay_window(&mut hi, &mut words, 3, &other);
+        assert_eq!(hi, 5);
+        assert_eq!(words[0] & 1, 1);
+        assert_eq!(words[0] & 4, 4);
+
+        let mut empty_hi = 0u64;
+        let mut empty = [0u64; 8];
+        merge_replay_window(&mut empty_hi, &mut empty, 0, &[0u64; 8]);
+        assert_eq!(empty_hi, 0);
+        assert_eq!(empty, [0u64; 8]);
+    }
+
+    #[test]
+    fn account_delta_is_idempotent_until_ack() {
+        assert_eq!(account_byte_delta(100, 40), 60);
+        assert_eq!(account_byte_delta(100, 40), 60);
+        assert_eq!(account_byte_delta(100, 100), 0);
+        assert_eq!(account_byte_delta(10, 40), 0);
     }
 }

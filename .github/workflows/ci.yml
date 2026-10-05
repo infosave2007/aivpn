@@ -43,28 +43,27 @@ jobs:
         if-no-files-found: error
         retention-days: 7
 
+    - name: Kernel policy tests
+      run: |
+        cc -std=c11 -Wall -Wextra -Werror -fsanitize=address,undefined platforms/linux-kernel/tests/policy_test.c -o /tmp/aivpn-policy-test
+        /tmp/aivpn-policy-test
+
     - name: Run tests
-      run: cargo test --workspace --exclude aivpn-windows --verbose
+      run: cargo test --locked --workspace --exclude aivpn-windows --features "aivpn-server/management-api,aivpn-server/metrics,aivpn-server/dns,aivpn-server/passive-distribution" --verbose
 
-    # Clippy runs on the whole workspace and surfaces findings, but is
-    # advisory (non-blocking) for now: the hard build gate is `cargo build`
-    # above (rustc warnings ARE denied there — a clean build is enforced).
-    # The current clippy backlog is ~90 pedantic/style lints (io::Error::other,
-    # needless borrows, sort_by_key, map_or simplifications) with no
-    # correctness impact, and this toolchain's `cargo fix --clippy` is
-    # unavailable to batch-apply them. TODO: clear the backlog, then restore
-    # `-- -D warnings` to make clippy blocking again.
-    - name: Clippy (advisory)
-      run: cargo clippy --workspace --all-targets --exclude aivpn-windows || echo "::warning::clippy reported findings (advisory, non-blocking) — see log"
+    - name: Protected build tests
+      run: cargo test --locked -p aivpn-server -p aivpn-client -p aivpn-common --features "aivpn-server/production-secure,aivpn-server/management-api,aivpn-server/passive-distribution,aivpn-client/production-secure,aivpn-common/production-secure" --lib
 
-    # R2 Phase A — offline nDPI provenance gate over assets/masks/*.json.
-    # The DPI toolchain (nDPI + maskpcap) lives under the gitignored research/
-    # tree, so on a plain checkout this step SKIPS gracefully (exit 0) and never
-    # blocks the build. To ENFORCE it, provision the toolchain first (build
-    # research/dpi-harness nDPI + research/mask-generation/eval-gate maskpcap)
-    # and set MASK_GATE_REQUIRE=1 so a skip becomes a failure. See
-    # docs/R2_PHASE_A.md → "How it plugs into CI".
-    - name: Mask DPI gate (R2 Phase A)
+    - name: Clippy correctness and suspicious checks
+      run: cargo clippy --locked --workspace --all-targets --exclude aivpn-windows -- -D clippy::correctness -D clippy::suspicious
+
+    - name: Install DPI build dependencies
+      run: sudo apt-get update && sudo apt-get install -y autoconf automake libtool pkg-config libpcap-dev libjson-c-dev
+
+    - name: Build pinned DPI classifier
+      run: deploy/ci/build-dpi-tools.sh
+
+    - name: Mask DPI gate
       run: make mask-gate
 
     # The public tree carries a seam for pluggable datagram transports. What
@@ -78,6 +77,9 @@ jobs:
     # A path dependency reaching outside the repository is a hard Cargo error
     # for everyone who just cloned it, and invisible to whoever added it — their
     # working copy has the sibling directory.
+    - name: Mask installer integrity tests
+      run: python3 deploy/ci/test-install-masks.py
+
     - name: Self-contained public tree
       run: make selfcontained
 
@@ -139,6 +141,12 @@ jobs:
     - name: Install XcodeGen
       run: brew install xcodegen
 
+    - name: Helper certificate failure tests
+      run: python3 deploy/ci/test-helper-certificate.py
+
+    - name: Device identity failure tests
+      run: swift test --package-path platforms/ios
+
     - name: Generate Xcode project
       run: cd platforms/ios && xcodegen generate
 
@@ -151,3 +159,31 @@ jobs:
           -destination 'generic/platform=iOS' \
           CODE_SIGNING_ALLOWED=NO \
           CODE_SIGNING_REQUIRED=NO
+
+  web:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:18-alpine
+        env:
+          POSTGRES_PASSWORD: test-only
+          POSTGRES_DB: aivpn_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    defaults:
+      run:
+        working-directory: platforms/aivpn-web
+    steps:
+    - uses: actions/checkout@v4
+    - uses: oven-sh/setup-bun@v2
+      with:
+        bun-version: 1.4.2
+    - run: bun install --frozen-lockfile
+    - run: bun run check
+    - run: bun test server/tests
+    - run: bun test server/tests
+      env:
+        AIVPN_TEST_DATABASE_URL: postgres://postgres:test-only@localhost:5432/aivpn_test
+    - run: bun run build

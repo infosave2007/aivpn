@@ -16,6 +16,7 @@ use aivpn_client::mask_feedback_log::{MaskFeedbackLog, RegionalHintsStore};
 use aivpn_client::server_pool::{PoolMode, ServerEntry, ServerPool};
 use aivpn_client::tunnel::TunnelConfig;
 use aivpn_client::AivpnClient;
+#[cfg(not(feature = "production-secure"))]
 use aivpn_common::mask::preset_masks;
 #[cfg(not(feature = "production-secure"))]
 use aivpn_common::mask::preset_masks::bootstrap_default;
@@ -30,6 +31,21 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{error, info, warn};
+
+/// §2 L3 - minimum server-reported success score for a regional hint to be
+/// allowed to bias initial mask selection. Below this the bootstrap-selected
+/// mask is kept, so a weak/noisy hint never displaces the default choice.
+const HINT_BIAS_MIN_SCORE: f32 = 0.5;
+
+/// Initial reconnect backoff, also the value a healthy session resets to.
+const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
+/// Upper bound on the reconnect backoff.
+const MAX_BACKOFF: Duration = Duration::from_secs(60);
+/// A session that stayed connected at least this long is considered healthy;
+/// its reconnect backoff resets to `INITIAL_BACKOFF` instead of continuing to
+/// grow. The threshold comfortably exceeds normal handshake time so that only
+/// genuinely established sessions (well past connect) trigger a reset.
+const HEALTHY_CONNECTION_THRESHOLD: Duration = Duration::from_secs(30);
 
 /// AIVPN Client - Censorship-resistant VPN client
 #[derive(Parser, Debug)]
@@ -110,6 +126,10 @@ pub struct ClientArgs {
     /// Example: --proxy-listen 127.0.0.1:1080
     #[arg(long, value_name = "HOST:PORT")]
     pub proxy_listen: Option<String>,
+
+    /// DNS-серверы SOCKS5 внутри VPN, до четырех IPv4-адресов.
+    #[arg(long, value_delimiter = ',', default_value = "1.1.1.1,9.9.9.9")]
+    pub proxy_dns: Vec<std::net::Ipv4Addr>,
 
     /// Path to a 104-byte mTLS client certificate (raw binary or base64-encoded).
     /// Required when the server has `mtls.required = true`.
@@ -348,7 +368,7 @@ struct ClientFileConfig {
 
 fn load_client_file_config(path: Option<&str>) -> Option<ClientFileConfig> {
     let resolved = path?;
-    std::fs::read_to_string(&resolved)
+    std::fs::read_to_string(resolved)
         .ok()
         .and_then(|json| serde_json::from_str::<ClientFileConfig>(&json).ok())
 }
@@ -370,12 +390,65 @@ fn decode_base64_key(label: &str, encoded: &str) -> [u8; 32] {
 }
 
 // In development mode, derive a deterministic bootstrap mask from the PSK when no cached descriptors are available.
+#[cfg(not(feature = "production-secure"))]
 fn bootstrap_mask_for_psk(psk: &[u8; 32]) -> aivpn_common::mask::MaskProfile {
     use blake3;
     let presets = preset_masks::all();
     let hash = blake3::derive_key("aivpn-bootstrap-mask-v1", psk);
     let idx = hash[0] as usize % presets.len();
     presets[idx].clone()
+}
+
+/// Режим проверки масок.
+///
+/// В production-secure пустое значение становится enforce. Явные off и warn
+/// возвращают ошибку: сборка не должна молча ослабить проверку. Пустая строка
+/// тоже ошибка, это не отсутствие поля.
+fn parse_client_mask_verify_mode(
+    raw: Option<&str>,
+) -> Result<aivpn_common::mask::MaskVerifyMode, String> {
+    #[cfg(feature = "production-secure")]
+    {
+        match raw {
+            None => Ok(aivpn_common::mask::MaskVerifyMode::Enforce),
+            Some(text) => match text.trim() {
+                "" => Err("mask_verify_mode: пустое значение".to_string()),
+                other => match other.parse::<aivpn_common::mask::MaskVerifyMode>() {
+                    Ok(aivpn_common::mask::MaskVerifyMode::Enforce) => {
+                        Ok(aivpn_common::mask::MaskVerifyMode::Enforce)
+                    }
+                    Ok(mode) => Err(format!(
+                        "production-secure принимает только mask_verify_mode=enforce, получено '{mode:?}'"
+                    )),
+                    Err(e) => Err(e),
+                },
+            },
+        }
+    }
+    #[cfg(not(feature = "production-secure"))]
+    {
+        match raw {
+            None => Ok(aivpn_common::mask::MaskVerifyMode::default()),
+            Some(text) => text.parse(),
+        }
+    }
+}
+
+#[cfg(any(feature = "production-secure", test))]
+fn production_secure_client_keys_present(
+    signing: Option<&[u8; 32]>,
+    operator: Option<&[u8; 32]>,
+) -> bool {
+    signing.is_some() && operator.is_some()
+}
+
+/// Неподписанный пресет не должен вытеснять маску из проверенного дескриптора.
+/// Если замены нет или текущая маска не из дескриптора, выбор пресета остается.
+fn unsigned_preset_replaces_authenticated_descriptor(
+    mask_id: &str,
+    replacement_is_preset: bool,
+) -> bool {
+    replacement_is_preset && mask_id.starts_with("bootstrap:")
 }
 
 /// Точка входа клиента.
@@ -590,7 +663,10 @@ pub async fn run(
         match command {
             ClientCommand::KillSwitch { action } => match action {
                 KillSwitchAction::Clear => {
-                    aivpn_client::kill_switch::KillSwitch::clear_stale();
+                    if let Err(error) = aivpn_client::kill_switch::KillSwitch::clear_stale() {
+                        eprintln!("Kill-switch cleanup failed: {error}");
+                        std::process::exit(1);
+                    }
                     println!("Kill-switch stale rules cleared.");
                     return;
                 }
@@ -834,6 +910,7 @@ pub async fn run(
                             mdh_len: 20,
                             keepalive_secs: None,
                             ipv6_address: None,
+                            ipv6_prefix_len: None,
                         })
                 })
             })
@@ -978,7 +1055,13 @@ pub async fn run(
     // Lower initial MTU for restrictive mobile networks (MTS, Megafon) when adaptive is on.
     let network_config = if adaptive_on {
         aivpn_common::network_config::ClientNetworkConfig {
-            mtu: network_config.mtu.min(1200),
+            mtu: network_config
+                .mtu
+                .min(if network_config.ipv6_address.is_some() {
+                    1280
+                } else {
+                    1200
+                }),
             ..network_config
         }
     } else {
@@ -1036,18 +1119,16 @@ pub async fn run(
         })
         .or(conn_mop_b64)
         .map(|b64| decode_base64_key("mask operator pubkey", &b64));
-    let mask_verify_mode: aivpn_common::mask::MaskVerifyMode =
-        match args.mask_verify_mode.clone().or_else(|| {
-            file_config
-                .as_ref()
-                .and_then(|c| c.mask_verify_mode.clone())
-        }) {
-            None => aivpn_common::mask::MaskVerifyMode::default(),
-            Some(s) => s.parse().unwrap_or_else(|e| {
-                error!("{}", e);
-                std::process::exit(1);
-            }),
-        };
+    let mask_verify_raw = args.mask_verify_mode.clone().or_else(|| {
+        file_config
+            .as_ref()
+            .and_then(|c| c.mask_verify_mode.clone())
+    });
+    let mask_verify_mode = parse_client_mask_verify_mode(mask_verify_raw.as_deref())
+        .unwrap_or_else(|e| {
+            error!("{}", e);
+            std::process::exit(1);
+        });
 
     // Parse PSK
     let preshared_key: Option<[u8; 32]> = psk_bytes.and_then(|v| {
@@ -1060,8 +1141,15 @@ pub async fn run(
         }
     });
 
-    let network_config = network_config;
-
+    #[cfg(feature = "production-secure")]
+    if !production_secure_client_keys_present(
+        server_signing_key.as_ref(),
+        mask_operator_pubkey.as_ref(),
+    ) {
+        error!("production-secure требует оба ключа: server signing key и mask operator pubkey");
+        std::process::exit(1);
+    }
+    #[cfg(not(feature = "production-secure"))]
     if server_signing_key.is_none() {
         warn!("No --server-signing-key provided; bootstrap descriptors accepted without signature verification");
     }
@@ -1086,7 +1174,10 @@ pub async fn run(
     }
 
     // Build multi-channel bootstrap configuration if any channels are specified
-    let mut bootstrap_config = BootstrapConfig::default();
+    let mut bootstrap_config = BootstrapConfig {
+        trusted_signing_key: server_signing_key,
+        ..Default::default()
+    };
     if let Some(cdn_url) = &args.bootstrap_cdn_url {
         bootstrap_config = bootstrap_config.with_cdn(cdn_url, "custom");
     }
@@ -1425,8 +1516,19 @@ pub async fn run(
         } else if let Some(ref name) = args.preferred_mask {
             match aivpn_common::mask::preset_masks::by_id(name.as_str()) {
                 Some(m) => {
-                    info!("Using preferred mask '{}'", name);
-                    m
+                    if unsigned_preset_replaces_authenticated_descriptor(
+                        &initial_mask.mask_id,
+                        true,
+                    ) {
+                        warn!(
+                            "Предпочитаемая маска '{}' не заменяет проверенный дескриптор '{}'",
+                            name, initial_mask.mask_id
+                        );
+                        initial_mask
+                    } else {
+                        info!("Using preferred mask '{}'", name);
+                        m
+                    }
                 }
                 None => {
                     warn!(
@@ -1454,11 +1556,38 @@ pub async fn run(
         //   - Only applies when a hinted mask is a KNOWN built-in preset with a
         //     success score at or above `HINT_BIAS_MIN_SCORE`; otherwise the
         //     bootstrap-selected mask is kept unchanged.
-        let initial_mask = if args.receive_mask_hints
-            && !no_fallback
+        // production-secure не подменяет маску открытия региональным пресетом.
+        // В обычной сборке подсказка тоже не вытесняет дескриптор bootstrap:.
+        #[cfg(feature = "production-secure")]
+        if args.receive_mask_hints
             && args.preferred_mask.is_none()
             && args.polymorphic_base.is_none()
         {
+            warn!(
+                "production-secure: региональные подсказки не заменяют маску открытия неподписанным пресетом"
+            );
+        }
+        #[cfg(feature = "production-secure")]
+        let hints_allowed = false;
+        #[cfg(not(feature = "production-secure"))]
+        let hints_allowed = {
+            let requested = args.receive_mask_hints
+                && !no_fallback
+                && args.preferred_mask.is_none()
+                && args.polymorphic_base.is_none();
+            if requested
+                && unsigned_preset_replaces_authenticated_descriptor(&initial_mask.mask_id, true)
+            {
+                warn!(
+                    "Региональная подсказка не заменяет проверенный дескриптор '{}' неподписанным пресетом",
+                    initial_mask.mask_id
+                );
+                false
+            } else {
+                requested
+            }
+        };
+        let initial_mask = if hints_allowed {
             if let Some(cc) = country_code {
                 let hints = RegionalHintsStore::load_default().for_region(cc);
                 let biased = hints.into_iter().find_map(|(mask_id, score)| {
@@ -1559,6 +1688,7 @@ pub async fn run(
             initial_mask,
             tun_config,
             proxy_listen,
+            proxy_dns: args.proxy_dns.clone(),
             mtls_cert: mtls_cert.clone(),
             initial_adaptive_level,
             polymorphic_base: args.polymorphic_base.clone(),
@@ -1575,6 +1705,8 @@ pub async fn run(
             inbound_control_tap: None,
             node_identity: None,
             pool_node_id: None,
+            remote_verified_node: None,
+            remote_enroll_hook: None,
             transport: transport_config(),
         };
 
@@ -1733,21 +1865,6 @@ fn parse_connection_key(conn_key: &str) -> Result<serde_json::Value, String> {
     serde_json::from_slice(&json_bytes).map_err(|e| format!("Malformed connection key JSON: {}", e))
 }
 
-/// §2 L3 — minimum server-reported success score for a regional hint to be
-/// allowed to bias initial mask selection. Below this the bootstrap-selected
-/// mask is kept, so a weak/noisy hint never displaces the default choice.
-const HINT_BIAS_MIN_SCORE: f32 = 0.5;
-
-/// Initial reconnect backoff, also the value a healthy session resets to.
-const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
-/// Upper bound on the reconnect backoff.
-const MAX_BACKOFF: Duration = Duration::from_secs(60);
-/// A session that stayed connected at least this long is considered healthy;
-/// its reconnect backoff resets to `INITIAL_BACKOFF` instead of continuing to
-/// grow. The threshold comfortably exceeds normal handshake time so that only
-/// genuinely established sessions (well past connect) trigger a reset.
-const HEALTHY_CONNECTION_THRESHOLD: Duration = Duration::from_secs(30);
-
 /// Whether a session with the given uptime should reset the reconnect backoff.
 fn should_reset_backoff(uptime: Duration) -> bool {
     uptime >= HEALTHY_CONNECTION_THRESHOLD
@@ -1767,7 +1884,50 @@ fn fallback_network_config(tun_addr: &str) -> ClientNetworkConfig {
         mdh_len: 20,
         keepalive_secs: None,
         ipv6_address: None,
+        ipv6_prefix_len: None,
     }
+}
+
+/// Which datagram transport this run should open, if configuration names one.
+///
+/// Deliberately configuration-only: there is no command-line flag and no UI
+/// control for this, so the choice cannot be made accidentally and does not
+/// have to be represented anywhere a user can see. `AIVPN_TRANSPORT` names the
+/// transport; `AIVPN_TRANSPORT_PARAMS` carries base64 parameters that are
+/// passed through without being parsed here - what they mean is entirely the
+/// business of whichever factory claimed the name.
+///
+/// `None` - the case in a build that registers nothing - is the direct UDP
+/// socket the client has always used.
+fn transport_config() -> Option<aivpn_common::transport::TransportConfig> {
+    let name = std::env::var("AIVPN_TRANSPORT")
+        .ok()
+        .filter(|s| !s.trim().is_empty())?;
+    let params = std::env::var("AIVPN_TRANSPORT_PARAMS")
+        .ok()
+        .and_then(|s| base64::engine::general_purpose::STANDARD.decode(s).ok())
+        .unwrap_or_default();
+    Some(aivpn_common::transport::TransportConfig::new(
+        name.trim(),
+        params,
+    ))
+}
+
+/// The transports this binary can open.
+///
+/// This function is the extension point: a build that plugs in additional
+/// datagram transports registers them here, and nothing else in the client
+/// changes - it resolves whatever `transport_config()` asks for against this
+/// registry and otherwise knows nothing about what is in it. The default build
+/// registers none, so the only path is the direct UDP socket.
+fn transport_registry(
+    extra: Vec<std::sync::Arc<dyn aivpn_common::transport::TransportFactory>>,
+) -> aivpn_common::transport::TransportRegistry {
+    let mut registry = aivpn_common::transport::TransportRegistry::new();
+    for factory in extra {
+        registry.register(factory);
+    }
+    registry
 }
 
 #[cfg(test)]
@@ -1889,46 +2049,63 @@ mod tests {
         let key = decode_base64_key("test key", &b64);
         assert_eq!(key, [0u8; 32]);
     }
-}
 
-/// Which datagram transport this run should open, if configuration names one.
-///
-/// Deliberately configuration-only: there is no command-line flag and no UI
-/// control for this, so the choice cannot be made accidentally and does not
-/// have to be represented anywhere a user can see. `AIVPN_TRANSPORT` names the
-/// transport; `AIVPN_TRANSPORT_PARAMS` carries base64 parameters that are
-/// passed through without being parsed here — what they mean is entirely the
-/// business of whichever factory claimed the name.
-///
-/// `None` — the case in a build that registers nothing — is the direct UDP
-/// socket the client has always used.
-fn transport_config() -> Option<aivpn_common::transport::TransportConfig> {
-    let name = std::env::var("AIVPN_TRANSPORT")
-        .ok()
-        .filter(|s| !s.trim().is_empty())?;
-    let params = std::env::var("AIVPN_TRANSPORT_PARAMS")
-        .ok()
-        .and_then(|s| base64::engine::general_purpose::STANDARD.decode(s).ok())
-        .unwrap_or_default();
-    Some(aivpn_common::transport::TransportConfig::new(
-        name.trim(),
-        params,
-    ))
-}
-
-/// The transports this binary can open.
-///
-/// This function is the extension point: a build that plugs in additional
-/// datagram transports registers them here, and nothing else in the client
-/// changes — it resolves whatever `transport_config()` asks for against this
-/// registry and otherwise knows nothing about what is in it. The default build
-/// registers none, so the only path is the direct UDP socket.
-fn transport_registry(
-    extra: Vec<std::sync::Arc<dyn aivpn_common::transport::TransportFactory>>,
-) -> aivpn_common::transport::TransportRegistry {
-    let mut registry = aivpn_common::transport::TransportRegistry::new();
-    for factory in extra {
-        registry.register(factory);
+    #[test]
+    fn preset_does_not_replace_bootstrap_descriptor() {
+        assert!(unsigned_preset_replaces_authenticated_descriptor(
+            "bootstrap:epoch:webrtc_zoom_v3:1:aa",
+            true
+        ));
+        assert!(!unsigned_preset_replaces_authenticated_descriptor(
+            "webrtc_zoom_v3",
+            true
+        ));
+        assert!(!unsigned_preset_replaces_authenticated_descriptor(
+            "bootstrap:epoch:webrtc_zoom_v3:1:aa",
+            false
+        ));
+        assert!(production_secure_client_keys_present(
+            Some(&[1u8; 32]),
+            Some(&[2u8; 32])
+        ));
+        assert!(!production_secure_client_keys_present(
+            None,
+            Some(&[2u8; 32])
+        ));
+        assert!(!production_secure_client_keys_present(
+            Some(&[1u8; 32]),
+            None
+        ));
     }
-    registry
+
+    #[cfg(not(feature = "production-secure"))]
+    #[test]
+    fn client_verify_mode_defaults_to_warn() {
+        assert_eq!(
+            parse_client_mask_verify_mode(None).unwrap(),
+            aivpn_common::mask::MaskVerifyMode::Warn
+        );
+        assert_eq!(
+            parse_client_mask_verify_mode(Some("off")).unwrap(),
+            aivpn_common::mask::MaskVerifyMode::Off
+        );
+        assert!(parse_client_mask_verify_mode(Some("nope")).is_err());
+    }
+
+    #[cfg(feature = "production-secure")]
+    #[test]
+    fn client_verify_mode_production_secure_enforce_only() {
+        assert_eq!(
+            parse_client_mask_verify_mode(None).unwrap(),
+            aivpn_common::mask::MaskVerifyMode::Enforce
+        );
+        assert_eq!(
+            parse_client_mask_verify_mode(Some("enforce")).unwrap(),
+            aivpn_common::mask::MaskVerifyMode::Enforce
+        );
+        let off = parse_client_mask_verify_mode(Some("off")).unwrap_err();
+        assert!(off.contains("production-secure"), "{off}");
+        assert!(parse_client_mask_verify_mode(Some("warn")).is_err());
+        assert!(parse_client_mask_verify_mode(Some("  ")).is_err());
+    }
 }

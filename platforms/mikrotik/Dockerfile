@@ -18,6 +18,7 @@ WORKDIR /app
 # listed in Cargo.toml to be present to resolve the workspace at all.
 COPY Cargo.toml Cargo.lock ./
 COPY crates crates/
+COPY vendor vendor/
 COPY assets/masks assets/masks/
 
 RUN cargo build --locked --release --target "${TARGET_TRIPLE}" -p aivpn-client --bin aivpn-client \

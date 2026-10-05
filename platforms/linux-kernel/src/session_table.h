@@ -6,7 +6,7 @@
  *   aivpn_tag_htable    — keyed by 8-byte resonance tag (RCU, read from softirq)
  *   aivpn_session_htable — keyed by 16-byte session_id (spinlock, management only)
  *
- * Anti-replay uses a WireGuard-style 256-bit sliding window per session.
+ * Anti-replay uses the shared 512-bit window in policy.h (bit 0 = newest).
  */
 
 #ifndef AIVPN_SESSION_TABLE_H
@@ -19,13 +19,16 @@
 #include <linux/atomic.h>
 #include <crypto/aead.h>
 #include "../include/uapi/aivpn.h"
+#include "policy.h"
+
+/* Размеры полей зашифрованного Data. */
+#define AIVPN_AUTH_SIZE 16
+#define AIVPN_PADLEN_SIZE 2
+#define AIVPN_INNER_HDR_SIZE 4
 
 /* Hash table sizes */
 #define AIVPN_TAG_HASH_BITS      17   /* 128K buckets for tag entries */
 #define AIVPN_SESSION_HASH_BITS   9   /* 512 buckets for session objects */
-
-/* WireGuard-style sliding window: 256 bits */
-#define AIVPN_REPLAY_WINDOW  256UL
 
 /**
  * struct aivpn_tag_entry - one (tag, counter) entry in the per-session tag window.
@@ -92,14 +95,19 @@ struct aivpn_kern_session {
 	u8   dl_mdh[AIVPN_DL_MDH_MAX];
 	u16  dl_mdh_len;
 	u16  dl_seq_base;
+	/* 0xFFFF пока downlink ioctl не задал реальное положение тега.
+	 * Ноль означает встройку с начала заголовка, а не legacy. */
+	u16  dl_tag_pos;
 	u32  dl_count;
 	u32  dl_next;                 /* next unused entry (protected by s->lock) */
 	struct aivpn_dl_entry dl_entries[AIVPN_TAG_WINDOW_SLOTS];
 
-	/* WireGuard-style anti-replay */
-	spinlock_t        lock;            /* protects counter + replay_window + stats */
-	u64               recv_counter;   /* highest validated counter */
-	unsigned long     replay_window[AIVPN_REPLAY_WINDOW / BITS_PER_LONG];
+	/* Политика, replay и остатки квоты. Писатели флагов держат table lock
+	 * и этот lock. Datapath меняет квоту, токены и replay только под этим lock. */
+	spinlock_t        lock;
+	struct aivpn_pol  pol;
+	/* Окно эпох не входит в pol: обновление политики его не стирает. */
+	struct aivpn_epoch_win replay;
 
 	/* stats (updated under lock) */
 	u64  rx_packets;
@@ -110,21 +118,25 @@ struct aivpn_kern_session {
 	/* tag window: pointers to tag entries installed in aivpn_tag_htable */
 	struct aivpn_tag_entry   *tag_entries[AIVPN_TAG_WINDOW_SLOTS];
 	int                       tag_entry_count;
-
-	/* outbound TX counter for aivpn_encrypt(); atomic, no lock needed */
-	atomic64_t                tx_counter;
 };
 
 /* ── Lifecycle ───────────────────────────────────────────────────────────── */
 
 int  aivpn_session_table_init(void);
 void aivpn_session_table_fini(void);
+void aivpn_session_owner_release(void);
 
 /* ── CRUD ────────────────────────────────────────────────────────────────── */
 
 int  aivpn_session_insert(const struct aivpn_session_add *add);
 int  aivpn_session_tags_update(const struct aivpn_session_update_tags *upd);
 int  aivpn_session_downlink_update(const struct aivpn_session_downlink *dl);
+int  aivpn_session_policy_set(const struct aivpn_session_policy *in);
+int  aivpn_session_sync(struct aivpn_session_sync *io);
+int  aivpn_session_replay_claim(struct aivpn_replay_claim *io);
+int  aivpn_session_replay_rotate(const struct aivpn_replay_rotate *in);
+int  aivpn_session_qos_charge(struct aivpn_qos_charge *io);
+int  aivpn_client_revoke(const struct aivpn_client_revoke *rv);
 int  aivpn_session_remove(const u8 *session_id);
 void aivpn_session_flush(void);
 int  aivpn_session_stat(struct aivpn_session_stat *stat);
@@ -141,6 +153,7 @@ struct aivpn_dl_reservation {
 	u64  counter;
 	u16  seq_num;
 	u16  mdh_len;
+	u16  tag_pos;                 /* копия dl_tag_pos на момент резерва */
 	u8   mdh[AIVPN_DL_MDH_MAX];
 	u8   client_addr[28];
 };
@@ -155,16 +168,37 @@ struct aivpn_dl_reservation {
 struct aivpn_kern_session *aivpn_session_lookup_by_ip(u32 client_ip);
 
 /**
- * aivpn_session_dl_reserve - claim the next reserved downlink slot.
+ * aivpn_session_dl_reserve - проверить политику и занять слот downlink.
  *
- * Caller holds rcu_read_lock() over @s. Takes s->lock internally, atomically
- * consumes one (tag, counter) entry, and copies it plus the MDH and client
- * address into @out. Returns 0 on success, -EAGAIN when the block is exhausted
- * (caller must fall back to user-space). The AEAD is performed by the caller
- * AFTER this returns, with no lock held.
+ * Caller holds rcu_read_lock(). @buf_len это длина уже скопированного префикса
+ * (обычно 40), @pkt_len это skb->len. 0: слот занят и квота списана.
+ * -EAGAIN: fallback, слот не занят. -EPERM: drop, слот не занят.
+ * Встройка, в которую тег не помещается, дает -EAGAIN до занятия слота.
  */
-int aivpn_session_dl_reserve(struct aivpn_kern_session *s,
+int aivpn_session_dl_reserve(struct aivpn_kern_session *s, const u8 *ip,
+			     unsigned int buf_len, unsigned int pkt_len,
 			     struct aivpn_dl_reservation *out);
+
+/**
+ * aivpn_session_rx_prepare - быстрый вердикт и просмотр replay до расшифровки.
+ *
+ * Caller holds s->lock. Не двигает окно. Эпоха 0 дает FALLBACK без отметки.
+ * DUP это DROP, слишком старый счетчик это FALLBACK.
+ * *replay_dup = 1 только для уже виденного счетчика текущей эпохи.
+ */
+int aivpn_session_rx_prepare(struct aivpn_kern_session *s, u64 counter,
+			     int *replay_dup);
+
+/**
+ * aivpn_session_rx_finish - повтор replay, адреса, квота и фиксация ACCEPT.
+ *
+ * Caller holds s->lock and rcu_read_lock() (поиск соседа идет через RCU).
+ * Захват счетчика стоит сразу перед списанием. Если списание не удалось,
+ * счетчик уже занят и вердикт DROP, не FALLBACK.
+ */
+int aivpn_session_rx_finish(struct aivpn_kern_session *s, u64 counter,
+			    const u8 *plain, unsigned int plain_len,
+			    unsigned int wire_len, int *replay_dup);
 
 /**
  * aivpn_tag_lookup - find a session by its wire resonance tag.
@@ -190,25 +224,5 @@ struct aivpn_kern_session *aivpn_tag_lookup(const u8 *tag, u64 *counter);
  * lookup that misses. Read lock-free on the hot path.
  */
 u64 aivpn_tag_probe_offsets(void);
-
-/**
- * aivpn_counter_check - WireGuard-style sliding window anti-replay CHECK.
- *
- * Must be called with session->lock held.  Read-only: returns true if the
- * counter would be acceptable (not too old, not yet seen) WITHOUT advancing
- * the window.  The caller marks the counter with aivpn_counter_update() only
- * after the packet authenticates (WireGuard ordering) so fallback packets
- * never burn counters in the kernel window.
- */
-bool aivpn_counter_check(const struct aivpn_kern_session *s, u64 counter);
-
-/**
- * aivpn_counter_update - mark @counter as received, advancing the window.
- *
- * Must be called with session->lock held, after AEAD authentication succeeds
- * and while the same lock hold that performed aivpn_counter_check() is still
- * in place (check+update are atomic under s->lock).
- */
-void aivpn_counter_update(struct aivpn_kern_session *s, u64 counter);
 
 #endif /* AIVPN_SESSION_TABLE_H */

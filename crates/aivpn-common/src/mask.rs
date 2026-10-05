@@ -39,12 +39,12 @@ impl BootstrapDescriptor {
 
     /// Verify the ed25519 signature of this descriptor against an operator signing key.
     pub fn verify_signature(&self, public_key: &[u8; 32]) -> Result<bool> {
-        use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+        use ed25519_dalek::{Signature, VerifyingKey};
         let vk = VerifyingKey::from_bytes(public_key)
             .map_err(|e| Error::Crypto(format!("Invalid Ed25519 public key: {}", e)))?;
         let message = self.signing_bytes();
         let sig = Signature::from_bytes(&self.signature);
-        match vk.verify(&message, &sig) {
+        match vk.verify_strict(&message, &sig) {
             Ok(()) => Ok(true),
             Err(_) => Ok(false),
         }
@@ -120,6 +120,9 @@ impl BootstrapChannel {
 /// Configuration for multi-channel bootstrap descriptor distribution.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BootstrapConfig {
+    /// Доверенный ключ подписи дескрипторов из сетевых каналов.
+    #[serde(default)]
+    pub trusted_signing_key: Option<[u8; 32]>,
     /// List of channels to try (in order of preference)
     pub channels: Vec<BootstrapChannel>,
     /// Maximum age of descriptors to accept (seconds)
@@ -135,6 +138,7 @@ pub struct BootstrapConfig {
 impl Default for BootstrapConfig {
     fn default() -> Self {
         Self {
+            trusted_signing_key: None,
             channels: Vec::new(),
             max_descriptor_age: 86400, // 24 hours
             min_success_channels: 1,
@@ -304,10 +308,8 @@ pub fn decode_bootstrap_descriptor(bytes: &[u8]) -> Option<BootstrapDescriptor> 
 ///    a present-but-invalid signature is REJECTED; only descriptors whose
 ///    signature verifies against `k` are accepted. A forged/tampered persisted
 ///    descriptor can never steer the handshake mask.
-///  - `trusted_key = None` → signature is not checked (no key to check it
-///    against — same trust model as the AEAD-authenticated in-session store
-///    path that produced these descriptors in the first place). Only the
-///    validity window is enforced.
+///  - При `trusted_key = None` обычная сборка проверяет срок действия.
+///    production-secure требует ключ и отклоняет такой дескриптор.
 ///
 /// Never panics; malformed JSON yields an empty vec. The result is sorted
 /// newest-first by `created_at`.
@@ -334,7 +336,16 @@ pub fn accept_persisted_descriptors(
                 // trusted operator key is configured.
                 d.signature != [0u8; 64] && matches!(d.verify_signature(key), Ok(true))
             }
-            None => true,
+            None => {
+                #[cfg(feature = "production-secure")]
+                {
+                    false
+                }
+                #[cfg(not(feature = "production-secure"))]
+                {
+                    true
+                }
+            }
         })
         .collect();
     out.sort_by_key(|d| std::cmp::Reverse(d.created_at));
@@ -349,7 +360,7 @@ pub fn accept_persisted_descriptors(
 /// must pick the same handshake mask the same way, or the server's per-mask
 /// layout-aware tag scan can't match it. The historical per-core snippet was
 ///
-/// ```ignore
+/// ```text
 /// preferred.and_then(preset_masks::by_id).unwrap_or_else(|| bootstrap_mask_for_psk(psk))
 /// ```
 ///
@@ -406,9 +417,22 @@ pub fn resolve_handshake_mask(
         .filter(|s| !s.is_empty() && *s != "auto");
 
     // 1. Explicit named preset (user's deliberate mask-picker selection).
+    //    production-secure не подменяет уже имеющийся дескриптор неподписанным
+    //    пресетом. Если дескрипторов нет, явный пресет по-прежнему выбирается.
     if let Some(name) = pref {
         if let Some(mask) = preset_masks::by_id(name) {
-            return mask;
+            #[cfg(feature = "production-secure")]
+            let keep_descriptor = !descriptors.is_empty();
+            #[cfg(not(feature = "production-secure"))]
+            let keep_descriptor = false;
+            if keep_descriptor {
+                tracing::warn!(
+                    "production-secure: пресет '{}' не заменяет аутентифицированный дескриптор",
+                    name
+                );
+            } else {
+                return mask;
+            }
         }
     }
 
@@ -489,10 +513,20 @@ pub fn resolve_handshake_mask_resilient(
     preshared_key: Option<&[u8; 32]>,
     fail_streak: u32,
 ) -> MaskProfile {
-    if fail_streak >= HANDSHAKE_FALLBACK_THRESHOLD {
-        resolve_handshake_mask(preferred, &[], preshared_key)
-    } else {
+    // production-secure не сбрасывает дескрипторы на встроенный пресет после
+    // серии неудачных рукопожатий. Доступность здесь не важнее подписи.
+    #[cfg(feature = "production-secure")]
+    {
+        let _ = fail_streak;
         resolve_handshake_mask(preferred, descriptors, preshared_key)
+    }
+    #[cfg(not(feature = "production-secure"))]
+    {
+        if fail_streak >= HANDSHAKE_FALLBACK_THRESHOLD {
+            resolve_handshake_mask(preferred, &[], preshared_key)
+        } else {
+            resolve_handshake_mask(preferred, descriptors, preshared_key)
+        }
     }
 }
 
@@ -622,6 +656,49 @@ pub fn verify_mask_artifact(
         MaskVerifyMode::Enforce => matches!(detail, MaskVerifyDetail::Valid),
     };
     MaskVerifyResult { accept, detail }
+}
+
+/// Режим проверки маски для защищенной сборки.
+///
+/// `None` - историческое значение по умолчанию (Android передает 1, iOS
+/// передает пустую строку). В production-secure оно поднимается до enforce.
+/// Явные off и warn в этой сборке - ошибка, а не тихая подмена.
+pub fn resolve_protected_mask_verify_mode(
+    explicit: Option<MaskVerifyMode>,
+) -> std::result::Result<MaskVerifyMode, String> {
+    #[cfg(feature = "production-secure")]
+    {
+        match explicit {
+            None | Some(MaskVerifyMode::Enforce) => Ok(MaskVerifyMode::Enforce),
+            Some(other) => Err(format!(
+                "production-secure принимает только mask_verify_mode=enforce, получено '{other:?}'"
+            )),
+        }
+    }
+    #[cfg(not(feature = "production-secure"))]
+    {
+        Ok(explicit.unwrap_or(MaskVerifyMode::Warn))
+    }
+}
+
+/// Защищенная сборка требует оба ключа: подпись сервера и ключ оператора масок.
+pub fn protected_build_requires_keys(
+    signing: bool,
+    operator: bool,
+) -> std::result::Result<(), String> {
+    #[cfg(feature = "production-secure")]
+    {
+        if signing && operator {
+            Ok(())
+        } else {
+            Err("production-secure требует server signing key и mask operator pubkey".to_string())
+        }
+    }
+    #[cfg(not(feature = "production-secure"))]
+    {
+        let _ = (signing, operator);
+        Ok(())
+    }
 }
 
 /// Perturb `mask` in place into a polymorphic variant, deterministically from
@@ -1534,7 +1611,7 @@ impl SizeIatGmm2d {
             return false;
         }
         let k = k as usize;
-        self.params.len() >= 1 + k * Self::STRIDE
+        self.params.len() > k * Self::STRIDE
     }
 
     /// Sample a joint `(size_bytes, iat_ms)`. Falls back to a benign default if
@@ -1650,14 +1727,14 @@ impl MaskProfile {
     }
 
     pub fn verify_signature(&self, public_key: &[u8; 32]) -> Result<bool> {
-        use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+        use ed25519_dalek::{Signature, VerifyingKey};
 
         let vk = VerifyingKey::from_bytes(public_key)
             .map_err(|e| Error::Crypto(format!("Invalid Ed25519 public key: {}", e)))?;
 
         let message = self.signing_message();
         let sig = Signature::from_bytes(&self.signature);
-        match vk.verify(&message, &sig) {
+        match vk.verify_strict(&message, &sig) {
             Ok(()) => Ok(true),
             Err(_) => Ok(false),
         }
@@ -2531,13 +2608,25 @@ mod tests {
             resolve_handshake_mask(Some("auto"), std::slice::from_ref(&descriptor), Some(&psk));
         assert!(auto.mask_id.starts_with("bootstrap:epoch-42:"));
 
-        // Explicit preset name is honored (deliberate user mask-picker choice).
+        // Обычная сборка разрешает пресет, защищенная сохраняет дескриптор.
         let preset = resolve_handshake_mask(
             Some("webrtc_zoom_v3"),
             std::slice::from_ref(&descriptor),
             Some(&psk),
         );
+        #[cfg(not(feature = "production-secure"))]
         assert_eq!(preset.mask_id, "webrtc_zoom_v3");
+        #[cfg(feature = "production-secure")]
+        assert!(
+            preset.mask_id.starts_with("bootstrap:epoch-42:"),
+            "preset must not replace a descriptor, got {}",
+            preset.mask_id
+        );
+        #[cfg(feature = "production-secure")]
+        {
+            let bare = resolve_handshake_mask(Some("webrtc_zoom_v3"), &[], Some(&psk));
+            assert_eq!(bare.mask_id, "webrtc_zoom_v3");
+        }
     }
 
     #[test]
@@ -2577,24 +2666,29 @@ mod tests {
         );
         assert!(covert.mask_id.starts_with("bootstrap:epoch-77:"));
 
-        // At the threshold the descriptor is abandoned for a builtin preset
-        // (the unmatchable-descriptor reconnect-loop breaker).
+        // Порог ошибок разрешает пресет только в обычной сборке.
         let fallback = resolve_handshake_mask_resilient(
             None,
             descriptors,
             Some(&psk),
             HANDSHAKE_FALLBACK_THRESHOLD,
         );
+        #[cfg(not(feature = "production-secure"))]
         assert!(preset_masks::by_id(&fallback.mask_id).is_some());
+        #[cfg(feature = "production-secure")]
+        assert!(fallback.mask_id.starts_with("bootstrap:epoch-77:"));
 
-        // An explicit preset choice is honored on both sides of the threshold.
+        // Явный пресет не заменяет дескриптор в защищенной сборке.
         let chosen = resolve_handshake_mask_resilient(
             Some("webrtc_zoom_v3"),
             descriptors,
             Some(&psk),
             HANDSHAKE_FALLBACK_THRESHOLD,
         );
+        #[cfg(not(feature = "production-secure"))]
         assert_eq!(chosen.mask_id, "webrtc_zoom_v3");
+        #[cfg(feature = "production-secure")]
+        assert!(chosen.mask_id.starts_with("bootstrap:epoch-77:"));
     }
 
     #[test]
@@ -2989,7 +3083,10 @@ mod tests {
 
 #[cfg(test)]
 mod persisted_descriptor_tests {
-    use super::{accept_persisted_descriptors, current_unix_secs, BootstrapDescriptor};
+    use super::{
+        accept_persisted_descriptors, current_unix_secs, protected_build_requires_keys,
+        resolve_protected_mask_verify_mode, BootstrapDescriptor, MaskVerifyMode,
+    };
 
     fn valid_descriptor(id: &str, created: u64) -> BootstrapDescriptor {
         let now = current_unix_secs();
@@ -3006,6 +3103,7 @@ mod persisted_descriptor_tests {
         }
     }
 
+    #[cfg(not(feature = "production-secure"))]
     #[test]
     fn parses_array_filters_expired_sorts_newest_first() {
         let now = current_unix_secs();
@@ -3021,6 +3119,7 @@ mod persisted_descriptor_tests {
         assert_eq!(accepted[1].descriptor_id, "d1");
     }
 
+    #[cfg(not(feature = "production-secure"))]
     #[test]
     fn accepts_single_object_without_trusted_key() {
         let now = current_unix_secs();
@@ -3049,5 +3148,76 @@ mod persisted_descriptor_tests {
     fn malformed_json_yields_empty() {
         assert!(accept_persisted_descriptors("not json", None).is_empty());
         assert!(accept_persisted_descriptors("", Some(&[0u8; 32])).is_empty());
+    }
+
+    #[test]
+    fn accepts_signed_descriptor_and_rejects_a_missing_key_when_protected() {
+        use ed25519_dalek::Signer;
+        let key = ed25519_dalek::SigningKey::from_bytes(&[3u8; 32]);
+        let now = current_unix_secs();
+        let mut expired = valid_descriptor("old", now.saturating_sub(100));
+        expired.expires_at = now.saturating_sub(10);
+        let d1 = valid_descriptor("d1", now.saturating_sub(50));
+        let d2 = valid_descriptor("d2", now.saturating_sub(5));
+        let sign = |mut item: BootstrapDescriptor| {
+            item.signature = key.sign(&item.signing_bytes()).to_bytes();
+            item
+        };
+        let json = serde_json::to_string(&vec![sign(expired), sign(d1), sign(d2)]).unwrap();
+        let pubkey = key.verifying_key().to_bytes();
+        let accepted = accept_persisted_descriptors(&json, Some(&pubkey));
+        assert_eq!(accepted.len(), 2, "expired descriptor must be dropped");
+        assert_eq!(accepted[0].descriptor_id, "d2");
+        assert_eq!(accepted[1].descriptor_id, "d1");
+        #[cfg(feature = "production-secure")]
+        assert!(accept_persisted_descriptors(&json, None).is_empty());
+        #[cfg(not(feature = "production-secure"))]
+        assert_eq!(accept_persisted_descriptors(&json, None).len(), 2);
+    }
+
+    #[test]
+    fn weak_operator_key_cannot_authenticate_an_artifact() {
+        let mut public_key = [0u8; 32];
+        public_key[0] = 1;
+        let mut forged_signature = [0u8; 64];
+        forged_signature[0] = 1;
+        let mut descriptor = valid_descriptor("weak-key", current_unix_secs());
+        descriptor.signature = forged_signature;
+        assert!(!descriptor.verify_signature(&public_key).unwrap());
+        let mut profile = super::preset_masks::webrtc_zoom_v3();
+        profile.signature = forged_signature;
+        assert!(!profile.verify_signature(&public_key).unwrap());
+    }
+
+    #[test]
+    fn protected_mode_and_keys_follow_the_build() {
+        #[cfg(not(feature = "production-secure"))]
+        {
+            assert_eq!(
+                resolve_protected_mask_verify_mode(None).unwrap(),
+                MaskVerifyMode::Warn
+            );
+            assert_eq!(
+                resolve_protected_mask_verify_mode(Some(MaskVerifyMode::Off)).unwrap(),
+                MaskVerifyMode::Off
+            );
+            assert!(protected_build_requires_keys(false, false).is_ok());
+        }
+        #[cfg(feature = "production-secure")]
+        {
+            assert_eq!(
+                resolve_protected_mask_verify_mode(None).unwrap(),
+                MaskVerifyMode::Enforce
+            );
+            assert_eq!(
+                resolve_protected_mask_verify_mode(Some(MaskVerifyMode::Enforce)).unwrap(),
+                MaskVerifyMode::Enforce
+            );
+            assert!(resolve_protected_mask_verify_mode(Some(MaskVerifyMode::Off)).is_err());
+            assert!(resolve_protected_mask_verify_mode(Some(MaskVerifyMode::Warn)).is_err());
+            assert!(protected_build_requires_keys(true, true).is_ok());
+            assert!(protected_build_requires_keys(true, false).is_err());
+            assert!(protected_build_requires_keys(false, true).is_err());
+        }
     }
 }

@@ -232,7 +232,7 @@ pub fn export_server(opts: &ExportOptions, output_path: &Path) -> Result<()> {
         .as_ref()
         .and_then(|p| p.parent())
         .or_else(|| opts.clients_db.as_ref().and_then(|p| p.parent()))
-        .or_else(|| opts.mask_dir.as_deref());
+        .or(opts.mask_dir.as_deref());
     match key_dir.and_then(|dir| load_backup_key(dir, true)) {
         Some(key) => {
             let mac = blake3::keyed_hash(&key, &manifest.mac_input());
@@ -558,7 +558,6 @@ fn semver_major(v: &str) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Read as _;
 
     fn write_archive(path: &Path, entries: &[(&str, Vec<u8>)]) {
         let file = std::fs::File::create(path).unwrap();

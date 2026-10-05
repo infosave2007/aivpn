@@ -8,6 +8,8 @@ pub mod crypto;
 pub mod error;
 pub mod event_log;
 pub mod fec;
+pub mod fragment;
+pub mod identity_file;
 pub mod mask;
 pub mod mimic_protocol;
 pub mod network_config;
@@ -57,3 +59,5 @@ pub use mimic_protocol::*;
 pub use network_config::*;
 pub use protocol::*;
 pub use recording::*;
+
+pub mod ip_packet;

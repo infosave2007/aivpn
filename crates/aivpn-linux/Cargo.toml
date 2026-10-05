@@ -11,7 +11,7 @@ name = "aivpn-linux"
 path = "src/main.rs"
 
 [dependencies]
-iced = { version = "0.13", features = ["tokio", "image"] }
+iced = { version = "0.14", features = ["tokio", "image", "advanced"] }
 # Neutral descriptor for extra settings sections. The GUI reads an optional
 # file and renders whatever it declares; with no file it renders nothing.
 aivpn-common = { path = "../aivpn-common", features = ["ui-ext"] }

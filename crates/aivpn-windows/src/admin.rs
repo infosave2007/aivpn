@@ -583,9 +583,6 @@ pub enum AdminRequest {
     ListClients,
     AddClient(NewClientForm),
     EditClient(EditClientForm),
-    DeleteClient {
-        id: String,
-    },
     RevokeClient {
         id: String,
     },
@@ -642,10 +639,6 @@ pub enum AdminResponse {
         editing: bool,
         result: Result<AdminClient, String>,
     },
-    ClientDeleted {
-        id: String,
-        result: Result<(), String>,
-    },
     ClientRevoked {
         id: String,
         result: Result<(), String>,
@@ -699,10 +692,6 @@ pub fn spawn(client_binary: PathBuf, req: AdminRequest, tx: Sender<AdminResponse
                 editing: true,
                 result: edit_client(&client_binary, &form),
             },
-            AdminRequest::DeleteClient { id } => {
-                let result = mgmt_status_only(&client_binary, "DELETE", &path_client(&id));
-                AdminResponse::ClientDeleted { id, result }
-            }
             AdminRequest::RevokeClient { id } => {
                 let result = mgmt_status_only(&client_binary, "POST", &path_revoke(&id));
                 AdminResponse::ClientRevoked { id, result }

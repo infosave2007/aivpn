@@ -107,7 +107,7 @@ impl super::App {
         // ── Header ────────────────────────────────────────────────────────────
         // Container-dot avoids Unicode glyph rendering issues on systems with
         // limited fonts — renders as a 10×10 colored circle regardless.
-        let dot = container(Space::with_width(0))
+        let dot = container(Space::new().width(0))
             .width(10)
             .height(10)
             .style(move |_: &Theme| container::Style {
@@ -133,13 +133,13 @@ impl super::App {
             .color(muted);
         let header = row![
             dot,
-            Space::with_width(6),
+            Space::new().width(6),
             text("AIVPN").size(17),
-            Space::with_width(Length::Fill),
+            Space::new().width(Length::Fill),
             version_label,
-            Space::with_width(4),
+            Space::new().width(4),
             lang_btn,
-            Space::with_width(2),
+            Space::new().width(2),
             theme_btn,
         ]
         .align_y(Alignment::Center);
@@ -188,7 +188,7 @@ impl super::App {
                 text(format!("RX {}", format_bytes(self.stats.bytes_received)))
                     .size(11)
                     .color(muted),
-                Space::with_width(6),
+                Space::new().width(6),
                 text(format!("TX {}", format_bytes(self.stats.bytes_sent)))
                     .size(11)
                     .color(muted),
@@ -196,7 +196,7 @@ impl super::App {
             // Live link quality from the client's quality.json (0 = not
             // reported yet / old client).
             if self.stats.quality_score > 0 {
-                r = r.push(Space::with_width(6)).push(
+                r = r.push(Space::new().width(6)).push(
                     text(format!("Q {}%", self.stats.quality_score))
                         .size(11)
                         .color(muted),
@@ -210,9 +210,9 @@ impl super::App {
         let status_card = container(
             row![
                 text(status_str).color(status_color).size(14),
-                Space::with_width(8),
+                Space::new().width(8),
                 traffic_row,
-                Space::with_width(Length::Fill),
+                Space::new().width(Length::Fill),
                 conn_btn,
             ]
             .align_y(Alignment::Center),
@@ -240,13 +240,13 @@ impl super::App {
                 .color(Color::from_rgb(1.0, 0.65, 0.15))
                 .into()
         } else {
-            Space::with_height(0).into()
+            Space::new().height(0).into()
         };
 
         // ── Profiles ──────────────────────────────────────────────────────────
         let profiles_header = row![
             text(t(lang, "Profiles")).size(14),
-            Space::with_width(Length::Fill),
+            Space::new().width(Length::Fill),
             button(t(lang, "+ Add"))
                 .on_press(Message::ShowAddDialog)
                 .style(button::text),
@@ -279,7 +279,7 @@ impl super::App {
 
                 let row_content: Element<Message> = row![
                     profile_col,
-                    Space::with_width(Length::Fill),
+                    Space::new().width(Length::Fill),
                     edit_btn,
                     del_btn,
                 ]
@@ -321,7 +321,7 @@ impl super::App {
                     .width(Length::Fill)
                     .padding(4),
             )
-            .height(profile_list_h),
+            .height(u32::from(profile_list_h)),
         )
         .style(|theme: &Theme| {
             let palette = theme.extended_palette();
@@ -349,7 +349,7 @@ impl super::App {
                             text(t(lang, "Record New Mask")).size(13),
                             row![
                                 text(details).color(color).size(12),
-                                Space::with_width(Length::Fill),
+                                Space::new().width(Length::Fill),
                                 button(t(lang, "Dismiss"))
                                     .on_press(Message::DismissRecordingResult)
                                     .style(button::text),
@@ -363,7 +363,7 @@ impl super::App {
                         text(format!("{} {svc}", t(lang, "Recording:")))
                             .color(Color::from_rgb(0.9, 0.2, 0.1))
                             .size(13),
-                        Space::with_width(Length::Fill),
+                        Space::new().width(Length::Fill),
                         button(t(lang, "Stop"))
                             .on_press(Message::StopRecording)
                             .style(button::danger),
@@ -380,7 +380,7 @@ impl super::App {
                             text_input("Service name", &self.recording_service)
                                 .on_input(Message::RecordServiceChanged)
                                 .width(180),
-                            Space::with_width(8),
+                            Space::new().width(8),
                             button(t(lang, "Start Recording")).on_press(Message::StartRecording),
                         ]
                         .align_y(Alignment::Center),
@@ -389,7 +389,7 @@ impl super::App {
                     .into(),
                 }
             } else {
-                Space::with_height(0).into()
+                Space::new().height(0).into()
             };
 
         // Only frame the recording area with its own trailing separator when
@@ -399,14 +399,14 @@ impl super::App {
         let recording_block: Element<Message> =
             if matches!(self.status, VpnStatus::Connected { .. }) {
                 column![
-                    Space::with_height(6),
+                    Space::new().height(6),
                     recording_section,
-                    Space::with_height(6),
-                    horizontal_rule(1),
+                    Space::new().height(6),
+                    rule::horizontal(1),
                 ]
                 .into()
             } else {
-                Space::with_height(0).into()
+                Space::new().height(0).into()
             };
 
         // ── Diagnostics / Bench ───────────────────────────────────────────────
@@ -418,7 +418,7 @@ impl super::App {
         } else if let Some(r) = &self.bench_result {
             text(r).size(12).into()
         } else {
-            Space::with_height(0).into()
+            Space::new().height(0).into()
         };
         let diag_btn = {
             let b = button(t(lang, "Diagnostics")).style(button::secondary);
@@ -489,11 +489,9 @@ impl super::App {
         // mirrors the Windows/macOS/iOS GUIs, which all disable this control on "auto".
         let mask_is_preset =
             self.settings.preferred_mask != "auto" && !self.settings.preferred_mask.is_empty();
-        let polymorphic_row = checkbox(
-            t(lang, "Polymorphic (per-session unique shape)"),
-            self.settings.polymorphic_mask,
-        )
-        .on_toggle_maybe(mask_is_preset.then_some(Message::TogglePolymorphicMask));
+        let polymorphic_row = checkbox(self.settings.polymorphic_mask)
+            .label(t(lang, "Polymorphic (per-session unique shape)"))
+            .on_toggle_maybe(mask_is_preset.then_some(Message::TogglePolymorphicMask));
         let polymorphic_desc = text(t(
             lang,
             "Each session gets a unique variant of the selected mask. Not used with \"Auto\".",
@@ -504,16 +502,12 @@ impl super::App {
         // Stack the two toggles vertically: side by side they overflowed a
         // narrow window and wrapped to one letter per line ("плывёт").
         let feedback_row = column![
-            checkbox(
-                t(lang, "Share blocked-mask feedback"),
-                self.settings.share_mask_feedback
-            )
-            .on_toggle(Message::ToggleShareMaskFeedback),
-            checkbox(
-                t(lang, "Receive mask hints for my region"),
-                self.settings.receive_mask_hints
-            )
-            .on_toggle(Message::ToggleReceiveMaskHints),
+            checkbox(self.settings.share_mask_feedback)
+                .label(t(lang, "Share blocked-mask feedback"))
+                .on_toggle(Message::ToggleShareMaskFeedback),
+            checkbox(self.settings.receive_mask_hints)
+                .label(t(lang, "Receive mask hints for my region"))
+                .on_toggle(Message::ToggleReceiveMaskHints),
         ]
         .spacing(6);
 
@@ -526,9 +520,11 @@ impl super::App {
         .spacing(8)
         .align_y(Alignment::Center);
 
-        let kill_switch_row = checkbox(t(lang, "Kill switch"), self.settings.kill_switch)
+        let kill_switch_row = checkbox(self.settings.kill_switch)
+            .label(t(lang, "Kill switch"))
             .on_toggle(Message::ToggleKillSwitch);
-        let autostart_row = checkbox(t(lang, "Start on login"), self.settings.autostart)
+        let autostart_row = checkbox(self.settings.autostart)
+            .label(t(lang, "Start on login"))
             .on_toggle(Message::ToggleAutostart);
 
         let dns_row = row![
@@ -564,12 +560,13 @@ impl super::App {
                 .width(Length::Fill)
                 .into()
         } else {
-            Space::with_width(Length::Fill).into()
+            Space::new().width(Length::Fill).into()
         };
         let socks5_row = row![
-            checkbox(t(lang, "SOCKS5 proxy"), self.settings.socks5_enabled)
+            checkbox(self.settings.socks5_enabled)
+                .label(t(lang, "SOCKS5 proxy"))
                 .on_toggle(Message::ToggleSocks5),
-            Space::with_width(8),
+            Space::new().width(8),
             socks5_addr_input,
         ]
         .align_y(Alignment::Center);
@@ -583,7 +580,7 @@ impl super::App {
             button(text(bootstrap_toggle_label))
                 .on_press(Message::ToggleBootstrapPanel)
                 .style(button::text),
-            Space::with_width(Length::Fill),
+            Space::new().width(Length::Fill),
         ]
         .align_y(Alignment::Center);
         let bootstrap_desc_text = text(bootstrap_desc(lang)).size(11).color(muted);
@@ -636,7 +633,7 @@ impl super::App {
             .align_y(Alignment::Center);
             column![
                 bootstrap_desc_text,
-                Space::with_height(4),
+                Space::new().height(4),
                 cdn_row,
                 telegram_token_row,
                 telegram_chat_row,
@@ -646,7 +643,7 @@ impl super::App {
             .spacing(4)
             .into()
         } else {
-            Space::with_height(0).into()
+            Space::new().height(0).into()
         };
 
         let log_toggle_label = if self.logs_open {
@@ -666,7 +663,7 @@ impl super::App {
             button(log_toggle_label)
                 .on_press(Message::ToggleLogPanel)
                 .style(button::text),
-            Space::with_width(Length::Fill),
+            Space::new().width(Length::Fill),
             button(t(lang, "Clear"))
                 .on_press(Message::ClearLog)
                 .style(button::text),
@@ -697,7 +694,7 @@ impl super::App {
             .height(160)
             .into()
         } else {
-            Space::with_height(0).into()
+            Space::new().height(0).into()
         };
 
         // Admin client-management panel: gated on the panel being connected
@@ -719,7 +716,7 @@ impl super::App {
         let admin_section: Element<Message> = if admin_can_view {
             self.view_admin_section(admin_can_mutate)
         } else {
-            Space::with_height(0).into()
+            Space::new().height(0).into()
         };
         // Pool topology panel (B3): same connected+Viewer-or-Admin gate as
         // the client-management panel above — pool node/health data is a
@@ -728,7 +725,7 @@ impl super::App {
         let pool_section: Element<Message> = if admin_can_view {
             self.view_pool_section()
         } else {
-            Space::with_height(0).into()
+            Space::new().height(0).into()
         };
         // G-A2: audit-log panel — same Viewer-or-Admin gate; the server's
         // `audit-log` route is GET-only in the curated allowlist regardless
@@ -736,7 +733,7 @@ impl super::App {
         let audit_section: Element<Message> = if admin_can_view {
             self.view_audit_section()
         } else {
-            Space::with_height(0).into()
+            Space::new().height(0).into()
         };
         // G-A3: Server Settings panel — Admin-only (`admin_can_mutate`, NOT
         // `admin_can_view`), unlike the three sections above: every control
@@ -745,7 +742,7 @@ impl super::App {
         let server_settings_section: Element<Message> = if admin_can_mutate {
             self.view_server_settings_section()
         } else {
-            Space::with_height(0).into()
+            Space::new().height(0).into()
         };
 
         // C3: SSH server install wizard. Deliberately NOT gated behind
@@ -763,35 +760,35 @@ impl super::App {
             scrollable(
                 column![
                     header,
-                    Space::with_height(4),
-                    horizontal_rule(1),
-                    Space::with_height(6),
+                    Space::new().height(4),
+                    rule::horizontal(1),
+                    Space::new().height(6),
                     status_card,
                     fallback_badge,
-                    Space::with_height(8),
-                    horizontal_rule(1),
-                    Space::with_height(6),
+                    Space::new().height(8),
+                    rule::horizontal(1),
+                    Space::new().height(6),
                     profiles_header,
-                    Space::with_height(4),
+                    Space::new().height(4),
                     profiles_list,
-                    Space::with_height(6),
-                    row![diag_btn, Space::with_width(8), bench_label].align_y(Alignment::Center),
-                    Space::with_height(4),
-                    horizontal_rule(1),
-                    Space::with_height(6),
+                    Space::new().height(6),
+                    row![diag_btn, Space::new().width(8), bench_label].align_y(Alignment::Center),
+                    Space::new().height(4),
+                    rule::horizontal(1),
+                    Space::new().height(6),
                     adaptive_row,
                     adaptive_desc,
-                    Space::with_height(2),
+                    Space::new().height(2),
                     mask_row,
                     mask_desc,
-                    Space::with_height(2),
+                    Space::new().height(2),
                     polymorphic_row,
                     polymorphic_desc,
-                    Space::with_height(2),
+                    Space::new().height(2),
                     feedback_row,
                     country_code_row,
-                    Space::with_height(2),
-                    row![kill_switch_row, Space::with_width(16), autostart_row]
+                    Space::new().height(2),
+                    row![kill_switch_row, Space::new().width(16), autostart_row]
                         .align_y(Alignment::Center),
                     dns_row,
                     routes_row,
@@ -799,29 +796,29 @@ impl super::App {
                     socks5_row,
                     // Single separator after SOCKS5; the recording block adds its
                     // own trailing separator only when connected (see recording_block).
-                    Space::with_height(6),
-                    horizontal_rule(1),
+                    Space::new().height(6),
+                    rule::horizontal(1),
                     recording_block,
-                    Space::with_height(6),
+                    Space::new().height(6),
                     admin_section,
-                    Space::with_height(6),
+                    Space::new().height(6),
                     pool_section,
-                    Space::with_height(6),
+                    Space::new().height(6),
                     audit_section,
-                    Space::with_height(6),
+                    Space::new().height(6),
                     server_settings_section,
-                    Space::with_height(6),
+                    Space::new().height(6),
                     install_wizard_section,
-                    Space::with_height(6),
+                    Space::new().height(6),
                     bootstrap_header,
                     bootstrap_box,
-                    Space::with_height(4),
+                    Space::new().height(4),
                     self.view_ext_section(),
-                    Space::with_height(4),
-                    horizontal_rule(1),
+                    Space::new().height(4),
+                    rule::horizontal(1),
                     log_header,
                     log_box,
-                    Space::with_height(4),
+                    Space::new().height(4),
                 ]
                 .padding(16)
                 .spacing(4),
@@ -868,16 +865,16 @@ impl super::App {
             if !can_mutate {
                 text(t(lang, "View only")).size(11).color(muted).into()
             } else {
-                Element::from(Space::with_width(0))
+                Element::from(Space::new().width(0))
             },
-            Space::with_width(Length::Fill),
+            Space::new().width(Length::Fill),
             if self.admin_open {
                 button(t(lang, "Refresh"))
                     .on_press(Message::AdminRefreshClients)
                     .style(button::text)
                     .into()
             } else {
-                Element::from(Space::with_width(0))
+                Element::from(Space::new().width(0))
             },
         ]
         .spacing(8)
@@ -922,7 +919,8 @@ impl super::App {
                 text_input(t(lang, "Name"), &self.admin_new_name)
                     .on_input(Message::AdminNewNameChanged)
                     .width(Length::FillPortion(2)),
-                checkbox(t(lang, "One-time"), self.admin_new_one_time)
+                checkbox(self.admin_new_one_time)
+                    .label(t(lang, "One-time"))
                     .on_toggle(Message::AdminNewOneTimeToggled),
                 text_input("expires (RFC3339, optional)", &self.admin_new_expires)
                     .on_input(Message::AdminNewExpiresChanged)
@@ -962,7 +960,7 @@ impl super::App {
         for c in &self.admin_clients {
             let busy = self.admin_busy_id.as_deref() == Some(c.id.as_str());
             let title_row = row![
-                text(format!("{}", c.name)).size(13),
+                text(c.name.to_string()).size(13),
                 text(format!("[{}]", c.role_label())).size(11).color(muted),
                 text(if c.enabled {
                     t(lang, "enabled")
@@ -1163,14 +1161,14 @@ impl super::App {
             button(text(toggle_label))
                 .on_press(Message::TogglePoolPanel)
                 .style(button::text),
-            Space::with_width(Length::Fill),
+            Space::new().width(Length::Fill),
             if self.pool_open {
                 button(t(lang, "Refresh"))
                     .on_press(Message::PoolRefresh)
                     .style(button::text)
                     .into()
             } else {
-                Element::from(Space::with_width(0))
+                Element::from(Space::new().width(0))
             },
         ]
         .align_y(Alignment::Center);
@@ -1405,7 +1403,7 @@ impl super::App {
         let pending_active = self.server_settings_pending.is_some();
 
         // ── Active mask override (per-client, live) ─────────────────────
-        body = body.push(horizontal_rule(1));
+        body = body.push(rule::horizontal(1));
         body = body.push(text(t(lang, "Active mask override")).size(13));
         let client_choices = admin_client_choices(&self.admin_clients);
         let selected_client = self
@@ -1456,7 +1454,7 @@ impl super::App {
         }
 
         // ── Global exit node (pool default, restart required) ───────────
-        body = body.push(horizontal_rule(1));
+        body = body.push(rule::horizontal(1));
         body = body.push(text(t(lang, "Global exit node (pool default)")).size(13));
         let exit_choices = exit_node_choices(lang, &self.pool_nodes);
         let exit_selected = exit_node_selected(&self.server_settings_exit_node, &exit_choices);
@@ -1518,14 +1516,14 @@ impl super::App {
             button(text(toggle_label))
                 .on_press(Message::ToggleAuditPanel)
                 .style(button::text),
-            Space::with_width(Length::Fill),
+            Space::new().width(Length::Fill),
             if self.audit_open {
                 button(t(lang, "Refresh"))
                     .on_press(Message::AuditRefresh)
                     .style(button::text)
                     .into()
             } else {
-                Element::from(Space::with_width(0))
+                Element::from(Space::new().width(0))
             },
         ]
         .align_y(Alignment::Center);
@@ -1640,7 +1638,7 @@ impl super::App {
             button(text(toggle_label))
                 .on_press(Message::ToggleInstallWizard)
                 .style(button::text),
-            Space::with_width(Length::Fill),
+            Space::new().width(Length::Fill),
         ]
         .align_y(Alignment::Center);
 
@@ -1739,11 +1737,9 @@ impl super::App {
         );
 
         body = body.push(
-            checkbox(
-                t(lang, "Use SSH key instead of password"),
-                self.install_auth_is_key,
-            )
-            .on_toggle(Message::InstallAuthModeToggled),
+            checkbox(self.install_auth_is_key)
+                .label(t(lang, "Use SSH key instead of password"))
+                .on_toggle(Message::InstallAuthModeToggled),
         );
 
         if self.install_auth_is_key {
@@ -1808,12 +1804,12 @@ impl super::App {
 
         body = body.push(
             row![
-                checkbox("docker", self.install_mode_docker).on_toggle(Message::InstallModeToggled),
-                checkbox(
-                    t(lang, "Bind this device (admin access)"),
-                    self.install_bind_device
-                )
-                .on_toggle(Message::InstallBindDeviceToggled),
+                checkbox(self.install_mode_docker)
+                    .label("docker")
+                    .on_toggle(Message::InstallModeToggled),
+                checkbox(self.install_bind_device)
+                    .label(t(lang, "Bind this device (admin access)"))
+                    .on_toggle(Message::InstallBindDeviceToggled),
             ]
             .spacing(12),
         );
@@ -1917,14 +1913,14 @@ impl super::App {
                 .size(12)
                 .into()
         } else {
-            Space::with_height(0).into()
+            Space::new().height(0).into()
         };
 
         let buttons: Element<Message> = row![
             button(t(lang, "Save"))
                 .on_press(Message::DlgSave)
                 .style(button::primary),
-            Space::with_width(8),
+            Space::new().width(8),
             button(t(lang, "Cancel")).on_press(Message::DlgCancel),
         ]
         .into();
@@ -1932,28 +1928,26 @@ impl super::App {
         let dialog_content = container(
             column![
                 text(title).size(16),
-                Space::with_height(12),
+                Space::new().height(12),
                 text(t(lang, "Name")).size(12),
                 name_input,
-                Space::with_height(8),
+                Space::new().height(8),
                 text(t(lang, "Connection key")).size(12),
                 key_input,
-                Space::with_height(8),
+                Space::new().height(8),
                 text(t(lang, "mTLS cert path (optional)")).size(12),
                 mtls_input,
-                Space::with_height(6),
-                checkbox(
-                    if lang == "ru" {
+                Space::new().height(6),
+                checkbox(self.dlg_full_tunnel)
+                    .label(if lang == "ru" {
                         "Full tunnel (весь трафик через VPN)"
                     } else {
                         "Full tunnel (route all traffic through VPN)"
-                    },
-                    self.dlg_full_tunnel,
-                )
-                .on_toggle(Message::DlgFullTunnelToggled),
-                Space::with_height(2),
+                    })
+                    .on_toggle(Message::DlgFullTunnelToggled),
+                Space::new().height(2),
                 error_row,
-                Space::with_height(12),
+                Space::new().height(12),
                 buttons,
             ]
             .spacing(4)
@@ -1991,7 +1985,7 @@ impl super::App {
         use iced::widget::{checkbox, pick_list, text, text_input, Space};
 
         let Some(desc) = &self.ext_descriptor else {
-            return Space::with_height(0).into();
+            return Space::new().height(0).into();
         };
 
         let header_label = if self.ext_open { "[-]" } else { "[+]" };
@@ -2017,7 +2011,8 @@ impl super::App {
                         current,
                         Some(aivpn_common::ui_ext::FieldValue::Toggle(true))
                     );
-                    checkbox(f.label.clone(), on)
+                    checkbox(on)
+                        .label(f.label.clone())
                         .on_toggle(move |v| Message::ExtToggleChanged(key.clone(), v))
                         .into()
                 }

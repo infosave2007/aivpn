@@ -114,12 +114,7 @@ pub struct ClientConfig {
     /// `mgmt_service::HeavySetting::ExitNode`). `None` (default) falls back
     /// to the global default.
     ///
-    /// STORAGE ONLY as of Wave B2a: nothing in the data plane
-    /// (`ChainForwarder` / gateway forwarding / `pool_dialer` exit
-    /// sessions) reads this field yet — actually routing by it is Wave B2b.
-    /// Synced pool-wide via `merge_from_json`'s LWW/tombstone gate exactly
-    /// like `role`. Validated on `update_client` (see
-    /// `validate_exit_node_addr`) — must be `host:port` or unset.
+    /// Участвует в выборе выхода и синхронизируется между узлами пула.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exit_node: Option<String>,
 }

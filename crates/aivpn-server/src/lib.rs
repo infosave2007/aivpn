@@ -55,7 +55,6 @@ pub mod qos;
 pub mod tc_loader;
 
 // 0.9.0 modules
-pub mod chain_forwarder;
 #[cfg(feature = "dns")]
 pub mod dns_proxy;
 pub mod mtls;

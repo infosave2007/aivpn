@@ -10,21 +10,22 @@
     "check:watch": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json --watch"
   },
   "devDependencies": {
-    "@sveltejs/adapter-static": "^3.0.8",
-    "@sveltejs/kit": "^2.21.4",
-    "@sveltejs/vite-plugin-svelte": "^5.0.3",
-    "@tailwindcss/vite": "^4.1.10",
-    "@types/qrcode": "^1.5.5",
-    "svelte": "^5.33.12",
-    "svelte-check": "^4.2.1",
-    "tailwindcss": "^4.1.10",
-    "typescript": "^5.8.3",
-    "vite": "^6.3.5"
+    "@sveltejs/adapter-static": "^3.0.10",
+    "@sveltejs/kit": "^2.70.3",
+    "@sveltejs/vite-plugin-svelte": "^5.1.1",
+    "@tailwindcss/vite": "^4.3.3",
+    "@types/d3-scale": "^4.0.9",
+    "@types/qrcode": "^1.5.6",
+    "svelte": "^5.57.1",
+    "svelte-check": "^4.7.6",
+    "tailwindcss": "^4.3.3",
+    "typescript": "^5.9.3",
+    "vite": "^6.4.3"
   },
   "dependencies": {
-    "@simplewebauthn/browser": "^13.1.0",
-    "@tanstack/svelte-query": "^5.80.7",
-    "layerchart": "^1.0.0-next.8",
+    "@simplewebauthn/browser": "^13.3.0",
+    "@tanstack/svelte-query": "^5.90.2",
+    "layerchart": "^1.0.13",
     "lucide-svelte": "^0.513.0",
     "d3-scale": "^4.0.2",
     "qrcode": "^1.5.4"

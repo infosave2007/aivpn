@@ -21,9 +21,8 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::time;
 
 use crate::client_wire::{
-    build_inner_packet, build_shaped_mdh_packet, decode_downlink_any_mdh_len,
-    decode_packet_with_mdh_len, obfuscate_client_eph_pub, process_server_hello_with_mdh_len,
-    RecvWindow,
+    build_inner_packet, build_shaped_mdh_packet, decode_downlink_with_offsets,
+    obfuscate_client_eph_pub, process_server_hello_with_offsets, RecvWindow,
 };
 use crate::crypto::{derive_session_keys, device_enrollment_proof, KeyPair, SessionKeys};
 use crate::error::{Error, Result};
@@ -115,6 +114,17 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
     // path byte-for-byte unchanged.
     alt_transport: Option<Arc<dyn crate::transport::DatagramTransport>>,
 ) -> Result<()> {
+    if let Err(msg) = crate::mask::protected_build_requires_keys(
+        server_signing_key.is_some(),
+        mask_operator_pubkey.is_some(),
+    ) {
+        return Err(Error::Session(msg));
+    }
+    let mask_verify_mode =
+        match crate::mask::resolve_protected_mask_verify_mode(Some(mask_verify_mode)) {
+            Ok(mode) => mode,
+            Err(msg) => return Err(Error::Session(msg)),
+        };
     let level = AdaptiveLevel::from_u8(adaptive_level);
     let session = Arc::new(SessionRuntime::new());
     let _active_session_guard = activate_session(session.clone())?;
@@ -133,6 +143,9 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
     // Clear last session's server-assigned VPN IP; this attempt's ServerHello
     // will re-populate it (or leave it 0 for old servers).
     ASSIGNED_VPN_IP.store(0, Ordering::Relaxed);
+    *ASSIGNED_NETWORK_CONFIG
+        .lock()
+        .unwrap_or_else(|error| error.into_inner()) = None;
     ACTIVE_FEEDBACK_THRESHOLD.store(0, Ordering::Relaxed);
     ACTIVE_FEEDBACK_INTERVAL.store(0, Ordering::Relaxed);
     MASK_FEEDBACK_SENT.store(false, Ordering::Relaxed);
@@ -216,7 +229,7 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
     let stop_signal = create_stop_signal(&session)?;
 
     // Resolve host; race against stop signal so disconnect is always responsive.
-    let dest_str = format!("{}:{}", server_host, server_port);
+    let dest_host = server_host.trim_start_matches('[').trim_end_matches(']');
     let dest: SocketAddr = tokio::select! {
         biased;
         _ = wait_for_stop(&stop_signal) => {
@@ -224,13 +237,13 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
         }
         result = tokio::time::timeout(
             Duration::from_secs(5),
-            tokio::net::lookup_host(&dest_str),
+            tokio::net::lookup_host((dest_host, server_port)),
         ) => {
             result
                 .map_err(|_| Error::Session("DNS lookup timeout (5 s)".into()))?
                 .map_err(Error::Io)?
-                .find(|a| a.is_ipv4())
-                .ok_or_else(|| Error::Session("Cannot resolve server host to IPv4".into()))?
+                .min_by_key(|address| address.is_ipv6())
+                .ok_or_else(|| Error::Session("Cannot resolve server host".into()))?
         }
     };
 
@@ -359,6 +372,7 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
     // drops any packet whose mask differs and strands the tunnel on the first
     // rekey. Seeded with the fixed handshake/control length plus the bootstrap
     // mask's own length; extended when MaskUpdate arrives.
+    let mut recv_tag_offsets = vec![handshake_mask.tag_offset];
     let mut recv_mdh_candidates: Vec<usize> = vec![mdh_len];
     if !recv_mdh_candidates.contains(&hs_mdh_len) {
         recv_mdh_candidates.push(hs_mdh_len);
@@ -390,6 +404,7 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
     let handshake_deadline = Instant::now() + HANDSHAKE_TIMEOUT;
     let mut retry_count: u32 = 0;
     let mut recv_win = RecvWindow::new();
+    let mut fragment_rx = crate::fragment::Reassembler::default();
     let (server_network_cfg, server_eph_pub) = loop {
         let now = Instant::now();
         if now >= handshake_deadline {
@@ -435,11 +450,9 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
                         // an already-failed decode, which is harmless.
                         let peeked = [hs_mdh_len, mdh_len].into_iter().find_map(|len| {
                             let mut reject_peek_win = recv_win.clone();
-                            decode_packet_with_mdh_len(
-                                &recv_buf[..n],
-                                &keys,
-                                &mut reject_peek_win,
-                                len,
+                            decode_downlink_with_offsets(
+                                &recv_buf[..n], &keys, &mut reject_peek_win,
+                                &mut vec![len], &recv_tag_offsets,
                             )
                             .ok()
                         });
@@ -476,7 +489,7 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
                         let hello_mdh_len = if hs_mdh_len != mdh_len {
                             let (mut k, mut w, mut c) =
                                 (keys.clone(), recv_win.clone(), send_counter);
-                            if process_server_hello_with_mdh_len(
+                            if process_server_hello_with_offsets(
                                 &recv_buf[..n],
                                 &mut k,
                                 &keypair,
@@ -484,6 +497,7 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
                                 &mut c,
                                 hs_mdh_len,
                                 server_signing_key.as_ref(),
+                                &recv_tag_offsets,
                             )
                             .is_ok()
                             {
@@ -494,7 +508,7 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
                         } else {
                             mdh_len
                         };
-                        match process_server_hello_with_mdh_len(
+                        match process_server_hello_with_offsets(
                             &recv_buf[..n],
                             &mut keys,
                             &keypair,
@@ -502,6 +516,7 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
                             &mut send_counter,
                             hello_mdh_len,
                             server_signing_key.as_ref(),
+                            &recv_tag_offsets,
                         ) {
                             Ok((cfg, server_eph_pub)) => break (cfg, server_eph_pub),
                             Err(e) => {
@@ -564,6 +579,9 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
     // key-embedded IP stale and the anti-spoof check kills all uplink data).
     if let Some(cfg) = server_network_cfg.as_ref() {
         ASSIGNED_VPN_IP.store(u32::from(cfg.client_ip), Ordering::Relaxed);
+        *ASSIGNED_NETWORK_CONFIG
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(cfg.clone());
     }
     let base_keepalive = server_network_cfg
         .as_ref()
@@ -785,10 +803,24 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
                     if n == 0 {
                         continue;
                     }
-                    if tun_buf[0] >> 4 != 4 {
+                    let Some(packet) = crate::ip_packet::IpPacket::parse(&tun_buf[..n]) else {
                         continue;
+                    };
+                    if let std::net::IpAddr::V6(source) = packet.source {
+                        let assigned = ASSIGNED_NETWORK_CONFIG.lock().ok().and_then(|config| {
+                            config
+                                .as_ref()
+                                .and_then(|value| value.client_ipv6().ok().flatten())
+                        });
+                        if assigned.map(|(address, _)| address) != Some(source) {
+                            continue;
+                        }
                     }
-                    if tun_tx.send(tun_buf[..n].to_vec()).await.is_err() {
+                    if tun_tx
+                        .send(tun_buf[..packet.length].to_vec())
+                        .await
+                        .is_err()
+                    {
                         break;
                     }
                 }
@@ -984,6 +1016,28 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
         }
     }
 
+    let packet_features = ControlPayload::Capabilities {
+        role: 0,
+        features: crate::protocol::CLIENT_PACKET_FEATURES
+            | if level.fec_n() > 0 {
+                crate::protocol::CLIENT_FEC_ACTIVE
+            } else {
+                0
+            },
+    }
+    .encode()?;
+    let inner = build_inner_packet(InnerType::Control, send_seq, &packet_features);
+    let packet = build_shaped_mdh_packet(
+        &keys,
+        &mut send_counter,
+        &inner,
+        None,
+        hs_mdh_len,
+        &handshake_mask,
+    )?;
+    send_seq = send_seq.wrapping_add(1);
+    transport.send(&packet).await?;
+
     let mask_update_slot: Arc<Mutex<Option<MaskProfile>>> = Arc::new(Mutex::new(None));
     let mask_update_for_enc = Arc::clone(&mask_update_slot);
     let key_rotate_slot: Arc<Mutex<Option<SessionKeys>>> = Arc::new(Mutex::new(None));
@@ -1129,11 +1183,12 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
                 // a forward jump afterwards measures the downlink gap (loss).
                 let prev_primary_highest = recv_win.highest();
                 let mut decoded_via_primary = false;
-                let decoded = match decode_downlink_any_mdh_len(
+                let decoded = match decode_downlink_with_offsets(
                     &udp_buf[..n],
                     &keys,
                     &mut recv_win,
                     &mut recv_mdh_candidates,
+                    &recv_tag_offsets,
                 ) {
                     Ok(decoded) => {
                         decoded_via_primary = true;
@@ -1142,11 +1197,12 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
                     Err(e) => {
                         log::debug!("aivpn: decode failed (primary keys): {}", e);
                         if let Some(fallback_keys) = transition_recv_keys.as_ref() {
-                            let r = decode_downlink_any_mdh_len(
+                            let r = decode_downlink_with_offsets(
                                 &udp_buf[..n],
                                 fallback_keys,
                                 &mut transition_recv_win,
                                 &mut recv_mdh_candidates,
+                    &recv_tag_offsets,
                             );
                             if r.is_err() {
                                 log::debug!("aivpn: decode failed (fallback keys) — packet dropped");
@@ -1189,7 +1245,17 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
                     }
                 }
 
-                if let Some(decoded) = decoded {
+                if let Some(mut decoded) = decoded {
+                    if decoded.header.inner_type == InnerType::Fragment {
+                        match fragment_rx.accept(&decoded.payload, Instant::now()) {
+                            Ok(Some((kind, payload))) => {
+                                decoded.header.inner_type = kind;
+                                decoded.payload = payload;
+                            }
+                            Ok(None) => continue,
+                            Err(error) => { log::warn!("Invalid fragment: {}", error); continue; }
+                        }
+                    }
                     // Only a successfully authenticated packet proves the link is
                     // alive — advancing the watchdog on raw recv() would let
                     // undecodable (e.g. spoofed) datagrams mask a dead downlink.
@@ -1663,11 +1729,11 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
                                     // it, so the payload is dropped before even being decoded.
                                     let transport_verified: Option<bool> =
                                         server_signing_key.map(|signing_key| {
-                                            use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+                                            use ed25519_dalek::{Signature, VerifyingKey};
                                             match VerifyingKey::from_bytes(&signing_key) {
                                                 Ok(vk) => {
                                                     let sig = Signature::from_bytes(&signature);
-                                                    vk.verify(&mask_data, &sig).is_ok()
+                                                    vk.verify_strict(&mask_data, &sig).is_ok()
                                                 }
                                                 Err(_) => false,
                                             }
@@ -1718,6 +1784,7 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
                                             }
                                             // Track the new mask's downlink length so subsequent
                                             // server DATA/control packets framed with it decode.
+                                            if !recv_tag_offsets.contains(&mask.tag_offset) { recv_tag_offsets.push(mask.tag_offset); }
                                             let new_mdh = mask.mdh_len();
                                             if !recv_mdh_candidates.contains(&new_mdh) {
                                                 recv_mdh_candidates.insert(0, new_mdh);
@@ -1779,13 +1846,29 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
                                         decode_bootstrap_descriptor(&descriptor_data)
                                     {
                                         let id = descriptor.descriptor_id.clone();
-                                        store_bootstrap_descriptor(descriptor);
-                                        log::info!(
-                                            "aivpn: BootstrapDescriptorUpdate stored ({} bytes, descriptor {}) — \
-                                             covert mask available for next reconnect",
-                                            descriptor_data.len(),
-                                            id
+                                        // Обычная сборка доверяет AEAD-каналу сессии.
+                                        // production-secure дополнительно проверяет подпись
+                                        // дескриптора ключом сервера и не кладет чужой blob.
+                                        #[cfg(feature = "production-secure")]
+                                        let signature_ok = server_signing_key.as_ref().is_some_and(
+                                            |key| matches!(descriptor.verify_signature(key), Ok(true)),
                                         );
+                                        #[cfg(not(feature = "production-secure"))]
+                                        let signature_ok = true;
+                                        if signature_ok {
+                                            store_bootstrap_descriptor(descriptor);
+                                            log::info!(
+                                                "aivpn: BootstrapDescriptorUpdate stored ({} bytes, descriptor {}) - \
+                                                 covert mask available for next reconnect",
+                                                descriptor_data.len(),
+                                                id
+                                            );
+                                        } else {
+                                            log::warn!(
+                                                "aivpn: BootstrapDescriptorUpdate rejected: подпись не прошла проверку (descriptor {})",
+                                                id
+                                            );
+                                        }
                                     } else {
                                         log::warn!(
                                             "aivpn: BootstrapDescriptorUpdate received ({} bytes) but failed to parse",
@@ -1809,7 +1892,7 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
                                     // up on the session — stranding a healthy tunnel. Mirrors
                                     // desktop client.rs's unified ServerHello handler.
                                     if let Some(signing_key) = server_signing_key.as_ref() {
-                                        use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+                                        use ed25519_dalek::{Signature, VerifyingKey};
                                         let verified = VerifyingKey::from_bytes(signing_key)
                                             .ok()
                                             .map(|vk| {
@@ -1817,7 +1900,7 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
                                                 msg.extend_from_slice(&server_eph_pub);
                                                 msg.extend_from_slice(&keypair.public_key_bytes());
                                                 let sig = Signature::from_bytes(&signature);
-                                                vk.verify(&msg, &sig).is_ok()
+                                                vk.verify_strict(&msg, &sig).is_ok()
                                             })
                                             .unwrap_or(false);
                                         if !verified {
@@ -1909,6 +1992,7 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
                                     // does (ASSIGNED_VPN_IP for the pool re-home mismatch check,
                                     // keepalive interval for the NAT-safe/adaptive-level combo).
                                     if let Some(cfg) = network_config.as_ref() {
+                                        *ASSIGNED_NETWORK_CONFIG.lock().unwrap_or_else(|error| error.into_inner()) = Some(cfg.clone());
                                         ASSIGNED_VPN_IP.store(
                                             u32::from(cfg.client_ip),
                                             Ordering::Relaxed,
@@ -1983,6 +2067,7 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
                                 | ControlPayload::RouteSync { .. }
                                 | ControlPayload::ChainForward { .. }
                                 | ControlPayload::PartitionAnnounce { .. }
+                                | ControlPayload::SiteData { .. }
                                 | ControlPayload::NodeEnrollment { .. }
                                 | ControlPayload::MgmtRequest { .. }
                                 | ControlPayload::RecordingStatusRequest

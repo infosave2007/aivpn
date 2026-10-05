@@ -4,7 +4,9 @@
 //! by sending appropriate ControlPayload messages to the server.
 
 use serde::{Deserialize, Serialize};
-use tracing::{info, warn};
+use tracing::info;
+#[cfg(unix)]
+use tracing::warn;
 
 /// Returns platform-appropriate paths for recording status files.
 pub fn recording_status_paths() -> Vec<std::path::PathBuf> {
@@ -617,7 +619,7 @@ mod admin_command_tests {
             })
         );
 
-        let bad_raw = format!("wrong-token:mgmt:2:/api/v1/clients/1:");
+        let bad_raw = "wrong-token:mgmt:2:/api/v1/clients/1:".to_string();
         let (tok2, _rest2) = bad_raw
             .split_once(':')
             .expect("datagram has a token prefix");

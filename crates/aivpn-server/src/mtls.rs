@@ -133,7 +133,7 @@ pub fn verify_cert(cert: &SimpleCert, config: &MtlsConfig) -> bool {
     let mut ca_key_bytes = [0u8; 32];
     ca_key_bytes.copy_from_slice(&ca_pub_bytes);
 
-    use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+    use ed25519_dalek::{Signature, VerifyingKey};
     let vk = match VerifyingKey::from_bytes(&ca_key_bytes) {
         Ok(k) => k,
         Err(e) => {
@@ -143,7 +143,7 @@ pub fn verify_cert(cert: &SimpleCert, config: &MtlsConfig) -> bool {
     };
     let sig = Signature::from_bytes(&cert.ca_signature);
     let msg = SimpleCert::signed_message(&cert.client_pub_key, cert.expiry_ts);
-    match vk.verify(&msg, &sig) {
+    match vk.verify_strict(&msg, &sig) {
         Ok(()) => {
             debug!(
                 "mtls: cert valid (expires in {}s)",
@@ -213,6 +213,24 @@ mod tests {
             ca_public_key_hex: None,
             required,
         }
+    }
+
+    #[test]
+    fn weak_ca_cannot_authenticate_a_client() {
+        let mut weak = [0u8; 32];
+        weak[0] = 1;
+        let mut signature = [0u8; 64];
+        signature[0] = 1;
+        let cert = SimpleCert {
+            client_pub_key: [7u8; 32],
+            expiry_ts: u64::MAX,
+            ca_signature: signature,
+        };
+        let config = MtlsConfig {
+            ca_public_key_hex: Some(hex::encode(weak)),
+            required: true,
+        };
+        assert!(!verify_cert(&cert, &config));
     }
 
     #[test]

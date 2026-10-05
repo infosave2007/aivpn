@@ -227,20 +227,38 @@ pub unsafe extern "C" fn aivpn_run_tunnel(
         Some(arr)
     };
 
-    // R2 Phase B: parse the mode string the same way desktop's
-    // `MaskVerifyMode::from_str` does (off|warn|enforce, case-insensitive);
-    // NULL/empty/unrecognized all collapse to the default (`Warn`) rather
-    // than erroring — this FFI boundary must never fail closed on a typo.
-    let mask_verify_mode_val: aivpn_common::mask::MaskVerifyMode = if mask_verify_mode.is_null() {
-        aivpn_common::mask::MaskVerifyMode::default()
+    // NULL и пустая строка - историческое значение по умолчанию. Обычная
+    // сборка оставляет warn, в том числе для нераспознанной строки.
+    // production-secure поднимает пустое значение до enforce, явные off/warn
+    // и нераспознанную строку отклоняет.
+    let mask_verify_mode_text: Option<String> = if mask_verify_mode.is_null() {
+        None
     } else {
         // SAFETY: mask_verify_mode is a NUL-terminated C string from Swift.
         unsafe { std::ffi::CStr::from_ptr(mask_verify_mode) }
             .to_str()
             .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or_default()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
     };
+    let explicit_mode = match mask_verify_mode_text.as_deref() {
+        None => None,
+        Some(text) => text.parse::<aivpn_common::mask::MaskVerifyMode>().ok(),
+    };
+    let mask_verify_mode_val =
+        match aivpn_common::mask::resolve_protected_mask_verify_mode(explicit_mode) {
+            Ok(mode) => mode,
+            Err(_) => return -1,
+        };
+    if aivpn_common::mask::protected_build_requires_keys(
+        server_signing_key_opt.is_some(),
+        mask_operator_pubkey_opt.is_some(),
+    )
+    .is_err()
+    {
+        return -1;
+    }
 
     let rt = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -1122,6 +1140,32 @@ fn verify_bootstrap_descriptor_bytes(json: &[u8], pubkey: &[u8; 32]) -> bool {
         return false;
     }
     matches!(descriptor.verify_signature(pubkey), Ok(true))
+}
+
+/// Копирует сетевые настройки JSON целиком; 0 означает отсутствие снимка или малый буфер.
+///
+/// # Safety
+/// `buf` должен указывать на доступные для записи `capacity` байт.
+#[no_mangle]
+pub unsafe extern "C" fn aivpn_get_assigned_network_config(
+    buf: *mut libc::c_char,
+    capacity: usize,
+) -> usize {
+    let json = aivpn_common::mobile_tunnel::assigned_network_config_json();
+    if buf.is_null() || capacity == 0 {
+        return 0;
+    }
+    unsafe {
+        *buf = 0;
+    }
+    if json.is_empty() || json.len() >= capacity {
+        return 0;
+    }
+    unsafe {
+        std::ptr::copy_nonoverlapping(json.as_ptr(), buf.cast::<u8>(), json.len());
+        *buf.add(json.len()) = 0;
+    }
+    json.len()
 }
 
 #[cfg(test)]

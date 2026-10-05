@@ -3,6 +3,7 @@ mod app;
 mod install_wizard;
 mod key_storage;
 mod settings;
+mod subscription;
 mod tray;
 mod vpn_manager;
 
@@ -27,7 +28,8 @@ fn main() -> iced::Result {
         )
         .init();
 
-    iced::application("AIVPN", App::update, App::view)
+    iced::application(App::new, App::update, App::view)
+        .title("AIVPN")
         .subscription(App::subscription)
         .theme(App::theme)
         .window(iced::window::Settings {
@@ -39,5 +41,5 @@ fn main() -> iced::Result {
             antialiasing: true,
             ..Default::default()
         })
-        .run_with(App::new)
+        .run()
 }

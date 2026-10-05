@@ -9,7 +9,9 @@
 use base64::Engine as _;
 use std::path::PathBuf;
 use std::process::{Child, Command};
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+const FIREWALL_CLEAR_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConnectionState {
@@ -127,10 +129,8 @@ pub struct VpnManager {
     /// on the next launch. Best-effort: None means fall back to unmanaged child spawning.
     #[cfg(windows)]
     job_handle: Option<usize>,
-    /// Per-session child supervision thread (HIGH-2): watches the client PID
-    /// from a background thread so a child crash is detected — and the
-    /// kill-switch cleared — even while SW_HIDE has paused the egui update
-    /// loop (poll_status() only runs inside update()).
+    /// Поток сообщает интерфейсу о завершении клиента, в том числе при скрытом окне.
+    /// После аварии сетевые ограничения сохраняются до явного отключения.
     #[cfg(windows)]
     supervisor: Option<SupervisorHandle>,
     /// Wakes the egui event loop (ctx.request_repaint) from background
@@ -145,9 +145,19 @@ struct SupervisorHandle {
     /// Set by the UI thread before an INTENTIONAL kill (disconnect/Drop) so
     /// the supervisor doesn't misread it as a crash.
     shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    /// swap(true) before running `kill-switch clear` — whichever side
-    /// (supervisor or UI-thread poll) gets there first runs it exactly once.
-    cleared_kill_switch: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+#[cfg(windows)]
+impl Drop for SupervisorHandle {
+    fn drop(&mut self) {
+        self.shutdown
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        // Очистка старого firewall должна завершиться до следующего подключения.
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
 }
 
 impl Drop for VpnManager {
@@ -171,12 +181,6 @@ impl Drop for VpnManager {
 impl VpnManager {
     pub fn new() -> Self {
         let client_binary = Self::find_client_binary();
-        // MEDIUM-1: a GUI crash skips every kill-switch cleanup path (Drop,
-        // disconnect, poll) and leaves the block-all firewall rules active
-        // with no process that remembers them — detect that via the marker
-        // file the previous session left behind and clear the rules now.
-        #[cfg(windows)]
-        Self::clear_orphaned_kill_switch(&client_binary);
         Self {
             state: ConnectionState::Disconnected,
             child: None,
@@ -208,7 +212,7 @@ impl VpnManager {
             )),
             connected_since: None,
             session_since_ms: None,
-            kill_switch_active: false,
+            kill_switch_active: Self::kill_switch_marker_path().exists(),
             #[cfg(windows)]
             job_handle: create_kill_on_close_job(),
             #[cfg(windows)]
@@ -269,6 +273,15 @@ impl VpnManager {
     ) -> Result<(), String> {
         if self.child.is_some() {
             return Err("Already running".to_string());
+        }
+
+        #[cfg(windows)]
+        drop(self.supervisor.take());
+        if !kill_switch && self.kill_switch_active {
+            self.clear_kill_switch_once();
+            if self.kill_switch_active {
+                return Err("Previous kill-switch cleanup failed".into());
+            }
         }
 
         if !self.client_binary.exists() {
@@ -485,10 +498,7 @@ impl VpnManager {
                 self.child = Some(child);
                 self.kill_switch_active = kill_switch;
                 if kill_switch {
-                    // MEDIUM-1: persist a marker (contents: child PID) so a
-                    // GUI crash that skips every cleanup path is detected on
-                    // the next launch and the orphaned rules cleared. Deleted
-                    // whenever `kill-switch clear` is actually spawned.
+                    // Маркер сохраняет состояние защиты после перезапуска интерфейса.
                     let marker = Self::kill_switch_marker_path();
                     if let Some(dir) = marker.parent() {
                         let _ = std::fs::create_dir_all(dir);
@@ -516,15 +526,9 @@ impl VpnManager {
         }
     }
 
-    /// Spawn `aivpn-client kill-switch clear` to remove firewall rules left by
-    /// TerminateProcess (child.kill() on Windows bypasses the graceful shutdown cleanup path).
-    ///
-    /// Fire-and-forget: callers (disconnect(), poll_status(), Drop) all run on the egui
-    /// render/update thread, so blocking on `.status()` would freeze the whole window for
-    /// as long as the child takes — indefinitely if it hangs. `spawn()` is quick and
-    /// synchronous, so it also still works from Drop during app exit; dropping the Child
-    /// handle detaches the process, which keeps running until the rules are cleared.
-    fn run_kill_switch_clear(binary: &std::path::Path) {
+    /// Очистка идет в фоне, чтобы не блокировать интерфейс. Маркер сохраняется
+    /// до успешного завершения команды для повторной попытки после сбоя.
+    fn run_kill_switch_clear(binary: &std::path::Path) -> bool {
         let mut cmd = std::process::Command::new(binary);
         cmd.args(["kill-switch", "clear"]);
         #[cfg(windows)]
@@ -533,42 +537,23 @@ impl VpnManager {
             const CREATE_NO_WINDOW: u32 = 0x08000000;
             cmd.creation_flags(CREATE_NO_WINDOW);
         }
-        match cmd.spawn() {
-            Ok(_) => {
-                // Rules are being cleared — the crash-recovery marker no
-                // longer applies (kept on spawn failure so the next launch
-                // retries via clear_orphaned_kill_switch()).
-                let _ = std::fs::remove_file(Self::kill_switch_marker_path());
-            }
-            Err(e) => gui_log(&format!("kill-switch clear: spawn failed: {e}")),
+        let marker = Self::kill_switch_marker_path();
+        if let Err(error) = clear_firewall_and_marker(&mut cmd, &marker, FIREWALL_CLEAR_TIMEOUT) {
+            gui_log(&format!("kill-switch clear failed: {error}"));
+            return false;
         }
+        true
     }
 
-    /// Run `kill-switch clear` at most once per session: the supervision
-    /// thread and the UI-thread paths (disconnect/poll/Drop) race to the
-    /// shared `cleared_kill_switch` flag; whoever swaps it first clears.
+    /// Очистка вызывается только при намеренном отключении.
     fn clear_kill_switch_once(&mut self) {
-        #[cfg(windows)]
-        let already = self
-            .supervisor
-            .as_ref()
-            .map(|s| {
-                s.cleared_kill_switch
-                    .swap(true, std::sync::atomic::Ordering::SeqCst)
-            })
-            .unwrap_or(false);
-        #[cfg(not(windows))]
-        let already = false;
-        if !already {
-            Self::run_kill_switch_clear(&self.client_binary);
+        if Self::run_kill_switch_clear(&self.client_binary) {
+            self.kill_switch_active = false;
         }
-        self.kill_switch_active = false;
     }
 
-    /// Marker recording that a client session was started with --kill-switch
-    /// (contents: the child PID). Deleted whenever `kill-switch clear` is
-    /// spawned; its survival across a GUI crash triggers the startup cleanup
-    /// in `clear_orphaned_kill_switch()`.
+    /// PID владельца правил. Удаляется после успешной очистки, оставшийся
+    /// маркер запускает восстановление при следующем старте приложения.
     fn kill_switch_marker_path() -> PathBuf {
         dirs::data_local_dir()
             .unwrap_or_else(|| PathBuf::from("."))
@@ -576,48 +561,9 @@ impl VpnManager {
             .join("kill-switch.active")
     }
 
-    /// Startup recovery (MEDIUM-1): if a previous session's kill-switch
-    /// marker survived (GUI crashed with rules active) and its client is no
-    /// longer running, clear the rules. Blocking on purpose — a fire-and-
-    /// forget clear could race a connect_on_startup session started
-    /// milliseconds later and wipe the NEW session's freshly-added rules.
+    /// Ожидание завершения клиента независимо от цикла обновления окна.
     #[cfg(windows)]
-    fn clear_orphaned_kill_switch(binary: &std::path::Path) {
-        let marker = Self::kill_switch_marker_path();
-        let Ok(content) = std::fs::read_to_string(&marker) else {
-            return;
-        };
-        if let Ok(pid) = content.trim().parse::<u32>() {
-            if pid != 0 && process_is_aivpn_client(pid) {
-                // A client from a previous session is still alive and owns
-                // the rules — leave both it and the marker alone.
-                return;
-            }
-        }
-        gui_log("kill-switch: stale marker from a previous session — clearing orphaned rules");
-        let mut cmd = Command::new(binary);
-        cmd.args(["kill-switch", "clear"]);
-        {
-            use std::os::windows::process::CommandExt;
-            const CREATE_NO_WINDOW: u32 = 0x08000000;
-            cmd.creation_flags(CREATE_NO_WINDOW);
-        }
-        match cmd.status() {
-            Ok(_) => {
-                let _ = std::fs::remove_file(&marker);
-            }
-            Err(e) => gui_log(&format!("kill-switch clear (startup): spawn failed: {e}")),
-        }
-    }
-
-    /// HIGH-2: per-session supervision thread. poll_status() only runs inside
-    /// egui's update(), which SW_HIDE pauses — so while the window is hidden
-    /// a client crash would go undetected and, with kill-switch on, leave the
-    /// user without internet indefinitely. This thread watches the child PID
-    /// independently, clears the kill-switch the moment the child dies, and
-    /// pokes the event loop so poll_status() reconciles the UI state.
-    #[cfg(windows)]
-    fn spawn_child_supervisor(&mut self, pid: u32, kill_switch: bool) {
+    fn spawn_child_supervisor(&mut self, pid: u32, _kill_switch: bool) {
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::Arc;
         // connect() rejects while a child exists, so any previous supervisor
@@ -626,14 +572,12 @@ impl VpnManager {
             prev.shutdown.store(true, Ordering::SeqCst);
         }
         let shutdown = Arc::new(AtomicBool::new(false));
-        let cleared = Arc::new(AtomicBool::new(false));
-        self.supervisor = Some(SupervisorHandle {
+        let mut supervisor = SupervisorHandle {
             shutdown: Arc::clone(&shutdown),
-            cleared_kill_switch: Arc::clone(&cleared),
-        });
-        let binary = self.client_binary.clone();
+            thread: None,
+        };
         let wake = self.wake_cb.clone();
-        std::thread::spawn(move || {
+        supervisor.thread = Some(std::thread::spawn(move || {
             use winapi::shared::winerror::WAIT_TIMEOUT;
             use winapi::um::handleapi::CloseHandle;
             use winapi::um::processthreadsapi::OpenProcess;
@@ -657,14 +601,7 @@ impl VpnManager {
                     continue;
                 }
                 if r == WAIT_OBJECT_0 && !shutdown.load(Ordering::SeqCst) {
-                    // Child died while the update loop may be paused: clear
-                    // the kill-switch NOW (dedup'd against the UI thread via
-                    // the shared flag) instead of waiting for the user to
-                    // reopen the window, then wake the UI to reconcile.
-                    if kill_switch && !cleared.swap(true, Ordering::SeqCst) {
-                        gui_log("supervisor: client exited — clearing kill-switch");
-                        Self::run_kill_switch_clear(&binary);
-                    }
+                    // После аварии фильтры сохраняются до явного отключения.
                     if let Some(w) = &wake {
                         w();
                     }
@@ -672,7 +609,8 @@ impl VpnManager {
                 break;
             }
             unsafe { CloseHandle(handle) };
-        });
+        }));
+        self.supervisor = Some(supervisor);
     }
 
     /// Disconnect — kill the client process
@@ -710,7 +648,9 @@ impl VpnManager {
         self.stats.fallback = false;
         self.session_since_ms = None;
         self.connected_since = None;
-        self.last_error = None;
+        self.last_error = self
+            .kill_switch_active
+            .then(|| "Kill-switch cleanup failed; protection remains active".into());
         // Reset recording
         self.recording_state = RecordingState::Idle;
         self.can_record_masks = false;
@@ -785,9 +725,6 @@ impl VpnManager {
                         self.last_error = Some(format!("Client exited ({}){}", status, detail));
                     }
                     self.child = None;
-                    if self.kill_switch_active {
-                        self.clear_kill_switch_once();
-                    }
                     #[cfg(windows)]
                     if let Some(s) = self.supervisor.take() {
                         s.shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -811,9 +748,6 @@ impl VpnManager {
                 Err(e) => {
                     self.last_error = Some(format!("Connection lost (OS error): {e}"));
                     self.child = None;
-                    if self.kill_switch_active {
-                        self.clear_kill_switch_once();
-                    }
                     #[cfg(windows)]
                     if let Some(s) = self.supervisor.take() {
                         s.shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -1349,35 +1283,6 @@ fn create_kill_on_close_job() -> Option<usize> {
     }
 }
 
-/// Whether `pid` is a live process whose image is aivpn-client.exe. Used by
-/// the MEDIUM-1 startup recovery to distinguish "previous session's client
-/// still running" from "stale marker after a crash" (a bare liveness check
-/// would false-positive on PID reuse and strand the user behind orphaned
-/// block-all rules).
-#[cfg(windows)]
-fn process_is_aivpn_client(pid: u32) -> bool {
-    use winapi::um::handleapi::CloseHandle;
-    use winapi::um::processthreadsapi::OpenProcess;
-    use winapi::um::winbase::QueryFullProcessImageNameW;
-    use winapi::um::winnt::PROCESS_QUERY_LIMITED_INFORMATION;
-    unsafe {
-        let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
-        if h.is_null() {
-            return false;
-        }
-        let mut buf = [0u16; 1024];
-        let mut len = buf.len() as u32;
-        let ok = QueryFullProcessImageNameW(h, 0, buf.as_mut_ptr(), &mut len);
-        CloseHandle(h);
-        if ok == 0 {
-            return false;
-        }
-        String::from_utf16_lossy(&buf[..len as usize])
-            .to_ascii_lowercase()
-            .ends_with("aivpn-client.exe")
-    }
-}
-
 /// Log a GUI-side diagnostic line (LOW-5). `eprintln!` alone is invisible
 /// under `windows_subsystem = "windows"` (there is no console), so every
 /// message is also appended to %LOCALAPPDATA%\AIVPN\gui.log where it can
@@ -1427,5 +1332,84 @@ pub fn format_bytes(bytes: u64) -> String {
         format!("{:.1} KB", bytes as f64 / KB as f64)
     } else {
         format!("{} B", bytes)
+    }
+}
+
+/// Удаляем маркер только после подтвержденной очистки. Таймаут сохраняет его для восстановления.
+fn clear_firewall_and_marker(
+    command: &mut Command,
+    marker: &std::path::Path,
+    timeout: Duration,
+) -> std::io::Result<()> {
+    let previous_marker = std::fs::read(marker).ok();
+    let mut child = command.spawn()?;
+    let started = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => {
+                if std::fs::read(marker).ok() == previous_marker && previous_marker.is_some() {
+                    std::fs::remove_file(marker)?;
+                }
+                return Ok(());
+            }
+            Ok(Some(status)) => return Err(std::io::Error::other(format!("exit {status}"))),
+            Ok(None) if started.elapsed() < timeout => {
+                std::thread::sleep(Duration::from_millis(20))
+            }
+            result => {
+                #[cfg(windows)]
+                {
+                    let mut terminate = Command::new("taskkill");
+                    terminate.args(["/PID", &child.id().to_string(), "/T", "/F"]);
+                    {
+                        use std::os::windows::process::CommandExt;
+                        terminate.creation_flags(0x08000000);
+                    }
+                    let _ = terminate.status();
+                }
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(result.err().unwrap_or_else(|| {
+                    std::io::Error::new(std::io::ErrorKind::TimedOut, "firewall cleanup timed out")
+                }));
+            }
+        }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod firewall_cleanup_tests {
+    use super::*;
+
+    #[test]
+    fn cleanup_success_failure_timeout_and_marker_ownership() {
+        let root = std::env::temp_dir().join(format!("aivpn-firewall-test-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let marker = root.join("active");
+        for (script, succeeds) in [
+            ("exit 0", true),
+            ("exit 1", false),
+            ("exec sleep 10", false),
+        ] {
+            std::fs::write(&marker, "old-session").unwrap();
+            let result = clear_firewall_and_marker(
+                Command::new("sh").args(["-c", script]),
+                &marker,
+                Duration::from_millis(100),
+            );
+            assert_eq!(result.is_ok(), succeeds);
+            assert_eq!(marker.exists(), !succeeds);
+        }
+        std::fs::write(&marker, "old-session").unwrap();
+        clear_firewall_and_marker(
+            Command::new("sh")
+                .args(["-c", "printf new-session > \"$1\"", "sh"])
+                .arg(&marker),
+            &marker,
+            Duration::from_secs(2),
+        )
+        .unwrap();
+        assert_eq!(std::fs::read_to_string(&marker).unwrap(), "new-session");
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

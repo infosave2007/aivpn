@@ -52,6 +52,23 @@ pub trait PacketEncryptor: Send {
     fn encrypt_data(&mut self, payload: &[u8]) -> Result<Vec<u8>>;
     /// Encrypt an arbitrary control message into a ready-to-send UDP datagram.
     fn encrypt_control(&mut self, payload: &ControlPayload) -> Result<Vec<u8>>;
+    /// Разбивает крупное управляющее сообщение до шифрования.
+    fn encrypt_control_packets(&mut self, payload: &ControlPayload) -> Result<Vec<Vec<u8>>> {
+        let bytes = payload.encode()?;
+        if bytes.len() <= crate::fragment::FRAGMENT_DATA_SIZE {
+            return Ok(vec![self.encrypt_control(payload)?]);
+        }
+        crate::fragment::split(InnerType::Control, &bytes)?
+            .iter()
+            .map(|fragment| self.encrypt_fragment(fragment))
+            .collect()
+    }
+    fn encrypt_fragment(&mut self, _payload: &[u8]) -> Result<Vec<u8>> {
+        Err(crate::error::Error::InvalidPacket(
+            "Encryptor does not support fragments",
+        ))
+    }
+
     /// Encrypt a keepalive control message into a ready-to-send UDP datagram.
     fn encrypt_keepalive(&mut self) -> Result<Vec<u8>>;
     /// Called after a data datagram has been successfully sent.
@@ -157,6 +174,12 @@ impl PacketEncryptor for ZeroMdhEncryptor {
             }
         }
         Ok(pkt)
+    }
+
+    fn encrypt_fragment(&mut self, payload: &[u8]) -> Result<Vec<u8>> {
+        let inner = build_inner_packet(InnerType::Fragment, self.seq, payload);
+        self.seq = self.seq.wrapping_add(1);
+        build_random_mdh_packet(&self.keys, &mut self.counter, &inner, None, self.mdh_len)
     }
 
     fn encrypt_control(&mut self, payload: &ControlPayload) -> Result<Vec<u8>> {
@@ -271,8 +294,9 @@ pub async fn run_upload_loop(
     ) -> Result<()> {
         if let Some(insp) = inspector.as_deref_mut() {
             if let Some(req) = insp.observe(wire) {
-                let enc_req = enc.encrypt_control(&req)?;
-                send_tolerant(transport.as_ref(), &enc_req).await?;
+                for enc_req in enc.encrypt_control_packets(&req)? {
+                    send_tolerant(transport.as_ref(), &enc_req).await?;
+                }
             }
         }
         Ok(())
@@ -299,8 +323,9 @@ pub async fn run_upload_loop(
             loop {
                 match crx.try_recv() {
                     Ok(payload) => {
-                        let encrypted = enc.encrypt_control(&payload)?;
-                        send_tolerant(transport.as_ref(), &encrypted).await?;
+                        for encrypted in enc.encrypt_control_packets(&payload)? {
+                            send_tolerant(transport.as_ref(), &encrypted).await?;
+                        }
                     }
                     Err(mpsc::error::TryRecvError::Empty) => break,
                     Err(mpsc::error::TryRecvError::Disconnected) => break,
@@ -403,8 +428,9 @@ pub async fn run_upload_loop(
                     // channel does ("TUN->UDP channel closed" above).
                     None => return Err(Error::Channel("control channel closed".into())),
                 };
-                let encrypted = enc.encrypt_control(&payload)?;
-                send_tolerant(transport.as_ref(), &encrypted).await?;
+                for encrypted in enc.encrypt_control_packets(&payload)? {
+                    send_tolerant(transport.as_ref(), &encrypted).await?;
+                }
             }
         }
     }

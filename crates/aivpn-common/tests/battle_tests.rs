@@ -41,8 +41,8 @@ fn battle_key_exchange_deterministic_from_private() {
     let _a = KeyPair::generate();
     let priv_bytes = {
         // Re-generate from same private — we'll use a known key
-        let key = [0x42u8; 32];
-        key
+
+        [0x42u8; 32]
     };
     let k1 = KeyPair::from_private_key(priv_bytes);
     let k2 = KeyPair::from_private_key(priv_bytes);

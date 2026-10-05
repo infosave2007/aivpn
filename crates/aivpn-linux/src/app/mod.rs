@@ -6,8 +6,7 @@ mod views;
 use i18n::t;
 use iced::futures::SinkExt;
 use iced::widget::{
-    button, checkbox, container, horizontal_rule, image, pick_list, scrollable, text, text_input,
-    Space,
+    button, checkbox, container, image, pick_list, rule, scrollable, text, text_input, Space,
 };
 use iced::{Alignment, Background, Border, Color, Element, Length, Subscription, Task, Theme};
 pub use messages::Message;
@@ -27,9 +26,6 @@ use crate::vpn_manager::{
     self, extract_server_addr, find_client_binary, format_bytes, read_recording_status,
     read_traffic_stats, RecordingSnapshot, TrafficStats, VpnStatus,
 };
-#[allow(unused_imports)]
-use notify_rust;
-
 const MAX_LOG_LINES: usize = 200;
 
 /// G-A3: client-side estimate of the server's `PENDING_CONFIG_TIMEOUT`
@@ -242,6 +238,7 @@ pub fn acquire_single_instance_lock() -> Result<Option<std::fs::File>, ()> {
     let _ = std::fs::create_dir_all(&dir);
     let Ok(file) = std::fs::OpenOptions::new()
         .create(true)
+        .truncate(false)
         .write(true)
         .open(dir.join("gui.lock"))
     else {
@@ -1618,7 +1615,7 @@ impl App {
                     // (kill-switch rules) before the window closes and
                     // kill_on_drop SIGKILLs it.
                     self.shutdown_child_blocking();
-                    return iced::window::get_oldest().then(|opt_id| {
+                    return iced::window::oldest().then(|opt_id| {
                         if let Some(wid) = opt_id {
                             iced::window::close(wid)
                         } else {
@@ -1628,7 +1625,7 @@ impl App {
                 }
                 crate::tray::TrayAction::Open => {
                     // Restore window from tray (it may have been minimized via close button)
-                    return iced::window::get_oldest().then(|opt_id| {
+                    return iced::window::oldest().then(|opt_id| {
                         if let Some(wid) = opt_id {
                             iced::window::minimize(wid, false)
                         } else {
@@ -2744,221 +2741,230 @@ impl App {
                 let bootstrap_github = self.settings.bootstrap_github.clone();
                 let server_signing_key = self.settings.server_signing_key.clone();
                 let lang_clone = self.settings.lang.clone();
-                let stream = iced::stream::channel(64, move |mut sender| async move {
-                    let binary = match find_client_binary() {
-                        Ok(b) => b,
-                        Err(e) => {
-                            let _ = sender.try_send(Message::StatusReceived(VpnStatus::Error(e)));
-                            return;
-                        }
-                    };
-
-                    let binary = if is_root() {
-                        binary
-                    } else {
-                        match privilege::ensure_capable_binary(&binary, &lang_clone, &mut sender)
-                            .await
-                        {
-                            Ok(p) => p,
-                            Err(hint) => {
-                                let _ = sender.try_send(Message::LogLine(hint));
-                                binary
+                let stream = iced::stream::channel(
+                    64,
+                    move |mut sender: iced::futures::channel::mpsc::Sender<Message>| async move {
+                        let binary = match find_client_binary() {
+                            Ok(b) => b,
+                            Err(e) => {
+                                let _ =
+                                    sender.try_send(Message::StatusReceived(VpnStatus::Error(e)));
+                                return;
                             }
-                        }
-                    };
-                    let launch_params = vpn_manager::ClientLaunchParams {
-                        full_tunnel,
-                        mtls_cert,
-                        kill_switch,
-                        adaptive_level,
-                        dns_proxy,
-                        exclude_routes,
-                        include_routes,
-                        socks5_enabled,
-                        socks5_addr,
-                        preferred_mask,
-                        polymorphic_mask,
-                        share_mask_feedback,
-                        receive_mask_hints,
-                        country_code,
-                        bootstrap_cdn_url,
-                        bootstrap_telegram_token,
-                        bootstrap_telegram_chat,
-                        bootstrap_github,
-                        server_signing_key,
-                    };
-                    let mut cmd = vpn_manager::build_client_command(&binary, &key, &launch_params);
-                    // The section may have selected an alternative transport.
-                    // It travels neutrally: a name plus a base64 parameter blob
-                    // this GUI never parses. Absent → the client uses direct UDP.
-                    if let Some(cfg) = &ext_transport {
-                        use base64::Engine as _;
-                        cmd.env("AIVPN_TRANSPORT", cfg.name());
-                        cmd.env(
-                            "AIVPN_TRANSPORT_PARAMS",
-                            base64::engine::general_purpose::STANDARD.encode(cfg.params()),
-                        );
-                    }
+                        };
 
-                    let mut child = match cmd.spawn() {
-                        Ok(c) => c,
-                        Err(e) => {
+                        let binary = if is_root() {
+                            binary
+                        } else {
+                            match privilege::ensure_capable_binary(
+                                &binary,
+                                &lang_clone,
+                                &mut sender,
+                            )
+                            .await
+                            {
+                                Ok(p) => p,
+                                Err(hint) => {
+                                    let _ = sender.try_send(Message::LogLine(hint));
+                                    binary
+                                }
+                            }
+                        };
+                        let launch_params = vpn_manager::ClientLaunchParams {
+                            full_tunnel,
+                            mtls_cert,
+                            kill_switch,
+                            adaptive_level,
+                            dns_proxy,
+                            exclude_routes,
+                            include_routes,
+                            socks5_enabled,
+                            socks5_addr,
+                            preferred_mask,
+                            polymorphic_mask,
+                            share_mask_feedback,
+                            receive_mask_hints,
+                            country_code,
+                            bootstrap_cdn_url,
+                            bootstrap_telegram_token,
+                            bootstrap_telegram_chat,
+                            bootstrap_github,
+                            server_signing_key,
+                        };
+                        let mut cmd =
+                            vpn_manager::build_client_command(&binary, &key, &launch_params);
+                        // The section may have selected an alternative transport.
+                        // It travels neutrally: a name plus a base64 parameter blob
+                        // this GUI never parses. Absent → the client uses direct UDP.
+                        if let Some(cfg) = &ext_transport {
+                            use base64::Engine as _;
+                            cmd.env("AIVPN_TRANSPORT", cfg.name());
+                            cmd.env(
+                                "AIVPN_TRANSPORT_PARAMS",
+                                base64::engine::general_purpose::STANDARD.encode(cfg.params()),
+                            );
+                        }
+
+                        let mut child = match cmd.spawn() {
+                            Ok(c) => c,
+                            Err(e) => {
+                                let _ = sender.try_send(Message::StatusReceived(VpnStatus::Error(
+                                    format!("Launch failed: {e}"),
+                                )));
+                                return;
+                            }
+                        };
+
+                        // Take the pipes and publish the child handle immediately -
+                        // no awaits or early returns in between. Any path that
+                        // drops the Child before it reaches child_handle fires
+                        // kill_on_drop's SIGKILL, bypassing the client's
+                        // kill-switch cleanup (traffic blackout).
+                        let stdout = child.stdout.take();
+                        let stderr = child.stderr.take();
+                        let child_pid = child.id();
+                        match child_handle.lock() {
+                            Ok(mut guard) => *guard = Some(child),
+                            Err(e) => *e.into_inner() = Some(child),
+                        }
+                        if let Some(pid) = child_pid {
+                            write_client_pidfile(pid);
+                        }
+                        let (Some(stdout), Some(stderr)) = (stdout, stderr) else {
+                            // Should be impossible with piped stdio - terminate
+                            // the already-published child gracefully, never drop
+                            // it.
+                            let taken = match child_handle.lock() {
+                                Ok(mut g) => g.take(),
+                                Err(e) => e.into_inner().take(),
+                            };
+                            if let Some(c) = taken {
+                                terminate_child_graceful(c, kill_switch);
+                            }
                             let _ = sender.try_send(Message::StatusReceived(VpnStatus::Error(
-                                format!("Launch failed: {e}"),
+                                "stdout/stderr pipe unavailable".to_string(),
                             )));
                             return;
-                        }
-                    };
+                        };
+                        let _ = sender
+                            .send(Message::StatusReceived(VpnStatus::Connecting))
+                            .await;
 
-                    // Take the pipes and publish the child handle immediately —
-                    // no awaits or early returns in between. Any path that
-                    // drops the Child before it reaches child_handle fires
-                    // kill_on_drop's SIGKILL, bypassing the client's
-                    // kill-switch cleanup (traffic blackout).
-                    let stdout = child.stdout.take();
-                    let stderr = child.stderr.take();
-                    let child_pid = child.id();
-                    match child_handle.lock() {
-                        Ok(mut guard) => *guard = Some(child),
-                        Err(e) => *e.into_inner() = Some(child),
-                    }
-                    if let Some(pid) = child_pid {
-                        write_client_pidfile(pid);
-                    }
-                    let (Some(stdout), Some(stderr)) = (stdout, stderr) else {
-                        // Should be impossible with piped stdio — terminate
-                        // the already-published child gracefully, never drop
-                        // it.
-                        let taken = match child_handle.lock() {
+                        let mut out = BufReader::new(stdout).lines();
+                        let mut err = BufReader::new(stderr).lines();
+
+                        // Preferred, machine-readable status protocol: newer
+                        // clients print "AIVPN-STATUS connected <vpn_ip>" /
+                        // "AIVPN-STATUS reconnecting" / "AIVPN-STATUS disconnected"
+                        // on stdout. A reconnecting client DEMOTES the UI to
+                        // Connecting instead of showing Connected over a dead,
+                        // silently-retrying tunnel.
+                        let parse_status_line = vpn_manager::parse_status_line;
+
+                        // Fallback heuristic for OLDER clients only: detects the
+                        // "Connected to server at ..." / TUN-ready log line. The
+                        // client's tracing subscriber writes to stderr (not stdout -
+                        // see 9c84bf7, so bench --json's stdout output stays clean),
+                        // so this line always arrives via `err`, never `out`; still
+                        // checked on both streams in case a future client build ever
+                        // emits it differently.
+                        let check_connected = |l: &str| -> Option<Message> {
+                            if l.contains("Connected") || l.contains("TUN interface") {
+                                let ip = l
+                                    .split_whitespace()
+                                    .find(|t| t.contains('.') && t.contains('/'))
+                                    .map(|s| s.to_string())
+                                    .unwrap_or_default();
+                                Some(Message::StatusReceived(VpnStatus::Connected { vpn_ip: ip }))
+                            } else {
+                                None
+                            }
+                        };
+
+                        // Once one machine-readable line has been seen the
+                        // heuristic is disabled for the rest of the session: it
+                        // substring-matches log prose ("Reconnected", pre-handshake
+                        // "TUN interface") and would fight the authoritative
+                        // protocol.
+                        let mut saw_status_line = false;
+                        let mut line_messages = |l: &str| -> Vec<Message> {
+                            let mut msgs = Vec::new();
+                            // 3c: orthogonal to VpnStatus (can co-occur with
+                            // Connecting/Connected), so it's dispatched
+                            // separately rather than through parse_status_line.
+                            if l.trim() == "AIVPN-STATUS bootstrap-fallback" {
+                                msgs.push(Message::BootstrapFallbackDetected);
+                            }
+                            if let Some(status) = parse_status_line(l) {
+                                saw_status_line = true;
+                                msgs.push(Message::StatusReceived(status));
+                            } else if !saw_status_line {
+                                msgs.extend(check_connected(l));
+                            }
+                            msgs
+                        };
+
+                        // Drain BOTH streams to their own EOF (same fix as the
+                        // install-wizard subscription): on child exit both pipes
+                        // EOF and `select!` polls in random order - a bare
+                        // `_ => break` on whichever EOF lands first silently
+                        // dropped final status lines (e.g. "AIVPN-STATUS
+                        // rejected <reason>") still buffered on the OTHER
+                        // stream. Status/log messages are `send().await`ed (not
+                        // `try_send`) so a burst of log lines can never overflow
+                        // the channel and silently drop a status transition.
+                        let mut out_done = false;
+                        let mut err_done = false;
+                        loop {
+                            tokio::select! {
+                                line = out.next_line(), if !out_done => match line {
+                                    Ok(Some(l)) => {
+                                        for m in line_messages(&l) {
+                                            let _ = sender.send(m).await;
+                                        }
+                                        let _ = sender.send(Message::LogLine(strip_ansi(&l))).await;
+                                    }
+                                    _ => out_done = true,
+                                },
+                                line = err.next_line(), if !err_done => match line {
+                                    Ok(Some(l)) => {
+                                        for m in line_messages(&l) {
+                                            let _ = sender.send(m).await;
+                                        }
+                                        let _ = sender
+                                            .send(Message::LogLine(format!("[err] {}", strip_ansi(&l))))
+                                            .await;
+                                    }
+                                    _ => err_done = true,
+                                },
+                                else => break,
+                            }
+                            if out_done && err_done {
+                                break;
+                            }
+                        }
+
+                        // The child has exited; reap it so it doesn't linger as a zombie
+                        // until the next Connect/Disconnect. Take it out of the shared
+                        // handle first (Disconnect may have already taken it) and wait
+                        // without holding the std mutex across the await.
+                        let reaped = match child_handle.lock() {
                             Ok(mut g) => g.take(),
                             Err(e) => e.into_inner().take(),
                         };
-                        if let Some(c) = taken {
-                            terminate_child_graceful(c, kill_switch);
+                        if let Some(mut c) = reaped {
+                            let _ = c.wait().await;
                         }
-                        let _ = sender.try_send(Message::StatusReceived(VpnStatus::Error(
-                            "stdout/stderr pipe unavailable".to_string(),
-                        )));
-                        return;
-                    };
-                    let _ = sender
-                        .send(Message::StatusReceived(VpnStatus::Connecting))
-                        .await;
-
-                    let mut out = BufReader::new(stdout).lines();
-                    let mut err = BufReader::new(stderr).lines();
-
-                    // Preferred, machine-readable status protocol: newer
-                    // clients print "AIVPN-STATUS connected <vpn_ip>" /
-                    // "AIVPN-STATUS reconnecting" / "AIVPN-STATUS disconnected"
-                    // on stdout. A reconnecting client DEMOTES the UI to
-                    // Connecting instead of showing Connected over a dead,
-                    // silently-retrying tunnel.
-                    let parse_status_line = vpn_manager::parse_status_line;
-
-                    // Fallback heuristic for OLDER clients only: detects the
-                    // "Connected to server at ..." / TUN-ready log line. The
-                    // client's tracing subscriber writes to stderr (not stdout —
-                    // see 9c84bf7, so bench --json's stdout output stays clean),
-                    // so this line always arrives via `err`, never `out`; still
-                    // checked on both streams in case a future client build ever
-                    // emits it differently.
-                    let check_connected = |l: &str| -> Option<Message> {
-                        if l.contains("Connected") || l.contains("TUN interface") {
-                            let ip = l
-                                .split_whitespace()
-                                .find(|t| t.contains('.') && t.contains('/'))
-                                .map(|s| s.to_string())
-                                .unwrap_or_default();
-                            Some(Message::StatusReceived(VpnStatus::Connected { vpn_ip: ip }))
-                        } else {
-                            None
-                        }
-                    };
-
-                    // Once one machine-readable line has been seen the
-                    // heuristic is disabled for the rest of the session: it
-                    // substring-matches log prose ("Reconnected", pre-handshake
-                    // "TUN interface") and would fight the authoritative
-                    // protocol.
-                    let mut saw_status_line = false;
-                    let mut line_messages = |l: &str| -> Vec<Message> {
-                        let mut msgs = Vec::new();
-                        // 3c: orthogonal to VpnStatus (can co-occur with
-                        // Connecting/Connected), so it's dispatched
-                        // separately rather than through parse_status_line.
-                        if l.trim() == "AIVPN-STATUS bootstrap-fallback" {
-                            msgs.push(Message::BootstrapFallbackDetected);
-                        }
-                        if let Some(status) = parse_status_line(l) {
-                            saw_status_line = true;
-                            msgs.push(Message::StatusReceived(status));
-                        } else if !saw_status_line {
-                            msgs.extend(check_connected(l));
-                        }
-                        msgs
-                    };
-
-                    // Drain BOTH streams to their own EOF (same fix as the
-                    // install-wizard subscription): on child exit both pipes
-                    // EOF and `select!` polls in random order — a bare
-                    // `_ => break` on whichever EOF lands first silently
-                    // dropped final status lines (e.g. "AIVPN-STATUS
-                    // rejected <reason>") still buffered on the OTHER
-                    // stream. Status/log messages are `send().await`ed (not
-                    // `try_send`) so a burst of log lines can never overflow
-                    // the channel and silently drop a status transition.
-                    let mut out_done = false;
-                    let mut err_done = false;
-                    loop {
-                        tokio::select! {
-                            line = out.next_line(), if !out_done => match line {
-                                Ok(Some(l)) => {
-                                    for m in line_messages(&l) {
-                                        let _ = sender.send(m).await;
-                                    }
-                                    let _ = sender.send(Message::LogLine(strip_ansi(&l))).await;
-                                }
-                                _ => out_done = true,
-                            },
-                            line = err.next_line(), if !err_done => match line {
-                                Ok(Some(l)) => {
-                                    for m in line_messages(&l) {
-                                        let _ = sender.send(m).await;
-                                    }
-                                    let _ = sender
-                                        .send(Message::LogLine(format!("[err] {}", strip_ansi(&l))))
-                                        .await;
-                                }
-                                _ => err_done = true,
-                            },
-                            else => break,
-                        }
-                        if out_done && err_done {
-                            break;
-                        }
-                    }
-
-                    // The child has exited; reap it so it doesn't linger as a zombie
-                    // until the next Connect/Disconnect. Take it out of the shared
-                    // handle first (Disconnect may have already taken it) and wait
-                    // without holding the std mutex across the await.
-                    let reaped = match child_handle.lock() {
-                        Ok(mut g) => g.take(),
-                        Err(e) => e.into_inner().take(),
-                    };
-                    if let Some(mut c) = reaped {
-                        let _ = c.wait().await;
-                    }
-                    remove_client_pidfile();
-                    // send().await, not try_send: this terminal status is what
-                    // lets the UI leave Connected/Connecting — if it were
-                    // dropped on a full channel the status would stick forever.
-                    let _ = sender
-                        .send(Message::StatusReceived(VpnStatus::Disconnected))
-                        .await;
-                });
-                Subscription::run_with_id("aivpn_worker", stream)
+                        remove_client_pidfile();
+                        // send().await, not try_send: this terminal status is what
+                        // lets the UI leave Connected/Connecting - if it were
+                        // dropped on a full channel the status would stick forever.
+                        let _ = sender
+                            .send(Message::StatusReceived(VpnStatus::Disconnected))
+                            .await;
+                    },
+                );
+                crate::subscription::from_stream("aivpn_worker", stream)
             }
             None => Subscription::none(),
         };
@@ -2972,14 +2978,17 @@ impl App {
             None => Subscription::none(),
         };
 
-        let stats_stream = iced::stream::channel(4, |mut sender| async move {
-            loop {
-                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                let stats = read_traffic_stats();
-                let _ = sender.try_send(Message::StatsRefresh(stats));
-            }
-        });
-        let stats_sub = Subscription::run_with_id("stats_poll", stats_stream);
+        let stats_stream = iced::stream::channel(
+            4,
+            |mut sender: iced::futures::channel::mpsc::Sender<Message>| async move {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    let stats = read_traffic_stats();
+                    let _ = sender.try_send(Message::StatsRefresh(stats));
+                }
+            },
+        );
+        let stats_sub = crate::subscription::from_stream("stats_poll", stats_stream);
 
         let tray_sub = Self::tray_subscription();
         let close_sub = Self::close_subscription();
@@ -2989,14 +2998,17 @@ impl App {
             self.recording_state,
             RecordingState::Active(_) | RecordingState::Stopping
         ) {
-            let stream = iced::stream::channel(4, |mut sender| async move {
-                loop {
-                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                    let snap = read_recording_status();
-                    let _ = sender.try_send(Message::RecordingPoll(snap));
-                }
-            });
-            Subscription::run_with_id("recording_poll", stream)
+            let stream = iced::stream::channel(
+                4,
+                |mut sender: iced::futures::channel::mpsc::Sender<Message>| async move {
+                    loop {
+                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                        let snap = read_recording_status();
+                        let _ = sender.try_send(Message::RecordingPoll(snap));
+                    }
+                },
+            );
+            crate::subscription::from_stream("recording_poll", stream)
         } else {
             Subscription::none()
         };
@@ -3007,13 +3019,16 @@ impl App {
         // that flips (same conditional-inclusion pattern as `recording_sub`
         // above) rather than needing its own explicit start/stop messages.
         let server_settings_countdown_sub = if self.server_settings_pending.is_some() {
-            let stream = iced::stream::channel(4, |mut sender| async move {
-                loop {
-                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                    let _ = sender.try_send(Message::ServerSettingsCountdownTick);
-                }
-            });
-            Subscription::run_with_id("server_settings_countdown", stream)
+            let stream = iced::stream::channel(
+                4,
+                |mut sender: iced::futures::channel::mpsc::Sender<Message>| async move {
+                    loop {
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                        let _ = sender.try_send(Message::ServerSettingsCountdownTick);
+                    }
+                },
+            );
+            crate::subscription::from_stream("server_settings_countdown", stream)
         } else {
             Subscription::none()
         };
@@ -3030,19 +3045,22 @@ impl App {
     }
 
     fn tray_subscription() -> Subscription<Message> {
-        let stream = iced::stream::channel(8, |mut sender| async move {
-            let mut rx = match crate::tray::spawn().await {
-                Ok(rx) => rx,
-                Err(e) => {
-                    tracing::warn!("Tray icon creation failed: {e}");
-                    return;
+        let stream = iced::stream::channel(
+            8,
+            |mut sender: iced::futures::channel::mpsc::Sender<Message>| async move {
+                let mut rx = match crate::tray::spawn().await {
+                    Ok(rx) => rx,
+                    Err(e) => {
+                        tracing::warn!("Tray icon creation failed: {e}");
+                        return;
+                    }
+                };
+                while let Some(action) = rx.recv().await {
+                    let _ = sender.try_send(Message::TrayEvent(action));
                 }
-            };
-            while let Some(action) = rx.recv().await {
-                let _ = sender.try_send(Message::TrayEvent(action));
-            }
-        });
-        Subscription::run_with_id("tray_ksni", stream)
+            },
+        );
+        crate::subscription::from_stream("tray_ksni", stream)
     }
 
     fn close_subscription() -> Subscription<Message> {

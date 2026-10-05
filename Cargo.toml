@@ -37,7 +37,6 @@ subtle = "2.5"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 rmp-serde = "1.1"
-bincode = "1.3"
 
 # Async
 tokio = { version = "1.35", features = ["full"] }
@@ -66,3 +65,7 @@ chrono = { version = "0.4", features = ["serde"] }
 [profile.release.package.aivpn-android-core]
 opt-level = "s"
 strip = true
+
+[patch.crates-io]
+# Исправленная lru для текстового рендера Iced; код cryoglyph не изменен.
+cryoglyph = { path = "vendor/cryoglyph" }

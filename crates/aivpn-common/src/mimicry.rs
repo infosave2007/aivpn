@@ -438,6 +438,14 @@ impl PacketEncryptor for MimicryEncryptor {
         Ok(pkt)
     }
 
+    fn encrypt_fragment(&mut self, payload: &[u8]) -> Result<Vec<u8>> {
+        self.check_mask();
+        let inner = build_inner_packet(InnerType::Fragment, self.seq, payload);
+        self.seq = self.seq.wrapping_add(1);
+        self.engine
+            .build_packet(&inner, &self.keys, &mut self.counter, None)
+    }
+
     fn encrypt_control(&mut self, payload: &ControlPayload) -> Result<Vec<u8>> {
         self.check_mask();
         let bytes = payload.encode()?;
@@ -495,7 +503,63 @@ pub fn bootstrap_mask_for_psk(psk: Option<&[u8; 32]>) -> MaskProfile {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::client_wire::{decode_packet_with_layout, decode_packet_with_mdh_len, RecvWindow};
     use crate::mask::preset_masks::webrtc_zoom_v3;
+
+    #[test]
+    fn maximum_management_request_roundtrips_through_encrypted_fragments() {
+        use crate::fragment::Reassembler;
+        let mut keys = SessionKeys {
+            session_key: [1; 32],
+            session_key_s2c: [2; 32],
+            tag_secret: [3; 32],
+            prng_seed: [4; 32],
+        };
+        let mask = webrtc_zoom_v3();
+        let mdh_len = mask
+            .header_spec
+            .as_ref()
+            .map(|spec| spec.min_length())
+            .unwrap_or_else(|| mask.header_template.len());
+        let tag_offset = mask.tag_offset;
+        let mut sender =
+            MimicryEncryptor::new(keys.clone(), 0, 0, mask, Arc::new(Mutex::new(None)));
+        let request = ControlPayload::MgmtRequest {
+            req_id: 51,
+            method: 1,
+            path: "/api/v1/clients".into(),
+            body: vec![b'x'; 262144],
+        };
+        let packets = sender.encrypt_control_packets(&request).unwrap();
+        assert!(packets.len() > 200);
+        assert!(packets.iter().all(|packet| packet.len() <= 1500));
+        // Декодер downlink использует S2C; здесь проверяем фактически зашифрованный C2S.
+        keys.session_key_s2c = keys.session_key;
+        let mut window = RecvWindow::new();
+        let mut fragments = Reassembler::default();
+        let mut received = None;
+        for packet in packets {
+            let decoded =
+                decode_packet_with_layout(&packet, &keys, &mut window, mdh_len, tag_offset)
+                    .unwrap();
+            assert_eq!(decoded.header.inner_type, InnerType::Fragment);
+            assert!(
+                decode_packet_with_layout(&packet, &keys, &mut window, mdh_len, tag_offset)
+                    .is_err()
+            );
+            if let Some((kind, payload)) = fragments
+                .accept(&decoded.payload, std::time::Instant::now())
+                .unwrap()
+            {
+                assert_eq!(kind, InnerType::Control);
+                received = Some(ControlPayload::decode(&payload).unwrap());
+            }
+        }
+        assert_eq!(
+            received.unwrap().encode().unwrap(),
+            request.encode().unwrap()
+        );
+    }
 
     #[test]
     fn test_mimicry_engine_builds_packet() {
@@ -544,7 +608,6 @@ mod tests {
 
     #[test]
     fn embedded_stun_packet_roundtrips_and_shows_magic_cookie() {
-        use crate::client_wire::{decode_packet_with_layout, RecvWindow};
         use crate::crypto::{
             compute_time_window, current_timestamp_ms, generate_resonance_tag, DEFAULT_WINDOW_MS,
         };
@@ -592,7 +655,6 @@ mod tests {
 
     #[test]
     fn embedded_quic_packet_roundtrips_and_shows_long_header() {
-        use crate::client_wire::{decode_packet_with_layout, RecvWindow};
         use crate::mask::preset_masks::quic_https_v2;
         use crate::protocol::InnerType;
 
@@ -642,7 +704,6 @@ mod tests {
 
     #[test]
     fn quic_mask_with_non_dcid_tag_offset_falls_back_to_legacy_layout() {
-        use crate::client_wire::{decode_packet_with_mdh_len, RecvWindow};
         use crate::crypto::{
             compute_time_window, current_timestamp_ms, generate_resonance_tag, DEFAULT_WINDOW_MS,
         };
@@ -688,7 +749,6 @@ mod tests {
 
     #[test]
     fn legacy_mask_still_prefixes_tag() {
-        use crate::client_wire::{decode_packet_with_mdh_len, RecvWindow};
         use crate::crypto::{
             compute_time_window, current_timestamp_ms, generate_resonance_tag, DEFAULT_WINDOW_MS,
         };
@@ -726,7 +786,6 @@ mod tests {
 
     #[test]
     fn overlapping_tag_and_eph_falls_back_to_legacy() {
-        use crate::client_wire::{decode_packet_with_mdh_len, RecvWindow};
         use crate::protocol::InnerType;
 
         // Malformed mask: tag slot [8,16) overlaps eph_pub slot [10,42).
@@ -806,7 +865,6 @@ mod tests {
         // In the legacy tag-prefix layout the STUN header is shifted past the
         // 8-byte tag; patch_stun_length must NOT run (it would corrupt the tag).
         // The packet still round-trips, proving the length patch stayed clear.
-        use crate::client_wire::{decode_packet_with_mdh_len, RecvWindow};
         let mut mask = webrtc_zoom_v3();
         mask.tag_offset = u16::MAX;
         let mdh_len = mask.header_spec.as_ref().unwrap().min_length();

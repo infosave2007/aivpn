@@ -10,8 +10,10 @@ use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use tracing::{error, info, warn};
 
-use aivpn_common::error::Result;
-use aivpn_common::mask::{verify_mask_artifact, MaskProfile, MaskVerifyDetail, MaskVerifyMode};
+use aivpn_common::error::{Error, Result};
+use aivpn_common::mask::{
+    verify_mask_artifact, MaskProfile, MaskVerifyDetail, MaskVerifyMode, MaskVerifyResult,
+};
 
 use crate::gateway::MaskCatalog;
 
@@ -46,6 +48,7 @@ pub struct MaskEntry {
 pub struct MaskStore {
     /// All masks (mask_id → MaskEntry)
     masks: DashMap<String, MaskEntry>,
+    mutation: std::sync::Mutex<()>,
     /// Reference to the gateway's mask catalog for registration
     catalog: Arc<MaskCatalog>,
     /// Storage directory for mask files
@@ -55,25 +58,26 @@ pub struct MaskStore {
     /// moves past what a session was last sent, so newly auto-generated masks
     /// reach connected clients live (see gateway Keepalive handler).
     version: portable_atomic::AtomicU64,
-    /// R2 Phase B: operator Ed25519 signing key. When `Some`, freshly
-    /// generated masks (`mask_gen::generate_and_store_mask`) are signed with
-    /// it after the KS self-test passes. `None` = generate unsigned (legacy).
+    /// Приватный ключ оператора. Если он есть, генератор подписывает маску
+    /// после самопроверки. В production-secure отсутствие ключа запрещает
+    /// генерацию. Обычная сборка без ключа по-прежнему пишет нулевую подпись.
     signing_key: Option<ed25519_dalek::SigningKey>,
-    /// R2 Phase B: operator Ed25519 verifying (public) key used to check the
-    /// embedded `MaskProfile.signature` of masks loaded from disk.
+    /// Публичный ключ оператора для проверки подписи на диске и при записи.
+    /// Если в конструктор передали только приватный ключ, публичный выводится
+    /// из него.
     operator_pubkey: Option<[u8; 32]>,
-    /// R2 Phase B: config-gated verification level for disk loads
-    /// (off | warn | enforce). Default `warn`.
+    /// Режим проверки. В production-secure конструктор фиксирует enforce.
     verify_mode: MaskVerifyMode,
 }
 
 impl MaskStore {
-    /// Create a new mask store.
+    /// Создает хранилище и сразу читает маски с диска.
     ///
-    /// `signing_key` — operator mask-signing key (signs newly generated masks).
-    /// `operator_pubkey` — operator verifying key for disk-load verification.
-    /// `verify_mode` — off | warn (default) | enforce, applied in
-    /// `load_from_disk`.
+    /// `signing_key` подписывает новые маски. `operator_pubkey` проверяет
+    /// подпись при чтении и записи. Если публичный ключ не передан, он
+    /// выводится из приватного. `verify_mode` в обычной сборке применяется
+    /// как есть. В production-secure режим всегда enforce: переданный off
+    /// или warn не открывает загрузку неподписанных масок.
     pub fn new(
         catalog: Arc<MaskCatalog>,
         storage_dir: PathBuf,
@@ -81,8 +85,29 @@ impl MaskStore {
         operator_pubkey: Option<[u8; 32]>,
         verify_mode: MaskVerifyMode,
     ) -> Self {
+        let operator_pubkey = operator_pubkey.or_else(|| {
+            signing_key
+                .as_ref()
+                .map(|key| key.verifying_key().to_bytes())
+        });
+        #[cfg(feature = "production-secure")]
+        if verify_mode != MaskVerifyMode::Enforce {
+            error!(
+                "production-secure: mask_verify_mode={:?} не применяется, действует только enforce",
+                verify_mode
+            );
+        }
+        #[cfg(feature = "production-secure")]
+        if signing_key.is_none() {
+            error!(
+                "production-secure: ключ подписи масок не задан. Генерация будет отклонена, \
+                 загрузка примет только маски с верной подписью оператора"
+            );
+        }
+        let verify_mode = crate::server_config::effective_mask_verify_mode(verify_mode);
         let store = Self {
             masks: DashMap::new(),
+            mutation: std::sync::Mutex::new(()),
             catalog,
             storage_dir,
             // Start at 1 so a session that has never been sent a catalog
@@ -92,7 +117,8 @@ impl MaskStore {
             operator_pubkey,
             verify_mode,
         };
-        // Load masks only from disk — no hardcoded presets
+        // С диска, без встроенных пресетов: пресет это код клиента и сервера,
+        // а не файл, который можно подменить в каталоге.
         store.load_from_disk();
         store
     }
@@ -102,8 +128,16 @@ impl MaskStore {
         self.signing_key.as_ref()
     }
 
-    /// Add a new mask entry
+    /// Добавляет маску в каталог и на диск.
+    ///
+    /// Та же проверка, что и при чтении с диска. В enforce неподписанная,
+    /// чужая или битая подпись не попадает в каталог. В warn маска
+    /// сохраняется, сбой подписи пишется в журнал. Производные маски сессии
+    /// (`polymorphic:` и `bootstrap:`) здесь не исключаются: на диск их
+    /// класть нельзя, канал сессии их и так подтверждает отдельно.
     pub fn add_mask(&self, entry: MaskEntry) -> Result<()> {
+        let _guard = self.mutation.lock().unwrap_or_else(|e| e.into_inner());
+        self.ensure_profile_allowed(&entry.profile)?;
         let mask_id = entry.stats.mask_id.clone();
         info!(
             "Storing mask '{}' (confidence: {:.2})",
@@ -111,7 +145,10 @@ impl MaskStore {
         );
 
         // Save to disk
-        self.save_to_disk(&mask_id, &entry);
+        if entry.profile.mask_id != mask_id {
+            return Err(Error::InvalidPacket("Mask ID does not match metadata"));
+        }
+        self.save_to_disk(&mask_id, &entry)?;
 
         // Register in catalog for neural resonance
         self.catalog.register_mask(entry.profile.clone());
@@ -190,19 +227,25 @@ impl MaskStore {
     }
 
     /// Delete a mask
-    pub fn delete_mask(&self, mask_id: &str) {
+    pub fn delete_mask(&self, mask_id: &str) -> Result<()> {
+        let _guard = self.mutation.lock().unwrap_or_else(|e| e.into_inner());
+        let path = self
+            .safe_mask_path(mask_id, "json")
+            .ok_or(Error::InvalidPacket("Invalid mask ID"))?;
+        match std::fs::remove_file(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
         self.masks.remove(mask_id);
         self.catalog.remove_mask(mask_id);
         self.version
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        // Remove disk files (guarded so a crafted mask_id can't escape the dir).
-        if let Some(json_path) = self.safe_mask_path(mask_id, "json") {
-            let _ = std::fs::remove_file(&json_path);
-        }
-        if let Some(stats_path) = self.safe_mask_path(mask_id, "stats") {
-            let _ = std::fs::remove_file(&stats_path);
+        if let Some(path) = self.safe_mask_path(mask_id, "stats") {
+            let _ = std::fs::remove_file(path);
         }
         info!("Deleted mask '{}'", mask_id);
+        Ok(())
     }
 
     /// Build the on-disk path for a mask file, or `None` when `mask_id` is not a
@@ -287,22 +330,39 @@ impl MaskStore {
     }
 
     /// Save mask entry to disk
-    fn save_to_disk(&self, mask_id: &str, entry: &MaskEntry) {
-        let Some(json_path) = self.safe_mask_path(mask_id, "json") else {
-            return;
-        };
-        let _ = std::fs::create_dir_all(&self.storage_dir);
-
-        match serde_json::to_string_pretty(&entry.profile) {
-            Ok(json) => {
-                if let Err(e) = std::fs::write(&json_path, json) {
-                    error!("Failed to save mask profile {}: {}", mask_id, e);
-                }
+    fn save_to_disk(&self, mask_id: &str, entry: &MaskEntry) -> Result<()> {
+        let json_path = self
+            .safe_mask_path(mask_id, "json")
+            .ok_or(Error::InvalidPacket("Invalid mask ID"))?;
+        std::fs::create_dir_all(&self.storage_dir)?;
+        let bytes = serde_json::to_vec_pretty(&entry.profile)
+            .map_err(|error| Error::Serialization(error.to_string()))?;
+        let temporary = self
+            .storage_dir
+            .join(format!(".mask-{:016x}.tmp", rand::random::<u64>()));
+        let result = (|| -> std::io::Result<()> {
+            use std::io::Write;
+            let mut options = std::fs::OpenOptions::new();
+            options.create_new(true).write(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
             }
-            Err(e) => error!("Failed to serialize mask profile {}: {}", mask_id, e),
+            let mut file = options.open(&temporary)?;
+            file.write_all(&bytes)?;
+            file.sync_all()?;
+            std::fs::rename(&temporary, &json_path)?;
+            #[cfg(unix)]
+            std::fs::File::open(&self.storage_dir)?.sync_all()?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(&temporary);
         }
-
+        result?;
         self.save_stats_to_disk(mask_id, &entry.stats);
+        Ok(())
     }
 
     /// Load masks from disk on startup
@@ -339,17 +399,25 @@ impl MaskStore {
                     None => continue,
                 };
 
-                // R2 Phase B: config-gated operator signature verification.
-                // No derived-variant exemption here — disk is not a
-                // channel-authenticated path, and an attacker who can write to
-                // the mask dir must not bypass `enforce` by picking a
-                // `polymorphic:`-prefixed mask_id.
-                let verdict =
-                    verify_mask_artifact(&profile, self.operator_pubkey.as_ref(), self.verify_mode);
+                if profile.mask_id != mask_id {
+                    warn!(
+                        "Mask file name does not match its signed ID: {}",
+                        path.display()
+                    );
+                    continue;
+                }
+                // Диск не является каналом сессии. Префикс polymorphic: или
+                // bootstrap: не освобождает файл от проверки подписи.
+                let verdict = assess_stored_profile(
+                    &profile,
+                    self.operator_pubkey.as_ref(),
+                    self.verify_mode,
+                );
                 if !verdict.accept {
                     error!(
-                        "Mask '{}' REJECTED (mask_verify_mode=enforce): {} — file: {}",
+                        "Mask '{}' REJECTED (mask_verify_mode={}): {} , file: {}",
                         mask_id,
+                        verify_mode_name(self.verify_mode),
                         verify_detail_str(verdict.detail),
                         path.display()
                     );
@@ -357,7 +425,7 @@ impl MaskStore {
                 }
                 if verdict.is_failure() && self.operator_pubkey.is_some() {
                     warn!(
-                        "Mask '{}' failed operator signature verification ({}) — \
+                        "Mask '{}' failed operator signature verification ({}) , \
                          accepted because mask_verify_mode=warn. Re-sign it or set \
                          mask_verify_mode=enforce once the corpus is signed.",
                         mask_id,
@@ -399,6 +467,61 @@ impl MaskStore {
     }
 }
 
+/// Проверка маски, которую кладут в хранилище: внешний профиль и, если он
+/// есть, обратный профиль. Обратный профиль подписывается отдельно, чтобы его
+/// можно было проверить и после извлечения. Внешняя подпись при этом тоже
+/// покрывает уже подписанный обратный профиль.
+fn assess_stored_profile(
+    profile: &MaskProfile,
+    operator_pubkey: Option<&[u8; 32]>,
+    mode: MaskVerifyMode,
+) -> MaskVerifyResult {
+    let outer = verify_mask_artifact(profile, operator_pubkey, mode);
+    if !outer.accept {
+        return outer;
+    }
+    if let Some(reverse) = profile.reverse_profile.as_deref() {
+        let inner = verify_mask_artifact(reverse, operator_pubkey, mode);
+        if !inner.accept || (inner.is_failure() && !outer.is_failure()) {
+            return inner;
+        }
+    }
+    outer
+}
+
+impl MaskStore {
+    fn ensure_profile_allowed(&self, profile: &MaskProfile) -> Result<()> {
+        let verdict =
+            assess_stored_profile(profile, self.operator_pubkey.as_ref(), self.verify_mode);
+        if !verdict.accept {
+            return Err(Error::Mask(format!(
+                "маска '{}' отклонена (mask_verify_mode={}): {}",
+                profile.mask_id,
+                verify_mode_name(self.verify_mode),
+                verify_detail_str(verdict.detail)
+            )));
+        }
+        if verdict.is_failure() && self.operator_pubkey.is_some() {
+            warn!(
+                "Mask '{}' failed operator signature verification ({}) , \
+                 accepted because mask_verify_mode={}",
+                profile.mask_id,
+                verify_detail_str(verdict.detail),
+                verify_mode_name(self.verify_mode)
+            );
+        }
+        Ok(())
+    }
+}
+
+fn verify_mode_name(mode: MaskVerifyMode) -> &'static str {
+    match mode {
+        MaskVerifyMode::Off => "off",
+        MaskVerifyMode::Warn => "warn",
+        MaskVerifyMode::Enforce => "enforce",
+    }
+}
+
 /// Human-readable reason for mask verification log lines.
 fn verify_detail_str(detail: MaskVerifyDetail) -> &'static str {
     match detail {
@@ -423,10 +546,11 @@ mod tests {
     use super::*;
 
     fn make_store() -> MaskStore {
-        let dir = std::env::temp_dir().join(format!("aivpn-maskstore-test-{}", std::process::id()));
+        let dir = corpus_dir("unit");
         let _ = std::fs::create_dir_all(&dir);
         MaskStore {
             masks: DashMap::new(),
+            mutation: std::sync::Mutex::new(()),
             catalog: Arc::new(MaskCatalog::new()),
             storage_dir: dir,
             version: portable_atomic::AtomicU64::new(1),
@@ -437,41 +561,95 @@ mod tests {
     }
 
     #[test]
-    fn phase_b_load_verification_modes() {
-        use aivpn_common::mask::preset_masks;
+    fn failed_persistence_does_not_publish_and_ids_must_match() {
+        let mut store = make_store();
+        store.verify_mode = MaskVerifyMode::Off;
+        let profile = aivpn_common::mask::preset_masks::webrtc_zoom_v3();
+        let entry = MaskEntry {
+            stats: MaskStats {
+                mask_id: profile.mask_id.clone(),
+                times_used: 0,
+                times_failed: 0,
+                success_rate: 1.0,
+                confidence: 1.0,
+                is_active: true,
+                created_by: "test".into(),
+                created_at: 0,
+                last_used: None,
+            },
+            profile,
+        };
+        let directory = store.storage_dir.clone();
+        let mut mismatch = entry.clone();
+        mismatch.stats.mask_id = "other".into();
+        assert!(store.add_mask(mismatch).is_err());
+        let blocker = directory.join("not-a-directory");
+        std::fs::write(&blocker, b"fixture").unwrap();
+        store.storage_dir = blocker;
+        let version = store.catalog_version();
+        assert!(store.add_mask(entry.clone()).is_err());
+        assert!(store.get_mask(&entry.profile.mask_id).is_none());
+        assert_eq!(store.catalog_version(), version);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 
-        let sk = ed25519_dalek::SigningKey::from_bytes(&[5u8; 32]);
-        let pk = sk.verifying_key().to_bytes();
-
+    fn corpus_dir(label: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
-            "aivpn-maskstore-verify-{}-{}",
+            "aivpn-maskstore-{label}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_nanos()
         ));
-        let _ = std::fs::create_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn write_profile(dir: &std::path::Path, profile: &aivpn_common::mask::MaskProfile) {
+        std::fs::write(
+            dir.join(format!("{}.json", profile.mask_id)),
+            serde_json::to_string(profile).unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// Подписанная, неподписанная и подделанная маски в одном каталоге.
+    fn write_signature_corpus(dir: &std::path::Path, sk: &ed25519_dalek::SigningKey) {
+        use aivpn_common::mask::preset_masks;
 
         let mut signed = preset_masks::all()[0].clone();
         signed.mask_id = "signed_m".into();
-        signed.sign(&sk);
-        std::fs::write(
-            dir.join("signed_m.json"),
-            serde_json::to_string(&signed).unwrap(),
-        )
-        .unwrap();
+        signed.sign(sk);
+        write_profile(dir, &signed);
 
         let mut unsigned = preset_masks::all()[0].clone();
         unsigned.mask_id = "unsigned_m".into();
         unsigned.signature = [0u8; 64];
-        std::fs::write(
-            dir.join("unsigned_m.json"),
-            serde_json::to_string(&unsigned).unwrap(),
-        )
-        .unwrap();
+        write_profile(dir, &unsigned);
 
-        // enforce: signed loads, unsigned is rejected.
+        let mut tampered = signed.clone();
+        tampered.mask_id = "tampered_m".into();
+        tampered.signature[0] ^= 0xff;
+        write_profile(dir, &tampered);
+
+        let mut reverse_broken = preset_masks::all()[0].clone();
+        reverse_broken.mask_id = "reverse_broken_m".into();
+        let mut reverse = preset_masks::all()[0].clone();
+        reverse.mask_id = "reverse_broken_m_rev".into();
+        reverse.signature = [0u8; 64];
+        reverse_broken.reverse_profile = Some(Box::new(reverse));
+        reverse_broken.sign(sk);
+        write_profile(dir, &reverse_broken);
+    }
+
+    #[test]
+    fn enforce_load_rejects_unsigned_tampered_and_unsigned_reverse() {
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[5u8; 32]);
+        let pk = sk.verifying_key().to_bytes();
+        let dir = corpus_dir("enforce");
+        write_signature_corpus(&dir, &sk);
+
         let store = MaskStore::new(
             Arc::new(MaskCatalog::new()),
             dir.clone(),
@@ -480,33 +658,157 @@ mod tests {
             MaskVerifyMode::Enforce,
         );
         assert!(store.get_mask("signed_m").is_some());
+        assert!(store.get_mask("unsigned_m").is_none());
+        assert!(store.get_mask("tampered_m").is_none());
         assert!(
-            store.get_mask("unsigned_m").is_none(),
-            "enforce must reject the unsigned legacy mask"
+            store.get_mask("reverse_broken_m").is_none(),
+            "enforce must reject a mask whose reverse profile is unsigned"
         );
 
-        // warn: both load (unsigned is logged, not rejected).
-        let store = MaskStore::new(
+        let closed = MaskStore::new(
+            Arc::new(MaskCatalog::new()),
+            dir.clone(),
+            None,
+            None,
+            MaskVerifyMode::Enforce,
+        );
+        assert!(
+            closed.get_mask("signed_m").is_none(),
+            "enforce without an operator key must fail closed"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(not(feature = "production-secure"))]
+    #[test]
+    fn dev_warn_and_off_still_load_unsigned() {
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[5u8; 32]);
+        let pk = sk.verifying_key().to_bytes();
+        let dir = corpus_dir("dev-modes");
+        write_signature_corpus(&dir, &sk);
+
+        let warn = MaskStore::new(
             Arc::new(MaskCatalog::new()),
             dir.clone(),
             None,
             Some(pk),
             MaskVerifyMode::Warn,
         );
-        assert!(store.get_mask("signed_m").is_some());
-        assert!(store.get_mask("unsigned_m").is_some());
+        assert!(warn.get_mask("signed_m").is_some());
+        assert!(warn.get_mask("unsigned_m").is_some());
+        assert!(warn.get_mask("tampered_m").is_some());
 
-        // off: both load, no verification at all.
-        let store = MaskStore::new(
+        let off = MaskStore::new(
             Arc::new(MaskCatalog::new()),
             dir.clone(),
             None,
             Some(pk),
             MaskVerifyMode::Off,
         );
-        assert!(store.get_mask("signed_m").is_some());
-        assert!(store.get_mask("unsigned_m").is_some());
+        assert!(off.get_mask("signed_m").is_some());
+        assert!(off.get_mask("unsigned_m").is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
+    #[cfg(feature = "production-secure")]
+    #[test]
+    fn production_secure_load_ignores_warn_and_off() {
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[5u8; 32]);
+        let pk = sk.verifying_key().to_bytes();
+        let dir = corpus_dir("locked");
+        write_signature_corpus(&dir, &sk);
+
+        for mode in [
+            MaskVerifyMode::Warn,
+            MaskVerifyMode::Off,
+            MaskVerifyMode::Enforce,
+        ] {
+            let store = MaskStore::new(
+                Arc::new(MaskCatalog::new()),
+                dir.clone(),
+                None,
+                Some(pk),
+                mode,
+            );
+            assert!(store.get_mask("signed_m").is_some(), "{mode:?}");
+            assert!(store.get_mask("unsigned_m").is_none(), "{mode:?}");
+            assert!(store.get_mask("tampered_m").is_none(), "{mode:?}");
+            assert!(store.get_mask("reverse_broken_m").is_none(), "{mode:?}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn sample_entry(mask_id: &str, profile: aivpn_common::mask::MaskProfile) -> MaskEntry {
+        MaskEntry {
+            stats: MaskStats {
+                mask_id: mask_id.to_string(),
+                times_used: 0,
+                times_failed: 0,
+                success_rate: 1.0,
+                confidence: 1.0,
+                is_active: true,
+                created_by: "test".into(),
+                created_at: 1,
+                last_used: None,
+            },
+            profile,
+        }
+    }
+
+    #[test]
+    fn enforce_add_rejects_unsigned_and_accepts_signed() {
+        use aivpn_common::mask::preset_masks;
+
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[6u8; 32]);
+        let pk = sk.verifying_key().to_bytes();
+        let dir = corpus_dir("add");
+        let store = MaskStore::new(
+            Arc::new(MaskCatalog::new()),
+            dir.clone(),
+            None,
+            Some(pk),
+            MaskVerifyMode::Enforce,
+        );
+
+        let mut unsigned = preset_masks::quic_https_v2();
+        unsigned.mask_id = "add_unsigned".into();
+        unsigned.signature = [0u8; 64];
+        let err = store
+            .add_mask(sample_entry("add_unsigned", unsigned))
+            .expect_err("unsigned mask must not enter an enforce store");
+        assert!(err.to_string().contains("отклонена"), "{err}");
+        assert!(store.get_mask("add_unsigned").is_none());
+
+        let mut signed = preset_masks::quic_https_v2();
+        signed.mask_id = "add_signed".into();
+        signed.sign(&sk);
+        store
+            .add_mask(sample_entry("add_signed", signed))
+            .expect("signed mask must be stored");
+        assert!(store.get_mask("add_signed").is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(not(feature = "production-secure"))]
+    #[test]
+    fn dev_warn_add_still_accepts_unsigned() {
+        use aivpn_common::mask::preset_masks;
+
+        let dir = corpus_dir("add-warn");
+        let store = MaskStore::new(
+            Arc::new(MaskCatalog::new()),
+            dir.clone(),
+            None,
+            None,
+            MaskVerifyMode::Warn,
+        );
+        let mut unsigned = preset_masks::quic_https_v2();
+        unsigned.mask_id = "dev_unsigned".into();
+        unsigned.signature = [0u8; 64];
+        store
+            .add_mask(sample_entry("dev_unsigned", unsigned))
+            .expect("dev warn mode keeps unsigned generation and import");
+        assert!(store.get_mask("dev_unsigned").is_some());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

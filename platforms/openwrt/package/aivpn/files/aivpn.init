@@ -24,7 +24,7 @@ start_service() {
     procd_set_param command "$PROG"
 
     if [ -n "$connection_key" ]; then
-        procd_append_param command --connection-key "$connection_key"
+        procd_set_param env "AIVPN_CONNECTION_KEY=$connection_key"
     elif [ -n "$server" ] && [ -n "$server_key" ]; then
         procd_append_param command --server "$server" --server-key "$server_key"
     else

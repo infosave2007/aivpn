@@ -43,7 +43,6 @@ impl super::AivpnClient {
         // (and its bound UDP socket) is cancelled when run() returns. Without this,
         // the orphaned task keeps 127.0.0.1:44301 bound across reconnect iterations,
         // causing the next run() call to fail with "Address already in use".
-        let admin_token = crate::record_cmd::ensure_admin_token();
         // P2.3-desktop: the admin socket now also bridges in-tunnel `mgmt`
         // calls (`AdminCommand::Mgmt`/`Role`/`Qr`) for the Windows egui /
         // Linux iced GUIs, which shell out to this binary rather than
@@ -68,6 +67,7 @@ impl super::AivpnClient {
         let _admin_task = if self.config.control_only {
             AbortOnDrop(tokio::spawn(std::future::pending::<()>()))
         } else {
+            let admin_token = crate::record_cmd::ensure_admin_token();
             AbortOnDrop(tokio::spawn(async move {
                 // Bind with a bounded retry, not a single attempt: AbortOnDrop
                 // kills the PREVIOUS session's admin loop when its run()
@@ -233,6 +233,7 @@ impl super::AivpnClient {
                 vpn_ip,
                 gateway_ip,
                 prefix_len: self.config.tun_config.prefix_len,
+                dns_servers: self.config.proxy_dns.clone(),
             };
             let handle = crate::proxy::spawn_proxy(proxy_cfg, tun_to_udp_tx.clone())
                 .await
@@ -429,6 +430,17 @@ impl super::AivpnClient {
             })
         };
 
+        self.send_control(&ControlPayload::Capabilities {
+            role: 0,
+            features: aivpn_common::protocol::CLIENT_PACKET_FEATURES
+                | if self.adaptive_level.fec_n() > 0 {
+                    aivpn_common::protocol::CLIENT_FEC_ACTIVE
+                } else {
+                    0
+                },
+        })
+        .await?;
+
         // ── Spawn upload task using the shared pipeline ──
         let upload_transport = self
             .transport
@@ -575,6 +587,8 @@ impl super::AivpnClient {
                 }
 
                 _ = rx_watchdog.tick() => {
+                    #[cfg(target_os = "linux")]
+                    if self.kernel_harvest() { last_rx = Instant::now(); }
                     // Post-freeze/suspend liveness probe (see WAKE_GAP_THRESHOLD):
                     // a tick gap ≫ the 5 s watchdog cadence means the process
                     // was frozen or the machine suspended. Arm a probe: unless
@@ -974,6 +988,17 @@ impl super::AivpnClient {
                 self.pending_fec.take()
             }
 
+            fn encrypt_fragment(&mut self, payload: &[u8]) -> Result<Vec<u8>> {
+                self.check_mask();
+                self.last_tx_ms.store(epoch_ms(), Ordering::Relaxed);
+                let mut state = self.upload_state.lock().unwrap_or_else(|e| e.into_inner());
+                let inner = build_inner_packet(InnerType::Fragment, state.seq, payload);
+                state.seq = state.seq.wrapping_add(1);
+                let keys = state.keys.clone();
+                self.engine
+                    .build_packet(&inner, &keys, &mut state.counter, None)
+            }
+
             fn encrypt_control(&mut self, payload: &ControlPayload) -> Result<Vec<u8>> {
                 self.check_mask();
                 self.last_tx_ms.store(epoch_ms(), Ordering::Relaxed);
@@ -1120,11 +1145,12 @@ impl super::AivpnClient {
         // control/rekey), so a single fixed length silently drops any packet
         // whose mask differs — the failure that strands the tunnel on the first
         // rekey. See `decode_downlink_any_mdh_len`.
-        let decoded = match decode_downlink_any_mdh_len(
+        let decoded = match decode_downlink_with_offsets(
             packet,
             keys,
             &mut self.recv_window,
             &mut self.recv_mdh_candidates,
+            &self.recv_tag_offsets,
         ) {
             Ok(decoded) => {
                 // M3: while a rekey staging is outstanding, a packet that
@@ -1133,18 +1159,31 @@ impl super::AivpnClient {
                 // switches its downlink to the new keys at commit) — promote
                 // the staged upload keys. No-op when no rekey is in flight.
                 self.promote_pending_upload_keys();
+                // Захват до выдачи в TUN. Отказ ядра не пускает пакет дальше.
+                #[cfg(target_os = "linux")]
+                if !self.kernel_accept_counter(self.kernel_epoch, decoded.counter) {
+                    return Ok(());
+                }
                 decoded
             }
             Err(primary_err) => {
                 // Fallback: PFS-ratchet transition keys (in-flight packets
                 // encrypted with the pre-rekey keys), same candidate lengths.
                 if let Some(fallback_keys) = self.transition_recv_keys.as_ref() {
-                    if let Ok(decoded) = decode_downlink_any_mdh_len(
+                    if let Ok(decoded) = decode_downlink_with_offsets(
                         packet,
                         fallback_keys,
                         &mut self.transition_recv_window,
                         &mut self.recv_mdh_candidates,
+                        &self.recv_tag_offsets,
                     ) {
+                        // Старая эпоха есть в ядре только после смены ключа.
+                        #[cfg(target_os = "linux")]
+                        if self.kernel_replay_bound
+                            && !self.kernel_accept_counter(self.kernel_prev_epoch, decoded.counter)
+                        {
+                            return Ok(());
+                        }
                         return self.process_decoded(decoded).await;
                     }
                 }
@@ -1164,8 +1203,21 @@ impl super::AivpnClient {
         #[cfg(target_os = "linux")]
         self.kernel_push_tags(false);
 
-        let inner_header = decoded.header;
-        let ip_payload = decoded.payload;
+        let mut inner_header = decoded.header;
+        let ip_payload = if inner_header.inner_type == InnerType::Fragment {
+            match self
+                .fragment_rx
+                .accept(&decoded.payload, std::time::Instant::now())?
+            {
+                Some((kind, payload)) => {
+                    inner_header.inner_type = kind;
+                    payload
+                }
+                None => return Ok(()),
+            }
+        } else {
+            decoded.payload
+        };
 
         match inner_header.inner_type {
             InnerType::Data => {

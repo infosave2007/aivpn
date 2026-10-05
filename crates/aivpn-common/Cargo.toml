@@ -21,7 +21,6 @@ aes = "0.8"
 serde.workspace = true
 serde_json.workspace = true
 rmp-serde.workspace = true
-bincode.workspace = true
 serde_bytes = "0.11"
 
 # Security
@@ -118,6 +117,10 @@ qr = ["dep:qrcode", "dep:image", "dep:anyhow"]
 # default aivpn-common build or the mobile FFI cores (aivpn-android-core /
 # aivpn-ios-core), neither of which enables this feature.
 ssh-install = ["dep:russh", "dep:russh-sftp", "tokio"]
+# Protected mobile build. Empty feature: policy gates in mask resolution and
+# the shared tunnel loop compile to the strict path. Android and iOS enable
+# it via their own `production-secure` feature. The desktop client does not.
+production-secure = []
 
 # The descriptor contract test needs the module it tests. Without
 # `required-features` a plain `cargo test --workspace` — which does not enable
@@ -126,3 +129,11 @@ ssh-install = ["dep:russh", "dep:russh-sftp", "tokio"]
 [[test]]
 name = "ui_ext_descriptor"
 required-features = ["ui-ext"]
+
+[package.metadata.cargo-machete]
+# Используется в атрибутах serde(with), которые анализатор не распознает.
+ignored = ["serde_bytes"]
+
+[[example]]
+name = "maskpcap"
+required-features = ["client-upload"]

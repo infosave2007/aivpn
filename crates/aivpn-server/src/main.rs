@@ -130,11 +130,16 @@ async fn main() {
                 eprintln!("Failed to resolve VPN network config: {}", e);
                 std::process::exit(1);
             });
-    let bootstrap_masks =
-        cli::mask::load_bootstrap_masks(file_config.as_ref()).unwrap_or_else(|e| {
-            eprintln!("Failed to load bootstrap masks: {}", e);
-            std::process::exit(1);
-        });
+    let bootstrap_masks = cli::mask::load_bootstrap_masks_trusted(
+        file_config.as_ref(),
+        args.mask_signing_key.as_deref(),
+        args.mask_operator_pubkey.as_deref(),
+        args.mask_verify_mode.as_deref(),
+    )
+    .unwrap_or_else(|e| {
+        eprintln!("Failed to load bootstrap masks: {}", e);
+        std::process::exit(1);
+    });
 
     // --list-masks: scan mask directory and print names (no DB needed)
     if args.list_masks {
@@ -168,7 +173,7 @@ async fn main() {
         return;
     }
     if let Some(ref name_or_id) = args.reset_device.clone() {
-        cli::client::handle_reset_device(&client_db, &name_or_id);
+        cli::client::handle_reset_device(&client_db, name_or_id);
         return;
     }
     if let Some(ref id) = args.remove_client {
@@ -581,10 +586,21 @@ mod tests {
         };
 
         let result = cli::mask::load_bootstrap_masks(Some(&file_config));
-        assert!(result.is_ok());
-        let masks = result.unwrap();
-        assert_eq!(masks.len(), 1);
-        assert_eq!(masks[0].mask_id, "test_mask");
+        #[cfg(not(feature = "production-secure"))]
+        {
+            assert!(result.is_ok());
+            let masks = result.unwrap();
+            assert_eq!(masks.len(), 1);
+            assert_eq!(masks[0].mask_id, "test_mask");
+        }
+        #[cfg(feature = "production-secure")]
+        {
+            let err = result.expect_err("unsigned bootstrap mask without a signing key");
+            assert!(
+                err.contains("production-secure") || err.contains("подпис"),
+                "{err}"
+            );
+        }
 
         std::fs::remove_dir_all(&temp_dir).ok();
     }
@@ -682,12 +698,70 @@ mod tests {
         };
 
         let result = cli::mask::load_bootstrap_masks(Some(&file_config));
-        assert!(result.is_ok());
-        let masks = result.unwrap();
-        assert_eq!(masks.len(), 2);
-        assert_eq!(masks[0].mask_id, "mask1");
-        assert_eq!(masks[1].mask_id, "mask2");
+        #[cfg(not(feature = "production-secure"))]
+        {
+            assert!(result.is_ok());
+            let masks = result.unwrap();
+            assert_eq!(masks.len(), 2);
+            assert_eq!(masks[0].mask_id, "mask1");
+            assert_eq!(masks[1].mask_id, "mask2");
+        }
+        #[cfg(feature = "production-secure")]
+        {
+            let err = result.expect_err("unsigned bootstrap masks without a signing key");
+            assert!(
+                err.contains("production-secure") || err.contains("подпис"),
+                "{err}"
+            );
+        }
 
+        std::fs::remove_dir_all(&temp_dir).ok();
+    }
+
+    #[test]
+    fn load_bootstrap_masks_verifies_operator_signature() {
+        use std::io::Write;
+        let temp_dir = std::env::temp_dir().join("aivpn_test_bootstrap_signed");
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let key_path = temp_dir.join("operator.key");
+        let mask_path = temp_dir.join("signed.json");
+        let seed = [9u8; 32];
+        std::fs::write(&key_path, seed).unwrap();
+        let signing = ed25519_dalek::SigningKey::from_bytes(&seed);
+        let mut mask = aivpn_common::mask::preset_masks::webrtc_zoom_v3();
+        mask.sign(&signing);
+        std::fs::File::create(&mask_path)
+            .unwrap()
+            .write_all(serde_json::to_string(&mask).unwrap().as_bytes())
+            .unwrap();
+        let file_config = ServerFileConfig {
+            bootstrap_mask_files: Some(vec![mask_path.to_string_lossy().to_string()]),
+            mask_signing_key: Some(key_path.to_string_lossy().to_string()),
+            mask_verify_mode: Some("enforce".to_string()),
+            ..Default::default()
+        };
+        let loaded = cli::mask::load_bootstrap_masks(Some(&file_config)).expect("signed mask");
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].mask_id, mask.mask_id);
+
+        let mut tampered = mask.clone();
+        tampered.signature[0] ^= 0xff;
+        std::fs::write(&mask_path, serde_json::to_string(&tampered).unwrap()).unwrap();
+        let rejected = cli::mask::load_bootstrap_masks(Some(&file_config));
+        assert!(rejected.is_err(), "tampered signature must be rejected");
+
+        #[cfg(feature = "production-secure")]
+        {
+            let weakened = ServerFileConfig {
+                mask_verify_mode: Some("warn".to_string()),
+                ..file_config.clone()
+            };
+            let err = cli::mask::load_bootstrap_masks(Some(&weakened)).unwrap_err();
+            assert!(
+                err.contains("production-secure") || err.contains("enforce"),
+                "{err}"
+            );
+        }
         std::fs::remove_dir_all(&temp_dir).ok();
     }
 

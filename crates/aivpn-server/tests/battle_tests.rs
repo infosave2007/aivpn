@@ -444,7 +444,6 @@ fn battle_session_seq_wrapping() {
 }
 
 #[test]
-#[ignore]
 fn battle_session_idle_detection() {
     let server_kp = KeyPair::generate();
     let signing_key = ed25519_dalek::SigningKey::from_bytes(&[0x42u8; 32]);
@@ -456,8 +455,11 @@ fn battle_session_idle_detection() {
         .create_session(make_addr(10000), client_kp.public_key_bytes(), None, None)
         .unwrap();
 
-    // Freshly created session is not idle
     assert!(!session.lock().is_idle());
+    session.lock().last_seen = std::time::Instant::now()
+        - aivpn_server::session::IDLE_TIMEOUT
+        - std::time::Duration::from_secs(1);
+    assert!(session.lock().is_idle());
 }
 
 // ============================================================================
@@ -641,7 +643,7 @@ fn battle_full_pipeline_control_messages() {
         .unwrap();
 
     // Test each control message type
-    let controls = vec![
+    let controls = [
         ControlPayload::Keepalive { send_ts: 0 },
         ControlPayload::Shutdown { reason: 1 },
         ControlPayload::TelemetryRequest { metric_flags: 0xFF },
@@ -911,7 +913,6 @@ fn battle_ratchet_tag_validation() {
 }
 
 #[test]
-#[ignore]
 fn battle_complete_ratchet() {
     let server_kp = KeyPair::generate();
     let signing_key = ed25519_dalek::SigningKey::from_bytes(&[0x42u8; 32]);
@@ -939,7 +940,7 @@ fn battle_complete_ratchet() {
     mgr.complete_session_ratchet(&session_id);
 
     // After ratchet: keys should be the ratcheted keys
-    let sess = session.lock();
+    let mut sess = session.lock();
     assert!(sess.is_ratcheted, "Session must be marked as ratcheted");
     assert_eq!(
         sess.keys.session_key, ratcheted_key,
@@ -950,20 +951,24 @@ fn battle_complete_ratchet() {
         "Ratcheted keys should be consumed"
     );
     assert!(
-        sess.server_eph_pub.is_none(),
-        "Ephemeral key should be cleared"
+        sess.server_eph_pub.is_some(),
+        "Public transcript key is retained for enrollment"
     );
     assert!(
         sess.ratcheted_expected_tags.is_empty(),
         "Ratcheted tags should be moved"
     );
 
-    // Initial key tags should no longer validate
     let tw = compute_time_window(current_timestamp_ms(), DEFAULT_WINDOW_MS);
     let old_tag = generate_resonance_tag(&initial_tag_secret, 0, tw);
     assert!(
+        sess.validate_tag(&old_tag).is_some(),
+        "In-flight old-key packets have a bounded grace window"
+    );
+    sess.pre_ratchet_expire = Some(std::time::Instant::now() - std::time::Duration::from_secs(1));
+    assert!(
         sess.validate_tag(&old_tag).is_none(),
-        "Old tags must be invalid after ratchet"
+        "Old tags expire after grace"
     );
 
     // Ratcheted tags should validate as normal (not ratcheted anymore, they're "initial" now)
@@ -1456,7 +1461,6 @@ fn test_mask_catalog_second_compromise_refused_when_it_would_empty_catalog() {
 // ============================================================================
 
 #[test]
-#[ignore]
 fn test_session_mask_update() {
     let (mgr, _) = make_session_manager();
     let client_kp = KeyPair::generate();
@@ -1474,8 +1478,13 @@ fn test_session_mask_update() {
     let new_mask = quic_https_v2();
     mgr.update_session_mask(&session_id, new_mask);
 
-    let sess = session.lock();
-    assert!(sess.mask.is_some());
+    let mut sess = session.lock();
+    assert!(sess.mask.is_none());
+    assert!(sess.pending_mask.is_some());
+    assert!(!sess.commit_pending_mask());
+    sess.pending_mask.as_mut().unwrap().1 =
+        std::time::Instant::now() - std::time::Duration::from_secs(1);
+    assert!(sess.commit_pending_mask());
     assert_eq!(sess.mask.as_ref().unwrap().mask_id, "quic_https_v2");
     assert_eq!(sess.state, SessionState::Active);
     assert_eq!(sess.fsm_state, 0, "FSM must reset after mask change");
@@ -1595,13 +1604,23 @@ fn test_gateway_config_default_has_neural() {
 fn test_gateway_creation_with_neural() {
     use aivpn_server::Gateway;
     // Create temp mask dir with a mask file
-    let mask_dir = std::path::PathBuf::from("/tmp/aivpn-test-gateway-masks");
+    let temp = tempfile::tempdir().unwrap();
+    let mask_dir = temp.path().join("masks");
     let _ = std::fs::create_dir_all(&mask_dir);
-    let mask = webrtc_zoom_v3();
+    let mut mask = webrtc_zoom_v3();
+    mask.sign(&ed25519_dalek::SigningKey::from_bytes(&[79; 32]));
     let json = serde_json::to_string_pretty(&mask).unwrap();
     std::fs::write(mask_dir.join(format!("{}.json", mask.mask_id)), &json).unwrap();
     std::fs::write(mask_dir.join(format!("{}.stats", mask.mask_id)), "{}").unwrap();
     let mut config = GatewayConfig::default();
+    config.client_db = Some(std::sync::Arc::new(
+        aivpn_server::ClientDatabase::load(
+            &temp.path().join("clients.json"),
+            config.network_config.clone(),
+        )
+        .unwrap(),
+    ));
+    config.mask_signing_key = Some([79; 32]);
     config.mask_dir = mask_dir;
     let gateway = Gateway::new(config);
     assert!(

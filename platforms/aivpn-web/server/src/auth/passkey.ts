@@ -104,10 +104,10 @@ export async function getAuthenticationOptions(
 ) {
   const options = await generateAuthenticationOptions({
     rpID: RP_ID,
-    allowCredentials: allowedPasskeys?.map((pk) => ({
+    ...(allowedPasskeys ? { allowCredentials: allowedPasskeys.map((pk) => ({
       id: pk.credential_id,
       transports: (pk.transports ?? []) as AuthenticatorTransportFuture[],
-    })),
+    })) } : {}),
     // Deliberately kept 'preferred' rather than 'required', unlike the
     // registration side above. Existing passkeys were enrolled back when
     // registration also allowed 'preferred', so some already-enrolled

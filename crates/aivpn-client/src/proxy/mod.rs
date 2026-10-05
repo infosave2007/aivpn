@@ -62,6 +62,7 @@ pub struct ProxyConfig {
     pub vpn_ip: Ipv4Addr,
     pub gateway_ip: Ipv4Addr,
     pub prefix_len: u8,
+    pub dns_servers: Vec<Ipv4Addr>,
 }
 
 pub struct ProxyHandle {
@@ -145,7 +146,7 @@ struct PendingDns {
 enum UdpStackCommand {
     CreateAssoc(NewUdpAssoc),
     SendPacket(UdpPacketCommand),
-    Resolve(DnsResolve), // ← добавили
+    Resolve(DnsResolve),
 }
 
 /// Запустить smoltcp-стек и SOCKS5-слушатель.
@@ -153,6 +154,8 @@ pub async fn spawn_proxy(
     config: ProxyConfig,
     tun_to_udp_tx: mpsc::Sender<Vec<u8>>,
 ) -> std::io::Result<ProxyHandle> {
+    validate_dns_servers(&config.dns_servers)?;
+    let listener = tokio::net::TcpListener::bind(config.listen_addr).await?;
     let rx_queue: Arc<Mutex<VecDeque<Vec<u8>>>> = Arc::new(Mutex::new(VecDeque::new()));
     let tx_queue: Arc<Mutex<VecDeque<Vec<u8>>>> = Arc::new(Mutex::new(VecDeque::new()));
 
@@ -163,6 +166,7 @@ pub async fn spawn_proxy(
     let vpn_ip = config.vpn_ip;
     let gateway_ip = config.gateway_ip;
     let prefix_len = config.prefix_len;
+    let dns_servers = config.dns_servers;
     let rx_clone = Arc::clone(&rx_queue);
     let tx_clone = Arc::clone(&tx_queue);
 
@@ -177,10 +181,10 @@ pub async fn spawn_proxy(
             vpn_ip,
             gateway_ip,
             prefix_len,
+            dns_servers,
         );
     });
 
-    let listener = tokio::net::TcpListener::bind(config.listen_addr).await?;
     info!("SOCKS5 proxy listening on {}", config.listen_addr);
 
     let proxy_ip = config.listen_addr.ip();
@@ -244,6 +248,7 @@ fn run_stack(
     vpn_ip: Ipv4Addr,
     gateway_ip: Ipv4Addr,
     prefix_len: u8,
+    dns_servers: Vec<Ipv4Addr>,
 ) {
     let mut device = VpnDevice::new(Arc::clone(&rx_queue), Arc::clone(&tx_queue), PROXY_MTU);
 
@@ -264,8 +269,13 @@ fn run_stack(
     let mut tcp_conns: Vec<ManagedConn> = Vec::new();
     let mut udp_assocs: HashMap<u16, ManagedUdpAssoc> = HashMap::new();
 
-    let dns_servers = [IpAddress::v4(1, 1, 1, 1)]; // TODO: получать адреса извне, важно: работает ток с одним адресом :(
-                                                   // Vec даёт owned-слоты; find_free_query() сам делает push при нехватке.
+    let dns_servers: Vec<_> = dns_servers
+        .into_iter()
+        .map(|ip| {
+            let [a, b, c, d] = ip.octets();
+            IpAddress::v4(a, b, c, d)
+        })
+        .collect();
     let dns_socket = dns::Socket::new(&dns_servers, Vec::<Option<dns::DnsQuery>>::new());
     let dns_handle = sockets.add(dns_socket);
     let mut pending_dns: Vec<PendingDns> = Vec::new();
@@ -281,8 +291,8 @@ fn run_stack(
                     socket.set_ack_delay(None);
                     socket.set_nagle_enabled(false);
 
-                    let mut cx = iface.context();
-                    match socket.connect(&mut cx, nc.target, nc.src_port) {
+                    let cx = iface.context();
+                    match socket.connect(cx, nc.target, nc.src_port) {
                         Ok(()) => {
                             let handle = sockets.add(socket);
                             tcp_conns.push(ManagedConn {
@@ -352,8 +362,8 @@ fn run_stack(
                 }
                 Ok(UdpStackCommand::Resolve(r)) => {
                     let dns_sock = sockets.get_mut::<dns::Socket>(dns_handle);
-                    let mut cx = iface.context();
-                    match dns_sock.start_query(&mut cx, &r.name, r.qtype) {
+                    let cx = iface.context();
+                    match dns_sock.start_query(cx, &r.name, r.qtype) {
                         Ok(handle) => pending_dns.push(PendingDns {
                             handle,
                             reply: r.reply,
@@ -473,10 +483,7 @@ async fn resolve_via_tunnel(
             }))
             .is_err()
         {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "stack thread gone or queue full",
-            ));
+            return Err(std::io::Error::other("stack thread gone or queue full"));
         }
         let _ = wake_tx.try_send(()); // разбудить стек: DNS-запрос
         let ip =
@@ -1170,5 +1177,35 @@ mod tests {
             1,
             "relay socket fd must be released after abort"
         );
+    }
+}
+
+fn validate_dns_servers(servers: &[Ipv4Addr]) -> std::io::Result<()> {
+    if servers.is_empty()
+        || servers.len() > 4
+        || servers.iter().any(|ip| {
+            ip.is_unspecified() || ip.is_multicast() || ip.is_broadcast() || ip.is_loopback()
+        })
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "SOCKS5 requires one to four unicast DNS servers reachable through the VPN",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod dns_config_tests {
+    use super::*;
+
+    #[test]
+    fn accepts_multiple_resolvers_and_rejects_invalid_configuration() {
+        assert!(
+            validate_dns_servers(&[Ipv4Addr::new(10, 2, 0, 1), Ipv4Addr::new(9, 9, 9, 9)]).is_ok()
+        );
+        assert!(validate_dns_servers(&[]).is_err());
+        assert!(validate_dns_servers(&[Ipv4Addr::LOCALHOST]).is_err());
+        assert!(validate_dns_servers(&[Ipv4Addr::new(1, 1, 1, 1); 5]).is_err());
     }
 }

@@ -547,11 +547,55 @@ pub fn decode_downlink_any_mdh_len(
     recv_window: &mut RecvWindow,
     candidate_mdh_lens: &mut Vec<usize>,
 ) -> Result<DecodedPacket> {
-    // Legacy framing only: tag at [0..TAG_SIZE], counter lookup once.
-    if packet.len() < TAG_SIZE + 16 {
+    let offsets: Vec<_> = crate::mask::preset_masks::all()
+        .iter()
+        .map(|mask| mask.tag_offset)
+        .collect();
+    decode_downlink_with_offsets(packet, keys, recv_window, candidate_mdh_lens, &offsets)
+}
+
+/// Принимает текущую и прежние маски; окно replay меняется только после AEAD.
+/// Поиск длины заголовка запускается только после совпадения секретного тега.
+pub fn decode_downlink_with_offsets(
+    packet: &[u8],
+    keys: &SessionKeys,
+    recv_window: &mut RecvWindow,
+    candidate_mdh_lens: &mut Vec<usize>,
+    tag_offsets: &[u16],
+) -> Result<DecodedPacket> {
+    let mut offsets = vec![u16::MAX];
+    for &offset in tag_offsets {
+        if !offsets.contains(&offset) {
+            offsets.push(offset);
+        }
+    }
+    let mut error = Error::InvalidPacket("Invalid resonance tag");
+    for offset in offsets {
+        match decode_downlink_one_layout(packet, keys, recv_window, candidate_mdh_lens, offset) {
+            Ok(decoded) => return Ok(decoded),
+            Err(failure) => error = failure,
+        }
+    }
+    Err(error)
+}
+
+fn decode_downlink_one_layout(
+    packet: &[u8],
+    keys: &SessionKeys,
+    recv_window: &mut RecvWindow,
+    candidate_mdh_lens: &mut Vec<usize>,
+    tag_offset: u16,
+) -> Result<DecodedPacket> {
+    let prefix_len = if tag_offset == u16::MAX { TAG_SIZE } else { 0 };
+    let tag_start = if tag_offset == u16::MAX {
+        0
+    } else {
+        tag_offset as usize
+    };
+    if packet.len() < tag_start + TAG_SIZE + 16 {
         return Err(Error::InvalidPacket("Packet too short"));
     }
-    let tag: [u8; TAG_SIZE] = packet[0..TAG_SIZE]
+    let tag: [u8; TAG_SIZE] = packet[tag_start..tag_start + TAG_SIZE]
         .try_into()
         .map_err(|_| Error::InvalidPacket("Packet tag malformed"))?;
     let counter = recv_window
@@ -562,7 +606,10 @@ pub fn decode_downlink_any_mdh_len(
     // Fast path: try every MDH length we have already learned.
     let mut tried_any = false;
     for &mdh_len in candidate_mdh_lens.iter() {
-        let ct_start = TAG_SIZE + mdh_len;
+        let ct_start = prefix_len + mdh_len;
+        if ct_start < tag_start + TAG_SIZE {
+            continue;
+        }
         if packet.len() < ct_start + 16 {
             continue;
         }
@@ -594,7 +641,10 @@ pub fn decode_downlink_any_mdh_len(
         if candidate_mdh_lens.contains(&mdh_len) {
             continue;
         }
-        let ct_start = TAG_SIZE + mdh_len;
+        let ct_start = prefix_len + mdh_len;
+        if ct_start < tag_start + TAG_SIZE {
+            continue;
+        }
         if packet.len() < ct_start + 16 {
             continue;
         }
@@ -643,7 +693,31 @@ pub fn process_server_hello_with_mdh_len(
     mdh_len: usize,
     server_signing_key: Option<&[u8; 32]>,
 ) -> Result<(Option<crate::network_config::ClientNetworkConfig>, [u8; 32])> {
-    let decoded = decode_packet_with_mdh_len(packet, keys, recv_window, mdh_len)?;
+    process_server_hello_with_offsets(
+        packet,
+        keys,
+        keypair,
+        recv_window,
+        send_counter,
+        mdh_len,
+        server_signing_key,
+        &[u16::MAX],
+    )
+}
+
+/// ServerHello для префиксных и встроенных тегов с явным набором масок.
+pub fn process_server_hello_with_offsets(
+    packet: &[u8],
+    keys: &mut SessionKeys,
+    keypair: &KeyPair,
+    recv_window: &mut RecvWindow,
+    send_counter: &mut u64,
+    mdh_len: usize,
+    server_signing_key: Option<&[u8; 32]>,
+    tag_offsets: &[u16],
+) -> Result<(Option<crate::network_config::ClientNetworkConfig>, [u8; 32])> {
+    let decoded =
+        decode_downlink_with_offsets(packet, keys, recv_window, &mut vec![mdh_len], tag_offsets)?;
 
     if decoded.header.inner_type != InnerType::Control {
         return Err(Error::InvalidPacket(
@@ -660,14 +734,14 @@ pub fn process_server_hello_with_mdh_len(
             // Verify ed25519 signature over (server_eph_pub || client_eph_pub),
             // matching desktop's ServerHello handler in aivpn-client/src/client.rs.
             if let Some(signing_key) = server_signing_key {
-                use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+                use ed25519_dalek::{Signature, VerifyingKey};
                 let vk = VerifyingKey::from_bytes(signing_key)
                     .map_err(|e| Error::Crypto(format!("Invalid server signing key: {}", e)))?;
                 let mut msg = Vec::with_capacity(64);
                 msg.extend_from_slice(&server_eph_pub);
                 msg.extend_from_slice(&keypair.public_key_bytes());
                 let sig = Signature::from_bytes(&signature);
-                if vk.verify(&msg, &sig).is_err() {
+                if vk.verify_strict(&msg, &sig).is_err() {
                     return Err(Error::Crypto(
                         "ServerHello signature invalid — possible MITM attack".into(),
                     ));
@@ -721,6 +795,29 @@ mod tag_layout_tests {
         // the live tunnel.
         keys.session_key_s2c = keys.session_key;
         keys
+    }
+
+    #[test]
+    fn custom_embedded_downlink_discovers_length_and_rejects_replay() {
+        let keys = test_keys();
+        let inner = build_inner_packet(InnerType::Control, 4, b"custom-mask");
+        let packet =
+            build_random_mdh_packet_with_tag_offset(&keys, &mut 0, &inner, None, 48, 27).unwrap();
+        let mut window = RecvWindow::new();
+        let mut lengths = vec![20];
+        let mut corrupt = packet.clone();
+        *corrupt.last_mut().unwrap() ^= 1;
+        assert!(
+            decode_downlink_with_offsets(&corrupt, &keys, &mut window, &mut lengths, &[27])
+                .is_err()
+        );
+        let decoded =
+            decode_downlink_with_offsets(&packet, &keys, &mut window, &mut lengths, &[27]).unwrap();
+        assert_eq!(decoded.payload, b"custom-mask");
+        assert!(lengths.contains(&48));
+        assert!(
+            decode_downlink_with_offsets(&packet, &keys, &mut window, &mut lengths, &[27]).is_err()
+        );
     }
 
     #[test]

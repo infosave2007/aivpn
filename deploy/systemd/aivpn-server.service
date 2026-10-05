@@ -38,16 +38,12 @@ ExecStart=__AIVPN_BINPATH__ \
   --listen __AIVPN_LISTEN__
 ExecReload=/bin/kill -HUP $MAINPID
 
-# Runs as root: needs to open the TUN device, run NAT/nftables/iptables
-# rule management, and bind privileged ports (e.g. :443). Capabilities are
-# still declared explicitly for clarity/auditability even though root
-# already implies them, and DeviceAllow is required for the TUN device
-# to be reachable under a cgroup-v2 "closed" DevicePolicy regardless of
-# the running user.
+# TUN и правила NAT требуют NET_ADMIN, низкие порты - NET_BIND_SERVICE.
+# NET_RAW нужен утилитам управления iptables. BoundingSet ограничивает и root.
 User=root
 Group=root
-AmbientCapabilities=CAP_NET_ADMIN
-CapabilityBoundingSet=CAP_NET_ADMIN
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
 DeviceAllow=/dev/net/tun rw
 
 RuntimeDirectory=aivpn

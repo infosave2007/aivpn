@@ -92,30 +92,9 @@ pub struct ServeConfig {
     /// 500 — see `mgmt_service::apply_heavy`'s doc comment), which only
     /// happens if a caller builds `ServeConfig` without wiring this up.
     pub pending_config: Option<std::sync::Arc<PendingConfigManager>>,
-    /// Wave B1 (pool topology read endpoints): whether pool sync is
-    /// configured on this node AT ALL (`server.json`'s `pool` block
-    /// present), regardless of transport — mirrors
-    /// `gateway::GatewayConfig::pool_configured`; see that field's doc
-    /// comment for why this is needed to tell `"legacy"` apart from
-    /// `"none"` when `pool_dialer_slot` below is empty.
+    /// Пул задан в конфиге, даже если dialer еще запускается.
     pub pool_configured: bool,
-    /// Wave B1: a shared, fillable-later handle to the live `NodeRegistry`.
-    /// `main.rs` constructs this `ServeConfig` (and spawns the REST API)
-    /// BEFORE the pool-sync setup block that actually creates the
-    /// `NodeRegistry`/`PoolDialer` (they're only built once
-    /// `pool.transport == "masked"` is confirmed, deep inside the
-    /// post-`AivpnServer::new()` match arm) — reordering that spawn was
-    /// judged too invasive for this change. Passing the SAME
-    /// `Arc<Mutex<Option<..>>>` cell into both `ServeConfig` (read at
-    /// request time, in `ApiState::mgmt_ctx`) and the pool-sync setup block
-    /// (written once, right after `NodeRegistry::load`/`PoolDialer::new`
-    /// succeed) sidesteps the ordering problem entirely: a REST request
-    /// that lands before the pool-sync block finishes just observes an
-    /// empty slot (degrades to `pool_configured`'s `"legacy"`/`"none"`
-    /// label, never an error) and self-heals on the very next request once
-    /// `main.rs` fills it in — no restart needed. `None` when pool sync
-    /// isn't configured at all (`main.rs` never allocates a cell it will
-    /// never fill).
+    /// Registry заполняется при запуске пула. API читает актуальное значение.
     pub pool_registry_slot: Option<
         std::sync::Arc<
             parking_lot::Mutex<Option<std::sync::Arc<crate::node_registry::NodeRegistry>>>,
@@ -240,7 +219,7 @@ impl ApiState {
                     transport: "masked",
                 })
             }
-            None if self.pool_configured => mgmt_service::PoolSnapshot::empty("legacy"),
+            None if self.pool_configured => mgmt_service::PoolSnapshot::empty("masked"),
             None => mgmt_service::PoolSnapshot::empty("none"),
         }
     }
@@ -678,7 +657,27 @@ async fn put_config(
     // the next server start (`load_server_file_config` exits on parse
     // failure). The allowlist is back (`CONFIG_KNOWN_KEYS`, checked above),
     // but guarded by a test that catches drift against the shipped example.
-    if let Err(e) = serde_json::from_value::<crate::server_config::ServerFileConfig>(body.clone()) {
+    let parsed_cfg =
+        match serde_json::from_value::<crate::server_config::ServerFileConfig>(body.clone()) {
+            Ok(cfg) => cfg,
+            Err(e) => {
+                audit(
+                    &state,
+                    "ConfigPut",
+                    &path.display().to_string(),
+                    &format!("rejected: {}", e),
+                );
+                return (
+                    StatusCode::BAD_REQUEST,
+                    err(format!("invalid config: {}", e)),
+                )
+                    .into_response();
+            }
+        };
+    // Полная замена файла: в production-secure тело без mask_signing_key или с
+    // режимом off/warn не должно сохраниться. Обычная сборка по-прежнему
+    // принимает warn без ключа.
+    if let Err(e) = parsed_cfg.validate_mask_trust() {
         audit(
             &state,
             "ConfigPut",
@@ -852,18 +851,19 @@ async fn upload_mask(
                 .into_response()
         }
     };
-    // Config-gated operator signature verification, mirroring mask_store's
-    // disk-load policy: enforce → reject, warn → accept with a warning.
+    // Проверка совпадает с mask_store. Защищенная сборка требует enforce
+    // и при старом сохраненном значении warn.
+    let verify_mode = crate::server_config::effective_mask_verify_mode(state.mask_verify_mode);
     let verdict = aivpn_common::mask::verify_mask_artifact(
         &profile,
         state.mask_operator_pubkey.as_ref(),
-        state.mask_verify_mode,
+        verify_mode,
     );
     if !verdict.accept {
         return (
             StatusCode::BAD_REQUEST,
             err(format!(
-                "mask signature verification failed (mask_verify_mode=enforce): {:?}",
+                "mask signature verification failed (mask_verify_mode={verify_mode:?}): {:?}",
                 verdict.detail
             )),
         )

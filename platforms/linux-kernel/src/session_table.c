@@ -23,6 +23,8 @@
 #include <linux/bitmap.h>
 #include <linux/rcupdate.h>
 #include <linux/atomic.h>
+#include <linux/mutex.h>
+#include <linux/timekeeping.h>
 #include <crypto/aead.h>
 #include <crypto/algapi.h>
 #include "session_table.h"
@@ -38,7 +40,25 @@ static DEFINE_HASHTABLE(aivpn_session_htable, AIVPN_SESSION_HASH_BITS);
  * write-side aivpn_table_lock with the other two tables. */
 static DEFINE_HASHTABLE(aivpn_ip_htable,      AIVPN_SESSION_HASH_BITS);
 static DEFINE_SPINLOCK(aivpn_table_lock);
+/* Смена объекта сессии и flush не должны пересекаться между ioctl. */
+static DEFINE_MUTEX(aivpn_lifecycle_lock);
 static atomic_t aivpn_session_count = ATOMIC_INIT(0);
+
+/* Общее ведро на client_key. Слот живет дольше сессии: reinstall не наполняет бюджет заново. */
+#define AIVPN_QOS_HASH_BITS 8
+
+struct aivpn_qos_slot {
+	struct hlist_node node;
+	spinlock_t lock;
+	u8 client_key[16];
+	struct aivpn_pol budget;
+};
+
+static DEFINE_HASHTABLE(aivpn_qos_htable, AIVPN_QOS_HASH_BITS);
+static DEFINE_SPINLOCK(aivpn_qos_lock);
+
+static struct aivpn_kern_session *aivpn_session_detach(const u8 *session_id);
+static void aivpn_qos_flush(void);
 
 /* Bitmap of tag byte offsets in use (Variant A). Written under the table lock,
  * read lock-free on the RX path via READ_ONCE. Only grows, so a stale read is
@@ -61,15 +81,34 @@ int aivpn_session_table_init(void)
 	int ret;
 
 	BUILD_BUG_ON(AIVPN_TAG_WINDOW_SLOTS < 32 || AIVPN_TAG_WINDOW_SLOTS > 1024);
+	BUILD_BUG_ON(sizeof(struct aivpn_session_policy) != 104);
+	BUILD_BUG_ON(sizeof(struct aivpn_session_sync) != 160);
+	BUILD_BUG_ON(sizeof(struct aivpn_client_revoke) != 16);
+	BUILD_BUG_ON(sizeof(struct aivpn_session_downlink) != 4188);
+	BUILD_BUG_ON(sizeof(struct aivpn_session_add) != 192);
+	BUILD_BUG_ON(sizeof(struct aivpn_replay_claim) != 40);
+	BUILD_BUG_ON(sizeof(struct aivpn_replay_rotate) != 24);
+	BUILD_BUG_ON(sizeof(struct aivpn_qos_charge) != 48);
+	BUILD_BUG_ON(AIVPN_REPLAY_WORDS != 8);
 	hash_init(aivpn_tag_htable);
 	hash_init(aivpn_session_htable);
 	hash_init(aivpn_ip_htable);
+	hash_init(aivpn_qos_htable);
 	ret = aivpn_stats_init();
 	if (ret)
 		return ret;
 	aivpn_info("session table ready (tag: %u, session: %u buckets)\n",
 		   1u << AIVPN_TAG_HASH_BITS, 1u << AIVPN_SESSION_HASH_BITS);
 	return 0;
+}
+
+void aivpn_session_owner_release(void)
+{
+	aivpn_udp_hook_uninstall();
+	aivpn_egress_fini();
+	aivpn_session_flush();
+	aivpn_qos_flush();
+	aivpn_tun_clear();
 }
 
 void aivpn_session_table_fini(void)
@@ -91,6 +130,8 @@ void aivpn_session_table_fini(void)
 	aivpn_udp_hook_uninstall();
 	aivpn_egress_fini();
 	aivpn_session_flush();
+	/* Хуки уже сняты, слоты QoS больше никто не держит. */
+	aivpn_qos_flush();
 	aivpn_tun_clear();
 	aivpn_stats_fini();
 }
@@ -163,18 +204,11 @@ static struct crypto_aead *aivpn_alloc_tfm(const u8 *key)
 
 /* ── aivpn_session_insert ────────────────────────────────────────────────── */
 
-int aivpn_session_insert(const struct aivpn_session_add *add)
+static int aivpn_session_insert_locked(const struct aivpn_session_add *add)
 {
-	struct aivpn_kern_session *s;
+	struct aivpn_kern_session *s, *old;
 	struct crypto_aead *tfm;
 	int ret;
-
-	/* Idempotent install: evict any existing session with this id first, so a
-	 * re-add (the client switched masks, or the keys rotated) refreshes the
-	 * wire offsets and keys instead of leaving a stale duplicate whose frozen
-	 * mdh_len/tfm would silently fail every decrypt. Cheap no-op (returns
-	 * -ENOENT before any grace period) on a first-time add. */
-	aivpn_session_remove(add->session_id);
 
 	s = kzalloc(sizeof(*s), GFP_KERNEL);
 	if (!s)
@@ -184,8 +218,9 @@ int aivpn_session_insert(const struct aivpn_session_add *add)
 	memcpy(s->nonce_suffix, add->nonce_suffix, sizeof(s->nonce_suffix));
 	memcpy(s->client_addr,  add->client_addr, sizeof(s->client_addr));
 	s->client_ip = add->client_ip;
-	/* Downlink block starts empty: a session is not downlink-accelerated until
-	 * AIVPN_IOC_SESSION_DOWNLINK arms it. kzalloc already zeroed dl_*. */
+	/* Downlink block starts empty. kzalloc обнуляет политику (armed = 0) и
+	 * dl_tag_pos, поэтому legacy sentinel ставим явно: ноль значил бы встройку. */
+	s->dl_tag_pos = 0xFFFF;
 
 	/* Derive the Variant A wire offsets. Legacy (u16::MAX): 8-byte tag prefix
 	 * at offset 0, ciphertext at TAG_SIZE + mdh_len. Embedded: tag inside the
@@ -199,8 +234,8 @@ int aivpn_session_insert(const struct aivpn_session_add *add)
 	}
 
 	spin_lock_init(&s->lock);
-	atomic64_set(&s->tx_counter, (s64)add->counter_base);
-	/* recv_counter and replay_window are zero-initialised by kzalloc */
+	/* counter_base остается в ABI. Отдельный tx_counter больше не нужен:
+	 * aivpn_encrypt удален, downlink берет счетчики из зарезервированного блока. */
 
 	/* c2s uplink key — the direction the kernel currently decrypts. */
 	tfm = aivpn_alloc_tfm(add->session_key);
@@ -220,6 +255,22 @@ int aivpn_session_insert(const struct aivpn_session_add *add)
 		return ret;
 	}
 	s->tfm_s2c = tfm;
+
+	/* Все операции, которые могут не выделить память, завершены до detach. */
+	old = aivpn_session_detach(add->session_id);
+	if (old) {
+		synchronize_rcu();
+		spin_lock_bh(&old->lock);
+		s->replay = old->replay;
+		s->rx_packets = old->rx_packets;
+		s->rx_bytes = old->rx_bytes;
+		s->tx_packets = old->tx_packets;
+		s->tx_bytes = old->tx_bytes;
+		s->pol = old->pol;
+		s->pol.armed = 0;
+		spin_unlock_bh(&old->lock);
+		session_free(old);
+	}
 
 	spin_lock_bh(&aivpn_table_lock);
 	if (atomic_read(&aivpn_session_count) >= MAX_SESSIONS) {
@@ -247,6 +298,16 @@ int aivpn_session_insert(const struct aivpn_session_add *add)
 		aivpn_probe_offsets_bitmap |= 1ull;
 	spin_unlock_bh(&aivpn_table_lock);
 	return 0;
+}
+
+int aivpn_session_insert(const struct aivpn_session_add *add)
+{
+	int ret;
+
+	mutex_lock(&aivpn_lifecycle_lock);
+	ret = aivpn_session_insert_locked(add);
+	mutex_unlock(&aivpn_lifecycle_lock);
+	return ret;
 }
 
 /* ── aivpn_session_tags_update ───────────────────────────────────────────── */
@@ -373,6 +434,7 @@ int aivpn_session_downlink_update(const struct aivpn_session_downlink *dl)
 	}
 	s->dl_count = count;
 	s->dl_next  = 0;
+	s->dl_tag_pos = dl->dl_tag_pos;
 	spin_unlock_bh(&s->lock);
 	spin_unlock_bh(&aivpn_table_lock);
 	return 0;
@@ -392,33 +454,498 @@ struct aivpn_kern_session *aivpn_session_lookup_by_ip(u32 client_ip)
 	return NULL;
 }
 
-/* ── aivpn_session_dl_reserve — claim one reserved downlink slot ─────────── */
+/* Сосед это другая живая сессия с тем же VPN IPv4. Вызывать под rcu_read_lock,
+ * не беря table lock (datapath уже может держать session lock). */
+static int aivpn_peer_is_other(__u32 ipv4_raw, void *ctx)
+{
+	struct aivpn_kern_session *self = ctx;
+	struct aivpn_kern_session *other;
 
-int aivpn_session_dl_reserve(struct aivpn_kern_session *s,
+	other = aivpn_session_lookup_by_ip(ipv4_raw);
+	return other && other != self;
+}
+
+static int aivpn_key_nonzero(const u8 key[16])
+{
+	u8 acc = 0;
+	int i;
+
+	for (i = 0; i < 16; i++)
+		acc |= key[i];
+	return acc != 0;
+}
+
+/* Вызывать под aivpn_qos_lock. */
+static struct aivpn_qos_slot *aivpn_qos_lookup(const u8 key[16])
+{
+	struct aivpn_qos_slot *slot;
+
+	hash_for_each_possible(aivpn_qos_htable, slot, node, jhash(key, 16, 0)) {
+		if (!crypto_memneq(slot->client_key, key, 16))
+			return slot;
+	}
+	return NULL;
+}
+
+/* Вызывать под aivpn_qos_lock. GFP_ATOMIC: замок уже взят. */
+static struct aivpn_qos_slot *aivpn_qos_create(const u8 key[16])
+{
+	struct aivpn_qos_slot *slot;
+
+	slot = kzalloc(sizeof(*slot), GFP_ATOMIC);
+	if (!slot)
+		return NULL;
+	memcpy(slot->client_key, key, 16);
+	spin_lock_init(&slot->lock);
+	hash_add(aivpn_qos_htable, &slot->node, jhash(key, 16, 0));
+	return slot;
+}
+
+/* Session lock уже взят. Дальше qos lock, затем lock слота. Обратный порядок запрещен. */
+static void aivpn_qos_reconfigure(const struct aivpn_session_policy *in)
+{
+	struct aivpn_qos_slot *slot;
+
+	if (!aivpn_key_nonzero(in->client_key))
+		return;
+	spin_lock_bh(&aivpn_qos_lock);
+	slot = aivpn_qos_lookup(in->client_key);
+	if (!slot)
+		slot = aivpn_qos_create(in->client_key);
+	if (slot) {
+		spin_lock(&slot->lock);
+		aivpn_pol_apply(&slot->budget, in);
+		spin_unlock(&slot->lock);
+	}
+	spin_unlock_bh(&aivpn_qos_lock);
+}
+
+static void aivpn_qos_flush(void)
+{
+	struct aivpn_qos_slot *slot;
+	struct hlist_node *tmp;
+	int bkt;
+
+	spin_lock_bh(&aivpn_qos_lock);
+	hash_for_each_safe(aivpn_qos_htable, bkt, tmp, slot, node) {
+		hash_del(&slot->node);
+		kfree(slot);
+	}
+	spin_unlock_bh(&aivpn_qos_lock);
+}
+
+/* Нулевой ключ списывает бюджет сессии, ненулевой общий бюджет клиента.
+ * Проверка квоты и скорости выполняется одним атомарным действием. */
+static int aivpn_session_account(struct aivpn_kern_session *s, int dir,
+				 unsigned int nbytes, u64 now_ns)
+{
+	struct aivpn_qos_slot *slot;
+	int v;
+
+	if (!aivpn_key_nonzero(s->pol.client_key))
+		return aivpn_pol_charge(&s->pol, dir, nbytes, now_ns);
+
+	spin_lock_bh(&aivpn_qos_lock);
+	slot = aivpn_qos_lookup(s->pol.client_key);
+	if (!slot) {
+		spin_unlock_bh(&aivpn_qos_lock);
+		return AIVPN_VERDICT_DROP;
+	}
+	spin_lock(&slot->lock);
+	spin_unlock_bh(&aivpn_qos_lock);
+	v = aivpn_pol_charge(&slot->budget, dir, nbytes, now_ns);
+	s->pol.quota_up = slot->budget.quota_up;
+	s->pol.quota_down = slot->budget.quota_down;
+	spin_unlock(&slot->lock);
+	if (v != AIVPN_VERDICT_ACCEPT)
+		return v;
+	return AIVPN_VERDICT_ACCEPT;
+}
+
+static __u64 aivpn_qos_budget_left(const u8 key[16], int dir, __u64 session_tokens, __u64 *quota)
+{
+	struct aivpn_qos_slot *slot;
+	__u64 left = session_tokens;
+
+	if (!aivpn_key_nonzero(key))
+		return session_tokens;
+	spin_lock_bh(&aivpn_qos_lock);
+	slot = aivpn_qos_lookup(key);
+	if (!slot) {
+		spin_unlock_bh(&aivpn_qos_lock);
+		return 0;
+	}
+	spin_lock(&slot->lock);
+	spin_unlock_bh(&aivpn_qos_lock);
+	left = dir == AIVPN_DIR_UPLINK ? slot->budget.tokens_up : slot->budget.tokens_down;
+	*quota = dir == AIVPN_DIR_UPLINK ? slot->budget.quota_up : slot->budget.quota_down;
+	spin_unlock(&slot->lock);
+	return left;
+}
+
+/* Слот лимита занимает только вооруженная серверная сессия без fallback. */
+static int aivpn_pol_slot_armed(const struct aivpn_pol *p)
+{
+	if (!p->armed || p->version != AIVPN_POLICY_VERSION)
+		return 0;
+	if (p->role != AIVPN_ROLE_SERVER)
+		return 0;
+	if (p->flags & (AIVPN_POL_REVOKED | AIVPN_POL_FALLBACK | AIVPN_POL_MTLS_WAIT |
+			AIVPN_POL_EXIT | AIVPN_POL_ENROLL_WAIT | AIVPN_POL_SITE))
+		return 0;
+	return 1;
+}
+
+static struct aivpn_kern_session *aivpn_find_session(const u8 *session_id)
+{
+	struct aivpn_kern_session *candidate;
+
+	hash_for_each_possible(aivpn_session_htable, candidate, mgmt_node,
+			       sid_hash_key(session_id)) {
+		if (!crypto_memneq(candidate->session_id, session_id, 16))
+			return candidate;
+	}
+	return NULL;
+}
+
+/* ── aivpn_session_dl_reserve - политика, затем слот ─────────────────────── */
+
+int aivpn_session_dl_reserve(struct aivpn_kern_session *s, const u8 *ip,
+			     unsigned int buf_len, unsigned int pkt_len,
 			     struct aivpn_dl_reservation *out)
 {
+	struct aivpn_ip_view view;
+	unsigned int nbytes;
+	int v;
 	u32 idx;
 
-	/* Caller holds rcu_read_lock() so s cannot be freed under us. Take s->lock
-	 * only to consume a slot — the AEAD runs after we return, lock-free. */
+	/* Caller holds rcu_read_lock(). Слот не занимаем, пока политика не ACCEPT. */
 	spin_lock_bh(&s->lock);
+	v = aivpn_pol_direction(&s->pol, AIVPN_POL_TX_FALLBACK);
+	if (v == AIVPN_VERDICT_DROP) {
+		spin_unlock_bh(&s->lock);
+		return -EPERM;
+	}
+	if (v != AIVPN_VERDICT_ACCEPT) {
+		spin_unlock_bh(&s->lock);
+		return -EAGAIN;
+	}
+	if (s->dl_tag_pos != 0xFFFF &&
+	    (unsigned int)s->dl_tag_pos + AIVPN_TAG_SIZE > s->dl_mdh_len) {
+		spin_unlock_bh(&s->lock);
+		return -EAGAIN;
+	}
 	if (s->dl_next >= s->dl_count) {
 		spin_unlock_bh(&s->lock);
-		return -EAGAIN; /* block exhausted — fall back to user-space */
+		return -EAGAIN;
+	}
+	if (aivpn_ip_parse(ip, buf_len, pkt_len, &view) != 0) {
+		spin_unlock_bh(&s->lock);
+		return -EPERM;
+	}
+	v = aivpn_pol_check_addrs(&s->pol, AIVPN_DIR_DOWNLINK, ip, buf_len, pkt_len,
+				  aivpn_peer_is_other, s);
+	if (v == AIVPN_VERDICT_DROP) {
+		spin_unlock_bh(&s->lock);
+		return -EPERM;
+	}
+	if (v != AIVPN_VERDICT_ACCEPT) {
+		spin_unlock_bh(&s->lock);
+		return -EAGAIN;
+	}
+	nbytes = view.length ? view.length : pkt_len;
+	v = aivpn_session_account(s, AIVPN_DIR_DOWNLINK, nbytes, ktime_get_ns());
+	if (v != AIVPN_VERDICT_ACCEPT) {
+		spin_unlock_bh(&s->lock);
+		return -EPERM;
 	}
 	idx = s->dl_next++;
 	memcpy(out->tag, s->dl_entries[idx].tag, AIVPN_TAG_SIZE);
 	out->counter = s->dl_entries[idx].counter;
 	out->seq_num = (u16)(s->dl_seq_base + idx);
 	out->mdh_len = s->dl_mdh_len;
+	out->tag_pos = s->dl_tag_pos;
 	if (s->dl_mdh_len)
 		memcpy(out->mdh, s->dl_mdh, s->dl_mdh_len);
+	else
+		memset(out->mdh, 0, sizeof(out->mdh));
 	memcpy(out->client_addr, s->client_addr, sizeof(out->client_addr));
+	s->tx_packets++;
+	/* Учет сервера совпадает с длиной UDP payload в userspace. */
+	s->tx_bytes += nbytes + s->dl_mdh_len + AIVPN_PADLEN_SIZE + AIVPN_INNER_HDR_SIZE + AIVPN_AUTH_SIZE +
+		(s->dl_tag_pos == 0xFFFF ? AIVPN_TAG_SIZE : 0U);
 	spin_unlock_bh(&s->lock);
 	return 0;
 }
 
-/* ── aivpn_tag_lookup — hot path, called with rcu_read_lock() held ─────── */
+int aivpn_session_rx_prepare(struct aivpn_kern_session *s, u64 counter,
+			     int *replay_dup)
+{
+	int v, r;
+
+	*replay_dup = 0;
+	v = aivpn_pol_direction(&s->pol, AIVPN_POL_RX_FALLBACK);
+	if (v != AIVPN_VERDICT_ACCEPT)
+		return v;
+	v = aivpn_pol_fast(&s->pol);
+	if (v != AIVPN_VERDICT_ACCEPT)
+		return v;
+	/* Эпоха еще не привязана: не смотрим чужое окно и не отмечаем счетчик. */
+	if (s->replay.epoch == 0)
+		return AIVPN_VERDICT_FALLBACK;
+	r = aivpn_replay_observe_win(s->replay.hi, s->replay.words, counter);
+	if (r == AIVPN_REPLAY_DUP) {
+		*replay_dup = 1;
+		return AIVPN_VERDICT_DROP;
+	}
+	if (r == AIVPN_REPLAY_TOO_OLD)
+		return AIVPN_VERDICT_FALLBACK;
+	return AIVPN_VERDICT_ACCEPT;
+}
+
+int aivpn_session_rx_finish(struct aivpn_kern_session *s, u64 counter,
+			    const u8 *plain, unsigned int plain_len,
+			    unsigned int wire_len, int *replay_dup)
+{
+	struct aivpn_ip_view view;
+	int v, r, claim;
+
+	*replay_dup = 0;
+	v = aivpn_pol_direction(&s->pol, AIVPN_POL_RX_FALLBACK);
+	if (v != AIVPN_VERDICT_ACCEPT)
+		return v;
+	if (s->replay.epoch == 0)
+		return AIVPN_VERDICT_FALLBACK;
+	r = aivpn_replay_observe_win(s->replay.hi, s->replay.words, counter);
+	if (r == AIVPN_REPLAY_DUP) {
+		*replay_dup = 1;
+		return AIVPN_VERDICT_DROP;
+	}
+	if (r == AIVPN_REPLAY_TOO_OLD)
+		return AIVPN_VERDICT_FALLBACK;
+	v = aivpn_pol_fast(&s->pol);
+	if (v != AIVPN_VERDICT_ACCEPT)
+		return v;
+	if (aivpn_ip_parse(plain, plain_len, plain_len, &view) != 0)
+		return AIVPN_VERDICT_DROP;
+	v = aivpn_pol_check_addrs(&s->pol, AIVPN_DIR_UPLINK, plain, plain_len,
+				  plain_len, aivpn_peer_is_other, s);
+	if (v != AIVPN_VERDICT_ACCEPT)
+		return v;
+	/* Захват только после адресов: FALLBACK не сжигает счетчик для userspace. */
+	claim = aivpn_epoch_claim(&s->replay, s->replay.epoch, counter);
+	if (claim == AIVPN_CLAIM_DUP) {
+		*replay_dup = 1;
+		return AIVPN_VERDICT_DROP;
+	}
+	if (claim != AIVPN_CLAIM_OK)
+		return AIVPN_VERDICT_FALLBACK;
+	v = aivpn_session_account(s, AIVPN_DIR_UPLINK, view.length, ktime_get_ns());
+	if (v != AIVPN_VERDICT_ACCEPT)
+		return AIVPN_VERDICT_DROP;
+	s->rx_packets++;
+	s->rx_bytes += s->pol.role == AIVPN_ROLE_CLIENT ? view.length : wire_len;
+	return AIVPN_VERDICT_ACCEPT;
+}
+
+int aivpn_session_policy_set(const struct aivpn_session_policy *in)
+{
+	struct aivpn_kern_session *s, *cand;
+	u32 others = 0;
+	int bkt, ret;
+
+	if (!in)
+		return -EINVAL;
+	spin_lock_bh(&aivpn_table_lock);
+	s = aivpn_find_session(in->session_id);
+	if (!s) {
+		spin_unlock_bh(&aivpn_table_lock);
+		return -ENOENT;
+	}
+	/* Считаем чужие слоты под table lock, без их session lock: писатель
+	 * флагов тоже держит table lock, datapath эти поля не меняет. */
+	if (aivpn_key_nonzero(in->client_key)) {
+		hash_for_each(aivpn_session_htable, bkt, cand, mgmt_node) {
+			if (cand == s)
+				continue;
+			if (!aivpn_key_nonzero(cand->pol.client_key))
+				continue;
+			if (crypto_memneq(cand->pol.client_key, in->client_key, 16))
+				continue;
+			if (aivpn_pol_slot_armed(&cand->pol))
+				others++;
+		}
+	}
+	spin_lock_bh(&s->lock);
+	ret = aivpn_pol_apply(&s->pol, in);
+	if (!ret && aivpn_pol_over_cap(others, s->pol.max_sessions)) {
+		/* Лимит не валит ioctl: новая сессия остается без ускорения. */
+		s->pol.armed = 0;
+		s->pol.flags |= AIVPN_POL_FALLBACK;
+	}
+	if (!ret)
+		aivpn_qos_reconfigure(in);
+	spin_unlock_bh(&s->lock);
+	spin_unlock_bh(&aivpn_table_lock);
+	return ret ? -EINVAL : 0;
+}
+
+int aivpn_session_sync(struct aivpn_session_sync *io)
+{
+	struct aivpn_kern_session *s;
+	__u64 rx_d, tx_d;
+
+	if (!io)
+		return -EINVAL;
+	spin_lock_bh(&aivpn_table_lock);
+	s = aivpn_find_session(io->session_id);
+	if (!s) {
+		spin_unlock_bh(&aivpn_table_lock);
+		return -ENOENT;
+	}
+	spin_lock_bh(&s->lock);
+	/* PUSH не вливается: анти-replay это только claim под этим замком. */
+	rx_d = s->rx_bytes >= s->pol.rx_bytes_synced ?
+		s->rx_bytes - s->pol.rx_bytes_synced : 0;
+	tx_d = s->tx_bytes >= s->pol.tx_bytes_synced ?
+		s->tx_bytes - s->pol.tx_bytes_synced : 0;
+	if (io->flags & AIVPN_SYNC_ACK_STATS) {
+		s->pol.rx_bytes_synced = s->rx_bytes;
+		s->pol.tx_bytes_synced = s->tx_bytes;
+	}
+	io->replay_hi = s->replay.hi;
+	memcpy(io->replay_words, s->replay.words, sizeof(io->replay_words));
+	io->rx_packets = s->rx_packets;
+	io->tx_packets = s->tx_packets;
+	io->rx_bytes = s->rx_bytes;
+	io->tx_bytes = s->tx_bytes;
+	io->rx_bytes_delta = rx_d;
+	io->tx_bytes_delta = tx_d;
+	io->quota_up_left = s->pol.quota_up;
+	io->quota_down_left = s->pol.quota_down;
+	{
+		__u64 quota = io->quota_up_left;
+		aivpn_qos_budget_left(s->pol.client_key, AIVPN_DIR_UPLINK, 0, &quota);
+		io->quota_up_left = quota;
+		quota = io->quota_down_left;
+		aivpn_qos_budget_left(s->pol.client_key, AIVPN_DIR_DOWNLINK, 0, &quota);
+		io->quota_down_left = quota;
+	}
+	spin_unlock_bh(&s->lock);
+	spin_unlock_bh(&aivpn_table_lock);
+	return 0;
+}
+
+int aivpn_session_replay_claim(struct aivpn_replay_claim *io)
+{
+	struct aivpn_kern_session *s;
+
+	if (!io)
+		return -EINVAL;
+	spin_lock_bh(&aivpn_table_lock);
+	s = aivpn_find_session(io->session_id);
+	if (!s) {
+		spin_unlock_bh(&aivpn_table_lock);
+		return -ENOENT;
+	}
+	spin_lock_bh(&s->lock);
+	/* Unarmed тоже фиксирует бит: userspace отмечает пакет раньше, чем ядро возьмет RX. */
+	io->result = aivpn_epoch_claim(&s->replay, io->epoch, io->counter);
+	spin_unlock_bh(&s->lock);
+	spin_unlock_bh(&aivpn_table_lock);
+	return 0;
+}
+
+int aivpn_session_replay_rotate(const struct aivpn_replay_rotate *in)
+{
+	struct aivpn_kern_session *s;
+	int ret;
+
+	if (!in)
+		return -EINVAL;
+	spin_lock_bh(&aivpn_table_lock);
+	s = aivpn_find_session(in->session_id);
+	if (!s) {
+		spin_unlock_bh(&aivpn_table_lock);
+		return -ENOENT;
+	}
+	spin_lock_bh(&s->lock);
+	ret = aivpn_epoch_rotate(&s->replay, in->epoch);
+	spin_unlock_bh(&s->lock);
+	spin_unlock_bh(&aivpn_table_lock);
+	return ret ? -EINVAL : 0;
+}
+
+int aivpn_session_qos_charge(struct aivpn_qos_charge *io)
+{
+	struct aivpn_kern_session *s;
+	int v;
+	__u64 tokens, quota;
+
+	if (!io)
+		return -EINVAL;
+	if (io->dir != AIVPN_QOS_DIR_UP && io->dir != AIVPN_QOS_DIR_DOWN)
+		return -EINVAL;
+	spin_lock_bh(&aivpn_table_lock);
+	s = aivpn_find_session(io->session_id);
+	if (!s) {
+		spin_unlock_bh(&aivpn_table_lock);
+		return -ENOENT;
+	}
+	spin_lock_bh(&s->lock);
+	if (s->pol.flags & AIVPN_POL_REVOKED) {
+		io->result = AIVPN_QOS_DROP;
+		io->tokens_left = 0;
+		io->quota_left = io->dir == AIVPN_QOS_DIR_UP ? s->pol.quota_up
+							    : s->pol.quota_down;
+		spin_unlock_bh(&s->lock);
+		spin_unlock_bh(&aivpn_table_lock);
+		return 0;
+	}
+	v = aivpn_pol_fast(&s->pol);
+	if (v != AIVPN_VERDICT_ACCEPT) {
+		io->result = AIVPN_QOS_FALLBACK;
+		io->tokens_left = 0;
+		io->quota_left = io->dir == AIVPN_QOS_DIR_UP ? s->pol.quota_up
+							    : s->pol.quota_down;
+		spin_unlock_bh(&s->lock);
+		spin_unlock_bh(&aivpn_table_lock);
+		return 0;
+	}
+	v = aivpn_session_account(s, (int)io->dir, io->nbytes, ktime_get_ns());
+	tokens = io->dir == AIVPN_QOS_DIR_UP ? s->pol.tokens_up : s->pol.tokens_down;
+	quota = io->dir == AIVPN_QOS_DIR_UP ? s->pol.quota_up : s->pol.quota_down;
+	tokens = aivpn_qos_budget_left(s->pol.client_key, (int)io->dir, tokens, &quota);
+	io->result = v == AIVPN_VERDICT_ACCEPT ? AIVPN_QOS_ACCEPT : AIVPN_QOS_DROP;
+	io->tokens_left = tokens;
+	io->quota_left = quota;
+	spin_unlock_bh(&s->lock);
+	spin_unlock_bh(&aivpn_table_lock);
+	return 0;
+}
+
+int aivpn_client_revoke(const struct aivpn_client_revoke *rv)
+{
+	struct aivpn_kern_session *s;
+	int bkt;
+
+	if (!rv || !aivpn_key_nonzero(rv->client_key))
+		return -EINVAL;
+	spin_lock_bh(&aivpn_table_lock);
+	hash_for_each(aivpn_session_htable, bkt, s, mgmt_node) {
+		if (!aivpn_key_nonzero(s->pol.client_key))
+			continue;
+		if (crypto_memneq(s->pol.client_key, rv->client_key, 16))
+			continue;
+		spin_lock_bh(&s->lock);
+		s->pol.flags |= AIVPN_POL_REVOKED;
+		spin_unlock_bh(&s->lock);
+	}
+	spin_unlock_bh(&aivpn_table_lock);
+	return 0;
+}
+
+/* ── aivpn_tag_lookup - hot path, called with rcu_read_lock() held ─────── */
 
 struct aivpn_kern_session *aivpn_tag_lookup(const u8 *tag, u64 *counter)
 {
@@ -434,88 +961,25 @@ struct aivpn_kern_session *aivpn_tag_lookup(const u8 *tag, u64 *counter)
 	return NULL;
 }
 
-/* ── WireGuard-style anti-replay: check, then update after auth ─────────── */
-
-/*
- * Split check/update (WireGuard ordering): the RX path CHECKS the window
- * before decrypting but only UPDATES it after the packet authenticates as
- * Data.  Packets that fall back to user-space (Control/Ack/keepalive, auth
- * failures) must not advance the kernel window — user-space maintains its own
- * window over the same counter space, and burning counters here made the two
- * diverge, dropping legitimately-reordered Data packets.
- */
-
-bool aivpn_counter_check(const struct aivpn_kern_session *s, u64 counter)
-{
-	u64 diff;
-
-	/* Caller must hold s->lock (via spin_lock_bh) */
-
-	if (counter > s->recv_counter)
-		return true;
-
-	diff = s->recv_counter - counter;
-	if (diff >= AIVPN_REPLAY_WINDOW)
-		return false; /* too old */
-
-	return !test_bit((u32)diff, s->replay_window); /* false on replay */
-}
-
-void aivpn_counter_update(struct aivpn_kern_session *s, u64 counter)
-{
-	u64 diff;
-
-	/* Caller must hold s->lock (via spin_lock_bh) */
-
-	if (counter > s->recv_counter) {
-		/* Advance window; shift left so bit 0 = recv_counter */
-		diff = counter - s->recv_counter;
-		if (diff < AIVPN_REPLAY_WINDOW) {
-			bitmap_shift_left(s->replay_window, s->replay_window,
-					  (unsigned int)diff, AIVPN_REPLAY_WINDOW);
-		} else {
-			bitmap_zero(s->replay_window, AIVPN_REPLAY_WINDOW);
-		}
-		s->recv_counter = counter;
-		set_bit(0, s->replay_window);
-		return;
-	}
-
-	diff = s->recv_counter - counter;
-	if (diff < AIVPN_REPLAY_WINDOW)
-		set_bit((u32)diff, s->replay_window);
-}
-
 /* ── aivpn_session_remove ────────────────────────────────────────────────── */
 
-int aivpn_session_remove(const u8 *session_id)
+static struct aivpn_kern_session *aivpn_session_detach(const u8 *session_id)
 {
-	struct aivpn_kern_session *s, *candidate;
+	struct aivpn_kern_session *s;
 	int i;
 
 	spin_lock_bh(&aivpn_table_lock);
-	s = NULL;
-	hash_for_each_possible(aivpn_session_htable, candidate, mgmt_node,
-			       sid_hash_key(session_id)) {
-		if (!crypto_memneq(candidate->session_id, session_id, 16)) {
-			s = candidate;
-			break;
-		}
-	}
+	s = aivpn_find_session(session_id);
 	if (!s) {
 		spin_unlock_bh(&aivpn_table_lock);
-		return -ENOENT;
+		return NULL;
 	}
-
 	hash_del(&s->mgmt_node);
 	if (!hlist_unhashed(&s->ip_node))
 		hash_del_rcu(&s->ip_node);
 	atomic_dec(&aivpn_session_count);
-	/* Unlink the tag entries and hand each to call_rcu (safe under the
-	 * spinlock): they are freed after a grace period, exactly as the old
-	 * kfree_sensitive-after-synchronize_rcu did, but without a 2 KiB
-	 * on-stack pointer snapshot and without any allocation that could
-	 * fail the remove path. */
+	/* Теги уходят в call_rcu. Слот QoS не освобождаем: следующая сессия того
+	 * же клиента должна увидеть оставшийся бюджет, а не полное ведро. */
 	for (i = 0; i < s->tag_entry_count; i++) {
 		if (s->tag_entries[i]) {
 			hash_del_rcu(&s->tag_entries[i]->hnode);
@@ -525,6 +989,16 @@ int aivpn_session_remove(const u8 *session_id)
 	}
 	s->tag_entry_count = 0;
 	spin_unlock_bh(&aivpn_table_lock);
+	return s;
+}
+
+static int aivpn_session_remove_locked(const u8 *session_id)
+{
+	struct aivpn_kern_session *s;
+
+	s = aivpn_session_detach(session_id);
+	if (!s)
+		return -ENOENT;
 
 	/* Wait for all in-flight RCU readers before freeing.  The RX fast path
 	 * holds rcu_read_lock() across its whole tag-lookup → decrypt → window
@@ -544,9 +1018,19 @@ int aivpn_session_remove(const u8 *session_id)
 	return 0;
 }
 
+int aivpn_session_remove(const u8 *session_id)
+{
+	int ret;
+
+	mutex_lock(&aivpn_lifecycle_lock);
+	ret = aivpn_session_remove_locked(session_id);
+	mutex_unlock(&aivpn_lifecycle_lock);
+	return ret;
+}
+
 /* ── aivpn_session_flush ─────────────────────────────────────────────────── */
 
-void aivpn_session_flush(void)
+static void aivpn_session_flush_locked(void)
 {
 	struct aivpn_kern_session *s;
 	struct hlist_node *tmp;
@@ -583,6 +1067,13 @@ void aivpn_session_flush(void)
 		}
 		session_free(s);
 	}
+}
+
+void aivpn_session_flush(void)
+{
+	mutex_lock(&aivpn_lifecycle_lock);
+	aivpn_session_flush_locked();
+	mutex_unlock(&aivpn_lifecycle_lock);
 }
 
 /* ── aivpn_session_stat ──────────────────────────────────────────────────── */

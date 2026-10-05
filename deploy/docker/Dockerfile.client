@@ -16,6 +16,7 @@ RUN apt-get update && apt-get install -y \
 # the moment a workspace member is added.
 COPY Cargo.toml Cargo.lock ./
 COPY crates crates/
+COPY vendor vendor/
 COPY assets/masks assets/masks/
 
 # --locked: build the exact dependency set recorded in Cargo.lock, so the test

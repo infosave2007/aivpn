@@ -47,41 +47,73 @@ impl Gateway {
         session: &Arc<parking_lot::Mutex<Session>>,
     ) -> Result<()> {
         let encoded = payload.encode()?;
-        let (mut inner_payload, nonce, counter, keys, client_addr) = {
-            let mut sess = session.lock();
-            let inner_header = InnerHeader {
-                inner_type: InnerType::Control,
-                seq_num: sess.next_seq() as u16,
-            };
-            let inner_payload = inner_header.encode().to_vec();
-            let (nonce, counter) = sess.next_send_nonce();
-            let keys = sess.keys.clone();
-            let client_addr = sess.client_addr;
-            (inner_payload, nonce, counter, keys, client_addr)
+        let (kind, pieces) = if encoded.len() > aivpn_common::fragment::FRAGMENT_DATA_SIZE {
+            (
+                InnerType::Fragment,
+                aivpn_common::fragment::split(InnerType::Control, &encoded)?,
+            )
+        } else {
+            (InnerType::Control, vec![encoded])
         };
-        inner_payload.extend_from_slice(&encoded);
-        let pad_len = 16u16;
-        let mut padded = Vec::with_capacity(2 + inner_payload.len() + pad_len as usize);
-        padded.extend_from_slice(&pad_len.to_le_bytes());
-        padded.extend_from_slice(&inner_payload);
-        {
-            use rand::Rng;
-            let mut rng = rand::thread_rng();
-            for _ in 0..pad_len {
-                padded.push(rng.gen::<u8>());
+        for (index, encoded) in pieces.into_iter().enumerate() {
+            // Даем приемнику разбирать большие ответы без переполнения UDP-буфера.
+            if index > 0 && index % 16 == 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
             }
+            let (mut inner_payload, nonce, counter, keys, client_addr, mask) = {
+                let mut sess = session.lock();
+                let inner_header = InnerHeader {
+                    inner_type: kind,
+                    seq_num: sess.next_seq() as u16,
+                };
+                let inner_payload = inner_header.encode().to_vec();
+                let (nonce, counter) = sess.next_send_nonce();
+                let keys = sess.keys.clone();
+                let client_addr = sess.client_addr;
+                (
+                    inner_payload,
+                    nonce,
+                    counter,
+                    keys,
+                    client_addr,
+                    sess.mask.clone(),
+                )
+            };
+            inner_payload.extend_from_slice(&encoded);
+            let pad_len = 16u16;
+            let mut padded = Vec::with_capacity(2 + inner_payload.len() + pad_len as usize);
+            padded.extend_from_slice(&pad_len.to_le_bytes());
+            padded.extend_from_slice(&inner_payload);
+            {
+                use rand::Rng;
+                let mut rng = rand::thread_rng();
+                for _ in 0..pad_len {
+                    padded.push(rng.gen::<u8>());
+                }
+            }
+            let ciphertext = encrypt_payload(&keys.session_key_s2c, &nonce, &padded)?; // downlink → S2C key
+            let time_window = crypto::compute_time_window(
+                crypto::current_timestamp_ms(),
+                aivpn_common::crypto::DEFAULT_WINDOW_MS,
+            );
+            let tag = crypto::generate_resonance_tag(&keys.tag_secret, counter, time_window);
+            let mut packet = Vec::with_capacity(TAG_SIZE + mdh.len() + ciphertext.len());
+            if let Some(mask) = mask
+                .as_ref()
+                .filter(|mask| mask.uses_embedded_layout(mdh.len()))
+            {
+                packet.extend_from_slice(mdh);
+                let offset = mask.tag_offset as usize;
+                packet[offset..offset + TAG_SIZE].copy_from_slice(&tag);
+                packet.extend_from_slice(&ciphertext);
+                mask.patch_stun_length(&mut packet);
+            } else {
+                packet.extend_from_slice(&tag);
+                packet.extend_from_slice(mdh);
+                packet.extend_from_slice(&ciphertext);
+            }
+            socket.send_to(&packet, client_addr).await?;
         }
-        let ciphertext = encrypt_payload(&keys.session_key_s2c, &nonce, &padded)?; // downlink → S2C key
-        let time_window = crypto::compute_time_window(
-            crypto::current_timestamp_ms(),
-            aivpn_common::crypto::DEFAULT_WINDOW_MS,
-        );
-        let tag = crypto::generate_resonance_tag(&keys.tag_secret, counter, time_window);
-        let mut packet = Vec::with_capacity(TAG_SIZE + mdh.len() + ciphertext.len());
-        packet.extend_from_slice(&tag);
-        packet.extend_from_slice(mdh);
-        packet.extend_from_slice(&ciphertext);
-        socket.send_to(&packet, client_addr).await?;
         Ok(())
     }
 
@@ -202,9 +234,20 @@ impl Gateway {
 
         // Assemble packet: TAG | MDH | ciphertext (no cleartext padding)
         let mut packet = Vec::with_capacity(TAG_SIZE + mdh.len() + ciphertext.len());
-        packet.extend_from_slice(&tag);
-        packet.extend_from_slice(&mdh);
-        packet.extend_from_slice(&ciphertext);
+        if let Some(mask) = current_mask
+            .as_ref()
+            .filter(|mask| mask.uses_embedded_layout(mdh.len()))
+        {
+            packet.extend_from_slice(&mdh);
+            let offset = mask.tag_offset as usize;
+            packet[offset..offset + TAG_SIZE].copy_from_slice(&tag);
+            packet.extend_from_slice(&ciphertext);
+            mask.patch_stun_length(&mut packet);
+        } else {
+            packet.extend_from_slice(&tag);
+            packet.extend_from_slice(&mdh);
+            packet.extend_from_slice(&ciphertext);
+        }
 
         Ok(packet)
     }
@@ -227,5 +270,88 @@ impl Gateway {
             }
         }
         entropy
+    }
+}
+
+#[cfg(test)]
+mod fragment_tests {
+    use super::*;
+    use aivpn_common::client_wire::{decode_packet_with_layout, RecvWindow};
+    use aivpn_common::crypto::SessionKeys;
+    use aivpn_common::fragment::Reassembler;
+
+    #[tokio::test]
+    async fn maximum_management_response_roundtrips_over_udp() {
+        response_roundtrip(false).await;
+        response_roundtrip(true).await;
+    }
+
+    async fn response_roundtrip(embedded: bool) {
+        let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let keys = SessionKeys {
+            session_key: [1; 32],
+            session_key_s2c: [2; 32],
+            tag_secret: [3; 32],
+            prng_seed: [4; 32],
+        };
+        let session = Arc::new(parking_lot::Mutex::new(Session::new(
+            [7; 16],
+            receiver.local_addr().unwrap(),
+            keys.clone(),
+            [9; 32],
+        )));
+        let mask = aivpn_common::mask::preset_masks::webrtc_zoom_v3();
+        let mdh = if embedded {
+            packet_mdh_bytes_for_mask(&mask)
+        } else {
+            vec![0; 20]
+        };
+        let tag_offset = if embedded { mask.tag_offset } else { u16::MAX };
+        let mdh_len = mdh.len();
+        if embedded {
+            session.lock().mask = Some(mask);
+        }
+        let response = ControlPayload::MgmtResponse {
+            req_id: 71,
+            status: 200,
+            body: vec![b'x'; 262144],
+        };
+        let expected = response.encode().unwrap();
+        let upload = tokio::spawn(async move {
+            Gateway::send_control_message_via(&sender, &mdh, &response, &session).await
+        });
+        let receive = async {
+            let mut fragments = Reassembler::default();
+            let mut window = RecvWindow::new();
+            let mut buffer = [0u8; 1500];
+            loop {
+                let length = receiver.recv(&mut buffer).await.unwrap();
+                let decoded = decode_packet_with_layout(
+                    &buffer[..length],
+                    &keys,
+                    &mut window,
+                    mdh_len,
+                    tag_offset,
+                )
+                .unwrap();
+                assert_eq!(decoded.header.inner_type, InnerType::Fragment);
+                if let Some((kind, bytes)) = fragments
+                    .accept(&decoded.payload, std::time::Instant::now())
+                    .unwrap()
+                {
+                    assert_eq!(kind, InnerType::Control);
+                    assert_eq!(
+                        ControlPayload::decode(&bytes).unwrap().encode().unwrap(),
+                        expected
+                    );
+                    break;
+                }
+            }
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(10), receive)
+            .await
+            .unwrap();
+        upload.await.unwrap().unwrap();
     }
 }

@@ -3,6 +3,8 @@
 //! Manages registered VPN clients with pre-shared keys, static IPs,
 //! and per-client statistics. Persisted to JSON file.
 
+use std::fs::File;
+use std::io::{Read, Write};
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 
@@ -82,15 +84,10 @@ pub struct ClientDatabase {
     /// `allocate_vpn_ip` uses the whole subnet, exactly as before Wave B-IP.
     partition: RwLock<Option<PartitionBounds>>,
     last_mtime: Mutex<Option<std::time::SystemTime>>,
-    /// data-plane H4: `save()`'s temp file name is PID-only, so two
-    /// concurrent `save()` calls in the SAME process (e.g. an admin update
-    /// racing a pool-sync merge or a batched stats flush — all take only a
-    /// shared read lock on `data`, so nothing stops them overlapping) write
-    /// the identical temp path and race on rename order. Whichever rename
-    /// lands last wins even if its snapshot was taken first — a silent lost
-    /// update. Serializing the full read → serialize → write → rename
-    /// sequence behind this mutex makes concurrent saves happen in a strict
-    /// order matching call order, so the most recent save always wins.
+    /// Сериализует снимок и запись внутри процесса.
+    /// Порядок захватов: flock, `save_lock`, запись `data`.
+    /// Обратный порядок вместе с `reload_from_disk` (flock, затем запись
+    /// `data`) дает взаимную блокировку.
     save_lock: Mutex<()>,
 }
 
@@ -98,19 +95,13 @@ impl ClientDatabase {
     /// Load or create client database from file
     pub fn load(file_path: &Path, network_config: VpnNetworkConfig) -> Result<Self> {
         network_config.validate()?;
-        let mut data: ClientDbFile = if file_path.exists() {
-            let content = std::fs::read_to_string(file_path)
-                .map_err(|e| Error::Session(format!("Failed to read client DB: {}", e)))?;
-            if content.trim().is_empty() {
-                // A zero-byte DB (e.g. pre-created by a package post-install)
-                // is an empty database, not corruption.
-                ClientDbFile::default()
-            } else {
-                serde_json::from_str(&content)
-                    .map_err(|e| Error::Session(format!("Failed to parse client DB: {}", e)))?
-            }
-        } else {
-            ClientDbFile::default()
+        // Пустой файл (пакетный post-install) это пустая база, не порча.
+        // Симлинк и битый JSON не читаем и не подменяем своей копией.
+        let mut data = match read_db_text(file_path)? {
+            None => ClientDbFile::default(),
+            Some(content) if content.trim().is_empty() => ClientDbFile::default(),
+            Some(content) => serde_json::from_str(&content)
+                .map_err(|e| Error::Session(format!("Failed to parse client DB: {}", e)))?,
         };
 
         let last_mtime = Mutex::new(std::fs::metadata(file_path).and_then(|m| m.modified()).ok());
@@ -132,46 +123,127 @@ impl ClientDatabase {
         })
     }
 
-    /// Save database to file
-    pub fn save(&self) -> Result<()> {
-        // data-plane H4: serialize the whole read → write → rename sequence
-        // so concurrent callers (admin API update, pool-sync merge, batched
-        // stats flush) can never race the same temp file / rename target.
-        let _save_guard = self.save_lock.lock();
-        let data = self.data.read();
-        let content = serde_json::to_string_pretty(&*data)
-            .map_err(|e| Error::Session(format!("Failed to serialize client DB: {}", e)))?;
+    fn lock_path(&self) -> PathBuf {
+        self.file_path.with_extension("lock")
+    }
 
-        // Write atomically via temp file (include PID to avoid races with concurrent processes)
-        let tmp_path = self
-            .file_path
-            .with_extension(format!("{}.tmp", std::process::id()));
-        std::fs::write(&tmp_path, &content)
-            .map_err(|e| Error::Session(format!("Failed to write client DB: {}", e)))?;
-        // server-sec HIGH4: clients.json holds every client's PSK in
-        // plaintext (base64). std::fs::write() creates the file with the
-        // process umask (commonly 0644 under root) — world/group readable.
-        // Harden the temp file BEFORE the rename makes it visible at the
-        // real path, so there is no window where the final file is
-        // reachable with lax permissions.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            if let Err(e) =
-                std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o600))
-            {
-                warn!("Failed to set clients DB permissions to 0600: {}", e);
-            }
-        }
-        std::fs::rename(&tmp_path, &self.file_path)
-            .map_err(|e| Error::Session(format!("Failed to rename client DB: {}", e)))?;
-
-        // Refresh cached mtime so reload_if_changed ignores our own write
+    fn remember_mtime(&self) {
         if let Ok(mtime) = std::fs::metadata(&self.file_path).and_then(|m| m.modified()) {
             *self.last_mtime.lock() = Some(mtime);
         }
+    }
 
-        Ok(())
+    /// Снимок с диска. `Ok(None)`, если файла еще нет.
+    /// Ошибка разбора и симлинк не превращаются в пустую базу.
+    fn read_disk_snapshot(&self) -> Result<Option<ClientDbFile>> {
+        match read_db_text(&self.file_path)? {
+            None => Ok(None),
+            Some(content) if content.trim().is_empty() => Ok(Some(ClientDbFile::default())),
+            Some(content) => serde_json::from_str(&content)
+                .map(Some)
+                .map_err(|e| Error::Session(format!("Failed to parse client DB: {}", e))),
+        }
+    }
+
+    /// Влить диск в уже захваченный `data`.
+    ///
+    /// Конфиг клиента с диска побеждает, если его `updated_at` новее, либо
+    /// метки времени равны и каноническое содержимое различается (внешняя
+    /// правка вроде смены PSK без сдвига метки). Более новый снимок в памяти
+    /// сохраняется. Счетчики статистики берутся как максимум, чтобы запись
+    /// CLI не обнулила счетчики демона. `next_host_offset` тоже максимум,
+    /// иначе устаревший курсор выдаст уже занятый адрес.
+    /// Записи, которые есть только в памяти, остаются: это еще не сохраненное
+    /// локальное добавление. Запись только с диска добавляется. Если на диске
+    /// более новая надгробная запись того же id, она заменяет живую копию.
+    fn absorb_disk_locked(&self, data: &mut ClientDbFile) -> Result<bool> {
+        let before = client_snapshot_sig(data);
+        if let Some(disk) = self.read_disk_snapshot()? {
+            for disk_client in &disk.clients {
+                if let Some(mem) = data.clients.iter_mut().find(|c| c.id == disk_client.id) {
+                    absorb_one_client(mem, disk_client);
+                } else {
+                    data.clients.push(disk_client.clone());
+                }
+            }
+            data.next_host_offset = data.next_host_offset.max(disk.next_host_offset);
+        }
+        // load() уже снимает просроченные надгробия из памяти, но не пишет файл.
+        // Без повторного снятия следующее слияние вернуло бы их с диска и
+        // снова сохранило.
+        reap_expired_tombstones(&mut data.clients);
+        Ok(client_snapshot_sig(data) != before)
+    }
+
+    /// Блокирующий flock, затем повторное чтение и слияние, затем мутация и
+    /// запись. Одного flock мало: процесс держит устаревший снимок в памяти
+    /// и без повторного чтения затирает чужое добавление своей копией.
+    /// Если запись на диск не удалась, мутация откатывается. Слияние с диском
+    /// и более новые счетчики трафика в памяти остаются.
+    /// Порядок захватов: flock, `save_lock`, запись `data`. Замыкание не
+    /// должно звать `save`, `reload_if_changed` или `with_mutation` повторно:
+    /// повторный захват flock или записи `data` в том же потоке встанет навсегда.
+    pub(crate) fn with_mutation<R>(
+        &self,
+        f: impl FnOnce(&mut ClientDbFile) -> Result<R>,
+    ) -> Result<R> {
+        let _file_lock = DbFileLock::acquire(&self.lock_path())?;
+        let _save_guard = self.save_lock.lock();
+        let (rollback, result) = {
+            let mut data = self.data.write();
+            self.absorb_disk_locked(&mut data)?;
+            let rollback = data.clone();
+            match f(&mut data) {
+                Ok(result) => (rollback, result),
+                Err(e) => {
+                    restore_preserving_traffic(&mut data, rollback);
+                    return Err(e);
+                }
+            }
+        };
+        if let Err(e) = self.write_snapshot_locked() {
+            let mut data = self.data.write();
+            restore_preserving_traffic(&mut data, rollback);
+            return Err(e);
+        }
+        self.remember_mtime();
+        Ok(result)
+    }
+
+    /// Save database to file.
+    ///
+    /// Перечитывает диск под flock и сливает его с памятью до записи, чтобы
+    /// устаревший снимок не затер параллельное изменение другого процесса.
+    pub fn save(&self) -> Result<()> {
+        self.with_mutation(|_| Ok(()))
+    }
+
+    /// Сериализация и атомарная подмена файла. Вызывающий уже держит
+    /// `save_lock` и не держит запись `data`.
+    /// Битый JSON на диске не затирается. Одинаковое содержимое не переписывается,
+    /// но режим файла подтягивается к 0600.
+    fn write_snapshot_locked(&self) -> Result<()> {
+        let content = {
+            let data = self.data.read();
+            serde_json::to_string_pretty(&*data)
+                .map_err(|e| Error::Session(format!("Failed to serialize client DB: {}", e)))?
+        };
+        match read_db_text(&self.file_path)? {
+            Some(existing) if existing.trim().is_empty() => {}
+            Some(existing) => {
+                if serde_json::from_str::<ClientDbFile>(&existing).is_err() {
+                    return Err(Error::Session(
+                        "Refusing to overwrite malformed client DB".into(),
+                    ));
+                }
+                if existing == content {
+                    tighten_db_mode(&self.file_path);
+                    return Ok(());
+                }
+            }
+            None => {}
+        }
+        write_bytes_atomic(&self.file_path, content.as_bytes())
     }
 
     /// Validate that `content` deserializes as a well-formed clients-DB JSON
@@ -210,17 +282,22 @@ impl ClientDatabase {
         name: &str,
         device_pubkey: Option<[u8; 32]>,
     ) -> Result<ClientConfig> {
-        let mut data = self.data.write();
+        self.with_mutation(|data| self.insert_client(data, name, device_pubkey, false))
+    }
 
-        // Check name uniqueness (tombstones don't hold their name)
+    fn insert_client(
+        &self,
+        data: &mut ClientDbFile,
+        name: &str,
+        device_pubkey: Option<[u8; 32]>,
+        one_time: bool,
+    ) -> Result<ClientConfig> {
         if data.clients.iter().any(|c| c.name == name && !c.deleted) {
             return Err(Error::Session(format!("Client '{}' already exists", name)));
         }
 
-        // Allocate VPN IP
-        let vpn_ip = self.allocate_vpn_ip(&mut data)?;
+        let vpn_ip = self.allocate_vpn_ip(data)?;
 
-        // Generate random ID and PSK
         let mut id_bytes = [0u8; 8];
         let mut psk = [0u8; 32];
         chacha20poly1305::aead::OsRng.fill_bytes(&mut id_bytes);
@@ -241,7 +318,7 @@ impl ClientDatabase {
             stats: ClientStats::default(),
             qos: None,
             device_pubkey,
-            one_time: false,
+            one_time,
             expires_at: None,
             updated_at: Some(Utc::now()),
             deleted: false,
@@ -250,24 +327,13 @@ impl ClientDatabase {
         };
 
         data.clients.push(client.clone());
-        drop(data);
-
-        self.save()?;
         Ok(client)
     }
 
-    /// Add a new one-time enrollment client — the first device to connect will be auto-bound.
+    /// Add a new one-time enrollment client. The first device to connect will be auto-bound.
+    /// Флаг `one_time` ставится в той же транзакции, что и создание записи.
     pub fn add_client_one_time(&self, name: &str) -> Result<ClientConfig> {
-        let mut client = self.add_client(name)?;
-        {
-            let mut data = self.data.write();
-            if let Some(c) = data.clients.iter_mut().find(|c| c.id == client.id) {
-                c.one_time = true;
-                client.one_time = true;
-            }
-        }
-        self.save()?;
-        Ok(client)
+        self.with_mutation(|data| self.insert_client(data, name, None, true))
     }
 
     /// Add a new one-time enrollment client already bound to `device_pubkey`
@@ -280,16 +346,7 @@ impl ClientDatabase {
         name: &str,
         device_pubkey: [u8; 32],
     ) -> Result<ClientConfig> {
-        let mut client = self.add_client_bound(name, device_pubkey)?;
-        {
-            let mut data = self.data.write();
-            if let Some(c) = data.clients.iter_mut().find(|c| c.id == client.id) {
-                c.one_time = true;
-                client.one_time = true;
-            }
-        }
-        self.save()?;
-        Ok(client)
+        self.with_mutation(|data| self.insert_client(data, name, Some(device_pubkey), true))
     }
 
     /// Find client by human-readable name.
@@ -307,57 +364,56 @@ impl ClientDatabase {
     /// Returns `Ok(false)` if the key was already bound and matches.
     /// Returns `Err` if there is an existing binding that does not match the presented key.
     pub fn enroll_device(&self, client_id: &str, static_pub: &[u8; 32]) -> Result<bool> {
-        let mut data = self.data.write();
-        let client = data
-            .clients
-            .iter_mut()
-            .find(|c| c.id == client_id)
-            .ok_or_else(|| Error::Session(format!("Client '{}' not found", client_id)))?;
+        let static_pub = *static_pub;
+        let client_id = client_id.to_string();
+        self.with_mutation(|data| {
+            let client = data
+                .clients
+                .iter_mut()
+                .find(|c| c.id == client_id)
+                .ok_or_else(|| Error::Session(format!("Client '{}' not found", client_id)))?;
 
-        let enforce = client.one_time;
-        match client.device_pubkey {
-            None => {
-                // First connect — always record. one_time is preserved so subsequent
-                // connections from a different device are still rejected for one-time creds.
-                client.device_pubkey = Some(*static_pub);
-                drop(data);
-                self.save()?;
-                Ok(true)
-            }
-            Some(ref bound) => {
-                use subtle::ConstantTimeEq;
-                if bound.ct_eq(static_pub).into() {
-                    Ok(false)
-                } else if enforce {
-                    // one_time = true: strict per-device enforcement
-                    Err(Error::Session(format!(
-                        "Device binding mismatch for client '{}'",
-                        client_id
-                    )))
-                } else {
-                    // one_time = false (regular credential): update binding on re-enroll
-                    // (e.g. reinstall, device replacement) without rejecting
-                    client.device_pubkey = Some(*static_pub);
-                    drop(data);
-                    self.save()?;
+            let enforce = client.one_time;
+            match client.device_pubkey {
+                None => {
+                    // First connect. one_time is preserved so a later device is still rejected.
+                    client.device_pubkey = Some(static_pub);
+                    client.updated_at = Some(Utc::now());
                     Ok(true)
                 }
+                Some(ref bound) => {
+                    use subtle::ConstantTimeEq;
+                    if bound.ct_eq(&static_pub).into() {
+                        Ok(false)
+                    } else if enforce {
+                        Err(Error::Session(format!(
+                            "Device binding mismatch for client '{}'",
+                            client_id
+                        )))
+                    } else {
+                        client.device_pubkey = Some(static_pub);
+                        client.updated_at = Some(Utc::now());
+                        Ok(true)
+                    }
+                }
             }
-        }
+        })
     }
 
     /// Reset device binding — clears the bound key and re-enables one-time enrollment.
     pub fn reset_device_binding(&self, client_id: &str) -> Result<()> {
-        let mut data = self.data.write();
-        let client = data
-            .clients
-            .iter_mut()
-            .find(|c| c.id == client_id)
-            .ok_or_else(|| Error::Session(format!("Client '{}' not found", client_id)))?;
-        client.device_pubkey = None;
-        client.one_time = true;
-        drop(data);
-        self.save()
+        let client_id = client_id.to_string();
+        self.with_mutation(|data| {
+            let client = data
+                .clients
+                .iter_mut()
+                .find(|c| c.id == client_id)
+                .ok_or_else(|| Error::Session(format!("Client '{}' not found", client_id)))?;
+            client.device_pubkey = None;
+            client.one_time = true;
+            client.updated_at = Some(Utc::now());
+            Ok(())
+        })
     }
 
     pub fn network_config(&self) -> VpnNetworkConfig {
@@ -379,19 +435,19 @@ impl ClientDatabase {
     /// is kept in the tombstone so peers can match the record (`merge_from_json`
     /// requires an id+PSK match) and apply the deletion themselves.
     pub fn remove_client(&self, client_id: &str) -> Result<()> {
-        let mut data = self.data.write();
-        let client = data
-            .clients
-            .iter_mut()
-            .find(|c| c.id == client_id && !c.deleted)
-            .ok_or_else(|| Error::Session(format!("Client '{}' not found", client_id)))?;
-        client.deleted = true;
-        client.enabled = false;
-        client.device_pubkey = None;
-        client.updated_at = Some(Utc::now());
-        drop(data);
-        self.save()?;
-        Ok(())
+        let client_id = client_id.to_string();
+        self.with_mutation(|data| {
+            let client = data
+                .clients
+                .iter_mut()
+                .find(|c| c.id == client_id && !c.deleted)
+                .ok_or_else(|| Error::Session(format!("Client '{}' not found", client_id)))?;
+            client.deleted = true;
+            client.enabled = false;
+            client.device_pubkey = None;
+            client.updated_at = Some(Utc::now());
+            Ok(())
+        })
     }
 
     /// Get all clients (tombstoned/deleted records excluded)
@@ -469,7 +525,9 @@ impl ClientDatabase {
         }
     }
 
-    /// Persist stats periodically (called from a background task)
+    /// Persist stats periodically (called from a background task).
+    /// Идет через ту же транзакцию, что и остальные записи: перед сбросом
+    /// счетчики сливаются с диском по максимуму.
     pub fn flush_stats(&self) {
         if let Err(e) = self.save() {
             warn!("Failed to flush client stats: {}", e);
@@ -514,65 +572,15 @@ impl ClientDatabase {
     /// Internal: reload from disk, merging with in-memory stats.
     /// Returns Ok(true) if data changed, Ok(false) if unchanged.
     fn reload_from_disk(&self) -> Result<bool> {
-        let content = std::fs::read_to_string(&self.file_path)
-            .map_err(|e| Error::Session(format!("Failed to read client DB for reload: {}", e)))?;
-        let new_data: ClientDbFile = serde_json::from_str(&content)
-            .map_err(|e| Error::Session(format!("Failed to parse client DB for reload: {}", e)))?;
-
+        // Тот же порядок, что у with_mutation: flock, затем запись data.
+        // save_lock здесь не берется, чтобы не встать в цикл с мутацией.
+        let _file_lock = DbFileLock::acquire(&self.lock_path())?;
         let mut data = self.data.write();
-
-        // Check if anything actually changed in the client configuration.
-        // The signature must cover EVERY synced field (via the same
-        // canonical-field digest pool sync uses — see
-        // `merge::client_record_digest`), not just (id, name, psk, vpn_ip,
-        // enabled): otherwise an external edit that touches only
-        // device_pubkey / one_time / qos / role / expires_at / exit_node
-        // (e.g. a sibling `aivpn-server --reset-device` / `--set-client-qos`
-        // process) is never applied, AND `reload_if_changed` still consumes
-        // the mtime, so the change would never be picked up at all.
-        // vpn_ip rides alongside the digest because it is deliberately not
-        // part of the pool-sync canonical field set (re-homed on conflict).
-        let old_sig: std::collections::HashMap<String, ([u8; 32], Ipv4Addr)> = data
-            .clients
-            .iter()
-            .map(|c| (c.id.clone(), (merge::client_record_digest(c), c.vpn_ip)))
-            .collect();
-        let new_sig: std::collections::HashMap<String, ([u8; 32], Ipv4Addr)> = new_data
-            .clients
-            .iter()
-            .map(|c| (c.id.clone(), (merge::client_record_digest(c), c.vpn_ip)))
-            .collect();
-        let changed = old_sig != new_sig;
-
-        if !changed {
-            return Ok(false);
+        let changed = self.absorb_disk_locked(&mut data)?;
+        if changed {
+            Self::warn_duplicate_vpn_ips(&data.clients);
         }
-
-        // Build a map of existing stats by client ID
-        let mut stats_map: std::collections::HashMap<String, ClientStats> =
-            std::collections::HashMap::new();
-        for client in &data.clients {
-            stats_map.insert(client.id.clone(), client.stats.clone());
-        }
-
-        // Replace clients list, preserving stats for existing clients
-        let new_clients: Vec<ClientConfig> = new_data
-            .clients
-            .into_iter()
-            .map(|mut c| {
-                if let Some(saved_stats) = stats_map.get(&c.id) {
-                    c.stats = saved_stats.clone();
-                }
-                c
-            })
-            .collect();
-
-        Self::warn_duplicate_vpn_ips(&new_clients);
-
-        data.clients = new_clients;
-        data.next_host_offset = new_data.next_host_offset;
-
-        Ok(true)
+        Ok(changed)
     }
 
     /// Export the full client list as JSON (for pool sync or backup).
@@ -598,81 +606,473 @@ impl ClientDatabase {
         if let Some(Some(ref addr)) = params.exit_node {
             validate_exit_node_addr(addr)?;
         }
-        let mut data = self.data.write();
-        if let Some(ref new_name) = params.name {
-            if data
+        let client_id = client_id.to_string();
+        self.with_mutation(|data| {
+            if let Some(ref new_name) = params.name {
+                if data
+                    .clients
+                    .iter()
+                    .any(|c| c.name == *new_name && c.id != client_id && !c.deleted)
+                {
+                    return Err(Error::Session(format!(
+                        "Client name '{}' already taken",
+                        new_name
+                    )));
+                }
+            }
+            let client = data
                 .clients
-                .iter()
-                .any(|c| c.name == *new_name && c.id != client_id && !c.deleted)
-            {
-                return Err(Error::Session(format!(
-                    "Client name '{}' already taken",
-                    new_name
-                )));
+                .iter_mut()
+                .find(|c| c.id == client_id && !c.deleted)
+                .ok_or_else(|| Error::Session(format!("Client '{}' not found", client_id)))?;
+            // Elevating to Viewer/Admin requires the client to already be
+            // device-bound: role is only ever authenticated via the connecting
+            // device's static key during the handshake, so granting it to a
+            // PSK-only (not-yet-bound) client would be a privilege that can
+            // never actually be proven to belong to whoever shows up with the
+            // PSK. Checked against the CURRENT `device_pubkey`. This call never
+            // sets one, so there is no ordering trick to bypass it.
+            if let Some(role) = params.role {
+                if role != ClientRole::User && client.device_pubkey.is_none() {
+                    return Err(Error::Session("role requires device binding".into()));
+                }
             }
-        }
-        let client = data
-            .clients
-            .iter_mut()
-            .find(|c| c.id == client_id && !c.deleted)
-            .ok_or_else(|| Error::Session(format!("Client '{}' not found", client_id)))?;
-        // Elevating to Viewer/Admin requires the client to already be
-        // device-bound: role is only ever authenticated via the connecting
-        // device's static key during the handshake, so granting it to a
-        // PSK-only (not-yet-bound) client would be a privilege that can
-        // never actually be proven to belong to whoever shows up with the
-        // PSK. Checked against the CURRENT `device_pubkey` — this call never
-        // sets one, so there is no ordering trick to bypass it.
-        if let Some(role) = params.role {
-            if role != ClientRole::User && client.device_pubkey.is_none() {
-                return Err(Error::Session("role requires device binding".into()));
+            if let Some(name) = params.name {
+                client.name = name;
             }
-        }
-        if let Some(name) = params.name {
-            client.name = name;
-        }
-        if let Some(enabled) = params.enabled {
-            client.enabled = enabled;
-        }
-        if let Some(one_time) = params.one_time {
-            client.one_time = one_time;
-        }
-        if let Some(qos) = params.qos {
-            client.qos = qos;
-        }
-        if let Some(expires_at) = params.expires_at {
-            client.expires_at = expires_at;
-        }
-        if let Some(role) = params.role {
-            client.role = role;
-        }
-        if let Some(exit_node) = params.exit_node {
-            client.exit_node = exit_node;
-        }
-        client.updated_at = Some(Utc::now());
-        let updated = client.clone();
-        drop(data);
-        self.save()?;
-        Ok(updated)
+            if let Some(enabled) = params.enabled {
+                client.enabled = enabled;
+            }
+            if let Some(one_time) = params.one_time {
+                client.one_time = one_time;
+            }
+            if let Some(qos) = params.qos {
+                client.qos = qos;
+            }
+            if let Some(expires_at) = params.expires_at {
+                client.expires_at = expires_at;
+            }
+            if let Some(role) = params.role {
+                client.role = role;
+            }
+            if let Some(exit_node) = params.exit_node {
+                client.exit_node = exit_node;
+            }
+            client.updated_at = Some(Utc::now());
+            Ok(client.clone())
+        })
     }
 
     /// Update QoS settings for a specific client.
     pub fn set_client_qos(&self, client_id: &str, qos: crate::qos::ClientQos) -> Result<()> {
-        let mut data = self.data.write();
-        match data
-            .clients
-            .iter_mut()
-            .find(|c| c.id == client_id && !c.deleted)
-        {
-            Some(client) => {
-                client.qos = Some(qos);
-                client.updated_at = Some(Utc::now());
-                drop(data);
-                self.save()
+        let client_id = client_id.to_string();
+        self.with_mutation(|data| {
+            match data
+                .clients
+                .iter_mut()
+                .find(|c| c.id == client_id && !c.deleted)
+            {
+                Some(client) => {
+                    client.qos = Some(qos);
+                    client.updated_at = Some(Utc::now());
+                    Ok(())
+                }
+                None => Err(Error::Session(format!("Client '{}' not found", client_id))),
             }
-            None => Err(Error::Session(format!("Client '{}' not found", client_id))),
+        })
+    }
+}
+
+/// Эксклюзивная блокировка соседнего файла `<db>.lock` на время транзакции.
+/// Держится только на время вызова, а не на все время жизни процесса.
+struct DbFileLock {
+    file: File,
+}
+
+impl DbFileLock {
+    fn acquire(path: &Path) -> Result<Self> {
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent).map_err(|e| {
+                    Error::Session(format!("Failed to create client DB lock dir: {}", e))
+                })?;
+            }
+        }
+        // O_NOFOLLOW и режим 0600: симлинк на месте lock-файла не открываем
+        // и не блокируем чужой inode.
+        let file = open_lock_nofollow(path).map_err(|e| {
+            if is_symlink_error(&e) {
+                Error::Session(format!(
+                    "Refusing to follow symlink for client DB lock: {e}"
+                ))
+            } else {
+                Error::Session(format!("Failed to open client DB lock: {e}"))
+            }
+        })?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+            if rc != 0 {
+                let err = std::io::Error::last_os_error();
+                return Err(Error::Session(format!("Failed to lock client DB: {}", err)));
+            }
+        }
+        Ok(Self { file })
+    }
+}
+
+impl Drop for DbFileLock {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            unsafe {
+                libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
+            }
         }
     }
+}
+
+fn is_symlink_error(err: &std::io::Error) -> bool {
+    #[cfg(unix)]
+    {
+        err.raw_os_error() == Some(libc::ELOOP)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = err;
+        false
+    }
+}
+
+/// Чтение обычного файла без перехода по последнему компоненту пути.
+/// `Ok(None)` значит, что файла нет. Симлинк это ошибка, а не содержимое цели.
+fn read_db_text(path: &Path) -> Result<Option<String>> {
+    match open_nofollow_read(path) {
+        Ok(mut file) => {
+            let mut buf = String::new();
+            file.read_to_string(&mut buf)
+                .map_err(|e| Error::Session(format!("Failed to read client DB: {e}")))?;
+            Ok(Some(buf))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) if is_symlink_error(&e) => Err(Error::Session(
+            "Refusing to follow symlink for client DB".into(),
+        )),
+        Err(e) => Err(Error::Session(format!("Failed to read client DB: {e}"))),
+    }
+}
+
+#[cfg(unix)]
+fn open_nofollow_read(path: &Path) -> std::io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+}
+
+#[cfg(not(unix))]
+fn open_nofollow_read(path: &Path) -> std::io::Result<File> {
+    File::open(path)
+}
+
+fn tighten_db_mode(path: &Path) {
+    let Ok(file) = open_nofollow_read(path) else {
+        return;
+    };
+    if let Err(e) = force_mode_0600(&file) {
+        warn!("Failed to set client DB permissions to 0600: {}", e);
+    }
+}
+
+/// Атомарная запись: новый файл с режимом 0600, случайное имя, fsync,
+/// rename, fsync каталога. При ошибке до rename временный файл удаляется.
+/// Ошибка fsync каталога после успешного rename не откатывает запись:
+/// новый файл уже виден другим процессам, откат памяти разошелся бы с диском.
+fn write_bytes_atomic(dest: &Path, content: &[u8]) -> Result<()> {
+    let tmp_path = temporary_sibling(dest);
+    let file = open_new_exclusive(&tmp_path)
+        .map_err(|e| Error::Session(format!("Failed to create client DB temporary file: {e}")))?;
+    let mut guard = TempGuard::arm(tmp_path);
+    if let Err(e) = force_mode_0600(&file) {
+        return Err(guard.fail(e));
+    }
+    if let Err(e) = write_and_sync(file, content) {
+        return Err(guard.fail(e));
+    }
+    if let Err(e) = std::fs::rename(&guard.path, dest) {
+        return Err(guard.fail(e));
+    }
+    guard.disarm();
+    if let Err(e) = fsync_parent(dest) {
+        warn!("Client DB directory fsync failed after rename: {}", e);
+    }
+    Ok(())
+}
+
+fn temporary_sibling(dest: &Path) -> PathBuf {
+    let mut random = [0u8; 16];
+    chacha20poly1305::aead::OsRng.fill_bytes(&mut random);
+    let mut suffix = String::with_capacity(random.len() * 2);
+    for byte in random {
+        suffix.push_str(&format!("{byte:02x}"));
+    }
+    let file_name = dest
+        .file_name()
+        .unwrap_or_else(|| std::ffi::OsStr::new("clients.json"));
+    let mut name = std::ffi::OsString::from(".");
+    name.push(file_name);
+    name.push(".");
+    name.push(suffix);
+    name.push(".tmp");
+    parent_dir(dest).join(name)
+}
+
+fn parent_dir(path: &Path) -> &Path {
+    match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    }
+}
+
+fn open_new_exclusive(path: &Path) -> std::io::Result<File> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(path)
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+    }
+}
+
+fn force_mode_0600(file: &File) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        // Безопасно: дескриптор принадлежит открытому File и жив на время вызова.
+        let rc = unsafe { libc::fchmod(file.as_raw_fd(), 0o600) };
+        if rc != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = file;
+    }
+    Ok(())
+}
+
+fn write_and_sync(mut file: File, content: &[u8]) -> std::io::Result<()> {
+    file.write_all(content)?;
+    file.sync_all()?;
+    Ok(())
+}
+
+fn fsync_parent(dest: &Path) -> std::io::Result<()> {
+    let dir = File::open(parent_dir(dest))?;
+    dir.sync_all()
+}
+
+struct TempGuard {
+    path: PathBuf,
+    armed: bool,
+}
+
+impl TempGuard {
+    fn arm(path: PathBuf) -> Self {
+        Self { path, armed: true }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+
+    fn fail(&mut self, err: impl std::fmt::Display) -> Error {
+        let cleanup = if self.armed {
+            let result = remove_temp(&self.path);
+            if result.is_ok() {
+                self.armed = false;
+            }
+            result.err()
+        } else {
+            None
+        };
+        match cleanup {
+            None => Error::Session(format!("Failed to write client DB: {err}")),
+            Some(cleanup) => Error::Session(format!(
+                "Failed to write client DB: {err}; failed to remove temporary file: {cleanup}"
+            )),
+        }
+    }
+}
+
+impl Drop for TempGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if let Err(e) = remove_temp(&self.path) {
+            warn!(
+                "Failed to remove temporary client DB file {}: {}",
+                self.path.display(),
+                e
+            );
+        }
+    }
+}
+
+fn remove_temp(path: &Path) -> std::io::Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+#[cfg(unix)]
+fn open_lock_nofollow(path: &Path) -> std::io::Result<File> {
+    use std::os::unix::ffi::OsStrExt;
+    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "client DB lock path contains NUL",
+        )
+    })?;
+    let base = libc::O_RDWR | libc::O_CLOEXEC | libc::O_NOFOLLOW;
+    let mut last_err = std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "client DB lock appeared and vanished",
+    );
+    for _ in 0..8 {
+        // Безопасно: путь нулевой терминатор, дескриптор либо закрывается, либо уходит в File.
+        let fd = unsafe { libc::open(c_path.as_ptr(), base) };
+        if fd >= 0 {
+            return owned_lock_file(fd);
+        }
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() != Some(libc::ENOENT) {
+            return Err(err);
+        }
+        let fd = unsafe { libc::open(c_path.as_ptr(), base | libc::O_CREAT | libc::O_EXCL, 0o600) };
+        if fd >= 0 {
+            return owned_lock_file(fd);
+        }
+        last_err = std::io::Error::last_os_error();
+        if last_err.raw_os_error() != Some(libc::EEXIST) {
+            return Err(last_err);
+        }
+    }
+    Err(last_err)
+}
+
+#[cfg(unix)]
+fn owned_lock_file(fd: i32) -> std::io::Result<File> {
+    use std::os::unix::io::FromRawFd;
+    // Безопасно: fd только что открыт и еще не принадлежит File.
+    let rc = unsafe { libc::fchmod(fd, 0o600) };
+    if rc != 0 {
+        let err = std::io::Error::last_os_error();
+        unsafe { libc::close(fd) };
+        return Err(err);
+    }
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+#[cfg(not(unix))]
+fn open_lock_nofollow(path: &Path) -> std::io::Result<File> {
+    std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(path)
+}
+
+fn client_snapshot_sig(data: &ClientDbFile) -> Vec<([u8; 32], Ipv4Addr, u32)> {
+    let mut sig: Vec<_> = data
+        .clients
+        .iter()
+        .map(|c| {
+            (
+                merge::client_record_digest(c),
+                c.vpn_ip,
+                data.next_host_offset,
+            )
+        })
+        .collect();
+    sig.sort_by_key(|a| a.0);
+    sig
+}
+
+fn absorb_one_client(mem: &mut ClientConfig, disk: &ClientConfig) {
+    let disk_newer = match (disk.updated_at, mem.updated_at) {
+        (Some(d), Some(m)) => d > m,
+        (Some(_), None) => true,
+        _ => false,
+    };
+    let mem_newer = match (disk.updated_at, mem.updated_at) {
+        (Some(d), Some(m)) => m > d,
+        (None, Some(_)) => true,
+        _ => false,
+    };
+    let digest_differs = merge::client_record_digest(disk) != merge::client_record_digest(mem)
+        || disk.vpn_ip != mem.vpn_ip;
+    let take_disk = if disk_newer {
+        true
+    } else if mem_newer {
+        false
+    } else if disk.deleted != mem.deleted {
+        // Равные метки: надгробная запись липкая и не дает воскресить клиента.
+        disk.deleted
+    } else {
+        digest_differs
+    };
+    let stats = max_stats(&mem.stats, &disk.stats);
+    if take_disk {
+        *mem = disk.clone();
+    }
+    mem.stats = stats;
+}
+
+fn max_stats(a: &ClientStats, b: &ClientStats) -> ClientStats {
+    ClientStats {
+        bytes_in: a.bytes_in.max(b.bytes_in),
+        bytes_out: a.bytes_out.max(b.bytes_out),
+        total_connections: a.total_connections.max(b.total_connections),
+        last_connected: max_opt_time(a.last_connected, b.last_connected),
+        last_handshake: max_opt_time(a.last_handshake, b.last_handshake),
+    }
+}
+
+fn max_opt_time(a: Option<DateTime<Utc>>, b: Option<DateTime<Utc>>) -> Option<DateTime<Utc>> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    }
+}
+
+/// Откат мутации к снимку после слияния с диском.
+/// Счетчики, выросшие в памяти пока шла запись, не уменьшаются и не складываются.
+fn restore_preserving_traffic(current: &mut ClientDbFile, mut snapshot: ClientDbFile) {
+    for client in &mut snapshot.clients {
+        if let Some(live) = current.clients.iter().find(|c| c.id == client.id) {
+            client.stats = max_stats(&client.stats, &live.stats);
+        }
+    }
+    *current = snapshot;
 }
 
 /// Shared test fixtures used by `client_db` and all of its submodules
@@ -962,7 +1362,7 @@ mod tests {
         assert!(err.to_string().contains("mismatch"));
 
         // The actual bound device re-enrolling is fine (already matches).
-        assert_eq!(db.enroll_device(&client.id, &[0x77u8; 32]).unwrap(), false);
+        assert!(!db.enroll_device(&client.id, &[0x77u8; 32]).unwrap());
     }
 
     // --- Wave B2a: per-client exit_node config layer -------------------
@@ -1056,5 +1456,495 @@ mod tests {
             db.find_by_id(&client.id).unwrap().exit_node,
             Some("exit.example.com:443".to_string())
         );
+    }
+
+    /// Два независимых ClientDatabase на одном файле. Устаревший экземпляр
+    /// не должен затирать клиента, которого добавил другой, и не должен
+    /// обнулять уже сброшенные счетчики трафика.
+    #[test]
+    fn stale_instance_merge_keeps_other_add_and_stats() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("clients.json");
+        let db1 = ClientDatabase::load(&db_path, test_network_config()).unwrap();
+        let alice = db1.add_client("alice").unwrap();
+        db1.record_traffic(&alice.id, 1000, 50);
+        db1.flush_stats();
+
+        let db2 = ClientDatabase::load(&db_path, test_network_config()).unwrap();
+        // db2 загружен до того, как db1... нет, db2 загружен после flush и
+        // видит alice. Сделаем его устаревшим относительно следующего add:
+        // сначала зафиксируем снимок, затем db1 добавит bob, потом db2
+        // добавит carol из старой памяти.
+        let bob = db1.add_client("bob").unwrap();
+        assert!(
+            db2.find_by_name("bob").is_none(),
+            "setup: second instance must still be stale"
+        );
+        db1.record_traffic(&alice.id, 500, 0);
+        db1.flush_stats();
+
+        let carol = db2.add_client("carol").unwrap();
+        assert_ne!(carol.vpn_ip, alice.vpn_ip);
+        assert_ne!(carol.vpn_ip, bob.vpn_ip);
+
+        let reloaded = ClientDatabase::load(&db_path, test_network_config()).unwrap();
+        let names: std::collections::HashSet<_> = reloaded
+            .list_clients()
+            .into_iter()
+            .map(|c| c.name)
+            .collect();
+        assert_eq!(
+            names,
+            std::collections::HashSet::from([
+                "alice".to_string(),
+                "bob".to_string(),
+                "carol".to_string(),
+            ])
+        );
+        let alice_disk = reloaded.find_by_id(&alice.id).unwrap();
+        assert!(
+            alice_disk.stats.bytes_in >= 1500,
+            "stale save must not zero daemon traffic counters, got {}",
+            alice_disk.stats.bytes_in
+        );
+        assert!(alice_disk.stats.bytes_out >= 50);
+    }
+
+    /// load() снимает просроченное надгробие из памяти. Следующая запись не
+    /// должна вернуть его с диска.
+    #[test]
+    fn later_save_does_not_resurrect_tombstone_reaped_at_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("clients.json");
+        let db = ClientDatabase::load(&db_path, test_network_config()).unwrap();
+        let old = db.add_client("old").unwrap();
+        let fresh = db.add_client("fresh").unwrap();
+        db.remove_client(&old.id).unwrap();
+        db.remove_client(&fresh.id).unwrap();
+        drop(db);
+
+        let mut on_disk: ClientDbFile =
+            serde_json::from_str(&std::fs::read_to_string(&db_path).unwrap()).unwrap();
+        on_disk
+            .clients
+            .iter_mut()
+            .find(|c| c.id == old.id)
+            .unwrap()
+            .updated_at = Some(Utc::now() - chrono::Duration::days(31));
+        std::fs::write(&db_path, serde_json::to_string_pretty(&on_disk).unwrap()).unwrap();
+
+        let db = ClientDatabase::load(&db_path, test_network_config()).unwrap();
+        assert!(
+            !db.list_clients_including_deleted()
+                .iter()
+                .any(|c| c.id == old.id),
+            "load must reap an expired tombstone"
+        );
+        db.add_client("carol").unwrap();
+
+        let disk = ClientDatabase::load(&db_path, test_network_config()).unwrap();
+        let all = disk.list_clients_including_deleted();
+        assert!(!all.iter().any(|c| c.id == old.id));
+        assert!(all.iter().any(|c| c.id == fresh.id && c.deleted));
+        assert!(disk.find_by_name("carol").is_some());
+    }
+
+    /// Два устаревших экземпляра: добавление, правка, удаление и адрес не теряются.
+    #[test]
+    fn stale_instances_keep_add_update_and_delete() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("clients.json");
+        let db1 = ClientDatabase::load(&db_path, test_network_config()).unwrap();
+        let alice = db1.add_client("alice").unwrap();
+        let bob = db1.add_client("bob").unwrap();
+        let db2 = ClientDatabase::load(&db_path, test_network_config()).unwrap();
+
+        db1.update_client(
+            &alice.id,
+            UpdateClientParams {
+                name: Some("alice-renamed".into()),
+                enabled: Some(false),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(db2.find_by_id(&alice.id).unwrap().name, "alice");
+
+        db2.update_client(
+            &bob.id,
+            UpdateClientParams {
+                exit_node: Some(Some("10.9.9.9:51820".into())),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mid = ClientDatabase::load(&db_path, test_network_config()).unwrap();
+        assert_eq!(mid.find_by_id(&alice.id).unwrap().name, "alice-renamed");
+        assert!(!mid.find_by_id(&alice.id).unwrap().enabled);
+        assert_eq!(
+            mid.find_by_id(&bob.id).unwrap().exit_node.as_deref(),
+            Some("10.9.9.9:51820")
+        );
+
+        db1.remove_client(&bob.id).unwrap();
+        assert!(
+            db2.find_by_id(&bob.id).is_some(),
+            "setup: db2 still holds bob until its next transaction"
+        );
+        let carol = db2.add_client("carol").unwrap();
+
+        let disk = ClientDatabase::load(&db_path, test_network_config()).unwrap();
+        let alice_disk = disk.find_by_id(&alice.id).unwrap();
+        assert_eq!(alice_disk.name, "alice-renamed");
+        assert!(!alice_disk.enabled);
+        assert!(
+            disk.find_by_id(&bob.id).is_none(),
+            "tombstone must stay deleted"
+        );
+        assert!(disk
+            .list_clients_including_deleted()
+            .iter()
+            .any(|c| c.id == bob.id && c.deleted));
+        let carol_disk = disk.find_by_name("carol").unwrap();
+        assert_eq!(carol_disk.id, carol.id);
+        let ips = [alice_disk.vpn_ip, carol_disk.vpn_ip];
+        assert_ne!(ips[0], ips[1]);
+        assert_eq!(db2.find_by_id(&alice.id).unwrap().name, "alice-renamed");
+        assert!(db2.find_by_id(&bob.id).is_none());
+    }
+
+    /// Повторный сброс счетчиков берет максимум и не удваивает уже записанный трафик.
+    #[test]
+    fn stale_instance_traffic_is_max_not_sum() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("clients.json");
+        let db1 = ClientDatabase::load(&db_path, test_network_config()).unwrap();
+        let alice = db1.add_client("alice").unwrap();
+        db1.record_traffic(&alice.id, 1000, 40);
+        db1.flush_stats();
+        let db2 = ClientDatabase::load(&db_path, test_network_config()).unwrap();
+
+        db1.record_traffic(&alice.id, 250, 0);
+        db1.flush_stats();
+        db2.record_traffic(&alice.id, 250, 7);
+        db2.flush_stats();
+        db2.flush_stats();
+        db1.flush_stats();
+
+        let stats = ClientDatabase::load(&db_path, test_network_config())
+            .unwrap()
+            .find_by_id(&alice.id)
+            .unwrap()
+            .stats;
+        assert_eq!(stats.bytes_in, 1250, "traffic counters must not double");
+        assert_eq!(
+            stats.bytes_out, 47,
+            "the other side's bytes_out must survive"
+        );
+    }
+
+    /// Неудачная мутация не выбрасывает клиентов, уже прочитанных с диска.
+    #[test]
+    fn failed_mutation_keeps_clients_absorbed_from_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("clients.json");
+        let db1 = ClientDatabase::load(&db_path, test_network_config()).unwrap();
+        let db2 = ClientDatabase::load(&db_path, test_network_config()).unwrap();
+        let alice = db1.add_client("alice").unwrap();
+        let err = db2.add_client("alice").unwrap_err();
+        assert!(err.to_string().contains("already exists"), "{err}");
+        assert_eq!(db2.find_by_id(&alice.id).unwrap().name, "alice");
+        assert_eq!(db2.list_clients().len(), 1);
+        assert_eq!(
+            ClientDatabase::load(&db_path, test_network_config())
+                .unwrap()
+                .list_clients()
+                .len(),
+            1
+        );
+    }
+
+    /// Отказ создания временного файла откатывает мутацию, но оставляет слияние.
+    #[cfg(unix)]
+    #[test]
+    fn failed_persist_rolls_back_mutation_but_keeps_absorbed_clients() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("clients.json");
+        let db1 = ClientDatabase::load(&db_path, test_network_config()).unwrap();
+        let db2 = ClientDatabase::load(&db_path, test_network_config()).unwrap();
+        let alice = db1.add_client("alice").unwrap();
+        db1.record_traffic(&alice.id, 80, 5);
+        db1.flush_stats();
+        let disk_before = std::fs::read(&db_path).unwrap();
+        assert!(db2.find_by_name("alice").is_none(), "setup: db2 is stale");
+
+        let _readonly = DirModeGuard::readonly(dir.path());
+        let err = db2.add_client("bob").unwrap_err();
+        drop(_readonly);
+
+        assert!(
+            err.to_string().contains("temporary") || err.to_string().contains("write"),
+            "{err}"
+        );
+        assert!(db2.find_by_name("bob").is_none());
+        assert_eq!(db2.find_by_id(&alice.id).unwrap().stats.bytes_in, 80);
+        assert_eq!(std::fs::read(&db_path).unwrap(), disk_before);
+        assert_no_regular_tmp(dir.path());
+
+        db2.add_client("carol").unwrap();
+        let names: std::collections::HashSet<_> =
+            ClientDatabase::load(&db_path, test_network_config())
+                .unwrap()
+                .list_clients()
+                .into_iter()
+                .map(|c| c.name)
+                .collect();
+        assert_eq!(
+            names,
+            std::collections::HashSet::from(["alice".into(), "carol".into()])
+        );
+    }
+
+    #[test]
+    fn malformed_json_fails_closed_on_load_and_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let broken = dir.path().join("broken.json");
+        std::fs::write(&broken, b"{not-json").unwrap();
+        let err = ClientDatabase::load(&broken, test_network_config())
+            .err()
+            .expect("malformed client DB must not load");
+        assert!(err.to_string().contains("parse"), "{err}");
+        assert_eq!(std::fs::read(&broken).unwrap(), b"{not-json");
+
+        let db_path = dir.path().join("clients.json");
+        let db = ClientDatabase::load(&db_path, test_network_config()).unwrap();
+        let alice = db.add_client("alice").unwrap();
+        let good = std::fs::read(&db_path).unwrap();
+        std::fs::write(&db_path, b"[").unwrap();
+
+        assert!(!db.reload_if_changed());
+        assert!(!db.reload_if_changed());
+        assert_eq!(db.find_by_id(&alice.id).unwrap().name, "alice");
+        let err = db.add_client("bob").unwrap_err();
+        assert!(db.find_by_name("bob").is_none(), "{err}");
+        assert_eq!(std::fs::read(&db_path).unwrap(), b"[");
+
+        std::fs::write(&db_path, &good).unwrap();
+        db.add_client("carol").unwrap();
+        let text = std::fs::read_to_string(&db_path).unwrap();
+        assert!(text.contains("alice"));
+        assert!(text.contains("carol"));
+        assert!(!text.starts_with('['));
+    }
+
+    #[test]
+    fn atomic_write_removes_temp_file_when_rename_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("clients.json");
+        std::fs::create_dir(&dest).unwrap();
+        std::fs::write(dest.join("keep"), b"keep").unwrap();
+        let secret = b"psk-secret-must-not-leak";
+        let err = write_bytes_atomic(&dest, secret).unwrap_err();
+        assert!(err.to_string().contains("Failed to write"), "{err}");
+        assert_no_regular_tmp(dir.path());
+        for entry in std::fs::read_dir(dir.path()).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_type().unwrap().is_file() {
+                let bytes = std::fs::read(entry.path()).unwrap();
+                assert!(
+                    bytes.windows(secret.len()).all(|w| w != secret),
+                    "secret leaked into {}",
+                    entry.path().display()
+                );
+            }
+        }
+        assert_eq!(std::fs::read(dest.join("keep")).unwrap(), b"keep");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persisted_db_and_lock_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("clients.json");
+        let db = ClientDatabase::load(&db_path, test_network_config()).unwrap();
+        db.add_client("alice").unwrap();
+        for path in [&db_path, &db_path.with_extension("lock")] {
+            let mode = std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode & 0o077, 0, "{path:?} mode {mode:o}");
+            assert_eq!(mode & 0o600, 0o600, "{path:?} mode {mode:o}");
+        }
+        assert_no_regular_tmp(dir.path());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn predictable_tmp_symlink_does_not_clobber_victim() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("clients.json");
+        let victim = dir.path().join("victim.txt");
+        let original = b"victim-original";
+        std::fs::write(&victim, original).unwrap();
+        let mode_before = std::fs::metadata(&victim).unwrap().permissions().mode();
+        let predictable = db_path.with_extension(format!("{}.tmp", std::process::id()));
+        symlink(&victim, &predictable).unwrap();
+        let also = dir
+            .path()
+            .join(format!("clients.json.{}.tmp", std::process::id()));
+        symlink(&victim, &also).unwrap();
+
+        let db = ClientDatabase::load(&db_path, test_network_config()).unwrap();
+        db.add_client("alice").unwrap();
+
+        assert_eq!(std::fs::read(&victim).unwrap(), original);
+        assert_eq!(
+            std::fs::metadata(&victim).unwrap().permissions().mode(),
+            mode_before
+        );
+        assert!(predictable
+            .symlink_metadata()
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        let meta = std::fs::symlink_metadata(&db_path).unwrap();
+        assert!(meta.file_type().is_file());
+        assert_eq!(meta.permissions().mode() & 0o077, 0);
+        assert_no_regular_tmp(dir.path());
+        let text = std::fs::read_to_string(&db_path).unwrap();
+        assert!(text.contains("alice"));
+        assert!(!text.contains("victim-original"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lock_file_symlink_is_not_followed() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("clients.json");
+        let victim = dir.path().join("victim.txt");
+        std::fs::write(&victim, b"victim-original").unwrap();
+        let mode = std::fs::metadata(&victim).unwrap().permissions().mode();
+        symlink(&victim, db_path.with_extension("lock")).unwrap();
+
+        let db = ClientDatabase::load(&db_path, test_network_config()).unwrap();
+        let err = db.add_client("alice").unwrap_err();
+        assert!(err.to_string().contains("symlink"), "{err}");
+        assert!(db.find_by_name("alice").is_none());
+        assert!(!db_path.exists());
+        assert_eq!(std::fs::read(&victim).unwrap(), b"victim-original");
+        assert_eq!(
+            std::fs::metadata(&victim).unwrap().permissions().mode(),
+            mode
+        );
+        assert!(db_path
+            .with_extension("lock")
+            .symlink_metadata()
+            .unwrap()
+            .file_type()
+            .is_symlink());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_and_mutation_refuse_to_follow_db_symlink() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("clients.json");
+        let victim = dir.path().join("victim.txt");
+        std::fs::write(&victim, b"victim-original").unwrap();
+        symlink(&victim, &db_path).unwrap();
+        let err = ClientDatabase::load(&db_path, test_network_config())
+            .err()
+            .expect("symlink client DB must not load");
+        assert!(err.to_string().contains("symlink"), "{err}");
+        assert_eq!(std::fs::read(&victim).unwrap(), b"victim-original");
+
+        std::fs::remove_file(&db_path).unwrap();
+        let db = ClientDatabase::load(&db_path, test_network_config()).unwrap();
+        db.add_client("alice").unwrap();
+        std::fs::remove_file(&db_path).unwrap();
+        symlink(&victim, &db_path).unwrap();
+        let err = db.add_client("bob").unwrap_err();
+        assert!(err.to_string().contains("symlink"), "{err}");
+        assert!(db.find_by_name("bob").is_none());
+        assert!(db.find_by_name("alice").is_some());
+        assert_eq!(std::fs::read(&victim).unwrap(), b"victim-original");
+    }
+
+    #[test]
+    fn two_instances_concurrent_adds_do_not_deadlock_or_drop_clients() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("clients.json");
+        let db1 = ClientDatabase::load(&db_path, test_network_config()).unwrap();
+        let db2 = ClientDatabase::load(&db_path, test_network_config()).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let tx2 = tx.clone();
+        let t1 = std::thread::spawn(move || {
+            for i in 0..6 {
+                db1.add_client(&format!("a{i}")).unwrap();
+            }
+            tx.send(()).unwrap();
+        });
+        let t2 = std::thread::spawn(move || {
+            for i in 0..6 {
+                db2.add_client(&format!("b{i}")).unwrap();
+            }
+            tx2.send(()).unwrap();
+        });
+        for _ in 0..2 {
+            rx.recv_timeout(Duration::from_secs(30))
+                .expect("deadlock or hung client DB transaction");
+        }
+        t1.join().unwrap();
+        t2.join().unwrap();
+
+        let clients = ClientDatabase::load(&db_path, test_network_config())
+            .unwrap()
+            .list_clients();
+        assert_eq!(clients.len(), 12);
+        let mut ips: Vec<_> = clients.iter().map(|c| c.vpn_ip).collect();
+        ips.sort();
+        ips.dedup();
+        assert_eq!(ips.len(), 12, "stale allocators must not reuse a VPN IP");
+    }
+
+    fn assert_no_regular_tmp(dir: &Path) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let entry = entry.unwrap();
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.ends_with(".tmp") && entry.file_type().unwrap().is_file() {
+                panic!("temp file left behind: {name}");
+            }
+        }
+    }
+
+    struct DirModeGuard {
+        path: std::path::PathBuf,
+    }
+
+    impl DirModeGuard {
+        fn readonly(path: &Path) -> Self {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o555)).unwrap();
+            }
+            Self {
+                path: path.to_path_buf(),
+            }
+        }
+    }
+
+    impl Drop for DirModeGuard {
+        fn drop(&mut self) {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ =
+                    std::fs::set_permissions(&self.path, std::fs::Permissions::from_mode(0o755));
+            }
+        }
     }
 }

@@ -19,18 +19,7 @@ use super::*;
 /// Returns `Some(tot_len)` — forward exactly that many bytes — or `None` to
 /// drop.
 pub(crate) fn fec_recovered_len(recovered: &[u8]) -> Option<usize> {
-    if recovered.len() < 20 || (recovered[0] >> 4) != 4 {
-        return None;
-    }
-    let ihl = (recovered[0] & 0x0f) as usize * 4;
-    let tot_len = u16::from_be_bytes([recovered[2], recovered[3]]) as usize;
-    if ihl < 20 || tot_len < ihl || tot_len > recovered.len() {
-        return None;
-    }
-    if recovered[tot_len..].iter().any(|b| *b != 0) {
-        return None;
-    }
-    Some(tot_len)
+    aivpn_common::ip_packet::IpPacket::parse(recovered).map(|packet| packet.length)
 }
 
 /// True when `seq` is stale relative to the most recently processed FecRepair
@@ -42,6 +31,95 @@ pub(crate) fn fec_seq_is_stale(repair_seq_hi: u16, seq: u16) -> bool {
 }
 
 impl super::Gateway {
+    pub(super) fn refresh_kernel_session(&self, sess: &mut Session) {
+        if sess.kernel_faulted {
+            return;
+        }
+        let Some(ka) = self.kernel_accel.as_ref() else {
+            return;
+        };
+        let (catalog_len, _, _, _) = self.mask_catalog.packet_layout();
+        let catalog_offset = self
+            .mask_catalog
+            .primary_mask()
+            .map(|m| m.tag_offset)
+            .unwrap_or(u16::MAX);
+        let (tag_offset, mdh_len) = kernel_wire_layout(sess, catalog_offset, catalog_len as u16);
+        let mut input = kernel_input_from_session(
+            sess,
+            self.client_db.as_deref(),
+            &self.config.network_config,
+            self.config.allow_peer_routing,
+            self.config.exit_node_enabled || self.masked_exit_addr.read().is_some(),
+        );
+        let recording = self
+            .recording_manager
+            .as_ref()
+            .is_some_and(|r| r.is_recording(&sess.session_id));
+        input.userspace_rx |= self.config.enable_neural || recording;
+        input.userspace_tx |= recording || self.config.downlink_shaping != ShapingLevel::Off;
+        let _ = kernel_maintain(ka, sess, tag_offset, mdh_len, &input, false);
+    }
+
+    /// Одинаковые QoS и маршрутизация для Data, восстановленного FEC и ChainForward.
+    pub(super) async fn forward_client_data(
+        &self,
+        session: &Arc<parking_lot::Mutex<Session>>,
+        payload: &[u8],
+        force_local: bool,
+    ) -> Result<()> {
+        let (client_id, site, session_id) = {
+            let session = session.lock();
+            (
+                session.client_id.clone(),
+                session.is_site_peer,
+                session.session_id,
+            )
+        };
+        let mut packet = payload.to_vec();
+        let nbytes = u32::try_from(packet.len()).unwrap_or(u32::MAX);
+        // Общее списание с fallback. Если ядро уже списало ведро, userspace его не трогает.
+        match kernel_qos_decide(
+            self.kernel_accel.as_deref(),
+            &session_id,
+            QOS_DIR_UP,
+            nbytes,
+        ) {
+            QosGate::Drop => return Ok(()),
+            QosGate::PassCharged => {}
+            QosGate::Userspace => {
+                if let Some(ref client_id) = client_id {
+                    if !self
+                        .qos_enforcer
+                        .check_upstream(client_id, packet.len() as u64)
+                    {
+                        return Ok(());
+                    }
+                }
+            }
+        }
+        if let Some(ref client_id) = client_id {
+            if let Some(dscp) = self.qos_enforcer.get_dscp(client_id) {
+                crate::qos::apply_dscp(&mut packet, dscp);
+            }
+        }
+        if !force_local && !site {
+            if let ExitDecision::Send {
+                addr,
+                local_fallback,
+            } = self.exit_decision_for_session(session)
+            {
+                return self.forward_via_exit(&addr, local_fallback, packet).await;
+            }
+        }
+        if let Some(tx) = &self.tun_write_tx {
+            let _ = tx.send(packet).await;
+        } else if let Some(nat) = &self.nat_forwarder {
+            nat.forward_packet(&packet).await?;
+        }
+        Ok(())
+    }
+
     /// Handle incoming packet
     pub(crate) async fn handle_packet(
         &self,
@@ -198,100 +276,108 @@ impl super::Gateway {
             // `pool_client_psk` is `None` — additive, byte-for-byte
             // unchanged behavior for any deployment that hasn't configured
             // pool sync.
+            let mut masked_key_slots: Vec<(
+                aivpn_common::crypto::KeyPair,
+                [u8; 32],
+                Option<Vec<String>>,
+            )> = Vec::new();
+            if let (Some(pool_kp), Some(pool_psk)) =
+                (&self.pool_server_keypair, self.pool_client_psk.as_ref())
+            {
+                masked_key_slots.push((pool_kp.clone(), *pool_psk, None));
+            }
+            for (keypair, psk, node_id) in &self.extra_masked_peer_keys {
+                masked_key_slots.push((keypair.clone(), *psk, Some(node_id.clone())));
+            }
             let masked_peer: Option<(Arc<parking_lot::Mutex<Session>>, MaskProfile)> =
-                if let (Some(pool_kp), Some(pool_psk)) =
-                    (&self.pool_server_keypair, &self.pool_client_psk)
-                {
+                if masked_key_slots.is_empty() {
+                    None
+                } else {
                     let mut found_peer = None;
-                    for candidate_mask in aivpn_common::mask::preset_masks::all() {
-                        let (
-                            _,
-                            candidate_handshake_mdh_len,
-                            candidate_eph_offset,
-                            candidate_eph_len,
-                        ) = packet_layout_for_mask(&candidate_mask);
-                        let prefix = tag_prefix_len(candidate_mask.tag_offset);
-                        if packet_data.len() < prefix + candidate_handshake_mdh_len {
-                            continue;
-                        }
-                        let eph_start = prefix + candidate_eph_offset;
-                        if packet_data.len() < eph_start + candidate_eph_len {
-                            continue;
-                        }
-                        let cand_tag =
-                            match extract_tag_for_layout(packet_data, candidate_mask.tag_offset) {
+                    'masked_keys: for (pool_kp, pool_psk, site_node_id) in &masked_key_slots {
+                        for candidate_mask in aivpn_common::mask::preset_masks::all() {
+                            let (
+                                _,
+                                candidate_handshake_mdh_len,
+                                candidate_eph_offset,
+                                candidate_eph_len,
+                            ) = packet_layout_for_mask(&candidate_mask);
+                            let prefix = tag_prefix_len(candidate_mask.tag_offset);
+                            if packet_data.len() < prefix + candidate_handshake_mdh_len {
+                                continue;
+                            }
+                            let eph_start = prefix + candidate_eph_offset;
+                            if packet_data.len() < eph_start + candidate_eph_len {
+                                continue;
+                            }
+                            let cand_tag = match extract_tag_for_layout(
+                                packet_data,
+                                candidate_mask.tag_offset,
+                            ) {
                                 Some(t) => t,
                                 None => continue,
                             };
 
-                        let mut eph_pub = [0u8; 32];
-                        eph_pub.copy_from_slice(
-                            &packet_data[eph_start..eph_start + candidate_eph_len],
-                        );
-                        // Obfuscated against the shared POOL keypair's public
-                        // key — NOT `self.session_manager.server_public_key()` —
-                        // since the dialer derived its side of DH1 against
-                        // that shared static key, not our real server key.
-                        crypto::obfuscate_eph_pub(&mut eph_pub, &pool_kp.public_key_bytes());
+                            let mut eph_pub = [0u8; 32];
+                            eph_pub.copy_from_slice(
+                                &packet_data[eph_start..eph_start + candidate_eph_len],
+                            );
+                            // Obfuscated against the shared POOL keypair's public
+                            // key - NOT `self.session_manager.server_public_key()` -
+                            // since the dialer derived its side of DH1 against
+                            // that shared static key, not our real server key.
+                            crypto::obfuscate_eph_pub(&mut eph_pub, &pool_kp.public_key_bytes());
 
-                        if !self.session_manager.handshake_tag_precheck_with_static(
-                            &eph_pub,
-                            Some(*pool_psk),
-                            &cand_tag,
-                            pool_kp,
-                        ) {
-                            continue;
-                        }
+                            if !self.session_manager.handshake_tag_precheck_with_static(
+                                &eph_pub,
+                                Some(*pool_psk),
+                                &cand_tag,
+                                pool_kp,
+                            ) {
+                                continue;
+                            }
 
-                        match self.session_manager.create_masked_pool_peer_session(
-                            client_addr,
-                            eph_pub,
-                            pool_kp,
-                            pool_psk,
-                        ) {
-                            Ok(sess) => {
-                                let validation = sess.lock().validate_handshake_tag(&cand_tag);
-                                if validation.is_some() {
-                                    tag = cand_tag;
-                                    sess.lock().mask = Some(candidate_mask.clone());
-                                    // BUG B1 fix: a validated masked pool-client
-                                    // handshake gets a fresh random session_id
-                                    // every time (see
-                                    // `cleanup_masked_peer_sessions_for_ip`'s doc
-                                    // comment) and none of the existing
-                                    // `cleanup_old_sessions_for_ip`/`_vpn_ip`/
-                                    // `_client_id` dedup paths ever fire for
-                                    // masked peers (no vpn_ip/client_id). Without
-                                    // this, a reconnecting dialer — or anyone who
-                                    // knows the pool-client PSK — piles up a new
-                                    // permanent session per handshake instead of
-                                    // collapsing to one live session per source
-                                    // IP.
-                                    let new_session_id = sess.lock().session_id;
-                                    self.session_manager.cleanup_masked_peer_sessions_for_ip(
-                                        &client_addr.ip(),
-                                        &new_session_id,
-                                    );
-                                    debug!(
+                            match self.session_manager.create_masked_pool_peer_session(
+                                client_addr,
+                                eph_pub,
+                                pool_kp,
+                                pool_psk,
+                            ) {
+                                Ok(sess) => {
+                                    let validation = sess.lock().validate_handshake_tag(&cand_tag);
+                                    if validation.is_some() {
+                                        tag = cand_tag;
+                                        sess.lock().mask = Some(candidate_mask.clone());
+                                        {
+                                            let mut session = sess.lock();
+                                            session.is_site_peer = site_node_id.is_some();
+                                            session.site_peer_names =
+                                                site_node_id.clone().unwrap_or_default();
+                                        }
+                                        let new_session_id = sess.lock().session_id;
+                                        self.session_manager.cleanup_masked_peer_handshakes(
+                                            &client_addr,
+                                            &new_session_id,
+                                        );
+                                        debug!(
                                         "Masked pool-client handshake SUCCESS from {} via mask {}",
                                         hash_addr(&client_addr),
                                         candidate_mask.mask_id
                                     );
-                                    found_peer = Some((sess, candidate_mask));
-                                    break;
+                                        found_peer = Some((sess, candidate_mask));
+                                        break 'masked_keys;
+                                    }
+                                    let sid = sess.lock().session_id;
+                                    self.session_manager.rollback_failed_session(&sid);
                                 }
-                                let sid = sess.lock().session_id;
-                                self.session_manager.rollback_failed_session(&sid);
-                            }
-                            Err(e) => {
-                                debug!("create_masked_pool_peer_session failed: {}", e);
-                                continue;
+                                Err(e) => {
+                                    debug!("create_masked_pool_peer_session failed: {}", e);
+                                    continue;
+                                }
                             }
                         }
                     }
                     found_peer
-                } else {
-                    None
                 };
 
             let (session, matched_client_id, bootstrap_mask) = if let Some((s, m)) = masked_peer {
@@ -522,66 +608,7 @@ impl super::Gateway {
                     }
                 }
             } else {
-                // No client DB — legacy mode without PSK
-                let mut found = None;
-                let candidate_masks = self
-                    .bootstrap_descriptors
-                    .read()
-                    .iter()
-                    .flat_map(|descriptor| derive_bootstrap_candidates(descriptor, None))
-                    .chain(builtin_bootstrap_masks.clone().into_iter())
-                    .collect::<Vec<_>>();
-                for bootstrap_mask in candidate_masks {
-                    let (_, candidate_handshake_mdh_len, candidate_eph_offset, candidate_eph_len) =
-                        packet_layout_for_mask(&bootstrap_mask);
-                    // Layout-aware handshake parse (see the client_db branch
-                    // above): embedded masks drop the TAG_SIZE prefix.
-                    let prefix = tag_prefix_len(bootstrap_mask.tag_offset);
-                    if packet_data.len() < prefix + candidate_handshake_mdh_len {
-                        continue;
-                    }
-                    let eph_start = prefix + candidate_eph_offset;
-                    if packet_data.len() < eph_start + candidate_eph_len {
-                        continue;
-                    }
-                    let cand_tag =
-                        match extract_tag_for_layout(packet_data, bootstrap_mask.tag_offset) {
-                            Some(t) => t,
-                            None => continue,
-                        };
-
-                    let mut eph_pub = [0u8; 32];
-                    eph_pub.copy_from_slice(&packet_data[eph_start..eph_start + candidate_eph_len]);
-                    crypto::obfuscate_eph_pub(
-                        &mut eph_pub,
-                        &self.session_manager.server_public_key(),
-                    );
-
-                    // DoS hardening: cheap tag pre-check before create_session
-                    // (see the client_db branch above).
-                    if !self
-                        .session_manager
-                        .handshake_tag_precheck(&eph_pub, None, &cand_tag)
-                    {
-                        continue;
-                    }
-
-                    let sess =
-                        self.session_manager
-                            .create_session(client_addr, eph_pub, None, None)?;
-                    let validation = sess.lock().validate_handshake_tag(&cand_tag);
-                    if validation.is_some() {
-                        tag = cand_tag;
-                        found = Some((sess, None, bootstrap_mask));
-                        break;
-                    }
-                    let sid = sess.lock().session_id;
-                    self.session_manager.rollback_failed_session(&sid);
-                }
-
-                found.ok_or_else(|| {
-                    Error::InvalidPacket("No bootstrap mask matched this handshake")
-                })?
+                return Err(Error::InvalidPacket("Handshake requires a client database"));
             };
 
             // Validate the tag against the session. This MUST use the same
@@ -858,22 +885,7 @@ impl super::Gateway {
         // every uplink packet for such masks.
         let (session_mdh_len, session_hs_mdh_len, _session_tag_offset, data_prefix, hs_prefix) = {
             let sess = session.lock();
-            if sess.is_pool_peer || sess.is_site_peer {
-                // Cluster (pool/site/chain) traffic uses a FIXED, mask-
-                // independent framing: [8-byte tag prefix][CLUSTER_MDH_LEN
-                // random bytes][ciphertext]. It must NOT follow the catalog's
-                // primary mask: that mask differs across nodes and over time,
-                // and an embedded-tag primary (tag_offset != u16::MAX) would
-                // shift the expected ciphertext offset, failing AEAD on every
-                // peer packet even though the tag matched.
-                (
-                    crate::pool_sync::CLUSTER_MDH_LEN,
-                    crate::pool_sync::CLUSTER_MDH_LEN,
-                    u16::MAX,
-                    TAG_SIZE,
-                    TAG_SIZE,
-                )
-            } else if let Some(ref mask) = sess.mask {
+            if let Some(ref mask) = sess.mask {
                 let (p, h, _, _) = packet_layout_for_mask(mask);
                 (
                     p,
@@ -1057,46 +1069,38 @@ impl super::Gateway {
         if is_ratcheted_tag {
             let session_id = session.lock().session_id;
             self.session_manager.complete_session_ratchet(&session_id);
-            // Install session into kernel accelerator now that keys are stable.
-            if let Some(ref ka) = self.kernel_accel {
-                let mut sess = session.lock();
-                info!(
-                    "PFS ratchet complete for {} — send_counter={}, counter={}",
-                    hash_addr(&client_addr),
-                    sess.send_counter,
-                    sess.counter
-                );
-                let (kernel_tag_offset, kernel_mdh_len) =
-                    kernel_wire_layout(&sess, catalog_tag_offset, catalog_mdh_len as u16);
-                let add = make_kernel_session_add(&sess, kernel_tag_offset, kernel_mdh_len);
-                let upd = make_kernel_update_tags(&sess);
-                if let Err(e) = ka.session_add(&add) {
-                    warn!("kernel session_add failed: {e}");
-                } else {
-                    // Record the installed signature so the refresh path only
-                    // re-installs once the mask or keys actually change.
-                    sess.kernel_install_sig =
-                        kernel_session_sig(&sess, kernel_tag_offset, kernel_mdh_len);
-                }
-                if let Err(e) = ka.session_update_tags(&upd) {
-                    warn!("kernel session_update_tags failed: {e}");
-                }
-                // Arm the kernel downlink fast path with a reserved counter block.
-                if let Some(dl) = make_kernel_downlink(&mut sess) {
-                    if let Err(e) = ka.session_downlink(&dl) {
-                        warn!("kernel session_downlink failed: {e}");
-                    }
-                }
-            } else {
-                let sess = session.lock();
-                info!(
-                    "PFS ratchet complete for {} — send_counter={}, counter={}",
-                    hash_addr(&client_addr),
-                    sess.send_counter,
-                    sess.counter
-                );
-            }
+            let sess = session.lock();
+            info!(
+                "PFS ratchet complete for {} - send_counter={}, counter={}",
+                hash_addr(&client_addr),
+                sess.send_counter,
+                sess.counter
+            );
+        }
 
+        // Захват до pad, дескрипторов и payload. Слияние bitmap гонку не закрывает.
+        let replay = {
+            let mut sess = session.lock();
+            if let Some(ka) = self.kernel_accel.as_ref() {
+                self.refresh_kernel_session(&mut sess);
+                kernel_claim_deliver(
+                    Some(ka.as_ref()),
+                    &sess,
+                    counter,
+                    decrypted_with_pre_ratchet,
+                )
+            } else {
+                kernel_claim_deliver(None, &sess, counter, decrypted_with_pre_ratchet)
+            }
+        };
+        if replay == ReplayGate::Drop {
+            let mut sess = session.lock();
+            kernel_note_rejected(&mut sess, counter, decrypted_with_pre_ratchet);
+            return Ok(());
+        }
+
+        // Дескрипторы только после захвата: повтор ratchet не рассылает их снова.
+        if is_ratcheted_tag {
             // CRITICAL (server-sec): this packet carrying a ratcheted-key tag
             // IS the return-routability proof — the client could only have
             // produced it by actually receiving ServerHello (server_eph_pub)
@@ -1221,34 +1225,11 @@ impl super::Gateway {
             self.session_manager.refresh_session_tags(&session_id);
             if let Some(ref ka) = self.kernel_accel {
                 let mut sess = session.lock();
-                // Re-install the kernel session so its wire offsets and keys
-                // track the session's CURRENT state. The client switches from
-                // the bootstrap mask to the runtime mask shortly after connect
-                // (different tag_offset/mdh_len) and rotates keys on rekey; the
-                // offsets/keys frozen at the initial install would otherwise
-                // make every kernel decrypt fail silently. session_add is
-                // idempotent (replaces the existing entry). Re-install only when
-                // the relevant state changed, so a steady session pays nothing.
-                let (kernel_tag_offset, kernel_mdh_len) =
-                    kernel_wire_layout(&sess, catalog_tag_offset, catalog_mdh_len as u16);
-                let sig = kernel_session_sig(&sess, kernel_tag_offset, kernel_mdh_len);
-                let reinstall = sess.kernel_install_sig != sig;
-                let add = reinstall
-                    .then(|| make_kernel_session_add(&sess, kernel_tag_offset, kernel_mdh_len));
+                // Ключ и раскладку ставит kernel_maintain до захвата. Здесь только
+                // окно тегов и downlink: session_add снял бы уже поставленную политику.
                 let upd = make_kernel_update_tags(&sess);
-                // Refresh the downlink reserved counter block on the same cadence
-                // so its pre-computed resonance tags stay inside the client's
-                // current time window and its counters stay near the client's
-                // highest-seen downlink counter.
                 let dl = make_kernel_downlink(&mut sess);
                 drop(sess);
-                if let Some(add) = add {
-                    if let Err(e) = ka.session_add(&add) {
-                        warn!("kernel session_add (refresh) failed: {e}");
-                    } else {
-                        session.lock().kernel_install_sig = sig;
-                    }
-                }
                 if let Err(e) = ka.session_update_tags(&upd) {
                     warn!("kernel session_update_tags (refresh) failed: {e}");
                 }
@@ -1351,6 +1332,7 @@ impl super::Gateway {
             self.process_inner_payload(plaintext, &session, client_addr)
                 .await?;
         }
+        self.refresh_kernel_session(&mut session.lock());
 
         Ok(())
     }
@@ -1366,8 +1348,24 @@ impl super::Gateway {
             return Err(Error::InvalidPacket("Inner payload too short"));
         }
 
-        let inner_header = InnerHeader::decode(plaintext)?;
-        let payload = &plaintext[4..];
+        let mut inner_header = InnerHeader::decode(plaintext)?;
+        let assembled;
+        let payload = if inner_header.inner_type == InnerType::Fragment {
+            match session
+                .lock()
+                .fragment_rx
+                .accept(&plaintext[4..], std::time::Instant::now())?
+            {
+                Some((kind, bytes)) => {
+                    inner_header.inner_type = kind;
+                    assembled = bytes;
+                    &assembled[..]
+                }
+                None => return Ok(()),
+            }
+        } else {
+            &plaintext[4..]
+        };
 
         match inner_header.inner_type {
             InnerType::Data => {
@@ -1405,113 +1403,20 @@ impl super::Gateway {
                     }
                 }
 
-                // Anti-spoof + peer routing gate (authoritative, at ingress).
-                // Only IPv4 is routed through the VPN; reject everything else to
-                // prevent clients from injecting arbitrary layer-3 traffic that
-                // bypasses the source-address check.
-                if payload.len() < 20 || (payload[0] >> 4) != 4 {
-                    debug!(
-                        "Anti-spoof: dropping non-IPv4 payload (len={} ver={})",
-                        payload.len(),
-                        payload.first().map(|b| b >> 4).unwrap_or(0)
-                    );
+                let Some(header) = aivpn_common::ip_packet::IpPacket::parse(payload) else {
+                    return Ok(());
+                };
+                let payload = &payload[..header.length];
+                if !self.session_allows_source(&session.lock(), header.source) {
                     return Ok(());
                 }
+                if !self.config.allow_peer_routing
+                    && self.session_for_inner_ip(header.destination).is_some()
                 {
-                    let inner_src =
-                        std::net::Ipv4Addr::new(payload[12], payload[13], payload[14], payload[15]);
-                    let inner_dst =
-                        std::net::Ipv4Addr::new(payload[16], payload[17], payload[18], payload[19]);
-                    let session_vpn_ip = session.lock().vpn_ip;
-                    if let Some(svpn) = session_vpn_ip {
-                        if inner_src != svpn {
-                            warn!(
-                                "Anti-spoof: dropping packet src={} from session owning vpn_ip={}",
-                                inner_src, svpn
-                            );
-                            return Ok(());
-                        }
-                    }
-                    // Block intra-VPN routing at ingress when not opted in.
-                    if !self.config.allow_peer_routing
-                        && self
-                            .session_manager
-                            .get_session_by_vpn_ip(&inner_dst)
-                            .is_some()
-                    {
-                        debug!(
-                            "Peer routing disabled — dropping {}->{} at ingress",
-                            inner_src, inner_dst
-                        );
-                        return Ok(());
-                    }
+                    return Ok(());
                 }
 
-                // Forward to NAT/internet via TUN write channel (lock-free)
-                debug!(
-                    "DATA packet from {} ({} bytes)",
-                    hash_addr(&client_addr),
-                    payload.len()
-                );
-
-                // QoS: enforce upstream rate limit before forwarding to TUN
-                let upstream_cid = session.lock().client_id.clone();
-                if let Some(ref c) = upstream_cid {
-                    if !self.qos_enforcer.check_upstream(c, payload.len() as u64) {
-                        debug!("QoS: upstream rate limited, dropping packet for {}", c);
-                        return Ok(());
-                    }
-                }
-
-                // Site peers send subnet traffic — never relay to the exit node
-                // (masked or legacy chain_forwarder), regardless of any exit
-                // configuration; always local TUN/NAT egress. Unchanged by B2b.
-                //
-                // B2b: for non-site-peer traffic, `exit_decision_for_session`
-                // resolves this CLIENT's own `exit_node` override (B2a,
-                // cached in `exit_route_cache`), falling back to the node's
-                // global default (`self.masked_exit_addr`, sourced from
-                // `pool.exit_node`) exactly as before when no per-client
-                // override is set — see `choose_exit`'s doc comment for the
-                // REGRESSION INVARIANT this preserves.
-                let is_site_peer_now = session.lock().is_site_peer;
-                if !is_site_peer_now {
-                    match self.exit_decision_for_session(session) {
-                        ExitDecision::Send {
-                            addr,
-                            local_fallback,
-                        } => {
-                            self.forward_via_exit(&addr, local_fallback, payload.to_vec())
-                                .await?;
-                        }
-                        ExitDecision::NoExit => {
-                            // No exit configured at all (neither per-client
-                            // nor global) — legacy chain_forwarder/local TUN
-                            // egress, byte-identical to the pre-B2b
-                            // `masked_exit_addr.is_none()` branch.
-                            if let Some(ref cf) = self.chain_forwarder {
-                                // Multi-hop: relay to exit node instead of local NAT
-                                cf.forward(payload.to_vec()).await;
-                            } else if let Some(ref tx) = self.tun_write_tx {
-                                if tx.send(payload.to_vec()).await.is_err() {
-                                    debug!("TUN write channel closed, dropping packet");
-                                }
-                            } else if let Some(ref nat) = self.nat_forwarder {
-                                nat.forward_packet(payload).await?;
-                            } else {
-                                debug!("NAT disabled, dropping packet");
-                            }
-                        }
-                    }
-                } else if let Some(ref tx) = self.tun_write_tx {
-                    if tx.send(payload.to_vec()).await.is_err() {
-                        debug!("TUN write channel closed, dropping packet");
-                    }
-                } else if let Some(ref nat) = self.nat_forwarder {
-                    nat.forward_packet(payload).await?;
-                } else {
-                    debug!("NAT disabled, dropping packet");
-                }
+                self.forward_client_data(session, payload, false).await?;
 
                 // Accumulate payload into FEC XOR buffer for server-side recovery.
                 // When FecRepair arrives we can reconstruct exactly one missing packet.
@@ -1534,10 +1439,7 @@ impl super::Gateway {
                 self.handle_control_message(payload, session, client_addr)
                     .await?;
             }
-            InnerType::Fragment => {
-                // TODO: Implement fragmentation
-                debug!("FRAGMENT packet (not implemented)");
-            }
+            InnerType::Fragment => return Err(Error::InvalidPacket("Nested fragment")),
             InnerType::Ack => {
                 // Handle ACK
                 debug!("ACK packet received");
@@ -1604,25 +1506,14 @@ impl super::Gateway {
                                     recovered.first().map(|b| b >> 4).unwrap_or(0)
                                 );
                             } else {
-                                let inner_src = std::net::Ipv4Addr::new(
-                                    recovered[12],
-                                    recovered[13],
-                                    recovered[14],
-                                    recovered[15],
-                                );
-                                let inner_dst = std::net::Ipv4Addr::new(
-                                    recovered[16],
-                                    recovered[17],
-                                    recovered[18],
-                                    recovered[19],
-                                );
-                                let (session_vpn_ip, is_site_peer) = {
+                                let header = aivpn_common::ip_packet::IpPacket::parse(&recovered)
+                                    .expect("FEC length validated");
+                                let inner_src = header.source;
+                                let inner_dst = header.destination;
+                                let (session_vpn_ip, spoof) = {
                                     let sess = session.lock();
-                                    (sess.vpn_ip, sess.is_site_peer)
+                                    (sess.vpn_ip, !self.session_allows_source(&sess, inner_src))
                                 };
-                                let spoof = session_vpn_ip
-                                    .map(|svpn| inner_src != svpn)
-                                    .unwrap_or(false);
                                 if spoof {
                                     warn!(
                                         "FEC anti-spoof: dropping recovered packet \
@@ -1630,50 +1521,15 @@ impl super::Gateway {
                                         inner_src, session_vpn_ip
                                     );
                                 } else if !self.config.allow_peer_routing
-                                    && self
-                                        .session_manager
-                                        .get_session_by_vpn_ip(&inner_dst)
-                                        .is_some()
+                                    && self.session_for_inner_ip(inner_dst).is_some()
                                 {
                                     debug!(
                                         "FEC: peer routing disabled — dropping \
                                          {}->{} at ingress",
                                         inner_src, inner_dst
                                     );
-                                } else if !is_site_peer {
-                                    // B2b: same per-client-exit-then-global
-                                    // resolution as the primary Data-packet
-                                    // site above — see `choose_exit`'s doc
-                                    // comment for the REGRESSION INVARIANT
-                                    // this preserves when no per-client
-                                    // override is set.
-                                    match self.exit_decision_for_session(session) {
-                                        ExitDecision::Send {
-                                            addr,
-                                            local_fallback,
-                                        } => {
-                                            self.forward_via_exit(&addr, local_fallback, recovered)
-                                                .await?;
-                                        }
-                                        ExitDecision::NoExit => {
-                                            if let Some(ref cf) = self.chain_forwarder {
-                                                cf.forward(recovered).await;
-                                            } else if let Some(ref tx) = self.tun_write_tx {
-                                                let _ = tx.send(recovered).await;
-                                            } else if let Some(ref nat) = self.nat_forwarder {
-                                                nat.forward_packet(&recovered).await?;
-                                            }
-                                        }
-                                    }
                                 } else {
-                                    // is_site_peer: subnet traffic never relays to an
-                                    // exit or the legacy chain_forwarder — local egress
-                                    // only, unchanged by B2b.
-                                    if let Some(ref tx) = self.tun_write_tx {
-                                        let _ = tx.send(recovered).await;
-                                    } else if let Some(ref nat) = self.nat_forwarder {
-                                        nat.forward_packet(&recovered).await?;
-                                    }
+                                    self.forward_client_data(session, &recovered, false).await?;
                                 }
                             }
                         }

@@ -133,11 +133,7 @@ clippy:
 fmt:
 	cargo fmt --all
 
-# Offline nDPI provenance gate (R2 Phase A). Synthesises every mask's real
-# uplink packets and fails if nDPI does not classify a mask as its declared
-# target protocol. Gracefully SKIPS (exit 0) when the research DPI toolchain
-# (nDPI + maskpcap under the gitignored research/ tree) is not built, so devs
-# without it are not blocked. See docs/R2_PHASE_A.md.
+# Обязательная DPI-проверка кадров масок. Классификатор собирает deploy/ci/build-dpi-tools.sh.
 mask-gate:
 	deploy/ci/ci-mask-gate.sh
 

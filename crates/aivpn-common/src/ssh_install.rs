@@ -992,6 +992,11 @@ pub fn build_install_argv(params: &InstallParams, remote_dir: &str) -> Vec<Strin
         argv.push(shell_quote(pubkey));
     }
 
+    // Открытый ключ выпуска встраивается при сборке клиента из доверенной CI-переменной.
+    if let Some(public_key) = option_env!("AIVPN_RELEASE_PUBKEY").filter(|key| !key.is_empty()) {
+        argv.push("--release-pubkey".into());
+        argv.push(shell_quote(public_key));
+    }
     for extra in &params.extra_args {
         argv.push(shell_quote(extra));
     }
