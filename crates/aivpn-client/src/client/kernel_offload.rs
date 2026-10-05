@@ -109,6 +109,10 @@ impl super::AivpnClient {
         let Some(transport) = self.transport.clone() else {
             return;
         };
+        // Транспорт без UDP-дескриптора полностью остается в userspace.
+        if transport.raw_fd().is_none() {
+            return;
+        }
         let Some(policy) = client_kernel_policy(self.kernel_session_id, &self.config.tun_config)
         else {
             warn!("kernel accel: нет адреса клиента, offload не включаем");

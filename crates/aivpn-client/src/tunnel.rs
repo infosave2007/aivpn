@@ -210,6 +210,9 @@ pub struct Tunnel {
     split_routes_applied: Vec<String>,
     ipv6_routes_added: bool,
     ipv6_server_bypass: Option<(String, String)>,
+    transport_mark: Option<u32>,
+    #[cfg(target_os = "linux")]
+    transport_routes: Option<crate::transport_routes::TransportRoutes>,
     ipv6_address_applied: Option<(std::net::Ipv6Addr, u8)>,
     /// Active kill-switch instance; deactivated on graceful Drop.
     kill_switch_state: Option<KillSwitch>,
@@ -269,6 +272,9 @@ impl Tunnel {
             split_routes_applied: Vec::new(),
             ipv6_routes_added: false,
             ipv6_server_bypass: None,
+            transport_mark: None,
+            #[cfg(target_os = "linux")]
+            transport_routes: None,
             ipv6_address_applied: None,
             kill_switch_state: None,
         }
@@ -793,7 +799,7 @@ impl Tunnel {
     /// integration, etc.), recover unconditionally by asking pkexec for
     /// one-shot root privilege instead of relying on the file capability.
     #[cfg(target_os = "linux")]
-    fn run_ip_privileged(args: &[&str]) -> io::Result<i32> {
+    pub(crate) fn run_ip_privileged(args: &[&str]) -> io::Result<i32> {
         Ok(Self::run_ip_batch_privileged(&[("cmd", args)])?
             .into_iter()
             .next()
@@ -1293,6 +1299,20 @@ impl Tunnel {
                 .status();
         }
 
+        Ok(())
+    }
+
+    /// Настроить обход до открытия сокетов альтернативного транспорта.
+    pub fn set_transport_mark(&mut self, mark: Option<u32>) -> Result<()> {
+        #[cfg(target_os = "linux")]
+        {
+            self.transport_routes = None;
+            if let Some(mark) = mark {
+                self.transport_routes =
+                    Some(crate::transport_routes::TransportRoutes::install(mark)?);
+            }
+        }
+        self.transport_mark = mark;
         Ok(())
     }
 
@@ -2058,6 +2078,9 @@ impl Tunnel {
             .clone()
             .unwrap_or_else(|| self.config.server_vpn_ip.clone());
         let mut ks = KillSwitch::new(self.config.tun_name.clone(), server_ip);
+        if let Some(mark) = self.transport_mark {
+            ks = ks.with_mark(mark);
+        }
         ks.activate()?;
         self.kill_switch_state = Some(ks);
         Ok(())

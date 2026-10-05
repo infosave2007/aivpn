@@ -51,3 +51,6 @@ pub use aivpn_common::ssh_install;
 pub use client::AivpnClient;
 pub use run::run;
 pub use tunnel::Tunnel;
+
+#[cfg(target_os = "linux")]
+mod transport_routes;

@@ -230,6 +230,11 @@ pub fn udp_transport(socket: Arc<UdpSocket>) -> SharedTransport {
 /// carries iOS's raw Swift context pointer, which nothing synchronises — so it
 /// cannot be reused here. Platforms construct a small guard alongside it.
 pub trait SocketGuard: Send + Sync {
+    /// Метка для согласования маршрутов и kill-switch.
+    fn routing_mark(&self) -> Option<u32> {
+        None
+    }
+
     /// Exempt one socket from the tunnel. Called before the socket's first
     /// byte, once per socket.
     ///
@@ -303,6 +308,10 @@ impl MarkGuard {
 
 #[cfg(target_os = "linux")]
 impl SocketGuard for MarkGuard {
+    fn routing_mark(&self) -> Option<u32> {
+        Some(self.mark)
+    }
+
     fn protect(&self, fd: RawFd) -> Result<()> {
         let mark = self.mark;
         // SAFETY: `fd` is a socket the caller has just created and still owns;

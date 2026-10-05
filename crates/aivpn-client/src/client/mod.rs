@@ -865,6 +865,10 @@ impl AivpnClient {
         // protocol above this point is unchanged either way — it only ever sees
         // `DatagramTransport`.
         if let Some(cfg) = self.config.transport.clone() {
+            if self.config.proxy_listen.is_none() && !self.config.control_only {
+                self.tunnel
+                    .set_transport_mark(self.socket_guard.routing_mark())?;
+            }
             let transport = self
                 .transport_registry
                 .open(&cfg, self.socket_guard.clone())
@@ -1002,7 +1006,13 @@ impl AivpnClient {
             self.kernel_epoch_key = [0u8; 32];
             self.kernel_installed_tag_offset = u16::MAX;
             self.kernel_installed_mdh_len = 0;
-            if self.config.proxy_listen.is_some() || self.config.control_only {
+            if self.config.proxy_listen.is_some()
+                || self.config.control_only
+                || self
+                    .transport
+                    .as_ref()
+                    .is_none_or(|transport| transport.raw_fd().is_none())
+            {
                 self.kernel_accel = None;
             } else {
                 self.kernel_accel = KernelAccel::try_open().map(Arc::new);
@@ -1204,7 +1214,14 @@ impl AivpnClient {
             self.kernel_installed_tag_offset = u16::MAX;
         }
 
-        self.transport = None;
+        if let Some(transport) = self.transport.take() {
+            match tokio::time::timeout(Duration::from_secs(3), transport.close()).await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => warn!("Transport close failed: {error}"),
+                Err(_) => warn!("Transport close timed out"),
+            }
+        }
+        let _ = self.tunnel.set_transport_mark(None);
 
         // Detach XDP filter (Linux only, best-effort)
         #[cfg(target_os = "linux")]
