@@ -140,6 +140,24 @@ impl Drop for TransportRoutes {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn unshare_unavailable(stderr: &str) -> bool {
+        stderr.starts_with("unshare:") && stderr.contains("Operation not permitted")
+    }
+
+    #[test]
+    fn recognizes_hosted_runner_user_namespace_failures() {
+        assert!(unshare_unavailable(
+            "unshare: unshare failed: Operation not permitted\n"
+        ));
+        assert!(unshare_unavailable(
+            "unshare: write failed /proc/self/uid_map: Operation not permitted\n"
+        ));
+        assert!(!unshare_unavailable(
+            "child test failed: assertion mismatch\n"
+        ));
+    }
+
     #[test]
     fn copies_physical_default_for_both_families() {
         let a = route_args(
@@ -237,7 +255,7 @@ mod tests {
             Err(e) => panic!("{e}"),
         };
         let stderr = String::from_utf8_lossy(&output.stderr);
-        if !output.status.success() && stderr.contains("unshare failed: Operation not permitted") {
+        if !output.status.success() && unshare_unavailable(&stderr) {
             eprintln!("пространства имен запрещены: сетевая проверка не выполнена");
             return;
         }

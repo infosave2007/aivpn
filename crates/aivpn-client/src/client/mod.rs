@@ -1640,6 +1640,10 @@ impl Drop for AivpnClient {
 
 /// Загружает постоянный ключ устройства, не заменяя поврежденный файл.
 fn load_or_generate_static_keypair() -> Result<Option<KeyPair>> {
+    #[cfg(test)]
+    let _home_guard = crate::TEST_HOME_MUTEX
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     dirs_home()
         .map(|home| device_identity::load_or_create(&home.join(".config").join("aivpn")))
         .transpose()
