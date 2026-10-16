@@ -33,7 +33,7 @@ RUSER  ?= root
 endif
 REMOTE ?= /opt/aivpn
 
-.PHONY: help setup check test clippy fmt mask-gate hygiene-gate selfcontained swift-parse \
+.PHONY: help setup check test clippy fmt mask-gate hygiene-gate version-gate selfcontained swift-parse \
         linux \
         server server-tiny client server-docker \
         server-arm64 client-arm64 \
@@ -61,6 +61,7 @@ help:
 	@printf "    %-40s %s\n" "make fmt"                 "cargo fmt --all"
 	@printf "    %-40s %s\n" "make mask-gate"           "nDPI-gate every assets/masks/*.json (R2 Phase A)"
 	@printf "    %-40s %s\n" "make hygiene-gate"        "Vocabulary gate over the publicly distributed tree"
+	@printf "    %-40s %s\n" "make version-gate"        "Check release version consistency"
 	@printf "    %-40s %s\n" "make selfcontained"       "Prove the public tree builds with nothing beside it"
 	@printf "    %-40s %s\n" "make swift-parse"         "Syntax-check platforms/ios + platforms/macos (no Xcode needed)"
 	@printf "\n  Server / Client — Linux x86_64\n"
@@ -137,13 +138,12 @@ fmt:
 mask-gate:
 	deploy/ci/ci-mask-gate.sh
 
-# The public tree carries a seam for pluggable datagram transports. The seam
-# itself is unremarkable; what must not leak is vocabulary naming a specific
-# out-of-tree implementation. Those slip in during ordinary work — a doc
-# comment, a debug log, a translation — so this is a build gate, not a review
-# item.
+# Проверка границы публичного дерева и служебных файлов.
 hygiene-gate:
 	deploy/ci/ci-public-hygiene.sh
+
+version-gate:
+	deploy/ci/ci-version-sync.sh
 
 # Cargo resolves every declared dependency, including switched-off optional
 # ones, so a path dependency reaching outside this repository breaks the build

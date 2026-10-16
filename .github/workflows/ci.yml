@@ -35,10 +35,17 @@ jobs:
     - name: Build release server (all production features)
       run: cargo build --locked --release -p aivpn-server --features "management-api,metrics,neural"
 
+    - name: Read workspace version
+      id: workspace-version
+      run: |
+        version="$(awk -F'"' '/^\[workspace\.package\]/{found=1; next} found && /^version = /{print $2; exit}' Cargo.toml)"
+        test -n "$version"
+        echo "version=$version" >> "$GITHUB_OUTPUT"
+
     - name: Upload release server
       uses: actions/upload-artifact@v4
       with:
-        name: aivpn-server-linux-x86_64-1.1.0
+        name: aivpn-server-linux-x86_64-${{ steps.workspace-version.outputs.version }}
         path: target/release/aivpn-server
         if-no-files-found: error
         retention-days: 7
@@ -66,13 +73,12 @@ jobs:
     - name: Mask DPI gate
       run: make mask-gate
 
-    # The public tree carries a seam for pluggable datagram transports. What
-    # must never appear alongside it is vocabulary naming a specific
-    # out-of-tree implementation — one doc comment, log line or translation is
-    # enough to undo the separation, and review does not catch those reliably.
-    # Hard gate: it must be held at zero.
+    # Проверяет границу публичного дерева и служебные файлы.
     - name: Public-tree vocabulary gate
       run: make hygiene-gate
+
+    - name: Release version consistency
+      run: make version-gate
 
     # A path dependency reaching outside the repository is a hard Cargo error
     # for everyone who just cloned it, and invisible to whoever added it — their

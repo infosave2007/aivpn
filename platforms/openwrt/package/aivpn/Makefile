@@ -1,18 +1,14 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=aivpn
-PKG_VERSION:=1.0.0
+PKG_VERSION:=1.2.0
 PKG_RELEASE:=1
 
 PKG_SOURCE_PROTO:=git
 PKG_SOURCE_URL:=https://github.com/infosave2007/aivpn.git
-# Pinned to the v1.0.1 release commit on PKG_SOURCE_URL's origin/master
-# (verified present on that remote — a local/fork-only commit would make
-# OpenWrt's git fetch fail outright), not the floating `master` branch — an
-# unpinned branch means every OpenWrt rebuild can silently pull in
-# unreviewed upstream changes at package-build time. Bump this (and
-# PKG_MIRROR_HASH below) deliberately on each package release.
-PKG_SOURCE_VERSION:=182c5fa2477635714e8455051739b7a12051d125
+# Исходники берутся по тегу выпуска. Тег должен быть опубликован в
+# PKG_SOURCE_URL до запуска загрузки в OpenWrt SDK.
+PKG_SOURCE_VERSION:=v$(PKG_VERSION)
 # TODO(security): "skip" disables OpenWrt's mirror-tarball integrity check —
 # it is a placeholder, not a real hash. A real value can only be produced by
 # the OpenWrt build system itself: inside an OpenWrt buildroot/SDK with this
