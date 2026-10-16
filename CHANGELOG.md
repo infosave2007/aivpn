@@ -28,7 +28,7 @@
 - **Enforced signatures in `production-secure`** - secure builds require trusted signing keys and artifact verification. The mask generator signs both forward and reverse profiles, and Ed25519 verification rejects small-order public keys.
 - **Signed release artifacts** - CI signs server binaries and mask archives with Ed25519 and checks that the configured signing keys match. The SSH installer verifies downloaded artifacts against a separately trusted public key; HTTPS downloads enforce size and redirect-address limits.
 - **Persistent Windows kill-switch** - dedicated Windows Filtering Platform filters are updated in one transaction and survive a client crash. Explicit disconnect removes the filters and reports cleanup failures; unrelated firewall policies are preserved.
-- **Dependency fixes** - updated affected Rust and web dependencies, including the vendored `cryoglyph` dependency on `lru`. A local `braces` patch caps parser nesting at 128 levels and has regression coverage; version-based audit tools still report the unchanged `3.0.3` package version.
+- **Dependency fixes** - updated affected Rust and web dependencies, including `quinn-proto` 0.11.18, `rustls` 0.23.46 and the vendored `cryoglyph` dependency on `lru`. A local `braces` patch caps parser nesting at 128 levels and has regression coverage; version-based audit tools still report the unchanged `3.0.3` package version.
 
 ### Changed
 
@@ -80,7 +80,7 @@
 - **Обязательные подписи в `production-secure`** - защищенная сборка требует доверенных ключей подписи и проверки артефактов. Генератор подписывает прямой и обратный профили масок, проверка Ed25519 отклоняет открытые ключи малого порядка.
 - **Подписанные артефакты выпуска** - CI подписывает серверные бинарники и архивы масок с помощью Ed25519 и проверяет соответствие настроенной пары ключей. SSH-установщик проверяет загрузки по отдельно доверенному открытому ключу; HTTPS-загрузки ограничены по размеру и адресам перенаправлений.
 - **Постоянный kill-switch Windows** - собственные фильтры Windows Filtering Platform обновляются одной транзакцией и сохраняются при аварии клиента. Явное отключение удаляет фильтры и сообщает об ошибках очистки; политики стороннего брандмауэра сохраняются.
-- **Исправления зависимостей** - обновлены затронутые Rust- и веб-зависимости, включая `lru` в локальной копии `cryoglyph`. Локальный patch `braces` ограничивает вложенность парсера 128 уровнями и покрыт регрессионными тестами; аудит по номеру версии продолжает отмечать неизмененный пакет `3.0.3`.
+- **Исправления зависимостей** - обновлены затронутые Rust- и веб-зависимости, включая `quinn-proto` 0.11.18, `rustls` 0.23.46 и `lru` в локальной копии `cryoglyph`. Локальный patch `braces` ограничивает вложенность парсера 128 уровнями и покрыт регрессионными тестами; аудит по номеру версии продолжает отмечать неизмененный пакет `3.0.3`.
 
 ### Изменено
 
