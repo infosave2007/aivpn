@@ -5,10 +5,9 @@ PKG_VERSION:=1.2.0
 PKG_RELEASE:=1
 
 PKG_SOURCE_PROTO:=git
-PKG_SOURCE_URL:=https://github.com/infosave2007/aivpn.git
-# Исходники берутся по тегу выпуска. Тег должен быть опубликован в
-# PKG_SOURCE_URL до запуска загрузки в OpenWrt SDK.
-PKG_SOURCE_VERSION:=v$(PKG_VERSION)
+PKG_SOURCE_URL:=https://github.com/vaminakov/aivpn.git
+# Закрепленный коммит содержит исходники приложения версии 1.2.0.
+PKG_SOURCE_VERSION:=1f65760e5d5cedf4a893cbee1db3276734bdba0b
 # TODO(security): "skip" disables OpenWrt's mirror-tarball integrity check —
 # it is a placeholder, not a real hash. A real value can only be produced by
 # the OpenWrt build system itself: inside an OpenWrt buildroot/SDK with this
