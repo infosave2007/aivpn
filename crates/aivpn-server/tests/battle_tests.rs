@@ -1628,3 +1628,224 @@ fn test_gateway_creation_with_neural() {
         "Gateway must create successfully with neural module"
     );
 }
+
+fn authenticated_session(
+    manager: &SessionManager,
+    server: &KeyPair,
+    addr: &str,
+    ip: &str,
+    identity: &str,
+    psk: [u8; 32],
+) -> aivpn_common::error::Result<std::sync::Arc<parking_lot::Mutex<aivpn_server::session::Session>>>
+{
+    let key = KeyPair::generate();
+    let eph = key.public_key_bytes();
+    let dh = key.compute_shared(&server.public_key_bytes()).unwrap();
+    let keys = derive_session_keys(&dh, Some(&psk), &eph);
+    let tag = generate_resonance_tag(
+        &keys.tag_secret,
+        0,
+        compute_time_window(current_timestamp_ms(), DEFAULT_WINDOW_MS),
+    );
+    manager.create_authenticated_session(
+        addr.parse().unwrap(),
+        eph,
+        psk,
+        ip.parse().unwrap(),
+        identity,
+        &tag,
+    )
+}
+
+#[test]
+fn reconnect_at_nat_limit_preserves_other_clients_and_bounds_reserve() {
+    let (manager, server) = make_session_manager();
+    let mut original = Vec::new();
+    for i in 0..5 {
+        let session = authenticated_session(
+            &manager,
+            &server,
+            &format!("203.0.113.1:{}", 10000 + i),
+            &format!("10.0.0.{}", i + 2),
+            &format!("client-{i}"),
+            [i as u8; 32],
+        )
+        .unwrap();
+        original.push(session.lock().session_id);
+    }
+    assert!(authenticated_session(
+        &manager,
+        &server,
+        "203.0.113.1:20000",
+        "10.0.0.9",
+        "new-client",
+        [9; 32]
+    )
+    .is_err());
+    let replacement = authenticated_session(
+        &manager,
+        &server,
+        "203.0.113.1:20001",
+        "10.0.0.2",
+        "client-0",
+        [0; 32],
+    )
+    .unwrap();
+    assert_eq!(manager.session_count(), 6);
+    assert!(manager.get_session(&original[0]).is_some());
+    assert!(authenticated_session(
+        &manager,
+        &server,
+        "203.0.113.1:20002",
+        "10.0.0.2",
+        "client-0",
+        [0; 32]
+    )
+    .is_err());
+    assert_eq!(manager.session_count(), 6);
+    let id = replacement.lock().session_id;
+    assert_eq!(
+        manager.cleanup_old_sessions_for_client_id("client-0", &id),
+        vec![original[0]]
+    );
+    assert_eq!(manager.session_count(), 5);
+    for id in &original[1..] {
+        assert!(manager.get_session(id).is_some());
+    }
+    assert_eq!(
+        manager
+            .get_session_by_vpn_ip(&"10.0.0.2".parse().unwrap())
+            .unwrap()
+            .lock()
+            .session_id,
+        id
+    );
+}
+
+#[test]
+fn reconnect_at_subnet_limit_requires_a_valid_handshake() {
+    let (manager, server) = make_session_manager();
+    for i in 0..10 {
+        authenticated_session(
+            &manager,
+            &server,
+            &format!("203.0.113.{}:10000", i + 1),
+            &format!("10.0.0.{}", i + 2),
+            &format!("client-{i}"),
+            [i as u8; 32],
+        )
+        .unwrap();
+    }
+    let key = KeyPair::generate();
+    assert!(manager
+        .create_authenticated_session(
+            "203.0.113.1:20000".parse().unwrap(),
+            key.public_key_bytes(),
+            [0; 32],
+            "10.0.0.2".parse().unwrap(),
+            "client-0",
+            &[0; TAG_SIZE]
+        )
+        .is_err());
+    assert_eq!(manager.session_count(), 10);
+    assert!(authenticated_session(
+        &manager,
+        &server,
+        "203.0.113.20:10000",
+        "10.0.0.20",
+        "new-client",
+        [20; 32]
+    )
+    .is_err());
+    let replacement = authenticated_session(
+        &manager,
+        &server,
+        "203.0.113.20:20000",
+        "10.0.0.2",
+        "client-0",
+        [0; 32],
+    )
+    .unwrap();
+    assert_eq!(manager.session_count(), 11);
+    let id = replacement.lock().session_id;
+    manager.cleanup_old_sessions_for_client_id("client-0", &id);
+    assert_eq!(manager.session_count(), 10);
+}
+
+#[test]
+fn global_reserve_accepts_reconnect_but_not_a_new_client() {
+    let (manager, server) = make_session_manager();
+    for i in 0..(aivpn_server::session::MAX_SESSIONS - 10) {
+        let session = manager
+            .create_session(
+                make_unique_addr(i as u16),
+                KeyPair::generate().public_key_bytes(),
+                Some([0; 32]),
+                None,
+            )
+            .unwrap();
+        session.lock().client_id = Some(format!("client-{i}"));
+    }
+    assert!(authenticated_session(
+        &manager,
+        &server,
+        "192.0.2.1:10000",
+        "10.10.0.2",
+        "new-client",
+        [0; 32]
+    )
+    .is_err());
+    let replacement = authenticated_session(
+        &manager,
+        &server,
+        "192.0.2.1:20000",
+        "10.10.0.2",
+        "client-0",
+        [0; 32],
+    )
+    .unwrap();
+    let id = replacement.lock().session_id;
+    assert_eq!(
+        manager
+            .cleanup_old_sessions_for_client_id("client-0", &id)
+            .len(),
+        1
+    );
+    assert_eq!(
+        manager.session_count(),
+        aivpn_server::session::MAX_SESSIONS - 10
+    );
+}
+
+#[test]
+fn concurrent_handshakes_cannot_overrun_the_nat_limit() {
+    let (manager, server) = make_session_manager();
+    let manager = std::sync::Arc::new(manager);
+    let start = std::sync::Arc::new(std::sync::Barrier::new(6));
+    let threads: Vec<_> = (0..6)
+        .map(|i| {
+            let manager = manager.clone();
+            let server = server.clone();
+            let start = start.clone();
+            std::thread::spawn(move || {
+                start.wait();
+                authenticated_session(
+                    &manager,
+                    &server,
+                    &format!("203.0.113.1:{}", 10000 + i),
+                    &format!("10.0.0.{}", i + 2),
+                    &format!("client-{i}"),
+                    [i as u8; 32],
+                )
+                .is_ok()
+            })
+        })
+        .collect();
+    let accepted = threads
+        .into_iter()
+        .map(|thread| thread.join().unwrap())
+        .filter(|ok| *ok)
+        .count();
+    assert_eq!(accepted, 5);
+    assert_eq!(manager.session_count(), 5);
+}

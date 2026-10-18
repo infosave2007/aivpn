@@ -50,9 +50,11 @@
 
 ### 第 4 步 — 创建并启动容器
 
+按照下方说明构建镜像，使用 `docker save` 导出，然后通过 WinBox 将 `aivpn-mikrotik.tar` 上传到 `disk1/`。从文件导入不需要 Docker Hub 上已发布的镜像。[RouterOS 镜像导入说明](https://help.mikrotik.com/docs/spaces/ROS/pages/84901929/Container#Container-OptionB:ImportimagefromPC)。
+
 ```routeros
 /container/add \
-    remote-image=infosave2007/aivpn-mikrotik:latest \
+    file=disk1/aivpn-mikrotik.tar \
     interface=veth-aivpn \
     start-on-boot=yes \
     envlist=aivpn-env \
@@ -110,14 +112,17 @@ aivpn-server --show-client "my-mikrotik" \
 ```bash
 # 单架构（arm64）
 docker build \
-    --platform linux/amd64 \
+    --platform linux/arm64 \
     --build-arg MUSL_IMAGE_TAG=aarch64-musl \
     --build-arg TARGET_TRIPLE=aarch64-unknown-linux-musl \
     -t aivpn-mikrotik:arm64 \
-    -f aivpn-mikrotik/Dockerfile .
+    -f platforms/mikrotik/Dockerfile .
+
+# 导出镜像以供路由器导入
+docker save --output aivpn-mikrotik.tar aivpn-mikrotik:arm64
 
 # 多架构推送到 Docker Hub
-./aivpn-mikrotik/build-mikrotik.sh infosave2007/aivpn-mikrotik:latest
+./platforms/mikrotik/build-mikrotik.sh infosave2007/aivpn-mikrotik:latest
 ```
 
 ## 故障排除

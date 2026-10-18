@@ -150,6 +150,9 @@ jobs:
     - name: Helper certificate failure tests
       run: python3 deploy/ci/test-helper-certificate.py
 
+    - name: macOS client path tests
+      run: python3 deploy/ci/test-macos-client-paths.py
+
     - name: Device identity failure tests
       run: swift test --package-path platforms/ios
 

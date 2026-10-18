@@ -800,7 +800,8 @@ impl super::AivpnClient {
                 } else if status == "analyzing" {
                     self.active_recording_session = None;
                 }
-                crate::record_cmd::handle_recording_ack(&session_id, &status);
+                self.recording_status
+                    .handle_recording_ack(&session_id, &status);
             }
             ControlPayload::RecordingComplete {
                 service,
@@ -808,17 +809,19 @@ impl super::AivpnClient {
                 confidence,
             } => {
                 self.active_recording_session = None;
-                crate::record_cmd::handle_recording_complete(&service, &mask_id, confidence);
+                self.recording_status
+                    .handle_recording_complete(&service, &mask_id, confidence);
             }
             ControlPayload::RecordingFailed { reason } => {
                 self.active_recording_session = None;
-                crate::record_cmd::handle_recording_failed(&reason);
+                self.recording_status.handle_recording_failed(&reason);
             }
             ControlPayload::RecordingStatus {
                 can_record,
                 active_service,
             } => {
-                crate::record_cmd::handle_recording_status(can_record, active_service.as_deref());
+                self.recording_status
+                    .handle_recording_status(can_record, active_service.as_deref());
             }
             ControlPayload::CertRejected {} => {
                 warn!("mTLS: server rejected the certificate — re-provision your mTLS cert");
@@ -839,7 +842,7 @@ impl super::AivpnClient {
                     let rtt_us = now_ms.saturating_sub(sent_ms).saturating_mul(1000);
                     self.quality_tracker.record_rtt(rtt_us);
                     let score = self.quality_tracker.score();
-                    Self::write_quality_file(
+                    self.write_quality_file(
                         score,
                         self.quality_tracker.rtt_ms(),
                         self.quality_tracker.jitter_ms(),

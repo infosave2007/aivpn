@@ -15,16 +15,8 @@ import SystemConfiguration
 // MARK: - Constants
 
 let SOCKET_PATH = "/var/run/aivpn/helper.sock"
-let DEFAULT_CLIENT_PATH = "/Library/Application Support/AIVPN/aivpn-client"
-let ALLOWED_CLIENT_PATHS = [
-    // build.sh produces "Aivpn.app"; the filesystem is case-insensitive but
-    // this string comparison is not — keep both historical capitalizations.
-    "/Applications/Aivpn.app/Contents/MacOS/aivpn-client",
-    "/Applications/Aivpn.app/Contents/Resources/aivpn-client",
-    "/Applications/AIVPN.app/Contents/MacOS/aivpn-client",
-    "/Applications/AIVPN.app/Contents/Resources/aivpn-client",
-    DEFAULT_CLIENT_PATH,
-]
+let DEFAULT_CLIENT_PATH = ClientBinaryPolicy.defaultPath
+let ALLOWED_CLIENT_PATHS = ClientBinaryPolicy.allowedPaths
 let LOG_PATH = "/var/run/aivpn/client.log"
 let PID_PATH = "/var/run/aivpn/client.pid"
 let RECORDING_STATUS_PATH = "/var/run/aivpn/recording.status"
@@ -300,7 +292,7 @@ func startClient(key: String, fullTunnel: Bool, binaryPath: String?, mtlsCertPat
     // child's environment is only readable by root/same-uid. The Rust client
     // reads the env var when -k is absent (crates/aivpn-client/src/main.rs)
     // and removes it from its own environment immediately after parsing.
-    var args: [String] = [clientPath]
+    var args: [String] = [clientPath, "--admin-listen", "127.0.0.1:44301"]
     var certificateFd: Int32 = -1
     defer { if certificateFd >= 0 { close(certificateFd) } }
 
@@ -638,7 +630,7 @@ func runClientCommand(args: [String], binaryPath: String?) -> HelperResponse {
 
     let task = Process()
     task.executableURL = URL(fileURLWithPath: clientPath)
-    task.arguments = args
+    task.arguments = ["--admin-listen", "127.0.0.1:44301"] + args
 
     let outputPipe = Pipe()
     task.standardOutput = outputPipe

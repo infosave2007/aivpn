@@ -502,6 +502,8 @@ pub struct AivpnClient {
     _recv_buf: Vec<u8>,
     proxy_handle: Option<crate::proxy::ProxyHandle>,
     // Recording tracking
+    admin_listen: std::net::SocketAddrV4,
+    recording_status: crate::record_cmd::RecordingStatusStore,
     active_recording_session: Option<[u8; 16]>,
     keepalive_interval: Duration,
     /// Shared keepalive interval in milliseconds with the upload task for dynamic updates.
@@ -629,6 +631,11 @@ pub struct AivpnClient {
 }
 
 impl AivpnClient {
+    pub fn set_admin_listen(&mut self, addr: std::net::SocketAddrV4) {
+        self.admin_listen = addr;
+        self.recording_status = crate::record_cmd::RecordingStatusStore::for_endpoint(addr);
+    }
+
     /// Create new client
     pub fn new(config: ClientConfig) -> Result<Self> {
         let keypair = KeyPair::generate();
@@ -723,6 +730,10 @@ impl AivpnClient {
             _send_buf: Vec::with_capacity(MAX_PACKET_SIZE),
             _recv_buf: Vec::with_capacity(MAX_PACKET_SIZE),
             proxy_handle: None,
+            admin_listen: crate::record_cmd::DEFAULT_ADMIN_ADDR,
+            recording_status: crate::record_cmd::RecordingStatusStore::for_endpoint(
+                crate::record_cmd::DEFAULT_ADMIN_ADDR,
+            ),
             active_recording_session: None,
             keepalive_interval: initial_keepalive,
             keepalive_interval_ms: Arc::new(AtomicU64::new(initial_keepalive.as_millis() as u64)),
@@ -1590,37 +1601,14 @@ impl AivpnClient {
         self.bytes_received.load(Ordering::Relaxed)
     }
 
-    fn write_quality_file(score: u8, rtt_ms: u16, jitter_ms: u16, adaptive_level: u8) {
+    fn write_quality_file(&self, score: u8, rtt_ms: u16, jitter_ms: u16, adaptive_level: u8) {
         let content = format!(
             r#"{{"quality":{},"rtt_ms":{},"jitter_ms":{},"adaptive":{}}}"#,
             score, rtt_ms, jitter_ms, adaptive_level
         );
-        // O_NOFOLLOW/create_new-hardened atomic write (secure_write.rs): this
-        // falls back to a predictable world-writable /tmp path, which a
-        // local attacker could pre-plant as a symlink to a file this
-        // (possibly root-run) process can write.
-        #[cfg(windows)]
-        {
-            let path = std::env::temp_dir().join("aivpn-quality.json");
+        for path in crate::record_cmd::local_status_paths(self.admin_listen, "quality.json") {
             if !crate::secure_write::write_status_best_effort(&path, content.as_bytes()) {
-                debug!("quality file write failed");
-            }
-        }
-        #[cfg(not(windows))]
-        {
-            let primary = std::path::PathBuf::from("/var/run/aivpn/quality.json");
-            let fallback = std::path::PathBuf::from("/tmp/aivpn-quality.json");
-            let dir_ok = primary
-                .parent()
-                .map(std::fs::create_dir_all)
-                .map(|r| r.is_ok())
-                .unwrap_or(false);
-            let wrote = dir_ok
-                && crate::secure_write::write_status_best_effort(&primary, content.as_bytes());
-            if !wrote
-                && !crate::secure_write::write_status_best_effort(&fallback, content.as_bytes())
-            {
-                debug!("quality file write failed");
+                debug!("quality file write failed: {}", path.display());
             }
         }
     }

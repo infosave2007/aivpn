@@ -14,6 +14,11 @@
 
 ### Fixed
 
+- **Multiple client instances** - a busy admin socket no longer causes a CPU spin or overwrites another client's token. `--admin-listen` / `AIVPN_ADMIN_LISTEN` selects a separate loopback endpoint for each instance and its management commands; recording status, traffic and quality files are isolated. Pending management replies release the socket when the session ends.
+- **Reconnects behind NAT** - a PSK-verified client can replace its existing session at the per-IP or subnet limit without disconnecting neighboring clients. Replacement slots are bounded, duplicate pending replacements are rejected and new clients retain the normal limits.
+- **macOS application location** - the GUI and privileged helper share the permitted binary paths. A renamed or relocated app uses the installed system client instead of passing a path that the helper rejects.
+- **MikroTik build instructions** - corrected repository paths and the runtime architecture in the arm64 Docker example; documented local image export and RouterOS file import without relying on a missing registry image.
+
 - **Concurrent database and status writes** - `clients.json` mutations lock and reload the current file before saving, preventing one process from overwriting another's changes. Failed saves no longer leave a successful change only in memory; client status snapshots are written atomically.
 - **IPv6 assignment and packet handling** - desktop routes follow the assigned network and are removed on disconnect; Android rebuilds the tunnel when the address, prefix or MTU changes, and iOS applies the assignment through Network Extension. DSCP updates preserve ECN, and IPv4 checksum calculation includes header options.
 - **Management request deadlines** - the timeout now covers waiting for queue capacity as well as the response, so a full transport queue cannot leave a request waiting indefinitely.
@@ -65,6 +70,11 @@
 - **Настраиваемый DNS в режиме SOCKS5** - `--proxy-dns` принимает до четырех IPv4 DNS-серверов, включая внутренние резолверы, доступные через VPN. Региональные подсказки также участвуют в выборе маски, не подменяя проверенный bootstrap-дескриптор неподписанным пресетом.
 
 ### Исправлено
+
+- **Несколько экземпляров клиента** - занятый admin-сокет больше не вызывает загрузку CPU пустым циклом и не перезаписывает чужой токен. `--admin-listen` / `AIVPN_ADMIN_LISTEN` задает отдельный локальный адрес экземпляра и команд управления; статус записи, счетчики трафика и качество соединения хранятся раздельно. Незавершенные управляющие запросы не удерживают сокет после завершения сессии.
+- **Переподключение за NAT** - клиент с проверенным PSK может заменить свою сессию при заполненном лимите IP или подсети, не отключая соседние клиенты. Резерв ограничен, повторная незавершенная замена отклоняется; новые клиенты подчиняются обычным лимитам.
+- **Расположение приложения macOS** - GUI и привилегированный helper используют общий список разрешенных путей. Переименованное или перемещенное приложение использует установленный системный клиент вместо передачи пути, который helper отклонит.
+- **Инструкции сборки MikroTik** - исправлены пути внутри репозитория и архитектура исполняемого образа в примере сборки arm64; добавлены экспорт локального образа и импорт файла в RouterOS без зависимости от отсутствующего образа в реестре.
 
 - **Одновременная запись БД и статуса** - изменения `clients.json` выполняются под файловой блокировкой с перечитыванием актуальной версии, поэтому процессы не затирают изменения друг друга. Ошибка сохранения больше не оставляет успешное изменение только в памяти; снимки статуса клиента записываются атомарно.
 - **Назначение IPv6 и обработка пакетов** - настольные клиенты настраивают маршруты по назначенной сети и удаляют их при отключении. Android пересоздает туннель при смене адреса, префикса или MTU, iOS применяет назначение через Network Extension. Изменение DSCP сохраняет ECN, расчет контрольной суммы IPv4 учитывает опции заголовка.

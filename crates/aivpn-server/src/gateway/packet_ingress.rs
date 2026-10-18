@@ -198,18 +198,6 @@ impl super::Gateway {
                 }
             };
 
-            // Guard against session pool exhaustion: the handshake path calls
-            // create_session() speculatively for every (client × bootstrap_mask)
-            // combination before tag validation confirms which one is correct.
-            // An attacker spoofing many source IPs can fill the pool with temporary
-            // sessions and block legitimate clients. Reserve 10 slots so ratchet
-            // renewals for existing sessions always have capacity.
-            if self.session_manager.session_count() + 10 >= MAX_SESSIONS {
-                debug!("Session pool near capacity ({}/{}), dropping unauthenticated handshake from {}",
-                    self.session_manager.session_count(), MAX_SESSIONS, hash_addr(&client_addr));
-                return Ok(());
-            }
-
             // No session found — try handshake
             // Rate-limit failed handshake attempts to prevent rapid session-creation loops.
             // After mask rotation or session timeout, stale clients may flood the server
@@ -458,11 +446,13 @@ impl super::Gateway {
                             continue;
                         }
 
-                        match self.session_manager.create_session(
+                        match self.session_manager.create_authenticated_session(
                             client_addr,
                             eph_pub,
-                            Some(psk),
-                            Some(client_cfg.vpn_ip),
+                            psk,
+                            client_cfg.vpn_ip,
+                            &client_cfg.id,
+                            &cand_tag,
                         ) {
                             Ok(sess) => {
                                 let validation = sess.lock().validate_handshake_tag(&cand_tag);

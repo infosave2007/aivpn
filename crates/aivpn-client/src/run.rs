@@ -51,6 +51,10 @@ const HEALTHY_CONNECTION_THRESHOLD: Duration = Duration::from_secs(30);
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 pub struct ClientArgs {
+    /// Локальный адрес управления; каждому экземпляру нужен отдельный порт.
+    #[arg(long, global = true, env = "AIVPN_ADMIN_LISTEN", default_value = "127.0.0.1:44301", value_parser = aivpn_client::record_cmd::parse_admin_addr)]
+    pub admin_listen: std::net::SocketAddrV4,
+
     /// Server address (e.g., 1.2.3.4:443)
     #[arg(short, long)]
     pub server: Option<String>,
@@ -257,8 +261,8 @@ pub enum ClientCommand {
         #[arg(long)]
         token: Option<String>,
         /// Admin-socket address of the running client daemon.
-        #[arg(long, default_value = "127.0.0.1:44301")]
-        socket: String,
+        #[arg(long, value_parser = aivpn_client::record_cmd::parse_admin_addr)]
+        socket: Option<std::net::SocketAddrV4>,
     },
     /// P2.3-desktop: report the server-assigned role (0=User, 1=Viewer,
     /// 2=Admin) cached by the running client daemon.
@@ -267,8 +271,8 @@ pub enum ClientCommand {
         #[arg(long)]
         token: Option<String>,
         /// Admin-socket address of the running client daemon.
-        #[arg(long, default_value = "127.0.0.1:44301")]
-        socket: String,
+        #[arg(long, value_parser = aivpn_client::record_cmd::parse_admin_addr)]
+        socket: Option<std::net::SocketAddrV4>,
     },
     /// Wave C2b-CLI: desktop bridge to the server SSH-installer
     /// (`aivpn_common::ssh_install`, re-exported as `aivpn_client::ssh_install`).
@@ -314,14 +318,15 @@ impl MgmtMethod {
 /// `role` CLI subcommands, which — unlike the pre-existing `record`
 /// subcommand (fire-and-forget, polls a status file) — need the daemon's
 /// direct reply.
-fn send_admin_request(socket_addr: &str, line: &str) -> Option<String> {
+fn send_admin_request(socket_addr: std::net::SocketAddrV4, line: &str) -> Option<String> {
     let socket = std::net::UdpSocket::bind("127.0.0.1:0").ok()?;
     socket
         .set_read_timeout(Some(std::time::Duration::from_secs(5)))
         .ok()?;
-    socket.send_to(line.as_bytes(), socket_addr).ok()?;
+    socket.connect(socket_addr).ok()?;
+    socket.send(line.as_bytes()).ok()?;
     let mut buf = [0u8; 65536];
-    let (len, _addr) = socket.recv_from(&mut buf).ok()?;
+    let len = socket.recv(&mut buf).ok()?;
     std::str::from_utf8(&buf[..len]).ok().map(|s| s.to_string())
 }
 
@@ -471,12 +476,14 @@ pub async fn run(
     // Собирается один раз на процесс: реестр неизменен после старта, а каждая
     // итерация переподключения получает тот же Arc.
     let registry = std::sync::Arc::new(transport_registry(extra));
+    let mut args = ClientArgs::parse();
 
     // On Windows, stderr inheritance via Stdio::from(File) is unreliable for
     // cross-compiled (MinGW) binaries with CREATE_NO_WINDOW. Write the log
     // directly to %LOCALAPPDATA%\AIVPN\client.log instead.
     #[cfg(target_os = "windows")]
     let _log_guard = {
+        let admin_addr = args.admin_listen;
         let args: Vec<String> = std::env::args().collect();
         // Only write to the persistent log file for the main VPN connection mode.
         // Subcommands (record, kill-switch, bench, mgmt, role, ssh-install) are
@@ -505,8 +512,15 @@ pub async fn run(
         let log_path = if is_subcommand {
             None
         } else {
-            std::env::var_os("LOCALAPPDATA")
-                .map(|p| std::path::PathBuf::from(p).join("AIVPN").join("client.log"))
+            std::env::var_os("LOCALAPPDATA").map(|p| {
+                std::path::PathBuf::from(p).join("AIVPN").join(
+                    if admin_addr == aivpn_client::record_cmd::DEFAULT_ADMIN_ADDR {
+                        "client.log".to_string()
+                    } else {
+                        format!("client-{}.log", admin_addr.port())
+                    },
+                )
+            })
         };
 
         if let Some(ref path) = log_path {
@@ -649,8 +663,6 @@ pub async fn run(
         });
     }
 
-    // Parse arguments
-    let mut args = ClientArgs::parse();
     if args.connection_key.is_none() {
         if let Ok(val) = std::env::var("AIVPN_CONNECTION_KEY") {
             args.connection_key = Some(val);
@@ -730,12 +742,13 @@ pub async fn run(
                     }),
                     None => Vec::new(),
                 };
+                let socket = socket.unwrap_or(args.admin_listen);
                 let token = token
-                    .or_else(aivpn_client::record_cmd::read_admin_token)
+                    .or_else(|| aivpn_client::record_cmd::read_admin_token_at(socket))
                     .unwrap_or_default();
                 let body_b64 = aivpn_client::record_cmd::encode_body_b64(&body);
                 let line = format!("{token}:mgmt:{}:{path}:{body_b64}", method.as_u8());
-                match send_admin_request(&socket, &line) {
+                match send_admin_request(socket, &line) {
                     Some(reply) => match aivpn_client::record_cmd::parse_mgmt_reply(&reply) {
                         Some((status, resp_body)) => {
                             eprintln!("{status}");
@@ -758,11 +771,12 @@ pub async fn run(
                 return;
             }
             ClientCommand::Role { token, socket } => {
+                let socket = socket.unwrap_or(args.admin_listen);
                 let token = token
-                    .or_else(aivpn_client::record_cmd::read_admin_token)
+                    .or_else(|| aivpn_client::record_cmd::read_admin_token_at(socket))
                     .unwrap_or_default();
                 let line = format!("{token}:role");
-                match send_admin_request(&socket, &line) {
+                match send_admin_request(socket, &line) {
                     Some(reply) => println!("{reply}"),
                     None => {
                         eprintln!("No reply from daemon at {socket} (is aivpn-client running?)");
@@ -777,15 +791,22 @@ pub async fn run(
                 std::process::exit(code);
             }
             ClientCommand::Record { action } => {
+                let store =
+                    aivpn_client::record_cmd::RecordingStatusStore::for_endpoint(args.admin_listen);
+                let token = aivpn_client::record_cmd::read_admin_token_at(args.admin_listen)
+                    .unwrap_or_else(|| {
+                        eprintln!(
+                            "No admin token at {} (is this client running?)",
+                            args.admin_listen
+                        );
+                        std::process::exit(1);
+                    });
                 match action {
                     RecordAction::Start { service } => {
-                        aivpn_client::record_cmd::handle_recording_status(true, Some(&service));
-                        let token =
-                            aivpn_client::record_cmd::read_admin_token().unwrap_or_default();
                         match std::net::UdpSocket::bind("127.0.0.1:0").and_then(|s| {
                             s.send_to(
                                 format!("{token}:record_start:{service}").as_bytes(),
-                                "127.0.0.1:44301",
+                                args.admin_listen,
                             )
                             .map(|_| s)
                         }) {
@@ -797,14 +818,8 @@ pub async fn run(
                         }
                     }
                     RecordAction::Stop => {
-                        let prior = aivpn_client::record_cmd::read_local_status();
-                        aivpn_client::record_cmd::mark_recording_stop_requested(
-                            prior.as_ref().and_then(|status| status.service.as_deref()),
-                        );
-                        let token =
-                            aivpn_client::record_cmd::read_admin_token().unwrap_or_default();
                         match std::net::UdpSocket::bind("127.0.0.1:0").and_then(|s| {
-                            s.send_to(format!("{token}:record_stop").as_bytes(), "127.0.0.1:44301")
+                            s.send_to(format!("{token}:record_stop").as_bytes(), args.admin_listen)
                                 .map(|_| s)
                         }) {
                             Ok(_) => {}
@@ -814,31 +829,28 @@ pub async fn run(
                         println!("Run 'aivpn-client record status' to inspect progress.");
                     }
                     RecordAction::Status => {
-                        let before = aivpn_client::record_cmd::read_local_status()
+                        let before = store
+                            .read_local_status()
                             .map(|status| status.updated_at_ms)
                             .unwrap_or(0);
-                        let token =
-                            aivpn_client::record_cmd::read_admin_token().unwrap_or_default();
                         if let Ok(socket) = std::net::UdpSocket::bind("127.0.0.1:0") {
                             let _ = socket.send_to(
                                 format!("{token}:record_status").as_bytes(),
-                                "127.0.0.1:44301",
+                                args.admin_listen,
                             );
                         }
                         let start = std::time::Instant::now();
                         let mut latest = None;
                         while start.elapsed() < std::time::Duration::from_secs(2) {
-                            if let Some(status) = aivpn_client::record_cmd::read_local_status() {
-                                if status.updated_at_ms >= before {
+                            if let Some(status) = store.read_local_status() {
+                                if status.updated_at_ms > before {
                                     latest = Some(status);
                                     break;
                                 }
                             }
                             std::thread::sleep(std::time::Duration::from_millis(100));
                         }
-                        if let Some(status) =
-                            latest.or_else(aivpn_client::record_cmd::read_local_status)
-                        {
+                        if let Some(status) = latest.or_else(|| store.read_local_status()) {
                             aivpn_client::record_cmd::print_local_status(&status);
                         } else {
                             println!("No recording status is available yet.");
@@ -1715,28 +1727,16 @@ pub async fn run(
                 client.set_transport_registry(registry.clone(), guard.clone());
                 info!("Client initialized successfully (TUN: {})", tun_name);
 
-                // Write initial stats file (platform-appropriate paths)
-                #[cfg(target_os = "windows")]
-                {
-                    if let Some(local_app) = std::env::var_os("LOCALAPPDATA") {
-                        let dir = std::path::PathBuf::from(local_app).join("AIVPN");
-                        let _ = std::fs::create_dir_all(&dir);
-                        let _ = std::fs::write(dir.join("traffic.stats"), "sent:0,received:0");
-                    }
-                    let _ = std::fs::write(
-                        std::env::temp_dir().join("aivpn-traffic.stats"),
-                        "sent:0,received:0",
-                    );
-                }
-                #[cfg(not(target_os = "windows"))]
-                {
-                    let _ = std::fs::write("/var/run/aivpn/traffic.stats", "sent:0,received:0");
-                    let _ = std::fs::write("/tmp/aivpn-traffic.stats", "sent:0,received:0");
-                }
-                aivpn_client::record_cmd::reset_local_status();
+                client.set_admin_listen(args.admin_listen);
 
                 let connect_started = std::time::Instant::now();
                 let run_result = client.run(shutdown.clone()).await;
+                if matches!(&run_result, Err(aivpn_common::Error::Io(error)) if error.kind() == std::io::ErrorKind::AddrInUse)
+                {
+                    error!("Local address already in use; choose distinct --admin-listen and --proxy-listen ports");
+                    client.deactivate_kill_switch();
+                    std::process::exit(1);
+                }
 
                 // §2 L2 failure attribution — did this attempt ever reach a
                 // connected state? An attempt that never connected is evidence
@@ -1941,6 +1941,40 @@ mod tests {
     }
 
     // ── valid key round-trip ──────────────────────────────────────────────────
+
+    #[test]
+    fn admin_endpoint_is_available_before_and_after_subcommand() {
+        for argv in [
+            vec![
+                "aivpn-client",
+                "--admin-listen",
+                "127.0.0.1:44302",
+                "record",
+                "status",
+            ],
+            vec![
+                "aivpn-client",
+                "record",
+                "status",
+                "--admin-listen",
+                "127.0.0.1:44302",
+            ],
+        ] {
+            assert_eq!(
+                ClientArgs::try_parse_from(argv)
+                    .unwrap()
+                    .admin_listen
+                    .port(),
+                44302
+            );
+        }
+        let args =
+            ClientArgs::try_parse_from(["aivpn-client", "role", "--socket", "127.0.0.1:44303"])
+                .unwrap();
+        assert!(
+            matches!(args.command, Some(ClientCommand::Role { socket: Some(addr), .. }) if addr.port() == 44303)
+        );
+    }
 
     #[test]
     fn test_parse_connection_key_valid_full() {

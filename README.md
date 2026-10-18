@@ -365,6 +365,19 @@ aivpn-client -k "aivpn://..." --proxy-listen 127.0.0.1:1080
 
 Configure Firefox / Chrome / curl to use `SOCKS5 127.0.0.1:1080`. No TUN device or administrator privileges required.
 
+For multiple clients, assign distinct SOCKS and admin ports and use a separate connection key for each client. Admin endpoints accept only `127.0.0.1` with a nonzero port:
+
+```bash
+AIVPN_CONNECTION_KEY="$KEY_ONE" aivpn-client --proxy-listen 127.0.0.1:1080 --admin-listen 127.0.0.1:44301
+AIVPN_CONNECTION_KEY="$KEY_TWO" aivpn-client --proxy-listen 127.0.0.1:1081 --admin-listen 127.0.0.1:44302
+
+aivpn-client --admin-listen 127.0.0.1:44302 record status
+aivpn-client --admin-listen 127.0.0.1:44302 role
+aivpn-client --admin-listen 127.0.0.1:44302 mgmt --method GET --path /api/v1/clients
+```
+
+`AIVPN_ADMIN_LISTEN` can replace the flag. Tokens, recording status and traffic counters are scoped to the admin port. The GUI uses `127.0.0.1:44301`; additional CLI clients must select other ports. A busy address fails before tunnel setup without replacing the running client's token.
+
 ---
 
 ## Connection Key Format

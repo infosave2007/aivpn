@@ -1667,6 +1667,7 @@ impl App {
                     async move {
                         if let Some(bin) = binary {
                             let _ = tokio::process::Command::new(&bin)
+                                .env_remove("AIVPN_ADMIN_LISTEN")
                                 .args(["record", "start", "--service", &svc])
                                 .output()
                                 .await;
@@ -1682,6 +1683,7 @@ impl App {
                     async move {
                         if let Some(bin) = binary {
                             let _ = tokio::process::Command::new(&bin)
+                                .env_remove("AIVPN_ADMIN_LISTEN")
                                 .args(["record", "stop"])
                                 .output()
                                 .await;

@@ -763,6 +763,7 @@ fn mgmt_call(
     };
 
     let mut cmd = Command::new(client_binary);
+    cmd.env_remove("AIVPN_ADMIN_LISTEN");
     cmd.arg("mgmt")
         .arg("--method")
         .arg(method)
@@ -985,6 +986,7 @@ fn get_audit_log(client_binary: &Path) -> Result<AuditLogView, String> {
 /// stdout on success (0=User, 1=Viewer, 2=Admin).
 fn run_role(client_binary: &Path) -> Result<u8, String> {
     let mut cmd = Command::new(client_binary);
+    cmd.env_remove("AIVPN_ADMIN_LISTEN");
     cmd.arg("role");
     #[cfg(windows)]
     {

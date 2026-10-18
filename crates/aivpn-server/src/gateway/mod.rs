@@ -118,7 +118,7 @@ use crate::neural::{NeuralResonanceModule, ResonanceStatus};
 use crate::qos::QosEnforcer;
 use crate::recording::RecordingManager;
 use crate::recording::RecordingStopOutcome;
-use crate::session::{Session, SessionManager, MAX_SESSIONS};
+use crate::session::{Session, SessionManager};
 use aivpn_common::event_log::EventBus;
 
 struct QueuedPacket {

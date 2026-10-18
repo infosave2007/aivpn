@@ -254,6 +254,7 @@ pub fn build_client_command(
     params: &ClientLaunchParams,
 ) -> tokio::process::Command {
     let mut cmd = tokio::process::Command::new(binary);
+    cmd.env_remove("AIVPN_ADMIN_LISTEN");
     // Ensure the VPN client is killed if this GUI process exits
     // (e.g. Quit from the tray). Without this, dropping the Child
     // on shutdown leaves aivpn-client orphaned with the tunnel up.

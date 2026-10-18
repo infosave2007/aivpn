@@ -341,6 +341,7 @@ impl VpnManager {
         let _ = std::fs::remove_file(std::env::temp_dir().join("aivpn-quality.json"));
 
         let mut cmd = Command::new(&self.client_binary);
+        cmd.env_remove("AIVPN_ADMIN_LISTEN");
         cmd.env("AIVPN_CONNECTION_KEY", connection_key);
         // An extension may have selected an alternative transport. Pass it
         // neutrally: a name plus a base64 blob the client forwards to the
@@ -530,6 +531,7 @@ impl VpnManager {
     /// до успешного завершения команды для повторной попытки после сбоя.
     fn run_kill_switch_clear(binary: &std::path::Path) -> bool {
         let mut cmd = std::process::Command::new(binary);
+        cmd.env_remove("AIVPN_ADMIN_LISTEN");
         cmd.args(["kill-switch", "clear"]);
         #[cfg(windows)]
         {
@@ -666,6 +668,7 @@ impl VpnManager {
             return None;
         }
         let mut cmd = Command::new(binary);
+        cmd.env_remove("AIVPN_ADMIN_LISTEN");
         cmd.args(["bench", "--server", server_addr, "--json"]);
         #[cfg(windows)]
         {
@@ -857,6 +860,7 @@ impl VpnManager {
         let args_owned: Vec<String> = args.iter().map(|s| s.to_string()).collect();
         std::thread::spawn(move || {
             let mut cmd = Command::new(&binary);
+            cmd.env_remove("AIVPN_ADMIN_LISTEN");
             for arg in &args_owned {
                 cmd.arg(arg);
             }
@@ -896,6 +900,7 @@ impl VpnManager {
         let binary = self.client_binary.clone();
         std::thread::spawn(move || {
             let mut cmd = std::process::Command::new(&binary);
+            cmd.env_remove("AIVPN_ADMIN_LISTEN");
             cmd.args(["record", "status"]);
             #[cfg(windows)]
             {

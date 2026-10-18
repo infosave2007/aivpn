@@ -350,6 +350,19 @@ aivpn-client -k "aivpn://..." --proxy-listen 127.0.0.1:1080
 
 Настроить Firefox / Chrome / curl на `SOCKS5 127.0.0.1:1080`. TUN-устройство и права Администратора не нужны.
 
+Для нескольких клиентов задайте каждому отдельные SOCKS- и admin-порты. Каждому клиенту нужен свой ключ доступа. Адрес управления принимает только `127.0.0.1` и ненулевой порт:
+
+```bash
+AIVPN_CONNECTION_KEY="$KEY_ONE" aivpn-client --proxy-listen 127.0.0.1:1080 --admin-listen 127.0.0.1:44301
+AIVPN_CONNECTION_KEY="$KEY_TWO" aivpn-client --proxy-listen 127.0.0.1:1081 --admin-listen 127.0.0.1:44302
+
+aivpn-client --admin-listen 127.0.0.1:44302 record status
+aivpn-client --admin-listen 127.0.0.1:44302 role
+aivpn-client --admin-listen 127.0.0.1:44302 mgmt --method GET --path /api/v1/clients
+```
+
+Вместо флага можно задать `AIVPN_ADMIN_LISTEN`. Токены, статус записи и счетчики разделены по admin-порту. GUI использует основной адрес `127.0.0.1:44301`; дополнительные CLI-клиенты должны выбирать другие порты. Занятый адрес вызывает ошибку до создания туннеля, без замены токена работающего клиента.
+
 ---
 
 ## Формат ключа подключения

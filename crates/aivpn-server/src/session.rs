@@ -967,6 +967,7 @@ impl Session {
 
 /// Session Manager with O(1) tag lookup
 pub struct SessionManager {
+    allocation_lock: Mutex<()>,
     /// Слабая ссылка не удерживает устройство после остановки gateway.
     kernel: std::sync::OnceLock<std::sync::Weak<aivpn_common::kernel_accel::KernelAccel>>,
     /// Sessions by ID
@@ -1014,6 +1015,7 @@ impl SessionManager {
             .map(|s| Duration::from_secs(s))
             .unwrap_or(IDLE_TIMEOUT);
         Self {
+            allocation_lock: Mutex::new(()),
             kernel: std::sync::OnceLock::new(),
             sessions: DashMap::new(),
             tag_map: DashMap::new(),
@@ -1114,7 +1116,61 @@ impl SessionManager {
         preshared_key: Option<[u8; 32]>,
         static_vpn_ip: Option<Ipv4Addr>,
     ) -> Result<Arc<Mutex<Session>>> {
-        if self.sessions.len() >= MAX_SESSIONS {
+        self.create_client_session(client_addr, eph_pub, preshared_key, static_vpn_ip, None)
+    }
+
+    /// Резерв для реконнекта доступен только после проверки тега с PSK из БД.
+    pub fn create_authenticated_session(
+        &self,
+        client_addr: SocketAddr,
+        eph_pub: [u8; X25519_PUBLIC_KEY_SIZE],
+        psk: [u8; 32],
+        vpn_ip: Ipv4Addr,
+        client_id: &str,
+        tag: &[u8; TAG_SIZE],
+    ) -> Result<Arc<Mutex<Session>>> {
+        if !self.handshake_tag_precheck(&eph_pub, Some(psk), tag) {
+            return Err(Error::InvalidPacket("Invalid authenticated handshake tag"));
+        }
+        self.create_client_session(
+            client_addr,
+            eph_pub,
+            Some(psk),
+            Some(vpn_ip),
+            Some(client_id),
+        )
+    }
+
+    fn create_client_session(
+        &self,
+        client_addr: SocketAddr,
+        eph_pub: [u8; X25519_PUBLIC_KEY_SIZE],
+        preshared_key: Option<[u8; 32]>,
+        static_vpn_ip: Option<Ipv4Addr>,
+        client_id: Option<&str>,
+    ) -> Result<Arc<Mutex<Session>>> {
+        let _allocation = self.allocation_lock.lock();
+        let mut previous = None;
+        if let Some(client_id) = client_id {
+            for entry in self.sessions.iter() {
+                let session = entry.value().lock();
+                if session.client_id.as_deref() == Some(client_id) {
+                    if previous.is_some() {
+                        return Err(Error::Session(
+                            "Client replacement is already pending".into(),
+                        ));
+                    }
+                    previous = Some(session.client_addr.ip());
+                }
+            }
+        }
+        // Резерв ограничен общим лимитом; старый сеанс жив до принятия нового.
+        let global_limit = if client_id.is_some() && previous.is_none() {
+            MAX_SESSIONS - 10
+        } else {
+            MAX_SESSIONS
+        };
+        if self.sessions.len() >= global_limit {
             return Err(Error::Session("Max sessions reached".into()));
         }
 
@@ -1124,7 +1180,8 @@ impl SessionManager {
             .iter()
             .filter(|e| e.value().lock().client_addr.ip() == client_addr.ip())
             .count();
-        if ip_count >= 5 {
+        let replaces_same_ip = previous.is_some_and(|ip| ip == client_addr.ip());
+        if ip_count.saturating_sub(usize::from(replaces_same_ip)) >= 5 {
             return Err(Error::Session("Per-IP session limit reached".into()));
         }
 
@@ -1145,7 +1202,10 @@ impl SessionManager {
                     }
                 })
                 .count();
-            if subnet_count >= 10 {
+            let replaces_same_subnet = previous.is_some_and(
+                |ip| matches!(ip, std::net::IpAddr::V4(ip) if u32::from(ip) >> 8 == subnet24),
+            );
+            if subnet_count.saturating_sub(usize::from(replaces_same_subnet)) >= 10 {
                 return Err(Error::Session(
                     "Per-subnet (/24) session limit reached".into(),
                 ));
@@ -1157,7 +1217,11 @@ impl SessionManager {
 
         let session =
             self.build_and_insert_session(client_addr, eph_pub, dh1, preshared_key, false)?;
-        let session_id = session.lock().session_id;
+        let session_id = {
+            let mut session = session.lock();
+            session.client_id = client_id.map(str::to_owned);
+            session.session_id
+        };
 
         // Адрес приходит из БД. Совпадение внешнего IP не доказывает личность.
         let vpn_ip = static_vpn_ip;
@@ -1180,6 +1244,7 @@ impl SessionManager {
         pool_kp: &crypto::KeyPair,
         pool_psk: &[u8; 32],
     ) -> Result<Arc<Mutex<Session>>> {
+        let _allocation = self.allocation_lock.lock();
         if self.sessions.len() >= MAX_SESSIONS {
             return Err(Error::Session("Max sessions reached".into()));
         }
