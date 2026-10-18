@@ -14,7 +14,7 @@
 
 ### Fixed
 
-- **CI classifier download** - fetch nDPI by its release tag with bounded retries for transient Git errors, then verify the pinned commit before building.
+- **CI classifier download** - keep nDPI outside the Cargo cache and explicitly select its Git directory so incomplete cached metadata cannot redirect fetches to the application repository. Fetch the release tag with bounded retries and verify the pinned commit before building.
 - **Multiple client instances** - a busy admin socket no longer causes a CPU spin or overwrites another client's token. `--admin-listen` / `AIVPN_ADMIN_LISTEN` selects a separate loopback endpoint for each instance and its management commands; recording status, traffic and quality files are isolated. Pending management replies release the socket when the session ends.
 - **Reconnects behind NAT** - a PSK-verified client can replace its existing session at the per-IP or subnet limit without disconnecting neighboring clients. Replacement slots are bounded, duplicate pending replacements are rejected and new clients retain the normal limits.
 - **macOS application location** - the GUI and privileged helper share the permitted binary paths. A renamed or relocated app uses the installed system client instead of passing a path that the helper rejects.
@@ -72,7 +72,7 @@
 
 ### Исправлено
 
-- **Загрузка классификатора в CI** - nDPI загружается по релизному тегу с ограниченными повторами при временных ошибках Git; перед сборкой проверяется закрепленный коммит.
+- **Загрузка классификатора в CI** - nDPI вынесен из кеша Cargo, его Git-каталог задан явно: неполные метаданные из кеша больше не перенаправляют загрузку в репозиторий приложения. Релизный тег загружается с ограниченными повторами, перед сборкой проверяется закрепленный коммит.
 - **Несколько экземпляров клиента** - занятый admin-сокет больше не вызывает загрузку CPU пустым циклом и не перезаписывает чужой токен. `--admin-listen` / `AIVPN_ADMIN_LISTEN` задает отдельный локальный адрес экземпляра и команд управления; статус записи, счетчики трафика и качество соединения хранятся раздельно. Незавершенные управляющие запросы не удерживают сокет после завершения сессии.
 - **Переподключение за NAT** - клиент с проверенным PSK может заменить свою сессию при заполненном лимите IP или подсети, не отключая соседние клиенты. Резерв ограничен, повторная незавершенная замена отклоняется; новые клиенты подчиняются обычным лимитам.
 - **Расположение приложения macOS** - GUI и привилегированный helper используют общий список разрешенных путей. Переименованное или перемещенное приложение использует установленный системный клиент вместо передачи пути, который helper отклонит.

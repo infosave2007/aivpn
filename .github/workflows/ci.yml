@@ -12,6 +12,9 @@ env:
 jobs:
   build:
     runs-on: ubuntu-latest
+    env:
+      AIVPN_NDPI_DIR: ${{ runner.temp }}/aivpn-ndpi
+      NDPI_READER: ${{ runner.temp }}/aivpn-ndpi/example/ndpiReader
 
     steps:
     - uses: actions/checkout@v4
@@ -66,6 +69,9 @@ jobs:
 
     - name: Install DPI build dependencies
       run: sudo apt-get update && sudo apt-get install -y autoconf automake libtool pkg-config libpcap-dev libjson-c-dev
+
+    - name: DPI checkout recovery tests
+      run: python3 deploy/ci/test-dpi-checkout.py
 
     - name: Build pinned DPI classifier
       run: deploy/ci/build-dpi-tools.sh
