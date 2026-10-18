@@ -12,9 +12,6 @@ env:
 jobs:
   build:
     runs-on: ubuntu-latest
-    env:
-      AIVPN_NDPI_DIR: ${{ runner.temp }}/aivpn-ndpi
-      NDPI_READER: ${{ runner.temp }}/aivpn-ndpi/example/ndpiReader
 
     steps:
     - uses: actions/checkout@v4
@@ -69,6 +66,11 @@ jobs:
 
     - name: Install DPI build dependencies
       run: sudo apt-get update && sudo apt-get install -y autoconf automake libtool pkg-config libpcap-dev libjson-c-dev
+
+    - name: Set DPI tool paths
+      run: |
+        echo "AIVPN_NDPI_DIR=$RUNNER_TEMP/aivpn-ndpi" >> "$GITHUB_ENV"
+        echo "NDPI_READER=$RUNNER_TEMP/aivpn-ndpi/example/ndpiReader" >> "$GITHUB_ENV"
 
     - name: DPI checkout recovery tests
       run: python3 deploy/ci/test-dpi-checkout.py
