@@ -695,12 +695,8 @@ func stopClient() -> HelperResponse {
                           message: wasConnected ? "Disconnected" : "No active connection")
 }
 
-/// True while the client's data-plane evidence is FRESH: the traffic.stats
-/// file carries a session `since:` epoch (the pre-session zero-writes in the
-/// client's reconnect loop deliberately omit it) and was rewritten recently —
-/// the client's stats task rewrites it once per second while a session is up.
-/// Stale/absent evidence means the client is between sessions (in-process
-/// reconnect loop), even though historic log lines still say "Connected".
+/// Проверяет свежесть статистики процесса. Сам по себе since не подтверждает
+/// ServerHello: писатель статистики запускается еще до ответа сервера.
 func connectionEvidenceFresh(maxAgeSeconds: TimeInterval = 10) -> Bool {
     let statsPath = "/var/run/aivpn/traffic.stats"
     guard let attrs = try? FileManager.default.attributesOfItem(atPath: statsPath),
@@ -740,13 +736,11 @@ func rejectToken(in logContent: String) -> String? {
 /// line matched — even while the client was midway through its in-process
 /// reconnect loop ("Client run failed … Reconnecting in …").
 func lastLogTransitionIsConnected(_ logContent: String) -> Bool {
-    let connectedMarkers = ["Connected to server", "PFS ratchet complete",
-                            "forward secrecy established"]
-    let disconnectedMarkers = ["Reconnecting in", "Client run failed",
-                               "Failed to create client", "Shutdown requested"]
     for line in logContent.components(separatedBy: "\n").reversed() {
-        if connectedMarkers.contains(where: { line.contains($0) }) { return true }
-        if disconnectedMarkers.contains(where: { line.contains($0) }) { return false }
+        let status = line.trimmingCharacters(in: .whitespacesAndNewlines)
+        if status.hasPrefix("AIVPN-STATUS connected ") { return true }
+        if status == "AIVPN-STATUS reconnecting" || status == "AIVPN-STATUS disconnected"
+            || status.hasPrefix("AIVPN-STATUS rejected ") { return false }
     }
     return false
 }
@@ -754,17 +748,8 @@ func lastLogTransitionIsConnected(_ logContent: String) -> Bool {
 /// Get current connection status
 func getStatus() -> HelperResponse {
     if managedPID > 0 && kill(managedPID, 0) == 0 {
-        if isConnected {
-            if connectionEvidenceFresh() {
-                return HelperResponse(status: "ok", message: "Connected",
-                                      connected: true, pid: Int(managedPID),
-                                      version: HELPER_VERSION)
-            }
-            // Data-plane evidence went stale: the client is re-establishing
-            // in-process. Demote instead of reporting a stale Connected, and
-            // fall through to the log-derived state below.
-            isConnected = false
-        }
+        // Статистика обновляется и до ServerHello, поэтому кеш не подтверждает связь.
+        isConnected = false
         // Check log for connection status
         if let logContent = try? String(contentsOfFile: LOG_PATH, encoding: .utf8) {
             // G-A4: an authenticated terminal refusal takes priority over
@@ -983,7 +968,7 @@ func getTrafficStats() -> HelperResponse {
 /// for the root-owned primary path for defense-in-depth/consistency, even
 /// though /var/run/aivpn is not attacker-writable.
 func readRegularFileNoFollow(_ path: String, maxBytes: Int = 65536) -> Data? {
-    let fd = open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
+    let fd = open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK)
     guard fd >= 0 else { return nil }
     defer { close(fd) }
 

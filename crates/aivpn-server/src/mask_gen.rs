@@ -251,6 +251,14 @@ pub async fn generate_and_store_mask(
 // ─── Traffic Analysis ────────────────────────────────────────────────────────
 
 fn analyze_traffic(_service: &str, packets: &[PacketMetadata]) -> Result<AnalysisResult> {
+    if packets
+        .iter()
+        .any(|packet| !packet.iat_ms.is_finite() || !packet.entropy.is_finite())
+    {
+        return Err(Error::Mask(
+            "запись содержит неконечные IAT или энтропию".into(),
+        ));
+    }
     let uplink: Vec<&PacketMetadata> = packets
         .iter()
         .filter(|p| p.direction == Direction::Uplink)
@@ -1911,7 +1919,14 @@ fn entropy_penalty(real_entropy: f64) -> f32 {
 /// Correct merge-walk that handles tied values: at each unique value,
 /// advance BOTH pointers past all duplicates before comparing CDFs.
 fn ks_test(sample1: &[f64], sample2: &[f64]) -> f32 {
-    if sample1.is_empty() || sample2.is_empty() {
+    // NaN не проходит сравнение <= и иначе останавливает продвижение индексов.
+    if sample1.is_empty()
+        || sample2.is_empty()
+        || sample1
+            .iter()
+            .chain(sample2)
+            .any(|value| !value.is_finite())
+    {
         return 1.0;
     }
 
@@ -2014,6 +2029,24 @@ mod tests {
         assert_eq!(entropy_penalty(6.03), 0.0);
         assert_eq!(entropy_penalty(7.8), 0.0);
         assert!(entropy_penalty(5.2) > 0.5);
+    }
+
+    #[test]
+    fn ks_test_rejects_nonfinite_samples() {
+        for invalid in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert_eq!(ks_test(&[1.0], &[invalid]), 1.0);
+            assert_eq!(ks_test(&[invalid], &[1.0]), 1.0);
+        }
+    }
+
+    #[test]
+    fn analyze_traffic_rejects_nonfinite_metadata() {
+        let mut packets = signable_recording();
+        packets[0].iat_ms = f64::NAN;
+        assert!(analyze_traffic("nonfinite", &packets).is_err());
+        packets[0].iat_ms = 10.0;
+        packets[0].entropy = f32::INFINITY;
+        assert!(analyze_traffic("nonfinite", &packets).is_err());
     }
 
     #[test]

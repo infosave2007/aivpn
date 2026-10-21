@@ -2861,35 +2861,10 @@ impl App {
                         // on stdout. A reconnecting client DEMOTES the UI to
                         // Connecting instead of showing Connected over a dead,
                         // silently-retrying tunnel.
-                        let parse_status_line = vpn_manager::parse_status_line;
+                        let parse_status_line = vpn_manager::parse_output_line;
 
-                        // Fallback heuristic for OLDER clients only: detects the
-                        // "Connected to server at ..." / TUN-ready log line. The
-                        // client's tracing subscriber writes to stderr (not stdout -
-                        // see 9c84bf7, so bench --json's stdout output stays clean),
-                        // so this line always arrives via `err`, never `out`; still
-                        // checked on both streams in case a future client build ever
-                        // emits it differently.
-                        let check_connected = |l: &str| -> Option<Message> {
-                            if l.contains("Connected") || l.contains("TUN interface") {
-                                let ip = l
-                                    .split_whitespace()
-                                    .find(|t| t.contains('.') && t.contains('/'))
-                                    .map(|s| s.to_string())
-                                    .unwrap_or_default();
-                                Some(Message::StatusReceived(VpnStatus::Connected { vpn_ip: ip }))
-                            } else {
-                                None
-                            }
-                        };
-
-                        // Once one machine-readable line has been seen the
-                        // heuristic is disabled for the rest of the session: it
-                        // substring-matches log prose ("Reconnected", pre-handshake
-                        // "TUN interface") and would fight the authoritative
-                        // protocol.
-                        let mut saw_status_line = false;
-                        let mut line_messages = |l: &str| -> Vec<Message> {
+                        // Локальная настройка TUN не подтверждает ответ сервера.
+                        let line_messages = |l: &str| -> Vec<Message> {
                             let mut msgs = Vec::new();
                             // 3c: orthogonal to VpnStatus (can co-occur with
                             // Connecting/Connected), so it's dispatched
@@ -2898,10 +2873,7 @@ impl App {
                                 msgs.push(Message::BootstrapFallbackDetected);
                             }
                             if let Some(status) = parse_status_line(l) {
-                                saw_status_line = true;
                                 msgs.push(Message::StatusReceived(status));
-                            } else if !saw_status_line {
-                                msgs.extend(check_connected(l));
                             }
                             msgs
                         };

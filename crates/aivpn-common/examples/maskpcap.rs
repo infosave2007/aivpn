@@ -21,6 +21,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         output.write_all(&value.to_le_bytes())?;
     }
     let keys = SessionKeys {
+        packet_cipher: aivpn_common::crypto::PacketCipher::Established,
         session_key: [1; 32],
         session_key_s2c: [2; 32],
         tag_secret: [3; 32],

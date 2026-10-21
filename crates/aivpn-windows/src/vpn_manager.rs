@@ -13,6 +13,42 @@ use std::time::{Duration, Instant};
 
 const FIREWALL_CLEAR_TIMEOUT: Duration = Duration::from_secs(15);
 
+#[cfg(all(test, unix))]
+mod connection_status_tests {
+    use super::*;
+
+    #[test]
+    fn live_child_without_server_confirmation_remains_connecting() {
+        let mut manager = VpnManager::new();
+        manager.kill_switch_active = false;
+        manager.last_recording_poll = Some(Instant::now());
+        manager
+            .recording_refresh_in_flight
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        manager.child = Some(Command::new("sleep").arg("5").spawn().unwrap());
+        manager.state = ConnectionState::Connecting;
+        manager.poll_status();
+        assert_eq!(manager.state, ConnectionState::Connecting);
+    }
+
+    #[test]
+    fn machine_status_reconnect_and_terminal_refusal_are_authoritative() {
+        let mut manager = VpnManager::new();
+        manager.kill_switch_active = false;
+        manager.child = Some(Command::new("sleep").arg("5").spawn().unwrap());
+        manager.apply_status_line("AIVPN-STATUS connected 10.0.0.3");
+        assert_eq!(manager.state, ConnectionState::Connected);
+        assert_eq!(manager.stats.vpn_ip.as_deref(), Some("10.0.0.3"));
+        manager.apply_status_line("AIVPN-STATUS reconnecting");
+        assert_eq!(manager.state, ConnectionState::Connecting);
+        manager.apply_status_line("AIVPN-STATUS rejected expired");
+        assert_eq!(manager.state, ConnectionState::Disconnected);
+        assert!(manager.last_error.as_deref().unwrap().contains("expired"));
+        manager.apply_status_line("AIVPN-STATUS disconnected");
+        assert!(manager.last_error.as_deref().unwrap().contains("expired"));
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConnectionState {
     Disconnected,
@@ -33,13 +69,7 @@ pub struct TrafficStats {
     /// `ip:` field arrives, or if that field failed to parse as an IPv4
     /// address (e.g. a torn read of the non-atomic stats write).
     pub vpn_ip: Option<String>,
-    /// 3c: true when the client's `fallback:1` key in traffic.stats says
-    /// this session is running on the built-in default mask (bootstrap
-    /// resilience fallback after repeated dead handshakes) rather than a
-    /// normal bootstrap-derived one. Unlike Linux (which also gets the
-    /// "AIVPN-STATUS bootstrap-fallback" stdout line), this GUI's child
-    /// stdout is piped to `Stdio::null()` (see `connect()`), so the stats
-    /// file is the only channel — same reason `vpn_ip` above exists.
+    /// Признак встроенной резервной маски из traffic.stats и статуса stdout.
     pub fallback: bool,
 }
 
@@ -95,6 +125,8 @@ pub fn is_acceptable_mask_id(id: &str) -> bool {
 pub struct VpnManager {
     state: ConnectionState,
     child: Option<Child>,
+    status_rx: Option<std::sync::mpsc::Receiver<String>>,
+    terminal_status_error: bool,
     stats: TrafficStats,
     last_poll: Option<Instant>,
     pub client_binary: PathBuf,
@@ -184,6 +216,8 @@ impl VpnManager {
         Self {
             state: ConnectionState::Disconnected,
             child: None,
+            status_rx: None,
+            terminal_status_error: false,
             stats: TrafficStats {
                 bytes_sent: 0,
                 bytes_received: 0,
@@ -274,6 +308,7 @@ impl VpnManager {
         if self.child.is_some() {
             return Err("Already running".to_string());
         }
+        self.status_rx = None;
 
         #[cfg(windows)]
         drop(self.supervisor.take());
@@ -468,7 +503,7 @@ impl VpnManager {
         // CREATE_NO_WINDOW — we no longer rely on it.
         cmd.env("RUST_LOG", "info");
         cmd.stderr(std::process::Stdio::null());
-        cmd.stdout(std::process::Stdio::null());
+        cmd.stdout(std::process::Stdio::piped());
 
         // Hide console window on Windows
         #[cfg(windows)]
@@ -479,8 +514,30 @@ impl VpnManager {
         }
 
         match cmd.spawn() {
-            Ok(child) => {
+            Ok(mut child) => {
                 let child_pid = child.id();
+                self.terminal_status_error = false;
+                let (tx, rx) = std::sync::mpsc::sync_channel(64);
+                self.status_rx = Some(rx);
+                if let Some(stdout) = child.stdout.take() {
+                    let wake = self.wake_cb.clone();
+                    std::thread::spawn(move || {
+                        use std::io::BufRead;
+                        for line in std::io::BufReader::new(stdout)
+                            .lines()
+                            .map_while(Result::ok)
+                        {
+                            if line.starts_with("AIVPN-STATUS ") {
+                                if tx.send(line).is_err() {
+                                    break;
+                                }
+                                if let Some(wake) = &wake {
+                                    wake();
+                                }
+                            }
+                        }
+                    });
+                }
                 // Assign the client to the kill-on-close Job Object so it dies with the
                 // GUI even on an abnormal exit that skips Drop. Best-effort — on failure
                 // the child still runs, just without the crash-cleanup guarantee.
@@ -508,9 +565,7 @@ impl VpnManager {
                 }
                 #[cfg(windows)]
                 self.spawn_child_supervisor(child_pid, kill_switch);
-                // Stay in Connecting — poll_status() transitions to Connected once
-                // the process survives its first liveness check, preventing the UI
-                // from briefly showing Connected before the TUN device is up.
+                // Connected подтверждает только статус после ServerHello.
                 self.stats.bytes_sent = 0;
                 self.stats.bytes_received = 0;
                 self.stats.vpn_ip = None;
@@ -631,6 +686,7 @@ impl VpnManager {
             let _ = child.wait();
         }
         self.child = None;
+        self.status_rx = None;
 
         // child.kill() on Windows calls TerminateProcess which bypasses KillSwitch::deactivate()
         // in the client. Run `kill-switch clear` explicitly so the user is not left without
@@ -710,6 +766,14 @@ impl VpnManager {
             }
         }
         self.last_poll = Some(Instant::now());
+        let lines: Vec<String> = self
+            .status_rx
+            .as_ref()
+            .map(|rx| rx.try_iter().collect())
+            .unwrap_or_default();
+        for line in lines {
+            self.apply_status_line(&line);
+        }
 
         // Check if process is still alive
         if let Some(ref mut child) = self.child {
@@ -721,7 +785,9 @@ impl VpnManager {
                     let detail = Self::read_last_log_line()
                         .map(|l| format!(": {l}"))
                         .unwrap_or_default();
-                    if status.success() {
+                    if self.terminal_status_error {
+                        // Причина отказа из stdout точнее последней строки журнала.
+                    } else if status.success() {
                         self.last_error =
                             Some(format!("Client disconnected unexpectedly{}", detail));
                     } else {
@@ -741,13 +807,7 @@ impl VpnManager {
                     self.session_since_ms = None;
                     return;
                 }
-                Ok(None) => {
-                    // Still running
-                    if self.state == ConnectionState::Connecting {
-                        self.state = ConnectionState::Connected;
-                        self.connected_since = Some(Instant::now());
-                    }
-                }
+                Ok(None) => {}
                 Err(e) => {
                     self.last_error = Some(format!("Connection lost (OS error): {e}"));
                     self.child = None;
@@ -801,6 +861,57 @@ impl VpnManager {
                     }
                 }
             }
+        }
+    }
+
+    fn apply_status_line(&mut self, line: &str) {
+        let Some(payload) = line.trim().strip_prefix("AIVPN-STATUS ") else {
+            return;
+        };
+        let mut parts = payload.split_whitespace();
+        match parts.next() {
+            Some("connected") => {
+                if self.child.is_none() {
+                    return;
+                }
+                self.state = ConnectionState::Connected;
+                self.connected_since = Some(Instant::now());
+                self.stats.vpn_ip = parts
+                    .next()
+                    .filter(|ip| ip.parse::<std::net::Ipv4Addr>().is_ok())
+                    .map(str::to_owned);
+                self.last_error = None;
+            }
+            Some("reconnecting") => {
+                if self.child.is_none() {
+                    return;
+                }
+                self.state = ConnectionState::Connecting;
+                self.connected_since = None;
+                self.session_since_ms = None;
+                self.stats.bytes_sent = 0;
+                self.stats.bytes_received = 0;
+            }
+            Some("disconnected") => {
+                self.state = ConnectionState::Disconnected;
+            }
+            Some("rejected") => {
+                self.state = ConnectionState::Disconnected;
+                self.terminal_status_error = true;
+                self.last_error = Some(
+                    match parts.next() {
+                        Some("one_time_used") => "Server: one-time key already used",
+                        Some("expired") => "Server: client expired",
+                        Some("disabled") => "Server: client disabled",
+                        _ => "Server: connection refused",
+                    }
+                    .to_owned(),
+                );
+            }
+            Some("bootstrap-fallback") => {
+                self.stats.fallback = true;
+            }
+            _ => {}
         }
     }
 

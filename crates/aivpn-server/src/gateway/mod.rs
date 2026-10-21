@@ -17,7 +17,7 @@ use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
-use aivpn_common::crypto::{self, decrypt_payload, encrypt_payload_into, NONCE_SIZE, TAG_SIZE};
+use aivpn_common::crypto::{self, encrypt_payload_into, TAG_SIZE};
 use aivpn_common::error::{Error, Result};
 use aivpn_common::fec::FecRepair;
 use aivpn_common::kernel_accel::{KernelAccel, QOS_DIR_DOWN, QOS_DIR_UP};
@@ -47,6 +47,8 @@ pub use config::{
     DEFAULT_FEEDBACK_REPORT_INTERVAL_SECS,
 };
 
+#[cfg(test)]
+mod auth_regression_tests;
 mod throttle;
 use throttle::{
     try_claim_mask_feedback_slot, try_claim_mask_preference_slot, try_claim_mgmt_slot,
@@ -70,8 +72,8 @@ mod kernel_offload;
 use kernel_offload::{
     harvest_kernel_counters, kernel_claim_deliver, kernel_clear_offload, kernel_client_key,
     kernel_input_from_session, kernel_maintain, kernel_note_rejected, kernel_qos_decide,
-    kernel_wire_layout, make_kernel_downlink, make_kernel_update_tags, QosGate, ReplayGate,
-    KERNEL_DOWNLINK_ARMED,
+    kernel_wire_layout, make_kernel_downlink, make_kernel_update_tags, session_allows_client_data,
+    QosGate, ReplayGate, KERNEL_DOWNLINK_ARMED,
 };
 
 mod recording;
@@ -475,21 +477,102 @@ impl Gateway {
         }
     }
 
-    /// Resolve a session's server-assigned management role:
-    /// `client_id -> client_db.find_by_id -> ClientConfig::role`, defaulting
-    /// to `ClientRole::User` when the session has no `client_id` yet
-    /// (pre-enrollment), no `client_db` is configured, or the client record
-    /// can no longer be found (e.g. it was just revoked). Deliberately
-    /// re-resolved on every call rather than cached on `Session` — a live
-    /// revoke or role downgrade must take effect on the client's very next
-    /// `MgmtRequest`/`Capabilities` push, not just after it reconnects.
-    /// Used by both the `Capabilities` announcement and the `MgmtRequest`
-    /// authorization gate (see the `Keepalive` and `MgmtRequest` arms in
-    /// `handle_control_message`).
+    fn refresh_mtls_gate(&self, session: &mut Session) -> bool {
+        let required = self.config.mtls.as_ref().is_some_and(|c| c.required)
+            && !session.is_masked_pool_peer
+            && !session.is_site_peer;
+        session.refresh_mtls_gate(required)
+    }
+
+    /// Адрес и живой сеанс заменяются только после полной аутентификации клиента.
+    async fn finish_client_admission(&self, session: &Arc<parking_lot::Mutex<Session>>) {
+        let removed = self.commit_client_admission(session);
+        if let (Some(recorder), Some(socket)) = (&self.recording_manager, &self.udp_socket) {
+            let store = recorder.store();
+            let mdh = self.mask_catalog.packet_mdh_bytes();
+            for sid in removed {
+                let outcome = recorder.stop_for_session_end(sid);
+                Self::handle_recording_outcome(
+                    socket,
+                    &self.session_manager,
+                    &store,
+                    &mdh,
+                    outcome,
+                    None,
+                )
+                .await;
+            }
+        }
+    }
+
+    fn commit_client_admission(&self, session: &Arc<parking_lot::Mutex<Session>>) -> Vec<[u8; 16]> {
+        // Два workers не должны взаимно удалить одновременно допущенные сессии.
+        let _admission = self.session_manager.admission_guard();
+        let (session_id, vpn_ip, client_id, client_addr, peer) = {
+            let mut sess = session.lock();
+            if sess.is_removed()
+                || !sess.is_ratcheted
+                || sess.client_admitted
+                || !self.refresh_mtls_gate(&mut sess)
+                || !session_allows_client_data(&sess, self.client_db.as_deref())
+            {
+                return Vec::new();
+            }
+            sess.client_admitted = true;
+            (
+                sess.session_id,
+                sess.vpn_ip,
+                sess.client_id.clone(),
+                sess.client_addr,
+                sess.is_masked_pool_peer,
+            )
+        };
+        let mut removed = Vec::new();
+        if peer {
+            removed.extend(
+                self.session_manager
+                    .cleanup_masked_peer_handshakes(&client_addr, &session_id),
+            );
+        }
+        if let Some(ip) = vpn_ip {
+            removed.extend(
+                self.session_manager
+                    .cleanup_old_sessions_for_vpn_ip(&ip, &session_id),
+            );
+            self.session_manager.bind_vpn_ip(&ip, &session_id);
+        }
+        if let Some(cid) = client_id {
+            removed.extend(
+                self.session_manager
+                    .cleanup_old_sessions_for_client_id(&cid, &session_id),
+            );
+            if let Some(db) = self.client_db.as_ref() {
+                db.record_handshake(&cid);
+            }
+        }
+        removed
+    }
+
+    /// PSK определяет клиента, но роль требует доказательства постоянного ключа.
+    /// Запись читается заново, чтобы отзыв и понижение роли действовали сразу.
     fn session_role(&self, session: &Arc<parking_lot::Mutex<Session>>) -> ClientRole {
-        let client_id = session.lock().client_id.clone();
+        let (client_id, verified) = {
+            let mut sess = session.lock();
+            if !self.refresh_mtls_gate(&mut sess) {
+                return ClientRole::User;
+            }
+            (sess.client_id.clone(), sess.verified_device_pub)
+        };
         client_id
             .and_then(|cid| self.client_db.as_ref().and_then(|db| db.find_by_id(&cid)))
+            .filter(|c| {
+                c.enabled
+                    && !c.deleted
+                    && c.expires_at
+                        .is_none_or(|expiry| expiry > chrono::Utc::now())
+                    && verified.is_some()
+                    && c.device_pubkey == verified
+            })
             .map(|c| c.role)
             .unwrap_or_default()
     }
@@ -1273,13 +1356,6 @@ impl Gateway {
         offsets
     }
 
-    /// Compute nonce from counter
-    fn compute_nonce(&self, counter: u64) -> [u8; NONCE_SIZE] {
-        let mut nonce = [0u8; NONCE_SIZE];
-        nonce[0..8].copy_from_slice(&counter.to_le_bytes());
-        nonce
-    }
-
     /// Get mask catalog reference
     pub fn mask_catalog(&self) -> &Arc<MaskCatalog> {
         &self.mask_catalog
@@ -1994,8 +2070,12 @@ mod tests {
         let keys = {
             let mut state = session.lock();
             state.mask = Some(mask.clone());
-            state.keys.clone()
+            state.ratcheted_keys.as_ref().unwrap().clone()
         };
+        let session_id = session.lock().session_id;
+        gateway
+            .session_manager
+            .complete_session_ratchet(&session_id);
         let inner = build_inner_packet(InnerType::Control, 0, &payload.encode().unwrap());
         let mut counter = 0;
         let packet = build_random_mdh_packet_with_tag_offset(
@@ -2042,6 +2122,84 @@ mod tests {
         mask.mask_id = "prefix_variant_test".to_string();
         mask.tag_offset = u16::MAX;
         pool_packet_through_gateway("pool-prefix", mask).await;
+    }
+
+    #[tokio::test]
+    async fn initial_pool_packet_cannot_modify_database_before_pfs_confirmation() {
+        use aivpn_common::client_wire::{
+            build_inner_packet, build_random_mdh_packet_with_tag_offset,
+        };
+        use aivpn_common::crypto;
+        use aivpn_common::protocol::{ControlPayload, InnerType};
+        use tokio::net::UdpSocket;
+        let mut gateway = Gateway::new(make_test_gateway_config("initial-no-effects")).unwrap();
+        gateway.udp_socket = Some(Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap()));
+        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = peer.local_addr().unwrap();
+        let server_kp = crypto::pool_server_keypair(&[7; 32]);
+        let psk = crypto::pool_client_psk(&[7; 32]);
+        let session = gateway
+            .session_manager
+            .create_masked_pool_peer_session(
+                addr,
+                crypto::KeyPair::generate().public_key_bytes(),
+                &server_kp,
+                &psk,
+            )
+            .unwrap();
+        let mask = webrtc_zoom_v3();
+        session.lock().mask = Some(mask.clone());
+        let keys = session.lock().keys.clone();
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::client_db::ClientDatabase::load(
+            &dir.path().join("clients.json"),
+            gateway.config.network_config.clone(),
+        )
+        .unwrap();
+        db.add_client("must-not-be-imported").unwrap();
+        let payload = ControlPayload::PoolSync {
+            clients_json: serde_json::to_vec(&db.list_clients_including_deleted()).unwrap(),
+        }
+        .encode()
+        .unwrap();
+        let inner = build_inner_packet(InnerType::Control, 0, &payload);
+        let mut counter = 0;
+        for _ in 0..2 {
+            let packet = build_random_mdh_packet_with_tag_offset(
+                &keys,
+                &mut counter,
+                &inner,
+                None,
+                super::packet_layout_for_mask(&mask).0,
+                mask.tag_offset,
+            )
+            .unwrap();
+            gateway.handle_packet(&packet, addr).await.unwrap();
+            assert!(gateway
+                .client_db
+                .as_ref()
+                .unwrap()
+                .list_clients()
+                .is_empty());
+            let mut buf = [0u8; 2048];
+            let len = tokio::time::timeout(Duration::from_secs(1), peer.recv(&mut buf))
+                .await
+                .unwrap()
+                .unwrap();
+            let mut window = aivpn_common::client_wire::RecvWindow::new();
+            let hello = aivpn_common::client_wire::decode_packet_with_layout(
+                &buf[..len],
+                &keys,
+                &mut window,
+                super::packet_layout_for_mask(&mask).0,
+                mask.tag_offset,
+            )
+            .unwrap();
+            assert!(matches!(
+                ControlPayload::decode(&hello.payload),
+                Ok(ControlPayload::ServerHello { .. })
+            ));
+        }
     }
 
     #[test]
@@ -2183,6 +2341,8 @@ mod tests {
         let session = sm
             .create_session(client_addr, client_kp.public_key_bytes(), None, None)
             .expect("session created");
+        let session_id = session.lock().session_id;
+        sm.complete_session_ratchet(&session_id);
         let mut keys = session.lock().keys.clone();
         // These e2e tests build a client-uplink packet (C2S key) and decode it
         // with decode_packet_* (which uses the S2C key, the client-downlink
@@ -2466,7 +2626,9 @@ mod tests {
         };
         use aivpn_common::crypto::{self, KeyPair};
         use aivpn_common::protocol::{ControlPayload, InnerType};
-        let mut gateway = Gateway::new(make_test_gateway_config("real-reconnect")).unwrap();
+        let mut config = make_test_gateway_config("real-reconnect");
+        config.polymorphic_all_sessions = true;
+        let mut gateway = Gateway::new(config).unwrap();
         let peer = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let addr = peer.local_addr().unwrap();
         gateway.udp_socket = Some(Arc::new(
@@ -2484,6 +2646,8 @@ mod tests {
             .unwrap();
         old.lock().client_id = Some(client.id.clone());
         let old_id = old.lock().session_id;
+        gateway.session_manager.complete_session_ratchet(&old_id);
+        old.lock().client_admitted = true;
         gateway.handshake_cooldowns.insert(
             addr,
             (0, std::time::Instant::now() - Duration::from_secs(1)),
@@ -2494,7 +2658,7 @@ mod tests {
         let server_pub = gateway.session_manager.server_public_key();
         let shared = kp.compute_shared(&server_pub).unwrap();
         let mut eph = kp.public_key_bytes();
-        let keys = crypto::derive_session_keys(&shared, Some(&client.psk), &eph);
+        let keys = crypto::derive_initial_session_keys(&shared, Some(&client.psk), &eph);
         crypto::obfuscate_eph_pub(&mut eph, &server_pub);
         let mask = webrtc_zoom_v3();
         let mdh_len = super::packet_layout_for_mask(&mask).0;
@@ -2509,7 +2673,55 @@ mod tests {
             mask.tag_offset,
         )
         .unwrap();
+        let mut corrupt = packet.clone();
+        *corrupt.last_mut().unwrap() ^= 1;
+        assert!(gateway.handle_packet(&corrupt, addr).await.is_err());
+        assert!(
+            peer.try_recv_from(&mut [0u8; 4096]).is_err(),
+            "До AEAD сервер не отправляет policy update или Hello"
+        );
         gateway.handle_packet(&packet, addr).await.unwrap();
+        assert!(
+            gateway.session_manager.get_session(&old_id).is_some(),
+            "Неподтвержденный init не вытесняет действующее соединение"
+        );
+        assert_eq!(
+            gateway
+                .session_manager
+                .get_session_by_vpn_ip(&client.vpn_ip)
+                .unwrap()
+                .lock()
+                .session_id,
+            old_id
+        );
+        let pending = gateway
+            .session_manager
+            .iter_sessions()
+            .map(|entry| entry.value().clone())
+            .find(|session| session.lock().session_id != old_id)
+            .unwrap();
+        assert!(
+            pending.lock().pending_mask.is_none(),
+            "До PFS политика не меняет маску"
+        );
+        let server_eph = pending.lock().server_eph_pub.unwrap();
+        let dh2 = kp.compute_shared(&server_eph).unwrap();
+        let established =
+            crypto::derive_session_keys(&dh2, Some(&keys.session_key), &kp.public_key_bytes());
+        let confirmation = build_random_mdh_packet_with_tag_offset(
+            &established,
+            &mut 0,
+            &inner,
+            None,
+            mdh_len,
+            mask.tag_offset,
+        )
+        .unwrap();
+        gateway.handle_packet(&confirmation, addr).await.unwrap();
+        assert!(
+            pending.lock().pending_mask.is_some(),
+            "После PFS политика отправляет маску"
+        );
         assert!(gateway.session_manager.get_session(&old_id).is_none());
         let replacement = gateway
             .session_manager
@@ -2635,6 +2847,7 @@ mod tests {
     /// need `client_id` and don't drive the handshake state machine.
     fn make_bare_session(client_id: Option<String>) -> Arc<parking_lot::Mutex<Session>> {
         let keys = aivpn_common::crypto::SessionKeys {
+            packet_cipher: aivpn_common::crypto::PacketCipher::Established,
             session_key: [1u8; 32],
             session_key_s2c: [1u8; 32],
             tag_secret: [1u8; 32],
@@ -2681,6 +2894,12 @@ mod tests {
         let gateway = Gateway::new(config).expect("gateway constructs");
 
         let bound_session = make_bare_session(Some(client.id.clone()));
+        assert_eq!(
+            gateway.session_role(&bound_session),
+            ClientRole::User,
+            "Знание PSK не доказывает владение привязанным ключом администратора"
+        );
+        assert!(bound_session.lock().record_verified_device([3; 32]));
         assert_eq!(gateway.session_role(&bound_session), ClientRole::Admin);
 
         let unbound_session = make_bare_session(None);
@@ -2716,6 +2935,532 @@ mod tests {
         assert!(authorize(ClientRole::Viewer.as_u8(), 0, "/api/v1/clients"));
         assert!(!authorize(ClientRole::Viewer.as_u8(), 1, "/api/v1/clients"));
         assert!(authorize(ClientRole::Admin.as_u8(), 1, "/api/v1/clients"));
+    }
+
+    async fn mtls_fixture() -> (
+        Gateway,
+        Arc<parking_lot::Mutex<Session>>,
+        aivpn_common::crypto::KeyPair,
+    ) {
+        let mut config = make_test_gateway_config("verified-mtls");
+        config.server_private_key = [19; 32];
+        let ca = ed25519_dalek::SigningKey::from_bytes(&[17; 32]);
+        config.mtls = Some(crate::mtls::MtlsConfig {
+            required: true,
+            ca_public_key_hex: Some(hex::encode(ca.verifying_key().to_bytes())),
+        });
+        let client = config
+            .client_db
+            .as_ref()
+            .unwrap()
+            .add_client("mtls-test")
+            .unwrap();
+        let mut gateway = Gateway::new(config).unwrap();
+        gateway.udp_socket = Some(Arc::new(
+            tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap(),
+        ));
+        let session = gateway
+            .session_manager
+            .create_session(
+                "127.0.0.1:40000".parse().unwrap(),
+                [7; 32],
+                Some(client.psk),
+                Some(client.vpn_ip),
+            )
+            .unwrap();
+        session.lock().client_id = Some(client.id);
+        session.lock().mtls_ok = false;
+        (
+            gateway,
+            session,
+            aivpn_common::crypto::KeyPair::from_private_key([23; 32]),
+        )
+    }
+
+    #[tokio::test]
+    async fn mtls_uses_verified_static_identity_in_either_delivery_order() {
+        use aivpn_common::{crypto, protocol::ControlPayload};
+        for cert_first in [true, false] {
+            let (gateway, session, device) = mtls_fixture().await;
+            let addr = session.lock().client_addr;
+            let cert = crate::mtls::issue_cert(
+                device.public_key_bytes(),
+                crypto::current_timestamp_ms() / 1000 + 60,
+                &[17; 32],
+            );
+            let (server_eph, client_eph) = {
+                let sess = session.lock();
+                (sess.server_eph_pub.unwrap(), sess.eph_pub)
+            };
+            let shared = device
+                .compute_shared(&gateway.session_manager.server_public_key())
+                .unwrap();
+            let enrollment = ControlPayload::DeviceEnrollment {
+                static_pub: device.public_key_bytes(),
+                dh_proof: crypto::device_enrollment_proof(&shared, &server_eph, &client_eph),
+            }
+            .encode()
+            .unwrap();
+            let certificate = ControlPayload::ClientCert {
+                cert_bytes: cert.to_bytes().to_vec(),
+            }
+            .encode()
+            .unwrap();
+            let (first, second) = if cert_first {
+                (&certificate, &enrollment)
+            } else {
+                (&enrollment, &certificate)
+            };
+            gateway
+                .handle_control_message(first, &session, addr)
+                .await
+                .unwrap();
+            assert!(
+                !session.lock().mtls_ok,
+                "До обоих доказательств доступ закрыт"
+            );
+            gateway
+                .handle_control_message(second, &session, addr)
+                .await
+                .unwrap();
+            assert!(
+                session.lock().mtls_ok,
+                "Сертификат постоянного ключа должен работать"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn expired_mtls_does_not_forward_userspace_data() {
+        use aivpn_common::{client_wire::build_inner_packet, protocol::InnerType};
+        let (mut gateway, session, device) = mtls_fixture().await;
+        {
+            let mut sess = session.lock();
+            assert!(sess.record_verified_device(device.public_key_bytes()));
+            sess.record_mtls_cert(crate::mtls::issue_cert(
+                device.public_key_bytes(),
+                1,
+                &[17; 32],
+            ));
+            sess.mtls_ok = true;
+        }
+        let (tx, mut rx) = tokio::sync::mpsc::channel(2);
+        gateway.tun_write_tx = Some(tx);
+        let mut packet = vec![
+            0x45, 0, 0, 20, 0, 0, 0, 0, 64, 1, 0, 0, 10, 0, 0, 2, 8, 8, 8, 8,
+        ];
+        packet[12..16].copy_from_slice(&session.lock().vpn_ip.unwrap().octets());
+        let inner = build_inner_packet(InnerType::Data, 1, &packet);
+        let addr = session.lock().client_addr;
+        gateway
+            .process_inner_payload(&inner, &session, addr)
+            .await
+            .unwrap();
+        assert!(
+            rx.try_recv().is_err(),
+            "Истекший сертификат не разрешает Data"
+        );
+    }
+
+    #[tokio::test]
+    async fn client_mtls_does_not_replace_masked_peer_authentication() {
+        use aivpn_common::protocol::ControlPayload;
+        let (mut gateway, session, _) = mtls_fixture().await;
+        gateway.config.exit_node_enabled = true;
+        let (tx, mut rx) = tokio::sync::mpsc::channel(2);
+        gateway.tun_write_tx = Some(tx);
+        let mut packet = vec![0u8; 20];
+        packet[0] = 0x45;
+        packet[2..4].copy_from_slice(&20u16.to_be_bytes());
+        packet[12..16].copy_from_slice(&session.lock().vpn_ip.unwrap().octets());
+        packet[16..20].copy_from_slice(&[8, 8, 8, 8]);
+        let encoded = ControlPayload::ChainForward {
+            payload: packet.clone(),
+        }
+        .encode()
+        .unwrap();
+        let addr = session.lock().client_addr;
+        gateway
+            .handle_control_message(&encoded, &session, addr)
+            .await
+            .unwrap();
+        assert!(
+            rx.try_recv().is_err(),
+            "Обычный клиент без сертификата не пересылает данные"
+        );
+        // Этот флаг назначает только PSK-precheck межсерверного канала.
+        session.lock().is_masked_pool_peer = true;
+        gateway
+            .handle_control_message(&encoded, &session, addr)
+            .await
+            .unwrap();
+        assert_eq!(rx.try_recv().unwrap(), packet);
+    }
+
+    #[tokio::test]
+    async fn bound_one_time_client_requires_device_proof_for_data_and_kernel() {
+        use aivpn_common::client_wire::build_inner_packet;
+        use aivpn_common::protocol::InnerType;
+        let (mut gateway, session, device) = mtls_fixture().await;
+        gateway.config.mtls = None;
+        let db = gateway.client_db.as_ref().unwrap();
+        let client_id = session.lock().client_id.clone().unwrap();
+        db.enroll_device(&client_id, &device.public_key_bytes())
+            .unwrap();
+        db.update_client(
+            &client_id,
+            crate::client_db::UpdateClientParams {
+                one_time: Some(true),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(2);
+        gateway.tun_write_tx = Some(tx);
+        let mut packet = vec![0u8; 20];
+        packet[0] = 0x45;
+        packet[2..4].copy_from_slice(&20u16.to_be_bytes());
+        packet[12..16].copy_from_slice(&session.lock().vpn_ip.unwrap().octets());
+        packet[16..20].copy_from_slice(&[8, 8, 8, 8]);
+        let inner = build_inner_packet(InnerType::Data, 1, &packet);
+        let addr = session.lock().client_addr;
+        gateway
+            .process_inner_payload(&inner, &session, addr)
+            .await
+            .unwrap();
+        assert!(
+            rx.try_recv().is_err(),
+            "Знания PSK недостаточно для привязанного одноразового ключа"
+        );
+        let input = super::kernel_input_from_session(
+            &session.lock(),
+            gateway.client_db.as_deref(),
+            &gateway.config.network_config,
+            true,
+            false,
+        );
+        assert!(
+            input.enroll_pending,
+            "Ядро тоже требует доказательство в этой сессии"
+        );
+        session
+            .lock()
+            .record_verified_device(device.public_key_bytes());
+        gateway
+            .process_inner_payload(&inner, &session, addr)
+            .await
+            .unwrap();
+        assert_eq!(rx.try_recv().unwrap(), packet);
+    }
+
+    #[tokio::test]
+    async fn protected_reconnect_waits_for_device_and_certificate_before_replacing_owner() {
+        use aivpn_common::{crypto, protocol::ControlPayload};
+        let (gateway, pending, device) = mtls_fixture().await;
+        let cid = pending.lock().client_id.clone().unwrap();
+        let db = gateway.client_db.as_ref().unwrap();
+        db.enroll_device(&cid, &device.public_key_bytes()).unwrap();
+        db.update_client(
+            &cid,
+            crate::client_db::UpdateClientParams {
+                one_time: Some(true),
+                role: Some(crate::client_db::ClientRole::Admin),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let (addr, vip, pending_id) = {
+            let s = pending.lock();
+            (s.client_addr, s.vpn_ip.unwrap(), s.session_id)
+        };
+        let old = gateway
+            .session_manager
+            .create_session(addr, [8; 32], None, Some(vip))
+            .unwrap();
+        let old_id = old.lock().session_id;
+        gateway
+            .session_manager
+            .complete_session_ratchet(&pending_id);
+        gateway.session_manager.bind_vpn_ip(&vip, &pending_id);
+        assert_eq!(
+            gateway
+                .session_manager
+                .get_session_by_vpn_ip(&vip)
+                .unwrap()
+                .lock()
+                .session_id,
+            old_id,
+            "PFS без доказательства устройства не захватывает IP"
+        );
+        let (server_eph, client_eph) = {
+            let s = pending.lock();
+            (s.server_eph_pub.unwrap(), s.eph_pub)
+        };
+        let dh = device
+            .compute_shared(&gateway.session_manager.server_public_key())
+            .unwrap();
+        let enrollment = ControlPayload::DeviceEnrollment {
+            static_pub: device.public_key_bytes(),
+            dh_proof: crypto::device_enrollment_proof(&dh, &server_eph, &client_eph),
+        }
+        .encode()
+        .unwrap();
+        pending.lock().capabilities_sent = true;
+        gateway
+            .handle_control_message(&enrollment, &pending, addr)
+            .await
+            .unwrap();
+        assert!(
+            !pending.lock().capabilities_sent,
+            "После proof роль должна объявляться заново"
+        );
+        assert_eq!(
+            gateway.session_role(&pending),
+            crate::client_db::ClientRole::User,
+            "Обязательный сертификат нужен и для управления"
+        );
+        assert!(gateway.session_manager.get_session(&old_id).is_some());
+        let cert = crate::mtls::issue_cert(
+            device.public_key_bytes(),
+            crypto::current_timestamp_ms() / 1000 + 60,
+            &[17; 32],
+        );
+        let encoded = ControlPayload::ClientCert {
+            cert_bytes: cert.to_bytes().to_vec(),
+        }
+        .encode()
+        .unwrap();
+        gateway
+            .handle_control_message(&encoded, &pending, addr)
+            .await
+            .unwrap();
+        assert_eq!(
+            gateway.session_role(&pending),
+            crate::client_db::ClientRole::Admin
+        );
+        assert!(gateway.session_manager.get_session(&old_id).is_none());
+        assert_eq!(
+            gateway
+                .session_manager
+                .get_session_by_vpn_ip(&vip)
+                .unwrap()
+                .lock()
+                .session_id,
+            pending_id
+        );
+        pending.lock().record_mtls_cert(crate::mtls::issue_cert(
+            device.public_key_bytes(),
+            1,
+            &[17; 32],
+        ));
+        assert_eq!(
+            gateway.session_role(&pending),
+            crate::client_db::ClientRole::User,
+            "Истекший сертификат отзывает управление без reconnect"
+        );
+    }
+
+    #[test]
+    fn concurrent_admission_keeps_one_live_owner() {
+        let gateway = Gateway::new(make_test_gateway_config("concurrent-admission")).unwrap();
+        let client = gateway
+            .client_db
+            .as_ref()
+            .unwrap()
+            .add_client("parallel")
+            .unwrap();
+        for _ in 0..30 {
+            let sessions: Vec<_> = (0..2)
+                .map(|n| {
+                    let session = gateway
+                        .session_manager
+                        .create_session(
+                            format!("127.0.0.1:{}", 40000 + n).parse().unwrap(),
+                            aivpn_common::crypto::KeyPair::generate().public_key_bytes(),
+                            Some(client.psk),
+                            Some(client.vpn_ip),
+                        )
+                        .unwrap();
+                    session.lock().client_id = Some(client.id.clone());
+                    let id = session.lock().session_id;
+                    gateway.session_manager.complete_session_ratchet(&id);
+                    session
+                })
+                .collect();
+            let barrier = std::sync::Barrier::new(2);
+            std::thread::scope(|scope| {
+                for session in &sessions {
+                    let gateway = &gateway;
+                    let barrier = &barrier;
+                    scope.spawn(move || {
+                        barrier.wait();
+                        gateway.commit_client_admission(session);
+                    });
+                }
+            });
+            let live = sessions
+                .iter()
+                .filter(|s| {
+                    gateway
+                        .session_manager
+                        .get_session(&s.lock().session_id)
+                        .is_some()
+                })
+                .count();
+            assert_eq!(
+                live, 1,
+                "Одновременные подтверждения не удаляют оба соединения"
+            );
+            assert!(gateway
+                .session_manager
+                .get_session_by_vpn_ip(&client.vpn_ip)
+                .is_some());
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_device_authentication_retries_the_same_hello_after_pfs() {
+        use aivpn_common::{client_wire, protocol::ControlPayload};
+        let (gateway, session, _) = mtls_fixture().await;
+        let peer = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = peer.local_addr().unwrap();
+        let sid = session.lock().session_id;
+        let mask = webrtc_zoom_v3();
+        session.lock().mask = Some(mask.clone());
+        session.lock().client_addr = addr;
+        let eph = session.lock().server_eph_pub.unwrap();
+        gateway.session_manager.complete_session_ratchet(&sid);
+        let keys = session.lock().keys.clone();
+        let keepalive = ControlPayload::Keepalive { send_ts: 0 }.encode().unwrap();
+        gateway
+            .handle_control_message(&keepalive, &session, addr)
+            .await
+            .unwrap();
+        let mut buffer = [0u8; 4096];
+        let len = tokio::time::timeout(Duration::from_secs(1), peer.recv(&mut buffer))
+            .await
+            .unwrap()
+            .unwrap();
+        let decoded = client_wire::decode_packet_with_layout(
+            &buffer[..len],
+            &keys,
+            &mut client_wire::RecvWindow::new(),
+            super::packet_layout_for_mask(&mask).0,
+            mask.tag_offset,
+        )
+        .unwrap();
+        assert!(
+            matches!(ControlPayload::decode(&decoded.payload),
+            Ok(ControlPayload::ServerHello { server_eph_pub, .. }) if server_eph_pub == eph),
+            "Утраченные proof/cert запрашиваются повтором того же Hello под PFS-ключом"
+        );
+    }
+
+    #[tokio::test]
+    async fn incomplete_client_authentication_has_a_deadline() {
+        let (gateway, session, _) = mtls_fixture().await;
+        let sid = session.lock().session_id;
+        gateway.session_manager.complete_session_ratchet(&sid);
+        session.lock().created_at = std::time::Instant::now() - Duration::from_secs(61);
+        let addr = session.lock().client_addr;
+        gateway
+            .handle_control_message(
+                &aivpn_common::protocol::ControlPayload::Keepalive { send_ts: 0 }
+                    .encode()
+                    .unwrap(),
+                &session,
+                addr,
+            )
+            .await
+            .unwrap();
+        assert!(
+            gateway.session_manager.get_session(&sid).is_none(),
+            "Keepalive не продлевает неполную аутентификацию бесконечно"
+        );
+    }
+
+    #[tokio::test]
+    async fn capabilities_are_reannounced_after_a_lost_udp_reply() {
+        use aivpn_common::{client_wire, protocol::ControlPayload};
+        let (gateway, session, _) = mtls_fixture().await;
+        let peer = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = peer.local_addr().unwrap();
+        let sid = session.lock().session_id;
+        gateway.session_manager.complete_session_ratchet(&sid);
+        let mask = webrtc_zoom_v3();
+        {
+            let mut sess = session.lock();
+            sess.mask = Some(mask.clone());
+            sess.client_addr = addr;
+            sess.client_admitted = true;
+        }
+        let keys = session.lock().keys.clone();
+        let mut window = client_wire::RecvWindow::new();
+        for _ in 0..2 {
+            gateway
+                .handle_control_message(
+                    &ControlPayload::Keepalive { send_ts: 0 }.encode().unwrap(),
+                    &session,
+                    addr,
+                )
+                .await
+                .unwrap();
+            let capability = tokio::time::timeout(Duration::from_secs(1), async {
+                loop {
+                    let mut buffer = [0; 4096];
+                    let n = peer.recv(&mut buffer).await.unwrap();
+                    let decoded = client_wire::decode_packet_with_layout(
+                        &buffer[..n],
+                        &keys,
+                        &mut window,
+                        super::packet_layout_for_mask(&mask).0,
+                        mask.tag_offset,
+                    )
+                    .unwrap();
+                    if matches!(
+                        ControlPayload::decode(&decoded.payload),
+                        Ok(ControlPayload::Capabilities { .. })
+                    ) {
+                        break;
+                    }
+                }
+            })
+            .await;
+            assert!(
+                capability.is_ok(),
+                "Успешный send_to не означает доставку роли по UDP"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn reconnects_of_one_client_do_not_create_independent_anomaly_reporters() {
+        use aivpn_common::protocol::ControlPayload;
+        let gateway = Gateway::new(make_test_gateway_config("stable-reporters")).unwrap();
+        let report = ControlPayload::TelemetryResponse {
+            packet_loss: 1000,
+            rtt_ms: 1000,
+            jitter_ms: 1,
+            buffer_pct: 1,
+        }
+        .encode()
+        .unwrap();
+        for reporter in 0..3 {
+            let session = make_bare_session(Some("same-authenticated-client".into()));
+            session.lock().session_id = [reporter; 16];
+            session.lock().mask = Some(webrtc_zoom_v3());
+            let addr = session.lock().client_addr;
+            for _ in 0..4 {
+                gateway
+                    .handle_control_message(&report, &session, addr)
+                    .await
+                    .unwrap();
+            }
+        }
+        assert!(!gateway
+            .neural_module
+            .lock()
+            .is_mask_anomalous(&webrtc_zoom_v3().mask_id));
     }
 }
 

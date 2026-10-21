@@ -134,6 +134,8 @@ void aivpn_session_table_fini(void)
 	aivpn_qos_flush();
 	aivpn_tun_clear();
 	aivpn_stats_fini();
+	/* Все producers остановлены. Grace period не дожидается call_rcu callbacks. */
+	rcu_barrier();
 }
 
 /* ── Hash helpers ────────────────────────────────────────────────────────── */
@@ -374,8 +376,10 @@ int aivpn_session_tags_update(const struct aivpn_session_update_tags *upd)
 	}
 
 	/* Link new entries into the RCU table and update session bookkeeping */
+	spin_lock_bh(&s->lock);
 	for (i = 0; i < count; i++) {
 		new_entries[i]->session = s;
+		new_entries[i]->epoch = s->replay.epoch;
 		hash_add_rcu(aivpn_tag_htable, &new_entries[i]->hnode,
 			     tag_hash_key(new_entries[i]->tag));
 		s->tag_entries[i] = new_entries[i];
@@ -383,6 +387,7 @@ int aivpn_session_tags_update(const struct aivpn_session_update_tags *upd)
 	for (i = count; i < (u32)old_count; i++)
 		s->tag_entries[i] = NULL;
 	s->tag_entry_count = (int)count;
+	spin_unlock_bh(&s->lock);
 	spin_unlock_bh(&aivpn_table_lock);
 
 	kfree(new_entries);
@@ -678,7 +683,7 @@ int aivpn_session_dl_reserve(struct aivpn_kern_session *s, const u8 *ip,
 	return 0;
 }
 
-int aivpn_session_rx_prepare(struct aivpn_kern_session *s, u64 counter,
+int aivpn_session_rx_prepare(struct aivpn_kern_session *s, u32 epoch, u64 counter,
 			     int *replay_dup)
 {
 	int v, r;
@@ -691,7 +696,7 @@ int aivpn_session_rx_prepare(struct aivpn_kern_session *s, u64 counter,
 	if (v != AIVPN_VERDICT_ACCEPT)
 		return v;
 	/* Эпоха еще не привязана: не смотрим чужое окно и не отмечаем счетчик. */
-	if (s->replay.epoch == 0)
+	if (epoch == 0 || s->replay.epoch != epoch)
 		return AIVPN_VERDICT_FALLBACK;
 	r = aivpn_replay_observe_win(s->replay.hi, s->replay.words, counter);
 	if (r == AIVPN_REPLAY_DUP) {
@@ -703,7 +708,7 @@ int aivpn_session_rx_prepare(struct aivpn_kern_session *s, u64 counter,
 	return AIVPN_VERDICT_ACCEPT;
 }
 
-int aivpn_session_rx_finish(struct aivpn_kern_session *s, u64 counter,
+int aivpn_session_rx_finish(struct aivpn_kern_session *s, u32 epoch, u64 counter,
 			    const u8 *plain, unsigned int plain_len,
 			    unsigned int wire_len, int *replay_dup)
 {
@@ -714,7 +719,8 @@ int aivpn_session_rx_finish(struct aivpn_kern_session *s, u64 counter,
 	v = aivpn_pol_direction(&s->pol, AIVPN_POL_RX_FALLBACK);
 	if (v != AIVPN_VERDICT_ACCEPT)
 		return v;
-	if (s->replay.epoch == 0)
+	/* Тег мог быть найден до ротации, а AEAD работала без session lock. */
+	if (epoch == 0 || s->replay.epoch != epoch)
 		return AIVPN_VERDICT_FALLBACK;
 	r = aivpn_replay_observe_win(s->replay.hi, s->replay.words, counter);
 	if (r == AIVPN_REPLAY_DUP) {
@@ -733,7 +739,7 @@ int aivpn_session_rx_finish(struct aivpn_kern_session *s, u64 counter,
 	if (v != AIVPN_VERDICT_ACCEPT)
 		return v;
 	/* Захват только после адресов: FALLBACK не сжигает счетчик для userspace. */
-	claim = aivpn_epoch_claim(&s->replay, s->replay.epoch, counter);
+	claim = aivpn_epoch_claim(&s->replay, epoch, counter);
 	if (claim == AIVPN_CLAIM_DUP) {
 		*replay_dup = 1;
 		return AIVPN_VERDICT_DROP;
@@ -947,7 +953,7 @@ int aivpn_client_revoke(const struct aivpn_client_revoke *rv)
 
 /* ── aivpn_tag_lookup - hot path, called with rcu_read_lock() held ─────── */
 
-struct aivpn_kern_session *aivpn_tag_lookup(const u8 *tag, u64 *counter)
+struct aivpn_kern_session *aivpn_tag_lookup(const u8 *tag, u64 *counter, u32 *epoch)
 {
 	struct aivpn_tag_entry *e;
 	u32 h = tag_hash_key(tag);
@@ -955,6 +961,7 @@ struct aivpn_kern_session *aivpn_tag_lookup(const u8 *tag, u64 *counter)
 	hash_for_each_possible_rcu(aivpn_tag_htable, e, hnode, h) {
 		if (!crypto_memneq(e->tag, tag, AIVPN_TAG_SIZE)) {
 			*counter = e->counter;
+			*epoch = e->epoch;
 			return e->session;
 		}
 	}

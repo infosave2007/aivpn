@@ -54,6 +54,20 @@ jobs:
       run: |
         cc -std=c11 -Wall -Wextra -Werror -fsanitize=address,undefined platforms/linux-kernel/tests/policy_test.c -o /tmp/aivpn-policy-test
         /tmp/aivpn-policy-test
+        python3 deploy/ci/test-kernel-rx.py
+        python3 deploy/ci/test-kernel-owner.py
+
+    - name: BPF and packaging regressions
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y libbpf-dev clang
+        cc -std=gnu11 -Wall -Wextra -Werror -Wno-unknown-pragmas -pthread -fsanitize=undefined platforms/linux-kernel/tests/bpf_policy_test.c -o /tmp/aivpn-bpf-test
+        /tmp/aivpn-bpf-test
+        clang -O2 -target bpf -g -Wall -Werror -I/usr/include/x86_64-linux-gnu -c deploy/ebpf/tc_qos_prog.c -o /tmp/aivpn-tc.o
+        clang -O2 -target bpf -g -Wall -Werror -I/usr/include/x86_64-linux-gnu -c platforms/linux-kernel/src/xdp_prog.c -o /tmp/aivpn-xdp.o
+        python3 deploy/ci/test-tc-loader.py
+        python3 deploy/ci/test-build-packaging.py
+        python3 deploy/ci/test-mikrotik-entrypoint.py
 
     - name: Run tests
       run: cargo test --locked --workspace --exclude aivpn-windows --features "aivpn-server/management-api,aivpn-server/metrics,aivpn-server/dns,aivpn-server/passive-distribution" --verbose

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
 //! dev.rs — misc device registration and ioctl dispatch for aivpn.ko
 //!
-//! Updated for the Linux 6.9+/7.x Rust-for-Linux API:
+//! Нужен Rust-for-Linux API с владельцем модуля в miscdevice fops:
 //!   kernel::miscdevice::{MiscDevice, MiscDeviceOptions, MiscDeviceRegistration}
 //!   kernel::uaccess::UserSlice
 //!   kernel::fs::File
@@ -98,6 +98,13 @@ impl AivpnDev {
         let opts = MiscDeviceOptions {
             name: kernel::c_str!("aivpn"),
         };
+        let fops = opts.into_raw::<Self>().fops;
+        // SAFETY: into_raw возвращает неизменяемую статическую vtable этого типа.
+        // До misc_register она еще никому не опубликована; NULL не разыменовываем.
+        if fops.is_null() || unsafe { (*fops).owner.is_null() } {
+            pr_err!("aivpn: miscdevice API не закрепляет модуль за открытым fd\n");
+            return Err(ENODEV);
+        }
         KBox::pin_init(
             try_pin_init!(AivpnDev {
                 _reg <- MiscDeviceRegistration::<AivpnDev>::register(opts),

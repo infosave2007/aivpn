@@ -12,7 +12,7 @@ use std::sync::Arc;
 use tokio::net::UdpSocket;
 use tracing::debug;
 
-use aivpn_common::crypto::{self, encrypt_payload, TAG_SIZE};
+use aivpn_common::crypto::{self, TAG_SIZE};
 use aivpn_common::error::{Error, Result};
 use aivpn_common::protocol::{ControlPayload, InnerHeader, InnerType};
 
@@ -28,7 +28,10 @@ impl Gateway {
         payload: &ControlPayload,
         session: &Arc<parking_lot::Mutex<Session>>,
     ) -> Result<()> {
-        let socket = self.udp_socket.as_ref().unwrap();
+        let socket = self
+            .udp_socket
+            .as_ref()
+            .ok_or_else(|| Error::Session("UDP socket не открыт".into()))?;
         let mdh = {
             let mut sess = session.lock();
             sess.commit_pending_mask();
@@ -60,7 +63,7 @@ impl Gateway {
             if index > 0 && index % 16 == 0 {
                 tokio::time::sleep(std::time::Duration::from_millis(1)).await;
             }
-            let (mut inner_payload, nonce, counter, keys, client_addr, mask) = {
+            let (mut inner_payload, _nonce, counter, keys, client_addr, mask) = {
                 let mut sess = session.lock();
                 let inner_header = InnerHeader {
                     inner_type: kind,
@@ -91,12 +94,18 @@ impl Gateway {
                     padded.push(rng.gen::<u8>());
                 }
             }
-            let ciphertext = encrypt_payload(&keys.session_key_s2c, &nonce, &padded)?; // downlink → S2C key
             let time_window = crypto::compute_time_window(
                 crypto::current_timestamp_ms(),
                 aivpn_common::crypto::DEFAULT_WINDOW_MS,
             );
             let tag = crypto::generate_resonance_tag(&keys.tag_secret, counter, time_window);
+            let ciphertext = crypto::encrypt_session_payload(
+                &keys,
+                crypto::PacketDirection::ServerToClient,
+                counter,
+                &tag,
+                &padded,
+            )?;
             let mut packet = Vec::with_capacity(TAG_SIZE + mdh.len() + ciphertext.len());
             if let Some(mask) = mask
                 .as_ref()
@@ -148,7 +157,10 @@ impl Gateway {
         let mut inner_payload = inner_header.encode().to_vec();
         inner_payload.extend_from_slice(&encoded);
         let packet = self.build_packet(&inner_payload, session)?;
-        let socket = self.udp_socket.as_ref().unwrap();
+        let socket = self
+            .udp_socket
+            .as_ref()
+            .ok_or_else(|| Error::Session("UDP socket не открыт".into()))?;
         let sent = socket.send_to(&packet, client_addr).await?;
         debug!("ServerHello sent: {} bytes to {}", sent, client_addr);
         Ok(())
@@ -200,7 +212,7 @@ impl Gateway {
         let mut sess = session.lock();
 
         // Use unified counter for both nonce and tag
-        let (nonce, counter) = sess.next_send_nonce();
+        let (_nonce, counter) = sess.next_send_nonce();
 
         // Build padded plaintext: pad_len(u16) || plaintext || random_padding
         // pad_len is inside encryption — invisible to DPI (CRIT-5 fix)
@@ -214,14 +226,19 @@ impl Gateway {
             padded.push(rng.gen::<u8>());
         }
 
-        let ciphertext = encrypt_payload(&sess.keys.session_key_s2c, &nonce, &padded)?; // downlink → S2C key
-
         // Generate tag
         let time_window = crypto::compute_time_window(
             crypto::current_timestamp_ms(),
             aivpn_common::crypto::DEFAULT_WINDOW_MS,
         );
         let tag = crypto::generate_resonance_tag(&sess.keys.tag_secret, counter, time_window);
+        let ciphertext = crypto::encrypt_session_payload(
+            &sess.keys,
+            crypto::PacketDirection::ServerToClient,
+            counter,
+            &tag,
+            &padded,
+        )?;
         let current_mask = sess.mask.clone();
         drop(sess);
 
@@ -290,6 +307,7 @@ mod fragment_tests {
         let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let keys = SessionKeys {
+            packet_cipher: crypto::PacketCipher::Established,
             session_key: [1; 32],
             session_key_s2c: [2; 32],
             tag_secret: [3; 32],

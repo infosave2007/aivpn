@@ -151,6 +151,9 @@ pub(crate) static KERNEL_DOWNLINK_ARMED: std::sync::atomic::AtomicBool =
 /// on the user-space downlink path — if the session has no mask yet or its MDH
 /// is larger than the kernel inline limit.
 pub(crate) fn make_kernel_downlink(sess: &mut crate::session::Session) -> Option<SessionDownlink> {
+    if sess.keys.packet_cipher.is_initial() {
+        return None;
+    }
     // Only reserve counters when the kernel is actually transmitting downlink.
     if !KERNEL_DOWNLINK_ARMED.load(std::sync::atomic::Ordering::Relaxed) {
         return None;
@@ -309,6 +312,9 @@ pub(crate) fn make_kernel_session_policy(
     if !sess.mtls_ok {
         flags |= POL_MTLS_WAIT;
     }
+    if sess.mtls_required {
+        flags |= POL_FALLBACK;
+    }
     if !sess.is_site_peer && sess.client_id.is_none() {
         flags |= POL_ENROLL_WAIT;
     }
@@ -421,6 +427,34 @@ fn ipv6_policy_prefix(
 
 /// Лимиты сессии: скорость и квота по client_key, IPv6, изоляция, exit и enrollment.
 /// Неизвестный QoS оставляет limits_ready ложью, и ядро не обходит userspace.
+fn device_proof_pending(
+    sess: &crate::session::Session,
+    client: &crate::client_db::ClientConfig,
+) -> bool {
+    (client.one_time || client.role != crate::client_db::ClientRole::User)
+        && (sess.verified_device_pub.is_none() || sess.verified_device_pub != client.device_pubkey)
+}
+
+pub(crate) fn session_allows_client_data(
+    sess: &crate::session::Session,
+    db: Option<&crate::client_db::ClientDatabase>,
+) -> bool {
+    if sess.is_masked_pool_peer || sess.is_site_peer {
+        return true;
+    }
+    sess.client_id
+        .as_ref()
+        .and_then(|id| db.and_then(|db| db.find_by_id(id)))
+        .is_some_and(|client| {
+            client.enabled
+                && !client.deleted
+                && client
+                    .expires_at
+                    .is_none_or(|expiry| expiry > chrono::Utc::now())
+                && !device_proof_pending(sess, &client)
+        })
+}
+
 pub(crate) fn kernel_limits_for(
     sess: &crate::session::Session,
     client: Option<&crate::client_db::ClientConfig>,
@@ -432,7 +466,7 @@ pub(crate) fn kernel_limits_for(
     let enroll_pending = if sess.is_site_peer {
         false
     } else if let Some(item) = client {
-        item.one_time && item.device_pubkey.is_none()
+        device_proof_pending(sess, item)
     } else {
         sess.client_id.is_none()
     };
@@ -539,6 +573,9 @@ pub(crate) fn kernel_reinstall(
     input: &KernelPolicyInput,
     refresh_policy: bool,
 ) -> Option<KernelWirePlan> {
+    if sess.keys.packet_cipher.is_initial() {
+        return None;
+    }
     let install_sig = kernel_session_sig(sess, tag_offset, mdh_len);
     let key_tag = kernel_key_tag(sess);
     let rotate = sess.kernel_epoch == 0 || sess.kernel_key_tag != key_tag;
@@ -710,6 +747,9 @@ pub(crate) fn kernel_maintain(
     input: &KernelPolicyInput,
     refresh_policy: bool,
 ) -> bool {
+    if sess.keys.packet_cipher.is_initial() {
+        return false;
+    }
     if sess.kernel_faulted {
         return false;
     }
@@ -762,6 +802,13 @@ pub(crate) fn kernel_claim_deliver(
     previous_epoch: bool,
 ) -> ReplayGate {
     if sess.kernel_faulted {
+        return ReplayGate::Drop;
+    }
+    if if previous_epoch {
+        sess.pre_ratchet_received.contains(&counter)
+    } else {
+        !sess.counter_is_fresh(counter)
+    } {
         return ReplayGate::Drop;
     }
     let Some(ka) = ka else {
@@ -865,6 +912,7 @@ mod tests {
 
     fn bare_session() -> crate::session::Session {
         let keys = SessionKeys {
+            packet_cipher: aivpn_common::crypto::PacketCipher::Established,
             session_key: [1u8; 32],
             session_key_s2c: [2u8; 32],
             tag_secret: [3u8; 32],
@@ -1170,6 +1218,44 @@ mod tests {
         );
         super::reset_kernel_binding(&mut sess);
         assert!(sess.kernel_faulted);
+    }
+
+    #[test]
+    fn userspace_workers_claim_one_authenticated_counter_only_once() {
+        let session = std::sync::Arc::new(parking_lot::Mutex::new(bare_session()));
+        let mut workers = Vec::new();
+        for _ in 0..2 {
+            let session = session.clone();
+            workers.push(std::thread::spawn(move || {
+                let mut sess = session.lock();
+                let gate = super::kernel_claim_deliver(None, &sess, 7, false);
+                if gate == ReplayGate::Deliver {
+                    sess.mark_tag_received(7);
+                }
+                gate
+            }));
+        }
+        let delivered = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .filter(|gate| *gate == ReplayGate::Deliver)
+            .count();
+        assert_eq!(
+            delivered, 1,
+            "Повторная проверка и отметка должны быть атомарны"
+        );
+    }
+
+    #[test]
+    fn initial_v2_never_produces_a_kernel_install_plan() {
+        let mut session = bare_session();
+        session.keys.packet_cipher = aivpn_common::crypto::PacketCipher::InitialV2 {
+            client_eph_pub: [7; 32],
+        };
+        assert!(
+            kernel_reinstall(&session, u16::MAX, 20, &KernelPolicyInput::default(), true).is_none()
+        );
+        assert!(super::make_kernel_downlink(&mut session).is_none());
     }
 
     #[test]

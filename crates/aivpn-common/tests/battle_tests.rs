@@ -500,6 +500,7 @@ fn battle_wire_format_multiple_packets() {
 #[test]
 fn battle_wire_format_zero_padding() {
     let keys = SessionKeys {
+        packet_cipher: aivpn_common::crypto::PacketCipher::Established,
         session_key: crypto::blake3_hash(b"key"),
         session_key_s2c: crypto::blake3_hash(b"key"),
         tag_secret: crypto::blake3_hash(b"tag"),
@@ -526,6 +527,7 @@ fn battle_wire_format_zero_padding() {
 #[test]
 fn battle_wire_format_max_padding() {
     let keys = SessionKeys {
+        packet_cipher: aivpn_common::crypto::PacketCipher::Established,
         session_key: crypto::blake3_hash(b"key"),
         session_key_s2c: crypto::blake3_hash(b"key"),
         tag_secret: crypto::blake3_hash(b"tag"),

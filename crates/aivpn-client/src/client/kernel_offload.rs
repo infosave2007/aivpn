@@ -105,6 +105,9 @@ impl super::AivpnClient {
         let Some(keys) = self.session_keys.as_ref() else {
             return;
         };
+        if keys.packet_cipher != crypto::PacketCipher::Established {
+            return;
+        }
         let (session_key_s2c, tag_secret) = (keys.session_key_s2c, keys.tag_secret);
         let Some(transport) = self.transport.clone() else {
             return;

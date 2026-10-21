@@ -132,8 +132,8 @@ int main(void)
 
 	fill_v4(pkt, 40, self, inet);
 	CHECK(aivpn_pol_check_addrs(&pol, AIVPN_DIR_UPLINK, pkt, 40, 40,
-				    peer_only, (void *)&other) == AIVPN_VERDICT_ACCEPT,
-	      "normal v4 accept");
+				    peer_only, (void *)&other) == AIVPN_VERDICT_FALLBACK,
+	      "isolated unknown v4 destination fallback");
 
 	fill_v4(pkt, 40, spoof, inet);
 	CHECK(aivpn_pol_check_addrs(&pol, AIVPN_DIR_UPLINK, pkt, 40, 40,
@@ -147,8 +147,17 @@ int main(void)
 
 	fill_v4(pkt, 40, self, inet);
 	CHECK(aivpn_pol_check_addrs(&pol, AIVPN_DIR_UPLINK, pkt, 40, 40,
-				    peer_only, (void *)&other) == AIVPN_VERDICT_ACCEPT,
-	      "other dest accept");
+				    peer_only, (void *)&other) == AIVPN_VERDICT_FALLBACK,
+	      "isolated Internet destination fallback");
+
+	fill_v4(pkt, 40, self, other);
+	CHECK(aivpn_pol_check_addrs(&pol, AIVPN_DIR_UPLINK, pkt, 40, 40,
+				    NULL, NULL) == AIVPN_VERDICT_FALLBACK,
+	      "userspace-only peer destination fallback");
+	fill_v4(pkt, 40, other, self);
+	CHECK(aivpn_pol_check_addrs(&pol, AIVPN_DIR_DOWNLINK, pkt, 40, 40,
+				    NULL, NULL) == AIVPN_VERDICT_FALLBACK,
+	      "userspace-only peer source fallback");
 
 	fill_v4(pkt, 40, self, self);
 	CHECK(aivpn_pol_check_addrs(&pol, AIVPN_DIR_UPLINK, pkt, 40, 40,
@@ -177,6 +186,13 @@ int main(void)
 	CHECK(aivpn_pol_check_addrs(&pol, AIVPN_DIR_UPLINK, pkt, 48, 48,
 				    peer_only, (void *)&other) == AIVPN_VERDICT_DROP,
 	      "v6 peer dest drop");
+	CHECK(aivpn_pol_check_addrs(&pol, AIVPN_DIR_UPLINK, pkt, 48, 48,
+				    NULL, NULL) == AIVPN_VERDICT_FALLBACK,
+	      "userspace-only v6 peer fallback");
+	fill_v6(pkt, 48, peer_v6, mine);
+	CHECK(aivpn_pol_check_addrs(&pol, AIVPN_DIR_DOWNLINK, pkt, 48, 48,
+				    NULL, NULL) == AIVPN_VERDICT_FALLBACK,
+	      "userspace-only v6 peer source fallback");
 
 	memset(pkt, 0, sizeof(pkt));
 	pkt[0] = 0x40;

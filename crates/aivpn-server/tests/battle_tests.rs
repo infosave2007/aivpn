@@ -7,8 +7,9 @@ use std::collections::HashSet;
 use std::net::SocketAddr;
 
 use aivpn_common::crypto::{
-    self, compute_time_window, current_timestamp_ms, decrypt_payload, derive_session_keys,
-    encrypt_payload, generate_resonance_tag, KeyPair, DEFAULT_WINDOW_MS, NONCE_SIZE, TAG_SIZE,
+    self, compute_time_window, current_timestamp_ms, decrypt_payload, derive_initial_session_keys,
+    derive_session_keys, encrypt_payload, generate_resonance_tag, KeyPair, PacketDirection,
+    DEFAULT_WINDOW_MS, NONCE_SIZE, TAG_SIZE,
 };
 use aivpn_common::mask::preset_masks::webrtc_zoom_v3;
 use aivpn_common::protocol::{ControlPayload, InnerHeader, InnerType};
@@ -71,7 +72,8 @@ fn battle_quic_initial_server_decode_roundtrip() {
     let client_shared = client_kp
         .compute_shared(&server_kp.public_key_bytes())
         .unwrap();
-    let client_keys = derive_session_keys(&client_shared, None, &client_kp.public_key_bytes());
+    let client_keys =
+        derive_initial_session_keys(&client_shared, None, &client_kp.public_key_bytes());
 
     // ── Client build path (exactly what MimicryEngine::emit does for QUIC) ──
     let counter: u64 = 0;
@@ -80,11 +82,16 @@ fn battle_quic_initial_server_decode_roundtrip() {
     let mut padded = Vec::new();
     padded.extend_from_slice(&0u16.to_le_bytes());
     padded.extend_from_slice(&inner);
-    let mut nonce = [0u8; NONCE_SIZE];
-    nonce[0..8].copy_from_slice(&counter.to_le_bytes());
-    let ciphertext = encrypt_payload(&client_keys.session_key, &nonce, &padded).unwrap();
     let tw = compute_time_window(current_timestamp_ms(), DEFAULT_WINDOW_MS);
     let tag = generate_resonance_tag(&client_keys.tag_secret, counter, tw);
+    let ciphertext = crypto::encrypt_session_payload(
+        &client_keys,
+        PacketDirection::ClientToServer,
+        counter,
+        &tag,
+        &padded,
+    )
+    .unwrap();
     let mut tag8 = [0u8; TAG_SIZE];
     tag8.copy_from_slice(&tag);
     let datagram = build_quic_initial(&tag8, &ciphertext, QUIC_MIN_DATAGRAM);
@@ -111,9 +118,11 @@ fn battle_quic_initial_server_decode_roundtrip() {
     // (3) Server recognizes the QUIC layout and decrypts the trailing ciphertext.
     let layout = parse_quic_initial(&datagram).expect("server recognizes QUIC layout");
     assert_eq!(layout.tag, tag8);
-    let decrypted = decrypt_payload(
-        &client_keys.session_key,
-        &nonce,
+    let decrypted = crypto::decrypt_session_payload(
+        &session.lock().keys,
+        PacketDirection::ClientToServer,
+        counter,
+        &tag,
         &datagram[layout.payload_offset..],
     )
     .expect("server decrypts trailing ciphertext");
@@ -250,7 +259,8 @@ fn battle_session_tag_validation() {
     let client_shared = client_kp
         .compute_shared(&server_kp.public_key_bytes())
         .unwrap();
-    let client_keys = derive_session_keys(&client_shared, None, &client_kp.public_key_bytes());
+    let client_keys =
+        derive_initial_session_keys(&client_shared, None, &client_kp.public_key_bytes());
 
     // Generate tag as client would
     let tw = compute_time_window(current_timestamp_ms(), DEFAULT_WINDOW_MS);
@@ -280,7 +290,8 @@ fn battle_session_anti_replay() {
     let client_shared = client_kp
         .compute_shared(&server_kp.public_key_bytes())
         .unwrap();
-    let client_keys = derive_session_keys(&client_shared, None, &client_kp.public_key_bytes());
+    let client_keys =
+        derive_initial_session_keys(&client_shared, None, &client_kp.public_key_bytes());
     let tw = compute_time_window(current_timestamp_ms(), DEFAULT_WINDOW_MS);
     let tag = generate_resonance_tag(&client_keys.tag_secret, 0, tw);
 
@@ -369,7 +380,8 @@ fn battle_session_multiple_clients() {
         let client_shared = client_kp
             .compute_shared(&server_kp.public_key_bytes())
             .unwrap();
-        let client_keys = derive_session_keys(&client_shared, None, &client_kp.public_key_bytes());
+        let client_keys =
+            derive_initial_session_keys(&client_shared, None, &client_kp.public_key_bytes());
 
         sessions.push(session);
         client_keys_list.push(client_keys);
@@ -480,7 +492,8 @@ fn battle_full_pipeline_data_packet() {
     let client_shared = client_kp
         .compute_shared(&server_kp.public_key_bytes())
         .unwrap();
-    let client_keys = derive_session_keys(&client_shared, None, &client_kp.public_key_bytes());
+    let client_keys =
+        derive_initial_session_keys(&client_shared, None, &client_kp.public_key_bytes());
 
     // 3. Server creates session (normally triggered by CRIT-4 session establishment)
     let _session = mgr
@@ -507,12 +520,16 @@ fn battle_full_pipeline_data_packet() {
         padded.push(i as u8);
     }
 
-    let mut nonce = [0u8; NONCE_SIZE];
-    nonce[0..8].copy_from_slice(&counter.to_le_bytes());
-    let ciphertext = encrypt_payload(&client_keys.session_key, &nonce, &padded).unwrap();
-
     let tw = compute_time_window(current_timestamp_ms(), DEFAULT_WINDOW_MS);
     let tag = generate_resonance_tag(&client_keys.tag_secret, counter, tw);
+    let ciphertext = crypto::encrypt_session_payload(
+        &client_keys,
+        PacketDirection::ClientToServer,
+        counter,
+        &tag,
+        &padded,
+    )
+    .unwrap();
 
     let mdh = mask.header_template.clone();
     let mut wire = Vec::new();
@@ -536,7 +553,14 @@ fn battle_full_pipeline_data_packet() {
         let sess = session.lock();
         sess.keys.clone()
     };
-    let decrypted = decrypt_payload(&server_keys.session_key, &nonce, encrypted).unwrap();
+    let decrypted = crypto::decrypt_session_payload(
+        &server_keys,
+        PacketDirection::ClientToServer,
+        counter,
+        &tag,
+        encrypted,
+    )
+    .unwrap();
 
     // 5d. Strip padding
     let dec_pad_len = u16::from_le_bytes([decrypted[0], decrypted[1]]) as usize;
@@ -569,7 +593,8 @@ fn battle_full_pipeline_100_packets() {
     let client_shared = client_kp
         .compute_shared(&server_kp.public_key_bytes())
         .unwrap();
-    let client_keys = derive_session_keys(&client_shared, None, &client_kp.public_key_bytes());
+    let client_keys =
+        derive_initial_session_keys(&client_shared, None, &client_kp.public_key_bytes());
 
     let session = mgr
         .create_session(make_addr(10000), client_kp.public_key_bytes(), None, None)
@@ -593,10 +618,15 @@ fn battle_full_pipeline_100_packets() {
             padded.push(i as u8);
         }
 
-        let mut nonce = [0u8; NONCE_SIZE];
-        nonce[0..8].copy_from_slice(&counter.to_le_bytes());
-        let ct = encrypt_payload(&client_keys.session_key, &nonce, &padded).unwrap();
         let tag = generate_resonance_tag(&client_keys.tag_secret, counter, tw);
+        let ct = crypto::encrypt_session_payload(
+            &client_keys,
+            PacketDirection::ClientToServer,
+            counter,
+            &tag,
+            &padded,
+        )
+        .unwrap();
 
         // Server validates
         let found = mgr.get_session_by_tag(&tag);
@@ -606,7 +636,14 @@ fn battle_full_pipeline_100_packets() {
         assert!(valid.is_some(), "Counter {counter}: tag validation failed");
 
         // Decrypt
-        let dec = decrypt_payload(&client_keys.session_key, &nonce, &ct).unwrap();
+        let dec = crypto::decrypt_session_payload(
+            &session.lock().keys,
+            PacketDirection::ClientToServer,
+            counter,
+            &tag,
+            &ct,
+        )
+        .unwrap();
         let pl = u16::from_le_bytes([dec[0], dec[1]]) as usize;
         let data = &dec[2..dec.len() - pl];
         let hdr = InnerHeader::decode(data).unwrap();
@@ -636,7 +673,8 @@ fn battle_full_pipeline_control_messages() {
     let client_shared = client_kp
         .compute_shared(&server_kp.public_key_bytes())
         .unwrap();
-    let client_keys = derive_session_keys(&client_shared, None, &client_kp.public_key_bytes());
+    let client_keys =
+        derive_initial_session_keys(&client_shared, None, &client_kp.public_key_bytes());
 
     let _session = mgr
         .create_session(make_addr(10000), client_kp.public_key_bytes(), None, None)
@@ -671,12 +709,29 @@ fn battle_full_pipeline_control_messages() {
         padded.extend_from_slice(&[0u8; 8]);
 
         let counter = i as u64;
-        let mut nonce = [0u8; NONCE_SIZE];
-        nonce[0..8].copy_from_slice(&counter.to_le_bytes());
-        let ct = encrypt_payload(&client_keys.session_key, &nonce, &padded).unwrap();
+        let tag = generate_resonance_tag(
+            &client_keys.tag_secret,
+            counter,
+            compute_time_window(current_timestamp_ms(), DEFAULT_WINDOW_MS),
+        );
+        let ct = crypto::encrypt_session_payload(
+            &client_keys,
+            PacketDirection::ClientToServer,
+            counter,
+            &tag,
+            &padded,
+        )
+        .unwrap();
 
         // Server decrypts
-        let dec = decrypt_payload(&client_keys.session_key, &nonce, &ct).unwrap();
+        let dec = crypto::decrypt_session_payload(
+            &client_keys,
+            PacketDirection::ClientToServer,
+            counter,
+            &tag,
+            &ct,
+        )
+        .unwrap();
         let pl = u16::from_le_bytes([dec[0], dec[1]]) as usize;
         let data = &dec[2..dec.len() - pl];
 
@@ -736,12 +791,12 @@ fn battle_cross_session_isolation() {
     let shared1 = client1_kp
         .compute_shared(&server_kp.public_key_bytes())
         .unwrap();
-    let keys1 = derive_session_keys(&shared1, None, &client1_kp.public_key_bytes());
+    let keys1 = derive_initial_session_keys(&shared1, None, &client1_kp.public_key_bytes());
 
     let shared2 = client2_kp
         .compute_shared(&server_kp.public_key_bytes())
         .unwrap();
-    let keys2 = derive_session_keys(&shared2, None, &client2_kp.public_key_bytes());
+    let keys2 = derive_initial_session_keys(&shared2, None, &client2_kp.public_key_bytes());
 
     // Keys must be different
     assert_ne!(keys1.session_key, keys2.session_key);
@@ -816,7 +871,7 @@ fn battle_stress_100_sessions() {
         let shared = client_kp
             .compute_shared(&server_kp.public_key_bytes())
             .unwrap();
-        let keys = derive_session_keys(&shared, None, &client_kp.public_key_bytes());
+        let keys = derive_initial_session_keys(&shared, None, &client_kp.public_key_bytes());
 
         let tag = generate_resonance_tag(&keys.tag_secret, 0, tw);
         let found = mgr.get_session_by_tag(&tag).or_else(|| {
@@ -1084,7 +1139,8 @@ fn battle_refresh_session_tags() {
     let client_shared = client_kp
         .compute_shared(&server_kp.public_key_bytes())
         .unwrap();
-    let client_keys = derive_session_keys(&client_shared, None, &client_kp.public_key_bytes());
+    let client_keys =
+        derive_initial_session_keys(&client_shared, None, &client_kp.public_key_bytes());
     let tw = compute_time_window(current_timestamp_ms(), DEFAULT_WINDOW_MS);
     let tag = generate_resonance_tag(&client_keys.tag_secret, 10, tw);
     let found = mgr.get_session_by_tag(&tag);
@@ -1136,7 +1192,7 @@ fn battle_ratchet_full_crypto_pipeline() {
         .compute_shared(&server_kp.public_key_bytes())
         .unwrap();
     let client_initial_keys =
-        derive_session_keys(&client_initial_shared, None, &client_kp.public_key_bytes());
+        derive_initial_session_keys(&client_initial_shared, None, &client_kp.public_key_bytes());
     let client_ratcheted = derive_session_keys(
         &client_dh2,
         Some(&client_initial_keys.session_key),
@@ -1641,7 +1697,7 @@ fn authenticated_session(
     let key = KeyPair::generate();
     let eph = key.public_key_bytes();
     let dh = key.compute_shared(&server.public_key_bytes()).unwrap();
-    let keys = derive_session_keys(&dh, Some(&psk), &eph);
+    let keys = derive_initial_session_keys(&dh, Some(&psk), &eph);
     let tag = generate_resonance_tag(
         &keys.tag_secret,
         0,
@@ -1671,7 +1727,11 @@ fn reconnect_at_nat_limit_preserves_other_clients_and_bounds_reserve() {
             [i as u8; 32],
         )
         .unwrap();
-        original.push(session.lock().session_id);
+        let id = session.lock().session_id;
+        manager.complete_session_ratchet(&id);
+        session.lock().client_admitted = true;
+        manager.bind_vpn_ip(&format!("10.0.0.{}", i + 2).parse().unwrap(), &id);
+        original.push(id);
     }
     assert!(authenticated_session(
         &manager,
@@ -1704,6 +1764,10 @@ fn reconnect_at_nat_limit_preserves_other_clients_and_bounds_reserve() {
     .is_err());
     assert_eq!(manager.session_count(), 6);
     let id = replacement.lock().session_id;
+    manager.complete_session_ratchet(&id);
+    // Этот тест проверяет лимиты manager; полную аутентификацию выполняет gateway.
+    replacement.lock().client_admitted = true;
+    manager.bind_vpn_ip(&"10.0.0.2".parse().unwrap(), &id);
     assert_eq!(
         manager.cleanup_old_sessions_for_client_id("client-0", &id),
         vec![original[0]]

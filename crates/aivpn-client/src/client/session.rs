@@ -1,8 +1,117 @@
 use super::*;
 
+#[cfg(test)]
+mod initial_upload_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn max_mtu_data_before_hello_is_dropped_without_stopping_upload() {
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        client.connect(server.local_addr().unwrap()).await.unwrap();
+        let initial = crypto::derive_initial_session_keys(&[7; 32], None, &[8; 32]);
+        let established = crypto::derive_session_keys(&[9; 32], None, &[8; 32]);
+        let state = Arc::new(Mutex::new(UploadCryptoState {
+            keys: initial.clone(),
+            counter: 0,
+            seq: 0,
+            rekey_ack: VecDeque::new(),
+        }));
+        let sent = Arc::new(AtomicU64::new(0));
+        let mask = aivpn_common::mask::preset_masks::webrtc_zoom_v3();
+        let (data_tx, data_rx) = mpsc::channel(8);
+        let (control_tx, control_rx) = mpsc::channel(8);
+        data_tx.send(vec![0x45; 1500]).await.unwrap();
+        control_tx
+            .send(ControlPayload::Keepalive { send_ts: 17 })
+            .await
+            .unwrap();
+        let mut task = tokio::spawn(AivpnClient::spawn_upload(
+            data_rx,
+            control_rx,
+            aivpn_common::transport::udp_transport(client),
+            MimicryEngine::new(mask.clone()),
+            state.clone(),
+            sent.clone(),
+            Arc::new(Mutex::new(None)),
+            Duration::from_secs(60),
+            Arc::new(AtomicU64::new(0)),
+            2,
+            Arc::new(AtomicU64::new(60000)),
+            Arc::new(AtomicU64::new(0)),
+        ));
+        // Оба начальных пакета - keepalive. Очередь DATA уже прочитана перед вторым.
+        for _ in 0..2 {
+            let kind = tokio::select! {
+                result = &mut task => panic!("Uploader остановился до Hello: {result:?}"),
+                kind = recv_kind(&server, &initial, &mask) => kind,
+            };
+            assert_eq!(kind, InnerType::Control);
+        }
+        assert!(!task.is_finished());
+        assert_eq!(sent.load(Ordering::Relaxed), 0);
+        {
+            let mut upload = state.lock().unwrap();
+            upload.keys = established.clone();
+            upload.counter = 0;
+        }
+        data_tx.send(vec![0x45; 1280]).await.unwrap();
+        data_tx.send(vec![0x45; 1280]).await.unwrap();
+        assert_eq!(
+            recv_kind(&server, &established, &mask).await,
+            InnerType::Data
+        );
+        assert_eq!(
+            recv_kind(&server, &established, &mask).await,
+            InnerType::Data
+        );
+        assert_eq!(
+            recv_kind(&server, &established, &mask).await,
+            InnerType::FecRepair
+        );
+        assert_eq!(sent.load(Ordering::Relaxed), 2560);
+        assert!(!task.is_finished());
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+    }
+
+    async fn recv_kind(server: &UdpSocket, keys: &SessionKeys, mask: &MaskProfile) -> InnerType {
+        let mut buf = [0; 65536];
+        let n = tokio::time::timeout(Duration::from_secs(2), server.recv(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        let start = mask.tag_offset as usize;
+        let tag = buf[start..start + 8].try_into().unwrap();
+        let tw =
+            crypto::compute_time_window(crypto::current_timestamp_ms(), crypto::DEFAULT_WINDOW_MS);
+        let counter = (0..16)
+            .find(|counter| {
+                [tw, tw.saturating_sub(1), tw + 1]
+                    .into_iter()
+                    .any(|window| {
+                        crypto::generate_resonance_tag(&keys.tag_secret, *counter, window) == tag
+                    })
+            })
+            .unwrap();
+        let plain = crypto::decrypt_session_payload(
+            keys,
+            crypto::PacketDirection::ClientToServer,
+            counter,
+            &tag,
+            &buf[mask.mdh_len()..n],
+        )
+        .unwrap();
+        aivpn_common::protocol::InnerHeader::decode(&plain[2..])
+            .unwrap()
+            .inner_type
+    }
+}
+
 impl super::AivpnClient {
     /// Run the client main loop
     pub async fn run(&mut self, shutdown: Arc<AtomicBool>) -> Result<()> {
+        let _dns_session = self.dns_proxy_gate.as_ref().map(|gate| gate.session());
         let admin_binding = if self.config.control_only {
             None
         } else {
@@ -394,17 +503,6 @@ impl super::AivpnClient {
                 }
             })
         };
-
-        self.send_control(&ControlPayload::Capabilities {
-            role: 0,
-            features: aivpn_common::protocol::CLIENT_PACKET_FEATURES
-                | if self.adaptive_level.fec_n() > 0 {
-                    aivpn_common::protocol::CLIENT_FEC_ACTIVE
-                } else {
-                    0
-                },
-        })
-        .await?;
 
         // ── Spawn upload task using the shared pipeline ──
         let upload_transport = self
@@ -918,6 +1016,16 @@ impl super::AivpnClient {
         }
 
         impl PacketEncryptor for MimicryEncryptor {
+            fn data_ready(&self) -> bool {
+                !self
+                    .upload_state
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .keys
+                    .packet_cipher
+                    .is_initial()
+            }
+
             fn encrypt_data(&mut self, payload: &[u8]) -> Result<Vec<u8>> {
                 self.check_mask();
                 self.last_tx_ms.store(epoch_ms(), Ordering::Relaxed);

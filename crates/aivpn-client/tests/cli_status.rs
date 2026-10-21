@@ -29,9 +29,9 @@ fn cli_reports_reconnecting_then_disconnected_on_sigterm() {
     let admin = UdpSocket::bind("127.0.0.1:0").unwrap();
     let admin_addr = admin.local_addr().unwrap().to_string();
     drop(admin);
-    let server_key = base64::engine::general_purpose::STANDARD
-        .encode(aivpn_common::crypto::KeyPair::generate().public_key_bytes());
-    // Порт 0 заставляет send_init вернуть ошибку без обращения к внешнему серверу.
+    // Нулевая X25519-точка дает ошибку DH до отправки первого пакета.
+    // UDP send на порт 0 может успешно отправиться, и отказ проявится позже.
+    let server_key = base64::engine::general_purpose::STANDARD.encode([0u8; 32]);
     let child = Command::new(env!("CARGO_BIN_EXE_aivpn-client"))
         .args([
             "--server",

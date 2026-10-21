@@ -23,6 +23,15 @@ pub use model::*;
 mod merge;
 pub use merge::*;
 
+/// Все параметры новой записи сохраняются одной транзакцией.
+#[derive(Debug, Default)]
+pub(crate) struct CreateClientOptions {
+    pub one_time: bool,
+    pub expires_at: Option<DateTime<Utc>>,
+    pub role: ClientRole,
+    pub qos: Option<crate::qos::ClientQos>,
+}
+
 /// Parameters for `ClientDatabase::update_client`.
 /// Fields set to `None` are left unchanged.
 /// For `qos` / `expires_at`, use `Some(None)` to clear the setting.
@@ -89,12 +98,15 @@ pub struct ClientDatabase {
     /// Обратный порядок вместе с `reload_from_disk` (flock, затем запись
     /// `data`) дает взаимную блокировку.
     save_lock: Mutex<()>,
+    /// Shared lock живет до drop базы: offline restore не пересекается со stale writer.
+    _live_guard: LiveDbGuard,
 }
 
 impl ClientDatabase {
     /// Load or create client database from file
     pub fn load(file_path: &Path, network_config: VpnNetworkConfig) -> Result<Self> {
         network_config.validate()?;
+        let live_guard = LiveDbGuard::shared(file_path)?;
         // Пустой файл (пакетный post-install) это пустая база, не порча.
         // Симлинк и битый JSON не читаем и не подменяем своей копией.
         let mut data = match read_db_text(file_path)? {
@@ -120,6 +132,7 @@ impl ClientDatabase {
             partition: RwLock::new(None),
             last_mtime,
             save_lock: Mutex::new(()),
+            _live_guard: live_guard,
         })
     }
 
@@ -265,6 +278,26 @@ impl ClientDatabase {
         self.add_client_inner(name, None)
     }
 
+    pub(crate) fn add_client_with_options(
+        &self,
+        name: &str,
+        options: CreateClientOptions,
+    ) -> Result<ClientConfig> {
+        self.with_mutation(|data| {
+            if options.role != ClientRole::User {
+                return Err(Error::Session(
+                    "elevated role requires device binding".into(),
+                ));
+            }
+            self.insert_client(data, name, None, options.one_time)?;
+            let client = data.clients.last_mut().expect("client just inserted");
+            client.expires_at = options.expires_at;
+            client.qos = options.qos;
+            client.role = options.role;
+            Ok(client.clone())
+        })
+    }
+
     /// Add a new client already bound to `device_pubkey` at creation time.
     ///
     /// Unlike `add_client`, the returned (and persisted) record has
@@ -373,9 +406,14 @@ impl ClientDatabase {
                 .find(|c| c.id == client_id)
                 .ok_or_else(|| Error::Session(format!("Client '{}' not found", client_id)))?;
 
-            let enforce = client.one_time;
+            let enforce = client.one_time || client.role != ClientRole::User;
             match client.device_pubkey {
                 None => {
+                    if client.role != ClientRole::User {
+                        return Err(Error::Session(
+                            "elevated role requires existing device binding".into(),
+                        ));
+                    }
                     // First connect. one_time is preserved so a later device is still rejected.
                     client.device_pubkey = Some(static_pub);
                     client.updated_at = Some(Utc::now());
@@ -411,6 +449,7 @@ impl ClientDatabase {
                 .ok_or_else(|| Error::Session(format!("Client '{}' not found", client_id)))?;
             client.device_pubkey = None;
             client.one_time = true;
+            client.role = ClientRole::User;
             client.updated_at = Some(Utc::now());
             Ok(())
         })
@@ -632,10 +671,10 @@ impl ClientDatabase {
             // never actually be proven to belong to whoever shows up with the
             // PSK. Checked against the CURRENT `device_pubkey`. This call never
             // sets one, so there is no ordering trick to bypass it.
-            if let Some(role) = params.role {
-                if role != ClientRole::User && client.device_pubkey.is_none() {
-                    return Err(Error::Session("role requires device binding".into()));
-                }
+            if params.role.unwrap_or(client.role) != ClientRole::User
+                && client.device_pubkey.is_none()
+            {
+                return Err(Error::Session("role requires device binding".into()));
             }
             if let Some(name) = params.name {
                 client.name = name;
@@ -679,6 +718,75 @@ impl ClientDatabase {
                 }
                 None => Err(Error::Session(format!("Client '{}' not found", client_id))),
             }
+        })
+    }
+}
+
+/// Удерживает shared-владение серверными файлами до drop, не мешая CLI-мутациям.
+/// Захватывается до чтения config, чтобы startup не пересекался с offline restore.
+pub struct LiveDbGuard {
+    _file: File,
+}
+
+impl LiveDbGuard {
+    fn lock(file_path: &Path, exclusive: bool) -> Result<Self> {
+        let mut name = file_path.as_os_str().to_os_string();
+        name.push(".live.lock");
+        let path = PathBuf::from(name);
+        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            std::fs::create_dir_all(parent).map_err(Error::Io)?;
+        }
+        let file = open_lock_nofollow(&path).map_err(Error::Io)?;
+        if !file.metadata().map_err(Error::Io)?.is_file() {
+            return Err(Error::Session(
+                "DB lifetime lock должен быть обычным файлом".into(),
+            ));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            let operation = if exclusive {
+                libc::LOCK_EX | libc::LOCK_NB
+            } else {
+                libc::LOCK_SH
+            };
+            // Дескриптор жив до drop guard. Shared load ждет окончания restore.
+            if unsafe { libc::flock(file.as_raw_fd(), operation) } != 0 {
+                let error = std::io::Error::last_os_error();
+                if exclusive && error.kind() == std::io::ErrorKind::WouldBlock {
+                    return Err(Error::Session("Восстановление доступно только offline: остановите сервер и все процессы, использующие эту базу, затем повторите aivpn-server --import".into()));
+                }
+                return Err(Error::Io(error));
+            }
+        }
+        #[cfg(not(unix))]
+        if exclusive {
+            return Err(Error::Session(
+                "Offline restore требует файловой блокировки Unix".into(),
+            ));
+        }
+        Ok(Self { _file: file })
+    }
+
+    /// Ждет окончания offline restore и сохраняет блокировку на все время владения.
+    pub fn shared(path: &Path) -> Result<Self> {
+        Self::lock(path, false)
+    }
+}
+
+/// Сначала исключаем живых владельцев, затем берем обычную блокировку записи.
+pub(crate) struct OfflineRestoreGuard {
+    _mutation: DbFileLock,
+    _live: LiveDbGuard,
+}
+
+impl OfflineRestoreGuard {
+    pub(crate) fn try_acquire(path: &Path) -> Result<Self> {
+        let live = LiveDbGuard::lock(path, true)?;
+        let mutation = DbFileLock::acquire(&path.with_extension("lock"))?;
+        Ok(Self {
+            _mutation: mutation,
+            _live: live,
         })
     }
 }
@@ -1703,6 +1811,111 @@ mod tests {
             names,
             std::collections::HashSet::from(["alice".into(), "carol".into()])
         );
+    }
+
+    #[test]
+    fn create_with_options_persists_complete_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("clients.json");
+        let db = ClientDatabase::load(&path, test_network_config()).unwrap();
+        let expires_at = Utc::now() + chrono::Duration::hours(1);
+        let client = db
+            .add_client_with_options(
+                "complete",
+                CreateClientOptions {
+                    one_time: true,
+                    expires_at: Some(expires_at),
+                    role: ClientRole::User,
+                    qos: Some(crate::qos::ClientQos {
+                        bandwidth_limit_up: Some(1234),
+                        ..Default::default()
+                    }),
+                },
+            )
+            .unwrap();
+        let loaded = ClientDatabase::load(&path, test_network_config())
+            .unwrap()
+            .find_by_id(&client.id)
+            .unwrap();
+        assert!(loaded.one_time);
+        assert_eq!(loaded.expires_at, Some(expires_at));
+        assert_eq!(loaded.qos.unwrap().bandwidth_limit_up, Some(1234));
+    }
+
+    #[test]
+    fn elevated_role_cannot_rebind_even_without_one_time_flag() {
+        let dir = tempfile::tempdir().unwrap();
+        let db =
+            ClientDatabase::load(&dir.path().join("clients.json"), test_network_config()).unwrap();
+        for role in [ClientRole::Viewer, ClientRole::Admin] {
+            let client = db
+                .add_client_bound(&format!("role-{role:?}"), [1; 32])
+                .unwrap();
+            db.update_client(
+                &client.id,
+                UpdateClientParams {
+                    role: Some(role),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert!(db.enroll_device(&client.id, &[2; 32]).is_err());
+            assert_eq!(
+                db.find_by_id(&client.id).unwrap().device_pubkey,
+                Some([1; 32])
+            );
+            assert!(!db.enroll_device(&client.id, &[1; 32]).unwrap());
+        }
+    }
+
+    #[test]
+    fn elevated_role_reset_requires_explicit_new_promotion() {
+        let dir = tempfile::tempdir().unwrap();
+        let db =
+            ClientDatabase::load(&dir.path().join("clients.json"), test_network_config()).unwrap();
+        for role in [ClientRole::Viewer, ClientRole::Admin] {
+            let client = db
+                .add_client_bound(&format!("role-{role:?}"), [1; 32])
+                .unwrap();
+            db.update_client(
+                &client.id,
+                UpdateClientParams {
+                    role: Some(role),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            db.reset_device_binding(&client.id).unwrap();
+            let reset = db.find_by_id(&client.id).unwrap();
+            assert_eq!(reset.role, ClientRole::User);
+            assert!(reset.device_pubkey.is_none());
+            assert!(db.enroll_device(&client.id, &[2; 32]).unwrap());
+            assert_eq!(db.find_by_id(&client.id).unwrap().role, ClientRole::User);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn create_with_options_io_failure_leaves_no_partial_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("clients.json");
+        let db = ClientDatabase::load(&path, test_network_config()).unwrap();
+        db.add_client("existing").unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let guard = DirModeGuard::readonly(dir.path());
+        let result = db.add_client_with_options(
+            "complete",
+            CreateClientOptions {
+                one_time: true,
+                expires_at: Some(Utc::now()),
+                ..Default::default()
+            },
+        );
+        drop(guard);
+        assert!(result.is_err());
+        assert!(db.find_by_name("complete").is_none());
+        assert!(std::fs::read(&path).unwrap() == before);
+        assert_no_regular_tmp(dir.path());
     }
 
     #[test]

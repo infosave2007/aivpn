@@ -37,6 +37,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name || github.event.inputs.tag || github.ref }}
 
       - name: Setup Rust Toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -103,6 +105,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name || github.event.inputs.tag || github.ref }}
 
       # Full feature set (management-api, metrics, neural), musl static
       # cross-build — see the server-musl-aarch64-full target in the Makefile
@@ -165,6 +169,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name || github.event.inputs.tag || github.ref }}
 
       - name: Setup Rust Toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -226,6 +232,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name || github.event.inputs.tag || github.ref }}
 
       - name: Set up Java
         uses: actions/setup-java@v4
@@ -313,6 +321,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name || github.event.inputs.tag || github.ref }}
 
       - name: Build musl release artifact
         run: make ${{ matrix.make_target }}
@@ -356,6 +366,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name || github.event.inputs.tag || github.ref }}
 
       - name: Install cross-compilation dependencies
         run: |
@@ -411,6 +423,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name || github.event.inputs.tag || github.ref }}
 
       - name: Setup Rust Toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -460,6 +474,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name || github.event.inputs.tag || github.ref }}
       - name: Package masks
         run: |
           mkdir -p releases

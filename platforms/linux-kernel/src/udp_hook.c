@@ -91,10 +91,12 @@ static void aivpn_sk_data_ready(struct sock *sk)
 	while ((skb = __skb_dequeue(&process_q)) != NULL) {
 		struct aivpn_kern_session *session = NULL;
 		u64 counter = 0;
+		u32 epoch = 0;
+		u8 tag[AIVPN_TAG_SIZE];
 		unsigned int ct_start = 0;
 		u64 offbits;
 		unsigned int off;
-		/* Enqueue-time charge; skb->truesize may grow later (pull/linearize). */
+		/* До ACCEPT skb не меняется, включая повторный просмотр fallback. */
 		unsigned int rmem_charge = skb->truesize;
 		int ret;
 
@@ -113,10 +115,8 @@ static void aivpn_sk_data_ready(struct sock *sk)
 		 * only know AFTER identifying the session, which we do BY the tag.
 		 * Resolve the cycle by probing every offset any live session uses.
 		 *
-		 * aivpn_tag_lookup() reads AIVPN_TAG_SIZE bytes from skb->data + off;
-		 * a paged/non-linear datagram may keep fewer than that in the linear
-		 * header, so pull each candidate window in before reading (GFP_ATOMIC,
-		 * non-sleeping — safe under rcu_read_lock).
+		 * Тег копируем без изменения skb: fallback может повторно попасть
+		 * сюда, а UDP charge должна остаться равной исходной truesize.
 		 */
 		/* Iterate the probe bitmap as a full u64: for_each_set_bit walks
 		 * unsigned longs, which on a 32-bit kernel would silently drop
@@ -126,9 +126,9 @@ static void aivpn_sk_data_ready(struct sock *sk)
 		for (off = 0; off < 64; off++) {
 			if (!(offbits & (1ULL << off)))
 				continue;
-			if (!pskb_may_pull(skb, off + AIVPN_TAG_SIZE))
+			if (skb_copy_bits(skb, off, tag, sizeof(tag)))
 				continue;
-			session = aivpn_tag_lookup(skb->data + off, &counter);
+			session = aivpn_tag_lookup(tag, &counter, &epoch);
 			if (session) {
 				ct_start = session->ct_pos;
 				break;
@@ -167,7 +167,7 @@ static void aivpn_sk_data_ready(struct sock *sk)
 		spin_lock_bh(&session->lock);
 		{
 			int replay_dup = 0;
-			int verdict = aivpn_session_rx_prepare(session, counter,
+			int verdict = aivpn_session_rx_prepare(session, epoch, counter,
 							       &replay_dup);
 			spin_unlock_bh(&session->lock);
 			if (verdict != AIVPN_VERDICT_ACCEPT) {
@@ -214,7 +214,7 @@ static void aivpn_sk_data_ready(struct sock *sk)
 			spin_lock_bh(&session->lock);
 			{
 				int replay_dup = 0;
-				int verdict = aivpn_session_rx_finish(session, counter,
+				int verdict = aivpn_session_rx_finish(session, epoch, counter,
 								      plain, plain_len,
 								      skb->len, &replay_dup);
 				spin_unlock_bh(&session->lock);
@@ -235,7 +235,7 @@ static void aivpn_sk_data_ready(struct sock *sk)
 			}
 
 			/* ACCEPT: только теперь кладем внутренний IP в skb. */
-			if (skb_linearize(skb) ||
+			if (skb_linearize_cow(skb) ||
 			    (skb->len < plain_len &&
 			     (pskb_expand_head(skb, 0, plain_len - skb->len, GFP_ATOMIC) ||
 			      !skb_put(skb, plain_len - skb->len)))) {

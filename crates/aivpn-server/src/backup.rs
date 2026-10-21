@@ -91,6 +91,41 @@ pub struct ExportOptions {
     pub clients_db: Option<PathBuf>,
 }
 
+/// Пути назначения задает оператор, а не содержимое архива.
+#[derive(Debug, Clone)]
+pub struct ImportOptions {
+    pub config_path: PathBuf,
+    pub clients_db: PathBuf,
+    pub mask_dir: PathBuf,
+}
+
+#[derive(Clone, Copy)]
+struct ImportLimits {
+    manifest: u64,
+    entry: u64,
+    total: u64,
+    entries: usize,
+}
+
+impl Default for ImportLimits {
+    fn default() -> Self {
+        Self {
+            manifest: 1024 * 1024,
+            entry: 64 * 1024 * 1024,
+            total: 256 * 1024 * 1024,
+            entries: 4096,
+        }
+    }
+}
+
+pub fn import_server_with_options(
+    archive_path: &Path,
+    opts: &ImportOptions,
+    dry_run: bool,
+) -> Result<ImportSummary> {
+    import_with_limits(archive_path, opts, dry_run, ImportLimits::default())
+}
+
 /// Load this server's local backup-integrity key from
 /// `<dir>/backup_integrity.key`, optionally generating one atomically
 /// (`O_EXCL` + mode 0600 in a single `open()` call, closing the TOCTOU
@@ -163,6 +198,12 @@ fn load_backup_key(dir: &Path, create: bool) -> Option<[u8; 32]> {
 
 /// Export server data to `output_path` (.tar.gz).
 pub fn export_server(opts: &ExportOptions, output_path: &Path) -> Result<()> {
+    // Export читает согласованный с offline restore снимок, даже без объекта DB.
+    let _live_guard = opts
+        .clients_db
+        .as_deref()
+        .map(crate::client_db::LiveDbGuard::shared)
+        .transpose()?;
     let mut components = Vec::new();
     let mut files: Vec<(String, Vec<u8>)> = Vec::new();
 
@@ -243,7 +284,7 @@ pub fn export_server(opts: &ExportOptions, output_path: &Path) -> Result<()> {
         }
     }
 
-    let file = std::fs::File::create(output_path)
+    let file = open_private_output(output_path)
         .map_err(|e| Error::Session(format!("create backup: {}", e)))?;
     let gz = flate2::write::GzEncoder::new(file, flate2::Compression::default());
     let mut ar = tar::Builder::new(gz);
@@ -271,6 +312,10 @@ pub fn export_server(opts: &ExportOptions, output_path: &Path) -> Result<()> {
 
     ar.finish()
         .map_err(|e| Error::Session(format!("finalize archive: {}", e)))?;
+    ar.into_inner()
+        .and_then(|gz| gz.finish())
+        .and_then(|file| file.sync_all())
+        .map_err(|e| Error::Session(format!("finalize backup: {}", e)))?;
 
     info!(
         "Backup written to {:?} (components: {:?}, signed: {})",
@@ -281,12 +326,36 @@ pub fn export_server(opts: &ExportOptions, output_path: &Path) -> Result<()> {
     Ok(())
 }
 
+fn open_private_output(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = options.open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::other("backup output is not a regular file"));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    file.set_len(0)?;
+    Ok(file)
+}
+
 /// Archive-relative paths this server will ever write during import.
 /// Positive allowlist (server-sec HIGH1): anything else — including a
 /// crafted `server.key` entry, which would land in the same directory as
 /// the real one — is rejected rather than written to disk.
 fn is_allowed_import_path(rel: &Path) -> bool {
-    if rel.is_absolute()
+    if rel.to_str().is_none_or(|s| s.contains('\\'))
+        || rel.is_absolute()
         || rel
             .components()
             .any(|c| c == std::path::Component::ParentDir)
@@ -295,12 +364,15 @@ fn is_allowed_import_path(rel: &Path) -> bool {
     }
     let comps: Vec<_> = rel.components().collect();
     match comps.as_slice() {
-        [only] => matches!(
-            only.as_os_str().to_str(),
-            Some("clients.json") | Some("server.json")
-        ),
+        [_only] => matches!(rel.to_str(), Some("clients.json") | Some("server.json")),
         [dir, name] => {
             dir.as_os_str().to_str() == Some("masks")
+                && rel.to_str()
+                    == name
+                        .as_os_str()
+                        .to_str()
+                        .map(|name| format!("masks/{name}"))
+                        .as_deref()
                 && Path::new(name.as_os_str())
                     .extension()
                     .and_then(|e| e.to_str())
@@ -351,6 +423,23 @@ pub fn import_server(
     target_dir: &Path,
     dry_run: bool,
 ) -> Result<ImportSummary> {
+    import_server_with_options(
+        archive_path,
+        &ImportOptions {
+            config_path: target_dir.join("server.json"),
+            clients_db: target_dir.join("clients.json"),
+            mask_dir: target_dir.join("masks"),
+        },
+        dry_run,
+    )
+}
+
+fn import_with_limits(
+    archive_path: &Path,
+    opts: &ImportOptions,
+    dry_run: bool,
+    limits: ImportLimits,
+) -> Result<ImportSummary> {
     // Pass 1: read the manifest AND every allowlisted, schema-valid
     // component into memory. Nothing is written to `target_dir` until every
     // file in the archive has been checked — a truncated or partially
@@ -358,6 +447,8 @@ pub fn import_server(
     // mixed state.
     let mut manifest: Option<BackupManifest> = None;
     let mut staged: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut decoded_size = 0u64;
+    let mut seen = std::collections::HashSet::new();
     {
         let file = std::fs::File::open(archive_path)
             .map_err(|e| Error::Session(format!("open backup: {}", e)))?;
@@ -366,14 +457,38 @@ pub fn import_server(
         for entry in ar
             .entries()
             .map_err(|e| Error::Session(format!("read archive: {}", e)))?
+            .raw(true)
+            .enumerate()
         {
+            let (index, entry) = entry;
+            if index >= limits.entries {
+                return Err(Error::Session("backup entry count limit exceeded".into()));
+            }
             let mut entry = entry.map_err(|e| Error::Session(format!("entry: {}", e)))?;
+            let size = entry.size();
+            decoded_size = decoded_size
+                .checked_add(size)
+                .ok_or_else(|| Error::Session("backup decoded size limit exceeded".into()))?;
+            if size > limits.entry || decoded_size > limits.total {
+                return Err(Error::Session("backup decoded size limit exceeded".into()));
+            }
+            // Не обрабатываем GNU/PAX расширения внутри tar: их размер должен
+            // пройти те же ограничения, что и размер обычной записи.
+            if !entry.header().entry_type().is_file() {
+                return Err(Error::Session("backup contains a non-regular entry".into()));
+            }
             let rel = entry
                 .path()
                 .map_err(|e| Error::Session(format!("entry path: {}", e)))?
                 .to_path_buf();
 
             if rel.to_str() == Some(MANIFEST_NAME) {
+                if size > limits.manifest {
+                    return Err(Error::Session("backup manifest size limit exceeded".into()));
+                }
+                if manifest.is_some() {
+                    return Err(Error::Session("duplicate backup manifest".into()));
+                }
                 let mut buf = String::new();
                 entry
                     .read_to_string(&mut buf)
@@ -386,7 +501,10 @@ pub fn import_server(
                 warn!("import: skipping disallowed archive path {:?}", rel);
                 continue;
             }
-            let rel_str = rel.to_string_lossy().replace('\\', "/");
+            let rel_str = rel.to_string_lossy().into_owned();
+            if !seen.insert(rel_str.clone()) {
+                return Err(Error::Session("duplicate backup component".into()));
+            }
             let mut buf = Vec::new();
             entry
                 .read_to_end(&mut buf)
@@ -466,7 +584,8 @@ pub fn import_server(
     // install, cross-server migration, or a pre-signing backup) — warn and
     // proceed, since the import endpoint is already admin-only (unix
     // socket / CLI on the host).
-    let mac_verified = match (&manifest.mac, load_backup_key(target_dir, false)) {
+    let key_dir = opts.config_path.parent().unwrap_or(Path::new("."));
+    let mac_verified = match (&manifest.mac, load_backup_key(key_dir, false)) {
         (Some(mac_hex), Some(key)) => {
             let expected = blake3::keyed_hash(&key, &manifest.mac_input())
                 .to_hex()
@@ -508,8 +627,9 @@ pub fn import_server(
         });
     }
 
-    std::fs::create_dir_all(target_dir)
-        .map_err(|e| Error::Session(format!("create target dir: {}", e)))?;
+    // Полная проверка завершена. Ни один DB owner не должен пережить restore
+    // со старой памятью и вернуть прежние записи следующим LWW/flush.
+    let _restore_guard = crate::client_db::OfflineRestoreGuard::try_acquire(&opts.clients_db)?;
 
     // Pass 2: every file already validated (allowlist + schema + content
     // hash) — write each to a per-file-unique temp path (PID + random
@@ -517,24 +637,36 @@ pub fn import_server(
     // into place, hardening permissions before the rename makes the file
     // visible at its real path.
     for (rel, bytes) in &staged {
-        let dest = target_dir.join(rel);
+        let dest = match rel.as_str() {
+            "server.json" => opts.config_path.clone(),
+            "clients.json" => opts.clients_db.clone(),
+            _ => opts
+                .mask_dir
+                .join(rel.strip_prefix("masks/").expect("validated mask path")),
+        };
         if let Some(parent) = dest.parent() {
             std::fs::create_dir_all(parent).map_err(|e| Error::Session(format!("mkdir: {}", e)))?;
         }
         let mut nonce = [0u8; 8];
         rand::rngs::OsRng.fill_bytes(&mut nonce);
         let tmp = dest.with_extension(format!("{}.{}.tmp", std::process::id(), hex::encode(nonce)));
-        std::fs::write(&tmp, bytes)
-            .map_err(|e| Error::Session(format!("write {:?}: {}", tmp, e)))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            if let Err(e) = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600)) {
-                warn!("failed to harden permissions on restored {:?}: {}", dest, e);
+        let result = (|| -> std::io::Result<()> {
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
             }
+            let mut file = options.open(&tmp)?;
+            file.write_all(bytes)?;
+            file.sync_all()?;
+            std::fs::rename(&tmp, &dest)
+        })();
+        if let Err(e) = result {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(Error::Session(format!("restore {:?}: {}", dest, e)));
         }
-        std::fs::rename(&tmp, &dest)
-            .map_err(|e| Error::Session(format!("rename {:?}: {}", dest, e)))?;
         info!("Restored {:?}", rel);
     }
 
@@ -558,6 +690,206 @@ fn semver_major(v: &str) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn import_paths_have_one_unambiguous_spelling() {
+        for path in [
+            "masks//escape.json",
+            "masks/./escape.json",
+            "./server.json",
+            "masks/../escape.json",
+            r"masks/..\escape.json",
+        ] {
+            assert!(!is_allowed_import_path(Path::new(path)), "accepted {path}");
+        }
+        assert!(is_allowed_import_path(Path::new("masks/valid.json")));
+    }
+
+    fn import_options(root: &Path) -> ImportOptions {
+        ImportOptions {
+            config_path: root.join("config/custom.json"),
+            clients_db: root.join("db/records.json"),
+            mask_dir: root.join("profiles"),
+        }
+    }
+
+    #[test]
+    fn import_uses_explicit_component_paths() {
+        let root = tempfile::tempdir().unwrap();
+        let archive = root.path().join("paths.tar.gz");
+        let profile = aivpn_common::mask::preset_masks::webrtc_zoom_v3();
+        let mask_path = format!("masks/{}.json", profile.mask_id);
+        write_archive(
+            &archive,
+            &[
+                ("server.json", b"{}".to_vec()),
+                ("clients.json", b"{\"clients\":[]}".to_vec()),
+                (&mask_path, serde_json::to_vec(&profile).unwrap()),
+                (
+                    MANIFEST_NAME,
+                    serde_json::to_vec(&BackupManifest::new(vec![])).unwrap(),
+                ),
+            ],
+        );
+        let opts = import_options(root.path());
+        import_server_with_options(&archive, &opts, false).unwrap();
+        assert!(
+            opts.config_path.exists(),
+            "configured filename was not restored"
+        );
+        assert!(opts.clients_db.exists());
+        assert!(opts
+            .mask_dir
+            .join(format!("{}.json", profile.mask_id))
+            .exists());
+        assert!(!root.path().join("config/server.json").exists());
+        assert!(!root.path().join("config/clients.json").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn export_is_private_for_new_and_existing_outputs() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let output = root.path().join("backup.tar.gz");
+        export_server(&ExportOptions::default(), &output).unwrap();
+        assert_eq!(
+            std::fs::metadata(&output).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        std::fs::set_permissions(&output, std::fs::Permissions::from_mode(0o644)).unwrap();
+        export_server(&ExportOptions::default(), &output).unwrap();
+        assert_eq!(
+            std::fs::metadata(&output).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn export_refuses_symlink_output() {
+        let root = tempfile::tempdir().unwrap();
+        let victim = root.path().join("victim");
+        let output = root.path().join("backup.tar.gz");
+        std::fs::write(&victim, b"sentinel").unwrap();
+        std::os::unix::fs::symlink(&victim, &output).unwrap();
+        assert!(export_server(&ExportOptions::default(), &output).is_err());
+        assert!(std::fs::read(&victim).unwrap() == b"sentinel");
+    }
+
+    #[test]
+    fn import_bounds_decoded_manifest_entry_total_and_count() {
+        let root = tempfile::tempdir().unwrap();
+        let archive = root.path().join("limits.tar.gz");
+        let opts = import_options(root.path());
+        let manifest = serde_json::to_vec(&BackupManifest::new(vec![])).unwrap();
+        let defaults = ImportLimits {
+            manifest: 1024,
+            entry: 1024,
+            total: 4096,
+            entries: 10,
+        };
+        for (entries, limits) in [
+            (
+                vec![(MANIFEST_NAME, manifest.clone())],
+                ImportLimits {
+                    manifest: 16,
+                    ..defaults
+                },
+            ),
+            (
+                vec![
+                    (MANIFEST_NAME, manifest.clone()),
+                    ("clients.json", vec![b' '; 1025]),
+                ],
+                defaults,
+            ),
+            (
+                vec![
+                    (MANIFEST_NAME, manifest.clone()),
+                    ("clients.json", vec![b' '; 700]),
+                ],
+                ImportLimits {
+                    total: 256,
+                    ..defaults
+                },
+            ),
+            (
+                vec![
+                    (MANIFEST_NAME, manifest.clone()),
+                    ("clients.json", b"{}".to_vec()),
+                ],
+                ImportLimits {
+                    entries: 1,
+                    ..defaults
+                },
+            ),
+        ] {
+            write_archive(&archive, &entries);
+            let error = import_with_limits(&archive, &opts, false, limits).unwrap_err();
+            assert!(
+                error.to_string().contains("limit"),
+                "unexpected error: {error}"
+            );
+            assert!(!opts.clients_db.exists());
+        }
+    }
+
+    #[test]
+    fn import_rejects_large_declared_payload_before_reading_it() {
+        let root = tempfile::tempdir().unwrap();
+        let archive = root.path().join("header-only.tar.gz");
+        for (name, entry_type) in [
+            ("clients.json", tar::EntryType::Regular),
+            ("manifest.json", tar::EntryType::Regular),
+            ("extension", tar::EntryType::GNULongName),
+        ] {
+            let mut header = tar::Header::new_gnu();
+            header.set_path(name).unwrap();
+            header.set_entry_type(entry_type);
+            header.set_size(1 << 40);
+            header.set_cksum();
+            let file = std::fs::File::create(&archive).unwrap();
+            let mut gz = flate2::write::GzEncoder::new(file, flate2::Compression::default());
+            gz.write_all(header.as_bytes()).unwrap();
+            gz.finish().unwrap();
+            let error = import_server_with_options(&archive, &import_options(root.path()), false)
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("limit"),
+                "unexpected error: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn import_does_not_escape_through_backslash_path() {
+        let root = tempfile::tempdir().unwrap();
+        let dst = root.path().join("restore");
+        std::fs::create_dir(&dst).unwrap();
+        let victim = root.path().join("victim.json");
+        std::fs::write(&victim, b"sentinel").unwrap();
+        let archive = root.path().join("traversal.tar.gz");
+        write_archive(
+            &archive,
+            &[
+                (
+                    r"masks/..\..\victim.json",
+                    serde_json::to_vec(&aivpn_common::mask::preset_masks::webrtc_zoom_v3())
+                        .unwrap(),
+                ),
+                (
+                    MANIFEST_NAME,
+                    serde_json::to_vec(&BackupManifest::new(vec![])).unwrap(),
+                ),
+            ],
+        );
+        let _ = import_server(&archive, &dst, false);
+        assert!(
+            std::fs::read(&victim).unwrap() == b"sentinel",
+            "external file changed"
+        );
+    }
 
     fn write_archive(path: &Path, entries: &[(&str, Vec<u8>)]) {
         let file = std::fs::File::create(path).unwrap();

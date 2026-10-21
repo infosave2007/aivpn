@@ -42,6 +42,7 @@
 struct aivpn_tag_entry {
 	u8                       tag[8];      /* wire resonance tag (hash key) */
 	u64                      counter;     /* counter that generated this tag */
+	u32                      epoch;       /* эпоха при публикации окна тегов */
 	struct aivpn_kern_session *session;   /* owning session (non-owning ptr) */
 	struct hlist_node        hnode;       /* aivpn_tag_htable linkage */
 	struct rcu_head          rcu;         /* for call_rcu on removal */
@@ -186,7 +187,7 @@ int aivpn_session_dl_reserve(struct aivpn_kern_session *s, const u8 *ip,
  * DUP это DROP, слишком старый счетчик это FALLBACK.
  * *replay_dup = 1 только для уже виденного счетчика текущей эпохи.
  */
-int aivpn_session_rx_prepare(struct aivpn_kern_session *s, u64 counter,
+int aivpn_session_rx_prepare(struct aivpn_kern_session *s, u32 epoch, u64 counter,
 			     int *replay_dup);
 
 /**
@@ -196,7 +197,7 @@ int aivpn_session_rx_prepare(struct aivpn_kern_session *s, u64 counter,
  * Захват счетчика стоит сразу перед списанием. Если списание не удалось,
  * счетчик уже занят и вердикт DROP, не FALLBACK.
  */
-int aivpn_session_rx_finish(struct aivpn_kern_session *s, u64 counter,
+int aivpn_session_rx_finish(struct aivpn_kern_session *s, u32 epoch, u64 counter,
 			    const u8 *plain, unsigned int plain_len,
 			    unsigned int wire_len, int *replay_dup);
 
@@ -210,7 +211,7 @@ int aivpn_session_rx_finish(struct aivpn_kern_session *s, u64 counter,
  * Caller must hold rcu_read_lock() across the returned pointer's use and
  * call rcu_read_unlock() when done.
  */
-struct aivpn_kern_session *aivpn_tag_lookup(const u8 *tag, u64 *counter);
+struct aivpn_kern_session *aivpn_tag_lookup(const u8 *tag, u64 *counter, u32 *epoch);
 
 /**
  * aivpn_tag_probe_offsets - bitmap of packet byte offsets at which a resonance

@@ -54,6 +54,11 @@ const REPLAY_WORDS: usize = TAG_WINDOW_SIZE / 64;
 /// RTC can still establish. The data plane keeps the tighter ±1 in `validate_tag`.
 const HANDSHAKE_SKEW_WINDOWS: [i64; 5] = [0, -1, 1, -2, 2];
 
+/// Пять окон допуска плюс 10 s повторов того же ephemeral мобильным клиентом.
+/// Срок не сокращается при удалении или откате сессии.
+const HANDSHAKE_REPLAY_TTL: Duration = Duration::from_millis(5 * DEFAULT_WINDOW_MS + 10_000);
+const HANDSHAKE_REPLAY_CAPACITY: usize = 8192;
+
 /// How often to rotate session keys (in-flight, no reconnect).
 pub const REKEY_INTERVAL_SECS: u64 = 120;
 /// Rotate after this many bytes even if the time interval hasn't elapsed.
@@ -222,6 +227,11 @@ pub struct Session {
     /// gateway has `mtls.required = true` it resets this to false at session
     /// creation; a valid `ClientCert` message flips it back to true.
     pub mtls_ok: bool,
+    pub mtls_required: bool,
+    /// Постоянная личность после проверки привязанного к сессии DH proof.
+    pub verified_device_pub: Option<[u8; 32]>,
+    /// Сертификат с проверенной подписью CA; может прийти раньше enrollment.
+    pub mtls_cert: Option<crate::mtls::SimpleCert>,
 
     /// Сессия площадки с отдельным sync_key, без права менять клиентскую БД.
     pub is_site_peer: bool,
@@ -263,6 +273,12 @@ pub struct Session {
     /// with no proof the initiator can even receive it — a reflection/
     /// amplification primitive.
     pub bootstrap_descriptors_sent: bool,
+
+    /// Допуск клиента к адресу после PFS и обязательных доказательств личности.
+    pub client_admitted: bool,
+
+    /// Повтор запроса proof/cert ограничен одной отправкой в секунду.
+    pub authentication_retry_at: Option<Instant>,
 
     /// Pending keypair for in-flight key rotation. Set when server sends KeyRotate,
     /// cleared when client responds.
@@ -312,12 +328,7 @@ pub struct Session {
     /// Starts at 0 so the catalog is sent once shortly after connect.
     pub mask_catalog_version_sent: u64,
 
-    /// True once a `ControlPayload::Capabilities` announcement (this
-    /// session's server-assigned role) has been pushed to the client.
-    /// Mirrors `mask_catalog_version_sent`'s send-once gate, but a plain
-    /// bool suffices — role doesn't change mid-session the way the mask
-    /// catalog does; a role change takes effect on the client's next
-    /// reconnect, when a fresh `Session` (and a fresh `false`) is created.
+    /// Роль хотя бы раз объявлена. Keepalive повторяет ее для потерь UDP и смены прав.
     pub capabilities_sent: bool,
     /// Однократное объявление формата клиентского потока.
     pub client_packet_features: Option<u32>,
@@ -462,6 +473,78 @@ impl ReplayWindow {
 }
 
 impl Session {
+    pub(crate) fn is_removed(&self) -> bool {
+        self.removed
+    }
+
+    /// Внутри сессии доказанный постоянный ключ не меняется.
+    pub fn record_verified_device(&mut self, static_pub: [u8; 32]) -> bool {
+        if self
+            .verified_device_pub
+            .is_some_and(|key| key != static_pub)
+        {
+            return false;
+        }
+        self.verified_device_pub = Some(static_pub);
+        true
+    }
+
+    /// Вызывающий код обязан сначала проверить подпись сертификата доверенной CA.
+    pub fn record_mtls_cert(&mut self, cert: crate::mtls::SimpleCert) {
+        self.mtls_cert = Some(cert);
+    }
+
+    pub fn refresh_mtls_gate(&mut self, required: bool) -> bool {
+        self.mtls_required = required;
+        self.mtls_ok = !required
+            || self.mtls_cert.as_ref().is_some_and(|cert| {
+                self.verified_device_pub == Some(cert.client_pub_key)
+                    && cert.expiry_ts >= crypto::current_timestamp_ms() / 1000
+            });
+        self.mtls_ok
+    }
+
+    /// Проверяет эпоху фактически использованных AEAD-ключей без изменения replay.
+    /// Вызывать под одной блокировкой с последующим kernel claim и mark.
+    pub(crate) fn authenticated_counter_epoch(
+        &self,
+        counter: u64,
+        authenticated_tag_secret: &[u8; 32],
+    ) -> Option<bool> {
+        if self.removed {
+            return None;
+        }
+        if bool::from(self.keys.tag_secret.ct_eq(authenticated_tag_secret)) {
+            return self.counter_is_fresh(counter).then_some(false);
+        }
+        let previous = self.pre_ratchet_keys_in_grace()?;
+        (bool::from(previous.tag_secret.ct_eq(authenticated_tag_secret))
+            && self.pre_ratchet_tags.contains_key(&counter)
+            && !self.pre_ratchet_received.contains(&counter))
+        .then_some(true)
+    }
+
+    /// Свежесть счетчика без изменения состояния. Подтверждение выполняется после AEAD.
+    pub(crate) fn counter_is_fresh(&self, counter: u64) -> bool {
+        counter > self.counter
+            || (self.counter - counter < TAG_WINDOW_SIZE as u64
+                && !self
+                    .received_bitmap
+                    .get_bit((self.counter - counter) as usize))
+    }
+
+    /// Переносим историю старой эпохи вместе с ключами, включая устаревшие счетчики.
+    fn preserve_replay_for_grace(&mut self, grace: Duration) {
+        self.pre_ratchet_received = self
+            .expected_tags
+            .keys()
+            .copied()
+            .filter(|&counter| !self.counter_is_fresh(counter))
+            .collect();
+        self.pre_ratchet_tags = std::mem::take(&mut self.expected_tags);
+        self.pre_ratchet_expire = Some(Instant::now() + grace);
+    }
+
     /// Влить окно текущей эпохи. Вызывать только если эпоха не менялась.
     pub fn absorb_shared_replay(&mut self, hi: u64, words: [u64; 8]) {
         aivpn_common::kernel_accel::merge_replay_window(
@@ -527,6 +610,9 @@ impl Session {
             pre_ratchet_received: std::collections::HashSet::new(),
             pre_ratchet_keys: None,
             mtls_ok: true,
+            mtls_required: false,
+            verified_device_pub: None,
+            mtls_cert: None,
             is_site_peer: false,
             site_peer_names: Vec::new(),
             is_masked_pool_peer: false,
@@ -534,6 +620,8 @@ impl Session {
             verified_node_pub: None,
             last_partition_check: None,
             bootstrap_descriptors_sent: false,
+            client_admitted: false,
+            authentication_retry_at: None,
             pending_rekey_keypair: None,
             pending_rekey_attempts: 0,
             last_keyrotate_sent_at: now,
@@ -917,9 +1005,7 @@ impl Session {
             // packets already in-flight with the pre-ratchet keys are not
             // dropped (see rekey_grace).
             let grace = self.rekey_grace();
-            self.pre_ratchet_tags = std::mem::take(&mut self.expected_tags);
-            self.pre_ratchet_expire = Some(Instant::now() + grace);
-            self.pre_ratchet_received.clear();
+            self.preserve_replay_for_grace(grace);
 
             // Retain the keys those tags belong to for the same window, or the
             // grace is inert (see `pre_ratchet_keys`).
@@ -940,7 +1026,7 @@ impl Session {
             // nothing. Nulling it here made the server reject every enrollment
             // with Shutdown reason 3, killing the session right after the
             // handshake — the whole data plane went dead.
-            self.server_hello_signature = None;
+            // Подпись не секретна и нужна для повтора Hello при потере proof/cert.
         }
     }
 
@@ -986,6 +1072,7 @@ struct IndexedTag {
 /// Session Manager with O(1) tag lookup
 pub struct SessionManager {
     allocation_lock: Mutex<()>,
+    handshake_replays: Mutex<HashMap<[u8; 32], Instant>>,
     /// Слабая ссылка не удерживает устройство после остановки gateway.
     kernel: std::sync::OnceLock<std::sync::Weak<aivpn_common::kernel_accel::KernelAccel>>,
     /// Sessions by ID
@@ -1009,6 +1096,11 @@ pub struct SessionManager {
 }
 
 impl SessionManager {
+    /// Выбор владельца адреса сериализован с созданием и заменой сессий.
+    pub(crate) fn admission_guard(&self) -> parking_lot::MutexGuard<'_, ()> {
+        self.allocation_lock.lock()
+    }
+
     pub(crate) fn attach_kernel(&self, kernel: &Arc<aivpn_common::kernel_accel::KernelAccel>) {
         let _ = self.kernel.set(Arc::downgrade(kernel));
     }
@@ -1036,6 +1128,7 @@ impl SessionManager {
             .unwrap_or(IDLE_TIMEOUT);
         Self {
             allocation_lock: Mutex::new(()),
+            handshake_replays: Mutex::new(HashMap::new()),
             kernel: std::sync::OnceLock::new(),
             sessions: DashMap::new(),
             tag_map: DashMap::new(),
@@ -1105,7 +1198,7 @@ impl SessionManager {
         // case where the very first datagram reordered ahead of the init is the
         // one that reaches the scan.
         const HANDSHAKE_TAG_SEARCH: u64 = 16;
-        let keys = crypto::derive_session_keys(dh1, preshared_key.as_ref(), eph_pub);
+        let keys = crypto::derive_initial_session_keys(dh1, preshared_key.as_ref(), eph_pub);
         let now = crypto::current_timestamp_ms();
         let base_tw = crypto::compute_time_window(now, DEFAULT_WINDOW_MS);
         // ±2 windows of clock-skew tolerance for the 0-RTT handshake. Data-plane
@@ -1249,7 +1342,9 @@ impl SessionManager {
 
         if let Some(vpn_ip) = vpn_ip {
             session.lock().vpn_ip = Some(vpn_ip);
-            self.vpn_ip_map.insert(vpn_ip, session_id);
+            if client_id.is_none() {
+                self.vpn_ip_map.insert(vpn_ip, session_id);
+            }
             debug!("Assigned VPN IP {} to session", vpn_ip);
         }
 
@@ -1302,7 +1397,9 @@ impl SessionManager {
             "Server eph_pub (after deobfuscation): {}",
             hex::encode(&eph_pub)
         );
-        let initial_keys = crypto::derive_session_keys(&dh1, preshared_key.as_ref(), &eph_pub);
+        let initial_keys =
+            crypto::derive_initial_session_keys(&dh1, preshared_key.as_ref(), &eph_pub);
+        self.claim_initial_keyspace(&initial_keys, Instant::now())?;
 
         // --- CRIT-3 + HIGH-6: PFS ratchet preparation ---
         // Generate server ephemeral keypair
@@ -1359,6 +1456,23 @@ impl SessionManager {
         Ok(session)
     }
 
+    /// Повторы initial keyspace ограничены независимо от случайного nonce InitialV2.
+    /// При заполнении отказываем новым handshake, не вытесняем живые записи.
+    fn claim_initial_keyspace(&self, keys: &SessionKeys, now: Instant) -> Result<()> {
+        let fingerprint =
+            blake3::derive_key("aivpn handshake replay tombstone v1", &keys.tag_secret);
+        let mut replays = self.handshake_replays.lock();
+        replays.retain(|_, deadline| now < *deadline);
+        if replays.contains_key(&fingerprint) {
+            return Err(Error::InvalidPacket("Replayed initial handshake"));
+        }
+        if replays.len() >= HANDSHAKE_REPLAY_CAPACITY {
+            return Err(Error::Session("Handshake replay cache full".into()));
+        }
+        replays.insert(fingerprint, now + HANDSHAKE_REPLAY_TTL);
+        Ok(())
+    }
+
     /// Remove all sessions for a given IP except the specified one.
     /// Called after a new handshake is validated to clean up stale sessions.
     /// Returns list of removed session IDs (for stopping recordings).
@@ -1410,6 +1524,20 @@ impl SessionManager {
         node_id: &str,
         keep_session_id: &[u8; 16],
     ) -> Vec<[u8; 16]> {
+        let _admission = self.admission_guard();
+        // Worker может держать Arc уже удаленной сессии. Он не выбирает владельца.
+        let Some(keep) = self.get_session(keep_session_id) else {
+            return Vec::new();
+        };
+        let valid = {
+            let session = keep.lock();
+            !session.removed
+                && session.is_masked_pool_peer
+                && session.verified_node_id.as_deref() == Some(node_id)
+        };
+        if !valid {
+            return Vec::new();
+        }
         self.cleanup_masked_peers(keep_session_id, |session| {
             session.verified_node_id.as_deref() == Some(node_id)
         })
@@ -1507,8 +1635,7 @@ impl SessionManager {
         removed
     }
 
-    /// Rollback a session that was created but failed tag validation.
-    /// Restores vpn_ip_map to the old session that still owns that IP.
+    /// Удаляет неподтвержденную сессию, не передавая адрес другой pending-сессии.
     pub fn rollback_failed_session(&self, session_id: &[u8; 16]) {
         // Grab the VPN IP before removal so we can restore the old mapping.
         let vpn_ip = self
@@ -1519,16 +1646,8 @@ impl SessionManager {
 
         self.remove_session(session_id);
 
-        // If there is still another session that owns this VPN IP, restore
-        // the mapping and take the IP back out of the free pool.
         if let Some(vpn_ip) = vpn_ip {
-            for entry in self.sessions.iter() {
-                let sess = entry.value().lock();
-                if sess.vpn_ip == Some(vpn_ip) {
-                    self.vpn_ip_map.insert(vpn_ip, *entry.key());
-                    break;
-                }
-            }
+            let _ = self.get_session_by_vpn_ip(&vpn_ip);
         }
     }
 
@@ -1764,32 +1883,22 @@ impl SessionManager {
                     let c = base.wrapping_add(i);
                     let expected = crypto::generate_resonance_tag(&tag_secret, c, tw);
                     if bool::from(expected.ct_eq(tag)) {
-                        // c > base is fresh by construction (`counter` is the
-                        // highest validated counter). c == base is fresh only
-                        // when the newest counter was never marked received
-                        // (fresh session); otherwise this is a replay of the
-                        // latest packet — reject without touching state.
-                        if c == base && session.lock().received_bitmap.get_bit(0) {
-                            debug!(
-                                "Counter recovery: counter {} already received — \
-                                 rejecting replay",
-                                c
-                            );
+                        // За время поиска другой worker мог сменить эпоху или
+                        // принять этот счетчик. Проверяем актуальное состояние.
+                        let s = session.lock();
+                        if s.removed
+                            || !bool::from(s.keys.tag_secret.ct_eq(&tag_secret))
+                            || !s.counter_is_fresh(c)
+                        {
+                            debug!("Counter recovery: счетчик {} или эпоха уже устарели", c);
                             return None;
                         }
                         info!(
                             "Counter recovery: found counter {} (drift=+{}) for session",
                             c, i
                         );
-                        // Update tag window to the recovered counter (mutex already released).
-                        {
-                            let mut s = session.lock();
-                            // Shift the replay bitmap and mark this counter
-                            // received (ingress marks it again — idempotent).
-                            s.mark_tag_received(c);
-                            s.update_tag_window();
-                            self.reindex_session(&s);
-                        }
+                        // Совпадение tag еще не подтверждает ciphertext: окно обновит ingress.
+                        drop(s);
                         return Some((session, c, false));
                     }
                 }
@@ -1809,7 +1918,13 @@ impl SessionManager {
             let session_id = *entry;
             drop(entry);
             if let Some(sess) = self.sessions.get(&session_id).map(|e| e.clone()) {
-                return Some(sess);
+                let routable = {
+                    let session = sess.lock();
+                    session.client_id.is_none() || session.client_admitted
+                };
+                if routable {
+                    return Some(sess);
+                }
             }
             // Map points at a session that no longer exists (removed without the
             // map being cleaned). Fall through to the self-healing scan below.
@@ -1822,7 +1937,10 @@ impl SessionManager {
         // trips its RX watchdog, and reconnects forever. The scan runs only on a
         // miss (the cold path), so it costs nothing on the hot downlink path.
         let repaired = self.sessions.iter().find_map(|entry| {
-            if entry.value().lock().vpn_ip == Some(*vpn_ip) {
+            let session = entry.value().lock();
+            if session.vpn_ip == Some(*vpn_ip)
+                && (session.client_id.is_none() || session.client_admitted)
+            {
                 Some((*entry.key(), entry.value().clone()))
             } else {
                 None
@@ -1845,7 +1963,14 @@ impl SessionManager {
     /// `vpn_ip_map` while its own tag validation was still pending can never
     /// leave the winning session without a downlink mapping.
     pub fn bind_vpn_ip(&self, vpn_ip: &Ipv4Addr, session_id: &[u8; 16]) {
-        self.vpn_ip_map.insert(*vpn_ip, *session_id);
+        if let Some(session) = self.sessions.get(session_id) {
+            let session = session.lock();
+            if session.vpn_ip == Some(*vpn_ip)
+                && (session.client_id.is_none() || session.client_admitted)
+            {
+                self.vpn_ip_map.insert(*vpn_ip, *session_id);
+            }
+        }
     }
 
     /// Remove session and return its ID if it existed.
@@ -2063,7 +2188,7 @@ impl SessionManager {
         session: &Arc<Mutex<Session>>,
         new_mask: &MaskProfile,
     ) -> Result<Vec<u8>> {
-        use aivpn_common::crypto::encrypt_payload;
+        use aivpn_common::crypto::{encrypt_session_payload, PacketDirection};
 
         // Serialize mask profile → mask_data (MessagePack to match client's rmp_serde::from_slice)
         let mask_data = rmp_serde::to_vec(new_mask)
@@ -2088,7 +2213,7 @@ impl SessionManager {
         inner_payload.extend_from_slice(&encoded);
 
         // Encrypt (same logic as Gateway::build_packet)
-        let (nonce, counter) = sess.next_send_nonce();
+        let (_, counter) = sess.next_send_nonce();
         let pad_len = 16u16;
         let mut padded = Vec::with_capacity(2 + inner_payload.len() + pad_len as usize);
         padded.extend_from_slice(&pad_len.to_le_bytes());
@@ -2101,12 +2226,17 @@ impl SessionManager {
             }
         }
 
-        let ciphertext = encrypt_payload(&sess.keys.session_key_s2c, &nonce, &padded)?; // downlink → S2C
-
         // Generate tag
         let time_window =
             crypto::compute_time_window(crypto::current_timestamp_ms(), DEFAULT_WINDOW_MS);
         let tag = crypto::generate_resonance_tag(&sess.keys.tag_secret, counter, time_window);
+        let ciphertext = encrypt_session_payload(
+            &sess.keys,
+            PacketDirection::ServerToClient,
+            counter,
+            &tag,
+            &padded,
+        )?;
 
         // Wrap MaskUpdate in the session's current mask. The switch to `new_mask`
         // happens only after the packet is successfully delivered.
@@ -2300,9 +2430,7 @@ impl SessionManager {
 
         // Preserve old keys for an RTT-scaled grace window (in-flight packets from client).
         let grace = sess.inline_rekey_grace();
-        sess.pre_ratchet_tags = std::mem::take(&mut sess.expected_tags);
-        sess.pre_ratchet_expire = Some(Instant::now() + grace);
-        sess.pre_ratchet_received.clear();
+        sess.preserve_replay_for_grace(grace);
 
         // Install new keys, retaining the outgoing ones for the grace window so
         // in-flight old-key packets can actually be decrypted (see
@@ -2352,6 +2480,7 @@ mod tests {
 
     fn make_keys(seed: u8) -> SessionKeys {
         SessionKeys {
+            packet_cipher: aivpn_common::crypto::PacketCipher::Established,
             session_key: [seed; CHACHA20_KEY_SIZE],
             session_key_s2c: [seed; CHACHA20_KEY_SIZE],
             tag_secret: [seed + 1; 32],
@@ -2610,6 +2739,186 @@ mod tests {
             ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]),
             aivpn_common::mask::preset_masks::bootstrap_default(),
         )
+    }
+
+    #[test]
+    fn initial_v2_precheck_rejects_previous_protocol_keys() {
+        let manager = make_manager();
+        let client = KeyPair::generate();
+        let eph = client.public_key_bytes();
+        let dh = client.compute_shared(&manager.server_public_key()).unwrap();
+        let time = crypto::compute_time_window(crypto::current_timestamp_ms(), DEFAULT_WINDOW_MS);
+        let initial = crypto::derive_initial_session_keys(&dh, Some(&[2; 32]), &eph);
+        let old = crypto::derive_session_keys(&dh, Some(&[2; 32]), &eph);
+        let new_tag = crypto::generate_resonance_tag(&initial.tag_secret, 0, time);
+        let old_tag = crypto::generate_resonance_tag(&old.tag_secret, 0, time);
+        assert!(manager.handshake_tag_precheck(&eph, Some([2; 32]), &new_tag));
+        assert!(!manager.handshake_tag_precheck(&eph, Some([2; 32]), &old_tag));
+    }
+
+    #[test]
+    fn initial_v2_restart_and_pool_node_keep_nonce_spaces_independent() {
+        let static_key = crypto::pool_server_keypair(&[7; 32]);
+        let psk = crypto::pool_client_psk(&[7; 32]);
+        let client = KeyPair::generate();
+        let eph = client.public_key_bytes();
+        let mut replies = Vec::new();
+        let mut established = Vec::new();
+        for port in [443, 444, 445] {
+            let manager = SessionManager::new(
+                static_key.clone(),
+                ed25519_dalek::SigningKey::from_bytes(&[9; 32]),
+                aivpn_common::mask::preset_masks::bootstrap_default(),
+            );
+            let session = manager
+                .create_masked_pool_peer_session(
+                    format!("127.0.0.1:{port}").parse().unwrap(),
+                    eph,
+                    &static_key,
+                    &psk,
+                )
+                .unwrap();
+            let session = session.lock();
+            assert!(session.keys.packet_cipher.is_initial());
+            assert!(!session
+                .ratcheted_keys
+                .as_ref()
+                .unwrap()
+                .packet_cipher
+                .is_initial());
+            replies.push(
+                crypto::encrypt_session_payload(
+                    &session.keys,
+                    crypto::PacketDirection::ServerToClient,
+                    0,
+                    &[3; 8],
+                    b"same reply",
+                )
+                .unwrap(),
+            );
+            established.push(session.ratcheted_keys.as_ref().unwrap().session_key);
+        }
+        for i in 1..replies.len() {
+            assert_ne!(&replies[0][..24], &replies[i][..24]);
+            assert_ne!(established[0], established[i]);
+        }
+    }
+
+    #[test]
+    fn initial_v2_policy_mask_update_uses_initial_envelope() {
+        let manager = make_manager();
+        let client = KeyPair::generate();
+        let session = manager
+            .create_session(
+                "127.0.0.1:443".parse().unwrap(),
+                client.public_key_bytes(),
+                None,
+                None,
+            )
+            .unwrap();
+        let transport_mask = aivpn_common::mask::preset_masks::bootstrap_default();
+        session.lock().mask = Some(transport_mask.clone());
+        let packet = manager
+            .build_mask_update_packet(&session, &transport_mask)
+            .unwrap();
+        let mdh_len = transport_mask
+            .header_spec
+            .as_ref()
+            .map(|spec| spec.min_length())
+            .unwrap_or(transport_mask.header_template.len());
+        let tag: [u8; 8] = packet[..8].try_into().unwrap();
+        let dh = client.compute_shared(&manager.server_public_key()).unwrap();
+        let keys = crypto::derive_initial_session_keys(&dh, None, &client.public_key_bytes());
+        let padded = crypto::decrypt_session_payload(
+            &keys,
+            crypto::PacketDirection::ServerToClient,
+            0,
+            &tag,
+            &packet[8 + mdh_len..],
+        )
+        .expect("до PFS MaskUpdate обязан использовать InitialV2");
+        assert_eq!(
+            InnerHeader::decode(&padded[2..]).unwrap().inner_type,
+            aivpn_common::protocol::InnerType::Control
+        );
+    }
+
+    fn pending_authenticated_client(manager: &SessionManager, port: u16) -> Arc<Mutex<Session>> {
+        let client = KeyPair::generate();
+        let eph = client.public_key_bytes();
+        let dh = client.compute_shared(&manager.server_public_key()).unwrap();
+        let keys = crypto::derive_initial_session_keys(&dh, Some(&[2; 32]), &eph);
+        let tag = crypto::generate_resonance_tag(
+            &keys.tag_secret,
+            0,
+            crypto::compute_time_window(crypto::current_timestamp_ms(), DEFAULT_WINDOW_MS),
+        );
+        manager
+            .create_authenticated_session(
+                format!("127.0.0.1:{port}").parse().unwrap(),
+                eph,
+                [2; 32],
+                "10.0.0.8".parse().unwrap(),
+                "client",
+                &tag,
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn initial_v2_pending_replacement_preserves_established_downlink_owner() {
+        let manager = make_manager();
+        let old = pending_authenticated_client(&manager, 1000);
+        let old_id = old.lock().session_id;
+        let vip = "10.0.0.8".parse().unwrap();
+        manager.complete_session_ratchet(&old_id);
+        old.lock().client_admitted = true;
+        manager.bind_vpn_ip(&vip, &old_id);
+        let pending = pending_authenticated_client(&manager, 2000);
+        assert_eq!(pending.lock().vpn_ip, Some(vip));
+        assert_eq!(
+            manager
+                .get_session_by_vpn_ip(&vip)
+                .unwrap()
+                .lock()
+                .session_id,
+            old_id
+        );
+        let pending_id = pending.lock().session_id;
+        manager.rollback_failed_session(&pending_id);
+        assert_eq!(
+            manager
+                .get_session_by_vpn_ip(&vip)
+                .unwrap()
+                .lock()
+                .session_id,
+            old_id
+        );
+    }
+
+    #[test]
+    fn initial_v2_pending_client_is_not_a_downlink_owner_even_after_repair() {
+        let manager = make_manager();
+        let pending = pending_authenticated_client(&manager, 1000);
+        let vip = "10.0.0.8".parse().unwrap();
+        assert!(manager.get_session_by_vpn_ip(&vip).is_none());
+        let pending_id = pending.lock().session_id;
+        manager.bind_vpn_ip(&vip, &pending_id);
+        assert!(manager.get_session_by_vpn_ip(&vip).is_none());
+        manager.vpn_ip_map.remove(&vip);
+        assert!(manager.get_session_by_vpn_ip(&vip).is_none());
+    }
+
+    #[test]
+    fn initial_v2_rollback_does_not_promote_another_pending_client() {
+        let manager = make_manager();
+        let _old = pending_authenticated_client(&manager, 1000);
+        let pending = pending_authenticated_client(&manager, 2000);
+        let id = pending.lock().session_id;
+        manager.rollback_failed_session(&id);
+        assert!(manager
+            .get_session_by_vpn_ip(&"10.0.0.8".parse().unwrap())
+            .is_none());
     }
 
     #[test]
@@ -2987,8 +3296,11 @@ mod tests {
         let dh = client_eph
             .compute_shared(&pool_kp.public_key_bytes())
             .expect("dial DH must succeed");
-        let keys =
-            crypto::derive_session_keys(&dh, Some(&pool_psk), &client_eph.public_key_bytes());
+        let keys = crypto::derive_initial_session_keys(
+            &dh,
+            Some(&pool_psk),
+            &client_eph.public_key_bytes(),
+        );
 
         let tw = crypto::compute_time_window(crypto::current_timestamp_ms(), DEFAULT_WINDOW_MS);
         let tag = crypto::generate_resonance_tag(&keys.tag_secret, 0, tw);
@@ -3149,6 +3461,41 @@ mod tests {
             sm.get_session(&client_id).is_some(),
             "an ordinary client session on the SAME IP must survive"
         );
+    }
+
+    #[test]
+    fn removed_peer_worker_cannot_remove_the_winning_identity_session() {
+        let manager = make_manager();
+        let pool_key = crypto::pool_server_keypair(&[7; 32]);
+        let pool_psk = crypto::pool_client_psk(&[7; 32]);
+        let sessions: Vec<_> = (0..2)
+            .map(|port| {
+                let session = manager
+                    .create_masked_pool_peer_session(
+                        format!("127.0.0.1:{}", 42000 + port).parse().unwrap(),
+                        crypto::KeyPair::generate().public_key_bytes(),
+                        &pool_key,
+                        &pool_psk,
+                    )
+                    .unwrap();
+                session.lock().verified_node_id = Some("same-peer".into());
+                session
+            })
+            .collect();
+        let a = sessions[0].lock().session_id;
+        let b = sessions[1].lock().session_id;
+        assert_eq!(
+            manager.cleanup_masked_peer_identity("same-peer", &a),
+            vec![b]
+        );
+        assert!(sessions[1].lock().is_removed());
+        assert!(
+            manager
+                .cleanup_masked_peer_identity("same-peer", &b)
+                .is_empty(),
+            "Отложенный worker удаленной сессии не может снова выбирать владельца"
+        );
+        assert!(manager.get_session(&a).is_some());
     }
 
     // ── Pre-ratchet grace: keys must outlive the tags ─────────────────────────
@@ -3347,11 +3694,9 @@ mod tests {
         assert!(s.received_bitmap.get_bit(0));
     }
 
-    /// M2 companion: the documented client-race case is FORWARD drift and
-    /// must keep working; the recovered counter is marked received so the
-    /// same packet cannot be replayed through either validation path.
+    /// Поиск счетчика не подтверждает AEAD и не должен менять replay-окно.
     #[test]
-    fn counter_recovery_accepts_forward_drift_and_marks_received() {
+    fn protocol_audit_counter_recovery_waits_for_aead() {
         let (mgr, session, keys) = make_manager_with_session();
         let tw = crypto::compute_time_window(crypto::current_timestamp_ms(), DEFAULT_WINDOW_MS);
         {
@@ -3368,13 +3713,245 @@ mod tests {
             .expect("forward drift must recover");
         assert_eq!(counter, 900);
         assert!(!is_ratcheted);
-        assert_eq!(recovered_session.lock().counter, 900);
-        // Marked received: validate_tag now rejects the same tag as a replay…
+        assert_eq!(recovered_session.lock().counter, 100);
+        assert!(recovered_session.lock().received_bitmap.get_bit(100));
+        assert!(mgr
+            .recover_session_by_tag(&drift_tag, &session_ip())
+            .is_some());
+        recovered_session.lock().mark_tag_received(counter);
         assert!(recovered_session.lock().validate_tag(&drift_tag).is_none());
-        // …and a second recovery attempt with it is rejected too (c == base
-        // with the newest-counter bit set).
         assert!(mgr
             .recover_session_by_tag(&drift_tag, &session_ip())
             .is_none());
+    }
+
+    #[test]
+    fn protocol_audit_initial_ratchet_preserves_old_replays() {
+        let mut session = make_session();
+        session.update_tag_window();
+        let replay = session.expected_tags[&5];
+        let inflight = session.expected_tags[&6];
+        session.mark_tag_received(5);
+        session.ratcheted_keys = Some(make_keys(2));
+        session.update_ratcheted_tag_window();
+        session.complete_ratchet();
+        assert!(session.validate_tag(&replay).is_none());
+        assert_eq!(session.validate_tag(&inflight), Some((6, false)));
+        session.mark_pre_ratchet_received(6);
+        assert!(session.validate_tag(&inflight).is_none());
+    }
+
+    #[test]
+    fn protocol_audit_inline_rekey_preserves_old_replays() {
+        let (manager, session, _) = make_manager_with_session();
+        let (id, replay, inflight) = {
+            let mut session = session.lock();
+            session.mark_tag_received(5);
+            session.pending_rekey_keypair = Some(KeyPair::generate());
+            (
+                session.session_id,
+                session.expected_tags[&5],
+                session.expected_tags[&6],
+            )
+        };
+        manager.commit_session_rekey(&id, &KeyPair::generate().public_key_bytes());
+        assert!(manager.find_session_by_tag(&replay).is_err());
+        assert!(manager.find_session_by_tag(&inflight).unwrap().is_some());
+        session.lock().mark_pre_ratchet_received(6);
+        assert!(manager.find_session_by_tag(&inflight).is_err());
+    }
+
+    #[test]
+    fn protocol_audit_handshake_reuse_cannot_restart_initial_nonce() {
+        let manager = make_manager();
+        let client = KeyPair::generate();
+        let addr = "127.0.0.1:43210".parse().unwrap();
+        let psk = [7; 32];
+        let first = manager
+            .create_session(addr, client.public_key_bytes(), Some(psk), None)
+            .unwrap();
+        let id = first.lock().session_id;
+        first.lock().next_send_nonce();
+        manager.remove_session(&id);
+        assert!(manager
+            .create_session(addr, client.public_key_bytes(), Some(psk), None)
+            .is_err());
+        assert!(manager
+            .create_session(
+                addr,
+                KeyPair::generate().public_key_bytes(),
+                Some(psk),
+                None
+            )
+            .is_ok());
+    }
+
+    #[test]
+    fn protocol_audit_handshake_tombstones_are_bounded_and_not_evicted_early() {
+        let manager = make_manager();
+        let now = Instant::now();
+        let keys = make_keys(1);
+        manager.claim_initial_keyspace(&keys, now).unwrap();
+        {
+            let mut replays = manager.handshake_replays.lock();
+            for index in 0..HANDSHAKE_REPLAY_CAPACITY - 1 {
+                let mut fingerprint = [0; 32];
+                fingerprint[..8].copy_from_slice(&(index as u64).to_le_bytes());
+                replays.insert(fingerprint, now + HANDSHAKE_REPLAY_TTL);
+            }
+        }
+        let before_expiry = now + HANDSHAKE_REPLAY_TTL - Duration::from_millis(1);
+        assert!(manager
+            .claim_initial_keyspace(&make_keys(9), before_expiry)
+            .is_err());
+        assert!(manager
+            .claim_initial_keyspace(&keys, before_expiry)
+            .is_err());
+        assert_eq!(
+            manager.handshake_replays.lock().len(),
+            HANDSHAKE_REPLAY_CAPACITY
+        );
+        manager
+            .claim_initial_keyspace(&make_keys(9), now + HANDSHAKE_REPLAY_TTL)
+            .unwrap();
+        assert_eq!(manager.handshake_replays.lock().len(), 1);
+    }
+
+    #[test]
+    fn protocol_audit_handshake_tombstones_distinguish_credentials() {
+        let manager = make_manager();
+        let ephemeral = KeyPair::generate().public_key_bytes();
+        let addr = "127.0.0.1:43210".parse().unwrap();
+        let first = manager
+            .create_session(addr, ephemeral, Some([1; 32]), None)
+            .unwrap();
+        let second = manager
+            .create_session(addr, ephemeral, Some([2; 32]), None)
+            .unwrap();
+        assert_ne!(
+            first.lock().keys.session_key_s2c,
+            second.lock().keys.session_key_s2c
+        );
+    }
+
+    #[test]
+    fn protocol_audit_handshake_tombstone_covers_late_retry_with_clock_skew() {
+        let manager = make_manager();
+        let keys = make_keys(1);
+        let claimed_at = Instant::now();
+        manager.claim_initial_keyspace(&keys, claimed_at).unwrap();
+
+        // Первый пакет в t=9, поздний retry того же ключа в t=16.5.
+        // Часы клиента спешат на 20 s, поэтому поздний tag еще допустим в t=59.1.
+        let first_server_ms = 9_000;
+        let late_client_ms = 16_500 + 20_000;
+        let replay_server_ms = 59_100;
+        let late_window = crypto::compute_time_window(late_client_ms, DEFAULT_WINDOW_MS);
+        let replay_window = crypto::compute_time_window(replay_server_ms, DEFAULT_WINDOW_MS);
+        assert_eq!(late_window + 2, replay_window);
+        let replay_at = claimed_at + Duration::from_millis(replay_server_ms - first_server_ms);
+        assert!(manager.claim_initial_keyspace(&keys, replay_at).is_err());
+    }
+
+    #[test]
+    fn protocol_audit_masked_pool_handshake_reuse_is_rejected() {
+        let manager = make_manager();
+        let ephemeral = KeyPair::generate().public_key_bytes();
+        let addr = "127.0.0.1:43210".parse().unwrap();
+        let server = crypto::pool_server_keypair(&[7; 32]);
+        let psk = crypto::pool_client_psk(&[7; 32]);
+        let first = manager
+            .create_masked_pool_peer_session(addr, ephemeral, &server, &psk)
+            .unwrap();
+        let id = first.lock().session_id;
+        manager.rollback_failed_session(&id);
+        assert!(manager
+            .create_masked_pool_peer_session(addr, ephemeral, &server, &psk)
+            .is_err());
+    }
+
+    #[test]
+    fn protocol_audit_initial_ratchet_rejects_counters_outside_old_bitmap() {
+        let mut session = make_session();
+        session.counter = 600;
+        session.update_tag_window();
+        let stale = session.expected_tags[&89];
+        session.mark_tag_received(700);
+        session.ratcheted_keys = Some(make_keys(2));
+        session.update_ratcheted_tag_window();
+        session.complete_ratchet();
+        assert!(session.validate_tag(&stale).is_none());
+    }
+
+    #[test]
+    fn protocol_audit_authenticated_epoch_is_fresh_and_non_mutating() {
+        let mut session = make_session();
+        let old_secret = session.keys.tag_secret;
+        session.update_tag_window();
+        session.mark_tag_received(5);
+        assert_eq!(session.authenticated_counter_epoch(5, &old_secret), None);
+        assert_eq!(
+            session.authenticated_counter_epoch(900, &old_secret),
+            Some(false)
+        );
+        assert_eq!(session.counter, 5);
+        session.ratcheted_keys = Some(make_keys(2));
+        session.update_ratcheted_tag_window();
+        session.complete_ratchet();
+        assert_eq!(session.authenticated_counter_epoch(5, &old_secret), None);
+        assert_eq!(
+            session.authenticated_counter_epoch(6, &old_secret),
+            Some(true)
+        );
+        session.mark_pre_ratchet_received(6);
+        assert_eq!(session.authenticated_counter_epoch(6, &old_secret), None);
+        assert_eq!(session.authenticated_counter_epoch(6, &[99; 32]), None);
+        session.pre_ratchet_expire = Some(Instant::now());
+        assert_eq!(session.authenticated_counter_epoch(7, &old_secret), None);
+        assert_eq!(
+            session.authenticated_counter_epoch(900, &session.keys.tag_secret),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn protocol_audit_mtls_requires_static_identity_in_either_delivery_order() {
+        for certificate_first in [false, true] {
+            let mut session = make_session();
+            let cert = crate::mtls::SimpleCert {
+                client_pub_key: [8; 32],
+                expiry_ts: u64::MAX,
+                ca_signature: [0; 64],
+            };
+            assert!(!session.refresh_mtls_gate(true));
+            if certificate_first {
+                session.record_mtls_cert(cert);
+                assert!(!session.refresh_mtls_gate(true));
+                assert!(session.record_verified_device([8; 32]));
+            } else {
+                assert!(session.record_verified_device([8; 32]));
+                assert!(!session.refresh_mtls_gate(true));
+                session.record_mtls_cert(cert);
+            }
+            assert!(session.refresh_mtls_gate(true));
+            assert!(session.record_verified_device([8; 32]));
+            assert!(!session.record_verified_device([9; 32]));
+            assert_eq!(session.verified_device_pub, Some([8; 32]));
+            session.mtls_cert.as_mut().unwrap().expiry_ts = 0;
+            assert!(!session.refresh_mtls_gate(true));
+            assert!(session.refresh_mtls_gate(false));
+        }
+    }
+
+    #[test]
+    fn protocol_audit_mtls_rejects_certificate_for_another_static_identity() {
+        let mut session = make_session();
+        assert!(session.record_verified_device([8; 32]));
+        session.record_mtls_cert(crate::mtls::SimpleCert {
+            client_pub_key: session.eph_pub,
+            expiry_ts: u64::MAX,
+            ca_signature: [0; 64],
+        });
+        assert!(!session.refresh_mtls_gate(true));
     }
 }

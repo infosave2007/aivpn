@@ -640,9 +640,10 @@ static inline int aivpn_pol_check_addrs(const struct aivpn_pol *p, int dir,
 		if (view.version == 4) {
 			if (view.src_v4 != p->client_ipv4)
 				return AIVPN_VERDICT_DROP;
-			if (isolate && view.dst_v4 != p->client_ipv4 &&
-			    aivpn_peer_hit(view.dst_v4, peer, ctx))
-				return AIVPN_VERDICT_DROP;
+			/* Ядро может не знать userspace-only соседа. Полную ACL проверит userspace. */
+			if (isolate && view.dst_v4 != p->client_ipv4)
+				return aivpn_peer_hit(view.dst_v4, peer, ctx) ?
+					AIVPN_VERDICT_DROP : AIVPN_VERDICT_FALLBACK;
 			return AIVPN_VERDICT_ACCEPT;
 		}
 		if (view.version == 6) {
@@ -654,14 +655,15 @@ static inline int aivpn_pol_check_addrs(const struct aivpn_pol *p, int dir,
 						p->client_ipv4, view.src_v6))
 				return AIVPN_VERDICT_DROP;
 			if (isolate &&
-			    aivpn_ipv6_matches(p->ipv6_prefix, p->ipv6_prefix_len,
-					       0, view.dst_v6) == 0) {
+			    !aivpn_ipv6_matches(p->ipv6_prefix, p->ipv6_prefix_len,
+					        p->client_ipv4, view.dst_v6)) {
 				memcpy(&mapped, view.dst_v6 + 12, 4);
 				if (aivpn_ipv6_matches(p->ipv6_prefix, p->ipv6_prefix_len,
 						       mapped, view.dst_v6) &&
 				    mapped != p->client_ipv4 &&
 				    aivpn_peer_hit(mapped, peer, ctx))
 					return AIVPN_VERDICT_DROP;
+				return AIVPN_VERDICT_FALLBACK;
 			}
 			return AIVPN_VERDICT_ACCEPT;
 		}
@@ -672,9 +674,9 @@ static inline int aivpn_pol_check_addrs(const struct aivpn_pol *p, int dir,
 	if (view.version == 4) {
 		if (view.dst_v4 != p->client_ipv4)
 			return AIVPN_VERDICT_FALLBACK;
-		if (isolate && view.src_v4 != p->client_ipv4 &&
-		    aivpn_peer_hit(view.src_v4, peer, ctx))
-			return AIVPN_VERDICT_DROP;
+		if (isolate && view.src_v4 != p->client_ipv4)
+			return aivpn_peer_hit(view.src_v4, peer, ctx) ?
+				AIVPN_VERDICT_DROP : AIVPN_VERDICT_FALLBACK;
 		return AIVPN_VERDICT_ACCEPT;
 	}
 	if (view.version == 6) {
@@ -691,6 +693,10 @@ static inline int aivpn_pol_check_addrs(const struct aivpn_pol *p, int dir,
 				       view.src_v6) &&
 		    mapped != p->client_ipv4 && aivpn_peer_hit(mapped, peer, ctx))
 			return AIVPN_VERDICT_DROP;
+		if (isolate &&
+		    !aivpn_ipv6_matches(p->ipv6_prefix, p->ipv6_prefix_len,
+				        p->client_ipv4, view.src_v6))
+			return AIVPN_VERDICT_FALLBACK;
 		return AIVPN_VERDICT_ACCEPT;
 	}
 	return AIVPN_VERDICT_DROP;

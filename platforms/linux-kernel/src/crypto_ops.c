@@ -56,9 +56,6 @@ int aivpn_decrypt(struct aivpn_kern_session *s, struct sk_buff *skb, u64 counter
 	if (skb->len < ct_start + AIVPN_AUTH_SIZE)
 		return -EINVAL;
 
-	if (skb_linearize(skb))
-		return -ENOMEM;
-
 	data_len  = skb->len - ct_start;          /* ciphertext + auth tag */
 	plain_len = data_len - AIVPN_AUTH_SIZE;    /* decrypted plaintext   */
 
@@ -68,7 +65,11 @@ int aivpn_decrypt(struct aivpn_kern_session *s, struct sk_buff *skb, u64 counter
 	scratch = kmalloc(data_len, GFP_ATOMIC);
 	if (!scratch)
 		return -ENOMEM;
-	skb_copy_bits(skb, ct_start, scratch, data_len);
+	/* Fallback должен сохранить не только байты, но и исходную truesize. */
+	if (skb_copy_bits(skb, ct_start, scratch, data_len)) {
+		kfree_sensitive(scratch);
+		return -EINVAL;
+	}
 
 	/* Nonce from tag-window counter, not from wire bytes */
 	build_nonce(nonce, counter, s->nonce_suffix);

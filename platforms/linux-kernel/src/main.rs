@@ -34,7 +34,14 @@ impl kernel::Module for AivpnModule {
             pr_err!("aivpn: session table init failed: {}\n", ret);
             return Err(Error::from_errno(ret));
         }
-        let dev = dev::AivpnDev::new()?;
+        let dev = match dev::AivpnDev::new() {
+            Ok(dev) => dev,
+            Err(err) => {
+                // Успешный C init уже опубликовал proc callbacks.
+                unsafe { aivpn_session_table_fini() };
+                return Err(err);
+            }
+        };
         pr_info!("aivpn: module loaded — /dev/aivpn ready\n");
         Ok(Self { dev: Some(dev) })
     }
@@ -42,13 +49,9 @@ impl kernel::Module for AivpnModule {
 
 impl Drop for AivpnModule {
     fn drop(&mut self) {
-        // Deregister /dev/aivpn FIRST. The Rust-for-Linux miscdevice vtable
-        // does not set file_operations.owner (verified: the fops table is
-        // zero-filled apart from open/release/ioctl and carries no
-        // __this_module relocation), so nothing pins this module while the
-        // device node exists — the ioctl dispatcher must be gone before the
-        // session table it dispatches into is torn down. Field drops would
-        // otherwise run only AFTER this body, i.e. after fini.
+        // Сначала закрываем вход для новых open/ioctl. Закрепление модуля через
+        // file_operations.owner зависит от версии Rust-for-Linux и не меняет
+        // этот порядок: поля автоматически удалились бы только после fini.
         self.dev = None;
         // SAFETY: called once at module unload, after the misc device above
         // is deregistered, so no new ioctl can reach the session table.
