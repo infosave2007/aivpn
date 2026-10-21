@@ -671,6 +671,12 @@ auth.post('/passkey/register', requireAuth(), zValidator('json', PasskeyRegister
 // GET /web/auth/passkey/authentication-options
 // Can be called unauthenticated (for passwordless login) or authenticated (2FA)
 auth.get('/passkey/authentication-options', async (c) => {
+  if (config.OIDC_MODE === 'exclusive') {
+    return c.json({ error: 'Local login is disabled (SSO required).' }, 403)
+  }
+  if (!checkRateLimit(`passkey_options:${getClientIp(c)}`, config.AUTH_RATE_MAX, config.AUTH_RATE_WINDOW_MS)) {
+    return c.json({ error: 'Too many authentication requests' }, 429)
+  }
   const username = c.req.query('username')
   const db = await getDb()
   const { users, passkeys } = tables()
@@ -710,6 +716,9 @@ auth.get('/passkey/authentication-options', async (c) => {
 
 // POST /web/auth/passkey/authenticate
 auth.post('/passkey/authenticate', zValidator('json', PasskeyAuthSchema), async (c) => {
+  if (config.OIDC_MODE === 'exclusive') {
+    return c.json({ error: 'Local login is disabled (SSO required).' }, 403)
+  }
   const body = c.req.valid('json')
   const db = await getDb()
   const { users, sessions, passkeys } = tables()

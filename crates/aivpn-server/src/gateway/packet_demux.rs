@@ -2,6 +2,12 @@
 
 use super::*;
 
+pub(crate) enum SessionLookup {
+    Found((Arc<parking_lot::Mutex<Session>>, u64, bool, [u8; TAG_SIZE])),
+    NotFound,
+    RecoveryLimited,
+}
+
 impl super::Gateway {
     /// Candidate resonance tags for a packet — one per distinct layout offset
     /// that fits in the packet. `candidates[0]` is always the legacy offset-0
@@ -45,25 +51,20 @@ impl super::Gateway {
         &self,
         packet_data: &[u8],
         client_ip: &IpAddr,
-    ) -> Result<Option<(Arc<parking_lot::Mutex<Session>>, u64, bool, [u8; TAG_SIZE])>> {
+    ) -> Result<SessionLookup> {
         let tags = self.candidate_tags(packet_data);
 
         // 1) Fast O(1) path across all layout offsets — no scan.
         for tag in &tags {
-            if let Some(session) = self.session_manager.get_session_by_tag(tag) {
-                // Drop the lock guard before moving `session` into the result.
-                let validated = session.lock().validate_tag(tag);
-                return match validated {
-                    Some((counter, is_ratcheted)) => {
-                        Ok(Some((session, counter, is_ratcheted, *tag)))
-                    }
-                    None => Err(Error::InvalidPacket("Invalid tag")),
-                };
+            if let Some((session, counter, is_ratcheted)) =
+                self.session_manager.find_session_by_tag(tag)?
+            {
+                return Ok(SessionLookup::Found((session, counter, is_ratcheted, *tag)));
             }
         }
 
         if !self.fallback_scan_allowed() {
-            return Ok(None);
+            return Ok(SessionLookup::RecoveryLimited);
         }
 
         // 2) Window-drift refresh. `refresh_and_find_by_tag` rebuilds STALE
@@ -77,19 +78,19 @@ impl super::Gateway {
                 .session_manager
                 .refresh_and_find_by_tag(first, client_ip)
             {
-                return Ok(Some((session, counter, is_ratcheted, *first)));
+                return Ok(SessionLookup::Found((
+                    session,
+                    counter,
+                    is_ratcheted,
+                    *first,
+                )));
             }
         }
         for tag in &tags {
-            if let Some(session) = self.session_manager.get_session_by_tag(tag) {
-                // Drop the lock guard before moving `session` into the result.
-                let validated = session.lock().validate_tag(tag);
-                return match validated {
-                    Some((counter, is_ratcheted)) => {
-                        Ok(Some((session, counter, is_ratcheted, *tag)))
-                    }
-                    None => Err(Error::InvalidPacket("Invalid tag")),
-                };
+            if let Some((session, counter, is_ratcheted)) =
+                self.session_manager.find_session_by_tag(tag)?
+            {
+                return Ok(SessionLookup::Found((session, counter, is_ratcheted, *tag)));
             }
         }
 
@@ -98,11 +99,11 @@ impl super::Gateway {
             if let Some((session, counter, is_ratcheted)) =
                 self.session_manager.recover_session_by_tag(tag, client_ip)
             {
-                return Ok(Some((session, counter, is_ratcheted, *tag)));
+                return Ok(SessionLookup::Found((session, counter, is_ratcheted, *tag)));
             }
         }
 
-        Ok(None)
+        Ok(SessionLookup::NotFound)
     }
 
     pub(crate) fn receive_worker_count() -> usize {

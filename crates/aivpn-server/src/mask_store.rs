@@ -471,7 +471,7 @@ impl MaskStore {
 /// есть, обратный профиль. Обратный профиль подписывается отдельно, чтобы его
 /// можно было проверить и после извлечения. Внешняя подпись при этом тоже
 /// покрывает уже подписанный обратный профиль.
-fn assess_stored_profile(
+pub(crate) fn assess_stored_profile(
     profile: &MaskProfile,
     operator_pubkey: Option<&[u8; 32]>,
     mode: MaskVerifyMode,

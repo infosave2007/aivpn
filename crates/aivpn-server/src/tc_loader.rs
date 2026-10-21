@@ -4,12 +4,16 @@
 //! via `tc` (traffic control) and updates per-client rules via `bpftool map`.
 //!
 //! The eBPF TC egress hook marks DSCP on outbound packets and enforces
-//! per-client bandwidth limits using a BPF LRU_HASH map `aivpn_qos_rules`.
+//! per-client bandwidth limits using a BPF HASH map `aivpn_qos_rules`.
 //! Falls back gracefully when `tc` or `bpftool` are unavailable.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use tracing::{debug, warn};
+
+const MAP_PIN_PATH: &str = "/sys/fs/bpf/tc/globals/aivpn_qos_rules";
+const FILTER_PREF: &str = "47741";
+const FILTER_HANDLE: &str = "1";
 
 /// eBPF TC loader — attaches a compiled BPF program to a network interface.
 pub struct TcQosLoader {
@@ -48,6 +52,9 @@ impl TcQosLoader {
     /// tc filter add dev <iface> egress bpf da obj <prog> sec tc
     /// ```
     pub fn attach(&mut self) -> bool {
+        if self.attached {
+            return true;
+        }
         if !self.prog_path.exists() {
             warn!(
                 "tc_loader: BPF object not found at {} — skipping attach",
@@ -83,6 +90,10 @@ impl TcQosLoader {
                 "dev",
                 &self.iface,
                 "egress",
+                "pref",
+                FILTER_PREF,
+                "handle",
+                FILTER_HANDLE,
                 "bpf",
                 "da",
                 "obj",
@@ -113,13 +124,9 @@ impl TcQosLoader {
 
     /// Update or insert a per-client QoS rule in the BPF `aivpn_qos_rules` map.
     ///
-    /// The value must match `struct qos_rule` in `deploy/ebpf/tc_qos_prog.c`
-    /// byte-for-byte (32 bytes, native endian):
-    ///   `[rate_bps: u64][tokens: u64][last_refill_ns: u64][dscp: u8][pad: 7]`
-    /// The bucket starts full (`tokens = rate_bps / 10`, matching the program's
-    /// 100 ms burst) and `last_refill_ns = 0` (the program caps elapsed time at
-    /// 1 s, so the first packet sees a full bucket).
-    /// Map pinned at `/sys/fs/bpf/aivpn_qos_rules`.
+    /// Формат совпадает с qos_rule в tc_qos_prog.c: 32 байта, native endian.
+    /// `[rate: u64][tokens: u64][time: u64][dscp: u8][pad: 3][spin_lock: u32]`.
+    /// Ведро вмещает 100 мс трафика, но не меньше одного MTU.
     pub fn update_rule(&self, rule: &TcQosRule) -> bool {
         if !self.attached {
             return false;
@@ -128,10 +135,9 @@ impl TcQosLoader {
         // The program runs on the TUN egress path (server -> client), so the
         // enforced rate is the client's downstream limit.
         let rate_bps = rule.rate_down_bps;
-        let burst = rate_bps / 10; // 100 ms burst, same as the BPF program
+        let burst = (rate_bps / 10).max(1500);
 
-        // Pack value: 8 + 8 + 8 + 1 + 7 = 32 bytes, native endian, hex-encoded
-        // for bpftool.
+        // Padding и spin_lock остаются нулевыми, bpftool получает каждый байт отдельно.
         let mut value = [0u8; 32];
         value[0..8].copy_from_slice(&rate_bps.to_ne_bytes());
         value[8..16].copy_from_slice(&burst.to_ne_bytes());
@@ -139,22 +145,11 @@ impl TcQosLoader {
         value[24] = rule.dscp;
         // value[25..32] padding stays zeroed
 
-        let key_hex = format!("{:08x}", rule.vpn_ip);
-        let val_hex: String = value.iter().map(|b| format!("{:02x}", b)).collect();
-
         let out = Command::new("bpftool")
-            .args([
-                "map",
-                "update",
-                "pinned",
-                "/sys/fs/bpf/aivpn_qos_rules",
-                "key",
-                "hex",
-                &key_hex,
-                "value",
-                "hex",
-                &val_hex,
-            ])
+            .args(["map", "update", "pinned", MAP_PIN_PATH, "key", "hex"])
+            .args(rule.vpn_ip.to_be_bytes().map(|b| format!("{b:02x}")))
+            .args(["value", "hex"])
+            .args(value.map(|b| format!("{b:02x}")))
             .output();
 
         match out {
@@ -181,36 +176,39 @@ impl TcQosLoader {
         if !self.attached {
             return false;
         }
-        let key_hex = format!("{:08x}", vpn_ip);
         let out = Command::new("bpftool")
-            .args([
-                "map",
-                "delete",
-                "pinned",
-                "/sys/fs/bpf/aivpn_qos_rules",
-                "key",
-                "hex",
-                &key_hex,
-            ])
+            .args(["map", "delete", "pinned", MAP_PIN_PATH, "key", "hex"])
+            .args(vpn_ip.to_be_bytes().map(|b| format!("{b:02x}")))
             .output();
         matches!(out, Ok(o) if o.status.success())
     }
 
-    /// Detach the BPF TC program and remove the clsact qdisc.
+    /// Снимает только наш фильтр, не удаляя общий clsact с чужими правилами.
     pub fn detach(&mut self) {
         if !self.attached {
             return;
         }
         let out = Command::new("tc")
-            .args(["qdisc", "del", "dev", &self.iface, "clsact"])
+            .args([
+                "filter",
+                "del",
+                "dev",
+                &self.iface,
+                "egress",
+                "pref",
+                FILTER_PREF,
+                "handle",
+                FILTER_HANDLE,
+                "bpf",
+            ])
             .output();
         match out {
             Ok(o) if o.status.success() => {
-                debug!("tc_loader: clsact qdisc removed from {}", self.iface);
+                debug!("tc_loader: собственный фильтр снят с {}", self.iface);
             }
             Ok(o) => {
                 warn!(
-                    "tc_loader: qdisc del failed: {}",
+                    "tc_loader: не удалось снять собственный фильтр: {}",
                     String::from_utf8_lossy(&o.stderr).trim()
                 );
             }
@@ -234,5 +232,5 @@ impl Drop for TcQosLoader {
 
 fn already_exists(stderr: &[u8]) -> bool {
     let msg = String::from_utf8_lossy(stderr);
-    msg.contains("already exists") || msg.contains("RTEXIST")
+    msg.contains("already exists") || msg.contains("File exists") || msg.contains("EEXIST")
 }

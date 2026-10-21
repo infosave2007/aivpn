@@ -495,6 +495,7 @@ pub struct AivpnClient {
     _send_buf: Vec<u8>,
     _recv_buf: Vec<u8>,
     proxy_handle: Option<crate::proxy::ProxyHandle>,
+    dns_proxy_gate: Option<crate::dns_proxy::DnsProxyGate>,
     // Recording tracking
     admin_listen: std::net::SocketAddrV4,
     recording_status: crate::record_cmd::RecordingStatusStore,
@@ -724,6 +725,7 @@ impl AivpnClient {
             _send_buf: Vec::with_capacity(MAX_PACKET_SIZE),
             _recv_buf: Vec::with_capacity(MAX_PACKET_SIZE),
             proxy_handle: None,
+            dns_proxy_gate: None,
             admin_listen: crate::record_cmd::DEFAULT_ADMIN_ADDR,
             recording_status: crate::record_cmd::RecordingStatusStore::for_endpoint(
                 crate::record_cmd::DEFAULT_ADMIN_ADDR,
@@ -974,6 +976,28 @@ impl AivpnClient {
     /// it directly: the tunnel still needs the server's address for its own
     /// routing (the host route and the kill-switch exemption are keyed on it).
     async fn finish_connect(&mut self, server_addr: SocketAddr) -> Result<()> {
+        // Новый транспорт означает новую попытку, даже при повторном connect()
+        // того же объекта. Старые ключи и replay-окна к ней не относятся.
+        self.keypair = KeyPair::generate();
+        self.counter = 0;
+        self.send_seq = 0;
+        self.recv_window.reset();
+        self.transition_recv_window.reset();
+        self.fragment_rx = aivpn_common::fragment::Reassembler::default();
+        self.session_keys = None;
+        self.upload_state = None;
+        self.transition_recv_keys = None;
+        self.transition_recv_deadline = None;
+        self.transition_grace_hard = None;
+        self.pending_upload_keys = None;
+        self.ratcheted_server_eph_pub = None;
+        self.ratcheted_rekey_eph_pub = None;
+        self.rekey_response_eph = None;
+        self.terminal_rejected = false;
+        self.reject_reason = 0;
+        self.recv_mdh_len = packet_mdh_len_for_mask(&self.config.initial_mask);
+        self.recv_mdh_candidates = vec![self.recv_mdh_len];
+        self.recv_tag_offsets = vec![self.config.initial_mask.tag_offset];
         self.ever_connected.store(false, Ordering::Relaxed);
 
         // Auto-detect kernel acceleration (Linux only).
@@ -1058,7 +1082,7 @@ impl AivpnClient {
         // Initialize mimicry engine
         self.mimicry_engine = Some(MimicryEngine::new(self.config.initial_mask.clone()));
 
-        // Derive session keys (Zero-RTT)
+        // Начальные ключи нужны только до подтвержденного PFS обмена.
         let dh_result = self
             .keypair
             .compute_shared(&self.config.server_public_key)?;
@@ -1071,7 +1095,7 @@ impl AivpnClient {
                 "absent"
             }
         );
-        self.session_keys = Some(crypto::derive_session_keys(
+        self.session_keys = Some(crypto::derive_initial_session_keys(
             &dh_result,
             self.config.preshared_key.as_ref(),
             &self.keypair.public_key_bytes(),
@@ -1158,6 +1182,15 @@ impl AivpnClient {
             self.tunnel
                 .apply_network_config(network_config.clone())
                 .await?;
+        } else if let Some(proxy) = &self.proxy_handle {
+            proxy
+                .update_network(
+                    network_config.client_ip,
+                    network_config.server_vpn_ip,
+                    network_config.prefix_len,
+                )
+                .await
+                .map_err(Error::Io)?;
         }
         // Ipv4Addr is Copy — capture before `network_config` moves into
         // `from_network_config` below.
@@ -1603,6 +1636,14 @@ impl AivpnClient {
     pub fn deactivate_kill_switch(&mut self) {
         self.tunnel.deactivate_kill_switch();
     }
+
+    pub fn take_kill_switch(&mut self) -> Option<crate::kill_switch::KillSwitch> {
+        self.tunnel.take_kill_switch()
+    }
+
+    pub fn set_dns_proxy_gate(&mut self, gate: crate::dns_proxy::DnsProxyGate) {
+        self.dns_proxy_gate = Some(gate);
+    }
 }
 
 impl Drop for AivpnClient {
@@ -1665,6 +1706,178 @@ mod tests {
             remote_enroll_hook: None,
             transport: None,
         }
+    }
+
+    #[tokio::test]
+    async fn reconnect_same_object_uses_fresh_ephemeral_and_empty_replay_state() {
+        let mut config = make_test_config();
+        config.control_only = true;
+        config.server_public_key = KeyPair::generate().public_key_bytes();
+        let mut client = AivpnClient::new(config).unwrap();
+        client.connect().await.unwrap();
+        let first_eph = client.keypair.public_key_bytes();
+        let first_key = client.session_keys.as_ref().unwrap().session_key;
+        client.counter = 77;
+        client.send_seq = 19;
+        client.recv_window.mark(51);
+        client.transition_recv_window.mark(31);
+        client.fragment_rx = aivpn_common::fragment::Reassembler::default();
+        client.disconnect().await;
+        client.connect().await.unwrap();
+        assert_ne!(client.keypair.public_key_bytes(), first_eph);
+        assert_ne!(client.session_keys.as_ref().unwrap().session_key, first_key);
+        assert_eq!(client.counter, 0);
+        assert_eq!(client.send_seq, 0);
+        assert_eq!(client.recv_window.highest(), None);
+        assert_eq!(client.transition_recv_window.highest(), None);
+        assert!(client.transition_recv_keys.is_none());
+        assert!(client.ratcheted_server_eph_pub.is_none());
+        client.disconnect().await;
+    }
+
+    #[tokio::test]
+    async fn second_server_hello_cannot_rekey_or_override_network() {
+        let mut config = make_test_config();
+        config.control_only = true;
+        config.server_public_key = KeyPair::generate().public_key_bytes();
+        let mut client = AivpnClient::new(config).unwrap();
+        client.connect().await.unwrap();
+        let first_eph = KeyPair::generate().public_key_bytes();
+        client
+            .handle_server_control(ControlPayload::ServerHello {
+                server_eph_pub: first_eph,
+                signature: [0; 64],
+                network_config: None,
+            })
+            .await
+            .unwrap();
+        let first_keys = client.session_keys.clone().unwrap();
+        client.counter = 41;
+        let mut different_network = client.config.tun_config.client_network_config().unwrap();
+        different_network.client_ip = "10.0.0.99".parse().unwrap();
+        client
+            .handle_server_control(ControlPayload::ServerHello {
+                server_eph_pub: KeyPair::generate().public_key_bytes(),
+                signature: [0; 64],
+                network_config: Some(different_network),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            client.session_keys.as_ref().unwrap().session_key,
+            first_keys.session_key
+        );
+        assert_eq!(client.ratcheted_server_eph_pub, Some(first_eph));
+        assert_eq!(client.counter, 41);
+        assert_eq!(*client.current_vpn_ip.lock().unwrap(), "10.0.0.2");
+        client.disconnect().await;
+    }
+
+    fn initial_downlink_packet(
+        keys: &SessionKeys,
+        counter: &mut u64,
+        inner: &[u8],
+        mdh_len: usize,
+    ) -> Vec<u8> {
+        let tag = crypto::generate_resonance_tag(
+            &keys.tag_secret,
+            *counter,
+            crypto::compute_time_window(crypto::current_timestamp_ms(), crypto::DEFAULT_WINDOW_MS),
+        );
+        let mut plain = vec![0, 0];
+        plain.extend(inner);
+        let envelope = crypto::encrypt_session_payload(
+            keys,
+            crypto::PacketDirection::ServerToClient,
+            *counter,
+            &tag,
+            &plain,
+        )
+        .unwrap();
+        *counter += 1;
+        let mut packet = tag.to_vec();
+        packet.resize(8 + mdh_len, 0);
+        packet.extend(envelope);
+        packet
+    }
+
+    #[tokio::test]
+    async fn delayed_initial_v2_hello_from_another_node_has_no_side_effects() {
+        let mut config = make_test_config();
+        config.control_only = true;
+        config.server_public_key = KeyPair::generate().public_key_bytes();
+        let mut client = AivpnClient::new(config).unwrap();
+        client.connect().await.unwrap();
+        let initial_keys = client.session_keys.clone().unwrap();
+        assert!(initial_keys.packet_cipher.is_initial());
+        let first_eph = KeyPair::generate().public_key_bytes();
+        let first_hello = ControlPayload::ServerHello {
+            server_eph_pub: first_eph,
+            signature: [0; 64],
+            network_config: None,
+        };
+        let inner = build_inner_packet(InnerType::Control, 0, &first_hello.encode().unwrap());
+        let mut counter = 0;
+        let packet =
+            initial_downlink_packet(&initial_keys, &mut counter, &inner, client.recv_mdh_len);
+        client.receive_and_write_packet(&packet).await.unwrap();
+        let first_key = client.session_keys.as_ref().unwrap().session_key;
+        assert_eq!(
+            client.session_keys.as_ref().unwrap().packet_cipher,
+            crypto::PacketCipher::Established
+        );
+        client.counter = 9;
+        let mut config = client.config.tun_config.client_network_config().unwrap();
+        config.client_ip = "10.0.0.99".parse().unwrap();
+        let other_hello = ControlPayload::ServerHello {
+            server_eph_pub: KeyPair::generate().public_key_bytes(),
+            signature: [0; 64],
+            network_config: Some(config),
+        };
+        let inner = build_inner_packet(InnerType::Control, 1, &other_hello.encode().unwrap());
+        let packet =
+            initial_downlink_packet(&initial_keys, &mut counter, &inner, client.recv_mdh_len);
+        client.receive_and_write_packet(&packet).await.unwrap();
+        assert_eq!(client.session_keys.as_ref().unwrap().session_key, first_key);
+        assert_eq!(client.ratcheted_server_eph_pub, Some(first_eph));
+        assert_eq!(client.counter, 9);
+        assert_eq!(*client.current_vpn_ip.lock().unwrap(), "10.0.0.2");
+        client.disconnect().await;
+    }
+
+    #[tokio::test]
+    async fn capabilities_are_announced_after_confirmed_server_hello() {
+        let mut config = make_test_config();
+        config.control_only = true;
+        config.server_public_key = KeyPair::generate().public_key_bytes();
+        let mut client = AivpnClient::new(config).unwrap();
+        client.control_handle();
+        let mut controls = client.preset_control_rx.take().unwrap();
+        client.connect().await.unwrap();
+        assert!(controls.try_recv().is_err());
+        client
+            .handle_server_control(ControlPayload::ServerHello {
+                server_eph_pub: KeyPair::generate().public_key_bytes(),
+                signature: [0; 64],
+                network_config: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            client.session_keys.as_ref().unwrap().packet_cipher,
+            crypto::PacketCipher::Established
+        );
+        let mut announced = None;
+        while let Ok(control) = controls.try_recv() {
+            if let ControlPayload::Capabilities { role, features } = control {
+                announced = Some((role, features));
+            }
+        }
+        assert_eq!(
+            announced,
+            Some((0, aivpn_common::protocol::CLIENT_PACKET_FEATURES))
+        );
+        client.disconnect().await;
     }
 
     fn server_hello_stdout(scenario: &str) -> Vec<String> {
@@ -1765,7 +1978,7 @@ mod tests {
                 }
                 client.handle_server_control(hello).await.unwrap();
                 if scenario == "network_update" {
-                    assert_eq!(*client.current_vpn_ip.lock().unwrap(), "10.0.0.4");
+                    assert_eq!(*client.current_vpn_ip.lock().unwrap(), "10.0.0.2");
                 }
             }
             "reconnect" => {
@@ -2539,9 +2752,8 @@ mod tests {
         let dh1 = client_kp
             .compute_shared(&server_static_kp.public_key_bytes())
             .unwrap();
-        let mut initial_keys =
-            crypto::derive_session_keys(&dh1, None, &client_kp.public_key_bytes());
-        initial_keys.session_key_s2c = initial_keys.session_key;
+        let initial_keys =
+            crypto::derive_initial_session_keys(&dh1, None, &client_kp.public_key_bytes());
         client.session_keys = Some(initial_keys.clone());
         client.transition_recv_keys = None;
         client.transition_recv_deadline = None;
@@ -2571,14 +2783,7 @@ mod tests {
         let mut send_counter = 0u64;
         // First delivery: the server's ORIGINAL ServerHello, encrypted with
         // the pre-ratchet (initial) keys.
-        let packet1 = aivpn_common::client_wire::build_random_mdh_packet(
-            &initial_keys,
-            &mut send_counter,
-            &inner,
-            None,
-            mdh_len,
-        )
-        .unwrap();
+        let packet1 = initial_downlink_packet(&initial_keys, &mut send_counter, &inner, mdh_len);
         client
             .receive_and_write_packet(&packet1)
             .await
@@ -2597,14 +2802,7 @@ mod tests {
         // this models gateway.rs's Keepalive-triggered resend path. It must
         // arrive within the client's transition_recv_deadline to be
         // decodable at all (otherwise it would just be dropped/warned).
-        let packet2 = aivpn_common::client_wire::build_random_mdh_packet(
-            &initial_keys,
-            &mut send_counter,
-            &inner,
-            None,
-            mdh_len,
-        )
-        .unwrap();
+        let packet2 = initial_downlink_packet(&initial_keys, &mut send_counter, &inner, mdh_len);
         client
             .receive_and_write_packet(&packet2)
             .await

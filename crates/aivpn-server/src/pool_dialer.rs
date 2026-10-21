@@ -623,10 +623,13 @@ impl PoolDialer {
             stop.store(true, Ordering::Relaxed);
         }
         self.dialed_peers.lock().remove(addr);
-        self.peer_senders.lock().remove(addr);
+        let mut senders = self.peer_senders.lock();
+        senders.remove(addr);
         if let Some(entry) = self.pool_status.lock().get_mut(addr) {
             entry.connected = false;
+            entry.converged = false;
         }
+        drop(senders);
         info!(
             "pool_dialer: remove_peer({}) — runtime exit dial torn down",
             addr
@@ -859,24 +862,11 @@ impl PoolDialer {
         // promotion ever happened.
         let per_session_ctrl = ctrl.clone();
 
-        // Wave B1 (pool topology read endpoints): record this connect so
-        // `pool_status_snapshot` reflects a live session immediately, even
-        // before the first anti-entropy beacon/convergence signal arrives.
         {
-            let now = Utc::now().timestamp();
-            let mut status = self.pool_status.lock();
-            let entry = status
-                .entry(peer.to_string())
-                .or_insert_with(|| PeerSyncStatus {
-                    connected: false,
-                    last_converged_unix: None,
-                    converged: false,
-                    last_seen_unix: None,
-                    partition_conflict: false,
-                    subnet_mismatch: false,
-                });
-            entry.connected = true;
-            entry.last_seen_unix = Some(now);
+            let senders = self.peer_senders.lock();
+            if !senders.contains_key(peer) {
+                mark_dialing(&self.pool_status, peer);
+            }
         }
 
         // PHASE 3: advertise our local subnets to this peer immediately on
@@ -953,6 +943,9 @@ impl PoolDialer {
             _ = &mut driver => Err(aivpn_common::error::Error::Session("Обмен с узлом завершен".into())),
         };
         driver.abort();
+        if !driver.is_finished() {
+            let _ = driver.await;
+        }
 
         // Registry cleanup: this peer no longer has a live session. A
         // reconnect (via `dial_loop`) promotes a fresh entry the next time
@@ -967,25 +960,19 @@ impl PoolDialer {
         // — an unconditional remove here would delete the live new
         // session's sender, leaving `has_live_session`/`send_to_peer` dark
         // for that peer until its next reconnect (potentially hours).
-        let removed_own_sender = {
+        {
             let mut senders = self.peer_senders.lock();
-            match senders.get(peer) {
-                Some(tx) if tx.same_channel(&per_session_ctrl) => {
-                    senders.remove(peer);
-                    true
+            if senders
+                .get(peer)
+                .is_some_and(|tx| tx.same_channel(&per_session_ctrl))
+            {
+                senders.remove(peer);
+                // Сброс статуса и смена отправителя используют один порядок
+                // блокировок: завершение старой сессии не затронет новую.
+                if let Some(entry) = self.pool_status.lock().get_mut(peer) {
+                    entry.connected = false;
+                    entry.converged = false;
                 }
-                _ => false,
-            }
-        };
-
-        // Wave B1: mirror the disconnect into the retained status too —
-        // `converged`/`last_converged_unix` are left untouched (they record
-        // the last time convergence WAS observed, which stays meaningful
-        // across a disconnect/reconnect). Same guard as above: a stale
-        // session must not mark a live replacement session disconnected.
-        if removed_own_sender {
-            if let Some(entry) = self.pool_status.lock().get_mut(peer) {
-                entry.connected = false;
             }
         }
 
@@ -1077,6 +1064,22 @@ fn mark_converged(
     entry.converged = true;
     entry.last_converged_unix = Some(now);
     entry.last_seen_unix = Some(now);
+}
+
+fn mark_dialing(pool_status: &parking_lot::Mutex<HashMap<String, PeerSyncStatus>>, peer: &str) {
+    let mut status = pool_status.lock();
+    let entry = status
+        .entry(peer.to_string())
+        .or_insert_with(|| PeerSyncStatus {
+            connected: false,
+            last_converged_unix: None,
+            converged: false,
+            last_seen_unix: None,
+            partition_conflict: false,
+            subnet_mismatch: false,
+        });
+    entry.connected = false;
+    entry.converged = false;
 }
 
 /// Mark `peer` as currently diverged as of `now` (unix seconds) — called
@@ -1332,7 +1335,12 @@ async fn anti_entropy(
                 // kept behind the latch to stay off the mutex per packet.
                 if !promoted && msg.is_some() {
                     promoted = true;
-                    peer_senders.lock().insert(peer.clone(), ctrl.clone());
+                    let mut senders = peer_senders.lock();
+                    senders.insert(peer.clone(), ctrl.clone());
+                    mark_diverged(&pool_status, &peer, Utc::now().timestamp());
+                    if let Some(entry) = pool_status.lock().get_mut(&peer) {
+                        entry.connected = true;
+                    }
                 }
                 match msg {
                     Some(ControlPayload::PoolStateDigest { digest }) => {
@@ -1805,6 +1813,13 @@ mod tests {
     async fn peer_promoted_to_live_only_after_first_inbound_message() {
         let cfg = base_pool_config();
         let dialer = PoolDialer::new(test_db(), &cfg, vec![], None, None).unwrap();
+        mark_dialing(&dialer.pool_status, "peer-a:443");
+        {
+            let status = dialer.pool_status.lock();
+            let entry = status.get("peer-a:443").unwrap();
+            assert!(!entry.connected, "handshake has not completed");
+            assert!(entry.last_seen_unix.is_none());
+        }
 
         let (ctrl_tx, _ctrl_rx) = tokio::sync::mpsc::channel::<ControlPayload>(8);
         let (tap_tx, tap_rx) = tokio::sync::mpsc::channel::<ControlPayload>(4);
@@ -1850,7 +1865,28 @@ mod tests {
             dialer.has_live_session("peer-a:443"),
             "the first inbound control message must promote the session to live"
         );
+        assert!(
+            dialer
+                .pool_status
+                .lock()
+                .get("peer-a:443")
+                .unwrap()
+                .connected
+        );
         driver.abort();
+    }
+
+    #[test]
+    fn reconnect_clears_current_convergence_without_faking_activity() {
+        let status = parking_lot::Mutex::new(HashMap::new());
+        mark_converged(&status, "peer", 100);
+        mark_dialing(&status, "peer");
+        let status = status.lock();
+        let entry = &status["peer"];
+        assert!(!entry.connected);
+        assert!(!entry.converged);
+        assert_eq!(entry.last_seen_unix, Some(100));
+        assert_eq!(entry.last_converged_unix, Some(100));
     }
 
     /// Registry insert/remove/broadcast logic exercised directly against

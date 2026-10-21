@@ -32,6 +32,8 @@ pub(crate) fn fec_seq_is_stale(repair_seq_hi: u16, seq: u16) -> bool {
 
 impl super::Gateway {
     pub(super) fn refresh_kernel_session(&self, sess: &mut Session) {
+        self.refresh_mtls_gate(sess);
+        let mtls_required = sess.mtls_required;
         if sess.kernel_faulted {
             return;
         }
@@ -58,6 +60,9 @@ impl super::Gateway {
             .is_some_and(|r| r.is_recording(&sess.session_id));
         input.userspace_rx |= self.config.enable_neural || recording;
         input.userspace_tx |= recording || self.config.downlink_shaping != ShapingLevel::Off;
+        // В ABI ядра нет срока сертификата, поэтому его проверяет userspace.
+        input.userspace_rx |= mtls_required;
+        input.userspace_tx |= mtls_required;
         let _ = kernel_maintain(ka, sess, tag_offset, mdh_len, &input, false);
     }
 
@@ -68,6 +73,14 @@ impl super::Gateway {
         payload: &[u8],
         force_local: bool,
     ) -> Result<()> {
+        {
+            let mut sess = session.lock();
+            if !self.refresh_mtls_gate(&mut sess)
+                || !session_allows_client_data(&sess, self.client_db.as_deref())
+            {
+                return Ok(());
+            }
+        }
         let (client_id, site, session_id) = {
             let session = session.lock();
             (
@@ -151,7 +164,17 @@ impl super::Gateway {
         // Existing-session lookup — layout-aware across every tag offset (legacy
         // prefix at 0 plus each embedded mask offset). Returns Err on a replay /
         // out-of-window packet for a known session (dropped, not handshaked).
-        let existing = self.find_existing_session(packet_data, &client_addr.ip())?;
+        let existing = match self.find_existing_session(packet_data, &client_addr.ip())? {
+            super::packet_demux::SessionLookup::Found(found) => Some(found),
+            super::packet_demux::SessionLookup::NotFound => None,
+            super::packet_demux::SessionLookup::RecoveryLimited => {
+                // Реальный reconnect допускается только через отдельные бюджеты ниже.
+                tracing::trace!(
+                    "Session recovery limited; handshake requires independent admission"
+                );
+                None
+            }
+        };
         let (session, counter, is_ratcheted_tag) = if let Some((
             session,
             counter,
@@ -159,10 +182,7 @@ impl super::Gateway {
             _resolved_tag,
         )) = existing
         {
-            // `tag` (offset-0 bytes) is not read again on the existing-session
-            // path — the layout-resolved tag was already validated inside
-            // `find_existing_session`. It is only reassigned on the handshake
-            // path below, where the post-loop re-validation reads it.
+            tag = _resolved_tag;
             (session, counter, is_ratcheted)
         } else {
             // NOTE: We intentionally do NOT drop packets from the same public IP
@@ -198,30 +218,20 @@ impl super::Gateway {
                 }
             };
 
-            // No session found — try handshake
-            // Rate-limit failed handshake attempts to prevent rapid session-creation loops.
-            // After mask rotation or session timeout, stale clients may flood the server
-            // with packets that consistently fail tag validation (issue #21, #42).
-            // A peer with a live session that lands here is not an unknown host:
-            // its packet missed the tag lookup because the window drifted or the
-            // global rescan budget was spent this second. Blocking it would deny
-            // that client its own reconnect for up to 16s while it keeps sending.
-            //
-            // `peer_has_session` is a LINEAR scan over the session pool
-            // (`SessionManager::has_session_for_addr`), so it is evaluated
-            // lazily — only where its value is actually needed: inside the
-            // per-IP cooldown check below (reachable only for an address that
-            // already failed once) and on the post-scan failure path. Computing
-            // it eagerly for EVERY handshake-branch packet would let a flood of
-            // spoofed source IPs (each bypassing the per-IP limiter) pin CPU on
-            // the scan before any rate-limit gate runs.
+            // Промах тега не доказывает новый handshake. Живому endpoint даем
+            // короткую паузу, неизвестному отправителю сохраняем backoff.
+            // Линейный поиск адреса нужен только после неудачного перебора.
             let peer_has_session = || self.session_manager.has_session_for_addr(&client_addr);
             {
                 if let Some(entry) = self.handshake_cooldowns.get(&client_addr) {
                     let (fail_count, last_fail) = *entry;
-                    // Exponential cooldown: 2s → 4s → 8s → 16s (max)
-                    let cooldown = Duration::from_millis((2000 * (1 << fail_count.min(3))) as u64);
-                    if !peer_has_session() && last_fail.elapsed() < cooldown {
+                    // Ноль означает короткую паузу живого endpoint, не запрет reconnect.
+                    let cooldown = if fail_count == 0 {
+                        Duration::from_secs(1)
+                    } else {
+                        Duration::from_millis((2000 * (1 << fail_count.min(3))) as u64)
+                    };
+                    if last_fail.elapsed() < cooldown {
                         debug!("Handshake cooldown active for {}: fail_count={}, elapsed={:?}, cooldown={:?}",
                             hash_addr(&client_addr), fail_count, last_fail.elapsed(), cooldown);
                         return Err(Error::InvalidPacket("Handshake cooldown active"));
@@ -240,6 +250,10 @@ impl super::Gateway {
                 );
                 return Err(Error::InvalidPacket("Handshake scan budget exhausted"));
             }
+
+            let _work_lease =
+                super::preauth::PreauthLease::acquire(self.handshake_work_budget.clone())
+                    .ok_or(Error::InvalidPacket("Handshake CPU budget exhausted"))?;
 
             // Try to establish a new session using one of the built-in bootstrap masks.
             // Runtime masks can be server-generated, but bootstrap must remain compatible
@@ -342,11 +356,6 @@ impl super::Gateway {
                                             session.site_peer_names =
                                                 site_node_id.clone().unwrap_or_default();
                                         }
-                                        let new_session_id = sess.lock().session_id;
-                                        self.session_manager.cleanup_masked_peer_handshakes(
-                                            &client_addr,
-                                            &new_session_id,
-                                        );
                                         debug!(
                                         "Masked pool-client handshake SUCCESS from {} via mask {}",
                                         hash_addr(&client_addr),
@@ -572,9 +581,10 @@ impl super::Gateway {
                             );
                             return Ok(());
                         }
-                        // Track failed handshake for cooldown — but never for a
-                        // peer whose session is still up (see `peer_has_session`).
+                        // Живому endpoint оставляем одну новую попытку в секунду.
                         if peer_has_session() {
+                            self.handshake_cooldowns
+                                .insert(client_addr, (0, Instant::now()));
                             return Err(Error::InvalidPacket(
                                 "Stale packet from an established peer",
                             ));
@@ -585,7 +595,7 @@ impl super::Gateway {
                             .map(|e| e.0)
                             .unwrap_or(0);
                         self.handshake_cooldowns
-                            .insert(client_addr, (fail_count + 1, Instant::now()));
+                            .insert(client_addr, (fail_count.saturating_add(1), Instant::now()));
                         warn!(
                             "Handshake failed for {} (attempt #{}) — tag mismatch for all {} registered clients",
                             hash_addr(&client_addr),
@@ -621,49 +631,6 @@ impl super::Gateway {
                 }
             };
 
-            // Tag is valid — this is a real handshake.
-            // Clean up old sessions for the SAME CLIENT (by VPN IP), not
-            // all sessions from this source IP — different clients behind
-            // the same NAT must coexist.
-            {
-                let (session_id, vpn_ip) = {
-                    let sess_lock = session.lock();
-                    (sess_lock.session_id, sess_lock.vpn_ip)
-                };
-                if let Some(vpn_ip) = vpn_ip {
-                    let removed = self
-                        .session_manager
-                        .cleanup_old_sessions_for_vpn_ip(&vpn_ip, &session_id);
-                    // Re-assert the downlink mapping for the winning session.
-                    // create_session inserts vpn_ip_map BEFORE tag validation, so a
-                    // concurrent duplicate/reconnect handshake for the same static
-                    // VPN IP could have overwritten it (and its own rollback would
-                    // not restore THIS session). Without this the client uploads
-                    // fine but downlink is a permanent blackhole ("no session for
-                    // VPN IP"). Making the validated winner authoritative here
-                    // closes that race deterministically.
-                    self.session_manager.bind_vpn_ip(&vpn_ip, &session_id);
-                    // Stop active recordings for removed stale sessions
-                    if let Some(ref recorder) = self.recording_manager {
-                        let socket = self.udp_socket.as_ref().unwrap().clone();
-                        let store = recorder.store();
-                        let mdh = self.mask_catalog.packet_mdh_bytes();
-                        for sid in removed {
-                            let outcome = recorder.stop_for_session_end(sid);
-                            Self::handle_recording_outcome(
-                                &socket,
-                                &self.session_manager,
-                                &store,
-                                &mdh,
-                                outcome,
-                                None,
-                            )
-                            .await;
-                        }
-                    }
-                }
-            }
-
             // CRITICAL (server-sec): do NOT clear the per-IP handshake
             // cooldown here. A bare tag-valid handshake packet proves
             // nothing about the sender's ability to receive traffic at
@@ -681,166 +648,16 @@ impl super::Gateway {
                 sess.rebuild_mdh_pool();
             }
 
-            // Record handshake in client DB
-            if let (Some(ref db), Some(ref cid)) = (&self.client_db, &matched_client_id) {
-                db.record_handshake(cid);
-                // Store client_id in session for traffic accounting
+            if let Some(ref cid) = matched_client_id {
                 session.lock().client_id = Some(cid.clone());
                 debug!("Client '{}' authenticated via PSK", cid);
             }
 
-            // Clean up any stale sessions for the same authenticated client
-            // (handles WiFi→cellular reconnect where source IP changes but PSK is the same).
-            if let Some(ref cid) = matched_client_id {
-                let session_id = session.lock().session_id;
-                let removed_cid = self
-                    .session_manager
-                    .cleanup_old_sessions_for_client_id(cid, &session_id);
-                if let Some(ref recorder) = self.recording_manager {
-                    let socket = self.udp_socket.as_ref().unwrap().clone();
-                    let store = recorder.store();
-                    let mdh = self.mask_catalog.packet_mdh_bytes();
-                    for sid in removed_cid {
-                        let outcome = recorder.stop_for_session_end(sid);
-                        Self::handle_recording_outcome(
-                            &socket,
-                            &self.session_manager,
-                            &store,
-                            &mdh,
-                            outcome,
-                            None,
-                        )
-                        .await;
-                    }
-                }
-            }
-
-            self.send_server_hello(&session, client_addr).await?;
             // CRITICAL (server-sec): the bootstrap-descriptor burst (up to 4
             // extra packets) is intentionally NOT sent here. It is deferred
             // to the `is_ratcheted_tag` branch below, once the client has
             // proven receipt of this ServerHello via return-routability.
             // See the field doc on `Session::bootstrap_descriptors_sent`.
-
-            // NOTE: the eager initial runtime-mask auto-switch (added earlier this
-            // session to un-inert the neural check) is intentionally NOT performed
-            // here. Committing the session onto a runtime mask whose MDH length
-            // differs from the bootstrap layout re-frames BOTH directions of the
-            // wire — the server then decodes uplink and encodes downlink at the
-            // runtime mdh_len while the client, which never adopted the mask, is
-            // still on the bootstrap layout — desyncing the ciphertext boundary
-            // (server: aead::Error on uplink; client: no MDH length authenticates)
-            // and stranding the tunnel into an RX-silence reconnect loop. The
-            // session stays on its bootstrap mask for the whole wire path; explicit
-            // client-driven switches (MaskPreference) and polymorphic variants still
-            // work because the client adopts those before the server reframes.
-            // Neural evaluation against the catalog's runtime mask must be decoupled
-            // from the wire-framing mask — tracked as a follow-up, not gated on this
-            // data-plane fix.
-            let _ = &bootstrap_mask;
-
-            // §3.2 "every session polymorphic" server policy: when enabled,
-            // derive and push a polymorphic variant for EVERY session right
-            // after handshake, without waiting for the client to opt in via
-            // `MaskPreference`. Base is the configured preset
-            // (`polymorphic_base_mask`) if set, else the session's own
-            // just-assigned bootstrap mask.
-            //
-            // Reuses the exact idempotency (`polymorphic_variant_already_active`)
-            // and throttle (`mask_preference_throttle` /
-            // `try_claim_mask_preference_slot`) guards as the client-driven
-            // `MaskPreference` arm below, so:
-            //   - a session that already carries this exact variant is not
-            //     re-pushed (idempotent — e.g. reconnect races reusing the
-            //     same prng_seed-derived variant id), and
-            //   - a client-requested `MaskPreference` still wins: if the
-            //     client sends one immediately after ServerHello (processed
-            //     concurrently with this handshake-completion code by a
-            //     different `tokio::spawn`ed task — see
-            //     `process_packets_concurrent`), whichever reaches the
-            //     shared per-session throttle slot first proceeds and the
-            //     other is silently dropped. In practice this code runs
-            //     synchronously moments after session creation, well before
-            //     a client could have received ServerHello and replied, so
-            //     it wins that race in the overwhelmingly common case — and
-            //     a genuinely later, out-of-window client `MaskPreference`
-            //     is never throttled by this (see `MASK_PREFERENCE_THROTTLE`'s
-            //     doc comment), so it always applies and correctly overrides
-            //     the policy-pushed variant.
-            if self.config.polymorphic_all_sessions {
-                let (poly_session_id, poly_prng_seed, poly_current_mask_id, poly_base) = {
-                    let sess = session.lock();
-                    let current = sess
-                        .pending_mask
-                        .as_ref()
-                        .map(|(m, _)| m.mask_id.clone())
-                        .or_else(|| sess.mask.as_ref().map(|m| m.mask_id.clone()));
-                    let base = self
-                        .config
-                        .polymorphic_base_mask
-                        .as_deref()
-                        .and_then(aivpn_common::mask::preset_masks::by_id)
-                        .or_else(|| sess.mask.clone());
-                    (sess.session_id, sess.keys.prng_seed, current, base)
-                };
-
-                if let Some(base) = poly_base {
-                    let variant = base.to_polymorphic(&poly_prng_seed);
-                    if !polymorphic_variant_already_active(
-                        poly_current_mask_id.as_deref(),
-                        &variant.mask_id,
-                    ) {
-                        let now = Instant::now();
-                        if try_claim_mask_preference_slot(
-                            &self.mask_preference_throttle,
-                            poly_session_id,
-                            now,
-                        ) {
-                            match self
-                                .session_manager
-                                .build_mask_update_packet(&session, &variant)
-                            {
-                                Ok(packet) => {
-                                    // FIX L: `udp_socket` is `None` until
-                                    // `run()` binds it — a handshake racing
-                                    // that startup window (or a future caller
-                                    // that constructs a `Gateway` without ever
-                                    // calling `run()`, e.g. tests) must not
-                                    // panic here.
-                                    if let Some(sock) = self.udp_socket.as_ref() {
-                                        if let Err(e) = sock.send_to(&packet, client_addr).await {
-                                            warn!(
-                                                "Failed to send policy-driven polymorphic MaskUpdate to {}: {}",
-                                                client_addr, e
-                                            );
-                                        } else {
-                                            self.session_manager
-                                                .update_session_mask(&poly_session_id, variant);
-                                            self.metrics.record_polymorphic_variant_pushed();
-                                        }
-                                    } else {
-                                        warn!(
-                                            "Dropping policy-driven polymorphic MaskUpdate for {} — UDP socket not bound",
-                                            hash_addr(&client_addr)
-                                        );
-                                    }
-                                }
-                                Err(e) => {
-                                    warn!(
-                                        "Failed to build policy-driven polymorphic MaskUpdate packet: {}",
-                                        e
-                                    );
-                                }
-                            }
-                        } else {
-                            debug!(
-                                "Polymorphic-all policy push for {} raced with a concurrent MaskPreference — skipping",
-                                hash_addr(&client_addr)
-                            );
-                        }
-                    }
-                }
-            }
 
             // NOTE: PFS ratchet is deferred until AFTER decrypting the init packet,
             // which was encrypted with pre-ratchet keys.
@@ -850,7 +667,7 @@ impl super::Gateway {
             // SAFETY: process_inner_payload is skipped for is_new_session packets (see below),
             // so mtls_ok=false is guaranteed to be visible before any Data is processed.
             if self.config.mtls.as_ref().map_or(false, |c| c.required) {
-                session.lock().mtls_ok = false;
+                self.refresh_mtls_gate(&mut session.lock());
             }
             debug!(
                 "New session from {} (ServerHello sent)",
@@ -949,16 +766,16 @@ impl super::Gateway {
         // epochs overlap after a ratchet (see `pre_ratchet_keys_in_grace`), so
         // AEAD authentication — which cannot succeed under the wrong key — is
         // what tells them apart. Drives the replay bookkeeping below.
-        let mut decrypted_with_pre_ratchet = false;
+        let mut authenticated_secret = zeroize::Zeroizing::new([0u8; 32]);
+        let mut initial_packet;
         let (payload_offset, padded_plaintext) = {
             let sess = session.lock();
-            let nonce = self.compute_nonce(counter);
             // For new sessions, always use initial keys for decryption since the
             // client hasn't received ServerHello yet and is still sending with
             // initial keys. Only use ratcheted keys when the client proves it
             // has switched by sending a ratcheted tag on an existing session.
-            let key = if is_new_session {
-                &sess.keys.session_key
+            let keys = if is_new_session {
+                &sess.keys
             } else if is_ratcheted_tag {
                 // Ratchet-seam race: `find_existing_session` validated this tag
                 // against `ratcheted_expected_tags`, but a concurrent worker may
@@ -971,12 +788,14 @@ impl super::Gateway {
                 // in `expected_tags` and the packet flows through the normal
                 // replay-window bookkeeping below.
                 match sess.ratcheted_keys.as_ref() {
-                    Some(ratcheted) => &ratcheted.session_key,
-                    None => &sess.keys.session_key,
+                    Some(ratcheted) => ratcheted,
+                    None => &sess.keys,
                 }
             } else {
-                &sess.keys.session_key
+                &sess.keys
             };
+            authenticated_secret.copy_from_slice(&keys.tag_secret);
+            initial_packet = matches!(keys.packet_cipher, crypto::PacketCipher::InitialV2 { .. });
 
             let mut decrypted = None;
             let mut last_error = None;
@@ -986,7 +805,13 @@ impl super::Gateway {
                     continue;
                 }
                 let encrypted_payload = &packet_data[payload_offset..];
-                match decrypt_payload(key, &nonce, encrypted_payload) {
+                match crypto::decrypt_session_payload(
+                    keys,
+                    crypto::PacketDirection::ClientToServer,
+                    counter,
+                    &tag,
+                    encrypted_payload,
+                ) {
                     Ok(padded_plaintext) => {
                         decrypted = Some((payload_offset, padded_plaintext));
                         break;
@@ -1009,11 +834,19 @@ impl super::Gateway {
                             continue;
                         }
                         let encrypted_payload = &packet_data[payload_offset..];
-                        if let Ok(padded_plaintext) =
-                            decrypt_payload(&old_keys.session_key, &nonce, encrypted_payload)
-                        {
+                        if let Ok(padded_plaintext) = crypto::decrypt_session_payload(
+                            old_keys,
+                            crypto::PacketDirection::ClientToServer,
+                            counter,
+                            &tag,
+                            encrypted_payload,
+                        ) {
                             decrypted = Some((payload_offset, padded_plaintext));
-                            decrypted_with_pre_ratchet = true;
+                            authenticated_secret.copy_from_slice(&old_keys.tag_secret);
+                            initial_packet = matches!(
+                                old_keys.packet_cipher,
+                                crypto::PacketCipher::InitialV2 { .. }
+                            );
                             break;
                         }
                     }
@@ -1071,21 +904,27 @@ impl super::Gateway {
         // Захват до pad, дескрипторов и payload. Слияние bitmap гонку не закрывает.
         let replay = {
             let mut sess = session.lock();
-            if let Some(ka) = self.kernel_accel.as_ref() {
+            let Some(previous_epoch) =
+                sess.authenticated_counter_epoch(counter, &authenticated_secret)
+            else {
+                return Ok(());
+            };
+            let replay = if let Some(ka) = self.kernel_accel.as_ref() {
                 self.refresh_kernel_session(&mut sess);
-                kernel_claim_deliver(
-                    Some(ka.as_ref()),
-                    &sess,
-                    counter,
-                    decrypted_with_pre_ratchet,
-                )
+                kernel_claim_deliver(Some(ka.as_ref()), &sess, counter, previous_epoch)
             } else {
-                kernel_claim_deliver(None, &sess, counter, decrypted_with_pre_ratchet)
+                kernel_claim_deliver(None, &sess, counter, previous_epoch)
+            };
+            if replay == ReplayGate::Drop {
+                kernel_note_rejected(&mut sess, counter, previous_epoch);
+            } else if previous_epoch {
+                sess.mark_pre_ratchet_received(counter);
+            } else {
+                sess.mark_tag_received(counter);
             }
+            replay
         };
         if replay == ReplayGate::Drop {
-            let mut sess = session.lock();
-            kernel_note_rejected(&mut sess, counter, decrypted_with_pre_ratchet);
             return Ok(());
         }
 
@@ -1109,6 +948,82 @@ impl super::Gateway {
                 }
             };
             if needs_descriptors {
+                // Политика маски меняет состояние только после подтверждения PFS.
+                if self.config.polymorphic_all_sessions {
+                    let (poly_session_id, poly_prng_seed, poly_current_mask_id, poly_base) = {
+                        let sess = session.lock();
+                        let current = sess
+                            .pending_mask
+                            .as_ref()
+                            .map(|(m, _)| m.mask_id.clone())
+                            .or_else(|| sess.mask.as_ref().map(|m| m.mask_id.clone()));
+                        let base = self
+                            .config
+                            .polymorphic_base_mask
+                            .as_deref()
+                            .and_then(aivpn_common::mask::preset_masks::by_id)
+                            .or_else(|| sess.mask.clone());
+                        (sess.session_id, sess.keys.prng_seed, current, base)
+                    };
+
+                    if let Some(base) = poly_base {
+                        let variant = base.to_polymorphic(&poly_prng_seed);
+                        if !polymorphic_variant_already_active(
+                            poly_current_mask_id.as_deref(),
+                            &variant.mask_id,
+                        ) {
+                            let now = Instant::now();
+                            if try_claim_mask_preference_slot(
+                                &self.mask_preference_throttle,
+                                poly_session_id,
+                                now,
+                            ) {
+                                match self
+                                    .session_manager
+                                    .build_mask_update_packet(&session, &variant)
+                                {
+                                    Ok(packet) => {
+                                        // FIX L: `udp_socket` is `None` until
+                                        // `run()` binds it — a handshake racing
+                                        // that startup window (or a future caller
+                                        // that constructs a `Gateway` without ever
+                                        // calling `run()`, e.g. tests) must not
+                                        // panic here.
+                                        if let Some(sock) = self.udp_socket.as_ref() {
+                                            if let Err(e) = sock.send_to(&packet, client_addr).await
+                                            {
+                                                warn!(
+                                                    "Failed to send policy-driven polymorphic MaskUpdate to {}: {}",
+                                                    client_addr, e
+                                                );
+                                            } else {
+                                                self.session_manager
+                                                    .update_session_mask(&poly_session_id, variant);
+                                                self.metrics.record_polymorphic_variant_pushed();
+                                            }
+                                        } else {
+                                            warn!(
+                                                "Dropping policy-driven polymorphic MaskUpdate for {} — UDP socket not bound",
+                                                hash_addr(&client_addr)
+                                            );
+                                        }
+                                    }
+                                    Err(e) => {
+                                        warn!(
+                                            "Failed to build policy-driven polymorphic MaskUpdate packet: {}",
+                                            e
+                                        );
+                                    }
+                                }
+                            } else {
+                                debug!(
+                                    "Polymorphic-all policy push for {} raced with a concurrent MaskPreference — skipping",
+                                    hash_addr(&client_addr)
+                                );
+                            }
+                        }
+                    }
+                }
                 self.handshake_cooldowns.remove(&client_addr);
                 if let Err(e) = self.send_bootstrap_descriptors(&session).await {
                     warn!(
@@ -1120,6 +1035,8 @@ impl super::Gateway {
             }
         }
 
+        self.finish_client_admission(&session).await;
+
         // Extract pad_len from inside decrypted data and strip padding
         if padded_plaintext.len() < 2 {
             return Err(Error::InvalidPacket("Decrypted payload too short"));
@@ -1130,36 +1047,21 @@ impl super::Gateway {
         }
         let plaintext = &padded_plaintext[2..padded_plaintext.len() - pad_len];
 
+        // До подтверждения PFS начальный пакет не выполняет Data или control.
+        // Повторный init получает тот же Hello, но с новым случайным nonce.
+        if initial_packet {
+            let pending = !session.lock().is_ratcheted;
+            if pending {
+                self.send_server_hello(&session, client_addr).await?;
+            }
+            return Ok(());
+        }
+
         // Update session state. Avoid expensive O(window) tag-map rebuild on every packet.
         let mut client_db_flush: Option<(String, u64, u64)> = None;
         let (session_id, refresh_tags, iat_ms) = {
             let mut sess = session.lock();
-            // H2: validate_tag() returns the same Some((counter, false)) shape
-            // for both a normal current-epoch match AND a pre-ratchet
-            // (old-key) match during the post-ratchet grace window — the
-            // pre-ratchet counter belongs to the OLD epoch's counter space.
-            // Folding it into mark_tag_received() would fast-forward the
-            // CURRENT epoch's counter/bitmap to that old (often much larger)
-            // value, corrupting the replay window so legitimate new-key
-            // packets with small counters then look "out of window" and get
-            // rejected — a likely root cause of "invalid tag after rekey".
-            // Route pre-ratchet counters exclusively into the dedicated
-            // pre-ratchet replay set (C-S-2) and never advance the main
-            // counter state for them.
-            //
-            // The discriminator is which key AUTHENTICATED the packet, not
-            // counter membership: `complete_ratchet` resets counter to 0 and
-            // both tag sets then cover 0..512, so the old membership test
-            // classified nearly every EARLY CURRENT-epoch packet as
-            // pre-ratchet. That skipped mark_tag_received() entirely, pinning
-            // `counter` at 0 and leaving the replay bitmap empty — and since
-            // is_replay() only rejects counters at or below `counter`, the
-            // same packet could then be replayed for the rest of the window.
-            if decrypted_with_pre_ratchet {
-                sess.mark_pre_ratchet_received(counter);
-            } else {
-                sess.mark_tag_received(counter);
-            }
+            // Replay уже захвачен и отмечен до первого await под одной блокировкой.
             // Inter-arrival time = gap since the PREVIOUS validated packet. This
             // MUST be measured before overwriting `last_seen`; the neural and
             // recording readers below would otherwise observe ~0 (the value we
@@ -1328,7 +1230,7 @@ impl super::Gateway {
     }
 
     /// Process decrypted inner payload
-    async fn process_inner_payload(
+    pub(super) async fn process_inner_payload(
         &self,
         plaintext: &[u8],
         session: &Arc<parking_lot::Mutex<Session>>,
@@ -1360,7 +1262,7 @@ impl super::Gateway {
         match inner_header.inner_type {
             InnerType::Data => {
                 // mTLS gate: drop Data packets until cert is verified (when required).
-                if !session.lock().mtls_ok {
+                if !self.refresh_mtls_gate(&mut session.lock()) {
                     warn!(
                         "mtls: Data from {} rejected — certificate not yet verified",
                         hash_addr(&client_addr)

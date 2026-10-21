@@ -2,7 +2,9 @@
 //!
 //! Pure extract-module move from `main.rs` (ÉTAPE 1 decomposition, step 2).
 
-use aivpn_server::backup::{export_server, import_server, ExportOptions};
+use aivpn_server::backup::{
+    export_server, import_server_with_options, ExportOptions, ImportOptions,
+};
 use aivpn_server::ServerArgs;
 use std::path::PathBuf;
 
@@ -29,19 +31,19 @@ pub(crate) fn handle_export(args: &ServerArgs, output_path: &str) {
 }
 
 pub(crate) fn handle_import(archive_path: &str, dry_run: bool, args: &ServerArgs) {
-    let target_dir = args
-        .config
-        .as_deref()
-        .and_then(|p| std::path::Path::new(p).parent())
-        .unwrap_or(std::path::Path::new("/etc/aivpn"));
-    match import_server(std::path::Path::new(archive_path), target_dir, dry_run) {
+    let opts = ImportOptions {
+        config_path: PathBuf::from(args.config.as_deref().unwrap_or("/etc/aivpn/server.json")),
+        clients_db: PathBuf::from(&args.clients_db),
+        mask_dir: PathBuf::from(args.mask_dir.as_deref().unwrap_or("/var/lib/aivpn/masks")),
+    };
+    match import_server_with_options(std::path::Path::new(archive_path), &opts, dry_run) {
         Ok(summary) => {
             if summary.dry_run {
                 println!("DRY RUN — no files will be written.");
                 println!("Backup created:  {}", summary.created_at);
                 println!("Backup version:  {}", summary.aivpn_version);
                 println!("Components:      {:?}", summary.components);
-                println!("Restore target:  {:?}", target_dir);
+                println!("Пути восстановления: {:?}", opts);
                 println!("Signed:          {}", summary.signed);
                 println!("✅ Dry-run complete. No files written.");
             } else {

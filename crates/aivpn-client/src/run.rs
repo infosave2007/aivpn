@@ -47,6 +47,16 @@ const MAX_BACKOFF: Duration = Duration::from_secs(60);
 /// genuinely established sessions (well past connect) trigger a reset.
 const HEALTHY_CONNECTION_THRESHOLD: Duration = Duration::from_secs(30);
 
+async fn wait_reconnect_backoff(backoff: Duration, shutdown: &AtomicBool) {
+    let deadline = tokio::time::Instant::now() + backoff;
+    while !shutdown.load(Ordering::SeqCst) && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep_until(
+            deadline.min(tokio::time::Instant::now() + Duration::from_millis(100)),
+        )
+        .await;
+    }
+}
+
 /// AIVPN Client - Censorship-resistant VPN client
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -1316,10 +1326,14 @@ pub async fn run(
     // aggregates per region and drops feedback without one).
     let feedback_share_enabled = args.share_mask_feedback && country_code.is_some();
 
-    // Start DNS proxy once before the reconnect loop so it stays alive across
-    // tunnel restarts. If created inside the loop, the handle is dropped at the
-    // end of each iteration and the proxy is killed during the backoff sleep —
-    // creating a DNS leak window on every reconnect.
+    if args.dns_proxy.is_some()
+        && (proxy_listen.is_some() || !cfg!(any(target_os = "linux", target_os = "macos")))
+    {
+        error!("--dns-proxy requires a Linux/macOS TUN; SOCKS uses its own DNS through the tunnel");
+        return;
+    }
+    // Слушатель живет между попытками, пересылка разрешена только для готового TUN.
+    let dns_proxy_gate = aivpn_client::dns_proxy::DnsProxyGate::default();
     let _dns_proxy_handle = args.dns_proxy.as_deref().and_then(|bind_str| {
         // Unlike every other malformed-input path in this file
         // (--server-key, --proxy-listen, --mtls-cert, --mask-verify-mode,
@@ -1354,9 +1368,11 @@ pub async fn run(
                 listen_addr: bind_addr,
                 upstream_addr,
             },
+            dns_proxy_gate.clone(),
         ))
     });
 
+    let mut reconnect_kill_switch: Option<aivpn_client::kill_switch::KillSwitch> = None;
     loop {
         if shutdown.load(Ordering::SeqCst) {
             info!("Shutdown requested, stopping client loop");
@@ -1726,6 +1742,7 @@ pub async fn run(
 
         match AivpnClient::new(config) {
             Ok(mut client) => {
+                client.set_dns_proxy_gate(dns_proxy_gate.clone());
                 client.set_transport_registry(registry.clone(), guard.clone());
                 info!("Client initialized successfully (TUN: {})", tun_name);
 
@@ -1737,6 +1754,9 @@ pub async fn run(
                 {
                     error!("Local address already in use; choose distinct --admin-listen and --proxy-listen ports");
                     client.deactivate_kill_switch();
+                    if let Some(ks) = &mut reconnect_kill_switch {
+                        ks.deactivate();
+                    }
                     std::process::exit(1);
                 }
 
@@ -1811,6 +1831,9 @@ pub async fn run(
                                 handshake_reject_message(client.reject_reason())
                             );
                             client.deactivate_kill_switch();
+                            if let Some(ks) = &mut reconnect_kill_switch {
+                                ks.deactivate();
+                            }
                             // Сохраняем rejected последним статусом для читателя stdout.
                             return;
                         }
@@ -1830,6 +1853,9 @@ pub async fn run(
                             e,
                             backoff.as_secs()
                         );
+                        if let Some(ks) = client.take_kill_switch() {
+                            reconnect_kill_switch = Some(ks);
+                        }
                     }
                 }
             }
@@ -1848,8 +1874,11 @@ pub async fn run(
         }
 
         println!("AIVPN-STATUS reconnecting");
-        tokio::time::sleep(backoff).await;
+        wait_reconnect_backoff(backoff, &shutdown).await;
         backoff = std::cmp::min(backoff * 2, max_backoff);
+    }
+    if let Some(ks) = &mut reconnect_kill_switch {
+        ks.deactivate();
     }
     println!("AIVPN-STATUS disconnected");
 }
@@ -1938,6 +1967,25 @@ fn transport_registry(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_interrupts_reconnect_backoff() {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let flag = shutdown.clone();
+        let task = tokio::spawn(async move {
+            wait_reconnect_backoff(Duration::from_secs(60), &flag).await;
+        });
+        tokio::task::yield_now().await;
+        shutdown.store(true, Ordering::SeqCst);
+        tokio::time::advance(Duration::from_millis(101)).await;
+        tokio::task::yield_now().await;
+        let finished = task.is_finished();
+        task.abort();
+        assert!(
+            finished,
+            "intentional shutdown must not wait the full backoff"
+        );
+    }
 
     /// Build a valid aivpn:// connection key from a JSON object literal.
     fn make_conn_key(json: &str) -> String {

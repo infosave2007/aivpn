@@ -43,7 +43,7 @@ const VIEWER_ALLOWED: Array<{ method: string; pattern: RegExp }> = [
   { method: 'GET', pattern: /^\/api\/v1\/masks$/ },
   // Kernel-module status — read-only diagnostic info, no secrets.
   { method: 'GET', pattern: /^\/api\/v1\/kernel$/ },
-  // Realtime dashboard event stream (SSE) — read-only status/traffic events.
+  // Это право проверяет ticket-route /web/events. Прямой proxy ниже закрыт всем.
   { method: 'GET', pattern: /^\/api\/v1\/events$/ },
   // Pool topology (nodes/links/health) — node IDs, addresses, sync/connected
   // state; no keys or credentials. Sidebar.svelte marks Pool `adminOnly:
@@ -185,6 +185,10 @@ proxy.all('/*', requireReadAccess(), async (c) => {
   const canonicalPath = canonicalizeForAuthz(apiPath)
   if (canonicalPath === null) {
     return c.json({ error: 'Bad request' }, 400)
+  }
+  // SSE разрешен только через /web/events с одноразовым ticket и лимитом времени.
+  if (canonicalPath === '/api/v1/events') {
+    return c.json({ error: 'Use /web/events with an event ticket' }, 403)
   }
 
   // Guard: only allow requests to /api/v1/ prefix (checked on canonical path

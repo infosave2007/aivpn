@@ -364,11 +364,13 @@ pub fn parse_quic_initial(datagram: &[u8]) -> Option<QuicInitialLayout> {
     let mut pos = scid_len_pos + 1 + scid_len;
     // Token length varint (must be 0 for a client Initial we built).
     let (token_len, tl) = decode_varint(datagram.get(pos..)?)?;
-    pos += tl + token_len as usize;
+    pos = pos
+        .checked_add(tl)?
+        .checked_add(usize::try_from(token_len).ok()?)?;
     // Length varint bounds the Initial (packet number + payload + AEAD tag).
     let (length_value, ll) = decode_varint(datagram.get(pos..)?)?;
-    pos += ll;
-    let payload_offset = pos.checked_add(length_value as usize)?;
+    pos = pos.checked_add(ll)?;
+    let payload_offset = pos.checked_add(usize::try_from(length_value).ok()?)?;
     if payload_offset > datagram.len() {
         return None;
     }
@@ -383,6 +385,25 @@ pub fn parse_quic_initial(datagram: &[u8]) -> Option<QuicInitialLayout> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn protocol_audit_quic_rejects_oversized_varint_offsets() {
+        for huge in [u32::MAX as u64 - 15, 1u64 << 32, (1u64 << 62) - 1] {
+            let mut packet = vec![0xc0, 0, 0, 0, 1, 8];
+            packet.extend_from_slice(&[0; 8]);
+            packet.push(0);
+            encode_varint(huge, &mut packet);
+            packet.extend_from_slice(&[0; 32]);
+            assert!(parse_quic_initial(&packet).is_none());
+
+            let mut packet = vec![0xc0, 0, 0, 0, 1, 8];
+            packet.extend_from_slice(&[0; 8]);
+            packet.extend_from_slice(&[0, 0]);
+            encode_varint(huge, &mut packet);
+            packet.extend_from_slice(&[0; 32]);
+            assert!(parse_quic_initial(&packet).is_none());
+        }
+    }
 
     #[test]
     fn roundtrip_layout() {

@@ -66,6 +66,9 @@ pub struct ProxyConfig {
 }
 
 pub struct ProxyHandle {
+    #[cfg(test)]
+    listen_addr: SocketAddr,
+    network_tx: std::sync::mpsc::SyncSender<UdpStackCommand>,
     pub rx_queue: Arc<Mutex<VecDeque<Vec<u8>>>>,
     pub wake_tx: std::sync::mpsc::SyncSender<()>,
     /// Accept loop task — aborted when ProxyHandle is dropped, releasing the TcpListener port.
@@ -74,6 +77,39 @@ pub struct ProxyHandle {
     /// connection doesn't keep the smoltcp stack's background thread (and its
     /// command-channel senders) alive across a VPN reconnect.
     conn_tasks: Arc<Mutex<tokio::task::JoinSet<()>>>,
+}
+
+impl ProxyHandle {
+    pub async fn update_network(
+        &self,
+        vpn_ip: Ipv4Addr,
+        gateway: Ipv4Addr,
+        prefix: u8,
+    ) -> std::io::Result<()> {
+        if prefix > 32 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "invalid proxy prefix",
+            ));
+        }
+        self.conn_tasks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .abort_all();
+        let (reply, received) = tokio::sync::oneshot::channel();
+        self.network_tx
+            .try_send(UdpStackCommand::Network {
+                vpn_ip,
+                gateway,
+                prefix,
+                reply,
+            })
+            .map_err(|_| std::io::Error::other("proxy stack unavailable"))?;
+        let _ = self.wake_tx.try_send(());
+        received
+            .await
+            .map_err(|_| std::io::Error::other("proxy stack stopped"))
+    }
 }
 
 impl Drop for ProxyHandle {
@@ -85,11 +121,19 @@ impl Drop for ProxyHandle {
     }
 }
 
+struct CloseOnDrop(Arc<AtomicBool>);
+impl Drop for CloseOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+}
+
 struct ManagedConn {
     handle: SocketHandle,
     inbound: Arc<Mutex<VecDeque<Vec<u8>>>>,
     outbound_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
     close_flag: Arc<AtomicBool>,
+    write_eof: Arc<AtomicBool>,
     ready_tx: Option<std::sync::mpsc::SyncSender<bool>>,
 }
 
@@ -99,6 +143,7 @@ struct NewConn {
     inbound: Arc<Mutex<VecDeque<Vec<u8>>>>,
     outbound_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
     close_flag: Arc<AtomicBool>,
+    write_eof: Arc<AtomicBool>,
     ready_tx: std::sync::mpsc::SyncSender<bool>,
 }
 
@@ -144,6 +189,12 @@ struct PendingDns {
 }
 
 enum UdpStackCommand {
+    Network {
+        vpn_ip: Ipv4Addr,
+        gateway: Ipv4Addr,
+        prefix: u8,
+        reply: tokio::sync::oneshot::Sender<()>,
+    },
     CreateAssoc(NewUdpAssoc),
     SendPacket(UdpPacketCommand),
     Resolve(DnsResolve),
@@ -156,11 +207,14 @@ pub async fn spawn_proxy(
 ) -> std::io::Result<ProxyHandle> {
     validate_dns_servers(&config.dns_servers)?;
     let listener = tokio::net::TcpListener::bind(config.listen_addr).await?;
+    #[cfg(test)]
+    let listen_addr = listener.local_addr()?;
     let rx_queue: Arc<Mutex<VecDeque<Vec<u8>>>> = Arc::new(Mutex::new(VecDeque::new()));
     let tx_queue: Arc<Mutex<VecDeque<Vec<u8>>>> = Arc::new(Mutex::new(VecDeque::new()));
 
     let (cmd_tx, cmd_rx) = std::sync::mpsc::sync_channel::<NewConn>(1024);
     let (udp_cmd_tx, udp_cmd_rx) = std::sync::mpsc::sync_channel::<UdpStackCommand>(1024);
+    let network_tx = udp_cmd_tx.clone();
     let (wake_tx, wake_rx) = std::sync::mpsc::sync_channel::<()>(1024);
 
     let vpn_ip = config.vpn_ip;
@@ -215,6 +269,9 @@ pub async fn spawn_proxy(
     });
 
     Ok(ProxyHandle {
+        #[cfg(test)]
+        listen_addr,
+        network_tx,
         rx_queue,
         wake_tx,
         accept_task,
@@ -300,6 +357,7 @@ fn run_stack(
                                 inbound: nc.inbound,
                                 outbound_tx: nc.outbound_tx,
                                 close_flag: nc.close_flag,
+                                write_eof: nc.write_eof,
                                 ready_tx: Some(nc.ready_tx),
                             });
                         }
@@ -317,6 +375,37 @@ fn run_stack(
         // Принимаем команды UDP ASSOCIATE и пакеты на отправку.
         loop {
             match udp_cmd_rx.try_recv() {
+                Ok(UdpStackCommand::Network {
+                    vpn_ip,
+                    gateway,
+                    prefix,
+                    reply,
+                }) => {
+                    for conn in tcp_conns.drain(..) {
+                        sockets.remove(conn.handle);
+                    }
+                    for (_, assoc) in udp_assocs.drain() {
+                        sockets.remove(assoc.handle);
+                    }
+                    let dns_socket = sockets.get_mut::<dns::Socket>(dns_handle);
+                    for query in pending_dns.drain(..) {
+                        dns_socket.cancel_query(query.handle);
+                        let _ = query.reply.send(None);
+                    }
+                    iface.update_ip_addrs(|ips| {
+                        ips.clear();
+                        let _ = ips.push(IpCidr::new(
+                            IpAddress::Ipv4(Ipv4Address(vpn_ip.octets())),
+                            prefix,
+                        ));
+                    });
+                    let _ = iface
+                        .routes_mut()
+                        .add_default_ipv4_route(Ipv4Address(gateway.octets()));
+                    rx_queue.lock().unwrap_or_else(|e| e.into_inner()).clear();
+                    tx_queue.lock().unwrap_or_else(|e| e.into_inner()).clear();
+                    let _ = reply.send(());
+                }
                 Ok(UdpStackCommand::CreateAssoc(nc)) => {
                     if udp_assocs.contains_key(&nc.relay_port) {
                         let _ = nc.ready_tx.send(false);
@@ -506,6 +595,11 @@ async fn resolve_via_tunnel(
 fn service_tcp_conn(conn: &mut ManagedConn, sockets: &mut SocketSet) -> bool {
     let socket = sockets.get_mut::<TcpSocket>(conn.handle);
 
+    if conn.close_flag.load(Ordering::Relaxed) {
+        socket.abort();
+        return true;
+    }
+
     if let Some(ready_tx) = conn.ready_tx.take() {
         match socket.state() {
             State::Established => {
@@ -522,11 +616,6 @@ fn service_tcp_conn(conn: &mut ManagedConn, sockets: &mut SocketSet) -> bool {
         }
     }
 
-    if conn.close_flag.load(Ordering::Relaxed) {
-        socket.abort();
-        return true;
-    }
-
     if socket.may_send() {
         let mut q = conn.inbound.lock().unwrap_or_else(|e| e.into_inner());
         while !q.is_empty() && socket.can_send() {
@@ -539,6 +628,9 @@ fn service_tcp_conn(conn: &mut ManagedConn, sockets: &mut SocketSet) -> bool {
                 Ok(_) => {}
                 Err(_) => break,
             }
+        }
+        if q.is_empty() && conn.write_eof.load(Ordering::Relaxed) {
+            socket.close();
         }
     }
 
@@ -569,10 +661,10 @@ fn service_tcp_conn(conn: &mut ManagedConn, sockets: &mut SocketSet) -> bool {
         }
     }
 
-    matches!(
-        socket.state(),
-        State::Closed | State::TimeWait | State::FinWait2
-    )
+    if socket.state() == State::CloseWait && !socket.can_recv() {
+        socket.close();
+    }
+    matches!(socket.state(), State::Closed | State::TimeWait)
 }
 
 /// Возвращает `true`, когда UDP-ассоциацию нужно закрыть.
@@ -740,6 +832,8 @@ async fn handle_connect(
 
     let inbound: Arc<Mutex<VecDeque<Vec<u8>>>> = Arc::new(Mutex::new(VecDeque::new()));
     let close_flag = Arc::new(AtomicBool::new(false));
+    let _close_on_drop = CloseOnDrop(close_flag.clone());
+    let write_eof = Arc::new(AtomicBool::new(false));
     let (outbound_tx, mut outbound_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1024);
     let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
 
@@ -750,6 +844,7 @@ async fn handle_connect(
             inbound: Arc::clone(&inbound),
             outbound_tx,
             close_flag: Arc::clone(&close_flag),
+            write_eof: write_eof.clone(),
             ready_tx,
         })
         .is_err()
@@ -789,7 +884,8 @@ async fn handle_connect(
     let close_flag_rd = Arc::clone(&close_flag);
     let wake_tx_rd = wake_tx.clone();
 
-    let mut read_half = tokio::spawn(async move {
+    let mut halves = tokio::task::JoinSet::new();
+    halves.spawn(async move {
         let mut buf = vec![0u8; 8192];
         loop {
             // Bounded inbound queue: while it holds SOCKS5_INBOUND_QUEUE_MAX
@@ -807,49 +903,43 @@ async fn handle_connect(
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
             match socks_rd.read(&mut buf).await {
-                Ok(0) | Err(_) => break,
+                Ok(0) => break,
+                Err(_) => {
+                    close_flag_rd.store(true, Ordering::Relaxed);
+                    break;
+                }
                 Ok(n) => {
                     inbound_clone
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
                         .push_back(buf[..n].to_vec());
-                    let _ = wake_tx_rd.send(()); // разбудить стек: данные от клиента
+                    let _ = wake_tx_rd.try_send(());
                 }
             }
         }
-        close_flag_rd.store(true, Ordering::Relaxed);
+        write_eof.store(true, Ordering::Relaxed);
+        let _ = wake_tx_rd.try_send(());
+        true
     });
 
-    let mut write_half = tokio::spawn(async move {
+    halves.spawn(async move {
         while let Some(data) = outbound_rx.recv().await {
             if socks_wr.write_all(&data).await.is_err() {
                 break;
             }
         }
+        false
     });
 
-    tokio::select! {
-        _ = &mut read_half => {
-            // Client half-closed (or errored) its write side. Don't abort
-            // write_half immediately — a still-in-flight tunnel→client
-            // response would be truncated the instant the client's own read
-            // side sees EOF, even though write_half is otherwise draining
-            // cleanly. close_flag_rd was already set inside read_half's own
-            // task body above, so the tunnel-side stack already knows to
-            // wind down that direction; give write_half a bounded grace
-            // period to finish delivering whatever's still coming before
-            // falling through to the unconditional abort below.
-            let _ = tokio::time::timeout(HALF_CLOSE_DRAIN_GRACE, &mut write_half).await;
-        }
-        _ = &mut write_half => {}
+    if matches!(halves.join_next().await, Some(Ok(true))) {
+        let _ = tokio::time::timeout(HALF_CLOSE_DRAIN_GRACE, halves.join_next()).await;
     }
 
     close_flag.store(true, Ordering::Relaxed);
     // Abort the sibling half so it doesn't linger detached, parked on a socket
     // read or channel recv after the connection has already torn down. A
     // no-op for whichever half already finished above.
-    read_half.abort();
-    write_half.abort();
+    halves.abort_all();
 }
 
 fn smol_ip_to_std(ip: IpAddress) -> IpAddr {
@@ -895,6 +985,7 @@ async fn handle_udp_associate(
 
     let relay_port = relay_addr.port();
     let close_flag = Arc::new(AtomicBool::new(false));
+    let _close_on_drop = CloseOnDrop(close_flag.clone());
     let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
     let (reply_tx, mut reply_rx) = mpsc::channel::<UdpRelayResponse>(256);
 
@@ -952,7 +1043,8 @@ async fn handle_udp_associate(
     let wake_tx_rd = wake_tx.clone();
 
     // Задача «клиент → VPN».
-    let mut read_task = tokio::spawn(async move {
+    let mut tasks = tokio::task::JoinSet::new();
+    tasks.spawn(async move {
         let mut buf = vec![0u8; 65535];
         let mut dns_cache: HashMap<(String, u16), SocketAddr> = HashMap::new();
         loop {
@@ -1055,7 +1147,7 @@ async fn handle_udp_associate(
     // Задача «VPN → клиент».
     let close_flag_wr = Arc::clone(&close_flag);
     let client_addr_wr = Arc::clone(&client_addr);
-    let mut write_task = tokio::spawn(async move {
+    tasks.spawn(async move {
         while let Some(response) = reply_rx.recv().await {
             if close_flag_wr.load(Ordering::Relaxed) {
                 break;
@@ -1092,7 +1184,7 @@ async fn handle_udp_associate(
     // Слушаем TCP-канал управления: закрытие клиентом → завершаем UDP ASSOCIATE (RFC 1928 §6).
     let mut ctrl_stream = session.stream;
     let mut ctrl_buf = [0u8; 1];
-    let mut ctrl_task = tokio::spawn(async move {
+    tasks.spawn(async move {
         loop {
             match ctrl_stream.read(&mut ctrl_buf).await {
                 Ok(0) | Err(_) => break,
@@ -1101,20 +1193,14 @@ async fn handle_udp_associate(
         }
     });
 
-    tokio::select! {
-        _ = &mut read_task => {}
-        _ = &mut write_task => {}
-        _ = &mut ctrl_task => {}
-    }
+    let _ = tasks.join_next().await;
 
     close_flag.store(true, Ordering::Relaxed);
     // Abort the sibling tasks. read_task in particular blocks on the relay
     // UDP socket's recv_from() and only checks close_flag at the top of its
     // loop, so without an explicit abort it would stay parked — leaking the
     // relay socket fd and the task — until a stray datagram happened to arrive.
-    read_task.abort();
-    write_task.abort();
-    ctrl_task.abort();
+    tasks.abort_all();
 }
 
 #[cfg(test)]
@@ -1122,6 +1208,169 @@ mod tests {
     use super::*;
     use std::sync::atomic::AtomicBool;
     use tokio::net::UdpSocket;
+
+    async fn mock_connect() -> (tokio::net::TcpStream, tokio::task::JoinHandle<()>, NewConn) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut peer = tokio::net::TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (stream, _) = listener.accept().await.unwrap();
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let (udp_tx, _udp_rx) = std::sync::mpsc::sync_channel(1);
+        let (wake_tx, _wake_rx) = std::sync::mpsc::sync_channel(1024);
+        let task = tokio::spawn(handle_connect(
+            Socks5Session::new(stream),
+            tx,
+            udp_tx,
+            wake_tx,
+            TargetAddr::Ip("192.0.2.1:80".parse().unwrap()),
+        ));
+        let nc = tokio::task::spawn_blocking(move || rx.recv().unwrap())
+            .await
+            .unwrap();
+        nc.ready_tx.send(true).unwrap();
+        let mut reply = [0; 10];
+        peer.read_exact(&mut reply).await.unwrap();
+        (peer, task, nc)
+    }
+
+    #[tokio::test]
+    async fn socks_parent_abort_closes_idle_socket() {
+        let (mut peer, task, _nc) = mock_connect().await;
+        task.abort();
+        let _ = task.await;
+        let mut buf = [0; 1];
+        assert_eq!(
+            tokio::time::timeout(Duration::from_millis(100), peer.read(&mut buf))
+                .await
+                .unwrap()
+                .unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn udp_parent_abort_releases_relay_socket() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut peer = tokio::net::TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (stream, _) = listener.accept().await.unwrap();
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let (wake, _wake_rx) = std::sync::mpsc::sync_channel(16);
+        let task = tokio::spawn(handle_udp_associate(
+            Socks5Session::new(stream),
+            tx,
+            wake,
+            "127.0.0.1".parse().unwrap(),
+        ));
+        let command = tokio::task::spawn_blocking(move || rx.recv().unwrap())
+            .await
+            .unwrap();
+        let UdpStackCommand::CreateAssoc(assoc) = command else {
+            panic!("expected association")
+        };
+        assoc.ready_tx.send(true).unwrap();
+        let mut reply = [0; 10];
+        peer.read_exact(&mut reply).await.unwrap();
+        task.abort();
+        let _ = task.await;
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+        let rebound = UdpSocket::bind((Ipv4Addr::LOCALHOST, assoc.relay_port)).await;
+        assert!(
+            rebound.is_ok(),
+            "cancelled association kept its relay socket open"
+        );
+    }
+
+    #[tokio::test]
+    async fn socks_half_close_does_not_abort_upstream() {
+        let (mut peer, task, nc) = mock_connect().await;
+        peer.shutdown().await.unwrap();
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+        let aborted = nc.close_flag.load(Ordering::Relaxed);
+        nc.outbound_tx.send(b"reply".to_vec()).await.unwrap();
+        let mut reply = [0; 5];
+        tokio::time::timeout(Duration::from_millis(100), peer.read_exact(&mut reply))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&reply, b"reply");
+        task.abort();
+        let _ = task.await;
+        assert!(!aborted, "SHUT_WR must allow the upstream reply");
+    }
+
+    #[tokio::test]
+    async fn reassigned_proxy_ip_is_used_by_tcp_syn() {
+        let (tx, mut rx) = mpsc::channel(32);
+        let proxy = spawn_proxy(
+            ProxyConfig {
+                listen_addr: "127.0.0.1:0".parse().unwrap(),
+                vpn_ip: Ipv4Addr::new(10, 0, 0, 2),
+                gateway_ip: Ipv4Addr::new(10, 0, 0, 1),
+                prefix_len: 24,
+                dns_servers: vec![Ipv4Addr::new(1, 1, 1, 1)],
+            },
+            tx,
+        )
+        .await
+        .unwrap();
+        proxy
+            .update_network(Ipv4Addr::new(10, 0, 0, 3), Ipv4Addr::new(10, 0, 0, 1), 24)
+            .await
+            .unwrap();
+        let mut peer = tokio::net::TcpStream::connect(proxy.listen_addr)
+            .await
+            .unwrap();
+        peer.write_all(&[5, 1, 0]).await.unwrap();
+        let mut greeting = [0; 2];
+        peer.read_exact(&mut greeting).await.unwrap();
+        peer.write_all(&[5, 1, 0, 1, 192, 0, 2, 1, 0, 80])
+            .await
+            .unwrap();
+        let packet = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        drop(proxy);
+        assert_eq!(&packet[12..16], &[10, 0, 0, 3]);
+    }
+
+    #[test]
+    fn cancelled_pending_connect_is_removed_before_ready() {
+        let q = Arc::new(Mutex::new(VecDeque::new()));
+        let mut dev = VpnDevice::new(q.clone(), q, PROXY_MTU);
+        let mut iface = Interface::new(Config::new(HardwareAddress::Ip), &mut dev, smoltcp_now());
+        iface.update_ip_addrs(|ips| {
+            ips.push(IpCidr::new(IpAddress::v4(10, 0, 0, 2), 24))
+                .unwrap();
+        });
+        let mut socket = TcpSocket::new(
+            TcpSocketBuffer::new(vec![0; 1024]),
+            TcpSocketBuffer::new(vec![0; 1024]),
+        );
+        socket
+            .connect(iface.context(), (Ipv4Address::new(10, 0, 0, 1), 80), 12345)
+            .unwrap();
+        let mut sockets = SocketSet::new(vec![]);
+        let handle = sockets.add(socket);
+        let (outbound_tx, _rx) = mpsc::channel(1);
+        let (ready_tx, _ready_rx) = std::sync::mpsc::sync_channel(1);
+        let mut conn = ManagedConn {
+            handle,
+            inbound: Arc::new(Mutex::new(VecDeque::new())),
+            outbound_tx,
+            close_flag: Arc::new(AtomicBool::new(true)),
+            write_eof: Arc::new(AtomicBool::new(false)),
+            ready_tx: Some(ready_tx),
+        };
+        assert!(service_tcp_conn(&mut conn, &mut sockets));
+    }
 
     /// Regression guard for the UDP-associate relay leak: a task parked on
     /// `recv_from` holds a clone of the relay socket `Arc`. Dropping its

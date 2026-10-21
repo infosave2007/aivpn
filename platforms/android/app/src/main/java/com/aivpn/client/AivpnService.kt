@@ -792,35 +792,15 @@ class AivpnService : VpnService() {
         }
         if (serverKey.size != 32) throw FatalConfigException("Invalid server key size: ${serverKey.size}")
 
-        // Optional key material: an undecodable value degrades the feature (same as a
-        // wrong-size value already did) instead of crash-looping the whole tunnel.
-        val psk: ByteArray? = snapPsk?.let {
-            val decoded = try {
-                android.util.Base64.decode(it, android.util.Base64.DEFAULT)
-            } catch (e: IllegalArgumentException) {
-                Log.w(TAG, "PSK is not valid base64 — ignoring")
-                null
-            }
-            if (decoded != null && decoded.size == 32) decoded else null
+        // Поврежденный ключ останавливает подключение, а не отключает проверку.
+        fun checkedKey(value: String?, field: String): ByteArray? = try {
+            decodeOptionalKey(value, field)
+        } catch (e: IllegalArgumentException) {
+            throw FatalConfigException(e.message ?: "Invalid optional key")
         }
-        val serverSigningKey: ByteArray? = snapServerSigningKey?.let {
-            val decoded = try {
-                android.util.Base64.decode(it, android.util.Base64.DEFAULT)
-            } catch (e: IllegalArgumentException) {
-                Log.w(TAG, "Server signing key is not valid base64 — ignoring")
-                null
-            }
-            if (decoded != null && decoded.size == 32) decoded else null
-        }
-        val maskOperatorPubkey: ByteArray? = snapMaskOperatorPubkey?.let {
-            val decoded = try {
-                android.util.Base64.decode(it, android.util.Base64.DEFAULT)
-            } catch (e: IllegalArgumentException) {
-                Log.w(TAG, "Mask operator pubkey is not valid base64 — ignoring")
-                null
-            }
-            if (decoded != null && decoded.size == 32) decoded else null
-        }
+        val psk = checkedKey(snapPsk, "p")
+        val serverSigningKey = checkedKey(snapServerSigningKey, "sk")
+        val maskOperatorPubkey = checkedKey(snapMaskOperatorPubkey, "mop")
         // R2 Phase B: Android has no CLI/config-file surface for mask verify mode
         // yet, so always request the same default desktop uses absent an explicit
         // --mask-verify-mode override (warn: log+accept on a bad/missing operator

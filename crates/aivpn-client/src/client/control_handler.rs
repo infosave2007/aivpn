@@ -439,6 +439,14 @@ impl super::AivpnClient {
                     }
                 }
 
+                if !aivpn_common::client_wire::server_hello_matches_connection(
+                    self.ratcheted_server_eph_pub,
+                    &server_eph_pub,
+                ) {
+                    warn!("ServerHello другого узла после завершенного handshake проигнорирован");
+                    return Ok(());
+                }
+
                 if let Some(network_config) = network_config {
                     if let Some(ka) = network_config.keepalive_secs.filter(|&s| s > 0) {
                         // NAT-safe cap (A4, Satellite exempt) + propagation to
@@ -525,6 +533,20 @@ impl super::AivpnClient {
                     #[cfg(target_os = "linux")]
                     self.kernel_install_session();
                 }
+
+                // Initial-пакеты не меняют состояние сервера. Возможности
+                // объявляются только под установленными PFS ключами.
+                let _ = self
+                    .send_control(&ControlPayload::Capabilities {
+                        role: 0,
+                        features: aivpn_common::protocol::CLIENT_PACKET_FEATURES
+                            | if self.adaptive_level.fec_n() > 0 {
+                                aivpn_common::protocol::CLIENT_FEC_ACTIVE
+                            } else {
+                                0
+                            },
+                    })
+                    .await;
 
                 // The following client-identity announcements (mTLS cert,
                 // recording status, device enrollment) only make sense for an
@@ -779,6 +801,11 @@ impl super::AivpnClient {
                 // поднимает локальный туннель еще до ответа сервера. Повторный
                 // ServerHello или ratchet не создают новое событие connected.
                 if !self.ever_connected.swap(true, Ordering::Relaxed) {
+                    if self.config.proxy_listen.is_none() && !self.config.control_only {
+                        if let Some(gate) = &self.dns_proxy_gate {
+                            gate.set_tunnel(self.tunnel.name());
+                        }
+                    }
                     println!("AIVPN-STATUS connected {}", self.config.tun_config.tun_addr);
                 }
             }

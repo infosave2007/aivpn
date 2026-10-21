@@ -8,7 +8,7 @@
 //!
 //! ```text
 //! struct SimpleCert {
-//!     client_pub_key: [u8; 32],  // X25519 client ephemeral key
+//!     client_pub_key: [u8; 32],  // Постоянный X25519 ключ устройства
 //!     expiry_ts:      [u8;  8],  // LE u64 — Unix seconds
 //!     ca_signature:   [u8; 64],  // ed25519 over (client_pub_key || expiry_ts)
 //! }

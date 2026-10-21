@@ -21,9 +21,11 @@ const users = IS_SQLITE ? sqliteUsers : pgUsers
 const { hashPassword } = await import('../src/auth/argon')
 const { authRoute: auth } = await import('../src/routes/auth')
 const { proxyRoute: proxy } = await import('../src/routes/proxy')
+const { eventsRoute: events } = await import('../src/routes/events')
 const { encryptTotpSecret } = await import('../src/auth/totp')
+const { config } = await import('../src/config')
 const { default: speakeasy } = await import('speakeasy')
-const app = new Hono().route('/web/auth', auth).route('/api/v1', proxy)
+const app = new Hono().route('/web/auth', auth).route('/api/v1', proxy).route('/web/events', events)
 const password = randomBytes(24).toString('hex')
 let passwordHash: string
 
@@ -106,4 +108,46 @@ test('одновременное обновление в двух вкладка
   for (const cookie of cookies) {
     expect((await post('/web/auth/refresh', {}, { Cookie: cookie.split(';')[0] })).status).toBe(200)
   }
+})
+
+test('exclusive OIDC блокирует обе локальные passkey точки входа', async () => {
+  const mode = config.OIDC_MODE
+  config.OIDC_MODE = 'exclusive'
+  try {
+    expect((await app.request('/web/auth/passkey/authentication-options')).status).toBe(403)
+    const response = await post('/web/auth/passkey/authenticate', { response: { id: 'existing-key' } })
+    expect(response.status).toBe(403)
+    expect(response.headers.has('set-cookie')).toBe(false)
+  } finally { config.OIDC_MODE = mode }
+})
+
+test('выдача passkey challenge ограничена даже для успешных запросов', async () => {
+  for (let i = 0; i < config.AUTH_RATE_MAX; i++) {
+    expect((await app.request('/web/auth/passkey/authentication-options')).status).toBe(200)
+  }
+  expect((await app.request('/web/auth/passkey/authentication-options')).status).toBe(429)
+})
+
+test('прямой SSE через API не обходит ticket stream policy', async () => {
+  for (const role of ['admin', 'viewer'] as const) {
+    const session = await login(await newUser(role))
+    const response = await app.request('/api/v1/events', { headers: { Authorization: `Bearer ${session.token}` } })
+    expect(response.status).toBe(403)
+  }
+})
+
+test('viewer получает SSE только через одноразовый ticket', async () => {
+  const session = await login(await newUser('viewer'))
+  const headers = { Authorization: `Bearer ${session.token}` }
+  expect((await app.request('/web/events')).status).toBe(401)
+  const minted = await post('/web/events/ticket', {}, headers)
+  expect(minted.status).toBe(200)
+  const { ticket } = await minted.json() as { ticket: string }
+  const response = await app.request(`/web/events?ticket=${encodeURIComponent(ticket)}`)
+  expect(response.status).toBe(200)
+  expect(response.headers.get('content-type')).toBe('text/event-stream')
+  // Unix socket в fixture отсутствует, но разрешенный stream должен отдать событие.
+  expect(await response.text()).toContain('event: state')
+  expect((await app.request(`/web/events?ticket=${encodeURIComponent(ticket)}`)).status).toBe(401)
+  expect((await post('/api/v1/clients', {}, headers)).status).toBe(403)
 })

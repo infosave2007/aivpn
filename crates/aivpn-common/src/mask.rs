@@ -1229,11 +1229,15 @@ impl IATDistribution {
         // jitter range; gen_range panics on those, so fall back to no jitter.
         let (lo, hi) = self.jitter_range_ms;
         let jitter = if lo.is_finite() && hi.is_finite() && lo <= hi {
+            // Ограничиваем и ширину диапазона: конечные края еще не гарантируют
+            // конечную разность внутри генератора случайного числа.
+            let lo = lo.clamp(-MAX_BASE_IAT_MS, MAX_BASE_IAT_MS);
+            let hi = hi.clamp(-MAX_BASE_IAT_MS, MAX_BASE_IAT_MS);
             rng.gen_range(lo..=hi)
         } else {
             0.0
         };
-        (base_iat + jitter).max(0.0)
+        (base_iat + jitter).clamp(0.0, MAX_BASE_IAT_MS)
     }
 }
 
@@ -2130,6 +2134,26 @@ mod tests {
     use super::*;
     use rand::rngs::StdRng;
     use rand::SeedableRng;
+
+    #[test]
+    fn protocol_audit_iat_bounds_include_jitter() {
+        let mut rng = StdRng::seed_from_u64(42);
+        for jitter_range_ms in [(1e30, 1e30), (-f64::MAX, f64::MAX), (f64::MAX, f64::MAX)] {
+            let distribution = IATDistribution {
+                dist_type: IATDistType::Empirical,
+                params: vec![MAX_BASE_IAT_MS],
+                jitter_range_ms,
+            };
+            for _ in 0..32 {
+                let sample = distribution.sample(&mut rng);
+                assert!(
+                    sample.is_finite() && (0.0..=MAX_BASE_IAT_MS).contains(&sample),
+                    "{sample}"
+                );
+                let _ = std::time::Duration::from_secs_f64(sample / 1000.0);
+            }
+        }
+    }
 
     #[test]
     fn size_iat_joint_reproduces_correlation() {

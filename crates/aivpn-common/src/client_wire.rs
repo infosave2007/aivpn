@@ -1,10 +1,12 @@
 use rand::RngCore;
 use subtle::ConstantTimeEq;
 
+#[cfg(test)]
+use crate::crypto::encrypt_payload;
 use crate::crypto::{
-    self, compute_time_window, current_timestamp_ms, decrypt_payload, derive_session_keys,
-    encrypt_payload, generate_resonance_tag, KeyPair, SessionKeys, DEFAULT_WINDOW_MS, NONCE_SIZE,
-    TAG_SIZE,
+    self, compute_time_window, current_timestamp_ms, decrypt_session_payload, derive_session_keys,
+    encrypt_session_payload, generate_resonance_tag, KeyPair, PacketDirection, SessionKeys,
+    DEFAULT_WINDOW_MS, NONCE_SIZE, TAG_SIZE,
 };
 use crate::error::{Error, Result};
 use crate::protocol::{ControlPayload, InnerHeader, InnerType};
@@ -19,6 +21,12 @@ pub struct DecodedPacket {
     pub counter: u64,
     pub header: InnerHeader,
     pub payload: Vec<u8>,
+}
+
+/// Первый ServerHello закрепляет серверную ephemeral-пару до reconnect.
+/// Поздний ответ другого узла не является новым событием ratchet.
+pub fn server_hello_matches_connection(pinned: Option<[u8; 32]>, received: &[u8; 32]) -> bool {
+    pinned.is_none_or(|expected| expected == *received)
 }
 
 const RECV_REORDER_WINDOW: usize = 256;
@@ -322,12 +330,18 @@ fn build_mdh_packet_core(
     rand::thread_rng().fill_bytes(&mut plaintext[2 + inner.len()..]);
 
     let current_counter = *counter;
-    *counter += 1;
-
-    let nonce = counter_to_nonce(current_counter);
-    let ciphertext = encrypt_payload(&keys.session_key, &nonce, &plaintext)?;
+    *counter = current_counter
+        .checked_add(1)
+        .ok_or_else(|| Error::Crypto("Счетчик отправки исчерпан".into()))?;
     let time_window = compute_time_window(current_timestamp_ms(), DEFAULT_WINDOW_MS);
     let tag = generate_resonance_tag(&keys.tag_secret, current_counter, time_window);
+    let ciphertext = encrypt_session_payload(
+        keys,
+        PacketDirection::ClientToServer,
+        current_counter,
+        &tag,
+        &plaintext,
+    )?;
 
     // Generate the MDH bytes. With a header-spec'd mask, shape the MDH as that
     // protocol's real header (STUN magic cookie, QUIC long header, …); without
@@ -472,15 +486,20 @@ pub fn decode_packet_with_layout(
         .find_counter(&tag, keys)
         .ok_or(Error::InvalidPacket("Invalid resonance tag"))?;
 
-    let nonce = counter_to_nonce(counter);
     let ciphertext = &packet[ct_start..];
     // This decode path is the CLIENT's downlink receive (server→client packets),
     // so it decrypts with the S2C key. The server never uses decode_packet_*; it
     // decrypts client uplink with `session_key` (C2S) directly in the gateway.
-    let padded = decrypt_payload(&keys.session_key_s2c, &nonce, ciphertext)?;
+    let padded = decrypt_session_payload(
+        keys,
+        PacketDirection::ServerToClient,
+        counter,
+        &tag,
+        ciphertext,
+    )?;
+    let decoded = parse_downlink_inner(counter, &padded)?;
     recv_window.mark(counter);
-
-    parse_downlink_inner(counter, &padded)
+    Ok(decoded)
 }
 
 /// Strip the `pad_len(LE u16) || inner_header || payload || random_padding`
@@ -601,7 +620,6 @@ fn decode_downlink_one_layout(
     let counter = recv_window
         .find_counter(&tag, keys)
         .ok_or(Error::InvalidPacket("Invalid resonance tag"))?;
-    let nonce = counter_to_nonce(counter);
 
     // Fast path: try every MDH length we have already learned.
     let mut tried_any = false;
@@ -614,7 +632,13 @@ fn decode_downlink_one_layout(
             continue;
         }
         tried_any = true;
-        if let Ok(padded) = decrypt_payload(&keys.session_key_s2c, &nonce, &packet[ct_start..]) {
+        if let Ok(padded) = decrypt_session_payload(
+            keys,
+            PacketDirection::ServerToClient,
+            counter,
+            &tag,
+            &packet[ct_start..],
+        ) {
             // Only advance the anti-replay window once we have a packet that
             // both authenticates and frames cleanly — a candidate that decrypts
             // but fails inner parsing must not consume the counter.
@@ -648,7 +672,13 @@ fn decode_downlink_one_layout(
         if packet.len() < ct_start + 16 {
             continue;
         }
-        if let Ok(padded) = decrypt_payload(&keys.session_key_s2c, &nonce, &packet[ct_start..]) {
+        if let Ok(padded) = decrypt_session_payload(
+            keys,
+            PacketDirection::ServerToClient,
+            counter,
+            &tag,
+            &packet[ct_start..],
+        ) {
             if let Ok(decoded) = parse_downlink_inner(counter, &padded) {
                 recv_window.mark(counter);
                 // Learn it: front = most-likely-next for the fast path.
@@ -779,6 +809,140 @@ mod tag_layout_tests {
         KeyPair, DEFAULT_WINDOW_MS,
     };
     use crate::protocol::InnerType;
+
+    #[test]
+    fn initial_v2_builder_carries_nonce_after_ephemeral_slot() {
+        let client = KeyPair::generate();
+        let server = KeyPair::generate();
+        let dh = client.compute_shared(&server.public_key_bytes()).unwrap();
+        let keys = crypto::derive_initial_session_keys(&dh, None, &client.public_key_bytes());
+        let mask = crate::mask::preset_masks::bootstrap_default();
+        let obf = obfuscate_client_eph_pub(&client, &server.public_key_bytes());
+        let inner = build_inner_packet(InnerType::Control, 0, &[3; 8]);
+        let packet = build_shaped_mdh_packet(&keys, &mut 0, &inner, Some(&obf), 20, &mask).unwrap();
+        let prefix = if mask.tag_offset == u16::MAX { 8 } else { 0 };
+        assert_eq!(&packet[prefix + 20..prefix + 52], &obf);
+        assert!(packet.len() >= prefix + 20 + 32 + 24 + 16 + 2 + inner.len() + 8);
+    }
+
+    #[test]
+    fn pinned_server_hello_rejects_another_node() {
+        assert!(server_hello_matches_connection(None, &[3; 32]));
+        assert!(server_hello_matches_connection(Some([3; 32]), &[3; 32]));
+        assert!(!server_hello_matches_connection(Some([3; 32]), &[4; 32]));
+    }
+
+    fn initial_downlink_fixture(keys: &SessionKeys, mdh_len: usize, tag_offset: u16) -> Vec<u8> {
+        let tag = generate_resonance_tag(
+            &keys.tag_secret,
+            0,
+            compute_time_window(current_timestamp_ms(), DEFAULT_WINDOW_MS),
+        );
+        let mut plain = vec![0, 0];
+        plain.extend(build_inner_packet(InnerType::Control, 7, b"hello-v2"));
+        let envelope =
+            crypto::encrypt_session_payload(keys, PacketDirection::ServerToClient, 0, &tag, &plain)
+                .unwrap();
+        let prefix = if tag_offset == u16::MAX { 8 } else { 0 };
+        let tag_start = if tag_offset == u16::MAX {
+            0
+        } else {
+            tag_offset as usize
+        };
+        let mut packet = vec![0; prefix + mdh_len];
+        packet[tag_start..tag_start + 8].copy_from_slice(&tag);
+        packet.extend(envelope);
+        packet
+    }
+
+    #[test]
+    fn initial_v2_downlink_discovers_layout_and_rejects_modified_nonce() {
+        let keys = crypto::derive_initial_session_keys(&[7; 32], Some(&[8; 32]), &[9; 32]);
+        for (mdh_len, tag_offset) in [(20, u16::MAX), (48, 27)] {
+            let packet = initial_downlink_fixture(&keys, mdh_len, tag_offset);
+            let prefix = if tag_offset == u16::MAX { 8 } else { 0 };
+            let mut changed_nonce = packet.clone();
+            changed_nonce[prefix + mdh_len] ^= 1;
+            let mut window = RecvWindow::new();
+            let mut lengths = vec![12];
+            assert!(decode_downlink_with_offsets(
+                &changed_nonce,
+                &keys,
+                &mut window,
+                &mut lengths,
+                &[tag_offset],
+            )
+            .is_err());
+            assert_eq!(window.highest(), None);
+            let decoded = decode_downlink_with_offsets(
+                &packet,
+                &keys,
+                &mut window,
+                &mut lengths,
+                &[tag_offset],
+            )
+            .unwrap();
+            assert_eq!(decoded.payload, b"hello-v2");
+            assert_eq!(decoded.header.seq_num, 7);
+            assert!(decode_downlink_with_offsets(
+                &packet,
+                &keys,
+                &mut window,
+                &mut lengths,
+                &[tag_offset],
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn initial_v2_ciphertext_cannot_be_retagged_to_another_counter() {
+        let keys = crypto::derive_initial_session_keys(&[7; 32], Some(&[8; 32]), &[9; 32]);
+        let original = initial_downlink_fixture(&keys, 20, u16::MAX);
+        let mut retagged = original.clone();
+        let tag = generate_resonance_tag(
+            &keys.tag_secret,
+            1,
+            compute_time_window(current_timestamp_ms(), DEFAULT_WINDOW_MS),
+        );
+        retagged[..8].copy_from_slice(&tag);
+        let mut window = RecvWindow::new();
+        assert!(decode_packet_with_mdh_len(&retagged, &keys, &mut window, 20).is_err());
+        assert_eq!(window.highest(), None);
+        assert_eq!(
+            decode_packet_with_mdh_len(&original, &keys, &mut window, 20)
+                .unwrap()
+                .counter,
+            0
+        );
+    }
+
+    #[test]
+    fn initial_v2_decoder_does_not_fallback_to_counter_nonce_cipher() {
+        let keys = crypto::derive_initial_session_keys(&[7; 32], Some(&[8; 32]), &[9; 32]);
+        let tag = generate_resonance_tag(
+            &keys.tag_secret,
+            0,
+            compute_time_window(current_timestamp_ms(), DEFAULT_WINDOW_MS),
+        );
+        let mut plain = vec![0, 0];
+        plain.extend(build_inner_packet(InnerType::Control, 7, b"old-cipher"));
+        let old_ciphertext =
+            encrypt_payload(&keys.session_key_s2c, &counter_to_nonce(0), &plain).unwrap();
+        let mut packet = tag.to_vec();
+        packet.extend([0; 20]);
+        packet.extend(old_ciphertext);
+        let mut window = RecvWindow::new();
+        assert!(decode_downlink_with_offsets(
+            &packet,
+            &keys,
+            &mut window,
+            &mut vec![20],
+            &[u16::MAX]
+        )
+        .is_err());
+        assert_eq!(window.highest(), None);
+    }
 
     fn test_keys() -> SessionKeys {
         let client_kp = KeyPair::generate();
@@ -1195,15 +1359,25 @@ mod server_hello_signature_tests {
         let encoded = hello.encode().unwrap();
         let inner = build_inner_packet(InnerType::Control, 0, &encoded);
 
-        let mut send_counter = 0u64;
-        let packet = build_random_mdh_packet(
-            initial_keys,
-            &mut send_counter,
-            &inner,
-            None,
-            DEFAULT_MDH_LEN,
-        )
-        .unwrap();
+        let tag = generate_resonance_tag(
+            &initial_keys.tag_secret,
+            0,
+            compute_time_window(current_timestamp_ms(), DEFAULT_WINDOW_MS),
+        );
+        let mut plain = vec![0, 0];
+        plain.extend(inner);
+        let mut packet = tag.to_vec();
+        packet.extend([0; DEFAULT_MDH_LEN]);
+        packet.extend(
+            crypto::encrypt_session_payload(
+                initial_keys,
+                PacketDirection::ServerToClient,
+                0,
+                &tag,
+                &plain,
+            )
+            .unwrap(),
+        );
         (server_eph_pub, packet)
     }
 
@@ -1213,11 +1387,8 @@ mod server_hello_signature_tests {
         let dh1 = client_kp
             .compute_shared(&server_static_kp.public_key_bytes())
             .unwrap();
-        let mut initial_keys = derive_session_keys(&dh1, None, &client_kp.public_key_bytes());
-        // ServerHello is server→client (S2C), but this test builds it with the
-        // C2S encode path; equalise so the format round-trips (directional
-        // separation is covered by `directional_keys_differ` + live tunnel).
-        initial_keys.session_key_s2c = initial_keys.session_key;
+        let initial_keys =
+            crypto::derive_initial_session_keys(&dh1, None, &client_kp.public_key_bytes());
         (client_kp, initial_keys)
     }
 

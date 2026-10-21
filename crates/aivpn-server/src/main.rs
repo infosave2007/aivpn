@@ -118,6 +118,19 @@ async fn main() {
         return;
     }
 
+    // Восстановление не загружает поврежденные config/DB и не держит shared owner.
+    if let Some(ref archive_path) = args.import {
+        cli::backup::handle_import(archive_path, args.dry_run, &args);
+        return;
+    }
+
+    // Config, маски и DB читаются только после завершения offline restore.
+    let _runtime_owner = aivpn_server::client_db::LiveDbGuard::shared(Path::new(&args.clients_db))
+        .unwrap_or_else(|error| {
+            eprintln!("Не удалось получить блокировку серверных файлов: {error}");
+            std::process::exit(1);
+        });
+
     let config_path = config_resolve::resolve_config_path(&args);
     let file_config = config_resolve::load_server_file_config(config_path.as_deref());
     let effective_tun_mtu: u16 = match file_config.as_ref().and_then(|c| c.tun_mtu.as_ref()) {
@@ -206,10 +219,6 @@ async fn main() {
     }
     if let Some(ref output_path) = args.export.clone() {
         cli::backup::handle_export(&args, output_path);
-        return;
-    }
-    if let Some(ref archive_path) = args.import.clone() {
-        cli::backup::handle_import(archive_path, args.dry_run, &args);
         return;
     }
     if let Some(ref name_or_id) = args.set_client_qos.clone() {

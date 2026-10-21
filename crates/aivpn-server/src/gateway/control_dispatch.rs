@@ -331,7 +331,9 @@ impl super::Gateway {
                 let session_id = session.lock().session_id;
                 self.session_manager
                     .cleanup_masked_peer_identity(&node_id, &session_id);
-                self.send_reverse_node_enrollment(session).await;
+                if !session.lock().is_removed() {
+                    self.send_reverse_node_enrollment(session).await;
+                }
             }
         } else {
             debug!(
@@ -1088,6 +1090,33 @@ impl super::Gateway {
             self.send_server_hello(session, client_addr).await?;
             return Ok(());
         }
+        let (expired, retry) = {
+            let mut sess = session.lock();
+            let pending = sess.client_id.is_some() && !sess.client_admitted;
+            let now = Instant::now();
+            let expired = pending && now.duration_since(sess.created_at) >= Duration::from_secs(60);
+            let retry = pending
+                && !expired
+                && sess
+                    .authentication_retry_at
+                    .is_none_or(|last| now.duration_since(last) >= Duration::from_secs(1));
+            if retry {
+                sess.authentication_retry_at = Some(now);
+            }
+            (expired, retry)
+        };
+        if expired {
+            let _ = self
+                .send_control_message(&ControlPayload::Shutdown { reason: 3 }, session)
+                .await;
+            let sid = session.lock().session_id;
+            self.session_manager.remove_session(&sid);
+            return Ok(());
+        }
+        if retry {
+            // Hello с тем же ephemeral не меняет ключи, но просит повторить proof/cert.
+            self.send_server_hello(session, client_addr).await?;
+        }
         // Echo the client's own send_ts so it can measure RTT without
         // clock-skew between client and server.
         self.send_control_message(&ControlPayload::KeepaliveAck { echo_ts: send_ts }, session)
@@ -1108,23 +1137,16 @@ impl super::Gateway {
                 Err(e) => debug!("MaskCatalog send failed: {}", e),
             }
         }
-        // P1.2: announce this session's server-assigned management
-        // role once, so the client knows whether to surface
-        // admin/viewer management UI. Gated exactly like the
-        // MaskCatalog push above — post-ratchet Keepalive only
-        // (guarded at the top of this arm), send-once via
-        // `capabilities_sent`, self-healing if the send is lost
-        // (retried on the next Keepalive).
-        if !session.lock().capabilities_sent {
-            let role = self.session_role(session);
-            let caps = ControlPayload::Capabilities {
-                role: role.as_u8(),
-                features: 0,
-            };
-            match self.send_control_message(&caps, session).await {
-                Ok(()) => session.lock().capabilities_sent = true,
-                Err(e) => debug!("Capabilities send failed: {}", e),
-            }
+        // UDP send_to не подтверждает доставку. Повторяем роль на keepalive,
+        // чтобы потерянный ответ и изменение прав не оставляли GUI со старой ролью.
+        let role = self.session_role(session);
+        let caps = ControlPayload::Capabilities {
+            role: role.as_u8(),
+            features: 0,
+        };
+        match self.send_control_message(&caps, session).await {
+            Ok(()) => session.lock().capabilities_sent = true,
+            Err(e) => debug!("Capabilities send failed: {}", e),
         }
         Ok(())
     }
@@ -1141,7 +1163,7 @@ impl super::Gateway {
         dh_proof: [u8; 32],
     ) -> Result<()> {
         let client_id = { session.lock().client_id.clone() };
-        if let (Some(ref db), Some(ref cid)) = (&self.client_db, &client_id) {
+        {
             // Verify the session-bound proof: dh_shared =
             // X25519(server_static_priv, client_static_pub) ==
             // client's X25519(static_priv, server_static_pub) (X25519
@@ -1179,7 +1201,7 @@ impl super::Gateway {
                 self.audit_log.log(
                     AuditActor::System,
                     "device_enrollment_rejected",
-                    cid,
+                    client_id.as_deref().unwrap_or("unbound"),
                     "denied",
                 );
                 let shutdown = ControlPayload::Shutdown { reason: 3 };
@@ -1188,33 +1210,56 @@ impl super::Gateway {
                 self.session_manager.remove_session(&session_id);
                 return Ok(());
             }
-            match db.enroll_device(cid, &static_pub) {
-                Ok(true) => info!("Device enrolled and bound for client {}", cid),
-                Ok(false) => debug!("Device binding verified for client {}", cid),
-                Err(e) => {
-                    // 3f: one-time key already used — a DIFFERENT
-                    // device already bound this one_time credential.
-                    // The session is already tag-validated/AEAD
-                    // established (this is a decrypted, authenticated
-                    // in-session control message), so PSK possession
-                    // is proven — send the specific, authenticated
-                    // HandshakeReject{reason:1} instead of the
-                    // generic Shutdown so the client can show why and
-                    // stop retrying.
-                    warn!("Device binding mismatch for {}: {}", cid, e);
-                    self.audit_log.log(
-                        AuditActor::System,
-                        "device_binding_mismatch",
-                        cid,
-                        "denied",
-                    );
-                    let reject = ControlPayload::HandshakeReject { reason: 1 };
-                    let _ = self.send_control_message(&reject, session).await;
-                    let session_id = session.lock().session_id;
-                    self.session_manager.remove_session(&session_id);
+            if session
+                .lock()
+                .verified_device_pub
+                .is_some_and(|key| key != static_pub)
+            {
+                let session_id = session.lock().session_id;
+                self.session_manager.remove_session(&session_id);
+                return Ok(());
+            }
+            if let (Some(db), Some(cid)) = (&self.client_db, &client_id) {
+                match db.enroll_device(cid, &static_pub) {
+                    Ok(true) => info!("Device enrolled and bound for client {}", cid),
+                    Ok(false) => debug!("Device binding verified for client {}", cid),
+                    Err(e) => {
+                        // 3f: one-time key already used — a DIFFERENT
+                        // device already bound this one_time credential.
+                        // The session is already tag-validated/AEAD
+                        // established (this is a decrypted, authenticated
+                        // in-session control message), so PSK possession
+                        // is proven — send the specific, authenticated
+                        // HandshakeReject{reason:1} instead of the
+                        // generic Shutdown so the client can show why and
+                        // stop retrying.
+                        warn!("Device binding mismatch for {}: {}", cid, e);
+                        self.audit_log.log(
+                            AuditActor::System,
+                            "device_binding_mismatch",
+                            cid,
+                            "denied",
+                        );
+                        let reject = ControlPayload::HandshakeReject { reason: 1 };
+                        let _ = self.send_control_message(&reject, session).await;
+                        let session_id = session.lock().session_id;
+                        self.session_manager.remove_session(&session_id);
+                        return Ok(());
+                    }
                 }
             }
+            let mut sess = session.lock();
+            if !sess.record_verified_device(static_pub) {
+                let session_id = sess.session_id;
+                drop(sess);
+                self.session_manager.remove_session(&session_id);
+                return Ok(());
+            }
+            self.refresh_mtls_gate(&mut sess);
+            sess.capabilities_sent = false;
+            self.refresh_kernel_session(&mut sess);
         }
+        self.finish_client_admission(session).await;
         Ok(())
     }
 
@@ -1426,13 +1471,18 @@ impl super::Gateway {
                     let sess = session.lock();
                     (
                         sess.mask.as_ref().map(|m| m.mask_id.clone()),
-                        sess.session_id,
+                        sess.client_id.as_ref().map(|id| {
+                            let mut hash = blake3::Hasher::new();
+                            hash.update(b"aivpn-telemetry-reporter\0");
+                            hash.update(id.as_bytes());
+                            let mut reporter = [0; 16];
+                            reporter.copy_from_slice(&hash.finalize().as_bytes()[..16]);
+                            reporter
+                        }),
                     )
                 };
-                if let Some(ref mid) = mask_id {
-                    // Pass the authenticated session id as the reporter so the
-                    // anomaly detector can require multi-reporter corroboration
-                    // before believing a client-reported compromise (anti-DoS).
+                if let (Some(ref mid), Some(reporter)) = (mask_id, reporter) {
+                    // Переподключение не создает нового независимого наблюдателя.
                     self.neural_module.lock().record_telemetry(
                         mid,
                         reporter,
@@ -1654,14 +1704,25 @@ impl super::Gateway {
             }
             ControlPayload::ClientCert { cert_bytes } => {
                 if let Some(ref mtls_cfg) = self.config.mtls {
-                    let session_eph_pub = session.lock().eph_pub;
-                    let ok = crate::mtls::SimpleCert::from_bytes(&cert_bytes)
-                        .map(|c| {
-                            c.client_pub_key == session_eph_pub
-                                && crate::mtls::verify_cert(&c, mtls_cfg)
-                        })
-                        .unwrap_or(false);
-                    session.lock().mtls_ok = ok;
+                    let cert = crate::mtls::SimpleCert::from_bytes(&cert_bytes)
+                        .filter(|cert| crate::mtls::verify_cert(cert, mtls_cfg));
+                    let ok = {
+                        let mut sess = session.lock();
+                        let ok = cert.as_ref().is_some_and(|cert| {
+                            sess.verified_device_pub
+                                .is_none_or(|key| key == cert.client_pub_key)
+                        });
+                        if ok {
+                            sess.record_mtls_cert(cert.unwrap());
+                        } else {
+                            sess.mtls_cert = None;
+                        }
+                        self.refresh_mtls_gate(&mut sess);
+                        sess.capabilities_sent = false;
+                        self.refresh_kernel_session(&mut sess);
+                        ok
+                    };
+                    self.finish_client_admission(session).await;
                     if ok {
                         debug!("mtls: client {} cert accepted", hash_addr(&client_addr));
                         self.audit_log.log(

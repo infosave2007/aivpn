@@ -16,7 +16,7 @@ AIVPN is a UDP-based VPN system that combines standard tunnel encryption with **
 
 Key technical properties:
 
-- **Zero-RTT data start** — encrypted payload can flow in the first packet; no mandatory handshake round-trip.
+- **InitialV2 и PFS** - начальный обмен подтверждает свежий ключ сервера; данные и управляющие команды передаются только после PFS. Для привязанных и привилегированных устройств также нужно доказательство постоянного ключа, при обязательном mTLS - действующий сертификат.
 - **O(1) session lookup** — no session ID is transmitted in the clear. Every packet carries an 8-byte *resonance tag* derived from a timestamp and a per-session secret. The server resolves the session in constant time via a `DashMap`.
 - **Perfect Forward Secrecy** — in-flight session key rotation via X25519 ratchet. Compromising the server key does not expose past traffic.
 - **Neural Resonance module** — per-mask micro-MLP (~66 KB) monitors live traffic statistics; high reconstruction error triggers automatic mask rotation without disconnecting clients.
@@ -64,6 +64,12 @@ deploy/ci/               — CI gates run by the Makefile (see `make help`)
 | `client.rs` | `aivpn-client` | State machine: Unprovisioned → Connecting → Connected, key exchange, reconnection |
 | `tunnel.rs` | `aivpn-client` | Cross-platform TUN: `/dev/net/tun` (Linux), `utun` (macOS), Wintun (Windows) |
 | `mimicry.rs` | `aivpn-client` | `MimicryEngine` — applies `MaskProfile` to outbound packets |
+
+### Совместимость начального обмена и ускорителя
+
+В готовящейся версии 1.2.0 начальный обмен переведен на InitialV2. Он несовместим с выпущенной 1.1.0 и прежними dev-сборками 1.2.0. Обновляйте согласованно серверы, узлы pool/site/chain и все клиенты, в том числе встроенные мобильные ядра. Формат ключа подключения и протокол управляющих сообщений между серверами не меняются. Начальный AEAD использует XChaCha20-Poly1305, случайный nonce24 и контекст соединения в AAD; установленный канал сохраняет прежний формат ChaCha20-Poly1305 и kernel ABI 7.
+
+Модуль Linux требует совместимых Rust-for-Linux API, kernel headers с `CONFIG_RUST=y` и соответствующего им Rust toolchain. Номер ядра сам по себе не гарантирует поддержку. До регистрации `/dev/aivpn` модуль проверяет `file_operations.owner` в настоящей miscdevice vtable и отказывает с `ENODEV`, если API не закрепляет код модуля за открытым дескриптором. Обходить эту проверку нельзя; без ускорителя используется userspace TUN.
 
 ### Pool sync
 
@@ -757,7 +763,7 @@ aivpn-client ssh-install run --host vpn.example.com --fingerprint "SHA256:..." \
 
 `ssh-install run` authenticates with exactly one of `--password-env`/`--password-stdin`/`--key-file` (never a raw `--password` argument — argv is visible via `/proc/<pid>/cmdline`), and accepts `--binary-file`/`--binary-url` to control which `aivpn-server` build gets installed, plus `--mode systemd|docker` and pass-through `--extra-arg` tokens forwarded to `install-server.sh`.
 
-Native clients originally also shipped a dedicated **migration wizard** (export the current server via `/api/v1/backup/export`, install a fresh server, import via `/api/v1/backup/import`) alongside the install wizard, but it was intentionally dropped from all 5 (Linux, Windows, macOS, Android, iOS) to avoid five near-duplicate implementations of the same export/import flow. Server migration is now a **web-panel-only** capability, driven from the existing Backup page (which already talks to the same `/api/v1/backup/export`/`/api/v1/backup/import` routes) — native clients keep only the install wizard above.
+В web-панели страница Backup экспортирует резервную копию и проверяет загруженный архив без изменения файлов (`POST /api/v1/backup/import?dry_run=true`). Восстановление выполняется только offline через CLI: остановите сервер и все процессы, использующие ту же базу, затем выполните `aivpn-server --import /path/backup.bin --config /path/server.json --clients-db /path/clients.json --mask-dir /path/masks`. Укажите реальные пути файлов и каталога масок. После успешного импорта запустите сервис. Работающий процесс с открытой базой блокирует восстановление; HTTP-запрос без `dry_run=true` возвращает 409. Нативные клиенты содержат только мастер установки, не мастер переноса сервера.
 
 CI publishes full-feature (`management-api,metrics,neural`) `aivpn-server` release binaries for both `x86_64` and `aarch64`, each with a `SHA256SUMS` file — matching what `install-server.sh`'s default `--binary-url` (GitHub Releases) fetches and verifies against.
 

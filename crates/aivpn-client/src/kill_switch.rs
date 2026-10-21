@@ -35,6 +35,8 @@ pub struct KillSwitch {
     /// out of the tunnel are the ones allowed out here — nothing broader.
     mark: Option<u32>,
     active: bool,
+    /// Даже прерванная настройка может оставить защитные правила до явного выхода.
+    cleanup_needed: bool,
 }
 
 impl KillSwitch {
@@ -44,6 +46,7 @@ impl KillSwitch {
             server_ip,
             mark: None,
             active: false,
+            cleanup_needed: false,
         }
     }
 
@@ -84,6 +87,7 @@ impl KillSwitch {
         if self.active {
             return Ok(());
         }
+        self.cleanup_needed = true;
         self.activate_impl()?;
         self.active = true;
         info!("Kill-switch activated — non-VPN traffic blocked");
@@ -92,11 +96,12 @@ impl KillSwitch {
 
     /// Remove kill-switch rules (called on graceful disconnect).
     pub fn deactivate(&mut self) {
-        if !self.active {
+        if !self.active && !self.cleanup_needed {
             return;
         }
         self.deactivate_impl();
         self.active = false;
+        self.cleanup_needed = false;
         info!("Kill-switch deactivated");
     }
 
@@ -141,11 +146,7 @@ impl KillSwitch {
                 .map(|s| s.success())
                 .unwrap_or(false);
             if !chain_ok {
-                // Roll back the table so we don't leave a policy-less table behind,
-                // then fail loud instead of reporting "active" with nothing blocked.
-                let _ = Command::new("nft")
-                    .args(["delete", "table", "inet", "aivpn_ks"])
-                    .status();
+                // Не удаляем прежнюю защиту при неудачном reconnect.
                 return Err(Error::Io(io::Error::other(
                     "kill-switch: nft failed to create drop-policy chain",
                 )));
@@ -159,9 +160,16 @@ impl KillSwitch {
             // process could still reach the old server IP unblocked. The drop
             // policy set above is preserved by flushing only the chain's rules
             // (mirrors the iptables path's `-F AIVPN_KS`).
-            let _ = Command::new("nft")
+            let flushed = Command::new("nft")
                 .args(["flush", "chain", "inet", "aivpn_ks", "output"])
-                .status();
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            if !flushed {
+                return Err(Error::Io(io::Error::other(
+                    "kill-switch: cannot clear stale nft rules",
+                )));
+            }
             let ip_family = self.nft_family();
             let mut rules: Vec<Vec<String>> = vec![
                 vec![
@@ -225,9 +233,7 @@ impl KillSwitch {
                     .map(|s| s.success())
                     .unwrap_or(false);
                 if !rule_ok {
-                    let _ = Command::new("nft")
-                        .args(["delete", "table", "inet", "aivpn_ks"])
-                        .status();
+                    // DROP policy остается до следующей попытки или явного выхода.
                     return Err(Error::Io(io::Error::other(
                         "kill-switch: nft failed to add accept rule (tunnel would be blocked)",
                     )));
@@ -236,77 +242,140 @@ impl KillSwitch {
             return Ok(());
         }
 
-        // Fallback: iptables / ip6tables
+        self.activate_iptables(&mut |program, args| {
+            Command::new(program)
+                .args(args)
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        })
+    }
+
+    #[cfg(target_os = "linux")]
+    fn activate_iptables(&self, run: &mut impl FnMut(&str, &[&str]) -> bool) -> Result<()> {
         let tun = self.tun_name.as_str();
         let sip = self.server_ip.as_str();
-        // Use ip6tables for IPv6 server addresses
-        let ipt = if self.server_ip.contains(':') {
+        let server_family = if self.server_ip.contains(':') {
             "ip6tables"
         } else {
             "iptables"
         };
-        for cmd in &[vec![ipt, "-N", "AIVPN_KS"], vec![ipt, "-F", "AIVPN_KS"]] {
-            let _ = Command::new(cmd[0]).args(&cmd[1..]).status();
+        for ipt in ["iptables", "ip6tables"] {
+            // Guard остается после прерванной перестройки и не дублируется.
+            let exists = run(
+                ipt,
+                &[
+                    "-C",
+                    "OUTPUT",
+                    "-m",
+                    "comment",
+                    "--comment",
+                    "AIVPN_KS_UPDATE",
+                    "-j",
+                    "DROP",
+                ],
+            );
+            if !exists
+                && !run(
+                    ipt,
+                    &[
+                        "-I",
+                        "OUTPUT",
+                        "1",
+                        "-m",
+                        "comment",
+                        "--comment",
+                        "AIVPN_KS_UPDATE",
+                        "-j",
+                        "DROP",
+                    ],
+                )
+            {
+                return Err(Error::Io(io::Error::other(
+                    "kill-switch: cannot protect rule update",
+                )));
+            }
         }
-        // -D may legitimately fail (no pre-existing jump rule); ignore its result.
-        let _ = Command::new(ipt)
-            .args(["-D", "OUTPUT", "-j", "AIVPN_KS"])
-            .status();
-        let mark_arg = self.mark.map(|m| format!("0x{m:x}"));
-        let mut cmds: Vec<Vec<&str>> = vec![
-            vec![ipt, "-I", "OUTPUT", "1", "-j", "AIVPN_KS"],
-            vec![ipt, "-A", "AIVPN_KS", "-o", "lo", "-j", "ACCEPT"],
-            vec![ipt, "-A", "AIVPN_KS", "-o", tun, "-j", "ACCEPT"],
-            vec![ipt, "-A", "AIVPN_KS", "-d", sip, "-j", "ACCEPT"],
-        ];
-        // Marked traffic — the transport's own sockets (see `mark`). Must be
-        // appended before the DROP that terminates the chain.
-        if let Some(m) = mark_arg.as_deref() {
-            cmds.push(vec![
-                ipt, "-A", "AIVPN_KS", "-m", "mark", "--mark", m, "-j", "ACCEPT",
-            ]);
-        }
-        cmds.push(vec![ipt, "-A", "AIVPN_KS", "-j", "DROP"]);
-        for cmd in &cmds {
-            let ok = Command::new(cmd[0])
-                .args(&cmd[1..])
-                .status()
-                .map(|s| s.success())
-                .unwrap_or(false);
-            if !ok {
-                let _ = Command::new(ipt)
-                    .args(["-D", "OUTPUT", "-j", "AIVPN_KS"])
-                    .status();
-                let _ = Command::new(ipt).args(["-F", "AIVPN_KS"]).status();
-                return Err(Error::Io(io::Error::other(format!(
-                    "kill-switch: {ipt} rule setup failed (nothing is blocked)"
-                ))));
+        for ipt in ["iptables", "ip6tables"] {
+            run(ipt, &["-N", "AIVPN_KS"]);
+            if !run(ipt, &["-F", "AIVPN_KS"]) {
+                return Err(Error::Io(io::Error::other(
+                    "kill-switch: cannot clear stale iptables rules",
+                )));
+            }
+            // -D may legitimately fail (no pre-existing jump rule); ignore its result.
+            run(ipt, &["-D", "OUTPUT", "-j", "AIVPN_KS"]);
+            let mark_arg = self.mark.map(|m| format!("0x{m:x}"));
+            let mut cmds: Vec<Vec<&str>> = vec![
+                vec![ipt, "-A", "AIVPN_KS", "-o", "lo", "-j", "ACCEPT"],
+                vec![ipt, "-A", "AIVPN_KS", "-o", tun, "-j", "ACCEPT"],
+            ];
+            if ipt == server_family {
+                cmds.push(vec![ipt, "-A", "AIVPN_KS", "-d", sip, "-j", "ACCEPT"]);
+            }
+            // Marked traffic — the transport's own sockets (see `mark`). Must be
+            // appended before the DROP that terminates the chain.
+            if let Some(m) = mark_arg.as_deref() {
+                cmds.push(vec![
+                    ipt, "-A", "AIVPN_KS", "-m", "mark", "--mark", m, "-j", "ACCEPT",
+                ]);
+            }
+            cmds.push(vec![ipt, "-A", "AIVPN_KS", "-j", "DROP"]);
+            cmds.push(vec![ipt, "-I", "OUTPUT", "1", "-j", "AIVPN_KS"]);
+            for cmd in &cmds {
+                let ok = run(cmd[0], &cmd[1..]);
+                if !ok {
+                    return Err(Error::Io(io::Error::other(format!(
+                        "kill-switch: {ipt} rule setup failed; drop protection retained"
+                    ))));
+                }
+            }
+            if !run(
+                ipt,
+                &[
+                    "-D",
+                    "OUTPUT",
+                    "-m",
+                    "comment",
+                    "--comment",
+                    "AIVPN_KS_UPDATE",
+                    "-j",
+                    "DROP",
+                ],
+            ) {
+                return Err(Error::Io(io::Error::other(
+                    "kill-switch: cannot release update guard",
+                )));
             }
         }
         Ok(())
     }
 
     #[cfg(target_os = "linux")]
-    fn deactivate_impl(&self) {
-        use std::process::Command;
-        // Try nftables
-        if Command::new("sh")
-            .args(["-c", "nft list table inet aivpn_ks 2>/dev/null"])
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
-        {
-            let _ = Command::new("nft")
-                .args(["delete", "table", "inet", "aivpn_ks"])
-                .status();
-            return;
+    fn clear_iptables(run: &mut impl FnMut(&str, &[&str]) -> bool) {
+        for program in ["iptables", "ip6tables"] {
+            run(program, &["-D", "OUTPUT", "-j", "AIVPN_KS"]);
+            run(program, &["-F", "AIVPN_KS"]);
+            run(program, &["-X", "AIVPN_KS"]);
+            run(
+                program,
+                &[
+                    "-D",
+                    "OUTPUT",
+                    "-m",
+                    "comment",
+                    "--comment",
+                    "AIVPN_KS_UPDATE",
+                    "-j",
+                    "DROP",
+                ],
+            );
         }
-        // Fallback: iptables
-        let _ = Command::new("iptables")
-            .args(["-D", "OUTPUT", "-j", "AIVPN_KS"])
-            .status();
-        let _ = Command::new("iptables").args(["-F", "AIVPN_KS"]).status();
-        let _ = Command::new("iptables").args(["-X", "AIVPN_KS"]).status();
+    }
+
+    #[cfg(target_os = "linux")]
+    fn deactivate_impl(&self) {
+        Self::clear_stale_impl();
     }
 
     #[cfg(target_os = "linux")]
@@ -315,11 +384,13 @@ impl KillSwitch {
         let _ = Command::new("nft")
             .args(["delete", "table", "inet", "aivpn_ks"])
             .status();
-        let _ = Command::new("iptables")
-            .args(["-D", "OUTPUT", "-j", "AIVPN_KS"])
-            .status();
-        let _ = Command::new("iptables").args(["-F", "AIVPN_KS"]).status();
-        let _ = Command::new("iptables").args(["-X", "AIVPN_KS"]).status();
+        Self::clear_iptables(&mut |program, args| {
+            Command::new(program)
+                .args(args)
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        });
     }
 
     // ──────────────────── macOS ────────────────────
@@ -465,6 +536,188 @@ impl KillSwitch {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn stale_accept_rules_cannot_survive_failed_flush() {
+        let ks = KillSwitch::new("tun0".into(), "192.0.2.1".into());
+        assert!(ks
+            .activate_iptables(&mut |_program, args| args != ["-F", "AIVPN_KS"])
+            .is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn reconnect_guard_precedes_flush_and_leaves_after_jump() {
+        let ks = KillSwitch::new("tun0".into(), "192.0.2.1".into());
+        let mut commands = Vec::new();
+        ks.activate_iptables(&mut |program, args| {
+            commands.push(format!("{} {}", program, args.join(" ")));
+            args.first() != Some(&"-C")
+        })
+        .unwrap();
+        for family in ["iptables", "ip6tables"] {
+            let guard = commands
+                .iter()
+                .position(|c| {
+                    c == &format!(
+                        "{family} -I OUTPUT 1 -m comment --comment AIVPN_KS_UPDATE -j DROP"
+                    )
+                })
+                .unwrap();
+            let flush = commands
+                .iter()
+                .position(|c| c == &format!("{family} -F AIVPN_KS"))
+                .unwrap();
+            let jump = commands
+                .iter()
+                .position(|c| c == &format!("{family} -I OUTPUT 1 -j AIVPN_KS"))
+                .unwrap();
+            let release = commands
+                .iter()
+                .position(|c| {
+                    c == &format!("{family} -D OUTPUT -m comment --comment AIVPN_KS_UPDATE -j DROP")
+                })
+                .unwrap();
+            assert!(guard < flush && flush < jump && jump < release);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fallback_blocks_both_families_and_bypasses_only_server_family() {
+        for server in ["192.0.2.1", "2001:db8::1"] {
+            let ks = KillSwitch::new("tun0".into(), server.into()).with_mark(0x4149);
+            let mut commands = Vec::new();
+            ks.activate_iptables(&mut |program, args| {
+                commands.push(format!("{} {}", program, args.join(" ")));
+                true
+            })
+            .unwrap();
+            for family in ["iptables", "ip6tables"] {
+                assert!(commands.contains(&format!("{family} -A AIVPN_KS -j DROP")));
+                assert!(commands.contains(&format!("{family} -I OUTPUT 1 -j AIVPN_KS")));
+            }
+            assert_eq!(commands.iter().filter(|c| c.contains(" -d ")).count(), 1);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fallback_partial_failure_preserves_drop_guards() {
+        let ks = KillSwitch::new("tun0".into(), "192.0.2.1".into());
+        let mut commands = Vec::new();
+        assert!(ks
+            .activate_iptables(&mut |program, args| {
+                commands.push(format!("{} {}", program, args.join(" ")));
+                !(program == "ip6tables" && args == ["-A", "AIVPN_KS", "-j", "DROP"])
+            })
+            .is_err());
+        for family in ["iptables", "ip6tables"] {
+            assert!(!commands.contains(&format!("{family} -X AIVPN_KS")));
+        }
+        assert!(
+            !commands.contains(
+                &"ip6tables -D OUTPUT -m comment --comment AIVPN_KS_UPDATE -j DROP".to_owned()
+            ),
+            "Ошибка настройки не должна снимать DROP guard неготовой семьи"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn nft_failure_fixture() {
+        let Ok(kind) = std::env::var("AIVPN_KS_FIXTURE_KIND") else {
+            return;
+        };
+        let log = std::env::var("AIVPN_KS_FIXTURE_LOG").unwrap();
+        let mut ks = if kind == "tunnel" {
+            let mut config = crate::tunnel::TunnelConfig::default();
+            config.kill_switch = true;
+            let mut tunnel = crate::tunnel::Tunnel::new(config);
+            assert!(tunnel.activate_kill_switch().is_err());
+            tunnel
+                .take_kill_switch()
+                .expect("Неудачная активация тоже владеет очисткой правил")
+        } else {
+            let mut ks = KillSwitch::new("tun0".into(), "192.0.2.1".into());
+            assert!(ks.activate().is_err());
+            assert!(!ks.is_active());
+            ks
+        };
+        use std::io::Write;
+        writeln!(
+            std::fs::OpenOptions::new().append(true).open(log).unwrap(),
+            "BEFORE_INTENTIONAL_EXIT"
+        )
+        .unwrap();
+        ks.deactivate();
+    }
+
+    #[cfg(target_os = "linux")]
+    fn nft_failure_log(kind: &str) -> String {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let root =
+            std::env::temp_dir().join(format!("aivpn-ks-test-{:032x}", rand::random::<u128>()));
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&root)
+            .unwrap();
+        let _cleanup = Cleanup(root.clone());
+        let nft = root.join("nft");
+        std::fs::write(&nft, "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$AIVPN_KS_FIXTURE_LOG\"\nif [ \"$1 $2\" = 'add rule' ]; then exit 1; fi\n").unwrap();
+        std::fs::set_permissions(&nft, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let log = root.join("commands");
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "kill_switch::tests::nft_failure_fixture",
+                "--nocapture",
+            ])
+            .env("PATH", &root)
+            .env("AIVPN_KS_FIXTURE_KIND", kind)
+            .env("AIVPN_KS_FIXTURE_LOG", &log)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        std::fs::read_to_string(log).unwrap()
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn nft_partial_failure_stays_closed_until_intentional_exit() {
+        let log = nft_failure_log("direct");
+        let (before, after) = log.split_once("BEFORE_INTENTIONAL_EXIT").unwrap();
+        assert!(
+            !before.contains("delete table"),
+            "Неудачная настройка сняла DROP policy"
+        );
+        assert!(
+            after.contains("delete table"),
+            "Intentional exit должен очистить частичную настройку"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn tunnel_keeps_failed_activation_owner_for_intentional_cleanup() {
+        let log = nft_failure_log("tunnel");
+        assert!(log
+            .split_once("BEFORE_INTENTIONAL_EXIT")
+            .unwrap()
+            .1
+            .contains("delete table"));
+    }
 
     /// No mark by default: a session that talks to the server directly needs
     /// only the address bypass, and accepting an unset mark would widen the

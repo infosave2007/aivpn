@@ -207,7 +207,10 @@ pub struct Tunnel {
     #[allow(dead_code)]
     wintun_if_index: Option<String>,
     /// CIDRs added by apply_split_routes — removed on Drop.
+    #[cfg(not(target_os = "linux"))]
     split_routes_applied: Vec<String>,
+    #[cfg(target_os = "linux")]
+    owned_split_routes: Vec<Vec<String>>,
     ipv6_routes_added: bool,
     ipv6_server_bypass: Option<(String, String)>,
     transport_mark: Option<u32>,
@@ -269,7 +272,10 @@ impl Tunnel {
             saved_default_dev: None,
             server_ip: None,
             wintun_if_index: None,
+            #[cfg(not(target_os = "linux"))]
             split_routes_applied: Vec::new(),
+            #[cfg(target_os = "linux")]
+            owned_split_routes: Vec::new(),
             ipv6_routes_added: false,
             ipv6_server_bypass: None,
             transport_mark: None,
@@ -890,6 +896,19 @@ impl Tunnel {
                 .any(|a| a.is_empty() || a.contains('\t') || a.contains('\n'))
         {
             return None;
+        }
+        let owned = args.strip_prefix(&["-6"]).unwrap_or(args);
+        match owned {
+            ["route", action @ ("add" | "del"), cidr, "dev", device, "proto", "242"] => {
+                return Some(format!("{name}\tsplit_{action}\t{cidr}\t{device}\t-"));
+            }
+            ["route", action @ ("add" | "del"), cidr, "via", gateway, "dev", device, "proto", "242"] =>
+            {
+                return Some(format!(
+                    "{name}\tsplit_{action}\t{cidr}\t{device}\t{gateway}"
+                ));
+            }
+            _ => {}
         }
         match args {
             ["route", "replace", "0.0.0.0/1", "dev", iface] => {
@@ -1830,57 +1849,107 @@ impl Tunnel {
             // IPv6 prefixes need `ip -6` — a bare `ip route replace <v6>`
             // is rejected by iproute2 and the route silently never lands
             // (DNS leak in split mode when the DNS upstream is v6).
-            let ok = if cidr.contains(':') {
-                Self::run_ip_privileged(&["-6", "route", "replace", &cidr, "dev", &tun])
-            } else {
-                Self::run_ip_privileged(&["route", "replace", &cidr, "dev", &tun])
-            }
-            .map(|c| c == 0)
-            .unwrap_or(false);
-            if ok {
-                info!("Split-tunnel include: {} via {}", cidr, tun);
-                self.split_routes_applied.push(cidr);
-            } else {
-                error!("Split-tunnel: failed to add include route {}", cidr);
-            }
+            let args = Self::linux_split_args(&cidr, &tun, None);
+            self.add_owned_split_route(args, Self::run_ip_privileged)?;
+            info!("Split-tunnel include: {} via {}", cidr, tun);
         }
 
-        let gw_opt = self.saved_default_gw.clone().or_else(|| {
-            Command::new("ip")
-                .args(["route", "show", "default"])
+        for cidr in self.config.exclude_routes.clone() {
+            let ipv6 = cidr.contains(':');
+            let output = Command::new("ip")
+                .args(Self::linux_default_route_query(ipv6))
                 .output()
-                .ok()
-                .and_then(|o| {
-                    let s = String::from_utf8_lossy(&o.stdout).to_string();
-                    let fields: Vec<&str> = s.split_whitespace().collect();
-                    fields
-                        .windows(2)
-                        .find(|w| w[0] == "via")
-                        .map(|w| w[1].to_string())
-                })
-        });
-
-        if let Some(gw) = gw_opt {
-            for cidr in self.config.exclude_routes.clone() {
-                let ok = if cidr.contains(':') {
-                    Self::run_ip_privileged(&["-6", "route", "replace", &cidr, "via", &gw])
-                } else {
-                    Self::run_ip_privileged(&["route", "replace", &cidr, "via", &gw])
-                }
-                .map(|c| c == 0)
-                .unwrap_or(false);
-                if ok {
-                    info!("Split-tunnel exclude: {} via {} (bypass VPN)", cidr, gw);
-                    self.split_routes_applied.push(cidr);
-                } else {
-                    error!("Split-tunnel: failed to exclude route {}", cidr);
-                }
+                .map_err(Error::Io)?;
+            if !output.status.success() {
+                return Err(Error::Io(io::Error::other("Cannot read default route")));
             }
-        } else if !self.config.exclude_routes.is_empty() {
-            error!("Split-tunnel: no default gateway found for exclude_routes");
+            let (gateway, device) =
+                Self::parse_split_default(&String::from_utf8_lossy(&output.stdout), ipv6)
+                    .ok_or_else(|| {
+                        Error::Io(io::Error::other(format!(
+                            "No usable default route for {cidr}"
+                        )))
+                    })?;
+            let args = Self::linux_split_args(&cidr, &device, gateway.as_deref());
+            self.add_owned_split_route(args, Self::run_ip_privileged)?;
         }
 
         Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn add_owned_split_route(
+        &mut self,
+        args: Vec<String>,
+        mut run: impl FnMut(&[&str]) -> io::Result<i32>,
+    ) -> Result<()> {
+        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        if run(&refs).map_err(Error::Io)? != 0 {
+            return Err(Error::Io(io::Error::other(
+                "Cannot add split route; existing route preserved",
+            )));
+        }
+        self.owned_split_routes.push(args);
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn take_split_cleanup(&mut self) -> Vec<Vec<String>> {
+        let mut routes = std::mem::take(&mut self.owned_split_routes);
+        for route in &mut routes {
+            let action = if route.first().map(String::as_str) == Some("-6") {
+                2
+            } else {
+                1
+            };
+            route[action] = "del".to_owned();
+        }
+        routes
+    }
+
+    #[cfg(target_os = "linux")]
+    fn linux_split_args(cidr: &str, device: &str, gateway: Option<&str>) -> Vec<String> {
+        let mut args = vec![];
+        if cidr.contains(':') {
+            args.push("-6");
+        }
+        args.extend(["route", "add", cidr]);
+        if let Some(gateway) = gateway {
+            args.extend(["via", gateway]);
+        }
+        args.extend(["dev", device]);
+        args.extend(["proto", "242"]);
+        args.into_iter().map(String::from).collect()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn linux_default_route_query(ipv6: bool) -> Vec<&'static str> {
+        if ipv6 {
+            vec!["-6", "route", "show", "default"]
+        } else {
+            vec!["-4", "route", "show", "default"]
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn parse_split_default(output: &str, ipv6: bool) -> Option<(Option<String>, String)> {
+        output.lines().find_map(|line| {
+            let words: Vec<&str> = line.split_whitespace().collect();
+            if words.first() != Some(&"default") {
+                return None;
+            }
+            let device = words.windows(2).find(|w| w[0] == "dev")?[1].to_owned();
+            let gateway = words
+                .windows(2)
+                .find(|w| w[0] == "via")
+                .map(|w| w[1].to_owned());
+            if let Some(gateway) = &gateway {
+                if gateway.parse::<std::net::IpAddr>().ok()?.is_ipv6() != ipv6 {
+                    return None;
+                }
+            }
+            Some((gateway, device))
+        })
     }
 
     #[cfg(target_os = "linux")]
@@ -1890,16 +1959,17 @@ impl Tunnel {
         // EPERM here). `ip -6` for IPv6 prefixes, symmetric with how they
         // were added. Already-absent routes fail with ESRCH, which is fine
         // and neither escalates nor counts as fatal.
-        let cidrs: Vec<String> = std::mem::take(&mut self.split_routes_applied);
-        let mut batch: Vec<(String, Vec<&str>)> = Vec::with_capacity(cidrs.len());
-        for (i, cidr) in cidrs.iter().enumerate() {
-            let args: Vec<&str> = if cidr.contains(':') {
-                vec!["-6", "route", "del", cidr.as_str()]
-            } else {
-                vec!["route", "del", cidr.as_str()]
-            };
-            batch.push((format!("split_{i}"), args));
-        }
+        let routes = self.take_split_cleanup();
+        let batch: Vec<(String, Vec<&str>)> = routes
+            .iter()
+            .enumerate()
+            .map(|(i, args)| {
+                (
+                    format!("split_{i}"),
+                    args.iter().map(String::as_str).collect(),
+                )
+            })
+            .collect();
         if !batch.is_empty() {
             let named_args: Vec<(&str, &[&str])> = batch
                 .iter()
@@ -2081,9 +2151,10 @@ impl Tunnel {
         if let Some(mark) = self.transport_mark {
             ks = ks.with_mark(mark);
         }
-        ks.activate()?;
+        let result = ks.activate();
+        // Ошибка не снимает DROP guard. Владелец нужен и для его явной очистки.
         self.kill_switch_state = Some(ks);
-        Ok(())
+        result
     }
 
     /// Explicitly deactivate the kill-switch. Call this on intentional disconnect,
@@ -2093,6 +2164,10 @@ impl Tunnel {
             ks.deactivate();
         }
         self.kill_switch_state = None;
+    }
+
+    pub fn take_kill_switch(&mut self) -> Option<KillSwitch> {
+        self.kill_switch_state.take()
     }
 
     /// Адрес и маршруты принадлежат только интерфейсу туннеля.
@@ -2445,6 +2520,75 @@ impl Drop for Tunnel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn split_route_add_never_replaces_foreign_route_and_tracks_owner() {
+        assert_eq!(
+            Tunnel::linux_split_args("10.0.0.0/8", "tun0", None),
+            ["route", "add", "10.0.0.0/8", "dev", "tun0", "proto", "242"]
+        );
+        assert_eq!(
+            Tunnel::linux_split_args("2001:db8::/64", "eth0", Some("fe80::1")),
+            [
+                "-6",
+                "route",
+                "add",
+                "2001:db8::/64",
+                "via",
+                "fe80::1",
+                "dev",
+                "eth0",
+                "proto",
+                "242"
+            ]
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn split_default_preserves_ipv6_linklocal_device_and_family() {
+        assert_eq!(
+            Tunnel::linux_default_route_query(true),
+            ["-6", "route", "show", "default"]
+        );
+        assert_eq!(
+            Tunnel::parse_split_default("default via fe80::1 dev eth0 proto ra metric 100", true),
+            Some((Some("fe80::1".into()), "eth0".into()))
+        );
+        assert!(Tunnel::parse_split_default("default via 192.0.2.1 dev eth0", true).is_none());
+        let args = Tunnel::linux_split_args("2001:db8::/64", "eth0", Some("fe80::1"));
+        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        assert_eq!(
+            Tunnel::helper_line_for("split", &refs),
+            Some("split\tsplit_add\t2001:db8::/64\teth0\tfe80::1".into())
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn split_conflict_is_not_owned_and_cleanup_is_exact() {
+        let mut tunnel = Tunnel::new(TunnelConfig::default());
+        let args = Tunnel::linux_split_args("10.0.0.0/8", "tun0", None);
+        assert!(tunnel
+            .add_owned_split_route(args.clone(), |_| Ok(2))
+            .is_err());
+        assert!(tunnel.take_split_cleanup().is_empty());
+        tunnel.add_owned_split_route(args, |_| Ok(0)).unwrap();
+        let cleanup = tunnel.take_split_cleanup();
+        assert_eq!(
+            cleanup,
+            vec![vec![
+                "route",
+                "del",
+                "10.0.0.0/8",
+                "dev",
+                "tun0",
+                "proto",
+                "242"
+            ]]
+        );
+    }
 
     #[test]
     fn ipv6_assignment_survives_tunnel_conversion() {

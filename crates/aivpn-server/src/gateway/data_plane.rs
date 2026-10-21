@@ -312,8 +312,13 @@ impl super::Gateway {
 
                 // Общий qos_charge до шифрования. PassCharged уже списан ядром.
                 let (qos_cid, session_id) = {
-                    let session = session.lock();
-                    if session.kernel_faulted {
+                    let mut session = session.lock();
+                    let required = session.mtls_required;
+                    if session.kernel_faulted
+                        || !session_allows_client_data(&session, client_db.as_deref())
+                        || session.keys.packet_cipher.is_initial()
+                        || !session.refresh_mtls_gate(required)
+                    {
                         continue;
                     }
                     (session.client_id.clone(), session.session_id)
