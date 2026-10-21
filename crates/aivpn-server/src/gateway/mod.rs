@@ -2365,6 +2365,43 @@ mod tests {
         assert_eq!(gateway.distinct_tag_offsets(), expected);
     }
 
+    #[test]
+    fn adjacent_window_packets_do_not_consume_recovery_budget() {
+        use super::{crypto, Instant, MAX_FALLBACK_SCANS_PER_SEC, TAG_SIZE};
+        for embedded in [false, true] {
+            let gateway = Gateway::new(make_test_gateway_config("adjacent-window")).unwrap();
+            let addr: SocketAddr = "203.0.113.7:40000".parse().unwrap();
+            let session = gateway
+                .session_manager
+                .create_session(addr, [7; 32], None, None)
+                .unwrap();
+            let (secret, tw) = {
+                let sess = session.lock();
+                (sess.keys.tag_secret, sess.tag_window_tw)
+            };
+            *gateway.fallback_scan_budget.lock() = (MAX_FALLBACK_SCANS_PER_SEC, Instant::now());
+            for counter in 1..=30 {
+                let window = if counter % 2 == 0 {
+                    tw.wrapping_sub(1)
+                } else {
+                    tw.wrapping_add(1)
+                };
+                let tag = crypto::generate_resonance_tag(&secret, counter, window);
+                let mut packet = [0u8; 64];
+                let offset = if embedded { 8 } else { 0 };
+                packet[offset..offset + TAG_SIZE].copy_from_slice(&tag);
+                let resolved = gateway.find_existing_session(&packet, &addr.ip()).unwrap();
+                assert!(
+                    resolved.is_some(),
+                    "Пакеты сессии не должны становиться handshake"
+                );
+                assert_eq!(resolved.unwrap().1, counter);
+                session.lock().mark_tag_received(counter);
+                assert!(gateway.find_existing_session(&packet, &addr.ip()).is_err());
+            }
+        }
+    }
+
     /// `distinct_tag_offsets()` must merge the cached preset offsets with
     /// whatever the LIVE runtime catalog currently holds — proving the
     /// cache isn't stale merely because it never re-reads the catalog — while

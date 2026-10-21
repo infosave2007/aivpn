@@ -50,15 +50,10 @@ impl super::Gateway {
 
         // 1) Fast O(1) path across all layout offsets — no scan.
         for tag in &tags {
-            if let Some(session) = self.session_manager.get_session_by_tag(tag) {
-                // Drop the lock guard before moving `session` into the result.
-                let validated = session.lock().validate_tag(tag);
-                return match validated {
-                    Some((counter, is_ratcheted)) => {
-                        Ok(Some((session, counter, is_ratcheted, *tag)))
-                    }
-                    None => Err(Error::InvalidPacket("Invalid tag")),
-                };
+            if let Some((session, counter, is_ratcheted)) =
+                self.session_manager.find_session_by_tag(tag)?
+            {
+                return Ok(Some((session, counter, is_ratcheted, *tag)));
             }
         }
 
@@ -81,15 +76,10 @@ impl super::Gateway {
             }
         }
         for tag in &tags {
-            if let Some(session) = self.session_manager.get_session_by_tag(tag) {
-                // Drop the lock guard before moving `session` into the result.
-                let validated = session.lock().validate_tag(tag);
-                return match validated {
-                    Some((counter, is_ratcheted)) => {
-                        Ok(Some((session, counter, is_ratcheted, *tag)))
-                    }
-                    None => Err(Error::InvalidPacket("Invalid tag")),
-                };
+            if let Some((session, counter, is_ratcheted)) =
+                self.session_manager.find_session_by_tag(tag)?
+            {
+                return Ok(Some((session, counter, is_ratcheted, *tag)));
             }
         }
 

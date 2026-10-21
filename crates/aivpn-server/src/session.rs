@@ -131,6 +131,8 @@ pub enum SessionState {
 
 /// Session information
 pub struct Session {
+    /// Удаленная сессия не должна заново публиковать теги из отложенной задачи.
+    removed: bool,
     pub fragment_rx: aivpn_common::fragment::Reassembler,
     pub session_id: [u8; 16],
     pub client_addr: SocketAddr,
@@ -489,6 +491,7 @@ impl Session {
     ) -> Self {
         let now = Instant::now();
         Self {
+            removed: false,
             fragment_rx: aivpn_common::fragment::Reassembler::default(),
             session_id,
             client_addr,
@@ -965,6 +968,21 @@ impl Session {
     }
 }
 
+#[derive(Clone, Copy)]
+enum TagEpoch {
+    Active,
+    Ratcheted,
+    Grace,
+}
+
+#[derive(Clone, Copy)]
+struct IndexedTag {
+    session_id: [u8; 16],
+    counter: u64,
+    time_window: u64,
+    epoch: TagEpoch,
+}
+
 /// Session Manager with O(1) tag lookup
 pub struct SessionManager {
     allocation_lock: Mutex<()>,
@@ -973,7 +991,9 @@ pub struct SessionManager {
     /// Sessions by ID
     sessions: DashMap<[u8; 16], Arc<Mutex<Session>>>,
     /// Tag -> Session ID mapping for O(1) lookup
-    tag_map: DashMap<[u8; TAG_SIZE], [u8; 16]>,
+    tag_map: DashMap<[u8; TAG_SIZE], IndexedTag>,
+    /// Собственные теги сессии позволяют обновлять индекс без полного обхода.
+    indexed_tags: DashMap<[u8; 16], Vec<[u8; TAG_SIZE]>>,
     /// VPN IP -> Session ID mapping for TUN return routing
     vpn_ip_map: DashMap<Ipv4Addr, [u8; 16]>,
     /// Server's long-term keypair
@@ -1019,6 +1039,7 @@ impl SessionManager {
             kernel: std::sync::OnceLock::new(),
             sessions: DashMap::new(),
             tag_map: DashMap::new(),
+            indexed_tags: DashMap::new(),
             vpn_ip_map: DashMap::new(),
             server_keys,
             signing_key,
@@ -1326,15 +1347,10 @@ impl SessionManager {
 
             // Compute initial tags
             sess.update_tag_window();
-            for tag in sess.expected_tags.values() {
-                self.tag_map.insert(*tag, session_id);
-            }
 
             // Pre-compute ratcheted tags (for when client switches to PFS keys)
             sess.update_ratcheted_tag_window();
-            for tag in sess.ratcheted_expected_tags.values() {
-                self.tag_map.insert(*tag, session_id);
-            }
+            self.reindex_session(&sess);
         }
 
         // Insert into session map
@@ -1519,11 +1535,133 @@ impl SessionManager {
     /// Get session by tag (O(1) lookup)
     pub fn get_session_by_tag(&self, tag: &[u8; TAG_SIZE]) -> Option<Arc<Mutex<Session>>> {
         if let Some(entry) = self.tag_map.get(tag) {
-            let session_id = *entry;
+            let session_id = entry.session_id;
             drop(entry);
             self.sessions.get(&session_id).map(|e| e.clone())
         } else {
             None
+        }
+    }
+
+    /// Метаданные индекса задают один счетчик, а не новый перебор окна.
+    pub(crate) fn find_session_by_tag(
+        &self,
+        tag: &[u8; TAG_SIZE],
+    ) -> Result<Option<(Arc<Mutex<Session>>, u64, bool)>> {
+        let Some(indexed) = self.tag_map.get(tag).map(|entry| *entry) else {
+            return Ok(None);
+        };
+        let Some(session) = self
+            .sessions
+            .get(&indexed.session_id)
+            .map(|entry| entry.clone())
+        else {
+            return Ok(None);
+        };
+        let sess = session.lock();
+        let now_tw = crypto::compute_time_window(crypto::current_timestamp_ms(), DEFAULT_WINDOW_MS);
+        let fresh = |counter: u64| {
+            if counter > sess.counter {
+                let ahead = TAG_WINDOW_SIZE as u64 - 1
+                    + if sess.pending_rekey_keypair.is_some() {
+                        REKEY_TAG_LOOKAHEAD
+                    } else {
+                        0
+                    };
+                return counter - sess.counter <= ahead;
+            }
+            let distance = sess.counter - counter;
+            distance < TAG_WINDOW_SIZE as u64 && !sess.received_bitmap.get_bit(distance as usize)
+        };
+        let keys = match indexed.epoch {
+            TagEpoch::Active if fresh(indexed.counter) => Some(&sess.keys),
+            TagEpoch::Ratcheted if !sess.is_ratcheted => sess.ratcheted_keys.as_ref(),
+            TagEpoch::Grace
+                if sess
+                    .pre_ratchet_expire
+                    .is_some_and(|expiry| Instant::now() < expiry)
+                    && !sess.pre_ratchet_received.contains(&indexed.counter) =>
+            {
+                sess.pre_ratchet_keys.as_ref()
+            }
+            _ => None,
+        };
+        let valid = !sess.removed
+            && indexed.time_window.abs_diff(now_tw) <= 1
+            && keys.is_some_and(|keys| {
+                bool::from(
+                    crypto::generate_resonance_tag(
+                        &keys.tag_secret,
+                        indexed.counter,
+                        indexed.time_window,
+                    )
+                    .ct_eq(tag),
+                )
+            });
+        if !valid {
+            return Err(Error::InvalidPacket("Invalid indexed tag"));
+        }
+        drop(sess);
+        Ok(Some((
+            session,
+            indexed.counter,
+            matches!(indexed.epoch, TagEpoch::Ratcheted),
+        )))
+    }
+
+    /// Вызывается под блокировкой сессии. Новые записи ставятся до удаления старых.
+    fn reindex_session(&self, sess: &Session) {
+        if sess.removed {
+            return;
+        }
+        let now_tw = crypto::compute_time_window(crypto::current_timestamp_ms(), DEFAULT_WINDOW_MS);
+        let windows = [now_tw.wrapping_sub(1), now_tw, now_tw.wrapping_add(1)];
+        let mut tags = HashMap::new();
+        let mut add = |secret: &[u8; 32], counters: &HashMap<u64, [u8; TAG_SIZE]>, epoch| {
+            for &counter in counters.keys() {
+                for time_window in windows {
+                    let tag = crypto::generate_resonance_tag(secret, counter, time_window);
+                    tags.insert(
+                        tag,
+                        IndexedTag {
+                            session_id: sess.session_id,
+                            counter,
+                            time_window,
+                            epoch,
+                        },
+                    );
+                }
+            }
+        };
+        add(&sess.keys.tag_secret, &sess.expected_tags, TagEpoch::Active);
+        if !sess.is_ratcheted {
+            if let Some(keys) = sess.ratcheted_keys.as_ref() {
+                add(
+                    &keys.tag_secret,
+                    &sess.ratcheted_expected_tags,
+                    TagEpoch::Ratcheted,
+                );
+            }
+        }
+        if sess
+            .pre_ratchet_expire
+            .is_some_and(|expiry| Instant::now() < expiry)
+        {
+            if let Some(keys) = sess.pre_ratchet_keys.as_ref() {
+                add(&keys.tag_secret, &sess.pre_ratchet_tags, TagEpoch::Grace);
+            }
+        }
+        for (tag, indexed) in &tags {
+            self.tag_map.insert(*tag, *indexed);
+        }
+        let next_tags = tags.keys().copied().collect();
+        if let Some(old_tags) = self.indexed_tags.insert(sess.session_id, next_tags) {
+            for tag in old_tags {
+                if !tags.contains_key(&tag) {
+                    self.tag_map
+                        .remove_if(&tag, |_, indexed| indexed.session_id == sess.session_id);
+                }
+            }
         }
     }
 
@@ -1562,30 +1700,12 @@ impl SessionManager {
             crypto::compute_time_window(crypto::current_timestamp_ms(), DEFAULT_WINDOW_MS);
         for entry in self.sessions.iter() {
             let session = entry.value().clone();
-            let session_id = *entry.key();
             let mut sess = session.lock();
 
             if sess.tag_window_tw != current_tw {
-                // Refresh initial key tags
-                let old_tags: Vec<[u8; TAG_SIZE]> = sess.expected_tags.values().cloned().collect();
-                for old_tag in &old_tags {
-                    self.tag_map.remove(old_tag);
-                }
                 sess.update_tag_window();
-                for t in sess.expected_tags.values() {
-                    self.tag_map.insert(*t, session_id);
-                }
-
-                // Refresh ratcheted key tags
-                let old_ratcheted: Vec<[u8; TAG_SIZE]> =
-                    sess.ratcheted_expected_tags.values().cloned().collect();
-                for old_tag in &old_ratcheted {
-                    self.tag_map.remove(old_tag);
-                }
                 sess.update_ratcheted_tag_window();
-                for t in sess.ratcheted_expected_tags.values() {
-                    self.tag_map.insert(*t, session_id);
-                }
+                self.reindex_session(&sess);
             }
 
             // Try to validate the tag now (only for this source IP's sessions)
@@ -1628,7 +1748,6 @@ impl SessionManager {
 
         for entry in self.sessions.iter() {
             let session = entry.value().clone();
-            let session_id = *entry.key();
             let (base, tag_secret) = {
                 let sess = session.lock();
                 if sess.client_addr.ip() != *client_ip {
@@ -1665,20 +1784,11 @@ impl SessionManager {
                         // Update tag window to the recovered counter (mutex already released).
                         {
                             let mut s = session.lock();
-                            // Collect old tags before updating window so we can
-                            // do targeted removal (retain would create a visibility gap).
-                            let old_tags: Vec<[u8; TAG_SIZE]> =
-                                s.expected_tags.values().cloned().collect();
                             // Shift the replay bitmap and mark this counter
                             // received (ingress marks it again — idempotent).
                             s.mark_tag_received(c);
                             s.update_tag_window();
-                            for t in &old_tags {
-                                self.tag_map.remove(t);
-                            }
-                            for t in s.expected_tags.values() {
-                                self.tag_map.insert(*t, session_id);
-                            }
+                            self.reindex_session(&s);
                         }
                         return Some((session, c, false));
                     }
@@ -1743,16 +1853,13 @@ impl SessionManager {
     pub fn remove_session(&self, session_id: &[u8; 16]) -> Option<[u8; 16]> {
         if let Some((_, session)) = self.sessions.remove(session_id) {
             let mut sess = session.lock();
+            sess.removed = true;
             sess.kernel_faulted = true;
-            // Remove all tags from tag map (initial + ratcheted + pre-ratchet grace)
-            for tag in sess.expected_tags.values() {
-                self.tag_map.remove(tag);
-            }
-            for tag in sess.ratcheted_expected_tags.values() {
-                self.tag_map.remove(tag);
-            }
-            for tag in sess.pre_ratchet_tags.values() {
-                self.tag_map.remove(tag);
+            if let Some((_, tags)) = self.indexed_tags.remove(session_id) {
+                for tag in tags {
+                    self.tag_map
+                        .remove_if(&tag, |_, indexed| &indexed.session_id == session_id);
+                }
             }
             // Remove VPN IP mapping only if it still points to THIS session.
             // A newer session may have already claimed the same VPN IP.
@@ -1774,35 +1881,7 @@ impl SessionManager {
     pub fn refresh_session_tags(&self, session_id: &[u8; 16]) {
         if let Some(session) = self.sessions.get(session_id) {
             let sess = session.lock();
-            // Remove only this session's tags by iterating its own expected_tags
-            // rather than scanning the entire global tag_map with retain().
-            // Collect old tags first to avoid holding lock during removal.
-            let old_tags: Vec<[u8; TAG_SIZE]> = self
-                .tag_map
-                .iter()
-                .filter(|e| e.value() == session_id)
-                .map(|e| *e.key())
-                .collect();
-            for tag in &old_tags {
-                self.tag_map.remove(tag);
-            }
-            // Re-add current tags
-            for tag in sess.expected_tags.values() {
-                self.tag_map.insert(*tag, *session_id);
-            }
-            for tag in sess.ratcheted_expected_tags.values() {
-                self.tag_map.insert(*tag, *session_id);
-            }
-            // Keep pre-ratchet grace tags resolvable O(1) while the grace
-            // window is still open (in-flight old-key packets at a rekey seam).
-            if sess
-                .pre_ratchet_expire
-                .is_some_and(|expire| Instant::now() < expire)
-            {
-                for tag in sess.pre_ratchet_tags.values() {
-                    self.tag_map.insert(*tag, *session_id);
-                }
-            }
+            self.reindex_session(&sess);
         }
     }
 
@@ -1813,21 +1892,9 @@ impl SessionManager {
             if sess.ratcheted_keys.is_none() {
                 return; // nothing to ratchet — complete_ratchet would be a no-op
             }
-            // Purge any PREVIOUS grace window's tags. The current initial-key
-            // tags deliberately STAY in the tag_map: complete_ratchet moves
-            // them into pre_ratchet_tags, and keeping them mapped preserves
-            // the O(1) lookup path for in-flight old-key packets during the
-            // grace window (see commit_session_rekey). Expired grace tags are
-            // purged by cleanup_expired.
-            for tag in sess.pre_ratchet_tags.values() {
-                self.tag_map.remove(tag);
-            }
             // Complete the ratchet (swaps keys, moves ratcheted_expected_tags → expected_tags)
             sess.complete_ratchet();
-            // Re-add the now-active tags (which were the ratcheted tags)
-            for tag in sess.expected_tags.values() {
-                self.tag_map.insert(*tag, *session_id);
-            }
+            self.reindex_session(&sess);
         }
     }
 
@@ -1841,13 +1908,11 @@ impl SessionManager {
         for entry in self.sessions.iter() {
             let mut sess = entry.value().lock();
             if sess.pre_ratchet_expire.is_some_and(|expire| now >= expire) {
-                for tag in sess.pre_ratchet_tags.values() {
-                    self.tag_map.remove(tag);
-                }
                 sess.pre_ratchet_tags.clear();
                 sess.pre_ratchet_received.clear();
                 sess.pre_ratchet_expire = None;
                 sess.pre_ratchet_keys = None;
+                self.reindex_session(&sess);
             }
         }
 
@@ -2233,20 +2298,6 @@ impl SessionManager {
             client_rekey_eph_pub,
         );
 
-        // Purge any PREVIOUS grace window's tags, then drop stale ratcheted
-        // tags. The CURRENT expected_tags deliberately STAY in the global
-        // tag_map: they become pre_ratchet_tags below, and keeping them mapped
-        // preserves the O(1) lookup path for in-flight old-key packets during
-        // the grace window — the fallback scan is globally rate-limited
-        // (20/s), so relying on it drops legitimate packets at the rekey seam
-        // under load. Expired grace tags are purged by cleanup_expired.
-        for tag in sess.pre_ratchet_tags.values() {
-            self.tag_map.remove(tag);
-        }
-        for tag in sess.ratcheted_expected_tags.values() {
-            self.tag_map.remove(tag);
-        }
-
         // Preserve old keys for an RTT-scaled grace window (in-flight packets from client).
         let grace = sess.inline_rekey_grace();
         sess.pre_ratchet_tags = std::mem::take(&mut sess.expected_tags);
@@ -2288,10 +2339,7 @@ impl SessionManager {
 
         // Compute new tag window and insert into global map.
         sess.update_tag_window();
-        let new_sid = *session_id;
-        for tag in sess.expected_tags.values() {
-            self.tag_map.insert(*tag, new_sid);
-        }
+        self.reindex_session(&sess);
 
         info!("Session inline rekey complete (new keys installed)");
     }
@@ -3213,6 +3261,60 @@ mod tests {
 
     fn session_ip() -> std::net::IpAddr {
         "10.9.9.9".parse().unwrap()
+    }
+
+    #[test]
+    fn removed_session_cannot_republish_tags() {
+        let (mgr, session, _) = make_manager_with_session();
+        let id = session.lock().session_id;
+        assert!(mgr.remove_session(&id).is_some());
+        mgr.reindex_session(&session.lock());
+        assert!(mgr.tag_map.is_empty());
+        assert!(mgr.indexed_tags.is_empty());
+    }
+
+    #[test]
+    fn kernel_fault_does_not_stop_userspace_index_refresh() {
+        let (mgr, session, keys) = make_manager_with_session();
+        let (id, tw) = {
+            let mut sess = session.lock();
+            sess.kernel_faulted = true;
+            sess.mark_tag_received(700);
+            sess.update_tag_window();
+            (sess.session_id, sess.tag_window_tw)
+        };
+        mgr.refresh_session_tags(&id);
+        let tag = crypto::generate_resonance_tag(&keys.tag_secret, 701, tw);
+        assert!(mgr.find_session_by_tag(&tag).unwrap().is_some());
+    }
+
+    #[test]
+    fn indexed_tag_rejects_replay_across_time_windows() {
+        let (mgr, session, keys) = make_manager_with_session();
+        let tw = session.lock().tag_window_tw;
+        let tag = crypto::generate_resonance_tag(&keys.tag_secret, 1, tw);
+        assert!(mgr.find_session_by_tag(&tag).unwrap().is_some());
+        session.lock().mark_tag_received(1);
+        for window in [tw.wrapping_sub(1), tw, tw.wrapping_add(1)] {
+            let tag = crypto::generate_resonance_tag(&keys.tag_secret, 1, window);
+            assert!(mgr.find_session_by_tag(&tag).is_err());
+        }
+    }
+
+    #[test]
+    fn stale_index_does_not_extend_rekey_lookahead_after_abort() {
+        let (mgr, session, keys) = make_manager_with_session();
+        let (id, tw) = {
+            let mut sess = session.lock();
+            sess.pending_rekey_keypair = Some(KeyPair::generate());
+            sess.update_tag_window();
+            (sess.session_id, sess.tag_window_tw)
+        };
+        mgr.refresh_session_tags(&id);
+        let tag = crypto::generate_resonance_tag(&keys.tag_secret, 1000, tw);
+        assert!(mgr.find_session_by_tag(&tag).unwrap().is_some());
+        session.lock().pending_rekey_keypair = None;
+        assert!(mgr.find_session_by_tag(&tag).is_err());
     }
 
     /// M2 regression: a replayed old packet whose counter sits behind
