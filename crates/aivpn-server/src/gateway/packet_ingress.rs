@@ -728,6 +728,16 @@ impl super::Gateway {
         } else {
             vec![data_prefix + packet_mdh_len]
         };
+        // Клиент применяет MaskUpdate сразу. До фиксации сервер принимает обе
+        // раскладки, иначе новый Keepalive не сможет завершить переход без downlink.
+        // Здесь только читаем кандидата: испорченный ciphertext не меняет маску.
+        if let Some((mask, _)) = session.lock().pending_mask.as_ref() {
+            let mdh_len = packet_layout_for_mask(mask).0;
+            let offset = mask.effective_tag_prefix_len(mdh_len) + mdh_len;
+            if !payload_offsets.contains(&offset) {
+                payload_offsets.push(offset);
+            }
+        }
         // During mask transition (bootstrap → runtime), also try the catalog
         // (runtime) layout in case the client already applied MaskUpdate — using
         // the catalog mask's OWN prefix, which may differ from the session's.
@@ -921,6 +931,11 @@ impl super::Gateway {
                 sess.mark_pre_ratchet_received(counter);
             } else {
                 sess.mark_tag_received(counter);
+            }
+            if replay != ReplayGate::Drop && sess.commit_pending_mask() {
+                // Новая раскладка и ее отпечаток попадают в ядро после AEAD и
+                // захвата replay. Idle-сессии больше не нужен исходящий пакет.
+                self.refresh_kernel_session(&mut sess);
             }
             replay
         };

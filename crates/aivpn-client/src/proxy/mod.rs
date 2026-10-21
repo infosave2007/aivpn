@@ -128,12 +128,18 @@ impl Drop for CloseOnDrop {
     }
 }
 
+enum TcpOutbound {
+    Data(Vec<u8>),
+    Eof,
+}
+
 struct ManagedConn {
     handle: SocketHandle,
     inbound: Arc<Mutex<VecDeque<Vec<u8>>>>,
-    outbound_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+    outbound_tx: tokio::sync::mpsc::Sender<TcpOutbound>,
     close_flag: Arc<AtomicBool>,
     write_eof: Arc<AtomicBool>,
+    read_eof_sent: bool,
     ready_tx: Option<std::sync::mpsc::SyncSender<bool>>,
 }
 
@@ -141,7 +147,7 @@ struct NewConn {
     target: IpEndpoint,
     src_port: u16,
     inbound: Arc<Mutex<VecDeque<Vec<u8>>>>,
-    outbound_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+    outbound_tx: tokio::sync::mpsc::Sender<TcpOutbound>,
     close_flag: Arc<AtomicBool>,
     write_eof: Arc<AtomicBool>,
     ready_tx: std::sync::mpsc::SyncSender<bool>,
@@ -358,6 +364,7 @@ fn run_stack(
                                 outbound_tx: nc.outbound_tx,
                                 close_flag: nc.close_flag,
                                 write_eof: nc.write_eof,
+                                read_eof_sent: false,
                                 ready_tx: Some(nc.ready_tx),
                             });
                         }
@@ -654,15 +661,24 @@ fn service_tcp_conn(conn: &mut ManagedConn, sockets: &mut SocketSet) -> bool {
                 Ok(0) => break,
                 Ok(n) => {
                     tmp.truncate(n);
-                    permit.send(tmp);
+                    permit.send(TcpOutbound::Data(tmp));
                 }
                 Err(_) => break,
             }
         }
     }
 
-    if socket.state() == State::CloseWait && !socket.can_recv() {
-        socket.close();
+    // FIN закрывает только прием. Отправка остается открытой до EOF клиента.
+    // Маркер идет после всех данных и повторяется при заполненной очереди.
+    if !conn.read_eof_sent && !socket.may_recv() {
+        match conn.outbound_tx.try_send(TcpOutbound::Eof) {
+            Ok(()) => conn.read_eof_sent = true,
+            Err(mpsc::error::TrySendError::Full(_)) => {}
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                socket.abort();
+                return true;
+            }
+        }
     }
     matches!(socket.state(), State::Closed | State::TimeWait)
 }
@@ -834,7 +850,7 @@ async fn handle_connect(
     let close_flag = Arc::new(AtomicBool::new(false));
     let _close_on_drop = CloseOnDrop(close_flag.clone());
     let write_eof = Arc::new(AtomicBool::new(false));
-    let (outbound_tx, mut outbound_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1024);
+    let (outbound_tx, mut outbound_rx) = tokio::sync::mpsc::channel::<TcpOutbound>(1024);
     let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
 
     if cmd_tx
@@ -923,8 +939,14 @@ async fn handle_connect(
     });
 
     halves.spawn(async move {
-        while let Some(data) = outbound_rx.recv().await {
-            if socks_wr.write_all(&data).await.is_err() {
+        while let Some(message) = outbound_rx.recv().await {
+            let result = match message {
+                TcpOutbound::Data(data) => socks_wr.write_all(&data).await,
+                // После передачи EOF ждем закрытия smoltcp. Вторая половина
+                // продолжает читать клиента, пока его отправка еще открыта.
+                TcpOutbound::Eof => socks_wr.shutdown().await,
+            };
+            if result.is_err() {
                 break;
             }
         }
@@ -1209,6 +1231,197 @@ mod tests {
     use std::sync::atomic::AtomicBool;
     use tokio::net::UdpSocket;
 
+    struct SocksStackPair {
+        proxy: ProxyHandle,
+        peer: tokio::net::TcpStream,
+        device: VpnDevice,
+        iface: Interface,
+        sockets: SocketSet<'static>,
+        remote: SocketHandle,
+        transport_rx: mpsc::Receiver<Vec<u8>>,
+        remote_rx: Arc<Mutex<VecDeque<Vec<u8>>>>,
+        remote_tx: Arc<Mutex<VecDeque<Vec<u8>>>>,
+    }
+
+    impl SocksStackPair {
+        async fn connected() -> Self {
+            let (transport_tx, transport_rx) = mpsc::channel(256);
+            let proxy = spawn_proxy(
+                ProxyConfig {
+                    listen_addr: "127.0.0.1:0".parse().unwrap(),
+                    vpn_ip: Ipv4Addr::new(10, 0, 0, 2),
+                    gateway_ip: Ipv4Addr::new(10, 0, 0, 1),
+                    prefix_len: 24,
+                    dns_servers: vec![Ipv4Addr::new(1, 1, 1, 1)],
+                },
+                transport_tx,
+            )
+            .await
+            .unwrap();
+            let mut peer = tokio::net::TcpStream::connect(proxy.listen_addr)
+                .await
+                .unwrap();
+            peer.write_all(&[5, 1, 0]).await.unwrap();
+            let mut greeting = [0; 2];
+            peer.read_exact(&mut greeting).await.unwrap();
+            assert_eq!(greeting, [5, 0]);
+            peer.write_all(&[5, 1, 0, 1, 10, 0, 0, 1, 0, 80])
+                .await
+                .unwrap();
+
+            let remote_rx = Arc::new(Mutex::new(VecDeque::new()));
+            let remote_tx = Arc::new(Mutex::new(VecDeque::new()));
+            let mut device = VpnDevice::new(remote_rx.clone(), remote_tx.clone(), PROXY_MTU);
+            let mut iface =
+                Interface::new(Config::new(HardwareAddress::Ip), &mut device, smoltcp_now());
+            iface.update_ip_addrs(|ips| {
+                ips.push(IpCidr::new(IpAddress::v4(10, 0, 0, 1), 24))
+                    .unwrap();
+            });
+            let mut socket = TcpSocket::new(
+                TcpSocketBuffer::new(vec![0; TCP_BUF]),
+                TcpSocketBuffer::new(vec![0; TCP_BUF]),
+            );
+            socket.listen(80).unwrap();
+            let mut sockets = SocketSet::new(vec![]);
+            let remote = sockets.add(socket);
+            let mut pair = Self {
+                proxy,
+                peer,
+                device,
+                iface,
+                sockets,
+                remote,
+                transport_rx,
+                remote_rx,
+                remote_tx,
+            };
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while pair.sockets.get::<TcpSocket>(pair.remote).state() != State::Established {
+                    pair.pump().await;
+                }
+            })
+            .await
+            .unwrap();
+            let mut reply = [0; 10];
+            tokio::time::timeout(Duration::from_secs(1), pair.peer.read_exact(&mut reply))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(&reply[..2], &[5, REP_SUCCESS]);
+            pair
+        }
+
+        async fn pump(&mut self) {
+            while let Ok(packet) = self.transport_rx.try_recv() {
+                self.remote_rx.lock().unwrap().push_back(packet);
+            }
+            self.iface
+                .poll(smoltcp_now(), &mut self.device, &mut self.sockets);
+            {
+                let mut remote_tx = self.remote_tx.lock().unwrap();
+                let mut proxy_rx = self.proxy.rx_queue.lock().unwrap();
+                proxy_rx.extend(remote_tx.drain(..));
+            }
+            let _ = self.proxy.wake_tx.try_send(());
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+
+        async fn receive_to_eof(&mut self) -> Vec<u8> {
+            tokio::time::timeout(Duration::from_secs(1), async {
+                let mut received = Vec::new();
+                let mut bytes = [0; 8192];
+                loop {
+                    self.pump().await;
+                    match self.peer.try_read(&mut bytes) {
+                        Ok(0) => return received,
+                        Ok(n) => received.extend_from_slice(&bytes[..n]),
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                        Err(error) => panic!("Ошибка чтения SOCKS: {error}"),
+                    }
+                }
+            })
+            .await
+            .expect("Удаленный EOF не передан локальному клиенту")
+        }
+    }
+
+    #[tokio::test]
+    async fn remote_fin_keeps_late_client_payload_until_local_eof() {
+        let mut pair = SocksStackPair::connected().await;
+        pair.sockets
+            .get_mut::<TcpSocket>(pair.remote)
+            .send_slice(b"remote reply")
+            .unwrap();
+        pair.sockets.get_mut::<TcpSocket>(pair.remote).close();
+        let reply = pair.receive_to_eof().await;
+        assert_eq!(reply, b"remote reply");
+
+        pair.peer.write_all(b"late client payload").await.unwrap();
+        let mut received = Vec::new();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while received.len() < 19 {
+                pair.pump().await;
+                let socket = pair.sockets.get_mut::<TcpSocket>(pair.remote);
+                if socket.can_recv() {
+                    let mut bytes = [0; 128];
+                    let n = socket.recv_slice(&mut bytes).unwrap();
+                    received.extend_from_slice(&bytes[..n]);
+                }
+            }
+        })
+        .await
+        .expect("Удаленный FIN оборвал еще открытую отправку клиента");
+        assert_eq!(received, b"late client payload");
+        assert!(pair.sockets.get::<TcpSocket>(pair.remote).may_recv());
+
+        pair.peer.shutdown().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while pair.sockets.get::<TcpSocket>(pair.remote).may_recv() {
+                pair.pump().await;
+            }
+        })
+        .await
+        .expect("Локальный EOF не дошел до удаленного сервера");
+    }
+
+    #[tokio::test]
+    async fn local_fin_drains_remote_reply_before_eof() {
+        let mut pair = SocksStackPair::connected().await;
+        pair.peer.write_all(b"request").await.unwrap();
+        pair.peer.shutdown().await.unwrap();
+        let mut request = Vec::new();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                pair.pump().await;
+                let socket = pair.sockets.get_mut::<TcpSocket>(pair.remote);
+                if socket.can_recv() {
+                    let mut bytes = [0; 128];
+                    let n = socket.recv_slice(&mut bytes).unwrap();
+                    request.extend_from_slice(&bytes[..n]);
+                }
+                if !socket.may_recv() {
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(request, b"request");
+
+        let response = vec![0x5a; 32_768];
+        assert_eq!(
+            pair.sockets
+                .get_mut::<TcpSocket>(pair.remote)
+                .send_slice(&response)
+                .unwrap(),
+            response.len()
+        );
+        pair.sockets.get_mut::<TcpSocket>(pair.remote).close();
+        let received = pair.receive_to_eof().await;
+        assert_eq!(received, response);
+    }
+
     async fn mock_connect() -> (tokio::net::TcpStream, tokio::task::JoinHandle<()>, NewConn) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let mut peer = tokio::net::TcpStream::connect(listener.local_addr().unwrap())
@@ -1293,7 +1506,10 @@ mod tests {
             tokio::task::yield_now().await;
         }
         let aborted = nc.close_flag.load(Ordering::Relaxed);
-        nc.outbound_tx.send(b"reply".to_vec()).await.unwrap();
+        nc.outbound_tx
+            .send(TcpOutbound::Data(b"reply".to_vec()))
+            .await
+            .unwrap();
         let mut reply = [0; 5];
         tokio::time::timeout(Duration::from_millis(100), peer.read_exact(&mut reply))
             .await
@@ -1303,6 +1519,54 @@ mod tests {
         task.abort();
         let _ = task.await;
         assert!(!aborted, "SHUT_WR must allow the upstream reply");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn local_eof_bounds_wait_for_a_remote_that_never_closes() {
+        let (mut peer, task, nc) = mock_connect().await;
+        peer.shutdown().await.unwrap();
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::advance(HALF_CLOSE_DRAIN_GRACE - Duration::from_millis(1)).await;
+        assert!(!task.is_finished());
+        tokio::time::advance(Duration::from_millis(2)).await;
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+        assert!(task.is_finished(), "Ожидание удаленного EOF не ограничено");
+        task.await.unwrap();
+        assert!(nc.close_flag.load(Ordering::Relaxed));
+        let mut byte = [0; 1];
+        assert_eq!(peer.read(&mut byte).await.unwrap(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn remote_eof_does_not_start_the_local_drain_deadline() {
+        let (mut peer, task, nc) = mock_connect().await;
+        nc.outbound_tx.send(TcpOutbound::Eof).await.unwrap();
+        let mut byte = [0; 1];
+        assert_eq!(peer.read(&mut byte).await.unwrap(), 0);
+        tokio::time::advance(HALF_CLOSE_DRAIN_GRACE + Duration::from_secs(1)).await;
+        assert!(!task.is_finished());
+        assert!(!nc.close_flag.load(Ordering::Relaxed));
+        peer.write_all(b"late request").await.unwrap();
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            nc.inbound
+                .lock()
+                .unwrap()
+                .iter()
+                .flatten()
+                .copied()
+                .collect::<Vec<_>>(),
+            b"late request"
+        );
+        peer.shutdown().await.unwrap();
+        drop(nc.outbound_tx);
+        task.await.unwrap();
     }
 
     #[tokio::test]
@@ -1367,6 +1631,7 @@ mod tests {
             outbound_tx,
             close_flag: Arc::new(AtomicBool::new(true)),
             write_eof: Arc::new(AtomicBool::new(false)),
+            read_eof_sent: false,
             ready_tx: Some(ready_tx),
         };
         assert!(service_tcp_conn(&mut conn, &mut sockets));

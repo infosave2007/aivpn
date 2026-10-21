@@ -38,6 +38,25 @@ const MAX_BACKOFF: Duration = Duration::from_secs(30);
 /// from a peer that is persistently unreachable.
 const BACKOFF_RESET_THRESHOLD: Duration = Duration::from_secs(60);
 
+/// Токен одной dial-петли. remove_peer навсегда останавливает это поколение.
+#[derive(Clone)]
+struct DialGeneration {
+    stop: Arc<AtomicBool>,
+    topology_lock: Arc<parking_lot::Mutex<()>>,
+}
+
+impl DialGeneration {
+    /// Проверка и публикация состояния атомарны относительно remove/add.
+    fn with_active(&self, publish: impl FnOnce()) -> bool {
+        let _topology = self.topology_lock.lock();
+        if self.stop.load(Ordering::Relaxed) {
+            return false;
+        }
+        publish();
+        true
+    }
+}
+
 /// Сессии узлов пула, площадок и выходов мультихопа.
 pub struct PoolDialer {
     db: Arc<ClientDatabase>,
@@ -154,7 +173,7 @@ pub struct PoolDialer {
     /// its fresh session just in time for the tail of `remove_peer` to
     /// wipe the new `peer_senders` entry. Always the OUTERMOST lock; the
     /// inner Mutexes are never held while acquiring it.
-    topology_lock: parking_lot::Mutex<()>,
+    topology_lock: Arc<parking_lot::Mutex<()>>,
     /// Собственный sync_key площадки, если endpoint не входит в pool.peers.
     /// Для pool peer ключ не подменяем: та же сессия несет и SiteData.
     peer_credentials: parking_lot::Mutex<HashMap<String, (crypto::KeyPair, [u8; 32], String)>>,
@@ -254,7 +273,7 @@ impl PoolDialer {
             spawn_count: Arc::new(AtomicUsize::new(0)),
             runtime_exit_peers: Arc::new(parking_lot::Mutex::new(HashSet::new())),
             peer_stop_flags: Arc::new(parking_lot::Mutex::new(HashMap::new())),
-            topology_lock: parking_lot::Mutex::new(()),
+            topology_lock: Arc::new(parking_lot::Mutex::new(())),
             peer_credentials: parking_lot::Mutex::new(HashMap::new()),
             site_peer_addrs: parking_lot::Mutex::new(Vec::new()),
             node_registry: parking_lot::Mutex::new(None),
@@ -702,7 +721,13 @@ impl PoolDialer {
                 combined.clone(),
             ));
 
-            let session_result = self.run_one_session(&peer, combined.clone()).await;
+            let generation = DialGeneration {
+                stop: peer_stop.clone(),
+                topology_lock: self.topology_lock.clone(),
+            };
+            let session_result = self
+                .run_one_session(&peer, combined.clone(), generation)
+                .await;
             watcher.abort();
 
             match session_result {
@@ -753,6 +778,7 @@ impl PoolDialer {
         &self,
         peer: &str,
         shutdown: Arc<AtomicBool>,
+        generation: DialGeneration,
     ) -> aivpn_common::error::Result<()> {
         let (tap_tx, tap_rx) = tokio::sync::mpsc::channel::<ControlPayload>(64);
 
@@ -862,11 +888,13 @@ impl PoolDialer {
         // promotion ever happened.
         let per_session_ctrl = ctrl.clone();
 
-        {
+        if !generation.with_active(|| {
             let senders = self.peer_senders.lock();
             if !senders.contains_key(peer) {
                 mark_dialing(&self.pool_status, peer);
             }
+        }) {
+            return Ok(());
         }
 
         // PHASE 3: advertise our local subnets to this peer immediately on
@@ -934,6 +962,7 @@ impl PoolDialer {
                 site_tun_tx,
                 site_identity,
                 authorization,
+                generation,
             )
             .await;
         });
@@ -1200,6 +1229,7 @@ async fn anti_entropy(
     site_tun_tx: Option<tokio::sync::mpsc::Sender<Vec<u8>>>,
     site_identity: Option<String>,
     authorization: Option<PeerAuthorization>,
+    generation: DialGeneration,
 ) {
     let mut authorization_tick = tokio::time::interval(Duration::from_secs(1));
     let mut beacon = tokio::time::interval(Duration::from_secs(beacon_secs));
@@ -1228,11 +1258,16 @@ async fn anti_entropy(
     let mut last_partition_check: Option<crate::pool_partition::PartitionCheck> = None;
 
     loop {
+        if generation.stop.load(Ordering::Relaxed) {
+            break;
+        }
         tokio::select! {
             _ = authorization_tick.tick() => {
+                if generation.stop.load(Ordering::Relaxed) { break; }
                 if authorization.as_ref().is_some_and(|auth| !auth.allowed()) { break; }
             }
             _ = beacon.tick() => {
+                if generation.stop.load(Ordering::Relaxed) { break; }
                 if authorization.as_ref().is_some_and(|auth| !auth.allowed()) { break; }
                 if site_identity.is_none() {
                 let digest = db.state_digest();
@@ -1316,6 +1351,7 @@ async fn anti_entropy(
                 }
             }
             msg = tap_rx.recv() => {
+                if generation.stop.load(Ordering::Relaxed) { break; }
                 if authorization.as_ref().is_some_and(|auth| !auth.allowed()) { break; }
                 if require_node_enrollment && verified_node.lock().ok().and_then(|value| value.clone()).is_none() {
                     if msg.is_none() { break; }
@@ -1334,13 +1370,15 @@ async fn anti_entropy(
                 // friends. Re-inserting on a later message is harmless but
                 // kept behind the latch to stay off the mutex per packet.
                 if !promoted && msg.is_some() {
-                    promoted = true;
+                    if !generation.with_active(|| {
                     let mut senders = peer_senders.lock();
                     senders.insert(peer.clone(), ctrl.clone());
                     mark_diverged(&pool_status, &peer, Utc::now().timestamp());
                     if let Some(entry) = pool_status.lock().get_mut(&peer) {
                         entry.connected = true;
                     }
+                    }) { break; }
+                    promoted = true;
                 }
                 match msg {
                     Some(ControlPayload::PoolStateDigest { digest }) => {
@@ -1349,9 +1387,9 @@ async fn anti_entropy(
                             // Converged — reset the stale-visibility latch.
                             last_converged = std::time::Instant::now();
                             warned_stale = false;
-                            mark_converged(&pool_status, &peer, Utc::now().timestamp());
+                            if !generation.with_active(|| mark_converged(&pool_status, &peer, Utc::now().timestamp())) { break; }
                         } else {
-                            mark_diverged(&pool_status, &peer, Utc::now().timestamp());
+                            if !generation.with_active(|| mark_diverged(&pool_status, &peer, Utc::now().timestamp())) { break; }
                             // Phase 2: send our bucketed digest (not the
                             // whole DB) so the peer can work out exactly
                             // which buckets differ and push us the delta.
@@ -1384,7 +1422,7 @@ async fn anti_entropy(
                             &peer_buckets,
                         );
                         if !differing.is_empty() {
-                            mark_diverged(&pool_status, &peer, Utc::now().timestamp());
+                            if !generation.with_active(|| mark_diverged(&pool_status, &peer, Utc::now().timestamp())) { break; }
                             let clients_json =
                                 db.clients_json_for_buckets(&differing).into_bytes();
                             if ctrl
@@ -1411,7 +1449,7 @@ async fn anti_entropy(
                             // it too.
                             last_converged = std::time::Instant::now();
                             warned_stale = false;
-                            mark_converged(&pool_status, &peer, Utc::now().timestamp());
+                            if !generation.with_active(|| mark_converged(&pool_status, &peer, Utc::now().timestamp())) { break; }
                         }
                         if reply_requested {
                             // Hand our own buckets back so the peer can
@@ -1563,7 +1601,7 @@ async fn anti_entropy(
                             );
                             last_partition_check = Some(check);
                         }
-                        mark_partition_check(&pool_status, &peer, check);
+                        if !generation.with_active(|| mark_partition_check(&pool_status, &peer, check)) { break; }
                     }
                     Some(_) => {
                         // Any other future control variant — not our concern here.
@@ -1839,6 +1877,10 @@ mod tests {
             None,
             None,
             None,
+            DialGeneration {
+                stop: Arc::new(AtomicBool::new(false)),
+                topology_lock: dialer.topology_lock.clone(),
+            },
         ));
 
         // Give the driver a chance to run its first beacon tick: the peer
@@ -1874,6 +1916,75 @@ mod tests {
                 .connected
         );
         driver.abort();
+    }
+
+    #[tokio::test]
+    async fn removed_dial_generation_cannot_replace_a_new_sender_or_status() {
+        let dialer = PoolDialer::new(test_db(), &base_pool_config(), vec![], None, None).unwrap();
+        let peer = "peer-a:443";
+        let old_stop = Arc::new(AtomicBool::new(false));
+        dialer
+            .peer_stop_flags
+            .lock()
+            .insert(peer.into(), old_stop.clone());
+        dialer.runtime_exit_peers.lock().insert(peer.into());
+        dialer.dialed_peers.lock().insert(peer.into());
+        assert!(dialer.remove_peer(peer));
+        assert!(old_stop.load(Ordering::Relaxed));
+        let (new_ctrl, _new_rx) = tokio::sync::mpsc::channel(8);
+        dialer
+            .peer_senders
+            .lock()
+            .insert(peer.into(), new_ctrl.clone());
+        mark_converged(&dialer.pool_status, peer, 123);
+        let (old_ctrl, _old_rx) = tokio::sync::mpsc::channel(8);
+        let (tap, tap_rx) = tokio::sync::mpsc::channel(2);
+        tap.send(ControlPayload::PoolStateDigest { digest: [0; 32] })
+            .await
+            .unwrap();
+        drop(tap);
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            anti_entropy(
+                old_ctrl,
+                tap_rx,
+                dialer.db.clone(),
+                3600,
+                peer.into(),
+                vec![],
+                Some("self:443".into()),
+                None,
+                dialer.pool_status.clone(),
+                dialer.peer_senders.clone(),
+                false,
+                Arc::new(std::sync::Mutex::new(None)),
+                None,
+                None,
+                None,
+                DialGeneration {
+                    stop: old_stop,
+                    topology_lock: dialer.topology_lock.clone(),
+                },
+            ),
+        )
+        .await
+        .unwrap();
+        assert!(
+            dialer
+                .peer_senders
+                .lock()
+                .get(peer)
+                .unwrap()
+                .same_channel(&new_ctrl),
+            "Удаленный dial не может затереть sender нового поколения"
+        );
+        let status = dialer.pool_status.lock();
+        let status = status.get(peer).unwrap();
+        assert!(
+            status.converged,
+            "Отложенный digest не меняет статус нового поколения"
+        );
+        assert_eq!(status.last_converged_unix, Some(123));
     }
 
     #[test]

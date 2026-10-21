@@ -49,6 +49,8 @@ pub use config::{
 
 #[cfg(test)]
 mod auth_regression_tests;
+#[cfg(test)]
+mod mask_transition_tests;
 mod throttle;
 use throttle::{
     try_claim_mask_feedback_slot, try_claim_mask_preference_slot, try_claim_mgmt_slot,
