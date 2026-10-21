@@ -151,7 +151,17 @@ impl super::Gateway {
         // Existing-session lookup — layout-aware across every tag offset (legacy
         // prefix at 0 plus each embedded mask offset). Returns Err on a replay /
         // out-of-window packet for a known session (dropped, not handshaked).
-        let existing = self.find_existing_session(packet_data, &client_addr.ip())?;
+        let existing = match self.find_existing_session(packet_data, &client_addr.ip())? {
+            super::packet_demux::SessionLookup::Found(found) => Some(found),
+            super::packet_demux::SessionLookup::NotFound => None,
+            super::packet_demux::SessionLookup::RecoveryLimited => {
+                // Реальный reconnect допускается только через отдельные бюджеты ниже.
+                tracing::trace!(
+                    "Session recovery limited; handshake requires independent admission"
+                );
+                None
+            }
+        };
         let (session, counter, is_ratcheted_tag) = if let Some((
             session,
             counter,
@@ -198,30 +208,20 @@ impl super::Gateway {
                 }
             };
 
-            // No session found — try handshake
-            // Rate-limit failed handshake attempts to prevent rapid session-creation loops.
-            // After mask rotation or session timeout, stale clients may flood the server
-            // with packets that consistently fail tag validation (issue #21, #42).
-            // A peer with a live session that lands here is not an unknown host:
-            // its packet missed the tag lookup because the window drifted or the
-            // global rescan budget was spent this second. Blocking it would deny
-            // that client its own reconnect for up to 16s while it keeps sending.
-            //
-            // `peer_has_session` is a LINEAR scan over the session pool
-            // (`SessionManager::has_session_for_addr`), so it is evaluated
-            // lazily — only where its value is actually needed: inside the
-            // per-IP cooldown check below (reachable only for an address that
-            // already failed once) and on the post-scan failure path. Computing
-            // it eagerly for EVERY handshake-branch packet would let a flood of
-            // spoofed source IPs (each bypassing the per-IP limiter) pin CPU on
-            // the scan before any rate-limit gate runs.
+            // Промах тега не доказывает новый handshake. Живому endpoint даем
+            // короткую паузу, неизвестному отправителю сохраняем backoff.
+            // Линейный поиск адреса нужен только после неудачного перебора.
             let peer_has_session = || self.session_manager.has_session_for_addr(&client_addr);
             {
                 if let Some(entry) = self.handshake_cooldowns.get(&client_addr) {
                     let (fail_count, last_fail) = *entry;
-                    // Exponential cooldown: 2s → 4s → 8s → 16s (max)
-                    let cooldown = Duration::from_millis((2000 * (1 << fail_count.min(3))) as u64);
-                    if !peer_has_session() && last_fail.elapsed() < cooldown {
+                    // Ноль означает короткую паузу живого endpoint, не запрет reconnect.
+                    let cooldown = if fail_count == 0 {
+                        Duration::from_secs(1)
+                    } else {
+                        Duration::from_millis((2000 * (1 << fail_count.min(3))) as u64)
+                    };
+                    if last_fail.elapsed() < cooldown {
                         debug!("Handshake cooldown active for {}: fail_count={}, elapsed={:?}, cooldown={:?}",
                             hash_addr(&client_addr), fail_count, last_fail.elapsed(), cooldown);
                         return Err(Error::InvalidPacket("Handshake cooldown active"));
@@ -240,6 +240,10 @@ impl super::Gateway {
                 );
                 return Err(Error::InvalidPacket("Handshake scan budget exhausted"));
             }
+
+            let _work_lease =
+                super::preauth::PreauthLease::acquire(self.handshake_work_budget.clone())
+                    .ok_or(Error::InvalidPacket("Handshake CPU budget exhausted"))?;
 
             // Try to establish a new session using one of the built-in bootstrap masks.
             // Runtime masks can be server-generated, but bootstrap must remain compatible
@@ -572,9 +576,10 @@ impl super::Gateway {
                             );
                             return Ok(());
                         }
-                        // Track failed handshake for cooldown — but never for a
-                        // peer whose session is still up (see `peer_has_session`).
+                        // Живому endpoint оставляем одну новую попытку в секунду.
                         if peer_has_session() {
+                            self.handshake_cooldowns
+                                .insert(client_addr, (0, Instant::now()));
                             return Err(Error::InvalidPacket(
                                 "Stale packet from an established peer",
                             ));
@@ -585,7 +590,7 @@ impl super::Gateway {
                             .map(|e| e.0)
                             .unwrap_or(0);
                         self.handshake_cooldowns
-                            .insert(client_addr, (fail_count + 1, Instant::now()));
+                            .insert(client_addr, (fail_count.saturating_add(1), Instant::now()));
                         warn!(
                             "Handshake failed for {} (attempt #{}) — tag mismatch for all {} registered clients",
                             hash_addr(&client_addr),

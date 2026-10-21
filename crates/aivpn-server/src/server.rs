@@ -430,19 +430,42 @@ impl AivpnServer {
 }
 
 /// Initialize logging
+fn logging_filter(value: Option<&str>) -> EnvFilter {
+    EnvFilter::builder()
+        .with_default_directive(tracing::Level::INFO.into())
+        .parse_lossy(value.unwrap_or(""))
+}
+
 pub fn init_logging() {
     tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::from_default_env()
-                .add_directive("aivpn_server=debug".parse().unwrap())
-                .add_directive("aivpn_common=debug".parse().unwrap()),
-        )
+        .with_env_filter(logging_filter(std::env::var("RUST_LOG").ok().as_deref()))
         .init();
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_logging_does_not_enable_packet_debug() {
+        use tracing_subscriber::prelude::*;
+        let subscriber = tracing_subscriber::registry().with(logging_filter(None));
+        tracing::subscriber::with_default(subscriber, || {
+            assert!(!tracing::enabled!(target: "aivpn_server", tracing::Level::DEBUG));
+            assert!(tracing::enabled!(target: "aivpn_server", tracing::Level::INFO));
+        });
+    }
+
+    #[test]
+    fn explicit_logging_level_is_not_overridden() {
+        use tracing_subscriber::prelude::*;
+        let subscriber = tracing_subscriber::registry().with(logging_filter(Some("warn")));
+        tracing::subscriber::with_default(subscriber, || {
+            assert!(!tracing::enabled!(target: "aivpn_server", tracing::Level::DEBUG));
+            assert!(!tracing::enabled!(target: "aivpn_common", tracing::Level::INFO));
+            assert!(tracing::enabled!(target: "aivpn_common", tracing::Level::WARN));
+        });
+    }
 
     #[test]
     fn test_server_creation() {

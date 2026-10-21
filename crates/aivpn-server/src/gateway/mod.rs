@@ -79,6 +79,7 @@ mod recording;
 mod control_send;
 
 mod bootstrap;
+mod preauth;
 use bootstrap::bootstrap_epoch;
 pub use bootstrap::{build_bootstrap_descriptors, derive_server_signing_key};
 
@@ -192,6 +193,8 @@ pub struct Gateway {
     /// is defeated by source-IP spoofing, so this bounds the aggregate scan rate.
     /// See `MAX_HANDSHAKE_SCANS_PER_SEC`. Fields: (count, window_start).
     handshake_scan_budget: Arc<parking_lot::Mutex<(u64, Instant)>>,
+    /// Ограничение времени полного перебора, а не только числа его запусков.
+    handshake_work_budget: Arc<parking_lot::Mutex<preauth::PreauthBudget>>,
     /// Neural Resonance Module (Patent 1) — periodic traffic validation
     neural_module: Arc<parking_lot::Mutex<NeuralResonanceModule>>,
     /// R2 Phase D — inline ML-DPI "reads-as-tunnel" gate. A sibling to the neural
@@ -845,6 +848,9 @@ impl Gateway {
             handshake_locks: Arc::new(DashMap::new()),
             fallback_scan_budget: Arc::new(parking_lot::Mutex::new((0, Instant::now()))),
             handshake_scan_budget: Arc::new(parking_lot::Mutex::new((0, Instant::now()))),
+            handshake_work_budget: Arc::new(parking_lot::Mutex::new(preauth::PreauthBudget::new(
+                Instant::now(),
+            ))),
             neural_module: Arc::new(parking_lot::Mutex::new(neural)),
             #[cfg(feature = "neural")]
             dpi_gate: Arc::new(crate::dpi_gate::DpiGate::new(
@@ -2391,15 +2397,125 @@ mod tests {
                 let offset = if embedded { 8 } else { 0 };
                 packet[offset..offset + TAG_SIZE].copy_from_slice(&tag);
                 let resolved = gateway.find_existing_session(&packet, &addr.ip()).unwrap();
-                assert!(
-                    resolved.is_some(),
-                    "Пакеты сессии не должны становиться handshake"
-                );
-                assert_eq!(resolved.unwrap().1, counter);
+                let super::packet_demux::SessionLookup::Found(found) = resolved else {
+                    panic!("Пакеты сессии не должны становиться handshake");
+                };
+                assert_eq!(found.1, counter);
                 session.lock().mark_tag_received(counter);
                 assert!(gateway.find_existing_session(&packet, &addr.ip()).is_err());
             }
         }
+    }
+
+    #[test]
+    fn exhausted_recovery_is_not_reported_as_missing_session() {
+        let gateway = Gateway::new(make_test_gateway_config("recovery-limited")).unwrap();
+        *gateway.fallback_scan_budget.lock() =
+            (super::MAX_FALLBACK_SCANS_PER_SEC, std::time::Instant::now());
+        let result = gateway
+            .find_existing_session(&[0; 64], &"203.0.113.7".parse().unwrap())
+            .unwrap();
+        assert!(matches!(
+            result,
+            super::packet_demux::SessionLookup::RecoveryLimited
+        ));
+    }
+
+    #[tokio::test]
+    async fn established_peer_cannot_repeat_expensive_handshake_without_pause() {
+        use aivpn_common::error::Error;
+        let gateway = Gateway::new(make_test_gateway_config("established-cooldown")).unwrap();
+        let addr = "203.0.113.7:40000".parse().unwrap();
+        gateway
+            .session_manager
+            .create_session(addr, [7; 32], None, None)
+            .unwrap();
+        assert!(gateway.handle_packet(&[0; 64], addr).await.is_err());
+        let result = gateway.handle_packet(&[0; 64], addr).await;
+        assert!(matches!(
+            result,
+            Err(Error::InvalidPacket("Handshake cooldown active"))
+        ));
+        assert_eq!(gateway.handshake_scan_budget.lock().0, 1);
+    }
+
+    #[tokio::test]
+    async fn established_peer_probe_resumes_without_extending_pause_on_each_packet() {
+        let gateway = Gateway::new(make_test_gateway_config("reconnect-probe")).unwrap();
+        let addr = "203.0.113.7:40000".parse().unwrap();
+        gateway
+            .session_manager
+            .create_session(addr, [7; 32], None, None)
+            .unwrap();
+        gateway.handshake_cooldowns.insert(
+            addr,
+            (0, std::time::Instant::now() - Duration::from_secs(1)),
+        );
+        assert!(gateway.handle_packet(&[0; 64], addr).await.is_err());
+        assert_eq!(gateway.handshake_scan_budget.lock().0, 1);
+        let stamp = gateway.handshake_cooldowns.get(&addr).unwrap().1;
+        assert!(gateway.handle_packet(&[0; 64], addr).await.is_err());
+        assert_eq!(gateway.handshake_scan_budget.lock().0, 1);
+        assert_eq!(gateway.handshake_cooldowns.get(&addr).unwrap().1, stamp);
+    }
+
+    #[tokio::test]
+    async fn authenticated_reconnect_is_allowed_after_known_peer_pause() {
+        use aivpn_common::client_wire::{
+            build_inner_packet, build_random_mdh_packet_with_tag_offset,
+        };
+        use aivpn_common::crypto::{self, KeyPair};
+        use aivpn_common::protocol::{ControlPayload, InnerType};
+        let mut gateway = Gateway::new(make_test_gateway_config("real-reconnect")).unwrap();
+        let peer = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = peer.local_addr().unwrap();
+        gateway.udp_socket = Some(Arc::new(
+            tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap(),
+        ));
+        let client = gateway
+            .client_db
+            .as_ref()
+            .unwrap()
+            .add_client("reconnect-test")
+            .unwrap();
+        let old = gateway
+            .session_manager
+            .create_session(addr, [7; 32], Some(client.psk), Some(client.vpn_ip))
+            .unwrap();
+        old.lock().client_id = Some(client.id.clone());
+        let old_id = old.lock().session_id;
+        gateway.handshake_cooldowns.insert(
+            addr,
+            (0, std::time::Instant::now() - Duration::from_secs(1)),
+        );
+        *gateway.fallback_scan_budget.lock() =
+            (super::MAX_FALLBACK_SCANS_PER_SEC, std::time::Instant::now());
+        let kp = KeyPair::generate();
+        let server_pub = gateway.session_manager.server_public_key();
+        let shared = kp.compute_shared(&server_pub).unwrap();
+        let mut eph = kp.public_key_bytes();
+        let keys = crypto::derive_session_keys(&shared, Some(&client.psk), &eph);
+        crypto::obfuscate_eph_pub(&mut eph, &server_pub);
+        let mask = webrtc_zoom_v3();
+        let mdh_len = super::packet_layout_for_mask(&mask).0;
+        let payload = ControlPayload::Keepalive { send_ts: 0 }.encode().unwrap();
+        let inner = build_inner_packet(InnerType::Control, 0, &payload);
+        let packet = build_random_mdh_packet_with_tag_offset(
+            &keys,
+            &mut 0,
+            &inner,
+            Some(&eph),
+            mdh_len,
+            mask.tag_offset,
+        )
+        .unwrap();
+        gateway.handle_packet(&packet, addr).await.unwrap();
+        assert!(gateway.session_manager.get_session(&old_id).is_none());
+        let replacement = gateway
+            .session_manager
+            .get_session_by_vpn_ip(&client.vpn_ip)
+            .unwrap();
+        assert_ne!(replacement.lock().session_id, old_id);
     }
 
     /// `distinct_tag_offsets()` must merge the cached preset offsets with
