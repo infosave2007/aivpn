@@ -34,7 +34,7 @@
 - **Enforced signatures in `production-secure`** - secure builds require trusted signing keys and artifact verification. The mask generator signs both forward and reverse profiles, and Ed25519 verification rejects small-order public keys.
 - **Signed release artifacts** - CI signs server binaries and mask archives with Ed25519 and checks that the configured signing keys match. The SSH installer verifies downloaded artifacts against a separately trusted public key; HTTPS downloads enforce size and redirect-address limits.
 - **Persistent Windows kill-switch** - dedicated Windows Filtering Platform filters are updated in one transaction and survive a client crash. Explicit disconnect removes the filters and reports cleanup failures; unrelated firewall policies are preserved.
-- **Dependency fixes** - updated affected Rust and web dependencies, including `quinn-proto` 0.11.18, `rustls` 0.23.46 and the vendored `cryoglyph` dependency on `lru`. A local `braces` patch caps parser nesting at 128 levels and has regression coverage; version-based audit tools still report the unchanged `3.0.3` package version.
+- **Dependency fixes** - updated affected Rust and web dependencies, including `quinn-proto` 0.11.18, `rustls` 0.23.46, `rustls-webpki` 0.103.16, `webpki-roots` 1.0.10 and the vendored `cryoglyph` dependency on `lru`. A local `braces` patch caps parser nesting at 128 levels and has regression coverage; version-based audit tools still report the unchanged `3.0.3` package version.
 
 ### Changed
 
@@ -97,6 +97,7 @@
 
 ### Безопасность
 
+- **Проверка TLS-сертификатов** - `rustls-webpki` обновлен до 0.103.16, `webpki-roots` до 1.0.10. Устранены RUSTSEC-2026-0382 и RUSTSEC-2026-0381: цепочки с отозванными промежуточными ключами emSign больше не принимаются, связанный корневой сертификат удален из набора доверия. Проверка `cargo-audit` в CI остается обязательной, исключения для этих уязвимостей не добавлены.
 - **Права межсерверных узлов и отзыв действующих соединений** - площадки обмениваются маршрутами и трафиком без прав на БД пула или управление. Источник SiteData проверяется по подсетям аутентифицированного узла; строгий enrollment связывает идентичность с handshake. Общий ключ площадок поддерживает список разрешенных идентичностей и должен отличаться от ключа пула. Отзыв проверяется на действующих соединениях, старая сессия не получает права узла, зарегистрированного повторно с новым ключом.
 - **Постоянные ключи и реестр доверия** - ключи устройства и узла устанавливаются атомарно без перезаписи ключа другого процесса. Поврежденные ключи не заменяются молча. Доверие к узлу выдается только после успешного сохранения; повреждение, исчезновение или подмена реестра ссылкой запрещают доступ.
 - **Обязательные подписи в `production-secure`** - защищенная сборка требует доверенных ключей подписи и проверки артефактов. Генератор подписывает прямой и обратный профили масок, проверка Ed25519 отклоняет открытые ключи малого порядка.
