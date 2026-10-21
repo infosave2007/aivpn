@@ -461,14 +461,6 @@ impl super::AivpnClient {
                 // server's (single) ratchet. So: skip the crypto, just prod
                 // the server again with fresh confirmation traffic.
                 let is_duplicate_hello = self.ratcheted_server_eph_pub == Some(server_eph_pub);
-                // Receiving ANY ServerHello is the real proof the server answered
-                // — this is the §2 L2 failure-attribution signal. The optimistic
-                // zero-RTT "Connected" transition in connect() happens with no
-                // server contact at all (UDP connect never round-trips), so a
-                // DPI-blocked mask (server silently dropped) must NOT be counted
-                // as a success. Mark here, matching the iOS/Android cores which
-                // set EVER_CONNECTED only after processing a ServerHello.
-                self.ever_connected.store(true, Ordering::Relaxed);
                 if is_duplicate_hello {
                     debug!(
                         "Duplicate ServerHello for already-ratcheted eph_pub — \
@@ -781,6 +773,13 @@ impl super::AivpnClient {
                     } else {
                         warn!("control_tx not initialized, skipping keepalive warmup");
                     }
+                }
+
+                // Только успешный ServerHello подтверждает соединение: connect()
+                // поднимает локальный туннель еще до ответа сервера. Повторный
+                // ServerHello или ratchet не создают новое событие connected.
+                if !self.ever_connected.swap(true, Ordering::Relaxed) {
+                    println!("AIVPN-STATUS connected {}", self.config.tun_config.tun_addr);
                 }
             }
             ControlPayload::Keepalive { .. } => {

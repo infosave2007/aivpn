@@ -1402,6 +1402,7 @@ pub async fn run(
                         "No valid bootstrap descriptors available and fallback disabled. \
                          Ensure multi-channel bootstrap is configured or descriptors are cached."
                     );
+                    println!("AIVPN-STATUS reconnecting");
                     tokio::time::sleep(backoff).await;
                     backoff = std::cmp::min(backoff * 2, max_backoff);
                     continue;
@@ -1415,6 +1416,7 @@ pub async fn run(
                     Some(mask) => mask,
                     None => {
                         error!("No valid bootstrap descriptors available");
+                        println!("AIVPN-STATUS reconnecting");
                         tokio::time::sleep(backoff).await;
                         backoff = std::cmp::min(backoff * 2, max_backoff);
                         continue;
@@ -1809,7 +1811,8 @@ pub async fn run(
                                 handshake_reject_message(client.reject_reason())
                             );
                             client.deactivate_kill_switch();
-                            break;
+                            // Сохраняем rejected последним статусом для читателя stdout.
+                            return;
                         }
                         // A connection that stayed up beyond the healthy threshold is
                         // treated as a genuinely established session, so its backoff
@@ -1844,9 +1847,11 @@ pub async fn run(
             break;
         }
 
+        println!("AIVPN-STATUS reconnecting");
         tokio::time::sleep(backoff).await;
         backoff = std::cmp::min(backoff * 2, max_backoff);
     }
+    println!("AIVPN-STATUS disconnected");
 }
 
 /// Parse an `aivpn://` connection key and return the decoded JSON value.

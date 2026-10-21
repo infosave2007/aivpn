@@ -488,14 +488,8 @@ pub struct AivpnClient {
     // Traffic counters
     bytes_sent: Arc<AtomicU64>,
     bytes_received: Arc<AtomicU64>,
-    /// Client's currently-effective VPN IP (the `client_ip` half of the last
-    /// applied `ClientNetworkConfig`). Seeded from the static key's `i` field
-    /// at construction and updated live by `apply_server_network_override` on
-    /// every server-confirmed network change, including a pool re-home that
-    /// assigns a different IP than the key's. Shared with the stats-writer
-    /// task (below) so file-based GUIs (Windows, whose child stdout is piped
-    /// to `Stdio::null()`) can observe the re-home the same way Linux's
-    /// stdout `AIVPN-STATUS` line does.
+    /// Текущий VPN IP для traffic.stats. Начальное значение берется из конфига,
+    /// а apply_server_network_override обновляет его при смене адреса сервером.
     current_vpn_ip: Arc<Mutex<String>>,
     // Pre-allocated buffers for zero-copy I/O (OPTIMIZATION)
     _send_buf: Vec<u8>,
@@ -980,6 +974,8 @@ impl AivpnClient {
     /// it directly: the tunnel still needs the server's address for its own
     /// routing (the host route and the kill-switch exemption are keyed on it).
     async fn finish_connect(&mut self, server_addr: SocketAddr) -> Result<()> {
+        self.ever_connected.store(false, Ordering::Relaxed);
+
         // Auto-detect kernel acceleration (Linux only).
         #[cfg(target_os = "linux")]
         {
@@ -1169,22 +1165,12 @@ impl AivpnClient {
         self.config.tun_config =
             TunnelConfig::from_network_config(tun_name, network_config, full_tunnel);
 
-        // HIGH #2 (client parity): this override just applied a genuinely
-        // different network config — either the first server confirmation of
-        // this session, or a pool re-home to a different server-assigned VPN
-        // IP than the one derived from the static key. Publish the new IP on
-        // both channels the GUIs consume: the shared value read by the
-        // stats-writer task's traffic.stats `ip:` field (Windows pipes the
-        // child's stdout to Stdio::null(), so it can only observe this via
-        // the stats file), and the "AIVPN-STATUS connected <ip>" stdout line
-        // the Linux GUI already parses (previously never emitted — it only
-        // had an unreachable doc comment describing this exact protocol).
+        // Обновляем IP в статистике. Событие connected отправляет обработчик
+        // ServerHello после успешного ratchet, независимо от смены сети.
         *self
             .current_vpn_ip
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = new_client_ip.to_string();
-        println!("AIVPN-STATUS connected {}", new_client_ip);
-
         Ok(())
     }
 
@@ -1679,6 +1665,194 @@ mod tests {
             remote_enroll_hook: None,
             transport: None,
         }
+    }
+
+    fn server_hello_stdout(scenario: &str) -> Vec<String> {
+        let home = std::env::temp_dir().join(format!(
+            "aivpn-hello-status-{:032x}",
+            rand::random::<u128>()
+        ));
+        std::fs::create_dir(&home).unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "client::tests::test_server_hello_stdout_scenario",
+                "--nocapture",
+            ])
+            .env("AIVPN_TEST_HELLO_SCENARIO", scenario)
+            .env("HOME", &home)
+            .env("XDG_CONFIG_HOME", &home)
+            .env("XDG_RUNTIME_DIR", &home)
+            .output()
+            .unwrap();
+        std::fs::remove_dir_all(home).unwrap();
+        assert!(
+            output.status.success(),
+            "Сценарий {scenario} завершился ошибкой:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .filter_map(|line| {
+                line.find("AIVPN-STATUS ")
+                    .map(|offset| line[offset..].trim().to_string())
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn test_server_hello_stdout_scenario() {
+        // Отдельный процесс позволяет проверить stdout без перехвата вывода других тестов.
+        let Ok(scenario) = std::env::var("AIVPN_TEST_HELLO_SCENARIO") else {
+            return;
+        };
+        let mut config = make_test_config();
+        config.server_public_key = KeyPair::generate().public_key_bytes();
+        config.proxy_listen = Some("127.0.0.1:0".parse().unwrap());
+        let mut client = AivpnClient::new(config).unwrap();
+        client
+            .finish_connect("127.0.0.1:443".parse().unwrap())
+            .await
+            .unwrap();
+        if scenario == "no_hello" {
+            assert!(!client.ever_connected());
+            return;
+        }
+
+        let mut network_config = client.config.tun_config.client_network_config().unwrap();
+        if matches!(scenario.as_str(), "changed" | "missing_keys") {
+            network_config.client_ip = "10.0.0.4".parse().unwrap();
+        }
+        let mut hello = ControlPayload::ServerHello {
+            server_eph_pub: KeyPair::generate().public_key_bytes(),
+            signature: [0; 64],
+            network_config: (scenario != "no_override").then_some(network_config),
+        };
+        if scenario == "invalid_signature" {
+            client.config.server_signing_key = Some(
+                ed25519_dalek::SigningKey::from_bytes(&[42; 32])
+                    .verifying_key()
+                    .to_bytes(),
+            );
+            assert!(client.handle_server_control(hello).await.is_err());
+            return;
+        }
+        if scenario == "missing_keys" {
+            client.session_keys = None;
+            assert!(client.handle_server_control(hello).await.is_err());
+            return;
+        }
+
+        client.handle_server_control(hello.clone()).await.unwrap();
+        assert!(client.ever_connected());
+        match scenario.as_str() {
+            "duplicate" => {
+                client.handle_server_control(hello).await.unwrap();
+            }
+            "reratchet" | "network_update" => {
+                if let ControlPayload::ServerHello {
+                    server_eph_pub,
+                    network_config,
+                    ..
+                } = &mut hello
+                {
+                    *server_eph_pub = KeyPair::generate().public_key_bytes();
+                    if scenario == "network_update" {
+                        network_config.as_mut().unwrap().client_ip = "10.0.0.4".parse().unwrap();
+                    }
+                }
+                client.handle_server_control(hello).await.unwrap();
+                if scenario == "network_update" {
+                    assert_eq!(*client.current_vpn_ip.lock().unwrap(), "10.0.0.4");
+                }
+            }
+            "reconnect" => {
+                client.disconnect().await;
+                client
+                    .finish_connect("127.0.0.1:443".parse().unwrap())
+                    .await
+                    .unwrap();
+                client.handle_server_control(hello).await.unwrap();
+            }
+            "same" | "changed" | "no_override" => {}
+            _ => panic!("Неизвестный сценарий"),
+        }
+    }
+
+    #[test]
+    fn test_connected_stdout_for_matching_network() {
+        assert_eq!(
+            server_hello_stdout("same"),
+            ["AIVPN-STATUS connected 10.0.0.2"]
+        );
+    }
+
+    #[test]
+    fn test_connected_stdout_without_network_override() {
+        assert_eq!(
+            server_hello_stdout("no_override"),
+            ["AIVPN-STATUS connected 10.0.0.2"]
+        );
+    }
+
+    #[test]
+    fn test_connected_stdout_uses_server_assigned_ip() {
+        assert_eq!(
+            server_hello_stdout("changed"),
+            ["AIVPN-STATUS connected 10.0.0.4"]
+        );
+    }
+
+    #[test]
+    fn test_connected_stdout_not_repeated_for_duplicate_hello() {
+        assert_eq!(
+            server_hello_stdout("duplicate"),
+            ["AIVPN-STATUS connected 10.0.0.2"]
+        );
+    }
+
+    #[test]
+    fn test_connected_stdout_not_repeated_for_reratchet() {
+        assert_eq!(
+            server_hello_stdout("reratchet"),
+            ["AIVPN-STATUS connected 10.0.0.2"]
+        );
+    }
+
+    #[test]
+    fn test_connected_stdout_not_repeated_for_network_update() {
+        assert_eq!(
+            server_hello_stdout("network_update"),
+            ["AIVPN-STATUS connected 10.0.0.2"]
+        );
+    }
+
+    #[test]
+    fn test_connected_stdout_emitted_again_after_reconnect() {
+        assert_eq!(
+            server_hello_stdout("reconnect"),
+            [
+                "AIVPN-STATUS connected 10.0.0.2",
+                "AIVPN-STATUS connected 10.0.0.2",
+            ]
+        );
+    }
+
+    #[test]
+    fn test_connected_stdout_waits_for_server_hello() {
+        assert!(server_hello_stdout("no_hello").is_empty());
+    }
+
+    #[test]
+    fn test_connected_stdout_not_emitted_for_invalid_signature() {
+        assert!(server_hello_stdout("invalid_signature").is_empty());
+    }
+
+    #[test]
+    fn test_connected_stdout_not_emitted_when_ratchet_fails() {
+        assert!(server_hello_stdout("missing_keys").is_empty());
     }
 
     // ── initial state ─────────────────────────────────────────────────────────
