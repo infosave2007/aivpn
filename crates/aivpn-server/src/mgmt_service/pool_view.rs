@@ -33,16 +33,9 @@ use serde::{Deserialize, Serialize};
 // "represent what you can" per the module's design brief, never silently
 // hide a peer just because the two identity systems don't line up.
 //
-// **Legacy-transport degradation**: [`PoolDialer`]/[`crate::node_registry::
-// NodeRegistry`] are ONLY ever constructed on a masked-transport node (see
-// `main.rs`'s pool-sync wiring) — the legacy, mask-independent `PeerSyncer`
-// path has no dialed sessions and therefore no notion of "peer link state"
-// at all. A node running legacy pool sync (or no pool sync) simply has no
-// `PoolDialer`/`NodeRegistry` to build a snapshot from; both call sites
-// detect this and hand `dispatch` a degraded [`PoolSnapshot::empty`]
-// (`transport: "legacy"` or `"none"`) instead of attempting to call into
-// either type — see those call sites' doc comments for how they tell the
-// two degraded cases apart.
+// Живой транспорт только masked. Пустой `pool.transport` тоже masked.
+// Явный legacy не показывается отдельным режимом: в снимке это `"masked"`.
+// `"none"` остается меткой узла без пула. Без `PoolDialer` списки пустые.
 
 /// One pool node as reported by [`build_pool_snapshot`]. `node_id` is
 /// always populated (falling back to the address string when no crypto
@@ -90,14 +83,20 @@ pub struct PoolLinkInfo {
     pub subnet_mismatch: bool,
 }
 
+/// Метка для ответа API. Пустое значение и `"legacy"` показываются как masked.
+fn displayed_transport(transport: &str) -> String {
+    match transport {
+        "legacy" | "" => "masked".to_string(),
+        other => other.to_string(),
+    }
+}
+
 /// Aggregate pool-sync health summary, as reported by [`build_pool_snapshot`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PoolHealth {
-    /// `"masked"` (this node runs [`crate::pool_dialer::PoolDialer`]),
-    /// `"legacy"` (pool sync is configured but runs the mask-independent
-    /// `PeerSyncer`, which has no queryable link state — see the module
-    /// doc's legacy-transport note), or `"none"` (pool sync isn't
-    /// configured on this node at all).
+    /// `"masked"`: узел на PoolDialer. Пустой transport и старая метка `"legacy"`
+    /// тоже показываются как `"masked"`, отдельного legacy-режима нет.
+    /// `"none"`: пул на узле не задан.
     pub transport: String,
     pub total_nodes: usize,
     pub connected_peers: usize,
@@ -117,11 +116,10 @@ pub struct PoolHealth {
 }
 
 impl PoolHealth {
-    /// The degraded health view for `transport` `"legacy"` or `"none"` —
-    /// see [`PoolSnapshot::empty`].
+    /// Пустой снимок. `"legacy"` и пустая строка отображаются как `"masked"`.
     pub(crate) fn empty(transport: &str) -> Self {
         Self {
-            transport: transport.to_string(),
+            transport: displayed_transport(transport),
             total_nodes: 0,
             connected_peers: 0,
             converged_peers: 0,
@@ -143,12 +141,9 @@ pub struct PoolSnapshot {
 }
 
 impl PoolSnapshot {
-    /// The degraded snapshot a call site hands `MgmtCtx::pool` when there is
-    /// no live [`crate::pool_dialer::PoolDialer`] to build a real one from —
-    /// `transport` should be `"legacy"` (pool sync configured, but running
-    /// the legacy mask-independent transport) or `"none"` (pool sync isn't
-    /// configured at all). Never an error condition: the `pool/*` routes
-    /// always return `200` for this.
+    /// Снимок без живого [`crate::pool_dialer::PoolDialer`].
+    /// `"none"`: пул не задан. `"masked"`, пустая строка и `"legacy"`
+    /// показываются как `"masked"`. Маршруты `pool/*` отвечают 200.
     pub fn empty(transport: &str) -> Self {
         Self {
             nodes: Vec::new(),
@@ -175,10 +170,8 @@ pub struct PoolSnapshotInputs<'a> {
     /// `PoolDialer::pool_status_snapshot()` — retained per-peer sync state,
     /// keyed by dialed peer address.
     pub statuses: &'a [(String, crate::pool_dialer::PeerSyncStatus)],
-    /// Always `"masked"` from both real call sites (this function is only
-    /// ever called when a live `PoolDialer` exists) — taken as a parameter
-    /// rather than hardcoded so a test can exercise the merge logic without
-    /// asserting a specific literal.
+    /// Метка транспорта. Живой dialer передает `"masked"`.
+    /// `"legacy"` при отображении заменяется на `"masked"`.
     pub transport: &'a str,
 }
 
@@ -267,7 +260,7 @@ pub fn build_pool_snapshot(inputs: PoolSnapshotInputs) -> PoolSnapshot {
         nodes: nodes.into_values().collect(),
         links,
         health: PoolHealth {
-            transport: inputs.transport.to_string(),
+            transport: displayed_transport(inputs.transport),
             total_nodes,
             connected_peers,
             converged_peers,
@@ -431,17 +424,19 @@ mod tests {
         assert_eq!(snap.health.total_nodes, 0);
         assert!(!snap.health.diverged);
     }
-    /// `PoolSnapshot::empty` — the degraded value both call sites hand
-    /// `MgmtCtx::pool` when there's no live `PoolDialer` — must always yield
-    /// empty lists and echo the given transport label.
+    /// Без dialer списки пустые. Метка по умолчанию masked, в том числе если
+    /// вызывающий код еще передает старое `"legacy"`. `"none"` не подменяется.
     #[test]
-    fn pool_snapshot_empty_has_given_transport_and_empty_lists() {
-        for transport in ["legacy", "none"] {
+    fn pool_snapshot_empty_defaults_to_masked_and_keeps_none() {
+        for transport in ["legacy", "", "masked"] {
             let snap = PoolSnapshot::empty(transport);
             assert!(snap.nodes.is_empty());
             assert!(snap.links.is_empty());
-            assert_eq!(snap.health.transport, transport);
+            assert_eq!(snap.health.transport, "masked");
             assert_eq!(snap.health.total_nodes, 0);
         }
+        let none = PoolSnapshot::empty("none");
+        assert_eq!(none.health.transport, "none");
+        assert!(none.nodes.is_empty());
     }
 }

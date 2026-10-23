@@ -15,11 +15,11 @@ impl super::AivpnClient {
                 // payload checked out — never merely because a key is absent.
                 let mut transport_verified = false;
                 if let Some(signing_key) = &self.config.server_signing_key {
-                    use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+                    use ed25519_dalek::{Signature, VerifyingKey};
                     match VerifyingKey::from_bytes(signing_key) {
                         Ok(vk) => {
                             let sig = Signature::from_bytes(&signature);
-                            if vk.verify(&mask_data, &sig).is_err() {
+                            if vk.verify_strict(&mask_data, &sig).is_err() {
                                 warn!("MaskUpdate rejected: invalid ed25519 signature");
                                 return Ok(());
                             }
@@ -414,14 +414,14 @@ impl super::AivpnClient {
                 // Verify ed25519 signature over (server_eph_pub || client_eph_pub).
                 // The server signs this tuple in session.rs create_session().
                 if let Some(signing_key) = &self.config.server_signing_key {
-                    use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+                    use ed25519_dalek::{Signature, VerifyingKey};
                     match VerifyingKey::from_bytes(signing_key) {
                         Ok(vk) => {
                             let mut msg = Vec::with_capacity(64);
                             msg.extend_from_slice(&server_eph_pub);
                             msg.extend_from_slice(&self.keypair.public_key_bytes());
                             let sig = Signature::from_bytes(&signature);
-                            if vk.verify(&msg, &sig).is_err() {
+                            if vk.verify_strict(&msg, &sig).is_err() {
                                 error!(
                                     "ServerHello rejected: ed25519 signature verification failed \
                                      — possible MITM attack"
@@ -437,6 +437,14 @@ impl super::AivpnClient {
                             )));
                         }
                     }
+                }
+
+                if !aivpn_common::client_wire::server_hello_matches_connection(
+                    self.ratcheted_server_eph_pub,
+                    &server_eph_pub,
+                ) {
+                    warn!("ServerHello другого узла после завершенного handshake проигнорирован");
+                    return Ok(());
                 }
 
                 if let Some(network_config) = network_config {
@@ -461,14 +469,6 @@ impl super::AivpnClient {
                 // server's (single) ratchet. So: skip the crypto, just prod
                 // the server again with fresh confirmation traffic.
                 let is_duplicate_hello = self.ratcheted_server_eph_pub == Some(server_eph_pub);
-                // Receiving ANY ServerHello is the real proof the server answered
-                // — this is the §2 L2 failure-attribution signal. The optimistic
-                // zero-RTT "Connected" transition in connect() happens with no
-                // server contact at all (UDP connect never round-trips), so a
-                // DPI-blocked mask (server silently dropped) must NOT be counted
-                // as a success. Mark here, matching the iOS/Android cores which
-                // set EVER_CONNECTED only after processing a ServerHello.
-                self.ever_connected.store(true, Ordering::Relaxed);
                 if is_duplicate_hello {
                     debug!(
                         "Duplicate ServerHello for already-ratcheted eph_pub — \
@@ -533,6 +533,20 @@ impl super::AivpnClient {
                     #[cfg(target_os = "linux")]
                     self.kernel_install_session();
                 }
+
+                // Initial-пакеты не меняют состояние сервера. Возможности
+                // объявляются только под установленными PFS ключами.
+                let _ = self
+                    .send_control(&ControlPayload::Capabilities {
+                        role: 0,
+                        features: aivpn_common::protocol::CLIENT_PACKET_FEATURES
+                            | if self.adaptive_level.fec_n() > 0 {
+                                aivpn_common::protocol::CLIENT_FEC_ACTIVE
+                            } else {
+                                0
+                            },
+                    })
+                    .await;
 
                 // The following client-identity announcements (mTLS cert,
                 // recording status, device enrollment) only make sense for an
@@ -782,6 +796,18 @@ impl super::AivpnClient {
                         warn!("control_tx not initialized, skipping keepalive warmup");
                     }
                 }
+
+                // Только успешный ServerHello подтверждает соединение: connect()
+                // поднимает локальный туннель еще до ответа сервера. Повторный
+                // ServerHello или ratchet не создают новое событие connected.
+                if !self.ever_connected.swap(true, Ordering::Relaxed) {
+                    if self.config.proxy_listen.is_none() && !self.config.control_only {
+                        if let Some(gate) = &self.dns_proxy_gate {
+                            gate.set_tunnel(self.tunnel.name());
+                        }
+                    }
+                    println!("AIVPN-STATUS connected {}", self.config.tun_config.tun_addr);
+                }
             }
             ControlPayload::Keepalive { .. } => {
                 debug!("Keepalive from server");
@@ -800,7 +826,8 @@ impl super::AivpnClient {
                 } else if status == "analyzing" {
                     self.active_recording_session = None;
                 }
-                crate::record_cmd::handle_recording_ack(&session_id, &status);
+                self.recording_status
+                    .handle_recording_ack(&session_id, &status);
             }
             ControlPayload::RecordingComplete {
                 service,
@@ -808,17 +835,19 @@ impl super::AivpnClient {
                 confidence,
             } => {
                 self.active_recording_session = None;
-                crate::record_cmd::handle_recording_complete(&service, &mask_id, confidence);
+                self.recording_status
+                    .handle_recording_complete(&service, &mask_id, confidence);
             }
             ControlPayload::RecordingFailed { reason } => {
                 self.active_recording_session = None;
-                crate::record_cmd::handle_recording_failed(&reason);
+                self.recording_status.handle_recording_failed(&reason);
             }
             ControlPayload::RecordingStatus {
                 can_record,
                 active_service,
             } => {
-                crate::record_cmd::handle_recording_status(can_record, active_service.as_deref());
+                self.recording_status
+                    .handle_recording_status(can_record, active_service.as_deref());
             }
             ControlPayload::CertRejected {} => {
                 warn!("mTLS: server rejected the certificate — re-provision your mTLS cert");
@@ -839,7 +868,7 @@ impl super::AivpnClient {
                     let rtt_us = now_ms.saturating_sub(sent_ms).saturating_mul(1000);
                     self.quality_tracker.record_rtt(rtt_us);
                     let score = self.quality_tracker.score();
-                    Self::write_quality_file(
+                    self.write_quality_file(
                         score,
                         self.quality_tracker.rtt_ms(),
                         self.quality_tracker.jitter_ms(),
@@ -950,7 +979,8 @@ impl super::AivpnClient {
             | ControlPayload::PoolBucketDigests { .. }
             | ControlPayload::RouteSync { .. }
             | ControlPayload::PartitionAnnounce { .. }
-            | ControlPayload::ChainForward { .. } => {
+            | ControlPayload::ChainForward { .. }
+            | ControlPayload::SiteData { .. } => {
                 // Normal end-user clients have no use for these pool
                 // anti-entropy messages (or, for `ChainForward`, a reverse
                 // exit reply) and silently ignore them, exactly as before —
@@ -994,8 +1024,46 @@ impl super::AivpnClient {
             } => {
                 self.mgmt.on_mgmt_response(req_id, status, body);
             }
-            ControlPayload::NodeEnrollment { .. }
-            | ControlPayload::MaskFeedback { .. }
+            ControlPayload::NodeEnrollment {
+                node_id,
+                node_pub,
+                time_window,
+                signature,
+            } => {
+                // Обратное доказательство узла, которому мы сами позвонили.
+                // Без транскрипта сессии проверку не делаем.
+                if let (Some(hook), Some(slot)) = (
+                    &self.config.remote_enroll_hook,
+                    &self.config.remote_verified_node,
+                ) {
+                    let Some(server_eph) = self.ratcheted_server_eph_pub else {
+                        warn!("NodeEnrollment dropped: session transcript is not ready");
+                        return Ok(());
+                    };
+                    let client_eph = self.keypair.public_key_bytes();
+                    if let Some(id) = (hook.0)(
+                        &node_id,
+                        &node_pub,
+                        time_window,
+                        &signature,
+                        &server_eph,
+                        &client_eph,
+                    ) {
+                        if let Ok(mut guard) = slot.lock() {
+                            *guard = Some(id);
+                        }
+                        if let Some(tap) = &self.config.inbound_control_tap {
+                            let _ = tap.try_send(ControlPayload::NodeEnrollment {
+                                node_id,
+                                node_pub,
+                                time_window,
+                                signature,
+                            });
+                        }
+                    }
+                }
+            }
+            ControlPayload::MaskFeedback { .. }
             | ControlPayload::MgmtRequest { .. }
             | ControlPayload::RecordingStart { .. }
             | ControlPayload::RecordingStop { .. }

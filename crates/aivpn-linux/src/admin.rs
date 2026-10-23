@@ -135,6 +135,7 @@ pub async fn mgmt_call(
 
     let mut tmp_path: Option<PathBuf> = None;
     let mut cmd = tokio::process::Command::new(&bin);
+    cmd.env_remove("AIVPN_ADMIN_LISTEN");
     cmd.args(["mgmt", "--method", method.as_clap_arg(), "--path", path]);
     if let Some(b) = body {
         let p = std::env::temp_dir().join(format!("aivpn-admin-body-{}.json", scratch_suffix()));
@@ -303,6 +304,7 @@ pub async fn audit_log() -> Result<AuditLogView, String> {
 pub async fn get_role() -> Result<u8, String> {
     let bin = find_client_binary()?;
     let out = tokio::process::Command::new(&bin)
+        .env_remove("AIVPN_ADMIN_LISTEN")
         .arg("role")
         .output()
         .await

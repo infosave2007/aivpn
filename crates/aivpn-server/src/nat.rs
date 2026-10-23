@@ -160,10 +160,22 @@ pub fn setup_nat66(tun_name: &str, prefix: &str) -> std::result::Result<(), Stri
     use std::io::Write as _;
     use std::process::{Command, Stdio};
 
-    // Enable IPv6 forwarding (idempotent).
+    NatForwarder::validate_tun_name(tun_name).map_err(|e| e.to_string())?;
+    let (address, length) = prefix.split_once('/').ok_or("invalid IPv6 prefix")?;
+    let address: std::net::Ipv6Addr = address.parse().map_err(|_| "invalid IPv6 address")?;
+    let length: u8 = length.parse().map_err(|_| "invalid IPv6 prefix length")?;
+    if !(1..=96).contains(&length) {
+        return Err("invalid IPv6 prefix length".into());
+    }
+    let prefix = format!("{address}/{length}");
+    let prefix = prefix.as_str();
+
+    // Ошибка настройки forwarding должна остановить запуск IPv6.
+
     let fwd = std::fs::read_to_string("/proc/sys/net/ipv6/conf/all/forwarding").unwrap_or_default();
     if fwd.trim() != "1" {
-        let _ = std::fs::write("/proc/sys/net/ipv6/conf/all/forwarding", "1");
+        std::fs::write("/proc/sys/net/ipv6/conf/all/forwarding", "1")
+            .map_err(|e| format!("enable IPv6 forwarding: {e}"))?;
     }
 
     let use_nft = Command::new("nft")
@@ -201,7 +213,9 @@ pub fn setup_nat66(tun_name: &str, prefix: &str) -> std::result::Result<(), Stri
             .map_err(|e| format!("nft spawn (nat66): {e}"))?;
 
         if let Some(stdin) = child.stdin.as_mut() {
-            let _ = stdin.write_all(ruleset.as_bytes());
+            stdin
+                .write_all(ruleset.as_bytes())
+                .map_err(|e| format!("write NAT66 rules: {e}"))?;
         }
         let out = child
             .wait_with_output()
@@ -229,7 +243,7 @@ pub fn setup_nat66(tun_name: &str, prefix: &str) -> std::result::Result<(), Stri
                 "-j",
                 "MASQUERADE",
             ],
-        );
+        )?;
         ip6t_ensure(
             "filter",
             "FORWARD",
@@ -243,7 +257,7 @@ pub fn setup_nat66(tun_name: &str, prefix: &str) -> std::result::Result<(), Stri
                 "-j",
                 "ACCEPT",
             ],
-        );
+        )?;
         ip6t_ensure(
             "filter",
             "FORWARD",
@@ -261,7 +275,7 @@ pub fn setup_nat66(tun_name: &str, prefix: &str) -> std::result::Result<(), Stri
                 "-j",
                 "ACCEPT",
             ],
-        );
+        )?;
         info!("ip6tables: aivpn NAT66 + forward rules installed");
     }
 
@@ -350,27 +364,29 @@ pub fn teardown_nat66(_tun_name: &str, _prefix: &str) -> std::result::Result<(),
 
 /// Add an ip6tables rule only if an identical rule does not already exist.
 #[cfg(target_os = "linux")]
-fn ip6t_ensure(table: &str, chain: &str, rule: &[&str]) {
+fn ip6t_ensure(table: &str, chain: &str, rule: &[&str]) -> std::result::Result<(), String> {
     use std::process::Command;
-    let mut check: Vec<&str> = vec!["-t", table, "-C", chain];
+    let mut check = vec!["-t", table, "-C", chain];
     check.extend_from_slice(rule);
-    let exists = Command::new("ip6tables")
+    let output = Command::new("ip6tables")
         .args(&check)
         .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
-    if !exists {
-        let mut add: Vec<&str> = vec!["-t", table, "-A", chain];
+        .map_err(|e| format!("ip6tables check: {e}"))?;
+    if !output.status.success() {
+        let mut add = vec!["-t", table, "-A", chain];
         add.extend_from_slice(rule);
-        if let Ok(out) = Command::new("ip6tables").args(&add).output() {
-            if !out.status.success() {
-                warn!(
-                    "ip6tables add failed: {}",
-                    String::from_utf8_lossy(&out.stderr)
-                );
-            }
+        let output = Command::new("ip6tables")
+            .args(&add)
+            .output()
+            .map_err(|e| format!("ip6tables add: {e}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "ip6tables add failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ));
         }
     }
+    Ok(())
 }
 
 /// Delete an ip6tables rule (best-effort; silently ignores "not found").
@@ -438,11 +454,11 @@ impl NatForwarder {
         });
 
         let dev = tun::create_as_async(&config)
-            .map_err(|e| Error::Io(io::Error::new(io::ErrorKind::Other, e.to_string())))?;
+            .map_err(|e| Error::Io(io::Error::other(e.to_string())))?;
 
         let (writer, reader) = dev
             .split()
-            .map_err(|e| Error::Io(io::Error::new(io::ErrorKind::Other, e.to_string())))?;
+            .map_err(|e| Error::Io(io::Error::other(e.to_string())))?;
         self.writer_taken = Some(Mutex::new(Some(writer)));
         self.reader = Some(Mutex::new(Some(reader)));
 
@@ -501,8 +517,7 @@ impl NatForwarder {
                             // conflict with.
                             warn!("nftables setup failed ({}) — falling back to iptables", e);
                             self.setup_iptables().map_err(|ipt_e| {
-                                Error::Io(io::Error::new(
-                                    io::ErrorKind::Other,
+                                Error::Io(io::Error::other(
                                     format!(
                                         "firewall setup failed on both backends: nftables: {}; iptables: {}",
                                         e, ipt_e
@@ -546,7 +561,7 @@ impl NatForwarder {
 
     /// Validate that tun_name is safe to interpolate into nftables/iptables
     /// format strings (H-S-3). Accepts names matching ^[a-z][a-z0-9_-]{0,14}$.
-    fn validate_tun_name(name: &str) -> Result<()> {
+    pub(crate) fn validate_tun_name(name: &str) -> Result<()> {
         let ok = !name.is_empty()
             && name.len() <= 15
             && name.starts_with(|c: char| c.is_ascii_lowercase())
@@ -606,23 +621,15 @@ impl NatForwarder {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .map_err(|e| {
-                Error::Io(io::Error::new(
-                    io::ErrorKind::Other,
-                    format!("nft spawn: {e}"),
-                ))
-            })?;
+            .map_err(|e| Error::Io(io::Error::other(format!("nft spawn: {e}"))))?;
 
         if let Some(stdin) = child.stdin.as_mut() {
             let _ = stdin.write_all(ruleset.as_bytes());
         }
 
-        let out = child.wait_with_output().map_err(|e| {
-            Error::Io(io::Error::new(
-                io::ErrorKind::Other,
-                format!("nft wait: {e}"),
-            ))
-        })?;
+        let out = child
+            .wait_with_output()
+            .map_err(|e| Error::Io(io::Error::other(format!("nft wait: {e}"))))?;
 
         if out.status.success() {
             info!("nftables: aivpn table installed (NAT + forward + MSS clamp)");
@@ -635,23 +642,20 @@ impl NatForwarder {
             // mirroring setup_nat66, which already fails hard here.
             let stderr = String::from_utf8_lossy(&out.stderr);
             let stdout = String::from_utf8_lossy(&out.stdout);
-            Err(Error::Io(io::Error::new(
-                io::ErrorKind::Other,
-                format!(
-                    "nftables setup failed (status: {}): {}{}",
-                    out.status,
-                    if stderr.trim().is_empty() {
-                        "<no stderr>"
-                    } else {
-                        stderr.trim()
-                    },
-                    if stdout.trim().is_empty() {
-                        String::new()
-                    } else {
-                        format!(" | stdout: {}", stdout.trim())
-                    }
-                ),
-            )))
+            Err(Error::Io(io::Error::other(format!(
+                "nftables setup failed (status: {}): {}{}",
+                out.status,
+                if stderr.trim().is_empty() {
+                    "<no stderr>"
+                } else {
+                    stderr.trim()
+                },
+                if stdout.trim().is_empty() {
+                    String::new()
+                } else {
+                    format!(" | stdout: {}", stdout.trim())
+                }
+            ))))
         }
     }
 

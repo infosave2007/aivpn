@@ -9,6 +9,18 @@
     "dev": "bun run --cwd server dev & bun run --cwd client dev",
     "build": "bun run --cwd client build && bun run --cwd server build",
     "start": "bun server/src/index.ts",
-    "migrate": "bun run --cwd server migrate"
+    "migrate": "bun run --cwd server db:migrate",
+    "test": "bun test server/tests",
+    "check": "bun run --cwd server check && bun run --cwd client check"
+  },
+  "overrides": {
+    "cookie": "^0.7.2",
+    "esbuild": "~0.25.12"
+  },
+  "patchedDependencies": {
+    "braces@3.0.3": "patches/braces@3.0.3.patch"
+  },
+  "devDependencies": {
+    "braces": "3.0.3"
   }
 }

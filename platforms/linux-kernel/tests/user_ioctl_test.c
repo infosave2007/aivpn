@@ -25,8 +25,14 @@ _Static_assert(sizeof(struct aivpn_session_add) == 192,
 	       "aivpn_session_add ABI size");
 _Static_assert(sizeof(struct aivpn_session_update_tags) == 4116,
 	       "aivpn_session_update_tags ABI size");
-_Static_assert(sizeof(struct aivpn_session_downlink) == 4184,
+_Static_assert(sizeof(struct aivpn_session_downlink) == 4188,
 	       "aivpn_session_downlink ABI size");
+_Static_assert(sizeof(struct aivpn_session_policy) == 104,
+	       "aivpn_session_policy ABI size");
+_Static_assert(sizeof(struct aivpn_session_sync) == 160,
+	       "aivpn_session_sync ABI size");
+_Static_assert(sizeof(struct aivpn_client_revoke) == 16,
+	       "aivpn_client_revoke ABI size");
 _Static_assert(AIVPN_IOC_SESSION_ADD ==
 	       ((1U << 30) | (192U << 16) | (0xAEU << 8) | 1U),
 	       "SESSION_ADD ioctl encoding");
@@ -36,6 +42,15 @@ _Static_assert(AIVPN_IOC_GET_VERSION ==
 _Static_assert(AIVPN_IOC_SESSION_UPDATE_TAGS ==
 	       ((1U << 30) | (4116U << 16) | (0xAEU << 8) | 8U),
 	       "SESSION_UPDATE_TAGS ioctl encoding");
+_Static_assert(AIVPN_IOC_SESSION_DOWNLINK ==
+	       ((1U << 30) | (4188U << 16) | (0xAEU << 8) | 9U),
+	       "SESSION_DOWNLINK ioctl encoding");
+_Static_assert(AIVPN_IOC_SESSION_POLICY == 0x4068AE0Bu,
+	       "SESSION_POLICY ioctl encoding");
+_Static_assert(AIVPN_IOC_SESSION_SYNC == 0xC0A0AE0Cu,
+	       "SESSION_SYNC ioctl encoding");
+_Static_assert(AIVPN_IOC_CLIENT_REVOKE == 0x4010AE0Du,
+	       "CLIENT_REVOKE ioctl encoding");
 
 #define DEV "/dev/aivpn"
 

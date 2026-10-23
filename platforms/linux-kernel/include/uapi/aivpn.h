@@ -2,7 +2,7 @@
 /*
  * aivpn.h — shared userspace/kernel UAPI header
  *
- * Included by both the kernel module (src/*.c) and userspace tools
+ * Included by both the kernel module sources and userspace tools
  * (tests/user_ioctl_test.c, aivpn-server dev.rs FFI layer).
  *
  * All structs are packed to avoid ABI surprises across compilers.
@@ -21,6 +21,7 @@ typedef uint8_t  __u8;
 typedef uint16_t __u16;
 typedef uint32_t __u32;
 typedef uint64_t __u64;
+typedef int32_t  __s32;
 #endif
 
 /* Module API version returned by AIVPN_IOC_GET_VERSION.
@@ -28,8 +29,61 @@ typedef uint64_t __u64;
  * v3: aivpn_session_add carries tag_offset + mdh_len (Variant A wire layout).
  * v4: aivpn_session_add carries session_key_s2c (directional downlink key).
  * v5: adds AIVPN_IOC_SESSION_DOWNLINK (reserved counter block + MDH template)
- *     and AIVPN_IOC_SET_EGRESS (kernel-side downlink encrypt egress hook). */
-#define AIVPN_MODULE_API_VERSION  5U
+ *     and AIVPN_IOC_SET_EGRESS (kernel-side downlink encrypt egress hook).
+ * v6: policy, sync and client revoke. Downlink ends with dl_tag_pos.
+ *     Пока политика не установлена (armed = 0), каждый пакет возвращается
+ *     в userspace. Ускорение сессии включается только после успешной политики.
+ * v7: атомарный replay claim, смена эпохи и общее списание QoS.
+ *     Периодический merge больше не является границей anti-replay. */
+#define AIVPN_MODULE_API_VERSION  7U
+
+/* Версия тела политики. Несовпадение отклоняет ioctl и не меняет сессию. */
+#define AIVPN_POLICY_VERSION      1U
+
+#define AIVPN_ROLE_NONE           0U
+#define AIVPN_ROLE_SERVER         1U
+#define AIVPN_ROLE_CLIENT         2U
+
+/* Флаги политики. FALLBACK и режимы ожидания оставляют пакет userspace. */
+#define AIVPN_POL_IPV6            (1U << 0)
+#define AIVPN_POL_PEER_ISOLATE    (1U << 1)
+#define AIVPN_POL_QOS_UP          (1U << 2)
+#define AIVPN_POL_QOS_DOWN        (1U << 3)
+#define AIVPN_POL_QUOTA_UP        (1U << 4)
+#define AIVPN_POL_QUOTA_DOWN      (1U << 5)
+#define AIVPN_POL_REVOKED         (1U << 6)
+#define AIVPN_POL_FALLBACK        (1U << 7)
+#define AIVPN_POL_MTLS_WAIT       (1U << 8)
+#define AIVPN_POL_EXIT            (1U << 9)
+#define AIVPN_POL_ENROLL_WAIT     (1U << 10)
+#define AIVPN_POL_SITE            (1U << 11)
+/* Явное пополнение квоты. Обычное обновление только уменьшает остаток. */
+#define AIVPN_POL_QUOTA_RESET     (1U << 12)
+#define AIVPN_POL_RX_FALLBACK     (1U << 13)
+#define AIVPN_POL_TX_FALLBACK     (1U << 14)
+
+/* Окно replay: 8 слов, бит 0 это самый новый счетчик. Совпадает с userspace. */
+#define AIVPN_REPLAY_WORDS        8
+
+/* SESSION_SYNC отдает окно текущей эпохи и дельту байт.
+ * AIVPN_SYNC_PUSH_REPLAY ядро игнорирует: это не граница anti-replay.
+ * Захват счетчика делает только AIVPN_IOC_REPLAY_CLAIM. */
+#define AIVPN_SYNC_PUSH_REPLAY    1U
+#define AIVPN_SYNC_ACK_STATS      2U
+
+/* Результат REPLAY_CLAIM. FALLBACK значит, что ядро не владеет этим счетчиком. */
+#define AIVPN_CLAIM_OK            0
+#define AIVPN_CLAIM_DUP           1
+#define AIVPN_CLAIM_TOO_OLD       2
+#define AIVPN_CLAIM_EPOCH         3
+#define AIVPN_CLAIM_FALLBACK      4
+
+/* Результат QOS_CHARGE. dir: 0 uplink, 1 downlink. */
+#define AIVPN_QOS_ACCEPT          0
+#define AIVPN_QOS_DROP            1
+#define AIVPN_QOS_FALLBACK        2
+#define AIVPN_QOS_DIR_UP          0U
+#define AIVPN_QOS_DIR_DOWN        1U
 
 /* ioctl magic byte */
 #define AIVPN_MAGIC  0xAE
@@ -184,6 +238,10 @@ struct aivpn_session_update_tags {
  * @count:      number of reserved (tag,counter) entries (<= AIVPN_TAG_WINDOW_SLOTS).
  * @mdh:        mask-derived downlink header template prepended after the tag.
  * @entries:    reserved (resonance_tag, counter) pairs, ascending by counter.
+ * @dl_tag_pos: 0xFFFF означает legacy (tag, затем mdh). Иное значение: tag
+ *              лежит внутри mdh по этому смещению, шифротекст начинается с mdh_len.
+ *              Ноль это допустимое смещение встройки, а не legacy.
+ * @_pad_dl:    выравнивание хвоста до 4 байт, чтобы размер ioctl был стабилен.
  */
 struct aivpn_session_downlink {
 	__u8  session_id[16];
@@ -192,6 +250,106 @@ struct aivpn_session_downlink {
 	__u32 count;
 	__u8  mdh[AIVPN_DL_MDH_MAX];
 	struct aivpn_tag_window_entry entries[AIVPN_TAG_WINDOW_SLOTS];
+	__u16 dl_tag_pos;
+	__u16 _pad_dl;
+} __attribute__((packed));
+
+/**
+ * struct aivpn_session_policy - политика одной сессии, ioctl SESSION_POLICY.
+ *
+ * client_ipv4 хранится как сырые байты адреса в том же порядке, что и
+ * iph->saddr на этой машине (memcpy октетов, не htonl). Нулевой ключ клиента
+ * не входит в группу лимита сессий. Квоты это остаток байт, а не исходный лимит.
+ * Смена политики сохраняет окно replay и курсоры учета.
+ */
+struct aivpn_session_policy {
+	__u8  session_id[16];
+	__u32 policy_version;
+	__u32 role;
+	__u32 flags;
+	__u32 client_ipv4;
+	__u8  ipv6_prefix[16];
+	__u8  ipv6_prefix_len;
+	__u8  _pad[3];
+	__u64 rate_up_bps;
+	__u64 rate_down_bps;
+	__u64 quota_up_bytes;
+	__u64 quota_down_bytes;
+	__u32 max_sessions;
+	__u8  client_key[16];
+} __attribute__((packed));
+
+/**
+ * struct aivpn_session_sync - окно текущей эпохи и дельта байт, ioctl SESSION_SYNC.
+ *
+ * Слова replay это родные u64 текущей эпохи, не предыдущей. Ядро не вливает
+ * окно userspace: PUSH не меняет bitmap. Дельта считается до сдвига курсора.
+ * AIVPN_SYNC_ACK_STATS двигает курсор на текущие счетчики. Повтор того же
+ * снимка без ack возвращает ту же дельту.
+ */
+struct aivpn_session_sync {
+	__u8  session_id[16];
+	__u32 flags;
+	__u32 _pad;
+	__u64 replay_hi;
+	__u64 replay_words[AIVPN_REPLAY_WORDS];
+	__u64 rx_packets;
+	__u64 tx_packets;
+	__u64 rx_bytes;
+	__u64 tx_bytes;
+	__u64 rx_bytes_delta;
+	__u64 tx_bytes_delta;
+	__u64 quota_up_left;
+	__u64 quota_down_left;
+} __attribute__((packed));
+
+/* Отзыв всех сессий с тем же ненулевым ключом клиента. */
+struct aivpn_client_revoke {
+	__u8 client_key[16];
+} __attribute__((packed));
+
+/**
+ * struct aivpn_replay_claim - атомарный захват счетчика под замком сессии.
+ *
+ * Эпоха 0 и чужая эпоха дают AIVPN_CLAIM_EPOCH и ничего не меняют.
+ * Совпадение с текущей или предыдущей эпохой фиксирует счетчик даже если
+ * сессия еще не armed: userspace успевает отметить пакет до включения ядра.
+ */
+struct aivpn_replay_claim {
+	__u8  session_id[16];
+	__u32 epoch;
+	__u32 _pad;
+	__u64 counter;
+	__s32 result;
+	__u32 _pad2;
+} __attribute__((packed));
+
+/**
+ * struct aivpn_replay_rotate - привязать новую эпоху.
+ *
+ * Эпоха 0 и откат назад отклоняются. Та же эпоха ничего не делает.
+ * Большая эпоха переносит текущее окно в предыдущее и начинает пустое.
+ */
+struct aivpn_replay_rotate {
+	__u8  session_id[16];
+	__u32 epoch;
+	__u32 _pad;
+} __attribute__((packed));
+
+/**
+ * struct aivpn_qos_charge - общее списание ведра клиента.
+ *
+ * Сессии с одним client_key делят один остаток. result: ACCEPT, DROP или
+ * FALLBACK. FALLBACK значит, что бюджет считает userspace.
+ */
+struct aivpn_qos_charge {
+	__u8  session_id[16];
+	__u32 dir;
+	__u32 nbytes;
+	__s32 result;
+	__u32 _pad;
+	__u64 tokens_left;
+	__u64 quota_left;
 } __attribute__((packed));
 
 /**
@@ -247,5 +405,23 @@ struct aivpn_set_egress {
 
 /** Enable/disable the kernel downlink egress hook */
 #define AIVPN_IOC_SET_EGRESS           _IOW(AIVPN_MAGIC, 10, struct aivpn_set_egress)
+
+/** Установить или обновить политику сессии, не сбрасывая replay. */
+#define AIVPN_IOC_SESSION_POLICY       _IOW(AIVPN_MAGIC, 11, struct aivpn_session_policy)
+
+/** Слить окно replay и забрать абсолютные счетчики плюс дельту байт. */
+#define AIVPN_IOC_SESSION_SYNC         _IOWR(AIVPN_MAGIC, 12, struct aivpn_session_sync)
+
+/** Пометить отозванными все сессии с этим ключом клиента. */
+#define AIVPN_IOC_CLIENT_REVOKE        _IOW(AIVPN_MAGIC, 13, struct aivpn_client_revoke)
+
+/** Атомарно захватить счетчик replay в текущей или предыдущей эпохе. */
+#define AIVPN_IOC_REPLAY_CLAIM         _IOWR(AIVPN_MAGIC, 14, struct aivpn_replay_claim)
+
+/** Сменить эпоху ключа, не смешивая старое окно с новым. */
+#define AIVPN_IOC_REPLAY_ROTATE        _IOW(AIVPN_MAGIC, 15, struct aivpn_replay_rotate)
+
+/** Списать общий бюджет QoS клиента. */
+#define AIVPN_IOC_QOS_CHARGE           _IOWR(AIVPN_MAGIC, 16, struct aivpn_qos_charge)
 
 #endif /* _UAPI_AIVPN_H */

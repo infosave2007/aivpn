@@ -5,9 +5,9 @@
 //! `create_stop_signal` fallback is iOS's version (it has the race-arm
 //! re-check the Android pipe fallback lacked).
 
-use std::net::{SocketAddr, SocketAddrV4};
+use std::net::SocketAddr;
 use std::os::fd::OwnedFd;
-use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
+use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
@@ -28,118 +28,40 @@ pub fn create_udp_socket(
     // `Sync` — a promise nothing in the call graph needs or can honour.
     protect: &dyn Fn(RawFd) -> Result<()>,
 ) -> Result<RawFd> {
-    let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
-    if fd < 0 {
-        return Err(Error::Io(std::io::Error::last_os_error()));
-    }
-
-    // Exempt this socket from the VPN (Android: VpnService.protect(int) via
-    // the JNI closure passed by the platform adapter; iOS: no-op — the
-    // NEPacketTunnelProvider process is automatically outside the VPN).
-    if let Err(e) = protect(fd) {
-        unsafe { libc::close(fd) };
-        return Err(e);
-    }
-
-    // Increase OS socket buffers to reduce drops/backpressure on high-throughput links.
-    // Ignore errors: kernels may cap/override values.
-    let sock_buf: libc::c_int = 4 * 1024 * 1024;
-    unsafe {
-        let _ = libc::setsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            libc::SO_SNDBUF,
-            &sock_buf as *const _ as *const libc::c_void,
-            std::mem::size_of_val(&sock_buf) as libc::socklen_t,
-        );
-        let _ = libc::setsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            libc::SO_RCVBUF,
-            &sock_buf as *const _ as *const libc::c_void,
-            std::mem::size_of_val(&sock_buf) as libc::socklen_t,
-        );
-    }
-
-    // Try to reuse the same local port as the previous session.  When a
-    // port-preserving CGNAT (MTS, Beeline, etc.) is in use, the carrier's
-    // inbound routing table still maps the old external port back to this
-    // phone.  Binding to the same internal port means no CGNAT update is
-    // needed and downlink arrives immediately without a stale-mapping delay.
-    // Falls back to OS-assigned ephemeral port if the saved port is
-    // unavailable (first connect, or port taken by another socket).
     let port_hint = LAST_LOCAL_PORT.load(Ordering::Relaxed);
-    unsafe {
-        let mut any: libc::sockaddr_in = std::mem::zeroed();
-        any.sin_family = libc::AF_INET as libc::sa_family_t;
+    let bind_address = |port| match dest {
+        SocketAddr::V4(_) => SocketAddr::from(([0, 0, 0, 0], port)),
+        SocketAddr::V6(_) => SocketAddr::from(([0u16; 8], port)),
+    };
+    let socket = std::net::UdpSocket::bind(bind_address(port_hint)).or_else(|error| {
         if port_hint != 0 {
-            any.sin_port = port_hint.to_be();
-            if libc::bind(
-                fd,
-                &any as *const libc::sockaddr_in as *const libc::sockaddr,
-                std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
-            ) < 0
-            {
-                // Port unavailable — fall back to OS-assigned ephemeral.
-                any.sin_port = 0;
-                let _ = libc::bind(
-                    fd,
-                    &any as *const libc::sockaddr_in as *const libc::sockaddr,
-                    std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
-                );
-            }
+            std::net::UdpSocket::bind(bind_address(0))
         } else {
-            let _ = libc::bind(
+            Err(error)
+        }
+    })?;
+    // Защита применяется до отправки первого пакета; RAII закрывает fd при ошибке.
+    let fd = socket.as_raw_fd();
+    protect(fd)?;
+    let sock_buf: libc::c_int = 4 * 1024 * 1024;
+    for option in [libc::SO_SNDBUF, libc::SO_RCVBUF] {
+        unsafe {
+            libc::setsockopt(
                 fd,
-                &any as *const libc::sockaddr_in as *const libc::sockaddr,
-                std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+                libc::SOL_SOCKET,
+                option,
+                &sock_buf as *const _ as *const libc::c_void,
+                std::mem::size_of_val(&sock_buf) as libc::socklen_t,
             );
         }
     }
-
-    // Connect to server (sets default destination for send/recv, non-blocking for UDP).
-    let SocketAddr::V4(v4) = dest else {
-        unsafe { libc::close(fd) };
-        return Err(Error::Session(
-            "Only IPv4 server addresses are supported".into(),
-        ));
-    };
-    let sa = to_sockaddr_in(&v4);
-    let rc = unsafe {
-        libc::connect(
-            fd,
-            &sa as *const libc::sockaddr_in as *const libc::sockaddr,
-            std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
-        )
-    };
-    if rc < 0 {
-        unsafe { libc::close(fd) };
-        return Err(Error::Io(std::io::Error::last_os_error()));
-    }
-
-    // Persist the local port for the next reconnect attempt.
-    unsafe {
-        let mut sa: libc::sockaddr_in = std::mem::zeroed();
-        let mut len = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
-        if libc::getsockname(
-            fd,
-            &mut sa as *mut libc::sockaddr_in as *mut libc::sockaddr,
-            &mut len,
-        ) == 0
-        {
-            LAST_LOCAL_PORT.store(u16::from_be(sa.sin_port), Ordering::Relaxed);
-        }
-    }
-
-    let control_fd = unsafe { libc::dup(fd) };
-    if control_fd < 0 {
-        unsafe { libc::close(fd) };
-        return Err(Error::Io(std::io::Error::last_os_error()));
-    }
-
-    session.udp_control_fd.store(control_fd, Ordering::SeqCst);
-
-    Ok(fd)
+    socket.connect(dest)?;
+    LAST_LOCAL_PORT.store(socket.local_addr()?.port(), Ordering::Relaxed);
+    let control = socket.try_clone()?;
+    session
+        .udp_control_fd
+        .store(control.into_raw_fd(), Ordering::SeqCst);
+    Ok(socket.into_raw_fd())
 }
 
 #[cfg(any(target_os = "android", target_os = "linux"))]
@@ -252,26 +174,6 @@ pub async fn wait_for_stop(stop_signal: &AsyncFd<OwnedFd>) -> std::io::Result<()
     }
 }
 
-pub fn to_sockaddr_in(addr: &SocketAddrV4) -> libc::sockaddr_in {
-    libc::sockaddr_in {
-        #[cfg(any(
-            target_os = "macos",
-            target_os = "ios",
-            target_os = "freebsd",
-            target_os = "openbsd",
-            target_os = "netbsd",
-            target_os = "dragonfly"
-        ))]
-        sin_len: std::mem::size_of::<libc::sockaddr_in>() as u8,
-        sin_family: libc::AF_INET as libc::sa_family_t,
-        sin_port: addr.port().to_be(),
-        sin_addr: libc::in_addr {
-            s_addr: u32::from_ne_bytes(addr.ip().octets()),
-        },
-        sin_zero: [0; 8],
-    }
-}
-
 // ──────────── Async TUN I/O ────────────
 
 pub async fn tun_async_read<T: AsRawFd>(
@@ -340,4 +242,34 @@ pub async fn tun_async_write<T: AsRawFd>(tun: &AsyncFd<T>, data: &[u8]) -> std::
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod socket_tests {
+    use super::*;
+
+    #[test]
+    fn connected_udp_supports_both_address_families() {
+        for bind in ["127.0.0.1:0", "[::1]:0"] {
+            let server = std::net::UdpSocket::bind(bind).unwrap();
+            server
+                .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                .unwrap();
+            let session = Arc::new(SessionRuntime::new());
+            let fd =
+                create_udp_socket(server.local_addr().unwrap(), &session, &|_| Ok(())).unwrap();
+            let socket = unsafe { std::net::UdpSocket::from_raw_fd(fd) };
+            socket.send(b"probe").unwrap();
+            let mut buffer = [0; 16];
+            let (length, peer) = server.recv_from(&mut buffer).unwrap();
+            assert_eq!(&buffer[..length], b"probe");
+            assert_eq!(peer.is_ipv6(), server.local_addr().unwrap().is_ipv6());
+            let control = session.udp_control_fd.swap(-1, Ordering::SeqCst);
+            if control >= 0 {
+                unsafe {
+                    libc::close(control);
+                }
+            }
+        }
+    }
 }

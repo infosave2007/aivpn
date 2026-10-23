@@ -1,5 +1,136 @@
 # Changelog
 
+## [1.2.0] - not yet released
+
+> **Dual-stack networking, signed distribution and application hardening.** This release extends IPv6 support across the tunnel, adds large management messages and new bootstrap/distribution channels, and fixes session, storage and platform security issues. Inter-server connections now use masked handshake sessions throughout; static legacy sessions and the server mode without a database are removed.
+
+### Added
+
+- **IPv6 across the tunnel** - the server assigns an IPv6 address, prefix and MTU through `ServerHello`; desktop and mobile clients apply the assignment. Data, recovered FEC packets and forwarded traffic enforce source validation, client isolation and QoS for both address families. Server setup validates the prefix and configures forwarding and NAT66; an IPv6 setup failure stops startup.
+- **Fragmented management messages** - requests and responses up to 512 KiB travel through the encrypted tunnel with separate nonces and sequence numbers per fragment. Reassembly is bounded to four incomplete messages per session and a ten-second timeout; conflicting fragments are rejected and partial messages never reach the handler.
+- **Email bootstrap through JMAP** - clients can read signed descriptors from messages selected by sender and subject. The channel uses a configured HTTPS JMAP session endpoint and a read-access token.
+- **Passive reception of signed masks** - DNS TXT, PNG RGB LSB, Bitcoin OP_RETURN and Ethereum calldata can carry signed mask profiles. Reception requires explicit network opt-in and a trusted operator key; size limits, signature checks and atomic profile installation apply before use.
+- **Configurable DNS for SOCKS5 mode** - `--proxy-dns` accepts up to four IPv4 DNS servers, including internal resolvers reachable through the VPN. Regional hints also participate in mask selection without replacing a verified bootstrap descriptor with an unsigned preset.
+
+### Fixed
+
+- **CI classifier download** - keep nDPI outside the Cargo cache and explicitly select its Git directory so incomplete cached metadata cannot redirect fetches to the application repository. Fetch the release tag with bounded retries and verify the pinned commit before building.
+- **Multiple client instances** - a busy admin socket no longer causes a CPU spin or overwrites another client's token. `--admin-listen` / `AIVPN_ADMIN_LISTEN` selects a separate loopback endpoint for each instance and its management commands; recording status, traffic and quality files are isolated. Pending management replies release the socket when the session ends.
+- **Reconnects behind NAT** - a PSK-verified client can replace its existing session at the per-IP or subnet limit without disconnecting neighboring clients. Replacement slots are bounded, duplicate pending replacements are rejected and new clients retain the normal limits.
+- **macOS application location** - the GUI and privileged helper share the permitted binary paths. A renamed or relocated app uses the installed system client instead of passing a path that the helper rejects.
+- **MikroTik build instructions** - corrected repository paths and the runtime architecture in the arm64 Docker example; documented local image export and RouterOS file import without relying on a missing registry image.
+
+- **Concurrent database and status writes** - `clients.json` mutations lock and reload the current file before saving, preventing one process from overwriting another's changes. Failed saves no longer leave a successful change only in memory; client status snapshots are written atomically.
+- **IPv6 assignment and packet handling** - desktop routes follow the assigned network and are removed on disconnect; Android rebuilds the tunnel when the address, prefix or MTU changes, and iOS applies the assignment through Network Extension. DSCP updates preserve ECN, and IPv4 checksum calculation includes header options.
+- **Management request deadlines** - the timeout now covers waiting for queue capacity as well as the response, so a full transport queue cannot leave a request waiting indefinitely.
+- **Linux kernel session lifecycle and accounting** - session removal also removes kernel state; accelerated traffic contributes to activity and statistics, including small increments and counters carried across a ratchet. Losing an established shared replay window requires a new handshake instead of silently resetting replay history.
+- **Web panel authentication and database compatibility** - fixed concurrent refresh-cookie updates, PostgreSQL schema types, strict interface typing, accessible button names and reproducible Docker builds.
+- **Apple identity and helper error handling** - Keychain and random-number generation failures are propagated, malformed stored keys are rejected, and the macOS helper reads certificates with file-safety checks.
+
+### Security
+
+- **Inter-server permissions and live revocation** - site peers can exchange routes and site traffic without receiving pool database or management rights. SiteData sources are checked against the authenticated node's subnets; strict enrollment binds identity to the handshake. A shared site key supports an identity allowlist but must differ from the pool key. Revocation is checked on active connections, and an old session cannot inherit the rights of a node registered again under a new key.
+- **Persistent identities and trust registry** - device and node keys are installed atomically without overwriting another process's key. Corrupt keys are not silently regenerated. Node trust is granted only after persistence succeeds; registry corruption, disappearance or symlink substitution denies access.
+- **Enforced signatures in `production-secure`** - secure builds require trusted signing keys and artifact verification. The mask generator signs both forward and reverse profiles, and Ed25519 verification rejects small-order public keys.
+- **Signed release artifacts** - CI signs server binaries and mask archives with Ed25519 and checks that the configured signing keys match. The SSH installer verifies downloaded artifacts against a separately trusted public key; HTTPS downloads enforce size and redirect-address limits.
+- **Persistent Windows kill-switch** - dedicated Windows Filtering Platform filters are updated in one transaction and survive a client crash. Explicit disconnect removes the filters and reports cleanup failures; unrelated firewall policies are preserved.
+- **Dependency fixes** - updated affected Rust and web dependencies, including `quinn-proto` 0.11.18, `rustls` 0.23.46, `rustls-webpki` 0.103.16, `webpki-roots` 1.0.10 and the vendored `cryoglyph` dependency on `lru`. A local `braces` patch caps parser nesting at 128 levels and has regression coverage; version-based audit tools still report the unchanged `3.0.3` package version.
+
+### Changed
+
+- **Linux kernel ABI 7** - client and server share replay-counter claims, key epochs, access policies and per-client QoS with the kernel path. FEC, DSCP processing, metadata recording, neural checks and shaped downlink retain the userspace processing they require. Server IPv6 downlink remains in userspace; kernel server downlink is explicitly enabled with `AIVPN_KERNEL_DOWNLINK=1`.
+- **Blocking correctness checks in CI** - Clippy `correctness` and `suspicious` diagnostics fail the build while style warnings remain visible. The DPI gate requires a pinned nDPI toolchain instead of skipping classification when the tool is absent.
+- **Upgrade requirements** - update inter-server nodes together, remove explicit `pool.transport=legacy`, configure the client database and rotate previously used static keys. Distribute trusted release/operator public keys before enabling signature enforcement. Configuration details are in [release settings](docs/RELEASE_1.2.0.md).
+
+### Removed
+
+- **Static legacy sessions and the standalone chain forwarder** - pool, site and exit connections use masked handshakes with individual session keys, rotation and replay protection. An omitted `pool.transport` selects `masked`; an explicit `legacy` value is rejected. Ordinary PSK handshakes and the tag-prefix packet layout used by handshake sessions remain supported.
+- **Server operation without a database** - the fixed fallback address pool is removed; address allocation uses the client database's network configuration and pool partitions.
+
+### Refactored
+
+- **Code cleanup** - removed dead functions and obsolete branches, separated shared settings and constants from local variables, and kept local variables in the smallest useful scope.
+
+### Testing
+
+- **Automated verification (1.2.0)** — the current run has 1361 passing Rust workspace tests and 1023 `production-secure` tests, with no failures or skips. Format, Clippy correctness/suspicious, Windows GNU compile check, 12 web tests, TypeScript/Svelte and available C/BPF/packaging checks pass. Platform runtime acceptance remains a separate stage.
+- **Kernel verification scope** — C policy/RX and BPF harnesses pass, both BPF programs compile. A full .ko build is not confirmed: installed header Rust metadata is incompatible with the local rustc. Loading the module and network-scenario testing require separate acceptance.
+
+---
+
+## [1.2.0] - not yet released (detailed audit fixes — incorporated into the entry above)
+
+> **IPv4/IPv6, signed delivery and application hardening.** Extended IPv6 support in the tunnel, large management messages and new bootstrap/mask-distribution channels. Fixed session, storage and platform-security issues. Inter-server connections fully moved to masked handshakes; static legacy sessions and DB-less server mode removed.
+
+### Added (details)
+
+- **IPv6 во всем туннеле** - сервер назначает IPv6-адрес, префикс и MTU через `ServerHello`, а настольные и мобильные клиенты применяют назначение. Для Data, восстановленных FEC-пакетов и перенаправляемого трафика действуют проверка источника, изоляция клиентов и QoS обоих семейств адресов. Сервер проверяет префикс и настраивает forwarding и NAT66; ошибка настройки IPv6 останавливает запуск.
+- **Фрагментация управляющих сообщений** - запросы и ответы размером до 512 КиБ передаются внутри зашифрованного туннеля с отдельными nonce и номерами последовательности для каждого фрагмента. Одновременно собираются не более четырех сообщений на сессию, срок сборки ограничен десятью секундами. Противоречащие фрагменты отклоняются, неполные сообщения не поступают обработчику.
+- **Почтовый bootstrap через JMAP** - клиенты получают подписанные дескрипторы из писем с заданным отправителем и темой. Для канала задаются HTTPS-адрес сессии JMAP и токен с правом чтения.
+- **Пассивное получение подписанных масок** - профили передаются через DNS TXT, RGB LSB изображений PNG, Bitcoin OP_RETURN и Ethereum calldata. Сетевой прием включается явно и требует доверенного ключа оператора. До использования проверяются размеры и подпись, профиль устанавливается атомарно.
+- **Настраиваемый DNS в режиме SOCKS5** - `--proxy-dns` принимает до четырех IPv4 DNS-серверов, включая внутренние резолверы, доступные через VPN. Региональные подсказки также участвуют в выборе маски, не подменяя проверенный bootstrap-дескриптор неподписанным пресетом.
+
+### Fixed (details)
+
+- **Смена маски после простоя** - сервер принимает текущую и ожидающую раскладки до завершения перехода. Валидный пакет после grace фиксирует маску и обновляет раскладку ядра без обязательного downlink; поврежденный ciphertext и replay состояние не меняют.
+- **TCP half-close в SOCKS5** - удаленный FIN передает EOF локальному клиенту, не закрывая его еще открытую отправку. Поздние данные доходят до сервера, накопленный ответ не обрывается, а отмена и локальный EOF завершают задачи с ограниченным ожиданием.
+- **Повторное подключение выхода пула** - удаленный dialer не может затереть sender и статус нового соединения при быстром remove/add. Публикация проверяет исходный токен поколения под общей блокировкой топологии, не ожидая опроса stop watcher.
+- Индекс тегов сервера охватывает соседние временные окна без широкого перебора на каждом пакете. Доаутентификационная работа ограничена бюджетом фактического времени, а настоящий reconnect остается доступным. Принудительное подробное логирование отключено.
+- Проверка и отметка replay выполняются атомарно после AEAD в правильной эпохе; история повторов сохраняется при ротации ключей. Роль управления требует доказательства постоянного ключа устройства, а mTLS проверяет этот ключ и срок сертификата, независимо от порядка enrollment и сертификата.
+- Восстановление резервных копий разрешено только offline через CLI: необходимо остановить сервер и все процессы, использующие базу. HTTP и web-панель только проверяют архив, не меняя файлы. Блокировка не позволяет работающему процессу затереть восстановленную базу старым состоянием из памяти. Импорт ограничивает распаковку и отвергает обход путей; экспорт защищен от symlink и создает приватные файлы.
+- Допуск новой сессии к VPN-адресу требует PFS, доказательства ключа привязанного или привилегированного устройства и обязательного mTLS. Неподтвержденная сессия не вытесняет живой туннель. Потерянные proof/cert повторяются после того же Hello, незавершенная аутентификация ограничена 60 секундами. Объявление роли обновляется после аутентификации и изменения прав. Операции управления не перезаписывают незавершенную транзакцию конфигурации, создание клиента сохраняется атомарно, права привязанных устройств не наследуются после сброса.
+- Исправлены защита DNS и маршрутов, проверки необязательных ключей Android, состояния подключения платформенных клиентов, очистка SOCKS-задач и завершение сессий. Web-аутентификация ограничивает число challenge и запрещает обход OIDC через passkey или прямой поток событий.
+- Исправлены гонки эпох и освобождения ресурсов в kernel path, изоляция неизвестных адресов, XDP pass-through, checksum и учет токенов TC, безопасное снятие собственного TC filter и ошибки упаковки. Реальная поддержка ядра по-прежнему зависит от совместимости Rust-for-Linux API и toolchain.
+
+- **Загрузка классификатора в CI** - nDPI вынесен из кеша Cargo, его Git-каталог задан явно: неполные метаданные из кеша больше не перенаправляют загрузку в репозиторий приложения. Релизный тег загружается с ограниченными повторами, перед сборкой проверяется закрепленный коммит.
+- **Несколько экземпляров клиента** - занятый admin-сокет больше не вызывает загрузку CPU пустым циклом и не перезаписывает чужой токен. `--admin-listen` / `AIVPN_ADMIN_LISTEN` задает отдельный локальный адрес экземпляра и команд управления; статус записи, счетчики трафика и качество соединения хранятся раздельно. Незавершенные управляющие запросы не удерживают сокет после завершения сессии.
+- **Переподключение за NAT** - клиент с проверенным PSK может заменить свою сессию при заполненном лимите IP или подсети, не отключая соседние клиенты. Резерв ограничен, повторная незавершенная замена отклоняется; новые клиенты подчиняются обычным лимитам.
+- **Расположение приложения macOS** - GUI и привилегированный helper используют общий список разрешенных путей. Переименованное или перемещенное приложение использует установленный системный клиент вместо передачи пути, который helper отклонит.
+- **Инструкции сборки MikroTik** - исправлены пути внутри репозитория и архитектура исполняемого образа в примере сборки arm64; добавлены экспорт локального образа и импорт файла в RouterOS без зависимости от отсутствующего образа в реестре.
+
+- **Одновременная запись БД и статуса** - изменения `clients.json` выполняются под файловой блокировкой с перечитыванием актуальной версии, поэтому процессы не затирают изменения друг друга. Ошибка сохранения больше не оставляет успешное изменение только в памяти; снимки статуса клиента записываются атомарно.
+- **Назначение IPv6 и обработка пакетов** - настольные клиенты настраивают маршруты по назначенной сети и удаляют их при отключении. Android пересоздает туннель при смене адреса, префикса или MTU, iOS применяет назначение через Network Extension. Изменение DSCP сохраняет ECN, расчет контрольной суммы IPv4 учитывает опции заголовка.
+- **Срок выполнения управляющего запроса** - таймаут охватывает ожидание места в очереди и ответа, поэтому заполненная очередь транспорта больше не оставляет запрос ждать бесконечно.
+- **Жизненный цикл и учет сессий в ядре Linux** - удаление сессии снимает ее состояние из ядра. Ускоренный трафик учитывается в активности и статистике, включая малые порции данных и перенос счетчиков через ratchet. Потеря действовавшего общего окна защиты от повтора требует нового handshake вместо незаметного сброса истории.
+- **Авторизация веб-панели и совместимость БД** - исправлены гонка обновления refresh cookies, типы схем PostgreSQL, строгая типизация интерфейса, доступные имена кнопок и воспроизводимость Docker-сборки.
+- **Обработка ошибок идентичности и helper на Apple** - ошибки Keychain и генератора случайных чисел передаются вызывающей стороне, поврежденные ключи отклоняются, macOS helper проверяет безопасность файла при чтении сертификата.
+
+### Security (details)
+
+- **Проверка TLS-сертификатов** - `rustls-webpki` обновлен до 0.103.16, `webpki-roots` до 1.0.10. Устранены RUSTSEC-2026-0382 и RUSTSEC-2026-0381: цепочки с отозванными промежуточными ключами emSign больше не принимаются, связанный корневой сертификат удален из набора доверия. Проверка `cargo-audit` в CI остается обязательной, исключения для этих уязвимостей не добавлены.
+- **Права межсерверных узлов и отзыв действующих соединений** - площадки обмениваются маршрутами и трафиком без прав на БД пула или управление. Источник SiteData проверяется по подсетям аутентифицированного узла; строгий enrollment связывает идентичность с handshake. Общий ключ площадок поддерживает список разрешенных идентичностей и должен отличаться от ключа пула. Отзыв проверяется на действующих соединениях, старая сессия не получает права узла, зарегистрированного повторно с новым ключом.
+- **Постоянные ключи и реестр доверия** - ключи устройства и узла устанавливаются атомарно без перезаписи ключа другого процесса. Поврежденные ключи не заменяются молча. Доверие к узлу выдается только после успешного сохранения; повреждение, исчезновение или подмена реестра ссылкой запрещают доступ.
+- **Обязательные подписи в `production-secure`** - защищенная сборка требует доверенных ключей подписи и проверки артефактов. Генератор подписывает прямой и обратный профили масок, проверка Ed25519 отклоняет открытые ключи малого порядка.
+- **Подписанные артефакты выпуска** - CI подписывает серверные бинарники и архивы масок с помощью Ed25519 и проверяет соответствие настроенной пары ключей. SSH-установщик проверяет загрузки по отдельно доверенному открытому ключу; HTTPS-загрузки ограничены по размеру и адресам перенаправлений.
+- **Постоянный kill-switch Windows** - собственные фильтры Windows Filtering Platform обновляются одной транзакцией и сохраняются при аварии клиента. Явное отключение удаляет фильтры и сообщает об ошибках очистки; политики стороннего брандмауэра сохраняются.
+- **Исправления зависимостей** - обновлены затронутые Rust- и веб-зависимости, включая `quinn-proto` 0.11.18, `rustls` 0.23.46 и `lru` в локальной копии `cryoglyph`. Локальный patch `braces` ограничивает вложенность парсера 128 уровнями и покрыт регрессионными тестами; аудит по номеру версии продолжает отмечать неизмененный пакет `3.0.3`.
+
+### Changed (details)
+
+- Initial exchange moved to a separate KDF v2 and XChaCha20-Poly1305 with a random 24-byte nonce. Tag, counter, direction and connection context are bound via AEAD. A repeated init after a restart or on another node does not repeat the key/nonce pair in the server response. The established channel and kernel ABI keep their previous format.
+- Initial-exchange backward compatibility with released 1.1.0 and prior 1.2.0 dev builds is broken. All servers, pool/site/chain nodes and all client builds (including the embedded mobile kernel) must be upgraded together. There is no automatic fallback to the old exchange. Connection-key format, PSK, server static keys and the native systemd unit are unchanged by this.
+- The initial epoch only establishes the connection: Data and control commands execute after PFS confirmation. Each new client connection gets a fresh ephemeral key; a late ServerHello from another connection does not change already-negotiated keys or network.
+
+- **Linux kernel ABI 7** — client and server share replay-counter claims, key epochs, access policies and per-client QoS with the kernel path. FEC, DSCP processing, metadata recording, neural checks and shaped downlink retain required userspace handling. Server IPv6 downlink remains in userspace; kernel server downlink is explicitly enabled with `AIVPN_KERNEL_DOWNLINK=1`.
+- **Blocking correctness checks in CI** — Clippy `correctness` and `suspicious` diagnostics fail the build; style warnings remain visible. The DPI gate requires a pinned nDPI toolchain instead of skipping classification when the tool is absent.
+- **Upgrade requirements** — update inter-server nodes together, remove explicit `pool.transport=legacy`, configure the client database and rotate previously used static keys. Distribute trusted release/operator public keys before enabling signature enforcement. See [release settings](docs/RELEASE_1.2.0.md).
+
+### Removed (details)
+
+- **Static legacy sessions and the standalone chain forwarder** — pool, site and exit use masked handshakes with per-session keys, rotation and replay protection. Missing `pool.transport` means `masked`; an explicit `legacy` value is rejected. Ordinary PSK handshakes and the tag-prefix packet layout used by handshake sessions remain supported.
+- **Server operation without a database** — the fixed fallback address pool is removed; address allocation uses the client database's network configuration and pool partitions.
+
+### Refactored (details)
+
+- **Code cleanup** — removed dead functions and obsolete branches, shared settings and constants separated from local variables kept in the smallest useful scope.
+
+### Testing
+
+- **Automated verification (1.2.0)** — the current run has 1361 passing Rust workspace tests and 1023 `production-secure` tests, with no failures or skips. Format, Clippy correctness/suspicious, Windows GNU compile check, 12 web tests, TypeScript/Svelte and available C/BPF/packaging checks pass. Platform runtime acceptance remains a separate stage.
+- **Kernel verification scope** — C policy/RX and BPF harnesses pass, both BPF programs compile. A full .ko build is not confirmed: installed header Rust metadata is incompatible with the local rustc. Loading the module and network-scenario testing require separate acceptance.
+
+---
+
 ## [1.1.0] - 2026-08-20
 
 > **First minor release since 1.0.x.** It consolidates everything after the RC2 label (2026-07-18) on top of the 1.0.2–1.0.5 fixes: a redesigned pool-sync transport, a behaviour-preserving architectural refactor of the largest modules, unification of the two mobile tunnels onto one shared core, and a seam for pluggable datagram transports. The version moves to 1.1.0 because the mobile cores, the GUI hosts and the client entry point changed shape — the wire protocol did not.

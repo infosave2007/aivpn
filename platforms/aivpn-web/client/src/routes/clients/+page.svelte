@@ -202,7 +202,7 @@
 
 {#if showAddModal}
   <div class="fixed inset-0 z-50 flex items-center justify-center">
-    <button class="absolute inset-0 bg-black/60" onclick={() => { showAddModal = false; }}></button>
+    <button aria-label="Close dialog" class="absolute inset-0 bg-black/60" onclick={() => { showAddModal = false; }}></button>
     <div class="relative bg-white dark:bg-gray-800 rounded-xl p-6 shadow-2xl w-full max-w-sm mx-4">
       <h2 class="text-lg font-semibold text-gray-900 dark:text-white mb-4">Add Client</h2>
       <form onsubmit={(e) => { e.preventDefault(); $createMut.mutate({ name: newName, one_time: newOneTime, expires_at: newExpiresAt ? new Date(newExpiresAt).toISOString() : null }); }} class="space-y-4">

@@ -12,6 +12,8 @@ settings:
     IPHONEOS_DEPLOYMENT_TARGET: "16.0"
     ENABLE_BITCODE: NO
     DEBUG_INFORMATION_FORMAT: dwarf-with-dsym
+    MARKETING_VERSION: "1.2.0"
+    CURRENT_PROJECT_VERSION: "9"
 
 targets:
   Aivpn:
@@ -60,6 +62,7 @@ targets:
     platform: iOS
     deploymentTarget: "16.0"
     sources:
+      - path: Identity
       - path: Tunnel
         excludes:
           - "*.entitlements"

@@ -6,6 +6,7 @@
 //! god-file decomposition.
 
 use dashmap::DashMap;
+#[cfg(test)]
 use std::net::Ipv4Addr;
 use std::time::{Duration, Instant};
 
@@ -57,10 +58,10 @@ const CHAIN_REVERSE_SWEEP_EVERY: usize = 256;
 /// only inserted/refreshed when there is no existing entry, the existing
 /// entry has already expired, or the existing entry belongs to the SAME
 /// `session_id` (a legitimate refresh, which still updates the `Instant`).
-pub(crate) fn chain_reverse_route_insert(
-    routes: &DashMap<Ipv4Addr, ([u8; 16], Instant)>,
+pub(crate) fn chain_reverse_route_insert<K: Eq + std::hash::Hash + Copy>(
+    routes: &DashMap<K, ([u8; 16], Instant)>,
     insert_count: &std::sync::atomic::AtomicUsize,
-    src_ip: Ipv4Addr,
+    src_ip: K,
     session_id: [u8; 16],
     now: Instant,
     incumbent_is_live: impl Fn(&[u8; 16]) -> bool,
@@ -90,7 +91,7 @@ pub(crate) fn chain_reverse_route_insert(
         }
     }
     let n = insert_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-    if n % CHAIN_REVERSE_SWEEP_EVERY == 0 {
+    if n.is_multiple_of(CHAIN_REVERSE_SWEEP_EVERY) {
         routes.retain(|_, (_, last_seen)| now.duration_since(*last_seen) < CHAIN_REVERSE_ROUTE_TTL);
     }
 }
@@ -100,9 +101,9 @@ pub(crate) fn chain_reverse_route_insert(
 /// route and when the recorded route is older than `CHAIN_REVERSE_ROUTE_TTL`
 /// — a stale entry is left in place for the next opportunistic sweep rather
 /// than removed here, keeping this a plain read.
-pub(crate) fn chain_reverse_route_lookup(
-    routes: &DashMap<Ipv4Addr, ([u8; 16], Instant)>,
-    dst_ip: &Ipv4Addr,
+pub(crate) fn chain_reverse_route_lookup<K: Eq + std::hash::Hash + Copy>(
+    routes: &DashMap<K, ([u8; 16], Instant)>,
+    dst_ip: &K,
     now: Instant,
 ) -> Option<[u8; 16]> {
     routes.get(dst_ip).and_then(|entry| {
@@ -330,7 +331,10 @@ mod tests {
         // CHAIN_REVERSE_SWEEP_EVERY == 0` boundary and trigger the
         // opportunistic sweep.
         let mut next_octet: u32 = 10;
-        while counter.load(std::sync::atomic::Ordering::Relaxed) % CHAIN_REVERSE_SWEEP_EVERY != 0 {
+        while !counter
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .is_multiple_of(CHAIN_REVERSE_SWEEP_EVERY)
+        {
             let filler_ip = Ipv4Addr::from(0x0A00_0000u32 + next_octet);
             next_octet += 1;
             chain_reverse_route_insert(&routes, &counter, filler_ip, [0u8; 16], sweep_now, |_| {
@@ -379,7 +383,10 @@ mod tests {
         // refreshes for `churn_ip` follow, exactly the low-host-count
         // scenario BUG C3 fixes.
         assert_eq!(routes.len(), 2);
-        while counter.load(std::sync::atomic::Ordering::Relaxed) % CHAIN_REVERSE_SWEEP_EVERY != 0 {
+        while !counter
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .is_multiple_of(CHAIN_REVERSE_SWEEP_EVERY)
+        {
             chain_reverse_route_insert(
                 &routes,
                 &counter,

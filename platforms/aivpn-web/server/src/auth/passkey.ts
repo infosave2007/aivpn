@@ -11,6 +11,7 @@ import {
 } from '@simplewebauthn/server'
 import { config, RP_ID, RP_NAME } from '../config'
 import { randomUUID } from 'node:crypto'
+import { ChallengeStore } from './challenge-store'
 
 // In-memory single-use store. Registration: keyed by `reg:<userId>`, value is
 // the challenge. Authentication: keyed by `auth:<challenge>`, value is the
@@ -18,19 +19,14 @@ import { randomUUID } from 'node:crypto'
 // keying auth challenges by the challenge itself makes discoverable-credential
 // logins work and prevents concurrent anonymous logins racing on a shared key.
 // In a multi-process deployment this should be Redis; for single-process it's fine.
-const challengeStore = new Map<string, { value: string; expiresAt: number }>()
-
-const CHALLENGE_TTL_MS = 5 * 60 * 1000 // 5 minutes
+const challengeStore = new ChallengeStore()
 
 function storeChallenge(key: string, value: string): void {
-  challengeStore.set(key, { value, expiresAt: Date.now() + CHALLENGE_TTL_MS })
+  challengeStore.set(key, value)
 }
 
 function consumeChallenge(key: string): string | null {
-  const entry = challengeStore.get(key)
-  challengeStore.delete(key)
-  if (!entry || entry.expiresAt < Date.now()) return null
-  return entry.value
+  return challengeStore.consume(key)
 }
 
 // ─── Registration ─────────────────────────────────────────────────────────────
@@ -104,10 +100,10 @@ export async function getAuthenticationOptions(
 ) {
   const options = await generateAuthenticationOptions({
     rpID: RP_ID,
-    allowCredentials: allowedPasskeys?.map((pk) => ({
+    ...(allowedPasskeys ? { allowCredentials: allowedPasskeys.map((pk) => ({
       id: pk.credential_id,
       transports: (pk.transports ?? []) as AuthenticatorTransportFuture[],
-    })),
+    })) } : {}),
     // Deliberately kept 'preferred' rather than 'required', unlike the
     // registration side above. Existing passkeys were enrolled back when
     // registration also allowed 'preferred', so some already-enrolled

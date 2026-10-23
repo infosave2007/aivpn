@@ -37,6 +37,12 @@ pub struct MaskCatalog {
 /// substitute for the DPI/anomaly detectors' own judgement.
 const COMPROMISED_TTL: Duration = Duration::from_secs(3600);
 
+impl Default for MaskCatalog {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl MaskCatalog {
     pub fn new() -> Self {
         Self {

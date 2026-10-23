@@ -1,8 +1,127 @@
 use super::*;
 
+#[cfg(test)]
+mod initial_upload_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn max_mtu_data_before_hello_is_dropped_without_stopping_upload() {
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        client.connect(server.local_addr().unwrap()).await.unwrap();
+        let initial = crypto::derive_initial_session_keys(&[7; 32], None, &[8; 32]);
+        let established = crypto::derive_session_keys(&[9; 32], None, &[8; 32]);
+        let state = Arc::new(Mutex::new(UploadCryptoState {
+            keys: initial.clone(),
+            counter: 0,
+            seq: 0,
+            rekey_ack: VecDeque::new(),
+        }));
+        let sent = Arc::new(AtomicU64::new(0));
+        let mask = aivpn_common::mask::preset_masks::webrtc_zoom_v3();
+        let (data_tx, data_rx) = mpsc::channel(8);
+        let (control_tx, control_rx) = mpsc::channel(8);
+        data_tx.send(vec![0x45; 1500]).await.unwrap();
+        control_tx
+            .send(ControlPayload::Keepalive { send_ts: 17 })
+            .await
+            .unwrap();
+        let mut task = tokio::spawn(AivpnClient::spawn_upload(
+            data_rx,
+            control_rx,
+            aivpn_common::transport::udp_transport(client),
+            MimicryEngine::new(mask.clone()),
+            state.clone(),
+            sent.clone(),
+            Arc::new(Mutex::new(None)),
+            Duration::from_secs(60),
+            Arc::new(AtomicU64::new(0)),
+            2,
+            Arc::new(AtomicU64::new(60000)),
+            Arc::new(AtomicU64::new(0)),
+        ));
+        // Оба начальных пакета - keepalive. Очередь DATA уже прочитана перед вторым.
+        for _ in 0..2 {
+            let kind = tokio::select! {
+                result = &mut task => panic!("Uploader остановился до Hello: {result:?}"),
+                kind = recv_kind(&server, &initial, &mask) => kind,
+            };
+            assert_eq!(kind, InnerType::Control);
+        }
+        assert!(!task.is_finished());
+        assert_eq!(sent.load(Ordering::Relaxed), 0);
+        {
+            let mut upload = state.lock().unwrap();
+            upload.keys = established.clone();
+            upload.counter = 0;
+        }
+        data_tx.send(vec![0x45; 1280]).await.unwrap();
+        data_tx.send(vec![0x45; 1280]).await.unwrap();
+        assert_eq!(
+            recv_kind(&server, &established, &mask).await,
+            InnerType::Data
+        );
+        assert_eq!(
+            recv_kind(&server, &established, &mask).await,
+            InnerType::Data
+        );
+        assert_eq!(
+            recv_kind(&server, &established, &mask).await,
+            InnerType::FecRepair
+        );
+        assert_eq!(sent.load(Ordering::Relaxed), 2560);
+        assert!(!task.is_finished());
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+    }
+
+    async fn recv_kind(server: &UdpSocket, keys: &SessionKeys, mask: &MaskProfile) -> InnerType {
+        let mut buf = [0; 65536];
+        let n = tokio::time::timeout(Duration::from_secs(2), server.recv(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        let start = mask.tag_offset as usize;
+        let tag = buf[start..start + 8].try_into().unwrap();
+        let tw =
+            crypto::compute_time_window(crypto::current_timestamp_ms(), crypto::DEFAULT_WINDOW_MS);
+        let counter = (0..16)
+            .find(|counter| {
+                [tw, tw.saturating_sub(1), tw + 1]
+                    .into_iter()
+                    .any(|window| {
+                        crypto::generate_resonance_tag(&keys.tag_secret, *counter, window) == tag
+                    })
+            })
+            .unwrap();
+        let plain = crypto::decrypt_session_payload(
+            keys,
+            crypto::PacketDirection::ClientToServer,
+            counter,
+            &tag,
+            &buf[mask.mdh_len()..n],
+        )
+        .unwrap();
+        aivpn_common::protocol::InnerHeader::decode(&plain[2..])
+            .unwrap()
+            .inner_type
+    }
+}
+
 impl super::AivpnClient {
     /// Run the client main loop
     pub async fn run(&mut self, shutdown: Arc<AtomicBool>) -> Result<()> {
+        let _dns_session = self.dns_proxy_gate.as_ref().map(|gate| gate.session());
+        let admin_binding = if self.config.control_only {
+            None
+        } else {
+            let binding = crate::record_cmd::bind_admin(self.admin_listen).await.map_err(|e| {
+                error!("Cannot bind admin IPC at {}: {}. Choose a separate --admin-listen for each client", self.admin_listen, e);
+                Error::Io(e)
+            })?;
+            self.recording_status.reset_local_status();
+            Some(binding)
+        };
         self.connect().await?;
 
         // Send initial handshake packet with eph_pub to establish session
@@ -43,7 +162,6 @@ impl super::AivpnClient {
         // (and its bound UDP socket) is cancelled when run() returns. Without this,
         // the orphaned task keeps 127.0.0.1:44301 bound across reconnect iterations,
         // causing the next run() call to fail with "Address already in use".
-        let admin_token = crate::record_cmd::ensure_admin_token();
         // P2.3-desktop: the admin socket now also bridges in-tunnel `mgmt`
         // calls (`AdminCommand::Mgmt`/`Role`/`Qr`) for the Windows egui /
         // Linux iced GUIs, which shell out to this binary rather than
@@ -60,158 +178,133 @@ impl super::AivpnClient {
         // `run()`'s exclusive session loop for the task's lifetime.
         let admin_mgmt = self.mgmt.clone();
         let admin_control_tx = control_tx.clone();
-        // Headless control-only mode (server-embedded pool-peer dialer): never
-        // bind the admin IPC socket. This is the hard blocker for running N
-        // dialers in one process — `admin_tx` is intentionally left un-moved
-        // here (not dropped) so `admin_rx.recv()` in the main select loop
-        // below simply pends forever instead of spinning on a closed channel.
-        let _admin_task = if self.config.control_only {
-            AbortOnDrop(tokio::spawn(std::future::pending::<()>()))
-        } else {
+        let mut admin_task = if let Some((socket, admin_token)) = admin_binding {
             AbortOnDrop(tokio::spawn(async move {
-                // Bind with a bounded retry, not a single attempt: AbortOnDrop
-                // kills the PREVIOUS session's admin loop when its run()
-                // returns, but a detached mgmt-reply task that loop spawned
-                // (see the `AdminCommand::Mgmt` arm below) keeps a clone of
-                // the old socket's `Arc` alive until its `mgmt_call` resolves
-                // — up to the full 10s timeout when the tunnel died with the
-                // call in flight (exactly the reconnect case). A single
-                // failed bind here would leave the admin socket dead for the
-                // WHOLE new session, breaking the desktop GUIs' mgmt/record
-                // bridge until the next reconnect. 48 x 250ms comfortably
-                // covers that 10s worst case.
-                let bind_result = async {
-                    let mut last_err = None;
-                    for _ in 0..48u32 {
-                        match tokio::net::UdpSocket::bind("127.0.0.1:44301").await {
-                            Ok(s) => return Ok(s),
-                            Err(e) => {
-                                last_err = Some(e);
-                                tokio::time::sleep(Duration::from_millis(250)).await;
-                            }
+                let mut replies = tokio::task::JoinSet::<(std::net::SocketAddr, String)>::new();
+                let mut buf = [0u8; 65536];
+                loop {
+                    let received = tokio::select! {
+                        result = socket.recv_from(&mut buf) => result,
+                        Some(Ok((addr, reply))) = replies.join_next(), if !replies.is_empty() => {
+                            let _ = socket.send_to(reply.as_bytes(), addr).await;
+                            continue;
+                        },
+                    };
+                    let (len, addr) = match received {
+                        Ok(value) => value,
+                        Err(error) => {
+                            warn!("Admin socket receive failed: {error}");
+                            break;
                         }
-                    }
-                    Err(last_err.expect("loop ran at least once"))
-                }
-                .await;
-                match bind_result {
-                    Ok(socket) => {
-                        let socket = Arc::new(socket);
-                        let mut buf = [0u8; 65536];
-                        loop {
-                            if let Ok((len, addr)) = socket.recv_from(&mut buf).await {
-                                if let Ok(raw) = std::str::from_utf8(&buf[..len]) {
-                                    match raw.split_once(':').and_then(|(tok, rest)| {
-                                        crate::record_cmd::tokens_match(tok, &admin_token)
-                                            .then(|| rest.to_string())
-                                    }) {
-                                        Some(rest) => {
-                                            match crate::record_cmd::parse_admin_command(&rest) {
-                                                Some(
-                                                    cmd @ (crate::record_cmd::AdminCommand::RecordStart(_)
-                                                    | crate::record_cmd::AdminCommand::RecordStop
-                                                    | crate::record_cmd::AdminCommand::RecordStatus),
-                                                ) => {
-                                                    // Preserve pre-existing behavior exactly:
-                                                    // forward the raw command string to the main
-                                                    // select loop (`admin_rx`), which owns the
-                                                    // recording session state and its own
-                                                    // fire-and-forget (no socket reply) handling.
-                                                    let forwarded = match cmd {
-                                                        crate::record_cmd::AdminCommand::RecordStart(service) => {
-                                                            format!("record_start:{service}")
-                                                        }
-                                                        crate::record_cmd::AdminCommand::RecordStop => {
-                                                            "record_stop".to_string()
-                                                        }
-                                                        crate::record_cmd::AdminCommand::RecordStatus => {
-                                                            "record_status".to_string()
-                                                        }
-                                                        _ => unreachable!(),
-                                                    };
-                                                    let _ = admin_tx.send(forwarded).await;
-                                                }
-                                                Some(crate::record_cmd::AdminCommand::Role) => {
-                                                    let reply = admin_mgmt.cached_role().to_string();
-                                                    let _ = socket.send_to(reply.as_bytes(), addr).await;
-                                                }
-                                                Some(crate::record_cmd::AdminCommand::Qr(text)) => {
-                                                    match crate::qr::png_for(&text) {
-                                                        Ok(png) => {
-                                                            let reply = crate::record_cmd::encode_body_b64(&png);
-                                                            let _ = socket.send_to(reply.as_bytes(), addr).await;
-                                                        }
-                                                        Err(e) => {
-                                                            warn!("admin qr command failed: {e}");
-                                                        }
-                                                    }
-                                                }
-                                                Some(crate::record_cmd::AdminCommand::Mgmt {
-                                                    method,
-                                                    path,
-                                                    body,
-                                                }) => {
-                                                    // Spawned so a slow/timed-out mgmt call (up to
-                                                    // 10s, see `MgmtClient::mgmt_call`) never blocks
-                                                    // this loop from servicing other admin-socket
-                                                    // commands (record_*, other mgmt calls) meanwhile.
-                                                    let mgmt = admin_mgmt.clone();
-                                                    let control_tx = admin_control_tx.clone();
-                                                    let socket = socket.clone();
-                                                    tokio::spawn(async move {
-                                                        let reply = match mgmt
-                                                            .mgmt_call(
-                                                                &control_tx,
-                                                                method,
-                                                                &path,
-                                                                body,
-                                                                Duration::from_secs(10),
-                                                            )
-                                                            .await
-                                                        {
-                                                            Ok((status, resp_body)) => {
-                                                                crate::record_cmd::format_mgmt_reply(status, &resp_body)
-                                                            }
-                                                            Err(e) => {
-                                                                warn!("admin mgmt command failed: {e}");
-                                                                // Status 0 is a synthetic sentinel (no
-                                                                // real HTTP-style status is ever < 100)
-                                                                // meaning the call itself failed locally
-                                                                // — control_tx closed, or no
-                                                                // `MgmtResponse` within the 10s
-                                                                // `mgmt_call` timeout — as opposed to a
-                                                                // real server-returned status. The CLI
-                                                                // (`aivpn-client mgmt`) treats 0 as a
-                                                                // hard failure (non-zero exit).
-                                                                crate::record_cmd::format_mgmt_reply(0, &[])
-                                                            }
-                                                        };
-                                                        let _ = socket.send_to(reply.as_bytes(), addr).await;
-                                                    });
-                                                }
-                                                None => {
-                                                    warn!("Rejected admin command: unparseable command");
-                                                }
+                    };
+                    if let Ok(raw) = std::str::from_utf8(&buf[..len]) {
+                        match raw.split_once(':').and_then(|(tok, rest)| {
+                            crate::record_cmd::tokens_match(tok, &admin_token)
+                                .then(|| rest.to_string())
+                        }) {
+                            Some(rest) => {
+                                match crate::record_cmd::parse_admin_command(&rest) {
+                                    Some(
+                                        cmd @ (crate::record_cmd::AdminCommand::RecordStart(_)
+                                        | crate::record_cmd::AdminCommand::RecordStop
+                                        | crate::record_cmd::AdminCommand::RecordStatus),
+                                    ) => {
+                                        // Preserve pre-existing behavior exactly:
+                                        // forward the raw command string to the main
+                                        // select loop (`admin_rx`), which owns the
+                                        // recording session state and its own
+                                        // fire-and-forget (no socket reply) handling.
+                                        let forwarded = match cmd {
+                                            crate::record_cmd::AdminCommand::RecordStart(
+                                                service,
+                                            ) => {
+                                                format!("record_start:{service}")
+                                            }
+                                            crate::record_cmd::AdminCommand::RecordStop => {
+                                                "record_stop".to_string()
+                                            }
+                                            crate::record_cmd::AdminCommand::RecordStatus => {
+                                                "record_status".to_string()
+                                            }
+                                            _ => unreachable!(),
+                                        };
+                                        let _ = admin_tx.send(forwarded).await;
+                                    }
+                                    Some(crate::record_cmd::AdminCommand::Role) => {
+                                        let reply = admin_mgmt.cached_role().to_string();
+                                        let _ = socket.send_to(reply.as_bytes(), addr).await;
+                                    }
+                                    Some(crate::record_cmd::AdminCommand::Qr(text)) => {
+                                        match crate::qr::png_for(&text) {
+                                            Ok(png) => {
+                                                let reply =
+                                                    crate::record_cmd::encode_body_b64(&png);
+                                                let _ =
+                                                    socket.send_to(reply.as_bytes(), addr).await;
+                                            }
+                                            Err(e) => {
+                                                warn!("admin qr command failed: {e}");
                                             }
                                         }
-                                        None => {
-                                            warn!(
-                                                "Rejected admin command: missing or invalid auth token"
-                                            );
-                                        }
+                                    }
+                                    Some(crate::record_cmd::AdminCommand::Mgmt {
+                                        method,
+                                        path,
+                                        body,
+                                    }) => {
+                                        // Spawned so a slow/timed-out mgmt call (up to
+                                        // 10s, see `MgmtClient::mgmt_call`) never blocks
+                                        // this loop from servicing other admin-socket
+                                        // commands (record_*, other mgmt calls) meanwhile.
+                                        let mgmt = admin_mgmt.clone();
+                                        let control_tx = admin_control_tx.clone();
+                                        replies.spawn(async move {
+                                            let reply = match mgmt
+                                                .mgmt_call(
+                                                    &control_tx,
+                                                    method,
+                                                    &path,
+                                                    body,
+                                                    Duration::from_secs(10),
+                                                )
+                                                .await
+                                            {
+                                                Ok((status, resp_body)) => {
+                                                    crate::record_cmd::format_mgmt_reply(
+                                                        status, &resp_body,
+                                                    )
+                                                }
+                                                Err(e) => {
+                                                    warn!("admin mgmt command failed: {e}");
+                                                    // Status 0 is a synthetic sentinel (no
+                                                    // real HTTP-style status is ever < 100)
+                                                    // meaning the call itself failed locally
+                                                    // — control_tx closed, or no
+                                                    // `MgmtResponse` within the 10s
+                                                    // `mgmt_call` timeout — as opposed to a
+                                                    // real server-returned status. The CLI
+                                                    // (`aivpn-client mgmt`) treats 0 as a
+                                                    // hard failure (non-zero exit).
+                                                    crate::record_cmd::format_mgmt_reply(0, &[])
+                                                }
+                                            };
+                                            (addr, reply)
+                                        });
+                                    }
+                                    None => {
+                                        warn!("Rejected admin command: unparseable command");
                                     }
                                 }
                             }
+                            None => {
+                                warn!("Rejected admin command: missing or invalid auth token");
+                            }
                         }
-                    }
-                    Err(e) => {
-                        error!(
-                            "Failed to bind local admin UDP socket 127.0.0.1:44301: {}",
-                            e
-                        );
                     }
                 }
             }))
+        } else {
+            AbortOnDrop(tokio::spawn(std::future::pending::<()>()))
         };
 
         // Proxy mode: start smoltcp + SOCKS5 instead of creating a TUN device
@@ -233,6 +326,7 @@ impl super::AivpnClient {
                 vpn_ip,
                 gateway_ip,
                 prefix_len: self.config.tun_config.prefix_len,
+                dns_servers: self.config.proxy_dns.clone(),
             };
             let handle = crate::proxy::spawn_proxy(proxy_cfg, tun_to_udp_tx.clone())
                 .await
@@ -338,37 +432,18 @@ impl super::AivpnClient {
         // plain captured bool is enough — no need for an Arc<AtomicBool>
         // like the live-updated `ip:` field above.
         let stats_bootstrap_fallback = self.config.is_bootstrap_fallback;
+        let stats_paths = crate::record_cmd::local_status_paths(self.admin_listen, "traffic.stats");
         let stats_task = if self.config.control_only {
             // Headless control-only mode: no stats file — there is no GUI or
             // CLI observing this in-process pool-peer dialer.
             tokio::spawn(std::future::pending::<()>())
         } else {
             tokio::spawn(async move {
-                // Determine platform-appropriate stats paths
-                #[cfg(target_os = "windows")]
-                let stats_paths: Vec<std::path::PathBuf> = {
-                    let mut paths = Vec::new();
-                    if let Some(local_app) = std::env::var_os("LOCALAPPDATA") {
-                        let dir = std::path::PathBuf::from(local_app).join("AIVPN");
-                        let _ = tokio::fs::create_dir_all(&dir).await;
-                        paths.push(dir.join("traffic.stats"));
-                    }
-                    let tmp = std::env::temp_dir().join("aivpn-traffic.stats");
-                    paths.push(tmp);
-                    paths
-                };
-                #[cfg(not(target_os = "windows"))]
-                let stats_paths: Vec<std::path::PathBuf> = vec![
-                    std::path::PathBuf::from("/var/run/aivpn/traffic.stats"),
-                    std::path::PathBuf::from("/tmp/aivpn-traffic.stats"),
-                ];
-
                 // Session epoch (unix ms), captured ONCE when this session's stats
                 // task starts. GUIs key on a CHANGE in `since` to detect a silent
                 // in-process reconnect: it tells them to accept the new (lower)
                 // counters and restart the displayed uptime together, instead of
-                // freezing on the old totals. The pre-session zero-writes in
-                // main.rs deliberately carry NO `since` — no session exists yet.
+                // freezing on the old totals.
                 let session_since_ms = epoch_ms();
 
                 // Write initial stats. O_NOFOLLOW/create_new-hardened atomic write
@@ -575,6 +650,8 @@ impl super::AivpnClient {
                 }
 
                 _ = rx_watchdog.tick() => {
+                    #[cfg(target_os = "linux")]
+                    if self.kernel_harvest() { last_rx = Instant::now(); }
                     // Post-freeze/suspend liveness probe (see WAKE_GAP_THRESHOLD):
                     // a tick gap ≫ the 5 s watchdog cadence means the process
                     // was frozen or the machine suspended. Arm a probe: unless
@@ -805,35 +882,33 @@ impl super::AivpnClient {
                     };
                 }
 
-                cmd = admin_rx.recv() => {
-                    if let Some(cmd) = cmd {
-                        if let Some(service) = cmd.strip_prefix("record_start:") {
-                            crate::record_cmd::handle_recording_status(true, Some(service));
-                            let payload = ControlPayload::RecordingStart { service: service.to_string() };
+                Some(cmd) = admin_rx.recv() => {
+                    if let Some(service) = cmd.strip_prefix("record_start:") {
+                        self.recording_status.handle_recording_status(true, Some(service));
+                        let payload = ControlPayload::RecordingStart { service: service.to_string() };
+                        if let Err(e) = control_tx.send(payload).await {
+                            error!("Failed to send RecordingStart to upload task: {}", e);
+                        } else {
+                            info!("Sent RecordingStart for {}", service);
+                        }
+                    } else if cmd == "record_stop" {
+                        if let Some(session_id) = self.active_recording_session {
+                            let current_service = self.recording_status.read_local_status().and_then(|status| status.service);
+                            self.recording_status.mark_recording_stop_requested(current_service.as_deref());
+                            let payload = ControlPayload::RecordingStop { session_id };
                             if let Err(e) = control_tx.send(payload).await {
-                                error!("Failed to send RecordingStart to upload task: {}", e);
+                                error!("Failed to send RecordingStop to upload task: {}", e);
                             } else {
-                                info!("Sent RecordingStart for {}", service);
+                                info!("Sent RecordingStop");
                             }
-                        } else if cmd == "record_stop" {
-                            if let Some(session_id) = self.active_recording_session {
-                                let current_service = crate::record_cmd::read_local_status().and_then(|status| status.service);
-                                crate::record_cmd::mark_recording_stop_requested(current_service.as_deref());
-                                let payload = ControlPayload::RecordingStop { session_id };
-                                if let Err(e) = control_tx.send(payload).await {
-                                    error!("Failed to send RecordingStop to upload task: {}", e);
-                                } else {
-                                    info!("Sent RecordingStop");
-                                }
-                            } else {
-                                warn!("No active recording session to stop");
-                                crate::record_cmd::handle_recording_failed("No active recording session to stop");
-                            }
-                        } else if cmd == "record_status" {
-                            let payload = ControlPayload::RecordingStatusRequest;
-                            if let Err(e) = control_tx.send(payload).await {
-                                error!("Failed to send RecordingStatusRequest to upload task: {}", e);
-                            }
+                        } else {
+                            warn!("No active recording session to stop");
+                            self.recording_status.handle_recording_failed("No active recording session to stop");
+                        }
+                    } else if cmd == "record_status" {
+                        let payload = ControlPayload::RecordingStatusRequest;
+                        if let Err(e) = control_tx.send(payload).await {
+                            error!("Failed to send RecordingStatusRequest to upload task: {}", e);
                         }
                     }
                 }
@@ -873,6 +948,8 @@ impl super::AivpnClient {
         // makes the two detached §2/§3 tasks (the MaskPreference retry and the
         // jittered MaskFeedback send) reliably bail out via their "receiver gone"
         // send-error paths instead of outliving `run()`.
+        admin_task.0.abort();
+        let _ = (&mut admin_task.0).await;
         stats_task.abort();
         tun_task.abort();
         udp_task.abort();
@@ -939,6 +1016,16 @@ impl super::AivpnClient {
         }
 
         impl PacketEncryptor for MimicryEncryptor {
+            fn data_ready(&self) -> bool {
+                !self
+                    .upload_state
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .keys
+                    .packet_cipher
+                    .is_initial()
+            }
+
             fn encrypt_data(&mut self, payload: &[u8]) -> Result<Vec<u8>> {
                 self.check_mask();
                 self.last_tx_ms.store(epoch_ms(), Ordering::Relaxed);
@@ -972,6 +1059,17 @@ impl super::AivpnClient {
 
             fn take_fec_repair(&mut self) -> Option<Vec<u8>> {
                 self.pending_fec.take()
+            }
+
+            fn encrypt_fragment(&mut self, payload: &[u8]) -> Result<Vec<u8>> {
+                self.check_mask();
+                self.last_tx_ms.store(epoch_ms(), Ordering::Relaxed);
+                let mut state = self.upload_state.lock().unwrap_or_else(|e| e.into_inner());
+                let inner = build_inner_packet(InnerType::Fragment, state.seq, payload);
+                state.seq = state.seq.wrapping_add(1);
+                let keys = state.keys.clone();
+                self.engine
+                    .build_packet(&inner, &keys, &mut state.counter, None)
             }
 
             fn encrypt_control(&mut self, payload: &ControlPayload) -> Result<Vec<u8>> {
@@ -1120,11 +1218,12 @@ impl super::AivpnClient {
         // control/rekey), so a single fixed length silently drops any packet
         // whose mask differs — the failure that strands the tunnel on the first
         // rekey. See `decode_downlink_any_mdh_len`.
-        let decoded = match decode_downlink_any_mdh_len(
+        let decoded = match decode_downlink_with_offsets(
             packet,
             keys,
             &mut self.recv_window,
             &mut self.recv_mdh_candidates,
+            &self.recv_tag_offsets,
         ) {
             Ok(decoded) => {
                 // M3: while a rekey staging is outstanding, a packet that
@@ -1133,18 +1232,31 @@ impl super::AivpnClient {
                 // switches its downlink to the new keys at commit) — promote
                 // the staged upload keys. No-op when no rekey is in flight.
                 self.promote_pending_upload_keys();
+                // Захват до выдачи в TUN. Отказ ядра не пускает пакет дальше.
+                #[cfg(target_os = "linux")]
+                if !self.kernel_accept_counter(self.kernel_epoch, decoded.counter) {
+                    return Ok(());
+                }
                 decoded
             }
             Err(primary_err) => {
                 // Fallback: PFS-ratchet transition keys (in-flight packets
                 // encrypted with the pre-rekey keys), same candidate lengths.
                 if let Some(fallback_keys) = self.transition_recv_keys.as_ref() {
-                    if let Ok(decoded) = decode_downlink_any_mdh_len(
+                    if let Ok(decoded) = decode_downlink_with_offsets(
                         packet,
                         fallback_keys,
                         &mut self.transition_recv_window,
                         &mut self.recv_mdh_candidates,
+                        &self.recv_tag_offsets,
                     ) {
+                        // Старая эпоха есть в ядре только после смены ключа.
+                        #[cfg(target_os = "linux")]
+                        if self.kernel_replay_bound
+                            && !self.kernel_accept_counter(self.kernel_prev_epoch, decoded.counter)
+                        {
+                            return Ok(());
+                        }
                         return self.process_decoded(decoded).await;
                     }
                 }
@@ -1164,8 +1276,21 @@ impl super::AivpnClient {
         #[cfg(target_os = "linux")]
         self.kernel_push_tags(false);
 
-        let inner_header = decoded.header;
-        let ip_payload = decoded.payload;
+        let mut inner_header = decoded.header;
+        let ip_payload = if inner_header.inner_type == InnerType::Fragment {
+            match self
+                .fragment_rx
+                .accept(&decoded.payload, std::time::Instant::now())?
+            {
+                Some((kind, payload)) => {
+                    inner_header.inner_type = kind;
+                    payload
+                }
+                None => return Ok(()),
+            }
+        } else {
+            decoded.payload
+        };
 
         match inner_header.inner_type {
             InnerType::Data => {

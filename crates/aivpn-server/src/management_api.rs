@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use axum::body::Bytes;
-use axum::extract::{Path, Query, State};
+use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::{header, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::IntoResponse;
@@ -32,6 +32,54 @@ use crate::client_db::{ClientDatabase, ClientRole};
 use crate::mgmt_service::{self, ClientView as ClientResponse, HeavySetting, MgmtCtx, MgmtError};
 use crate::mgmt_wire_common::{deserialize_opt_opt, kernel_loaded};
 use crate::pending_config::PendingConfigManager;
+
+const MAX_MASK_SIZE: usize = 5 * 1024 * 1024;
+const MAX_BACKUP_SIZE: usize = 50 * 1024 * 1024;
+
+#[derive(Debug)]
+struct PendingWriteConflict;
+
+impl std::fmt::Display for PendingWriteConflict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("pending change must be confirmed or rolled back first")
+    }
+}
+impl std::error::Error for PendingWriteConflict {}
+
+fn write_direct_file(
+    pending: Option<&PendingConfigManager>,
+    path: &std::path::Path,
+    content: &[u8],
+) -> anyhow::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let guard = pending.map(PendingConfigManager::lock_mutation);
+    if let (Some(manager), Some(guard)) = (pending, guard.as_ref()) {
+        if manager.has_pending_for_path_locked(path, guard) {
+            return Err(PendingWriteConflict.into());
+        }
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut suffix = [0u8; 16];
+    rand::rngs::OsRng.fill_bytes(&mut suffix);
+    let tmp = path.with_extension(format!("tmp.{}", hex::encode(suffix)));
+    let result = (|| -> std::io::Result<()> {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp)?;
+        file.write_all(content)?;
+        file.sync_all()?;
+        std::fs::rename(&tmp, path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    Ok(result?)
+}
 
 // ── Config passed by main ────────────────────────────────────────────────────
 
@@ -92,30 +140,9 @@ pub struct ServeConfig {
     /// 500 — see `mgmt_service::apply_heavy`'s doc comment), which only
     /// happens if a caller builds `ServeConfig` without wiring this up.
     pub pending_config: Option<std::sync::Arc<PendingConfigManager>>,
-    /// Wave B1 (pool topology read endpoints): whether pool sync is
-    /// configured on this node AT ALL (`server.json`'s `pool` block
-    /// present), regardless of transport — mirrors
-    /// `gateway::GatewayConfig::pool_configured`; see that field's doc
-    /// comment for why this is needed to tell `"legacy"` apart from
-    /// `"none"` when `pool_dialer_slot` below is empty.
+    /// Пул задан в конфиге, даже если dialer еще запускается.
     pub pool_configured: bool,
-    /// Wave B1: a shared, fillable-later handle to the live `NodeRegistry`.
-    /// `main.rs` constructs this `ServeConfig` (and spawns the REST API)
-    /// BEFORE the pool-sync setup block that actually creates the
-    /// `NodeRegistry`/`PoolDialer` (they're only built once
-    /// `pool.transport == "masked"` is confirmed, deep inside the
-    /// post-`AivpnServer::new()` match arm) — reordering that spawn was
-    /// judged too invasive for this change. Passing the SAME
-    /// `Arc<Mutex<Option<..>>>` cell into both `ServeConfig` (read at
-    /// request time, in `ApiState::mgmt_ctx`) and the pool-sync setup block
-    /// (written once, right after `NodeRegistry::load`/`PoolDialer::new`
-    /// succeed) sidesteps the ordering problem entirely: a REST request
-    /// that lands before the pool-sync block finishes just observes an
-    /// empty slot (degrades to `pool_configured`'s `"legacy"`/`"none"`
-    /// label, never an error) and self-heals on the very next request once
-    /// `main.rs` fills it in — no restart needed. `None` when pool sync
-    /// isn't configured at all (`main.rs` never allocates a cell it will
-    /// never fill).
+    /// Registry заполняется при запуске пула. API читает актуальное значение.
     pub pool_registry_slot: Option<
         std::sync::Arc<
             parking_lot::Mutex<Option<std::sync::Arc<crate::node_registry::NodeRegistry>>>,
@@ -240,7 +267,7 @@ impl ApiState {
                     transport: "masked",
                 })
             }
-            None if self.pool_configured => mgmt_service::PoolSnapshot::empty("legacy"),
+            None if self.pool_configured => mgmt_service::PoolSnapshot::empty("masked"),
             None => mgmt_service::PoolSnapshot::empty("none"),
         }
     }
@@ -678,7 +705,27 @@ async fn put_config(
     // the next server start (`load_server_file_config` exits on parse
     // failure). The allowlist is back (`CONFIG_KNOWN_KEYS`, checked above),
     // but guarded by a test that catches drift against the shipped example.
-    if let Err(e) = serde_json::from_value::<crate::server_config::ServerFileConfig>(body.clone()) {
+    let parsed_cfg =
+        match serde_json::from_value::<crate::server_config::ServerFileConfig>(body.clone()) {
+            Ok(cfg) => cfg,
+            Err(e) => {
+                audit(
+                    &state,
+                    "ConfigPut",
+                    &path.display().to_string(),
+                    &format!("rejected: {}", e),
+                );
+                return (
+                    StatusCode::BAD_REQUEST,
+                    err(format!("invalid config: {}", e)),
+                )
+                    .into_response();
+            }
+        };
+    // Полная замена файла: в production-secure тело без mask_signing_key или с
+    // режимом off/warn не должно сохраниться. Обычная сборка по-прежнему
+    // принимает warn без ключа.
+    if let Err(e) = parsed_cfg.validate_mask_trust() {
         audit(
             &state,
             "ConfigPut",
@@ -698,31 +745,10 @@ async fn put_config(
         }
     };
     let db = state.db.clone();
+    let pending = state.pending_config.clone();
     let path_for_log = path.display().to_string();
-    match tokio::task::spawn_blocking(move || -> Result<(), std::io::Error> {
-        // Unique (random-suffixed) temp name: two concurrent PUTs must not
-        // share one `<file>.tmp` — interleaved write/rename of a shared name
-        // can rename the OTHER writer's half-written content into place.
-        // Mirrors `heavy_settings::apply_heavy`'s randomized temp-file
-        // pattern.
-        let mut suffix = [0u8; 16];
-        rand::rngs::OsRng.fill_bytes(&mut suffix);
-        let tmp = path.with_extension(format!("tmp.{}", hex::encode(suffix)));
-        std::fs::write(&tmp, &content)?;
-        // server.json can hold plaintext secrets (e.g. bootstrap_publish S3 /
-        // GitHub / Telegram tokens). std::fs::write() creates the temp file
-        // with the process umask (commonly 0644 under root), so a rename
-        // would silently DOWNGRADE an operator-set 0600 on the live file.
-        // Harden the temp file BEFORE the rename makes it visible — same
-        // pattern as `ClientDatabase::save`.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            if let Err(e) = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600)) {
-                tracing::warn!("Failed to set server config permissions to 0600: {}", e);
-            }
-        }
-        std::fs::rename(&tmp, &path)?;
+    match tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        write_direct_file(pending.as_deref(), &path, content.as_bytes())?;
         db.reload_if_changed();
         Ok(())
     })
@@ -731,6 +757,9 @@ async fn put_config(
         Ok(Ok(())) => {
             audit(&state, "ConfigPut", &path_for_log, "ok");
             Json(serde_json::json!({ "ok": true })).into_response()
+        }
+        Ok(Err(e)) if e.is::<PendingWriteConflict>() => {
+            (StatusCode::CONFLICT, err(e.to_string())).into_response()
         }
         Ok(Err(e)) => {
             audit(
@@ -824,7 +853,7 @@ async fn upload_mask(
         || name.len() > 64
         || !name
             .chars()
-            .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
     {
         return (
             StatusCode::BAD_REQUEST,
@@ -832,7 +861,7 @@ async fn upload_mask(
         )
             .into_response();
     }
-    if body.len() > 5 * 1024 * 1024 {
+    if body.len() > MAX_MASK_SIZE {
         return (
             StatusCode::PAYLOAD_TOO_LARGE,
             err("mask file exceeds 5 MB limit"),
@@ -852,18 +881,22 @@ async fn upload_mask(
                 .into_response()
         }
     };
-    // Config-gated operator signature verification, mirroring mask_store's
-    // disk-load policy: enforce → reject, warn → accept with a warning.
-    let verdict = aivpn_common::mask::verify_mask_artifact(
+    if name != profile.mask_id {
+        return (StatusCode::BAD_REQUEST, err("name must match mask_id")).into_response();
+    }
+    // Проверка совпадает с mask_store. Защищенная сборка требует enforce
+    // и при старом сохраненном значении warn.
+    let verify_mode = crate::server_config::effective_mask_verify_mode(state.mask_verify_mode);
+    let verdict = crate::mask_store::assess_stored_profile(
         &profile,
         state.mask_operator_pubkey.as_ref(),
-        state.mask_verify_mode,
+        verify_mode,
     );
     if !verdict.accept {
         return (
             StatusCode::BAD_REQUEST,
             err(format!(
-                "mask signature verification failed (mask_verify_mode=enforce): {:?}",
+                "mask signature verification failed (mask_verify_mode={verify_mode:?}): {:?}",
                 verdict.detail
             )),
         )
@@ -977,19 +1010,15 @@ async fn set_active_mask(
 
     // Write override file: <mask_dir>/.overrides/<client-id>.mask
     let overrides_dir = state.mask_dir.join(".overrides");
-    match tokio::fs::create_dir_all(&overrides_dir).await {
-        Ok(()) => {}
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                err(format!("cannot create overrides dir: {}", e)),
-            )
-                .into_response()
-        }
-    }
     let override_path = overrides_dir.join(format!("{}.mask", client_id));
-    match tokio::fs::write(&override_path, body.mask.as_bytes()).await {
-        Ok(()) => {
+    let pending = state.pending_config.clone();
+    let mask = body.mask.clone();
+    match tokio::task::spawn_blocking(move || {
+        write_direct_file(pending.as_deref(), &override_path, mask.as_bytes())
+    })
+    .await
+    {
+        Ok(Ok(())) => {
             audit(
                 &state,
                 "MaskSetActive",
@@ -999,11 +1028,15 @@ async fn set_active_mask(
             Json(serde_json::json!({ "ok": true, "client": body.client, "mask": body.mask }))
                 .into_response()
         }
-        Err(e) => (
+        Ok(Err(e)) if e.is::<PendingWriteConflict>() => {
+            (StatusCode::CONFLICT, err(e.to_string())).into_response()
+        }
+        Ok(Err(e)) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             err(format!("write error: {}", e)),
         )
             .into_response(),
+        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, err("internal error")).into_response(),
     }
 }
 
@@ -1248,8 +1281,7 @@ async fn import_backup(
     Query(q): Query<ImportBackupQuery>,
     body: Bytes,
 ) -> impl IntoResponse {
-    use crate::backup::import_server;
-    const MAX_BACKUP_SIZE: usize = 50 * 1024 * 1024; // 50 MB
+    use crate::backup::{import_server_with_options, ImportOptions};
     if body.len() > MAX_BACKUP_SIZE {
         return (
             StatusCode::PAYLOAD_TOO_LARGE,
@@ -1257,12 +1289,19 @@ async fn import_backup(
         )
             .into_response();
     }
-    let target_dir = match state.config_path.as_ref().and_then(|p| p.parent()) {
-        Some(d) => d.to_path_buf(),
-        None => {
+    if !q.dry_run {
+        return (StatusCode::CONFLICT, err("Восстановление доступно только offline. Остановите сервер и все процессы, использующие базу, затем выполните aivpn-server --import <archive> --config <config> --clients-db <database> --mask-dir <masks>. Для проверки архива используйте ?dry_run=true.")).into_response();
+    }
+    let opts = match (&state.config_path, &state.clients_db_path) {
+        (Some(config), Some(clients)) => ImportOptions {
+            config_path: config.clone(),
+            clients_db: clients.clone(),
+            mask_dir: state.mask_dir.clone(),
+        },
+        _ => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                err("config path not configured"),
+                err("config or clients database path not configured"),
             )
                 .into_response()
         }
@@ -1289,7 +1328,7 @@ async fn import_backup(
                     .open(&tmp)?;
             }
             std::fs::write(&tmp, &body)?;
-            let r = import_server(&tmp, &target_dir, dry_run);
+            let r = import_server_with_options(&tmp, &opts, dry_run);
             let _ = std::fs::remove_file(&tmp);
             Ok(r?)
         })
@@ -1312,6 +1351,9 @@ async fn import_backup(
                 "signed": summary.signed,
             }))
             .into_response()
+        }
+        Ok(Err(e)) if e.is::<PendingWriteConflict>() => {
+            (StatusCode::CONFLICT, err(e.to_string())).into_response()
         }
         Ok(Err(e)) => {
             audit(
@@ -1517,11 +1559,19 @@ fn router(state: ApiState) -> Router {
         .route("/api/v1/config", get(get_config).put(put_config))
         .route("/api/v1/config/apply", post(apply_config))
         .route("/api/v1/config/confirm", post(confirm_config))
-        .route("/api/v1/masks", get(list_masks).post(upload_mask))
+        .route(
+            "/api/v1/masks",
+            get(list_masks)
+                .post(upload_mask)
+                .layer(DefaultBodyLimit::max(MAX_MASK_SIZE)),
+        )
         .route("/api/v1/masks/:name", axum::routing::delete(delete_mask))
         .route("/api/v1/masks/active", post(set_active_mask))
         .route("/api/v1/backup/export", get(export_backup))
-        .route("/api/v1/backup/import", post(import_backup))
+        .route(
+            "/api/v1/backup/import",
+            post(import_backup).layer(DefaultBodyLimit::max(MAX_BACKUP_SIZE)),
+        )
         .route("/api/v1/bootstrap/export", get(export_bootstrap))
         .route("/api/v1/audit-log", get(get_audit_log))
         .route("/api/v1/kernel", get(get_kernel))
@@ -1531,6 +1581,302 @@ fn router(state: ApiState) -> Router {
         .route("/api/v1/pool/health", get(get_pool_health))
         .route("/api/v1/pool/links", get(get_pool_links))
         .with_state(state)
+}
+
+#[cfg(test)]
+mod control_regression_tests {
+    use super::*;
+    use crate::pending_config::PendingConfig;
+    use axum::body::Body;
+    use axum::http::Request;
+
+    fn state(root: &std::path::Path) -> ApiState {
+        let db_path = root.join("clients.json");
+        let db = ClientDatabase::load(
+            &db_path,
+            crate::mgmt_service::test_support::test_network_config(),
+        )
+        .unwrap();
+        let mask_dir = root.join("masks");
+        std::fs::create_dir(&mask_dir).unwrap();
+        let signing = ed25519_dalek::SigningKey::from_bytes(&[42; 32]);
+        ApiState {
+            db: Arc::new(db),
+            started_at: Instant::now(),
+            server_pub_key: None,
+            server_addr: None,
+            server_signing_pubkey: None,
+            config_path: Some(root.join("custom.json")),
+            clients_db_path: Some(db_path),
+            mask_dir,
+            audit_log_path: None,
+            audit_log: None,
+            bootstrap_descriptors: None,
+            mask_operator_pubkey: Some(signing.verifying_key().to_bytes()),
+            mask_verify_mode: aivpn_common::mask::MaskVerifyMode::Enforce,
+            #[cfg(feature = "metrics")]
+            metrics: None,
+            pending_config: Some(Arc::new(PendingConfigManager::new())),
+            pool_configured: false,
+            pool_registry_slot: None,
+            pool_dialer_slot: None,
+            exit_route_cache: None,
+            masked_exit_addr: None,
+        }
+    }
+
+    fn pending(state: &ApiState, path: &std::path::Path) {
+        state
+            .pending_config
+            .as_ref()
+            .unwrap()
+            .begin(PendingConfig::begin(
+                "pending-test".into(),
+                path.to_path_buf(),
+                None,
+                "test".into(),
+                Instant::now(),
+                std::time::Duration::from_secs(60),
+            ));
+    }
+
+    fn signed_profile() -> aivpn_common::mask::MaskProfile {
+        let mut profile = aivpn_common::mask::preset_masks::webrtc_zoom_v3();
+        profile.sign(&ed25519_dalek::SigningKey::from_bytes(&[42; 32]));
+        profile
+    }
+
+    async fn request(app: Router, method: &str, path: &str, body: Vec<u8>) -> StatusCode {
+        app.oneshot(
+            Request::builder()
+                .method(method)
+                .uri(path)
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+        .status()
+    }
+
+    #[tokio::test]
+    async fn direct_config_write_conflicts_with_pending() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let path = state.config_path.clone().unwrap();
+        std::fs::write(&path, b"{}").unwrap();
+        pending(&state, &path);
+        let body = serde_json::to_vec(&serde_json::json!({
+            "mask_signing_key": "/test/mask.key", "mask_verify_mode": "enforce"
+        }))
+        .unwrap();
+        assert_eq!(
+            request(router(state), "PUT", "/api/v1/config", body).await,
+            StatusCode::CONFLICT
+        );
+        assert_eq!(std::fs::read(path).unwrap(), b"{}");
+    }
+
+    #[tokio::test]
+    async fn direct_mask_override_conflicts_with_pending() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let client = state.db.add_client("alice").unwrap();
+        let path = state
+            .mask_dir
+            .join(".overrides")
+            .join(format!("{}.mask", client.id));
+        pending(&state, &path);
+        let body = serde_json::to_vec(&serde_json::json!({
+            "client": "alice", "mask": "webrtc_zoom_v3"
+        }))
+        .unwrap();
+        assert_eq!(
+            request(router(state), "POST", "/api/v1/masks/active", body).await,
+            StatusCode::CONFLICT
+        );
+        assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn upload_rejects_mask_id_mismatch() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let path = state.mask_dir.join("different.json");
+        let body = serde_json::to_vec(&signed_profile()).unwrap();
+        assert_eq!(
+            request(router(state), "POST", "/api/v1/masks?name=different", body).await,
+            StatusCode::BAD_REQUEST
+        );
+        assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn upload_rejects_invalid_reverse_signature() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let mut profile = signed_profile();
+        profile.reverse_profile =
+            Some(Box::new(aivpn_common::mask::preset_masks::webrtc_zoom_v3()));
+        profile.sign(&ed25519_dalek::SigningKey::from_bytes(&[42; 32]));
+        let path = format!("/api/v1/masks?name={}", profile.mask_id);
+        assert_eq!(
+            request(
+                router(state),
+                "POST",
+                &path,
+                serde_json::to_vec(&profile).unwrap()
+            )
+            .await,
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[tokio::test]
+    async fn upload_limits_are_route_specific() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let app = router(state);
+        let profile = signed_profile();
+        let path = format!("/api/v1/masks?name={}", profile.mask_id);
+        let mut mask = serde_json::to_vec(&profile).unwrap();
+        mask.resize(3 * 1024 * 1024, b' ');
+        assert_eq!(
+            request(app.clone(), "POST", &path, mask).await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            request(
+                app.clone(),
+                "POST",
+                "/api/v1/backup/import?dry_run=true",
+                vec![0; 3 * 1024 * 1024]
+            )
+            .await,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            request(app.clone(), "POST", &path, vec![0; 5 * 1024 * 1024 + 1]).await,
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
+        assert_eq!(
+            request(
+                app.clone(),
+                "POST",
+                "/api/v1/backup/import",
+                vec![0; 50 * 1024 * 1024 + 1]
+            )
+            .await,
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
+        assert_eq!(
+            request(app, "PUT", "/api/v1/config", vec![b' '; 3 * 1024 * 1024]).await,
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
+    }
+
+    #[tokio::test]
+    async fn backup_http_is_validation_only_and_keeps_live_files_unchanged() {
+        let source = tempfile::tempdir().unwrap();
+        let target = tempfile::tempdir().unwrap();
+        let src_config = source.path().join("config.json");
+        let src_db = source.path().join("db.json");
+        std::fs::write(&src_config, b"{}").unwrap();
+        std::fs::write(&src_db, b"{\"clients\":[]}").unwrap();
+        let archive = source.path().join("backup.tar.gz");
+        crate::backup::export_server(
+            &crate::backup::ExportOptions {
+                include_config: true,
+                include_clients: true,
+                config_path: Some(src_config),
+                clients_db: Some(src_db),
+                ..Default::default()
+            },
+            &archive,
+        )
+        .unwrap();
+        let state = state(target.path());
+        let path = state.config_path.clone().unwrap();
+        let db_path = state.clients_db_path.clone().unwrap();
+        pending(&state, &path);
+        let app = router(state.clone());
+        let bytes = std::fs::read(&archive).unwrap();
+        assert_eq!(
+            request(app.clone(), "POST", "/api/v1/backup/import", bytes.clone()).await,
+            StatusCode::CONFLICT
+        );
+        assert!(!path.exists());
+        state
+            .pending_config
+            .as_ref()
+            .unwrap()
+            .confirm_and_take("pending-test")
+            .unwrap();
+        assert_eq!(
+            request(app.clone(), "POST", "/api/v1/backup/import", bytes.clone()).await,
+            StatusCode::CONFLICT
+        );
+        assert!(!path.exists());
+        assert!(!db_path.exists());
+        assert_eq!(
+            request(
+                app.clone(),
+                "POST",
+                "/api/v1/backup/import?dry_run=true",
+                bytes
+            )
+            .await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            request(
+                app,
+                "POST",
+                "/api/v1/backup/import?dry_run=true",
+                b"invalid".to_vec()
+            )
+            .await,
+            StatusCode::BAD_REQUEST
+        );
+        assert!(!path.exists());
+        assert!(!db_path.exists());
+        assert!(!target.path().join("server.json").exists());
+    }
+
+    #[test]
+    fn direct_write_waits_for_pending_mutation_lock() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("server.json");
+        let manager = Arc::new(PendingConfigManager::new());
+        let guard = manager.lock_mutation();
+        let worker_manager = manager.clone();
+        let worker_path = path.clone();
+        let (started, receive) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            started.send(()).unwrap();
+            write_direct_file(Some(&worker_manager), &worker_path, b"new")
+        });
+        receive.recv().unwrap();
+        manager.begin_locked(
+            PendingConfig::begin(
+                "test".into(),
+                path.clone(),
+                None,
+                "test".into(),
+                Instant::now(),
+                std::time::Duration::from_secs(60),
+            ),
+            &guard,
+        );
+        drop(guard);
+        assert!(worker
+            .join()
+            .unwrap()
+            .unwrap_err()
+            .is::<PendingWriteConflict>());
+        assert!(!path.exists());
+    }
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────

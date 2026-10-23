@@ -39,10 +39,6 @@ config/*.json
 # Machine-specific NDK / linker paths — never commit
 .cargo/
 
-# ── Claude Code ──────────────────────────────────────────────────────────────
-.claude/
-CLAUDE.md
-
 # ── Android ──────────────────────────────────────────────────────────────────
 platforms/android/**/build/
 platforms/android/**/bin/
@@ -98,7 +94,9 @@ coverage/
 *.gcno
 
 # ── Internal docs (not for public distribution) ──────────────────────────────
-docs/
+docs/*
+!docs/RELEASE_1.2.0.md
+/CODE_REVIEW_*.md
 
 # ── Makefile linux-appimage tool cache ───────────────────────────────────────
 /build/
@@ -126,3 +124,11 @@ node_modules/
 vngvenv/
 venv/
 .venv/
+
+# Swift Package Manager
+platforms/ios/.build/
+platforms/ios/.swiftpm/
+
+# Локальные результаты сборки модуля ядра
+/platforms/linux-kernel/tests/policy_test
+/platforms/linux-kernel/src/.*.o.d

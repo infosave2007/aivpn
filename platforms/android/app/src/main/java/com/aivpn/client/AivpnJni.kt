@@ -176,6 +176,7 @@ object AivpnJni {
      * with this address or the server's anti-spoof check drops all uplink data.
      */
     external fun getAssignedVpnIp(): String
+    external fun getAssignedNetworkConfig(): String
 
     /**
      * Returns `true` (and atomically clears the flag) if the server sent CertRejected

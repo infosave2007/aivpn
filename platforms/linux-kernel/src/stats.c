@@ -28,6 +28,8 @@ static const char *const aivpn_stat_names[AIVPN_STAT__COUNT] = {
 	[AIVPN_STAT_INJECT_FAIL]     = "inject_fail",
 	[AIVPN_STAT_TX_ENCRYPT_OK]   = "tx_encrypt_ok",
 	[AIVPN_STAT_TX_ENCRYPT_FAIL] = "tx_encrypt_fail",
+	[AIVPN_STAT_POLICY_DROP]     = "policy_drop",
+	[AIVPN_STAT_POLICY_FALLBACK] = "policy_fallback",
 };
 
 static int aivpn_stats_show(struct seq_file *m, void *v)

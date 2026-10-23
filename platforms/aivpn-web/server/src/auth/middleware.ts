@@ -125,7 +125,8 @@ export function requireReadAccess() {
     return await requireAuth()(c, async () => {
       const user = c.get('user')
       if (user.role === 'viewer' && c.req.method !== 'GET') {
-        return c.json({ error: 'Forbidden: viewer role is read-only' }, 403)
+        c.res = c.json({ error: 'Forbidden: viewer role is read-only' }, 403)
+        return
       }
       return await next()
     })

@@ -13,6 +13,10 @@ use crate::network_config::ClientNetworkConfig;
 /// Maximum UDP packet size (optimized for VPN MTU 1420 + overhead)
 pub const MAX_PACKET_SIZE: usize = 1500;
 
+/// Клиент объявляет формат потока. Эти биты не дают прав управления.
+pub const CLIENT_PACKET_FEATURES: u32 = 1 << 31;
+pub const CLIENT_FEC_ACTIVE: u32 = 1 << 30;
+
 /// UDP receive-buffer size for the client downlink loop. Control packets — most
 /// notably `MaskUpdate`, which carries a full serialized `MaskProfile` (several
 /// KB) — are far larger than a DATA packet's `MAX_PACKET_SIZE` MTU. Receiving
@@ -138,6 +142,9 @@ pub enum ControlSubtype {
     /// session may send it; a receiver that itself has a partition should
     /// reply with its own (0x27)
     PartitionAnnounce = 0x27,
+    /// Пакет IPv4/IPv6 между площадками внутри masked-сессии.
+    /// Поле длины совпадает с ChainForward. Получатель передает пакет в свой TUN.
+    SiteData = 0x28,
 }
 
 impl ControlSubtype {
@@ -182,6 +189,7 @@ impl ControlSubtype {
             0x25 => Some(Self::MgmtRequest),
             0x26 => Some(Self::MgmtResponse),
             0x27 => Some(Self::PartitionAnnounce),
+            0x28 => Some(Self::SiteData),
             _ => None,
         }
     }
@@ -603,6 +611,11 @@ pub enum ControlPayload {
         /// `pool.node_ip_partition` rather than a hash of `node_id`.
         explicit: bool,
     },
+    /// Один внутренний IPv4 пакет между площадками. Не ChainForward: выходной
+    /// NAT его не обрабатывает, приемник пишет пакет в свой TUN.
+    SiteData {
+        payload: Vec<u8>,
+    },
 }
 
 /// Aggregated success/fail outcome counters for a single mask, as reported by
@@ -714,6 +727,7 @@ impl ControlPayload {
                 buf.extend_from_slice(server_eph_pub);
                 buf.extend_from_slice(signature);
                 if let Some(network_config) = network_config {
+                    network_config.validate()?;
                     buf.extend_from_slice(&network_config.encode_wire());
                 }
             }
@@ -952,6 +966,11 @@ impl ControlPayload {
                 buf.extend_from_slice(&num_partitions.to_le_bytes());
                 buf.push(*explicit as u8);
             }
+            Self::SiteData { payload } => {
+                buf.push(ControlSubtype::SiteData as u8);
+                buf.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+                buf.extend_from_slice(payload);
+            }
         }
 
         Ok(buf)
@@ -1094,7 +1113,7 @@ impl ControlPayload {
                 // node_id_len + node_pub + time_window + signature — this
                 // rejects an inconsistent (attacker-crafted) pair of length
                 // fields instead of silently misreading the trailing bytes.
-                if total_len != 4 + node_id_len + 32 + 8 + 64 {
+                if node_id_len != total_len - (4 + 32 + 8 + 64) {
                     return Err(Error::InvalidPacket("NodeEnrollment length mismatch"));
                 }
 
@@ -1310,6 +1329,18 @@ impl ControlPayload {
                     return Err(Error::InvalidPacket("ChainForward invalid length"));
                 }
                 Ok(Self::ChainForward {
+                    payload: data[5..5 + len].to_vec(),
+                })
+            }
+            ControlSubtype::SiteData => {
+                if data.len() < 5 {
+                    return Err(Error::InvalidPacket("SiteData too short"));
+                }
+                let len = u32::from_le_bytes([data[1], data[2], data[3], data[4]]) as usize;
+                if data.len().saturating_sub(5) < len {
+                    return Err(Error::InvalidPacket("SiteData invalid length"));
+                }
+                Ok(Self::SiteData {
                     payload: data[5..5 + len].to_vec(),
                 })
             }
@@ -1657,6 +1688,15 @@ impl AckPacket {
 mod tests {
     use super::*;
 
+    #[test]
+    fn node_enrollment_rejects_overflowing_id_length() {
+        let mut packet = vec![0; 5 + 108];
+        packet[0] = ControlSubtype::NodeEnrollment as u8;
+        packet[1..5].copy_from_slice(&108u32.to_le_bytes());
+        packet[5..9].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(ControlPayload::decode(&packet).is_err());
+    }
+
     // -----------------------------------------------------------------------
     // InnerType::from_u16
     // -----------------------------------------------------------------------
@@ -1723,6 +1763,7 @@ mod tests {
             (0x25, ControlSubtype::MgmtRequest),
             (0x26, ControlSubtype::MgmtResponse),
             (0x27, ControlSubtype::PartitionAnnounce),
+            (0x28, ControlSubtype::SiteData),
         ];
         for (byte, expected) in pairs {
             assert_eq!(
@@ -1733,7 +1774,7 @@ mod tests {
             );
         }
         assert_eq!(ControlSubtype::from_u8(0x00), None);
-        assert_eq!(ControlSubtype::from_u8(0x28), None);
+        assert_eq!(ControlSubtype::from_u8(0x29), None);
     }
 
     // -----------------------------------------------------------------------
@@ -2852,7 +2893,7 @@ mod tests {
         // (usize == u32), passed, and the `data[5..5+len]` slice panicked —
         // a one-datagram DoS from any authenticated peer. The check must
         // reject with Err on every target width.
-        for subtype in [0x12u8, 0x13, 0x14, 0x15] {
+        for subtype in [0x12u8, 0x13, 0x14, 0x15, 0x28] {
             // PoolSync, RouteSync, ChainForward, ClientCert
             for len in [u32::MAX, u32::MAX - 4, u32::MAX - 5] {
                 let mut data = vec![subtype];

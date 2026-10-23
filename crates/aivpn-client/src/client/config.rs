@@ -1,5 +1,23 @@
 use super::*;
 
+/// Проверка входящего NodeEnrollment на стороне звонящего.
+/// Аргументы: node_id, node_pub, time_window, signature, server_eph, client_eph.
+/// `Some(node_id)` только после успешной проверки подписи и реестра.
+#[derive(Clone)]
+pub struct RemoteEnrollHook(
+    pub  Arc<
+        dyn Fn(&str, &[u8; 32], u64, &[u8; 64], &[u8; 32], &[u8; 32]) -> Option<String>
+            + Send
+            + Sync,
+    >,
+);
+
+impl std::fmt::Debug for RemoteEnrollHook {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("RemoteEnrollHook")
+    }
+}
+
 /// Client configuration
 #[derive(Debug, Clone)]
 pub struct ClientConfig {
@@ -14,6 +32,8 @@ pub struct ClientConfig {
     pub tun_config: TunnelConfig,
     /// When set, run as SOCKS5 proxy on this address instead of a TUN device.
     pub proxy_listen: Option<std::net::SocketAddr>,
+    /// DNS-серверы SOCKS5, запросы передаются внутри VPN.
+    pub proxy_dns: Vec<std::net::Ipv4Addr>,
     /// Optional 104-byte mTLS certificate sent to the server after session setup.
     /// Required when the server is configured with `mtls.required = true`.
     pub mtls_cert: Option<Vec<u8>>,
@@ -34,8 +54,8 @@ pub struct ClientConfig {
     /// also `Some`.
     pub share_mask_feedback: bool,
     /// §2 crowdsourced blocking feedback — opt-in, OFF by default. When true,
-    /// the client stores `RegionalMaskHints` pushed by the server (see
-    /// `regional_mask_hints()`) for future mask-selection use.
+    /// Клиент сохраняет RegionalMaskHints и при переподключении выбирает
+    /// успешные маски указанного региона.
     pub receive_mask_hints: bool,
     /// ISO-3166-1 alpha-2 country code the client believes it is in. Required
     /// for `share_mask_feedback` to have any effect — the server aggregates
@@ -106,6 +126,11 @@ pub struct ClientConfig {
     /// (matching `pool_dialer.rs`'s pre-existing `unwrap_or_default()`
     /// handling for its own `RouteSync`/enrollment payloads).
     pub pool_node_id: Option<String>,
+    /// Слот проверенного node_id удаленной стороны. Заполняет обработчик
+    /// входящего NodeEnrollment, читает pool dialer перед RouteSync.
+    pub remote_verified_node: Option<Arc<Mutex<Option<String>>>>,
+    /// Проверка обратного NodeEnrollment. `None` у обычного клиента.
+    pub remote_enroll_hook: Option<RemoteEnrollHook>,
     /// Which datagram transport to open, when the session should not use a
     /// direct UDP socket.
     ///

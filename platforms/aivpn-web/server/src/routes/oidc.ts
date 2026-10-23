@@ -116,7 +116,7 @@ app.get('/callback', async (c) => {
   const pkceMatch = cookie.match(/oidc_pkce=([^;]+)/)
   if (!pkceMatch) return c.html(errPage('Missing PKCE state cookie — try again'))
   let pkceData: { codeVerifier: string; state: string; nonce: string }
-  try { pkceData = JSON.parse(Buffer.from(pkceMatch[1], 'base64').toString()) }
+  try { pkceData = JSON.parse(Buffer.from(pkceMatch[1]!, 'base64').toString()) }
   catch { return c.html(errPage('Invalid PKCE cookie')) }
   if (pkceData.state !== state) return c.html(errPage('State mismatch — possible CSRF'))
 

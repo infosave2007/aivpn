@@ -23,7 +23,7 @@ dirs = "6"
 [target.'cfg(windows)'.dependencies]
 eframe = { version = "0.31", default-features = false, features = ["default_fonts", "glow"] }
 egui = "0.31"
-tray-icon = "0.19"
+tray-icon = "0.26"
 png = "0.18"
 winapi = { version = "0.3", features = [
     "winuser",

@@ -1101,7 +1101,7 @@ mod tests {
             let token = format!("ie-reporter-{i}");
             store.record_feedback(*b"IE", token.as_bytes(), &[outcome("mask_a", 5, 5)]);
         }
-        assert!(store.top_masks_for_region(*b"PT").is_empty() == false);
+        assert!(!store.top_masks_for_region(*b"PT").is_empty());
         let top = store.top_masks_for_region(*b"PT");
         assert_eq!(top[0].0, "mask_a");
     }

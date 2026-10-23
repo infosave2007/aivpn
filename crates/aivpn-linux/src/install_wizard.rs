@@ -462,108 +462,111 @@ pub async fn probe(host: String, port: u16, user: String) -> Result<String, Stri
 /// `tokio::select!` loop) — the password/passphrase are injected via
 /// `Command::env`, never argv, matching [`build_run_args`]'s contract.
 pub fn install_subscription(target: InstallTarget) -> Subscription<Message> {
-    let stream = iced::stream::channel(64, move |mut sender| async move {
-        let binary = match find_client_binary() {
-            Ok(b) => b,
-            Err(e) => {
-                let _ = sender.try_send(Message::InstallWizardSpawnError(e));
-                return;
-            }
-        };
+    let stream = iced::stream::channel(
+        64,
+        move |mut sender: iced::futures::channel::mpsc::Sender<Message>| async move {
+            let binary = match find_client_binary() {
+                Ok(b) => b,
+                Err(e) => {
+                    let _ = sender.try_send(Message::InstallWizardSpawnError(e));
+                    return;
+                }
+            };
 
-        let mut cmd = tokio::process::Command::new(&binary);
-        // Don't leave an install running detached if the GUI exits mid-run.
-        cmd.kill_on_drop(true);
-        cmd.arg("ssh-install").arg("run");
-        for a in build_run_args(&target) {
-            cmd.arg(a);
-        }
-        match &target.auth {
-            InstallAuth::Password(pw) => {
-                cmd.env(PASSWORD_ENV_VAR, pw);
+            let mut cmd = tokio::process::Command::new(&binary);
+            // Don't leave an install running detached if the GUI exits mid-run.
+            cmd.kill_on_drop(true);
+            cmd.arg("ssh-install").arg("run");
+            for a in build_run_args(&target) {
+                cmd.arg(a);
             }
-            InstallAuth::KeyFile { passphrase, .. } => {
-                if let Some(p) = passphrase {
-                    cmd.env(KEY_PASSPHRASE_ENV_VAR, p);
+            match &target.auth {
+                InstallAuth::Password(pw) => {
+                    cmd.env(PASSWORD_ENV_VAR, pw);
+                }
+                InstallAuth::KeyFile { passphrase, .. } => {
+                    if let Some(p) = passphrase {
+                        cmd.env(KEY_PASSPHRASE_ENV_VAR, p);
+                    }
                 }
             }
-        }
-        cmd.stdout(std::process::Stdio::piped());
-        cmd.stderr(std::process::Stdio::piped());
+            cmd.stdout(std::process::Stdio::piped());
+            cmd.stderr(std::process::Stdio::piped());
 
-        let mut child = match cmd.spawn() {
-            Ok(c) => c,
-            Err(e) => {
-                let _ = sender.try_send(Message::InstallWizardSpawnError(format!(
-                    "Failed to launch aivpn-client: {e}"
-                )));
+            let mut child = match cmd.spawn() {
+                Ok(c) => c,
+                Err(e) => {
+                    let _ = sender.try_send(Message::InstallWizardSpawnError(format!(
+                        "Failed to launch aivpn-client: {e}"
+                    )));
+                    return;
+                }
+            };
+            let stdout = child.stdout.take();
+            let stderr = child.stderr.take();
+            let (Some(stdout), Some(stderr)) = (stdout, stderr) else {
+                let _ = child.start_kill();
+                let _ = sender.try_send(Message::InstallWizardSpawnError(
+                    "stdout/stderr pipe unavailable".to_string(),
+                ));
                 return;
-            }
-        };
-        let stdout = child.stdout.take();
-        let stderr = child.stderr.take();
-        let (Some(stdout), Some(stderr)) = (stdout, stderr) else {
-            let _ = child.start_kill();
-            let _ = sender.try_send(Message::InstallWizardSpawnError(
-                "stdout/stderr pipe unavailable".to_string(),
-            ));
-            return;
-        };
-        let mut out = BufReader::new(stdout).lines();
-        let mut err = BufReader::new(stderr).lines();
+            };
+            let mut out = BufReader::new(stdout).lines();
+            let mut err = BufReader::new(stderr).lines();
 
-        // Drain BOTH streams to their own EOF — never break on the first one
-        // to finish. `ssh-install run`'s final `##AIVPN {"step":"done",...}`
-        // marker (which carries the `aivpn://` connection key the wizard
-        // auto-imports) is on STDOUT; a bare `_ => break` on the stderr arm
-        // would tear the loop down the instant stderr closed (e.g. an install
-        // that emits nothing on stderr) and silently drop that still-pending
-        // stdout marker. The per-branch `if !*_done` guards stop a finished
-        // stream's `next_line()` from being polled again (it would busy-return
-        // `Ok(None)`), and the loop exits only once both have hit EOF.
-        let mut out_done = false;
-        let mut err_done = false;
-        // Lines are `send().await`ed (not `try_send`): a fast-scrolling
-        // install (e.g. apt output) can easily outpace the event loop and
-        // fill the 64-slot channel, and a dropped `##AIVPN` marker line
-        // would lose the `connection_key` the wizard auto-imports.
-        loop {
-            tokio::select! {
-                line = out.next_line(), if !out_done => match line {
-                    Ok(Some(l)) => {
-                        let _ = sender
-                            .send(Message::InstallWizardLine(parse_install_line(&l)))
-                            .await;
-                    }
-                    _ => out_done = true,
-                },
-                line = err.next_line(), if !err_done => match line {
-                    Ok(Some(l)) => {
-                        let _ = sender
-                            .send(Message::InstallWizardLine(InstallLine::Raw(
-                                format!("[err] {l}"),
-                            )))
-                            .await;
-                    }
-                    _ => err_done = true,
-                },
-                else => break,
+            // Drain BOTH streams to their own EOF - never break on the first one
+            // to finish. `ssh-install run`'s final `##AIVPN {"step":"done",...}`
+            // marker (which carries the `aivpn://` connection key the wizard
+            // auto-imports) is on STDOUT; a bare `_ => break` on the stderr arm
+            // would tear the loop down the instant stderr closed (e.g. an install
+            // that emits nothing on stderr) and silently drop that still-pending
+            // stdout marker. The per-branch `if !*_done` guards stop a finished
+            // stream's `next_line()` from being polled again (it would busy-return
+            // `Ok(None)`), and the loop exits only once both have hit EOF.
+            let mut out_done = false;
+            let mut err_done = false;
+            // Lines are `send().await`ed (not `try_send`): a fast-scrolling
+            // install (e.g. apt output) can easily outpace the event loop and
+            // fill the 64-slot channel, and a dropped `##AIVPN` marker line
+            // would lose the `connection_key` the wizard auto-imports.
+            loop {
+                tokio::select! {
+                    line = out.next_line(), if !out_done => match line {
+                        Ok(Some(l)) => {
+                            let _ = sender
+                                .send(Message::InstallWizardLine(parse_install_line(&l)))
+                                .await;
+                        }
+                        _ => out_done = true,
+                    },
+                    line = err.next_line(), if !err_done => match line {
+                        Ok(Some(l)) => {
+                            let _ = sender
+                                .send(Message::InstallWizardLine(InstallLine::Raw(
+                                    format!("[err] {l}"),
+                                )))
+                                .await;
+                        }
+                        _ => err_done = true,
+                    },
+                    else => break,
+                }
+                if out_done && err_done {
+                    break;
+                }
             }
-            if out_done && err_done {
-                break;
-            }
-        }
 
-        let code = match child.wait().await {
-            Ok(status) => status.code().unwrap_or(-1),
-            Err(_) => -1,
-        };
-        // send().await, not try_send: dropping this terminal message on a
-        // full channel would leave `install_running` true forever (UI stuck
-        // on "Installing..." with no subprocess left).
-        let _ = sender.send(Message::InstallWizardFinished(code)).await;
-    });
-    Subscription::run_with_id("aivpn_install_wizard", stream)
+            let code = match child.wait().await {
+                Ok(status) => status.code().unwrap_or(-1),
+                Err(_) => -1,
+            };
+            // send().await, not try_send: dropping this terminal message on a
+            // full channel would leave `install_running` true forever (UI stuck
+            // on "Installing..." with no subprocess left).
+            let _ = sender.send(Message::InstallWizardFinished(code)).await;
+        },
+    );
+    crate::subscription::from_stream("aivpn_install_wizard", stream)
 }
 
 #[cfg(test)]

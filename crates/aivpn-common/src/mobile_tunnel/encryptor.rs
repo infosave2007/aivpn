@@ -77,6 +77,11 @@ impl PacketEncryptor for MobileEncryptor {
         self.inner.encrypt_data(payload)
     }
 
+    fn encrypt_fragment(&mut self, payload: &[u8]) -> Result<Vec<u8>> {
+        self.check_key_rotation();
+        self.inner.encrypt_fragment(payload)
+    }
+
     fn encrypt_control(&mut self, payload: &ControlPayload) -> Result<Vec<u8>> {
         // A KeyRotate response must go out under the pre-rotation keys, so a
         // pending rotation is deliberately NOT applied to it (the receive loop

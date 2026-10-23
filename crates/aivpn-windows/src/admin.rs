@@ -583,9 +583,6 @@ pub enum AdminRequest {
     ListClients,
     AddClient(NewClientForm),
     EditClient(EditClientForm),
-    DeleteClient {
-        id: String,
-    },
     RevokeClient {
         id: String,
     },
@@ -642,10 +639,6 @@ pub enum AdminResponse {
         editing: bool,
         result: Result<AdminClient, String>,
     },
-    ClientDeleted {
-        id: String,
-        result: Result<(), String>,
-    },
     ClientRevoked {
         id: String,
         result: Result<(), String>,
@@ -699,10 +692,6 @@ pub fn spawn(client_binary: PathBuf, req: AdminRequest, tx: Sender<AdminResponse
                 editing: true,
                 result: edit_client(&client_binary, &form),
             },
-            AdminRequest::DeleteClient { id } => {
-                let result = mgmt_status_only(&client_binary, "DELETE", &path_client(&id));
-                AdminResponse::ClientDeleted { id, result }
-            }
             AdminRequest::RevokeClient { id } => {
                 let result = mgmt_status_only(&client_binary, "POST", &path_revoke(&id));
                 AdminResponse::ClientRevoked { id, result }
@@ -774,6 +763,7 @@ fn mgmt_call(
     };
 
     let mut cmd = Command::new(client_binary);
+    cmd.env_remove("AIVPN_ADMIN_LISTEN");
     cmd.arg("mgmt")
         .arg("--method")
         .arg(method)
@@ -996,6 +986,7 @@ fn get_audit_log(client_binary: &Path) -> Result<AuditLogView, String> {
 /// stdout on success (0=User, 1=Viewer, 2=Admin).
 fn run_role(client_binary: &Path) -> Result<u8, String> {
     let mut cmd = Command::new(client_binary);
+    cmd.env_remove("AIVPN_ADMIN_LISTEN");
     cmd.arg("role");
     #[cfg(windows)]
     {

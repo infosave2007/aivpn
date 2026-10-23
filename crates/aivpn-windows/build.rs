@@ -3,11 +3,11 @@ use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
 
-fn manifest(arch: &str) -> String {
+fn manifest(arch: &str, version: &str) -> String {
     format!(
         r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
-  <assemblyIdentity type="win32" name="aivpn" version="1.1.0.0" processorArchitecture="{arch}"/>
+  <assemblyIdentity type="win32" name="aivpn" version="{version}.0" processorArchitecture="{arch}"/>
   <dependency>
     <dependentAssembly>
       <assemblyIdentity
@@ -45,7 +45,8 @@ fn main() {
         _ => "amd64",
     };
     let manifest_path = out_dir.join("aivpn.manifest");
-    fs::write(&manifest_path, manifest(arch)).expect("failed to write manifest");
+    let version = env::var("CARGO_PKG_VERSION").expect("CARGO_PKG_VERSION not set");
+    fs::write(&manifest_path, manifest(arch, &version)).expect("failed to write manifest");
 
     // Build .rc that embeds the manifest (resource id 1 = CREATEPROCESS_MANIFEST_RESOURCE_ID)
     // and the icon if present.

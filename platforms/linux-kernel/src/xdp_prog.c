@@ -142,7 +142,7 @@ int aivpn_xdp_filter(struct xdp_md *ctx)
 	__u32  key0    = 0;
 	__u64 *pcfg    = bpf_map_lookup_elem(&xdp_config, &key0);
 	__u16  vpn_port = pcfg ? (__u16)*pcfg : 0;
-	if (vpn_port != 0 && udp->dest != bpf_htons(vpn_port))
+	if (vpn_port == 0 || udp->dest != bpf_htons(vpn_port))
 		return XDP_PASS; /* not our port: leave untouched */
 
 	/* ── Minimum size check ───────────────────────────────────────── */

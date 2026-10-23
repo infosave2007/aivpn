@@ -9,7 +9,7 @@
 use blake3::Hasher;
 use chacha20poly1305::{
     aead::{AeadInPlace, KeyInit, OsRng},
-    ChaCha20Poly1305, Key as ChachaKey, Nonce,
+    ChaCha20Poly1305, Key as ChachaKey, Nonce, XChaCha20Poly1305, XNonce,
 };
 use hmac::Hmac;
 use rand::RngCore;
@@ -77,9 +77,33 @@ const HKDF_POOL_SERVER_STATIC_CONTEXT: &str = "aivpn-pool-server-static-v1";
 /// Ed25519 over attacker-influenced bytes.
 const NODE_ENROLLMENT_CONTEXT: &str = "aivpn-node-enrollment-v1";
 
-/// Session keys derived from key exchange
+/// Начальная эпоха имеет отдельный envelope, установленная сохраняет kernel wire.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PacketCipher {
+    #[default]
+    Established,
+    InitialV2 {
+        client_eph_pub: [u8; 32],
+    },
+}
+
+impl PacketCipher {
+    pub fn is_initial(self) -> bool {
+        matches!(self, Self::InitialV2 { .. })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PacketDirection {
+    ClientToServer,
+    ServerToClient,
+}
+
+/// Ключи направления и выбранный формат пакета сохраняются вместе при ratchet/grace.
 #[derive(Clone, Zeroize, ZeroizeOnDrop)]
 pub struct SessionKeys {
+    #[zeroize(skip)]
+    pub packet_cipher: PacketCipher,
     /// AEAD key for the client→server (uplink) direction. Named `session_key`
     /// for historical reasons; it is the C2S key.
     ///
@@ -215,12 +239,176 @@ pub fn derive_session_keys(
     let prng_seed_hash = blake3::derive_key(HKDF_PRNG_SEED_CONTEXT, &prng_seed_input);
 
     SessionKeys {
+        packet_cipher: PacketCipher::Established,
         session_key: session_key_hash[..CHACHA20_KEY_SIZE].try_into().unwrap(),
         session_key_s2c: session_key_s2c_hash[..CHACHA20_KEY_SIZE]
             .try_into()
             .unwrap(),
         tag_secret: tag_secret_hash[..32].try_into().unwrap(),
         prng_seed: prng_seed_hash[..32].try_into().unwrap(),
+    }
+}
+
+/// Начальный KDF отделен от установленного канала, включая resonance tag.
+pub fn derive_initial_session_keys(
+    dh: &[u8; 32],
+    psk: Option<&[u8; 32]>,
+    client_eph_pub: &[u8; 32],
+) -> SessionKeys {
+    let mut material = zeroize::Zeroizing::new(Vec::with_capacity(96));
+    material.extend_from_slice(dh);
+    if let Some(psk) = psk {
+        material.extend_from_slice(psk);
+    }
+    material.extend_from_slice(client_eph_pub);
+    SessionKeys {
+        packet_cipher: PacketCipher::InitialV2 {
+            client_eph_pub: *client_eph_pub,
+        },
+        session_key: blake3::derive_key("aivpn-initial-session-key-v2", &material),
+        session_key_s2c: blake3::derive_key("aivpn-initial-session-key-s2c-v2", &material),
+        tag_secret: blake3::derive_key("aivpn-initial-tag-secret-v2", &material),
+        prng_seed: blake3::derive_key("aivpn-initial-prng-seed-v2", &material),
+    }
+}
+
+/// Дополнительные байты envelope; существующий Poly1305 tag считается отдельно.
+pub fn session_payload_overhead(keys: &SessionKeys) -> usize {
+    if keys.packet_cipher.is_initial() {
+        24
+    } else {
+        0
+    }
+}
+
+fn initial_packet_aad(
+    direction: PacketDirection,
+    counter: u64,
+    tag: &[u8; TAG_SIZE],
+    client_eph_pub: &[u8; 32],
+    nonce: &[u8; 24],
+) -> Vec<u8> {
+    let mut aad = Vec::with_capacity(96);
+    aad.extend_from_slice(b"aivpn-packet-aead");
+    aad.extend_from_slice(&[2, 0]); // Версия 2, начальная эпоха.
+    aad.push(match direction {
+        PacketDirection::ClientToServer => 0,
+        PacketDirection::ServerToClient => 1,
+    });
+    aad.extend_from_slice(&counter.to_le_bytes());
+    aad.extend_from_slice(tag);
+    aad.extend_from_slice(client_eph_pub);
+    aad.extend_from_slice(nonce);
+    aad
+}
+
+/// InitialV2: nonce24 и XChaCha с transcript AAD. Established сохраняет kernel wire.
+pub fn encrypt_session_payload(
+    keys: &SessionKeys,
+    direction: PacketDirection,
+    counter: u64,
+    tag: &[u8; TAG_SIZE],
+    plaintext: &[u8],
+) -> Result<Vec<u8>> {
+    let mut output = Vec::new();
+    encrypt_session_payload_into(keys, direction, counter, tag, plaintext, &mut output)?;
+    Ok(output)
+}
+
+/// Пишет envelope в переиспользуемый буфер. Ошибка RNG не выпускает ciphertext.
+pub fn encrypt_session_payload_into(
+    keys: &SessionKeys,
+    direction: PacketDirection,
+    counter: u64,
+    tag: &[u8; TAG_SIZE],
+    plaintext: &[u8],
+    output: &mut Vec<u8>,
+) -> Result<()> {
+    encrypt_session_payload_into_with_rng(
+        keys, direction, counter, tag, plaintext, output, &mut OsRng,
+    )
+}
+
+fn encrypt_session_payload_into_with_rng<R: rand::RngCore>(
+    keys: &SessionKeys,
+    direction: PacketDirection,
+    counter: u64,
+    tag: &[u8; TAG_SIZE],
+    plaintext: &[u8],
+    output: &mut Vec<u8>,
+    rng: &mut R,
+) -> Result<()> {
+    let key = match direction {
+        PacketDirection::ClientToServer => &keys.session_key,
+        PacketDirection::ServerToClient => &keys.session_key_s2c,
+    };
+    match keys.packet_cipher {
+        PacketCipher::Established => {
+            let mut nonce = [0; NONCE_SIZE];
+            nonce[..8].copy_from_slice(&counter.to_le_bytes());
+            encrypt_payload_into(key, &nonce, plaintext, output)
+        }
+        PacketCipher::InitialV2 { client_eph_pub } => {
+            output.zeroize();
+            let mut nonce = [0; 24];
+            rng.try_fill_bytes(&mut nonce)
+                .map_err(|_| Error::Crypto("Не удалось получить nonce из системного RNG".into()))?;
+            let aad = initial_packet_aad(direction, counter, tag, &client_eph_pub, &nonce);
+            output.extend_from_slice(&nonce);
+            output.extend_from_slice(plaintext);
+            let cipher = XChaCha20Poly1305::new(ChachaKey::from_slice(key));
+            match cipher.encrypt_in_place_detached(
+                XNonce::from_slice(&nonce),
+                &aad,
+                &mut output[24..],
+            ) {
+                Ok(mac) => {
+                    output.extend_from_slice(&mac);
+                    Ok(())
+                }
+                Err(error) => {
+                    output.zeroize();
+                    Err(error.into())
+                }
+            }
+        }
+    }
+}
+
+/// Формат задают ключи эпохи. После ошибки аутентификации другой cipher не пробуется.
+pub fn decrypt_session_payload(
+    keys: &SessionKeys,
+    direction: PacketDirection,
+    counter: u64,
+    tag: &[u8; TAG_SIZE],
+    envelope: &[u8],
+) -> Result<Vec<u8>> {
+    let key = match direction {
+        PacketDirection::ClientToServer => &keys.session_key,
+        PacketDirection::ServerToClient => &keys.session_key_s2c,
+    };
+    match keys.packet_cipher {
+        PacketCipher::Established => {
+            let mut nonce = [0; NONCE_SIZE];
+            nonce[..8].copy_from_slice(&counter.to_le_bytes());
+            decrypt_payload(key, &nonce, envelope)
+        }
+        PacketCipher::InitialV2 { client_eph_pub } => {
+            if envelope.len() < 24 + POLY1305_TAG_SIZE {
+                return Err(Error::InvalidPacket("InitialV2 envelope too short"));
+            }
+            let nonce: [u8; 24] = envelope[..24].try_into().unwrap();
+            let aad = initial_packet_aad(direction, counter, tag, &client_eph_pub, &nonce);
+            let cipher = XChaCha20Poly1305::new(ChachaKey::from_slice(key));
+            let mut plaintext = envelope[24..].to_vec();
+            if let Err(error) =
+                cipher.decrypt_in_place(XNonce::from_slice(&nonce), &aad, &mut plaintext)
+            {
+                plaintext.zeroize();
+                return Err(error.into());
+            }
+            Ok(plaintext)
+        }
     }
 }
 
@@ -800,6 +988,195 @@ mod tests {
         assert_eq!(keys1.session_key, keys2.session_key);
         assert_eq!(keys1.tag_secret, keys2.tag_secret);
         assert_eq!(keys1.prng_seed, keys2.prng_seed);
+    }
+
+    #[test]
+    fn initial_v2_kdf_separates_all_material_from_established() {
+        let initial = derive_initial_session_keys(&[1; 32], Some(&[2; 32]), &[3; 32]);
+        let previous = derive_session_keys(&[1; 32], Some(&[2; 32]), &[3; 32]);
+        assert_ne!(initial.session_key, previous.session_key);
+        assert_ne!(initial.session_key_s2c, previous.session_key_s2c);
+        assert_ne!(initial.tag_secret, previous.tag_secret);
+        assert_ne!(initial.prng_seed, previous.prng_seed);
+        assert_ne!(initial.session_key, initial.session_key_s2c);
+        assert!(initial.packet_cipher.is_initial());
+        assert!(!previous.packet_cipher.is_initial());
+    }
+
+    #[test]
+    fn initial_v2_repeated_counter_uses_independent_random_nonce() {
+        let keys = derive_initial_session_keys(&[1; 32], Some(&[2; 32]), &[3; 32]);
+        for direction in [
+            PacketDirection::ClientToServer,
+            PacketDirection::ServerToClient,
+        ] {
+            let a = encrypt_session_payload(&keys, direction, 0, &[4; 8], b"ServerHello").unwrap();
+            let b = encrypt_session_payload(&keys, direction, 0, &[4; 8], b"ServerHello").unwrap();
+            assert_ne!(a, b, "повтор счетчика не должен повторять nonce");
+            assert_ne!(&a[..24], &b[..24]);
+            assert_eq!(a.len(), 24 + 16 + b"ServerHello".len());
+            assert_eq!(session_payload_overhead(&keys), 24);
+            assert_eq!(
+                decrypt_session_payload(&keys, direction, 0, &[4; 8], &a).unwrap(),
+                b"ServerHello"
+            );
+            assert_eq!(
+                decrypt_session_payload(&keys, direction, 0, &[4; 8], &b).unwrap(),
+                b"ServerHello"
+            );
+        }
+    }
+
+    #[test]
+    fn initial_v2_binds_tag_counter_identity_direction_and_nonce() {
+        let mut keys = derive_initial_session_keys(&[1; 32], Some(&[2; 32]), &[3; 32]);
+        keys.session_key_s2c = keys.session_key;
+        let direction = PacketDirection::ServerToClient;
+        let wire = encrypt_session_payload(&keys, direction, 7, &[4; 8], b"hello").unwrap();
+        assert!(decrypt_session_payload(&keys, direction, 7, &[5; 8], &wire).is_err());
+        assert!(decrypt_session_payload(&keys, direction, 8, &[4; 8], &wire).is_err());
+        assert!(
+            decrypt_session_payload(&keys, PacketDirection::ClientToServer, 7, &[4; 8], &wire)
+                .is_err()
+        );
+        let mut other_identity = keys.clone();
+        other_identity.packet_cipher = PacketCipher::InitialV2 {
+            client_eph_pub: [6; 32],
+        };
+        assert!(decrypt_session_payload(&other_identity, direction, 7, &[4; 8], &wire).is_err());
+        let mut damaged = wire.clone();
+        damaged[0] ^= 1;
+        assert!(decrypt_session_payload(&keys, direction, 7, &[4; 8], &damaged).is_err());
+    }
+
+    #[test]
+    fn initial_v2_envelope_matches_literal_aad_contract_and_rejects_other_phase() {
+        let keys = derive_initial_session_keys(&[1; 32], Some(&[2; 32]), &[3; 32]);
+        let wire =
+            encrypt_session_payload(&keys, PacketDirection::ClientToServer, 7, &[4; 8], b"hello")
+                .unwrap();
+        let mut literal_aad = b"aivpn-packet-aead\x02\x00\x00".to_vec();
+        literal_aad.extend_from_slice(&[7, 0, 0, 0, 0, 0, 0, 0]);
+        literal_aad.extend_from_slice(&[4; 8]);
+        literal_aad.extend_from_slice(&[3; 32]);
+        literal_aad.extend_from_slice(&wire[..24]);
+        let cipher = XChaCha20Poly1305::new(ChachaKey::from_slice(&keys.session_key));
+        let mut plaintext = wire[24..].to_vec();
+        cipher
+            .decrypt_in_place(
+                XNonce::from_slice(&wire[..24]),
+                &literal_aad,
+                &mut plaintext,
+            )
+            .unwrap();
+        assert_eq!(plaintext, b"hello");
+        // Меняем domain, version и phase независимо от production builder AAD.
+        for index in [0, 17, 18] {
+            let mut wrong_aad = literal_aad.clone();
+            wrong_aad[index] ^= 1;
+            let mut ciphertext = b"hello".to_vec();
+            cipher
+                .encrypt_in_place(XNonce::from_slice(&wire[..24]), &wrong_aad, &mut ciphertext)
+                .unwrap();
+            let mut malformed = wire[..24].to_vec();
+            malformed.extend_from_slice(&ciphertext);
+            assert!(decrypt_session_payload(
+                &keys,
+                PacketDirection::ClientToServer,
+                7,
+                &[4; 8],
+                &malformed
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn initial_v2_never_falls_back_to_established_cipher() {
+        let initial = derive_initial_session_keys(&[1; 32], Some(&[2; 32]), &[3; 32]);
+        let mut established = initial.clone();
+        established.packet_cipher = PacketCipher::Established;
+        let direction = PacketDirection::ClientToServer;
+        let v2 = encrypt_session_payload(&initial, direction, 0, &[4; 8], b"payload").unwrap();
+        let old = encrypt_session_payload(&established, direction, 0, &[4; 8], b"payload").unwrap();
+        assert!(decrypt_session_payload(&initial, direction, 0, &[4; 8], &old).is_err());
+        assert!(decrypt_session_payload(&established, direction, 0, &[4; 8], &v2).is_err());
+    }
+
+    #[test]
+    fn initial_v2_short_envelopes_fail_without_plaintext() {
+        let keys = derive_initial_session_keys(&[1; 32], None, &[3; 32]);
+        for length in 0..40 {
+            assert!(decrypt_session_payload(
+                &keys,
+                PacketDirection::ClientToServer,
+                0,
+                &[4; 8],
+                &vec![0; length]
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn initial_v2_random_failure_returns_error_and_clears_output() {
+        struct FailedRandom;
+        impl rand::RngCore for FailedRandom {
+            fn next_u32(&mut self) -> u32 {
+                panic!("не использовать слабый fallback");
+            }
+            fn next_u64(&mut self) -> u64 {
+                panic!("не использовать слабый fallback");
+            }
+            fn fill_bytes(&mut self, _: &mut [u8]) {
+                panic!("ошибка RNG должна возвращаться");
+            }
+            fn try_fill_bytes(&mut self, _: &mut [u8]) -> std::result::Result<(), rand::Error> {
+                Err(rand::Error::new("контролируемый отказ RNG"))
+            }
+        }
+        let keys = derive_initial_session_keys(&[1; 32], None, &[3; 32]);
+        let mut out = vec![0x55; 90];
+        assert!(encrypt_session_payload_into_with_rng(
+            &keys,
+            PacketDirection::ServerToClient,
+            0,
+            &[4; 8],
+            b"hello",
+            &mut out,
+            &mut FailedRandom
+        )
+        .is_err());
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn established_session_helpers_preserve_kernel_ciphertext() {
+        let keys = derive_session_keys(&[1; 32], Some(&[2; 32]), &[3; 32]);
+        let mut nonce = [0; 12];
+        nonce[..8].copy_from_slice(&7u64.to_le_bytes());
+        for (direction, key) in [
+            (PacketDirection::ClientToServer, keys.session_key),
+            (PacketDirection::ServerToClient, keys.session_key_s2c),
+        ] {
+            let expected = encrypt_payload(&key, &nonce, b"kernel-compatible").unwrap();
+            let mut output = vec![9; 100];
+            encrypt_session_payload_into(
+                &keys,
+                direction,
+                7,
+                &[4; 8],
+                b"kernel-compatible",
+                &mut output,
+            )
+            .unwrap();
+            assert_eq!(output, expected);
+            assert_eq!(session_payload_overhead(&keys), 0);
+            assert_eq!(
+                decrypt_session_payload(&keys, direction, 7, &[4; 8], &output).unwrap(),
+                b"kernel-compatible"
+            );
+        }
     }
 
     #[test]

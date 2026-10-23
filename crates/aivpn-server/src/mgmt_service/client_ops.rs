@@ -56,44 +56,19 @@ pub fn list_clients(ctx: &MgmtCtx) -> Vec<ClientView> {
     ctx.db.list_clients().into_iter().map(Into::into).collect()
 }
 
-/// Create a client, optionally setting `expires_at`/`role`/`qos` in the
-/// same atomic follow-up `update_client` call (mirrors the pre-refactor
-/// `add_client` handler, which did the same two-step create-then-update).
+/// Создает клиента со всеми параметрами в одной записи базы.
 pub fn add_client(ctx: &MgmtCtx, args: AddClientArgs) -> Result<ClientView, MgmtError> {
     client_name_valid(&args.name)?;
 
-    let client = if args.one_time {
-        ctx.db.add_client_one_time(&args.name)
-    } else {
-        ctx.db.add_client(&args.name)
-    };
-    let client = match client {
-        Ok(c) => c,
-        Err(e) => {
-            audit(ctx, "ClientAdd", &args.name, &format!("failed: {}", e));
-            return Err(MgmtError::Conflict(e.to_string()));
-        }
-    };
-
-    let needs_followup =
-        args.expires_at.is_some() || args.role != ClientRole::User || args.qos.is_some();
-    let result = if needs_followup {
-        ctx.db.update_client(
-            &client.id,
-            UpdateClientParams {
-                expires_at: args.expires_at.map(Some),
-                role: if args.role != ClientRole::User {
-                    Some(args.role)
-                } else {
-                    None
-                },
-                qos: args.qos.map(Some),
-                ..Default::default()
-            },
-        )
-    } else {
-        Ok(client)
-    };
+    let result = ctx.db.add_client_with_options(
+        &args.name,
+        crate::client_db::CreateClientOptions {
+            one_time: args.one_time,
+            expires_at: args.expires_at,
+            role: args.role,
+            qos: args.qos,
+        },
+    );
 
     match result {
         Ok(c) => {
@@ -287,6 +262,27 @@ pub fn status(ctx: &MgmtCtx) -> StatusView {
 mod tests {
     use super::*;
     use crate::mgmt_service::test_support::*;
+
+    #[test]
+    fn rejected_add_client_leaves_no_record() {
+        let (_dir, db) = test_db();
+        let mask_dir = std::path::PathBuf::from("/tmp");
+        let c = ctx(&db, &mask_dir);
+        let before = std::fs::read(db.file_path()).ok();
+        let result = add_client(
+            &c,
+            AddClientArgs {
+                name: "rejected-admin".into(),
+                one_time: true,
+                expires_at: None,
+                role: ClientRole::Admin,
+                qos: None,
+            },
+        );
+        assert!(result.is_err());
+        assert!(db.find_by_name("rejected-admin").is_none());
+        assert_eq!(std::fs::read(db.file_path()).ok(), before);
+    }
 
     #[test]
     fn add_client_happy_path_returns_view_without_psk() {

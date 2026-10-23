@@ -1,10 +1,12 @@
-//! Packet demultiplexing: resonance-tag candidate generation, existing-
-//! session resolution, and the sharded receive worker pool that dispatches
-//! inbound UDP packets to `handle_packet` (worker sizing/indexing plus
-//! the concurrent and legacy-sequential processing loops). Pure move out
-//! of `gateway/mod.rs` — no behavior change.
+//! Распределение UDP-пакетов по приемным задачам с учетом сессии и формата тега.
 
 use super::*;
+
+pub(crate) enum SessionLookup {
+    Found((Arc<parking_lot::Mutex<Session>>, u64, bool, [u8; TAG_SIZE])),
+    NotFound,
+    RecoveryLimited,
+}
 
 impl super::Gateway {
     /// Candidate resonance tags for a packet — one per distinct layout offset
@@ -49,25 +51,20 @@ impl super::Gateway {
         &self,
         packet_data: &[u8],
         client_ip: &IpAddr,
-    ) -> Result<Option<(Arc<parking_lot::Mutex<Session>>, u64, bool, [u8; TAG_SIZE])>> {
+    ) -> Result<SessionLookup> {
         let tags = self.candidate_tags(packet_data);
 
         // 1) Fast O(1) path across all layout offsets — no scan.
         for tag in &tags {
-            if let Some(session) = self.session_manager.get_session_by_tag(tag) {
-                // Drop the lock guard before moving `session` into the result.
-                let validated = session.lock().validate_tag(tag);
-                return match validated {
-                    Some((counter, is_ratcheted)) => {
-                        Ok(Some((session, counter, is_ratcheted, *tag)))
-                    }
-                    None => Err(Error::InvalidPacket("Invalid tag")),
-                };
+            if let Some((session, counter, is_ratcheted)) =
+                self.session_manager.find_session_by_tag(tag)?
+            {
+                return Ok(SessionLookup::Found((session, counter, is_ratcheted, *tag)));
             }
         }
 
         if !self.fallback_scan_allowed() {
-            return Ok(None);
+            return Ok(SessionLookup::RecoveryLimited);
         }
 
         // 2) Window-drift refresh. `refresh_and_find_by_tag` rebuilds STALE
@@ -81,19 +78,19 @@ impl super::Gateway {
                 .session_manager
                 .refresh_and_find_by_tag(first, client_ip)
             {
-                return Ok(Some((session, counter, is_ratcheted, *first)));
+                return Ok(SessionLookup::Found((
+                    session,
+                    counter,
+                    is_ratcheted,
+                    *first,
+                )));
             }
         }
         for tag in &tags {
-            if let Some(session) = self.session_manager.get_session_by_tag(tag) {
-                // Drop the lock guard before moving `session` into the result.
-                let validated = session.lock().validate_tag(tag);
-                return match validated {
-                    Some((counter, is_ratcheted)) => {
-                        Ok(Some((session, counter, is_ratcheted, *tag)))
-                    }
-                    None => Err(Error::InvalidPacket("Invalid tag")),
-                };
+            if let Some((session, counter, is_ratcheted)) =
+                self.session_manager.find_session_by_tag(tag)?
+            {
+                return Ok(SessionLookup::Found((session, counter, is_ratcheted, *tag)));
             }
         }
 
@@ -102,11 +99,11 @@ impl super::Gateway {
             if let Some((session, counter, is_ratcheted)) =
                 self.session_manager.recover_session_by_tag(tag, client_ip)
             {
-                return Ok(Some((session, counter, is_ratcheted, *tag)));
+                return Ok(SessionLookup::Found((session, counter, is_ratcheted, *tag)));
             }
         }
 
-        Ok(None)
+        Ok(SessionLookup::NotFound)
     }
 
     pub(crate) fn receive_worker_count() -> usize {
@@ -247,46 +244,6 @@ impl super::Gateway {
                                 );
                             }
                         }
-                    }
-                }
-                Err(e) => {
-                    error!("UDP recv error: {}", e);
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                }
-            }
-        }
-    }
-
-    /// Main packet processing loop (legacy sequential — unused, kept for reference)
-    #[allow(dead_code)]
-    async fn process_packets(&self) -> Result<()> {
-        let socket = self.udp_socket.as_ref().unwrap();
-        let mut buf = vec![0u8; MAX_PACKET_SIZE];
-
-        loop {
-            match socket.recv_from(&mut buf).await {
-                Ok((len, client_addr)) => {
-                    // Per-IP rate limiting.
-                    {
-                        let now = Instant::now();
-                        let mut entry =
-                            self.rate_limits.entry(client_addr.ip()).or_insert((0, now));
-                        if entry.1.elapsed() > Duration::from_secs(1) {
-                            entry.0 = 0;
-                            entry.1 = now;
-                        }
-                        entry.0 += 1;
-                        if entry.0 > self.config.per_ip_pps_limit {
-                            continue;
-                        }
-                    }
-
-                    let packet_data = &buf[..len];
-
-                    // Process packet
-                    if let Err(e) = self.handle_packet(packet_data, client_addr).await {
-                        debug!("Packet error from {}: {}", hash_addr(&client_addr), e);
-                        // Silent drop - no response for invalid packets
                     }
                 }
                 Err(e) => {

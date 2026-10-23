@@ -214,7 +214,15 @@ impl PendingConfigManager {
     /// detect "THIS request confirmed a change to that file" as
     /// pending-before ∧ gone-after.
     pub fn has_pending_for_path(&self, path: &Path) -> bool {
-        let _guard = self.lock_mutation();
+        let guard = self.lock_mutation();
+        self.has_pending_for_path_locked(path, &guard)
+    }
+
+    pub(crate) fn has_pending_for_path_locked(
+        &self,
+        path: &Path,
+        _guard: &MutexGuard<'_, ()>,
+    ) -> bool {
         self.inner.iter().any(|e| e.value().target_path == path)
     }
 

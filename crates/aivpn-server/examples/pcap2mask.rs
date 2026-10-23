@@ -185,7 +185,6 @@ async fn main() {
                 .expect("mask in store after generation");
             let p = &entry.profile;
             let r3 = p.size_iat_joint.is_some();
-            let r4 = !p.fsm_states.is_empty();
             println!("MASK_ID={mask_id}");
             println!("SPOOF_PROTOCOL={:?}", p.spoof_protocol);
             println!("R3_size_iat_joint={r3}");

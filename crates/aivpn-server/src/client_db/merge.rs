@@ -141,11 +141,13 @@ fn bucket_index_for_id(id: &str) -> usize {
 /// sits behind will simply keep firing every beacon until both nodes are
 /// upgraded, which is a visible, safe degradation rather than a crash.
 pub fn differing_pool_buckets(local: &[u8], peer: &[u8]) -> Vec<u16> {
-    if local.len() != peer.len() || local.len() % 8 != 0 {
+    if local.len() != peer.len() || !local.len().is_multiple_of(8) {
         return Vec::new();
     }
     local
-        .chunks_exact(8)
+        .as_chunks::<8>()
+        .0
+        .iter()
         .zip(peer.chunks_exact(8))
         .enumerate()
         .filter_map(|(i, (l, p))| if l != p { Some(i as u16) } else { None })
@@ -201,38 +203,22 @@ impl ClientDatabase {
     /// stale in-memory copy would overwrite the external addition on disk
     /// AND reset the cached mtime, so the next scheduled reload would see
     /// "unchanged" and the externally-added client would be gone for good.
-    /// To close that window, this pulls in any external on-disk change
-    /// FIRST (via the same `reload_if_changed` logic the daemon's poll loop
-    /// uses), so the merge below is computed against the latest known state
-    /// and the subsequent `save()` carries the external change forward
-    /// instead of overwriting it. `reload_if_changed` takes and releases its
-    /// own lock internally and returns before this function acquires
-    /// `self.data`'s write lock below, so there is no double-acquisition /
-    /// deadlock risk (see its doc comment).
-    ///
-    /// This does not close the window completely: another external write
-    /// landing between this reload and this function's own `save()` a few
-    /// lines below is still possible (there is no OS-level file lock across
-    /// processes) and would still be clobbered, but that window shrinks from
-    /// "up to one poll interval" (~10s) to "the duration of one merge call"
-    /// (microseconds), which is the best achievable without adding
-    /// cross-process file locking (`flock`) around the whole
-    /// read-modify-write sequence.
+    /// Окно закрыто внутри `with_mutation`: один flock на всю операцию,
+    /// повторное чтение, слияние, мутация и запись. Отдельный
+    /// `reload_if_changed` перед записью не вызывается: повторный захват
+    /// flock в том же потоке на Linux блокирует навсегда.
+    /// Внешняя запись другого процесса подхватывается этим слиянием.
+    /// Устаревшая копия в памяти больше не затирает диск.
     ///
     /// Returns the number of clients merged.
     pub fn merge_from_json(&self, json: &str) -> Result<usize> {
         let incoming: Vec<ClientConfig> = serde_json::from_str(json)
             .map_err(|e| Error::Session(format!("merge_from_json parse: {}", e)))?;
 
-        // A2: pick up any external on-disk change (e.g. a concurrent admin
-        // CLI `--add-client`) before computing/saving this merge, so it
-        // isn't clobbered. Must happen BEFORE `self.data.write()` below —
-        // `reload_if_changed` -> `reload_from_disk` takes its own
-        // `self.data.write()` internally and releases it on return, so
-        // sequencing this first avoids any double-acquisition/deadlock.
-        self.reload_if_changed();
-
-        let mut data = self.data.write();
+        // Повторное чтение и слияние диска выполняются внутри with_mutation
+        // под flock. Окно между reload и save, которое раньше затирало
+        // внешнюю запись, закрыто той же транзакцией.
+        self.with_mutation(|data| {
         let mut merged = 0usize;
         for mut inc in incoming {
             if let Some(existing) = data.clients.iter_mut().find(|c| c.id == inc.id) {
@@ -360,7 +346,7 @@ impl ClientDatabase {
                 // client-vs-client collision below (divergent per-node
                 // vpn_ip is allowed by design — `state_digest` excludes it).
                 if inc.vpn_ip == self.network_config().server_vpn_ip {
-                    match self.deterministic_reassign_offset(&inc.id, &data) {
+                    match self.deterministic_reassign_offset(&inc.id, data) {
                         Some(new_ip) => {
                             warn!(
                                 "merge_from_json: client '{}' vpn_ip {} collides with this node's server VPN IP — re-homed to {}",
@@ -393,7 +379,7 @@ impl ClientDatabase {
                         // IT in place; the incoming (winning) record keeps
                         // its vpn_ip unchanged when pushed below.
                         let loser_id = data.clients[conflict_idx].id.clone();
-                        match self.deterministic_reassign_offset(&loser_id, &data) {
+                        match self.deterministic_reassign_offset(&loser_id, data) {
                             Some(new_ip) => {
                                 warn!(
                                     "merge_from_json: incoming client '{}' (created {}) beats locally-resident '{}' (created {}) for vpn_ip {} — re-homed loser to {}",
@@ -429,7 +415,7 @@ impl ClientDatabase {
                         // The incoming record loses: re-home it before
                         // insertion, leaving the winning local record
                         // untouched.
-                        match self.deterministic_reassign_offset(&inc.id, &data) {
+                        match self.deterministic_reassign_offset(&inc.id, data) {
                             Some(new_ip) => {
                                 warn!(
                                     "merge_from_json: client '{}' vpn_ip {} conflicts locally — re-homed to {}",
@@ -469,11 +455,9 @@ impl ClientDatabase {
             Self::warn_duplicate_live_names(&data.clients);
         }
 
-        drop(data);
-        if merged > 0 || reaped {
-            self.save()?;
-        }
+        let _ = reaped;
         Ok(merged)
+        })
     }
 
     /// Log a warning for each live (non-tombstoned) client `name` that is
@@ -750,14 +734,29 @@ mod tests {
         db.remove_client(&old.id).unwrap();
         db.remove_client(&fresh.id).unwrap();
 
-        // Age the first tombstone beyond the TTL.
-        db.data
-            .write()
+        // Старим надгробие и в памяти, и на диске. Транзакция сначала сливает
+        // файл: более новая копия на диске иначе затрет искусственно состаренный
+        // снимок в памяти, и reap его не снимет.
+        let expired_at = Utc::now() - TOMBSTONE_TTL - chrono::Duration::days(1);
+        {
+            db.data
+                .write()
+                .clients
+                .iter_mut()
+                .find(|c| c.id == old.id)
+                .unwrap()
+                .updated_at = Some(expired_at);
+        }
+        let db_path = db.file_path().to_path_buf();
+        let mut on_disk: ClientDbFile =
+            serde_json::from_str(&std::fs::read_to_string(&db_path).unwrap()).unwrap();
+        on_disk
             .clients
             .iter_mut()
             .find(|c| c.id == old.id)
             .unwrap()
-            .updated_at = Some(Utc::now() - TOMBSTONE_TTL - chrono::Duration::days(1));
+            .updated_at = Some(expired_at);
+        std::fs::write(&db_path, serde_json::to_string_pretty(&on_disk).unwrap()).unwrap();
 
         // Any merge (even empty) runs the reaper.
         db.merge_from_json("[]").unwrap();
@@ -798,23 +797,27 @@ mod tests {
         let a = db.add_client("a").unwrap(); // gets 10.99.0.2
         db.remove_client(&a.id).unwrap();
 
-        // Rewind the allocation cursor so the tombstone's address is the
-        // first candidate again.
-        db.data.write().next_host_offset = 2;
-        let b = db.add_client("b").unwrap();
-        assert_eq!(
-            b.vpn_ip, a.vpn_ip,
-            "a revoked client's IP must be allocatable again"
-        );
+        // Курсор после выдачи адреса не откатывается ниже диска (транзакция
+        // берет max). Обход подсети доказывает, что адрес надгробия снова
+        // выдается, а не закреплен навсегда.
+        let mut reused = false;
+        for i in 0..300 {
+            let c = db.add_client(&format!("n{i}")).unwrap();
+            if c.vpn_ip == a.vpn_ip {
+                reused = true;
+                db.remove_client(&c.id).unwrap();
+                break;
+            }
+        }
+        assert!(reused, "a revoked client's IP must be allocatable again");
 
-        // And merge must not treat the tombstone as an IP conflict for an
-        // incoming live client either.
-        let mut peer_client = b.clone();
+        // Tombstone не удерживает адрес и не создает конфликт при merge.
+        let mut peer_client = a.clone();
         peer_client.id = "peer-new-id".to_string();
         peer_client.name = "peer-new".to_string();
         peer_client.psk = [0x42; 32];
-        // Remove b locally first so the IP is only held by the tombstone.
-        db.remove_client(&b.id).unwrap();
+        peer_client.deleted = false;
+        peer_client.enabled = true;
         db.merge_from_json(&serde_json::to_string(&vec![peer_client]).unwrap())
             .unwrap();
         assert!(
@@ -1260,31 +1263,30 @@ mod tests {
     #[test]
     fn bucket_digests_diff_yields_each_sides_own_missing_record() {
         let dir_a = tempfile::tempdir().unwrap();
-        let dir_b = tempfile::tempdir().unwrap();
         let db_a = ClientDatabase::load(&dir_a.path().join("clients.json"), test_network_config())
             .unwrap();
-        let db_b = ClientDatabase::load(&dir_b.path().join("clients.json"), test_network_config())
-            .unwrap();
+        let alice = db_a.add_client("alice").unwrap();
 
-        // Pick two candidate names that land in different buckets so the
-        // two "missing" records are distinguishable by bucket index (a
-        // real-world collision would just merge the delta into one
-        // PoolSync round, but the point of this test is to show the
-        // per-bucket attribution is exact).
-        let name_a = "alice".to_string();
-        let mut name_b = "bob".to_string();
-        let mut n = 0u32;
-        while bucket_index_for_id(&name_a) == bucket_index_for_id(&name_b) {
-            n += 1;
-            name_b = format!("bob{n}");
+        // Корзина считается по случайному id, а не по имени. Пока id совпадают,
+        // базу B создаем заново, чтобы не оставлять надгробие в дайджесте.
+        let mut kept_b = None;
+        for n in 0..POOL_SYNC_BUCKETS {
+            let dir_b = tempfile::tempdir().unwrap();
+            let candidate =
+                ClientDatabase::load(&dir_b.path().join("clients.json"), test_network_config())
+                    .unwrap();
+            let name = if n == 0 {
+                "bob".to_string()
+            } else {
+                format!("bob{n}")
+            };
+            let created = candidate.add_client(&name).unwrap();
+            if bucket_index_for_id(&alice.id) != bucket_index_for_id(&created.id) {
+                kept_b = Some((candidate, created, dir_b));
+                break;
+            }
         }
-
-        let alice = db_a.add_client(&name_a).unwrap();
-        let bob = db_b.add_client(&name_b).unwrap();
-        assert_ne!(
-            bucket_index_for_id(&alice.id) % POOL_SYNC_BUCKETS,
-            bucket_index_for_id(&bob.id) % POOL_SYNC_BUCKETS
-        );
+        let (db_b, bob, _dir_b) = kept_b.expect("a second client id must land in another bucket");
 
         let buckets_a = db_a.bucket_digests();
         let buckets_b = db_b.bucket_digests();

@@ -111,6 +111,32 @@ pub enum SshInstallError {
     /// budget in seconds.
     #[error("install timed out after {0}s overall")]
     Timeout(u64),
+    #[error("строка вывода удаленной команды превышает {0} байт")]
+    OutputLineTooLong(usize),
+}
+
+const MAX_OUTPUT_LINE_BYTES: usize = 1024 * 1024;
+
+fn push_output_bytes(
+    buffer: &mut Vec<u8>,
+    mut data: &[u8],
+    on_line: &mut impl FnMut(&str),
+) -> Result<()> {
+    while !data.is_empty() {
+        let newline = data.iter().position(|&byte| byte == b'\n');
+        let length = newline.map_or(data.len(), |position| position + 1);
+        if length > MAX_OUTPUT_LINE_BYTES.saturating_sub(buffer.len()) {
+            return Err(SshInstallError::OutputLineTooLong(MAX_OUTPUT_LINE_BYTES));
+        }
+        buffer.extend_from_slice(&data[..length]);
+        data = &data[length..];
+        if newline.is_some() {
+            // UTF-8 декодируется после сборки строки, а не на границе SSH чанка.
+            on_line(String::from_utf8_lossy(buffer).trim_end_matches(['\r', '\n']));
+            buffer.clear();
+        }
+    }
+    Ok(())
 }
 
 pub type Result<T> = std::result::Result<T, SshInstallError>;
@@ -331,17 +357,13 @@ impl SshSession {
 
         let mut exit_code: Option<u32> = None;
         let mut exit_signal: Option<String> = None;
-        let mut line_buf = String::new();
-        let mut err_buf = String::new();
+        let mut line_buf = Vec::new();
+        let mut err_buf = Vec::new();
 
         while let Some(msg) = channel.wait().await {
             match msg {
                 ChannelMsg::Data { data } => {
-                    line_buf.push_str(&String::from_utf8_lossy(&data));
-                    while let Some(pos) = line_buf.find('\n') {
-                        let line: String = line_buf.drain(..=pos).collect();
-                        on_line(line.trim_end_matches(['\r', '\n']));
-                    }
+                    push_output_bytes(&mut line_buf, &data, &mut on_line)?;
                 }
                 // stderr (SSH_EXTENDED_DATA_STDERR). Surfaced through the
                 // same line callback so failures that only write to stderr
@@ -350,11 +372,7 @@ impl SshSession {
                 // silently dropped. Buffered separately from stdout so a
                 // partial stdout line is never spliced mid-line with stderr.
                 ChannelMsg::ExtendedData { data, .. } => {
-                    err_buf.push_str(&String::from_utf8_lossy(&data));
-                    while let Some(pos) = err_buf.find('\n') {
-                        let line: String = err_buf.drain(..=pos).collect();
-                        on_line(line.trim_end_matches(['\r', '\n']));
-                    }
+                    push_output_bytes(&mut err_buf, &data, &mut on_line)?;
                 }
                 ChannelMsg::ExitStatus { exit_status } => {
                     exit_code = Some(exit_status);
@@ -378,10 +396,10 @@ impl SshSession {
         }
 
         if !line_buf.is_empty() {
-            on_line(&line_buf);
+            on_line(&String::from_utf8_lossy(&line_buf));
         }
         if !err_buf.is_empty() {
-            on_line(&err_buf);
+            on_line(&String::from_utf8_lossy(&err_buf));
         }
 
         match (exit_code, exit_signal) {
@@ -992,6 +1010,11 @@ pub fn build_install_argv(params: &InstallParams, remote_dir: &str) -> Vec<Strin
         argv.push(shell_quote(pubkey));
     }
 
+    // Открытый ключ выпуска встраивается при сборке клиента из доверенной CI-переменной.
+    if let Some(public_key) = option_env!("AIVPN_RELEASE_PUBKEY").filter(|key| !key.is_empty()) {
+        argv.push("--release-pubkey".into());
+        argv.push(shell_quote(public_key));
+    }
     for extra in &params.extra_args {
         argv.push(shell_quote(extra));
     }
@@ -1198,6 +1221,40 @@ async fn upload_and_run_installer(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn protocol_audit_ssh_bounds_partial_output_lines() {
+        let mut buffer = Vec::new();
+        push_output_bytes(&mut buffer, &vec![b'x'; MAX_OUTPUT_LINE_BYTES], &mut |_| {}).unwrap();
+        assert!(matches!(
+            push_output_bytes(&mut buffer, b"x", &mut |_| {}),
+            Err(SshInstallError::OutputLineTooLong(_))
+        ));
+        assert!(buffer.len() <= MAX_OUTPUT_LINE_BYTES);
+    }
+
+    #[test]
+    fn protocol_audit_ssh_preserves_utf8_across_chunks() {
+        let bytes = "готово\n".as_bytes();
+        let mut buffer = Vec::new();
+        let mut lines = Vec::new();
+        let mut on_line = |line: &str| lines.push(line.to_owned());
+        push_output_bytes(&mut buffer, &bytes[..1], &mut on_line).unwrap();
+        push_output_bytes(&mut buffer, &bytes[1..], &mut on_line).unwrap();
+        assert_eq!(lines, ["готово"]);
+    }
+
+    #[test]
+    fn protocol_audit_ssh_limit_applies_per_line_not_per_message() {
+        let mut buffer = Vec::new();
+        let mut data = vec![b'x'; MAX_OUTPUT_LINE_BYTES];
+        data[MAX_OUTPUT_LINE_BYTES - 1] = b'\n';
+        data.extend_from_within(..);
+        let mut count = 0;
+        push_output_bytes(&mut buffer, &data, &mut |_| count += 1).unwrap();
+        assert_eq!(count, 2);
+        assert!(buffer.is_empty());
+    }
 
     // --- parse_marker_line -------------------------------------------------
 

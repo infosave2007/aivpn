@@ -1,77 +1,14 @@
-//! FORK-B pool-sync DIALER — the masked pool-client half of pool sync.
+//! Межсерверный обмен поверх масочных handshake-сессий.
 //!
-//! [`crate::pool_sync::PeerSyncer`] is the legacy mask-INDEPENDENT push-only
-//! path: it sends `PoolSync` snapshots over a fixed, non-mask wire layout and
-//! never dials anything (peers only exchange data if BOTH sides independently
-//! push — no bidirectional session, no shared "we are connected" state).
+//! PoolDialer подключается к соседям как control-only AivpnClient. Узлы пула
+//! используют общий PSK и X25519 keypair из sync_key, затем выполняют PFS
+//! и подтверждают собственную Ed25519 identity через NodeEnrollment.
+//! Площадки с отдельными ключами передают только RouteSync и SiteData.
 //!
-//! [`PoolDialer`] is the new "server-B" strategy: each node DIALS every peer
-//! as a normal, fully masked `AivpnClient` running in headless
-//! `control_only` mode (see `aivpn_client::client::ClientConfig::control_only`)
-//! using a shared, pool-wide identity:
-//!
-//! - `preshared_key` = [`aivpn_common::crypto::pool_client_psk`] (same for
-//!   every pool node — the trust model is a single-operator trusted pool).
-//! - `server_public_key` = the pool-wide static X25519 identity every node
-//!   shares, [`aivpn_common::crypto::pool_server_keypair`]`(sync_key)`
-//!   `.public_key_bytes()`. Every node derives the SAME keypair from the same
-//!   `sync_key`, so "the peer's server public key" is simply this node's own
-//!   derived pool keypair's public key — no additional config or key exchange
-//!   is required.
-//!
-//! Because the dialed session is a real, bidirectional, ordinary masked VPN
-//! session (indistinguishable on the wire from a real client), asymmetric
-//! DPI that blocks one direction of a raw push (the original
-//! `PeerSyncer`/`site_sync` problem) cannot block this: whichever side
-//! successfully DIALS OUT gets a working bidirectional channel, and the
-//! anti-entropy protocol below (digest beacon + snapshot push both ways)
-//! converges the client DB regardless of which side initiated the link.
-//!
-//! ## Anti-entropy protocol over the dialed session
-//!
-//! Once connected, this task and the peer's gateway (already implemented,
-//! see `gateway.rs`'s masked-pool-client handling) exchange three control
-//! messages:
-//!
-//! - `PoolStateDigest { digest }` — a periodic beacon of
-//!   `ClientDatabase::state_digest()`, the cheap steady-state "are we in
-//!   sync?" root check. Sent by us on a timer.
-//! - `PoolBucketDigests { digests, reply_requested }` — Phase 2:
-//!   `ClientDatabase::bucket_digests()`, sent in reaction to a root-digest
-//!   mismatch (`reply_requested: true`) or in reply to such a message
-//!   (`reply_requested: false`). The receiver diffs the enclosed digests
-//!   against its own bucket digests and pushes a `PoolSync` containing just
-//!   the differing buckets' records. If `reply_requested` was true, the
-//!   receiver ALSO sends back its own `bucket_digests()` with
-//!   `reply_requested: false`, so the original sender can compute its own
-//!   differing buckets and push its delta too.
-//! - `PoolSync { clients_json }` — the (tombstone-inclusive) client records
-//!   for the differing buckets, merged by the receiver via `merge_from_json`.
-//!
-//! Both sides run the identical rule (see `gateway.rs`'s masked-pool-client
-//! handling), so a single dialed session converges both directions over a
-//! bounded number of messages with no ping-pong: on a root mismatch, the
-//! rule is `digest -> buckets(reply_requested=true) -> (PoolSync delta +
-//! buckets(reply_requested=false)) -> (PoolSync delta) -> silence`. A
-//! `PoolBucketDigests` is NEVER answered with another `PoolStateDigest`
-//! (that echo caused an earlier storm regression), and
-//! `reply_requested: false` is never itself answered with another
-//! `PoolBucketDigests` (that would ping-pong forever). No separate "am I
-//! the client or the server" coordination is needed — the rule is symmetric
-//! and idempotent, and a matching root digest on the next beacon ends the
-//! exchange.
-//!
-//! ## Known follow-up (not fixed here)
-//!
-//! `AivpnClient::new` unconditionally calls (client.rs)
-//! `load_or_generate_static_keypair()`, which reads/writes a single on-disk
-//! `~/.config/aivpn/device.key`. Running N concurrent control-only dialers
-//! (one per peer) in the same server process means N concurrent accesses to
-//! that same file path — benign today (the static keypair value is unused in
-//! `control_only` mode: no mTLS cert, no persisted per-device identity is
-//! read back), but a real race if that file is ever relied upon for
-//! something control-only sessions need. Flagged for a future fix, not
-//! addressed here.
+//! Сходимость БД: digest -> запрос bucket digests -> дельты PoolSync в обе
+//! стороны. Ответный digest не порождает новый запрос без расхождения;
+//! tombstone передается вместе с остальными записями и предотвращает возврат
+//! удаленного клиента. Для двустороннего обмена достаточно одного канала.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -101,36 +38,36 @@ const MAX_BACKOFF: Duration = Duration::from_secs(30);
 /// from a peer that is persistently unreachable.
 const BACKOFF_RESET_THRESHOLD: Duration = Duration::from_secs(60);
 
-/// Dials configured pool peers as masked, headless `control_only` VPN
-/// clients and runs bidirectional client-DB anti-entropy over each session.
-///
-/// Additive and gated: only constructed/started when
-/// `PoolSyncConfig::transport_is_masked()` is true (see the `main.rs` wiring
-/// site). Leaves the legacy [`crate::pool_sync::PeerSyncer`] path completely
-/// untouched.
+/// Токен одной dial-петли. remove_peer навсегда останавливает это поколение.
+#[derive(Clone)]
+struct DialGeneration {
+    stop: Arc<AtomicBool>,
+    topology_lock: Arc<parking_lot::Mutex<()>>,
+}
+
+impl DialGeneration {
+    /// Проверка и публикация состояния атомарны относительно remove/add.
+    fn with_active(&self, publish: impl FnOnce()) -> bool {
+        let _topology = self.topology_lock.lock();
+        if self.stop.load(Ordering::Relaxed) {
+            return false;
+        }
+        publish();
+        true
+    }
+}
+
+/// Сессии узлов пула, площадок и выходов мультихопа.
 pub struct PoolDialer {
     db: Arc<ClientDatabase>,
     peers: Vec<String>,
     pool_kp: crypto::KeyPair,
     pool_psk: [u8; 32],
     beacon_secs: u64,
-    /// This node's own pool `node_id` (`PoolSyncConfig::node_id`), carried in
-    /// every outbound `RouteSync` advertisement so the receiving
-    /// `site_sync::handle_route_sync` can bind the advertised subnets to
-    /// THIS node's `site_to_site.peers[].node_id` entry instead of falling
-    /// back to a union of every configured peer's `remote_subnets` (the
-    /// route-hijack fixed alongside this field). `None` when
-    /// `pool.node_id` is unset — in that case the receiver cannot attribute
-    /// the advert to any peer and drops it (fail-closed), matching
-    /// `PeerSyncer`'s existing node_id-required behavior.
+    /// Собственный node_id для NodeEnrollment и RouteSync.
     node_id: Option<String>,
-    /// PHASE 3 (site-to-site over masked transport): local subnets this node
-    /// advertises to every dialed peer via `ControlPayload::RouteSync`,
-    /// mirroring what `site_sync::SitePeer` advertises over the legacy
-    /// mask-independent channel. Empty unless the caller of [`Self::new`]
-    /// passes a non-empty list (see the `main.rs` wiring site, which only
-    /// does so when `pool.transport == "masked"` AND `site_to_site` is
-    /// configured) — additive, and a no-op for plain pool-sync-only setups.
+    require_node_enrollment: bool,
+    /// Локальные подсети для RouteSync. Пустой список не анонсируется.
     local_subnets: Vec<String>,
     /// Per-peer live control-channel senders, registered while a masked
     /// dialed session to that peer is PROVABLY up (promoted by
@@ -236,31 +173,21 @@ pub struct PoolDialer {
     /// its fresh session just in time for the tail of `remove_peer` to
     /// wipe the new `peer_senders` entry. Always the OUTERMOST lock; the
     /// inner Mutexes are never held while acquiring it.
-    topology_lock: parking_lot::Mutex<()>,
+    topology_lock: Arc<parking_lot::Mutex<()>>,
+    /// Собственный sync_key площадки, если endpoint не входит в pool.peers.
+    /// Для pool peer ключ не подменяем: та же сессия несет и SiteData.
+    peer_credentials: parking_lot::Mutex<HashMap<String, (crypto::KeyPair, [u8; 32], String)>>,
+    /// Площадки, которые надо набрать в start() помимо pool.peers.
+    site_peer_addrs: parking_lot::Mutex<Vec<String>>,
+    /// Реестр для проверки обратного NodeEnrollment удаленного узла.
+    node_registry: parking_lot::Mutex<Option<Arc<crate::node_registry::NodeRegistry>>>,
+    /// Куда dialer кладет принятый SiteData, чтобы шлюз записал его в TUN.
+    site_tun_tx: parking_lot::Mutex<Option<tokio::sync::mpsc::Sender<Vec<u8>>>>,
 }
 
 impl PoolDialer {
-    /// Returns `None` if `sync_key` is absent, invalid, or all-zero (mirrors
-    /// `PeerSyncer::new`'s fail-closed decode) — masked pool-client dialing
-    /// stays fully disabled in that case, exactly like the legacy path.
-    ///
-    /// `local_subnets` are advertised to every dialed peer as `RouteSync`
-    /// (PHASE 3 site-to-site-over-masked-transport); pass an empty `Vec` for
-    /// plain pool-sync-only setups (site-to-site not configured, or running
-    /// under the legacy transport where `site_sync::start` handles it).
-    ///
-    /// `reverse_downlink_tx` (PHASE 4, reverse chain-forward) should be
-    /// `Some(server.chain_reverse_downlink_sender())` when this node is both
-    /// running the masked pool-client transport AND has `pool.exit_node`
-    /// configured (an entry node that actually dials an exit); `None`
-    /// otherwise. See the field's doc comment.
-    ///
-    /// `node_identity` (PHASE 4, per-node cryptographic identity, SEND side)
-    /// should be `Some(signing_key)` — this node's own durable Ed25519
-    /// identity, loaded/generated by `main.rs` from `pool.node_identity_key`
-    /// — when this node runs the masked pool-client transport; `None` keeps
-    /// this node from ever sending a `NodeEnrollment` proof (legacy /
-    /// Phase-4-off, byte-for-byte unchanged).
+    /// Неверный sync_key или пустой node_id не позволяют создать dialer.
+    /// reverse_downlink_tx возвращает ответы выхода в клиентский downlink.
     pub fn new(
         db: Arc<ClientDatabase>,
         config: &PoolSyncConfig,
@@ -289,7 +216,7 @@ impl PoolDialer {
             .unwrap_or(DEFAULT_BEACON_SECS)
             .max(1);
 
-        // Skip self exactly like `PeerSyncer::new`: a node must never dial
+        // Не подключаться к собственному node_id:
         // its own `node_id` as though it were a distinct peer.
         let node_id = match config
             .node_id
@@ -301,9 +228,7 @@ impl PoolDialer {
             None => {
                 warn!(
                     "pool_dialer: pool.node_id not configured — masked pool dialer disabled \
-                     (mirrors PeerSyncer::new's fail-closed behavior: without a node_id, self-\
-                     filtering cannot skip this node's own address in `peers`, risking a self-\
-                     dial reconnect loop, and NodeEnrollment would sign with an empty node_id)"
+                     (node identity is required)"
                 );
                 return None;
             }
@@ -337,6 +262,7 @@ impl PoolDialer {
             // `NodeEnrollment`, where the peer side compares against its own
             // trimmed config entries and would never match.
             node_id: node_id.map(str::to_string),
+            require_node_enrollment: config.require_node_enrollment(),
             local_subnets,
             peer_senders: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             pool_status: Arc::new(parking_lot::Mutex::new(HashMap::new())),
@@ -347,8 +273,66 @@ impl PoolDialer {
             spawn_count: Arc::new(AtomicUsize::new(0)),
             runtime_exit_peers: Arc::new(parking_lot::Mutex::new(HashSet::new())),
             peer_stop_flags: Arc::new(parking_lot::Mutex::new(HashMap::new())),
-            topology_lock: parking_lot::Mutex::new(()),
+            topology_lock: Arc::new(parking_lot::Mutex::new(())),
+            peer_credentials: parking_lot::Mutex::new(HashMap::new()),
+            site_peer_addrs: parking_lot::Mutex::new(Vec::new()),
+            node_registry: parking_lot::Mutex::new(None),
+            site_tun_tx: parking_lot::Mutex::new(None),
         }))
+    }
+
+    /// Площадки без pool.sync_key. Фиктивный ключ живет только внутри dialer
+    /// и на шлюз не ставится: исходящие сессии берут sync_key конкретной площадки.
+    pub fn site_only(
+        db: Arc<ClientDatabase>,
+        node_id: &str,
+        local_subnets: Vec<String>,
+        require_node_enrollment: bool,
+        node_identity: Option<ed25519_dalek::SigningKey>,
+    ) -> Option<Arc<Self>> {
+        use base64::Engine as _;
+        let mut config = PoolSyncConfig::default();
+        config.sync_key = Some(base64::engine::general_purpose::STANDARD.encode([0xA5u8; 32]));
+        config.node_id = Some(node_id.to_string());
+        config.peers.clear();
+        config.require_node_enrollment = Some(require_node_enrollment);
+        Self::new(db, &config, local_subnets, None, node_identity)
+    }
+
+    pub fn set_node_registry(&self, registry: Arc<crate::node_registry::NodeRegistry>) {
+        *self.node_registry.lock() = Some(registry);
+    }
+
+    pub fn set_site_tun_tx(&self, tx: tokio::sync::mpsc::Sender<Vec<u8>>) {
+        *self.site_tun_tx.lock() = Some(tx);
+    }
+
+    /// Поставить площадку в очередь до start(). Если endpoint уже pool peer,
+    /// его pool-ключ не перезаписываем.
+    pub fn queue_site_peer(
+        &self,
+        endpoint: String,
+        keypair: crypto::KeyPair,
+        psk: [u8; 32],
+        expected_node: String,
+    ) {
+        if self.peers.iter().any(|peer| peer == &endpoint) {
+            return;
+        }
+        self.peer_credentials
+            .lock()
+            .insert(endpoint.clone(), (keypair, psk, expected_node));
+        let mut addrs = self.site_peer_addrs.lock();
+        if !addrs.iter().any(|peer| peer == &endpoint) {
+            addrs.push(endpoint);
+        }
+    }
+
+    fn credentials_for(&self, peer: &str) -> (crypto::KeyPair, [u8; 32]) {
+        if let Some((keypair, psk, _)) = self.peer_credentials.lock().get(peer) {
+            return (keypair.clone(), *psk);
+        }
+        (self.pool_kp.clone(), self.pool_psk)
     }
 
     /// Queue `payload` for delivery to `peer` over its currently-live dialed
@@ -489,9 +473,11 @@ impl PoolDialer {
         // doc comments).
         *self.shutdown.lock() = Some(shutdown);
 
+        let site_peers = self.site_peer_addrs.lock().clone();
         info!(
-            "pool_dialer: active ({} peers, masked pool-client transport)",
-            self.peers.len()
+            "pool_dialer: active ({} pool peers, {} site peers, masked transport)",
+            self.peers.len(),
+            site_peers.len()
         );
         for peer in self.peers.clone() {
             // `is_runtime_exit: false` — these are the startup-configured
@@ -500,6 +486,9 @@ impl PoolDialer {
             // `main.rs`'s wiring site). NEVER tracked in
             // `runtime_exit_peers`, so `remove_peer` can never tear any of
             // them down. See Wave 2 (dial-teardown)'s doc comments.
+            self.spawn_dial_loop(peer, false);
+        }
+        for peer in site_peers {
             self.spawn_dial_loop(peer, false);
         }
     }
@@ -653,10 +642,13 @@ impl PoolDialer {
             stop.store(true, Ordering::Relaxed);
         }
         self.dialed_peers.lock().remove(addr);
-        self.peer_senders.lock().remove(addr);
+        let mut senders = self.peer_senders.lock();
+        senders.remove(addr);
         if let Some(entry) = self.pool_status.lock().get_mut(addr) {
             entry.connected = false;
+            entry.converged = false;
         }
+        drop(senders);
         info!(
             "pool_dialer: remove_peer({}) — runtime exit dial torn down",
             addr
@@ -729,7 +721,13 @@ impl PoolDialer {
                 combined.clone(),
             ));
 
-            let session_result = self.run_one_session(&peer, combined.clone()).await;
+            let generation = DialGeneration {
+                stop: peer_stop.clone(),
+                topology_lock: self.topology_lock.clone(),
+            };
+            let session_result = self
+                .run_one_session(&peer, combined.clone(), generation)
+                .await;
             watcher.abort();
 
             match session_result {
@@ -780,6 +778,7 @@ impl PoolDialer {
         &self,
         peer: &str,
         shutdown: Arc<AtomicBool>,
+        generation: DialGeneration,
     ) -> aivpn_common::error::Result<()> {
         let (tap_tx, tap_rx) = tokio::sync::mpsc::channel::<ControlPayload>(64);
 
@@ -793,14 +792,55 @@ impl PoolDialer {
             .expect("preset_masks::all() is never empty");
         let recv_mdh_len = mask_mdh_len(&initial_mask);
 
+        let (peer_kp, peer_psk) = self.credentials_for(peer);
+        let verified_slot = Arc::new(std::sync::Mutex::new(None::<String>));
+        let verified_key = Arc::new(std::sync::Mutex::new(None));
+        let authorization = self
+            .node_registry
+            .lock()
+            .clone()
+            .map(|registry| PeerAuthorization {
+                registry,
+                identity: verified_key.clone(),
+            });
+        let remote_enroll_hook = self.node_registry.lock().clone().map(|registry| {
+            aivpn_client::client::RemoteEnrollHook(Arc::new(
+                move |node_id: &str,
+                      node_pub: &[u8; 32],
+                      time_window: u64,
+                      signature: &[u8; 64],
+                      server_eph: &[u8; 32],
+                      client_eph: &[u8; 32]| {
+                    match registry.authenticate(
+                        node_id,
+                        node_pub,
+                        time_window,
+                        signature,
+                        server_eph,
+                        client_eph,
+                    ) {
+                        crate::node_registry::NodeAuthOutcome::Verified
+                        | crate::node_registry::NodeAuthOutcome::BoundNew => {
+                            *verified_key
+                                .lock()
+                                .unwrap_or_else(|error| error.into_inner()) =
+                                Some((node_id.to_string(), *node_pub));
+                            Some(node_id.to_string())
+                        }
+                        crate::node_registry::NodeAuthOutcome::Rejected(_) => None,
+                    }
+                },
+            ))
+        });
         let cfg = ClientConfig {
             server_addr: peer.to_string(),
-            server_public_key: self.pool_kp.public_key_bytes(),
+            server_public_key: peer_kp.public_key_bytes(),
             server_signing_key: None,
-            preshared_key: Some(self.pool_psk),
+            preshared_key: Some(peer_psk),
             initial_mask,
             tun_config: control_only_tun_config(recv_mdh_len),
             proxy_listen: None,
+            proxy_dns: Vec::new(),
             mtls_cert: None,
             initial_adaptive_level: aivpn_common::quality::AdaptiveLevel::Off,
             polymorphic_base: None,
@@ -821,6 +861,8 @@ impl PoolDialer {
             // for `node_identity` reproduces the pre-Phase-4 no-op exactly.
             node_identity: self.node_identity.clone(),
             pool_node_id: self.node_id.clone(),
+            remote_verified_node: Some(verified_slot.clone()),
+            remote_enroll_hook,
             // The pool dialer always speaks direct UDP to its peer: it is a
             // server-to-server link, not a client session that might need an
             // alternative carrier.
@@ -846,24 +888,13 @@ impl PoolDialer {
         // promotion ever happened.
         let per_session_ctrl = ctrl.clone();
 
-        // Wave B1 (pool topology read endpoints): record this connect so
-        // `pool_status_snapshot` reflects a live session immediately, even
-        // before the first anti-entropy beacon/convergence signal arrives.
-        {
-            let now = Utc::now().timestamp();
-            let mut status = self.pool_status.lock();
-            let entry = status
-                .entry(peer.to_string())
-                .or_insert_with(|| PeerSyncStatus {
-                    connected: false,
-                    last_converged_unix: None,
-                    converged: false,
-                    last_seen_unix: None,
-                    partition_conflict: false,
-                    subnet_mismatch: false,
-                });
-            entry.connected = true;
-            entry.last_seen_unix = Some(now);
+        if !generation.with_active(|| {
+            let senders = self.peer_senders.lock();
+            if !senders.contains_key(peer) {
+                mark_dialing(&self.pool_status, peer);
+            }
+        }) {
+            return Ok(());
         }
 
         // PHASE 3: advertise our local subnets to this peer immediately on
@@ -899,6 +930,7 @@ impl PoolDialer {
         // using the `node_identity`/`pool_node_id` just threaded through
         // `cfg` above. This dialer no longer builds or sends one directly.
 
+        let require_node_enrollment = self.require_node_enrollment;
         let db = self.db.clone();
         let beacon_secs = self.beacon_secs;
         let peer_label = peer.to_string();
@@ -907,7 +939,13 @@ impl PoolDialer {
         let reverse_downlink_tx = self.reverse_downlink_tx.clone();
         let pool_status = self.pool_status.clone();
         let peer_senders = self.peer_senders.clone();
-        let driver = tokio::spawn(async move {
+        let site_tun_tx = self.site_tun_tx.lock().clone();
+        let site_identity = self
+            .peer_credentials
+            .lock()
+            .get(peer)
+            .map(|(_, _, id)| id.clone());
+        let mut driver = tokio::spawn(async move {
             anti_entropy(
                 ctrl,
                 tap_rx,
@@ -919,12 +957,24 @@ impl PoolDialer {
                 reverse_downlink_tx,
                 pool_status,
                 peer_senders,
+                require_node_enrollment,
+                verified_slot,
+                site_tun_tx,
+                site_identity,
+                authorization,
+                generation,
             )
             .await;
         });
 
-        let run_result = client.run(shutdown).await;
+        let run_result = tokio::select! {
+            result = client.run(shutdown) => result,
+            _ = &mut driver => Err(aivpn_common::error::Error::Session("Обмен с узлом завершен".into())),
+        };
         driver.abort();
+        if !driver.is_finished() {
+            let _ = driver.await;
+        }
 
         // Registry cleanup: this peer no longer has a live session. A
         // reconnect (via `dial_loop`) promotes a fresh entry the next time
@@ -939,25 +989,19 @@ impl PoolDialer {
         // — an unconditional remove here would delete the live new
         // session's sender, leaving `has_live_session`/`send_to_peer` dark
         // for that peer until its next reconnect (potentially hours).
-        let removed_own_sender = {
+        {
             let mut senders = self.peer_senders.lock();
-            match senders.get(peer) {
-                Some(tx) if tx.same_channel(&per_session_ctrl) => {
-                    senders.remove(peer);
-                    true
+            if senders
+                .get(peer)
+                .is_some_and(|tx| tx.same_channel(&per_session_ctrl))
+            {
+                senders.remove(peer);
+                // Сброс статуса и смена отправителя используют один порядок
+                // блокировок: завершение старой сессии не затронет новую.
+                if let Some(entry) = self.pool_status.lock().get_mut(peer) {
+                    entry.connected = false;
+                    entry.converged = false;
                 }
-                _ => false,
-            }
-        };
-
-        // Wave B1: mirror the disconnect into the retained status too —
-        // `converged`/`last_converged_unix` are left untouched (they record
-        // the last time convergence WAS observed, which stays meaningful
-        // across a disconnect/reconnect). Same guard as above: a stale
-        // session must not mark a live replacement session disconnected.
-        if removed_own_sender {
-            if let Some(entry) = self.pool_status.lock().get_mut(peer) {
-                entry.connected = false;
             }
         }
 
@@ -1051,6 +1095,22 @@ fn mark_converged(
     entry.last_seen_unix = Some(now);
 }
 
+fn mark_dialing(pool_status: &parking_lot::Mutex<HashMap<String, PeerSyncStatus>>, peer: &str) {
+    let mut status = pool_status.lock();
+    let entry = status
+        .entry(peer.to_string())
+        .or_insert_with(|| PeerSyncStatus {
+            connected: false,
+            last_converged_unix: None,
+            converged: false,
+            last_seen_unix: None,
+            partition_conflict: false,
+            subnet_mismatch: false,
+        });
+    entry.connected = false;
+    entry.converged = false;
+}
+
 /// Mark `peer` as currently diverged as of `now` (unix seconds) — called
 /// from `anti_entropy` whenever a digest mismatch is observed. Leaves
 /// `last_converged_unix` untouched (it records the last time convergence
@@ -1131,6 +1191,25 @@ const STALE_WARN_BEACONS: u32 = 5;
 /// below). Without the latter, a perfectly converged session would still
 /// warn after `STALE_WARN_BEACONS` beacons on every run, since the former
 /// path is structurally unreachable from this side.
+struct PeerAuthorization {
+    registry: Arc<crate::node_registry::NodeRegistry>,
+    identity: Arc<std::sync::Mutex<Option<(String, [u8; 32])>>>,
+}
+
+impl PeerAuthorization {
+    fn allowed(&self) -> bool {
+        let identity = self
+            .identity
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone();
+        match identity {
+            Some((id, key)) => self.registry.is_authorized(&id, &key),
+            None => self.registry.check_health().is_ok(),
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn anti_entropy(
     ctrl: tokio::sync::mpsc::Sender<ControlPayload>,
@@ -1145,7 +1224,14 @@ async fn anti_entropy(
     peer_senders: Arc<
         parking_lot::Mutex<HashMap<String, tokio::sync::mpsc::Sender<ControlPayload>>>,
     >,
+    require_node_enrollment: bool,
+    verified_node: Arc<std::sync::Mutex<Option<String>>>,
+    site_tun_tx: Option<tokio::sync::mpsc::Sender<Vec<u8>>>,
+    site_identity: Option<String>,
+    authorization: Option<PeerAuthorization>,
+    generation: DialGeneration,
 ) {
+    let mut authorization_tick = tokio::time::interval(Duration::from_secs(1));
     let mut beacon = tokio::time::interval(Duration::from_secs(beacon_secs));
     // The first tick fires immediately; that's desirable here — beacon as
     // soon as the session is up rather than waiting a full interval.
@@ -1172,14 +1258,25 @@ async fn anti_entropy(
     let mut last_partition_check: Option<crate::pool_partition::PartitionCheck> = None;
 
     loop {
+        if generation.stop.load(Ordering::Relaxed) {
+            break;
+        }
         tokio::select! {
+            _ = authorization_tick.tick() => {
+                if generation.stop.load(Ordering::Relaxed) { break; }
+                if authorization.as_ref().is_some_and(|auth| !auth.allowed()) { break; }
+            }
             _ = beacon.tick() => {
+                if generation.stop.load(Ordering::Relaxed) { break; }
+                if authorization.as_ref().is_some_and(|auth| !auth.allowed()) { break; }
+                if site_identity.is_none() {
                 let digest = db.state_digest();
                 if ctrl.send(ControlPayload::PoolStateDigest { digest }).await.is_err() {
                     // Session gone — the outer dial_loop will reconnect.
                     break;
                 }
 
+                }
                 // PHASE 3: fold the periodic RouteSync re-advertise into the
                 // same tick as the pool digest beacon (control-plane traffic,
                 // no need for a separate timer) — mirrors `site_sync`'s
@@ -1220,6 +1317,7 @@ async fn anti_entropy(
                 // on every beacon (self-healing, like `PoolStateDigest`)
                 // rather than once, so a late-configured/late-repartitioned
                 // peer's mismatch is picked up without a reconnect.
+                if site_identity.is_some() { continue; }
                 let local_cidr = db.network_config().cidr_string();
                 let local_partition = db.partition_info().unwrap_or(crate::client_db::PartitionInfo {
                     partition_index: 0,
@@ -1253,14 +1351,34 @@ async fn anti_entropy(
                 }
             }
             msg = tap_rx.recv() => {
+                if generation.stop.load(Ordering::Relaxed) { break; }
+                if authorization.as_ref().is_some_and(|auth| !auth.allowed()) { break; }
+                if require_node_enrollment && verified_node.lock().ok().and_then(|value| value.clone()).is_none() {
+                    if msg.is_none() { break; }
+                    continue;
+                }
+                if let Some(expected) = site_identity.as_ref() {
+                    if verified_node.lock().ok().and_then(|value| value.clone()).as_ref() != Some(expected) {
+                        if msg.is_none() { break; }
+                        continue;
+                    }
+                    if !matches!(&msg, None | Some(ControlPayload::NodeEnrollment { .. } | ControlPayload::RouteSync { .. } | ControlPayload::SiteData { .. })) { continue; }
+                }
                 // Lazy promotion (see the `promoted` latch above): any inbound
                 // control message proves the handshake completed — only now
                 // does this session count as live for `has_live_session` and
                 // friends. Re-inserting on a later message is harmless but
                 // kept behind the latch to stay off the mutex per packet.
                 if !promoted && msg.is_some() {
+                    if !generation.with_active(|| {
+                    let mut senders = peer_senders.lock();
+                    senders.insert(peer.clone(), ctrl.clone());
+                    mark_diverged(&pool_status, &peer, Utc::now().timestamp());
+                    if let Some(entry) = pool_status.lock().get_mut(&peer) {
+                        entry.connected = true;
+                    }
+                    }) { break; }
                     promoted = true;
-                    peer_senders.lock().insert(peer.clone(), ctrl.clone());
                 }
                 match msg {
                     Some(ControlPayload::PoolStateDigest { digest }) => {
@@ -1269,9 +1387,9 @@ async fn anti_entropy(
                             // Converged — reset the stale-visibility latch.
                             last_converged = std::time::Instant::now();
                             warned_stale = false;
-                            mark_converged(&pool_status, &peer, Utc::now().timestamp());
+                            if !generation.with_active(|| mark_converged(&pool_status, &peer, Utc::now().timestamp())) { break; }
                         } else {
-                            mark_diverged(&pool_status, &peer, Utc::now().timestamp());
+                            if !generation.with_active(|| mark_diverged(&pool_status, &peer, Utc::now().timestamp())) { break; }
                             // Phase 2: send our bucketed digest (not the
                             // whole DB) so the peer can work out exactly
                             // which buckets differ and push us the delta.
@@ -1304,7 +1422,7 @@ async fn anti_entropy(
                             &peer_buckets,
                         );
                         if !differing.is_empty() {
-                            mark_diverged(&pool_status, &peer, Utc::now().timestamp());
+                            if !generation.with_active(|| mark_diverged(&pool_status, &peer, Utc::now().timestamp())) { break; }
                             let clients_json =
                                 db.clients_json_for_buckets(&differing).into_bytes();
                             if ctrl
@@ -1331,7 +1449,7 @@ async fn anti_entropy(
                             // it too.
                             last_converged = std::time::Instant::now();
                             warned_stale = false;
-                            mark_converged(&pool_status, &peer, Utc::now().timestamp());
+                            if !generation.with_active(|| mark_converged(&pool_status, &peer, Utc::now().timestamp())) { break; }
                         }
                         if reply_requested {
                             // Hand our own buckets back so the peer can
@@ -1362,6 +1480,18 @@ async fn anti_entropy(
                         }
                     }
                     Some(ControlPayload::RouteSync { subnets_json }) => {
+                        let verified = verified_node.lock().ok().and_then(|guard| guard.clone());
+                        // Нет проверенного id: этот advert пропускаем, следующий
+                        // beacon придет снова. Не отбрасываем все подсети навсегда
+                        // и не подставляем самозаявленный node_id.
+                        if require_node_enrollment && verified.is_none() {
+                            warn!(
+                                "pool_dialer: RouteSync from {} is waiting for a verified node identity",
+                                peer
+                            );
+                            continue;
+                        }
+
                         // PHASE 3: the peer advertised its subnets over this
                         // same masked session. Feed it through the shared
                         // `site_sync::handle_route_sync` entry point — the
@@ -1370,11 +1500,6 @@ async fn anti_entropy(
                         // this dialer side installs the peer's routes too.
                         // One dialed session reconciles routes bidirectionally,
                         // just like it does for the client DB above.
-                        // PHASE 4: this dialer-side inbound tap does not
-                        // (yet) carry a verified NodeEnrollment identity for
-                        // the peer being dialed, so it passes `None` for
-                        // `verified_node_id` (the lower-trust self-asserted
-                        // node_id path).
                         //
                         // `peer` is the config string and may be a
                         // `hostname:port`, but `handle_route_sync` eagerly
@@ -1392,14 +1517,33 @@ async fn anti_entropy(
                             },
                         };
                         match from_addr {
-                            Some(addr) => {
-                                crate::site_sync::handle_route_sync(&subnets_json, &addr, None)
-                            }
+                            Some(addr) => crate::site_sync::handle_route_sync(
+                                &subnets_json,
+                                &addr,
+                                verified.as_deref(),
+                            ),
                             None => warn!(
                                 "pool_dialer: cannot resolve peer {} for its inbound \
                                  RouteSync — dropping the advert",
                                 peer
                             ),
+                        }
+                    }
+                    Some(ControlPayload::SiteData { payload }) => {
+                        let Some(header) = aivpn_common::ip_packet::IpPacket::parse(&payload) else {
+                            warn!("pool_dialer: SiteData from {} is not an IP packet", peer);
+                            continue;
+                        };
+                        let src = header.source;
+                        if !crate::site_sync::source_allowed_for_endpoint(&peer, src) {
+                            warn!(
+                                "pool_dialer: SiteData source {} from {} is outside that peer remote_subnets",
+                                src, peer
+                            );
+                            continue;
+                        }
+                        if let Some(tx) = &site_tun_tx {
+                            let _ = tx.try_send(payload[..header.length].to_vec());
                         }
                     }
                     Some(ControlPayload::ChainForward { payload }) => {
@@ -1457,7 +1601,7 @@ async fn anti_entropy(
                             );
                             last_partition_check = Some(check);
                         }
-                        mark_partition_check(&pool_status, &peer, check);
+                        if !generation.with_active(|| mark_partition_check(&pool_status, &peer, check)) { break; }
                     }
                     Some(_) => {
                         // Any other future control variant — not our concern here.
@@ -1483,23 +1627,7 @@ fn control_only_tun_config(mdh_len: u16) -> aivpn_client::tunnel::TunnelConfig {
     }
 }
 
-/// Build the masked-transport `RouteSync` payload: a JSON OBJECT
-/// `{"node_id": <self node_id or "">, "subnets": [<local_subnets>]}`.
-///
-/// This is deliberately NOT a bare array like the legacy
-/// `site_sync::SitePeer::send_advert` payload: a dialed masked pool-client
-/// session's source socket is an ephemeral dialer port, so it can never be
-/// attributed to a configured `site_to_site.peers[].endpoint` by IP the way
-/// the legacy channel is. Carrying `node_id` in the payload itself lets
-/// `site_sync::handle_route_sync`'s MASKED PATH bind the advertised subnets
-/// to exactly the one `site_to_site.peers[]` entry whose `node_id` matches —
-/// and FAIL-CLOSED (drop the whole message) when none does — instead of the
-/// prior union-of-all-peers fallback that let any masked pool-peer advertise
-/// any other peer's subnets (the route-hijack this format change fixes).
-///
-/// An absent `node_id` (i.e. `pool.node_id` unset) serializes as `""`, which
-/// `handle_route_sync` treats as unattributable and drops — matching
-/// `PeerSyncer`'s existing "pool sync disabled without node_id" behavior.
+/// Анонс содержит node_id, поскольку адрес UDP dialer не является личностью.
 fn masked_route_sync_payload(
     node_id: &Option<String>,
     local_subnets: &[String],
@@ -1594,8 +1722,7 @@ mod tests {
     /// (`node_id.is_some_and(|id| *peer == id)`) never skips this node's own
     /// address in `peers`, risking a self-dial reconnect loop, and the
     /// `NodeEnrollment` `AivpnClient` builds from `ClientConfig::pool_node_id`
-    /// would sign with an empty `node_id`. Must fail closed exactly like
-    /// `PeerSyncer::new`.
+    /// would sign with an empty `node_id`.
     #[test]
     fn new_is_none_when_node_id_absent() {
         let mut cfg = base_pool_config();
@@ -1607,8 +1734,7 @@ mod tests {
     }
 
     /// Same fail-closed behavior for a `node_id` that is present but empty
-    /// (or all whitespace) after trimming — mirrors `PeerSyncer::new`'s
-    /// `.filter(|s| !s.is_empty())` check.
+    /// Пробелы вместо node_id тоже недопустимы.
     #[test]
     fn new_is_none_when_node_id_empty_after_trim() {
         let mut cfg = base_pool_config();
@@ -1646,7 +1772,7 @@ mod tests {
         cfg.transport = Some("legacy".to_string());
         assert!(!cfg.transport_is_masked());
         cfg.transport = None;
-        assert!(!cfg.transport_is_masked());
+        assert!(cfg.transport_is_masked());
     }
 
     #[test]
@@ -1725,6 +1851,13 @@ mod tests {
     async fn peer_promoted_to_live_only_after_first_inbound_message() {
         let cfg = base_pool_config();
         let dialer = PoolDialer::new(test_db(), &cfg, vec![], None, None).unwrap();
+        mark_dialing(&dialer.pool_status, "peer-a:443");
+        {
+            let status = dialer.pool_status.lock();
+            let entry = status.get("peer-a:443").unwrap();
+            assert!(!entry.connected, "handshake has not completed");
+            assert!(entry.last_seen_unix.is_none());
+        }
 
         let (ctrl_tx, _ctrl_rx) = tokio::sync::mpsc::channel::<ControlPayload>(8);
         let (tap_tx, tap_rx) = tokio::sync::mpsc::channel::<ControlPayload>(4);
@@ -1739,6 +1872,15 @@ mod tests {
             None,
             dialer.pool_status.clone(),
             dialer.peer_senders.clone(),
+            dialer.require_node_enrollment,
+            Arc::new(std::sync::Mutex::new(None)),
+            None,
+            None,
+            None,
+            DialGeneration {
+                stop: Arc::new(AtomicBool::new(false)),
+                topology_lock: dialer.topology_lock.clone(),
+            },
         ));
 
         // Give the driver a chance to run its first beacon tick: the peer
@@ -1765,7 +1907,97 @@ mod tests {
             dialer.has_live_session("peer-a:443"),
             "the first inbound control message must promote the session to live"
         );
+        assert!(
+            dialer
+                .pool_status
+                .lock()
+                .get("peer-a:443")
+                .unwrap()
+                .connected
+        );
         driver.abort();
+    }
+
+    #[tokio::test]
+    async fn removed_dial_generation_cannot_replace_a_new_sender_or_status() {
+        let dialer = PoolDialer::new(test_db(), &base_pool_config(), vec![], None, None).unwrap();
+        let peer = "peer-a:443";
+        let old_stop = Arc::new(AtomicBool::new(false));
+        dialer
+            .peer_stop_flags
+            .lock()
+            .insert(peer.into(), old_stop.clone());
+        dialer.runtime_exit_peers.lock().insert(peer.into());
+        dialer.dialed_peers.lock().insert(peer.into());
+        assert!(dialer.remove_peer(peer));
+        assert!(old_stop.load(Ordering::Relaxed));
+        let (new_ctrl, _new_rx) = tokio::sync::mpsc::channel(8);
+        dialer
+            .peer_senders
+            .lock()
+            .insert(peer.into(), new_ctrl.clone());
+        mark_converged(&dialer.pool_status, peer, 123);
+        let (old_ctrl, _old_rx) = tokio::sync::mpsc::channel(8);
+        let (tap, tap_rx) = tokio::sync::mpsc::channel(2);
+        tap.send(ControlPayload::PoolStateDigest { digest: [0; 32] })
+            .await
+            .unwrap();
+        drop(tap);
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            anti_entropy(
+                old_ctrl,
+                tap_rx,
+                dialer.db.clone(),
+                3600,
+                peer.into(),
+                vec![],
+                Some("self:443".into()),
+                None,
+                dialer.pool_status.clone(),
+                dialer.peer_senders.clone(),
+                false,
+                Arc::new(std::sync::Mutex::new(None)),
+                None,
+                None,
+                None,
+                DialGeneration {
+                    stop: old_stop,
+                    topology_lock: dialer.topology_lock.clone(),
+                },
+            ),
+        )
+        .await
+        .unwrap();
+        assert!(
+            dialer
+                .peer_senders
+                .lock()
+                .get(peer)
+                .unwrap()
+                .same_channel(&new_ctrl),
+            "Удаленный dial не может затереть sender нового поколения"
+        );
+        let status = dialer.pool_status.lock();
+        let status = status.get(peer).unwrap();
+        assert!(
+            status.converged,
+            "Отложенный digest не меняет статус нового поколения"
+        );
+        assert_eq!(status.last_converged_unix, Some(123));
+    }
+
+    #[test]
+    fn reconnect_clears_current_convergence_without_faking_activity() {
+        let status = parking_lot::Mutex::new(HashMap::new());
+        mark_converged(&status, "peer", 100);
+        mark_dialing(&status, "peer");
+        let status = status.lock();
+        let entry = &status["peer"];
+        assert!(!entry.connected);
+        assert!(!entry.converged);
+        assert_eq!(entry.last_seen_unix, Some(100));
+        assert_eq!(entry.last_converged_unix, Some(100));
     }
 
     /// Registry insert/remove/broadcast logic exercised directly against

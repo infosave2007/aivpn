@@ -834,7 +834,6 @@ mod tests {
         // a regression fails the test instead of hanging the harness.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         let mut saw_done_marker = false;
-        let mut saw_gui_process_ok = false;
         let mut stderr_lines = 0usize;
         loop {
             match rx.recv_timeout(std::time::Duration::from_millis(200)) {
@@ -844,7 +843,6 @@ mod tests {
                     }
                     if step == "gui_process" {
                         assert_eq!(status, "ok");
-                        saw_gui_process_ok = true;
                         break;
                     }
                 }
@@ -861,7 +859,6 @@ mod tests {
             }
         }
         assert!(saw_done_marker, "stdout marker line was lost");
-        assert!(saw_gui_process_ok);
         assert!(
             stderr_lines > 0,
             "stderr lines should be forwarded to the install log"

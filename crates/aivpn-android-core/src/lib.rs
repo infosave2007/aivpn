@@ -300,11 +300,25 @@ pub extern "system" fn Java_com_aivpn_client_AivpnJni_runTunnel<'local>(
             Err(e) => return make_str(&mut env, &format!("bad mask_operator_pubkey: {e}")),
         }
     };
-    let mask_verify_mode: aivpn_common::mask::MaskVerifyMode = match mask_verify_mode_int {
-        0 => aivpn_common::mask::MaskVerifyMode::Off,
-        2 => aivpn_common::mask::MaskVerifyMode::Enforce,
-        _ => aivpn_common::mask::MaskVerifyMode::Warn,
+    // 0 явный off, 2 явный enforce. 1 и любое другое значение - исторический
+    // default приложения (AivpnService передает 1). Защищенная сборка
+    // поднимает его до enforce и отклоняет явный off.
+    let explicit_mode = match mask_verify_mode_int {
+        0 => Some(aivpn_common::mask::MaskVerifyMode::Off),
+        2 => Some(aivpn_common::mask::MaskVerifyMode::Enforce),
+        _ => None,
     };
+    let mask_verify_mode =
+        match aivpn_common::mask::resolve_protected_mask_verify_mode(explicit_mode) {
+            Ok(mode) => mode,
+            Err(e) => return make_str(&mut env, &e),
+        };
+    if let Err(e) = aivpn_common::mask::protected_build_requires_keys(
+        server_signing_key.is_some(),
+        mask_operator_pubkey.is_some(),
+    ) {
+        return make_str(&mut env, &e);
+    }
 
     let preferred_mask: Option<String> = if mask_name_obj.is_null() {
         None
@@ -314,7 +328,7 @@ pub extern "system" fn Java_com_aivpn_client_AivpnJni_runTunnel<'local>(
                 let js: JString<'local> = unsafe { JString::from_raw(mask_name_obj.as_raw()) };
                 env.get_string(&js)
                     .ok()
-                    .map(|s| String::from(s))
+                    .map(String::from)
                     .filter(|s| !s.is_empty() && s != "auto")
             }
             _ => None,
@@ -330,7 +344,7 @@ pub extern "system" fn Java_com_aivpn_client_AivpnJni_runTunnel<'local>(
                     unsafe { JString::from_raw(polymorphic_base_obj.as_raw()) };
                 env.get_string(&js)
                     .ok()
-                    .map(|s| String::from(s))
+                    .map(String::from)
                     .filter(|s| !s.is_empty())
             }
             _ => None,
@@ -398,7 +412,7 @@ pub extern "system" fn Java_com_aivpn_client_AivpnJni_runTunnel<'local>(
                     unsafe { JString::from_raw(prior_outcomes_json_obj.as_raw()) };
                 env.get_string(&js)
                     .ok()
-                    .map(|s| String::from(s))
+                    .map(String::from)
                     .filter(|s| !s.is_empty())
             }
             _ => None,
@@ -417,7 +431,7 @@ pub extern "system" fn Java_com_aivpn_client_AivpnJni_runTunnel<'local>(
                     unsafe { JString::from_raw(cached_descriptors_json_obj.as_raw()) };
                 env.get_string(&js)
                     .ok()
-                    .map(|s| String::from(s))
+                    .map(String::from)
                     .filter(|s| !s.is_empty())
             }
             _ => None,
@@ -1465,4 +1479,16 @@ mod device_pubkey_tests {
             None
         );
     }
+}
+
+/// Согласованные адреса и MTU в одном снимке JSON.
+#[no_mangle]
+pub extern "system" fn Java_com_aivpn_client_AivpnJni_getAssignedNetworkConfig(
+    mut env: JNIEnv,
+    _class: JClass,
+) -> jstring {
+    make_str(
+        &mut env,
+        &aivpn_common::mobile_tunnel::assigned_network_config_json(),
+    )
 }

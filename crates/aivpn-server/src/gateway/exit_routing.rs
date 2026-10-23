@@ -22,11 +22,7 @@ use super::Gateway;
 /// preserve the pre-B2b silent-drop-on-no-live-session behavior.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ExitDecision {
-    /// Neither a per-client override nor a global default exit is
-    /// configured for this packet — masked-transport exit routing does not
-    /// apply at all. The caller falls through to the legacy
-    /// `chain_forwarder`/local-TUN-egress branch, byte-identical to the
-    /// pre-B2b `self.masked_exit_addr.is_none()` case.
+    /// Выход через другой узел не задан. Пакет передается в локальный TUN.
     NoExit,
     /// Attempt `PoolDialer::send_to_peer(addr, ChainForward{..})`.
     ///
@@ -222,7 +218,7 @@ pub(crate) fn teardown_unused_exit_dials_for(
 /// live routing without a restart, instead of only the tunnel path doing
 /// so.
 ///
-/// A no-op — cheaply — when `pool_dialer` is `None` (legacy transport / no
+/// A no-op - cheaply - when `pool_dialer` is `None` (no
 /// masked pool-client dialer on this node), matching every one of the
 /// individual steps' own preconditions. `server_config_path: None` (no
 /// `server.json` path configured on this node) makes the re-read resolve to
@@ -263,7 +259,7 @@ mod tests {
         assert_eq!(
             choose_exit(None, None, |_| panic!("is_live must not be called")),
             ExitDecision::NoExit,
-            "no client override and no global default — legacy chain_forwarder/local path"
+            "no client override and no global default - local TUN path"
         );
         assert_eq!(
             choose_exit(None, Some("exit.example.com:443"), |_| panic!(
@@ -437,7 +433,7 @@ mod tests {
 
     /// `apply_global_exit_and_teardown` must be a safe, cheap no-op — never
     /// touching `masked_exit_addr` or reading `server_config_path` — when
-    /// `pool_dialer` is `None` (legacy transport / no masked pool-client
+    /// `pool_dialer` is `None` (no masked pool-client
     /// dialer on this node).
     #[test]
     fn apply_global_exit_and_teardown_noop_without_pool_dialer() {
