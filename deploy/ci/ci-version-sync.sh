@@ -37,7 +37,10 @@ expect_contains platforms/openwrt/package/aivpn/Makefile "PKG_VERSION:=$version"
 expect_contains platforms/openwrt/package/aivpn/Makefile 'PKG_SOURCE_URL:=https://github.com/vaminakov/aivpn.git' 'OpenWrt source URL'
 expect_contains .github/workflows/ci.yml 'steps.workspace-version.outputs.version' 'CI artifact'
 expect_contains CHANGELOG.md "## [$version]" 'CHANGELOG'
-expect_contains "docs/RELEASE_$version.md" "выпуска $version" 'release settings'
+if ! grep -Fq -- "выпуска $version" "docs/RELEASE_$version.md" && ! grep -Fq -- "Release $version" "docs/RELEASE_$version.md"; then
+    echo "FAIL: release settings не соответствует $version" >&2
+    fail=1
+fi
 
 openwrt_source="$(awk -F':=' '/^PKG_SOURCE_VERSION:=/{print $2; exit}' platforms/openwrt/package/aivpn/Makefile)"
 if [[ ! "$openwrt_source" =~ ^[0-9a-f]{40}$ ]]; then
