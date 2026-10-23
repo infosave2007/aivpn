@@ -1,6 +1,6 @@
 # Changelog
 
-## [1.2.0] - не выпущена
+## [1.2.0] - not yet released
 
 > **Dual-stack networking, signed distribution and application hardening.** This release extends IPv6 support across the tunnel, adds large management messages and new bootstrap/distribution channels, and fixes session, storage and platform security issues. Inter-server connections now use masked handshake sessions throughout; static legacy sessions and the server mode without a database are removed.
 
@@ -53,16 +53,16 @@
 
 ### Testing
 
-- **Автоматические проверки 1.2.0** - текущий прогон содержит 1361 успешный тест Rust workspace и 1023 теста `production-secure`, без ошибок и пропусков. Прошли форматирование, Clippy correctness/suspicious, Windows GNU compile check, 12 web-тестов, TypeScript/Svelte и доступные C/BPF/упаковочные проверки. Платформенная runtime-приемка остается отдельным этапом.
-- **Границы проверки ядра** - C policy/RX и BPF harness проходят проверки, обе BPF программы компилируются. Полная сборка текущего .ko не подтверждена: Rust metadata установленных headers несовместимы с локальным rustc. Загрузка модуля и сетевые сценарии требуют отдельной приемки.
+- **Automated verification (1.2.0)** — the current run has 1361 passing Rust workspace tests and 1023 `production-secure` tests, with no failures or skips. Format, Clippy correctness/suspicious, Windows GNU compile check, 12 web tests, TypeScript/Svelte and available C/BPF/packaging checks pass. Platform runtime acceptance remains a separate stage.
+- **Kernel verification scope** — C policy/RX and BPF harnesses pass, both BPF programs compile. A full .ko build is not confirmed: installed header Rust metadata is incompatible with the local rustc. Loading the module and network-scenario testing require separate acceptance.
 
 ---
 
-## [1.2.0] - не выпущена
+## [1.2.0] - not yet released (detailed audit fixes — incorporated into the entry above)
 
-> **IPv4/IPv6, подписанная доставка и усиление защиты приложения.** Расширена поддержка IPv6 в туннеле, добавлены крупные управляющие сообщения и новые каналы bootstrap и доставки масок. Исправлены ошибки сессий, хранения данных и защиты платформ. Межсерверные соединения полностью переведены на masked handshake; статические legacy-сессии и режим сервера без БД удалены.
+> **IPv4/IPv6, signed delivery and application hardening.** Extended IPv6 support in the tunnel, large management messages and new bootstrap/mask-distribution channels. Fixed session, storage and platform-security issues. Inter-server connections fully moved to masked handshakes; static legacy sessions and DB-less server mode removed.
 
-### Добавлено
+### Added (details)
 
 - **IPv6 во всем туннеле** - сервер назначает IPv6-адрес, префикс и MTU через `ServerHello`, а настольные и мобильные клиенты применяют назначение. Для Data, восстановленных FEC-пакетов и перенаправляемого трафика действуют проверка источника, изоляция клиентов и QoS обоих семейств адресов. Сервер проверяет префикс и настраивает forwarding и NAT66; ошибка настройки IPv6 останавливает запуск.
 - **Фрагментация управляющих сообщений** - запросы и ответы размером до 512 КиБ передаются внутри зашифрованного туннеля с отдельными nonce и номерами последовательности для каждого фрагмента. Одновременно собираются не более четырех сообщений на сессию, срок сборки ограничен десятью секундами. Противоречащие фрагменты отклоняются, неполные сообщения не поступают обработчику.
@@ -70,7 +70,7 @@
 - **Пассивное получение подписанных масок** - профили передаются через DNS TXT, RGB LSB изображений PNG, Bitcoin OP_RETURN и Ethereum calldata. Сетевой прием включается явно и требует доверенного ключа оператора. До использования проверяются размеры и подпись, профиль устанавливается атомарно.
 - **Настраиваемый DNS в режиме SOCKS5** - `--proxy-dns` принимает до четырех IPv4 DNS-серверов, включая внутренние резолверы, доступные через VPN. Региональные подсказки также участвуют в выборе маски, не подменяя проверенный bootstrap-дескриптор неподписанным пресетом.
 
-### Исправлено
+### Fixed (details)
 
 - **Смена маски после простоя** - сервер принимает текущую и ожидающую раскладки до завершения перехода. Валидный пакет после grace фиксирует маску и обновляет раскладку ядра без обязательного downlink; поврежденный ciphertext и replay состояние не меняют.
 - **TCP half-close в SOCKS5** - удаленный FIN передает EOF локальному клиенту, не закрывая его еще открытую отправку. Поздние данные доходят до сервера, накопленный ответ не обрывается, а отмена и локальный EOF завершают задачи с ограниченным ожиданием.
@@ -95,7 +95,7 @@
 - **Авторизация веб-панели и совместимость БД** - исправлены гонка обновления refresh cookies, типы схем PostgreSQL, строгая типизация интерфейса, доступные имена кнопок и воспроизводимость Docker-сборки.
 - **Обработка ошибок идентичности и helper на Apple** - ошибки Keychain и генератора случайных чисел передаются вызывающей стороне, поврежденные ключи отклоняются, macOS helper проверяет безопасность файла при чтении сертификата.
 
-### Безопасность
+### Security (details)
 
 - **Проверка TLS-сертификатов** - `rustls-webpki` обновлен до 0.103.16, `webpki-roots` до 1.0.10. Устранены RUSTSEC-2026-0382 и RUSTSEC-2026-0381: цепочки с отозванными промежуточными ключами emSign больше не принимаются, связанный корневой сертификат удален из набора доверия. Проверка `cargo-audit` в CI остается обязательной, исключения для этих уязвимостей не добавлены.
 - **Права межсерверных узлов и отзыв действующих соединений** - площадки обмениваются маршрутами и трафиком без прав на БД пула или управление. Источник SiteData проверяется по подсетям аутентифицированного узла; строгий enrollment связывает идентичность с handshake. Общий ключ площадок поддерживает список разрешенных идентичностей и должен отличаться от ключа пула. Отзыв проверяется на действующих соединениях, старая сессия не получает права узла, зарегистрированного повторно с новым ключом.
@@ -105,29 +105,29 @@
 - **Постоянный kill-switch Windows** - собственные фильтры Windows Filtering Platform обновляются одной транзакцией и сохраняются при аварии клиента. Явное отключение удаляет фильтры и сообщает об ошибках очистки; политики стороннего брандмауэра сохраняются.
 - **Исправления зависимостей** - обновлены затронутые Rust- и веб-зависимости, включая `quinn-proto` 0.11.18, `rustls` 0.23.46 и `lru` в локальной копии `cryoglyph`. Локальный patch `braces` ограничивает вложенность парсера 128 уровнями и покрыт регрессионными тестами; аудит по номеру версии продолжает отмечать неизмененный пакет `3.0.3`.
 
-### Изменено
+### Changed (details)
 
-- Начальный обмен переведен на отдельный KDF v2 и XChaCha20-Poly1305 со случайным 24-байтным nonce. Тег, счетчик, направление и контекст соединения связаны AEAD. Повтор init после перезапуска или на другом узле не приводит к повторению пары ключ/nonce в ответе сервера. Установленный канал и ABI ядра сохраняют прежний формат.
-- Нарушена обратная совместимость начального обмена с выпущенной 1.1.0 и прежними dev-сборками 1.2.0. Требуется согласованно обновить серверы, узлы pool/site/chain и все клиентские сборки, включая встроенное ядро мобильных приложений. Автоматического перехода на старый обмен нет. Формат ключей подключения, PSK, статические ключи сервера и нативная схема systemd из-за этого изменения не меняются.
-- Начальная эпоха только устанавливает соединение: данные и управляющие команды исполняются после подтверждения PFS. Каждое новое подключение клиента получает новый временный ключ; запоздалый ServerHello другого соединения не меняет уже согласованные ключи или сеть.
+- Initial exchange moved to a separate KDF v2 and XChaCha20-Poly1305 with a random 24-byte nonce. Tag, counter, direction and connection context are bound via AEAD. A repeated init after a restart or on another node does not repeat the key/nonce pair in the server response. The established channel and kernel ABI keep their previous format.
+- Initial-exchange backward compatibility with released 1.1.0 and prior 1.2.0 dev builds is broken. All servers, pool/site/chain nodes and all client builds (including the embedded mobile kernel) must be upgraded together. There is no automatic fallback to the old exchange. Connection-key format, PSK, server static keys and the native systemd unit are unchanged by this.
+- The initial epoch only establishes the connection: Data and control commands execute after PFS confirmation. Each new client connection gets a fresh ephemeral key; a late ServerHello from another connection does not change already-negotiated keys or network.
 
-- **ABI 7 модуля Linux** - клиент и сервер используют общие с ядром захват счетчиков защиты от повтора, эпохи ключей, политики доступа и QoS клиента. FEC, обработка DSCP, запись метаданных, нейросетевая проверка и шейпинг исходящего трафика сервера сохраняют необходимую обработку в userspace. IPv6 downlink сервера остается в userspace; ускорение downlink в ядре включается явно через `AIVPN_KERNEL_DOWNLINK=1`.
-- **Блокирующие проверки корректности в CI** - диагностики Clippy из групп `correctness` и `suspicious` останавливают сборку, стилевые предупреждения остаются видимыми. DPI gate требует закрепленную сборку nDPI и больше не пропускает классификацию при отсутствии инструмента.
-- **Условия обновления** - межсерверные узлы нужно обновить согласованно, убрать явный `pool.transport=legacy`, настроить клиентскую БД и заменить ранее использованные статические ключи. Доверенные открытые ключи выпуска и оператора нужно распространить до включения обязательной проверки подписей. Подробности приведены в [настройках выпуска](docs/RELEASE_1.2.0.md).
+- **Linux kernel ABI 7** — client and server share replay-counter claims, key epochs, access policies and per-client QoS with the kernel path. FEC, DSCP processing, metadata recording, neural checks and shaped downlink retain required userspace handling. Server IPv6 downlink remains in userspace; kernel server downlink is explicitly enabled with `AIVPN_KERNEL_DOWNLINK=1`.
+- **Blocking correctness checks in CI** — Clippy `correctness` and `suspicious` diagnostics fail the build; style warnings remain visible. The DPI gate requires a pinned nDPI toolchain instead of skipping classification when the tool is absent.
+- **Upgrade requirements** — update inter-server nodes together, remove explicit `pool.transport=legacy`, configure the client database and rotate previously used static keys. Distribute trusted release/operator public keys before enabling signature enforcement. See [release settings](docs/RELEASE_1.2.0.md).
 
-### Удалено
+### Removed (details)
 
-- **Статические legacy-сессии и отдельный chain forwarder** - пул, площадки и exit используют masked handshake с отдельными ключами сессии, ротацией и защитой от повтора. Отсутствующий `pool.transport` означает `masked`, явное значение `legacy` отклоняется. Обычный PSK handshake и формат пакета с тегом перед заголовком, используемый handshake-сессиями, сохранены.
-- **Работа сервера без БД** - фиксированный запасной пул адресов удален; выдача адресов использует сетевую конфигурацию клиентской БД и разделение пула.
+- **Static legacy sessions and the standalone chain forwarder** — pool, site and exit use masked handshakes with per-session keys, rotation and replay protection. Missing `pool.transport` means `masked`; an explicit `legacy` value is rejected. Ordinary PSK handshakes and the tag-prefix packet layout used by handshake sessions remain supported.
+- **Server operation without a database** — the fixed fallback address pool is removed; address allocation uses the client database's network configuration and pool partitions.
 
-### Рефакторинг
+### Refactored (details)
 
-- **Очистка кода** - удалены мертвые функции и устаревшие ветки, общие настройки и константы отделены от локальных переменных, для которых сохранена минимальная необходимая область видимости.
+- **Code cleanup** — removed dead functions and obsolete branches, shared settings and constants separated from local variables kept in the smallest useful scope.
 
-### Тестирование
+### Testing
 
-- **Автоматические проверки 1.2.0** - текущий прогон содержит 1361 успешный тест Rust workspace и 1023 теста `production-secure`, без ошибок и пропусков. Прошли форматирование, Clippy correctness/suspicious, Windows GNU compile check, 12 web-тестов, TypeScript/Svelte и доступные C/BPF/упаковочные проверки. Платформенная runtime-приемка остается отдельным этапом.
-- **Границы проверки модуля ядра** - C policy/RX и BPF harness проходят проверки, обе BPF программы компилируются. Полная сборка текущего .ko не подтверждена: Rust metadata установленных headers несовместимы с локальным rustc. Загрузка модуля и сетевые сценарии требуют отдельной приемки.
+- **Automated verification (1.2.0)** — the current run has 1361 passing Rust workspace tests and 1023 `production-secure` tests, with no failures or skips. Format, Clippy correctness/suspicious, Windows GNU compile check, 12 web tests, TypeScript/Svelte and available C/BPF/packaging checks pass. Platform runtime acceptance remains a separate stage.
+- **Kernel verification scope** — C policy/RX and BPF harnesses pass, both BPF programs compile. A full .ko build is not confirmed: installed header Rust metadata is incompatible with the local rustc. Loading the module and network-scenario testing require separate acceptance.
 
 ---
 

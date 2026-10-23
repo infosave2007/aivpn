@@ -1,96 +1,96 @@
-# Настройки и проверки выпуска 1.2.0
+# Release 1.2.0 Configuration and Verification
 
-## Подпись артефактов
+## Artifact Signing
 
-Удаленный установщик проверяет подпись Ed25519 бинарника и архива масок. Файлы `.SHA256SUMS` проверяют целостность, `.sig` подтверждают автора по заранее доверенному открытому ключу.
+The remote installer verifies Ed25519 signatures of the server binary and mask archives. `.SHA256SUMS` files verify integrity; `.sig` files prove authorship against a pre-trusted public key.
 
-CI требует секрет `RELEASE_SIGNING_KEY_PEM` в формате PEM и переменную `RELEASE_PUBLIC_KEY` с открытым ключом DER в base64. `deploy/ci/sign-release-assets.sh` проверяет соответствие ключей. Открытый ключ встраивается в клиент через `AIVPN_RELEASE_PUBKEY` при сборке; SSH-установщик передает его серверному скрипту. Для самостоятельного запуска предусмотрены `--release-pubkey` и `AIVPN_RELEASE_PUBKEY`. Доверенный ключ нужно подтвердить отдельно от проверяемой загрузки.
+CI requires the `RELEASE_SIGNING_KEY_PEM` secret (PEM) and the `RELEASE_PUBLIC_KEY` variable (DER public key in base64). `deploy/ci/sign-release-assets.sh` checks that the keys match. The public key is embedded into the client at build time via `AIVPN_RELEASE_PUBKEY`; the SSH installer forwards it to the server script. For standalone runs, `--release-pubkey` and `AIVPN_RELEASE_PUBKEY` are supported. The trusted key must be verified out-of-band, separately from the download being checked.
 
-Локальный `--binary-file` считается доверенным источником. Соседний `.SHA256SUMS`, если есть, также проверяется. При ротации ключа сначала распространяется новый доверенный открытый ключ, затем подписанные им артефакты.
+A local `--binary-file` is treated as a trusted source. A neighbouring `.SHA256SUMS`, if present, is also verified. When rotating keys, first distribute the new trusted public key, then the artifacts signed with it.
 
-## Почтовый bootstrap
+## Email Bootstrap via JMAP
 
-Канал `Email` читает JSON-дескрипторы из текстовых частей писем через JMAP. `address` задает точного отправителя, `subject_pattern` - подстроку темы. Тело содержит дескриптор или массив дескрипторов с подписью доверенного ключа сервера.
+The `Email` channel reads JSON descriptors from the text parts of emails via JMAP. `address` specifies the exact sender, `subject_pattern` is a subject substring. The body contains a single descriptor or an array of descriptors signed with the server's trusted key.
 
-- `AIVPN_BOOTSTRAP_JMAP_URL` - HTTPS URL ресурса сессии JMAP.
-- `AIVPN_BOOTSTRAP_JMAP_TOKEN` - токен с правом чтения почты.
+- `AIVPN_BOOTSTRAP_JMAP_URL` — HTTPS URL of the JMAP session resource.
+- `AIVPN_BOOTSTRAP_JMAP_TOKEN` — read-only mailbox token.
 
-API и ресурс сессии должны иметь одинаковый origin. Лимиты: 16 последних писем и 4 MiB на ответ. Обрезанные части, неверная кодировка, другой отправитель и неверные подписи отклоняются. Канал не отправляет письма и не изменяет ящик. Протокол: [JMAP Mail, RFC 8621](https://www.rfc-editor.org/rfc/rfc8621.html).
+The API and session resource must share the same origin. Limits: 16 most recent messages and 4 MiB per response. Truncated parts, wrong encoding, different sender and bad signatures are rejected. The channel never sends mail and never mutates the mailbox. Protocol: [JMAP Mail, RFC 8621](https://www.rfc-editor.org/rfc/rfc8621.html).
 
-## DNS в SOCKS5
+## DNS in SOCKS5 Mode
 
-`--proxy-dns 1.1.1.1,9.9.9.9` задает от одного до четырех IPv4 DNS-серверов. Запросы передаются внутри VPN. Можно указать внутренний DNS, доступный через туннель. Пустой список, loopback, multicast и broadcast отвергаются до запуска слушателя.
+`--proxy-dns 1.1.1.1,9.9.9.9` takes one to four IPv4 DNS servers. Queries are sent inside the VPN. An internal DNS reachable through the tunnel can be configured. An empty list, loopback, multicast and broadcast are rejected before the listener starts.
 
-## Фрагментация управления
+## Control-Message Fragmentation
 
-Крупные управляющие сообщения разбиваются перед шифрованием. Каждый фрагмент получает отдельные nonce и sequence number. Сборка выполняется после проверки AEAD и защиты от повтора. Лимиты: 512 KiB на сообщение, четыре незавершенных сообщения на сессию, 10 секунд на сборку. Противоречащие фрагменты отклоняются. Потерянное сообщение не передается обработчику частично; вызывающий запрос получает штатный таймаут.
+Large control messages are fragmented before encryption. Each fragment gets its own nonce and sequence number. Reassembly happens after AEAD and replay protection. Limits: 512 KiB per message, four incomplete messages per session, 10-second reassembly timeout. Conflicting fragments are rejected. A lost message is never delivered partially to the handler; the caller receives a normal timeout.
 
-## Обязательные проверки
+## Mandatory Checks
 
-`make mask-gate` использует реальный `MimicryEngine` и независимый nDPI. Команда `deploy/ci/build-dpi-tools.sh` собирает зафиксированную ревизию nDPI 5.0. Без инструмента проверка завершается ошибкой. Классификация протокола не доказывает неотличимость трафика от настоящего приложения во всех сетях и классификаторах.
+`make mask-gate` uses the real `MimicryEngine` and a standalone nDPI build. `deploy/ci/build-dpi-tools.sh` builds the pinned nDPI 5.0 revision. Without the tool the check fails. Protocol classification does not prove indistinguishability from the real application on all networks and classifiers.
 
-Clippy блокирует ошибки групп `correctness` и `suspicious`. Стилевые предупреждения остаются видимыми. `swift test --package-path platforms/ios` проверяет отказ чтения, RNG, сохранения и поврежденные ключи без доступа к рабочему Keychain.
+Clippy `correctness` and `suspicious` diagnostics block the build; style warnings remain visible. `swift test --package-path platforms/ios` verifies read failures, RNG, persistence and corrupted-key handling without access to a real Keychain.
 
-## Локальные исправления зависимостей
+## Local Dependency Patches
 
-`vendor/cryoglyph` содержит библиотечные исходники cryoglyph 0.1.0 без изменений. В манифесте обновлена lru до исправленной ветки 0.18; примеры и benchmark-зависимости не включены. Лицензии исходного пакета сохранены.
+`vendor/cryoglyph` contains the unmodified library sources of cryoglyph 0.1.0. The manifest bumps `lru` to the fixed 0.18 line; examples and benchmark dependencies are excluded. Original package licenses are preserved.
 
-Bun применяет `patches/braces@3.0.3.patch`, ограничивающий вложенность парсера до 128 уровней. Регрессионный тест проверяет отказ до переполнения стека и обычное раскрытие шаблонов. Аудитор реестра продолжает сообщать о версии 3.0.3, поскольку локальный patch не меняет номер пакета.
+Bun applies `patches/braces@3.0.3.patch` which caps parser nesting at 128 levels. A regression test verifies rejection before a stack overflow and normal pattern expansion. Registry auditors still report version 3.0.3 because the local patch does not bump the package version.
 
-## Dual-stack
+## Dual-Stack (IPv4/IPv6)
 
-При `ipv6_enabled=true` сервер проверяет `ipv6_prefix`, включает forwarding и NAT66, назначает адрес интерфейсу и передает клиенту его IPv6-адрес, префикс и MTU через ServerHello. Ошибка настройки IPv6 останавливает запуск. Минимальный MTU для IPv6 - 1280. Последние 32 бита адреса клиента содержат назначенный ему IPv4; обратное преобразование проверяет весь адрес.
+With `ipv6_enabled=true` the server validates `ipv6_prefix`, enables forwarding and NAT66, assigns an address to the interface and delivers the client's IPv6 address, prefix and MTU via `ServerHello`. An IPv6 setup failure aborts startup. Minimum MTU for IPv6 is 1280. The low 32 bits of the client's address contain its assigned IPv4; reverse mapping validates the whole address.
 
-Data, восстановленные FEC-пакеты и ChainForward проходят проверку длины IP-пакета, источника, изоляции клиентов и QoS для обоих семейств. Ненулевой хвост за объявленной длиной IP-пакета отвергается. DSCP сохраняет ECN; для IPv4 пересчитывается checksum всего заголовка с options.
+Data, FEC-recovered packets and ChainForward are subject to IP-packet length, source, client-isolation and QoS checks for both families. A non-zero tail beyond the declared IP length is rejected. DSCP preserves ECN; IPv4 recomputes the header checksum including options.
 
-Desktop перехватывает IPv6 маршрутами `::/1` и `8000::/1` через TUN и удаляет собственные маршруты при отключении. Android включает IPv6 после назначения сервером и пересоздает TUN при изменении адреса, префикса или MTU. iOS применяет назначение через Network Extension. Без назначения сервер отвергает IPv6.
+Desktop intercepts IPv6 via `::/1` and `8000::/1` routes through the TUN and removes its own routes on disconnect. Android enables IPv6 after the server assignment and recreates the TUN when the address, prefix or MTU changes. iOS applies the assignment via Network Extension. Without an assignment the server rejects IPv6.
 
-## Защита сети Windows
+## Windows Network Protection (Kill-Switch)
 
-Kill-switch использует постоянные фильтры Windows Filtering Platform в собственном sublayer. Разрешены интерфейс VPN, loopback, адрес сервера, DHCP и служебный ICMPv6 локальной сети. Остальной исходящий трафик блокируется. Политики стороннего брандмауэра сохраняются. Механизм приоритетов описан в [документации WFP](https://learn.microsoft.com/en-us/windows/win32/fwp/filter-arbitration).
+The kill-switch uses persistent Windows Filtering Platform filters in its own sublayer. Allowed: VPN interface, loopback, server address, DHCP and link-local ICMPv6. All other outbound traffic is blocked. Third-party firewall policies are preserved. Priority is described in [WFP documentation](https://learn.microsoft.com/en-us/windows/win32/fwp/filter-arbitration).
 
-Авария клиента сохраняет ограничения. Явное отключение запускает очистку и удаляет маркер только после ее успешного завершения. При неудаче маркер остается, интерфейс сообщает об ошибке. Правила обновляются одной транзакцией. Для перехода со старого netsh backend восстанавливается сохраненная им политика; поврежденное значение не подменяется предполагаемым значением по умолчанию.
+A client crash keeps the restrictions. An explicit disconnect runs cleanup and removes the marker only on success. On failure the marker stays and the UI reports the error. Rules are updated in a single transaction. When migrating from the old netsh backend the saved policy is restored; a corrupted value is not replaced with a guessed default.
 
-## Пассивное получение масок
+## Passive Mask Distribution
 
-Секция `passive_distribution` содержит `enable`, `allow_network`, `operator_pubkey_b64`, `check_interval_secs`, `dns_domains`, `dns_resolver`, `image_urls`, `chain_endpoints`, `max_image_bytes`, `max_image_pixels`. Прием отключен по умолчанию. Для рабочего опроса нужны `enable=true`, `allow_network=true` и доверенный открытый ключ Ed25519 оператора в base64. HTTP-получение требует feature `passive-distribution`.
+The `passive_distribution` section contains `enable`, `allow_network`, `operator_pubkey_b64`, `check_interval_secs`, `dns_domains`, `dns_resolver`, `image_urls`, `chain_endpoints`, `max_image_bytes`, `max_image_pixels`. Reception is disabled by default. Active polling requires `enable=true`, `allow_network=true` and a trusted Ed25519 operator public key in base64. HTTP fetching requires the `passive-distribution` feature.
 
-Поддерживаются подписанный контейнер AVM1 в DNS TXT, RGB LSB изображения PNG, набор частей Bitcoin OP_RETURN и Ethereum calldata. DNS при усеченном UDP-ответе повторяет запрос через TCP. HTTP принимает публичный HTTPS, ограничивает размер и проверяет адрес каждого перенаправления. PNG проверяется по размеру файла и числу пикселей до распаковки.
+Supported carriers: signed AVM1 container in DNS TXT, RGB LSB of PNG images, Bitcoin OP_RETURN part sets and Ethereum calldata. DNS retries over TCP when the UDP answer is truncated. HTTP accepts only public HTTPS, enforces size limits and validates each redirect address. PNG is checked by file size and pixel count before decoding.
 
-`chain_endpoints` - публичные HTTPS GET-адреса с контейнером AVBC, calldata либо JSON транзакции/массива транзакций. Для Bitcoin читаются `vout[].scriptpubkey` ([Esplora](https://github.com/Blockstream/esplora/blob/master/API.md)) и `vout[].scriptPubKey.hex`; для Ethereum - `input` из объекта или `result` ([формат JSON-RPC](https://ethereum.org/en/developers/docs/apis/json-rpc/#eth_gettransactionbyhash)). Это чтение опубликованных данных. Приложение не публикует транзакции и не расходует средства. Полнота набора частей и подпись проверяются до добавления маски.
+`chain_endpoints` are public HTTPS GET URLs returning an AVBC container, calldata, or a transaction / transaction-array JSON. For Bitcoin, `vout[].scriptpubkey` ([Esplora](https://github.com/Blockstream/esplora/blob/master/API.md)) and `vout[].scriptPubKey.hex` are read; for Ethereum, `input` from the object or `result` ([JSON-RPC format](https://ethereum.org/en/developers/docs/apis/json-rpc/#eth_gettransactionbyhash)). This is reading published chain data. The application never publishes transactions and never spends funds. Part-set completeness and signature are verified before a mask is added.
 
-Профиль записывается через временный файл, fsync и rename. Ошибка записи не публикует профиль в оперативном каталоге. Имя файла и идентификатор подписанного профиля должны совпадать.
+The profile is written via a temporary file, fsync and rename. A write error does not publish the profile to the live directory. The filename and the signed profile ID must match.
 
-## Межсерверные соединения и БД
+## Inter-Server Links and Client Database
 
-Пул, exit relay и площадки используют masked handshake с отдельными ключами сессии, ротацией и защитой от повтора. Пустой `pool.transport` означает `masked`. Явное значение `legacy` отклоняется. Старые статические сессии и отдельный chain forwarder удалены. Формат пакета с тегом перед заголовком остается совместимым форматом обычной handshake-сессии.
+Pool, exit relay and site nodes use masked handshakes with per-session keys, rotation and replay protection. An empty `pool.transport` means `masked`; an explicit `legacy` value is rejected. Old static sessions and the standalone chain forwarder are removed. The tag-prefix packet layout remains supported as the ordinary handshake-session format.
 
-Площадки могут соединяться без настройки пула. Несколько площадок могут использовать общий ключ со списком разрешенных идентичностей. Ключ площадок должен отличаться от ключа пула, иначе невозможно разделить их права; совпадение останавливает запуск. Их отдельные ключи дают право на RouteSync и SiteData, но не на синхронизацию клиентской БД или управление. Источник SiteData проверяется по разрешенным подсетям доказанного узла; IPv6-подсети передаются и через IPv4-соединение между серверами. Маршруты площадок направляются в TUN. При строгом enrollment обмен разрешается после проверки подписи идентичности в контексте текущего handshake.
+Sites can connect without pool configuration. Multiple sites may share one key with an explicit identity allowlist. The site key must differ from the pool key, otherwise their privileges cannot be separated; a match aborts startup. Their per-session keys grant RouteSync and SiteData but not pool-DB sync or management. SiteData sources are validated against the authenticated node's allowed subnets; IPv6 subnets are carried even over an IPv4 inter-server link. Site routes are injected into the TUN. With strict enrollment the exchange is allowed only after the identity signature is verified in the context of the current handshake.
 
-Серверу требуется клиентская БД. Выдача адресов использует ее сетевую конфигурацию и разделение пула; запасной фиксированный диапазон без БД удален. Одинаковый внешний IP не означает одинакового клиента. Изменения `clients.json` выполняются под общей файловой блокировкой с перечитыванием актуальной версии. Не следует редактировать работающий файл вручную в обход этой блокировки.
+The server requires a client database. Address allocation uses its network configuration and pool partitions; the fixed fallback range without a DB is removed. The same external IP does not mean the same client. `clients.json` mutations run under a shared file lock with a reload of the current version. Do not edit the live file manually bypassing that lock.
 
-## Постоянный ключ устройства
+## Persistent Device Key
 
-Клиент хранит X25519-ключ в `~/.config/aivpn/device.key` (`USERPROFILE` вместо `HOME` на Windows). Поврежденный или недоступный файл вызывает ошибку, а не замену идентичности. Новый ключ публикуется без перезаписи уже существующего файла; параллельные процессы получают один ключ. Ошибка сохранения не позволяет продолжить работу с временным ключом. На Unix файл имеет права 0600, каталог 0700; ссылки вместо файла отвергаются. Межсерверные соединения используют собственную node identity и не создают ключ устройства.
+The client stores an X25519 key at `~/.config/aivpn/device.key` (`USERPROFILE` instead of `HOME` on Windows). A corrupted or inaccessible file is a hard error, not a silent identity replacement. A new key is published without overwriting an existing file; concurrent processes converge on one key. A save failure does not allow continuing with an ephemeral key. On Unix the file is 0600, the directory 0700; symlinks instead of a regular file are rejected. Inter-server links use their own node identity and never create a device key.
 
-## Защищенная сборка
+## Hardened Build (`production-secure`)
 
-`production-secure` требует доверенные ключи подписи и проверку артефактов в режиме enforce. Генератор подписывает прямой и обратный профили масок. Отсутствие ключа, изменение подписанных полей и некорректная подпись приводят к отказу. Проверка Ed25519 отклоняет ключи малого порядка. Переход требует заранее распространить доверенный открытый ключ и подписанные профили на обе стороны.
+`production-secure` requires trusted signing keys and artifact verification in enforce mode. The generator signs both forward and reverse mask profiles. A missing key, mutated signed fields or a bad signature causes a hard failure. Ed25519 verification rejects small-order public keys. Migration requires distributing the trusted public key and signed profiles to both sides in advance.
 
-## Отзыв доверия к узлу
+## Node Trust Revocation
 
-`pool_nodes.json` перечитывается под общей блокировкой при аутентификации и проверке действующего канала. Поврежденный JSON, неверный ключ, ссылка или исчезновение уже загруженного файла запрещают доступ. Отсутствующий файл при первом запуске означает новый реестр. Файл нулевой длины считается поврежденным. После повреждения требуется восстановить файл и перезапустить процесс; автоматического сброса доверия нет.
+`pool_nodes.json` is re-read under a shared lock on authentication and on live-channel checks. Corrupted JSON, a bad key, a symlink or disappearance of an already-loaded file denies access. A missing file on first start means a new registry. A zero-length file counts as corrupted. After corruption, restore the file and restart the process; there is no automatic trust reset.
 
-Привязка считается успешной после сохранения. Неудачный отзыв возвращает ошибку CLI и запрещает узел в текущем процессе; ошибка отмены отзыва не открывает доступ. Активный входящий обмен проверяется перед обработкой сообщения. Исходящий канал дополнительно проверяет отзыв раз в секунду и завершает соединение. После отзыва и повторной регистрации под другим ключом старая сессия не получает права нового узла.
+A binding is considered successful only after it is persisted. A failed revocation returns a CLI error and keeps the node denied in the current process; a failed un-revocation does not grant access. An active inbound handshake is checked before any message is processed. An outbound channel additionally checks revocation once per second and tears down the connection. After revocation and re-registration under a different key, the old session does not inherit the new node's privileges.
 
-## Ускорение в ядре Linux
+## Linux Kernel Acceleration
 
-Клиент и сервер используют ABI 7. Устройство открывает один процесс с CAP_NET_ADMIN; второй процесс продолжает обычную обработку. Закрытие последнего дескриптора владельца снимает UDP/egress hooks, освобождает сессии и TUN. Для сервера нужен успешно настроенный TUN. Downlink сервера включается отдельно через `AIVPN_KERNEL_DOWNLINK=1`.
+Client and server use ABI 7. The device is opened by one process with `CAP_NET_ADMIN`; a second process continues normal handling. Closing the last descriptor of the owner removes UDP/egress hooks, frees sessions and the TUN. The server requires a successfully configured TUN. Server downlink is enabled separately via `AIVPN_KERNEL_DOWNLINK=1`.
 
-Сессия передается в порядке: ключи и раскладка, эпоха replay, политика. Повторная установка раскладки сохраняет окно. Новый ключ получает новую эпоху; предыдущая остается для переходных пакетов. Каждый принятый пакет захватывает счетчик в общем окне до передачи обработчику. Ошибка общего захвата отклоняет пакет. Если окно уже работавшей сессии потеряно, требуется новый handshake; локальное окно не подменяет потерянную историю ядра.
+A session is installed in order: keys and layout, replay epoch, policy. Re-installing a layout preserves the window. A new key gets a new epoch; the previous one is kept for in-flight packets. Each accepted packet claims a counter in the shared window before delivery to the handler. A failed shared claim rejects the packet. If the window of an already-active session is lost, a new handshake is required; a local window does not replace the kernel's lost history.
 
-Политика различает клиент и сервер, назначенные IPv4/IPv6, изоляцию, ожидание enrollment/mTLS, площадки и exit. Отзыв доступа имеет приоритет над переходом в userspace. QoS для ускоренных и обычных пакетов списывает общее ведро клиента. Повторная политика не пополняет остаток, смена сессии не создает новое ведро того же клиента. Байтовые квоты предусмотрены ABI; в текущей модели клиентской БД отдельной настройки квоты нет.
+Policy distinguishes client vs. server, assigned IPv4/IPv6, isolation, pending enrollment/mTLS, sites and exit. Access revocation takes priority over userspace fallback. QoS for accelerated and normal packets drains a single per-client bucket. Re-applying a policy does not refill the balance; a session change does not create a new bucket for the same client. Byte quotas are part of the ABI; the current client-DB model has no separate quota setting.
 
-Клиент объявляет использование FEC. До объявления и при включенном FEC сервер передает uplink в userspace, чтобы восстановление потерь видело полную группу. DSCP, нейросетевая проверка и запись метаданных также сохраняют необходимую обработку. При формировании Light/Full downlink пакеты проходят генератор padding в userspace. IPv6 downlink сервера пока использует userspace. Это выбор обработчика пакета; функции туннеля сохраняются.
+The client advertises FEC usage. Before the advertisement and while FEC is enabled the server sends uplink to userspace so loss recovery sees the full group. DSCP, neural checks and metadata recording also keep required handling in userspace. For Light/Full downlink, packets go through the userspace padding generator. Server IPv6 downlink still uses userspace. This is a per-packet handler choice; tunnel functionality is preserved.
 
-Счетчики ядра включаются в статистику и признаки активности. На сервере учитывается длина UDP payload, на клиенте - внутреннего IP-пакета, как в обычном пути. Сборка модуля и тесты политики не заменяют испытания загруженного модуля на целевом ядре.
+Kernel counters are included in statistics and liveness. The server counts UDP payload length, the client counts the inner IP packet, matching the normal path. Building the module and the policy tests do not replace testing a loaded module on the target kernel.
