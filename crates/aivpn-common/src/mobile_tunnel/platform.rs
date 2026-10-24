@@ -15,6 +15,15 @@ use crate::error::Result;
 // force iOS to promise its raw Swift context pointer is safe to alias across
 // threads, which nothing synchronises.
 pub trait PlatformIo: Send + 'static {
+    /// Применяет проверенное назначение сервера до запуска передачи через TUN.
+    /// Возвращенный fd принадлежит ядру; None сохраняет переданный при запуске TUN.
+    fn configure_tunnel(
+        &self,
+        _network: Option<&crate::network_config::ClientNetworkConfig>,
+    ) -> Result<Option<std::os::fd::OwnedFd>> {
+        Ok(None)
+    }
+
     /// Разрешает адрес сервера через сеть, доступную до подключения туннеля.
     fn resolve_host(
         &self,

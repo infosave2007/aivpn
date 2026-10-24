@@ -326,25 +326,6 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
         return Ok(());
     }
 
-    // ── 3. Set TUN fd to non-blocking for AsyncFd ──
-    let owned_tun_fd = unsafe { libc::dup(tun_fd) };
-    if owned_tun_fd < 0 {
-        return Err(Error::Io(std::io::Error::last_os_error()));
-    }
-
-    let fcntl_ret = unsafe { libc::fcntl(owned_tun_fd, libc::F_SETFL, libc::O_NONBLOCK) };
-    if fcntl_ret < 0 {
-        unsafe { libc::close(owned_tun_fd) };
-        return Err(Error::Io(std::io::Error::last_os_error()));
-    }
-    // Hand this duplicate to the SESSION, not to the `AsyncFd`: a disconnect
-    // must be able to drop the tun reference immediately instead of waiting for
-    // the tokio tasks that hold a view of it to be dropped (see
-    // `SessionRuntime::tun_write_fd`). The session guard is already active, so
-    // every `return Err` below still releases it.
-    session.tun_write_fd.store(owned_tun_fd, Ordering::SeqCst);
-    let tun = AsyncFd::new(TunFd(owned_tun_fd))?;
-
     // Все датаграммы идут через выбранный транспорт.
     let transport: Arc<dyn crate::transport::DatagramTransport> = match alt_transport {
         Some(t) => t,
@@ -643,6 +624,28 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
             .lock()
             .unwrap_or_else(|error| error.into_inner()) = Some(cfg.clone());
     }
+    // Назначение сервера применяется до чтения TUN и объявления готовности.
+    let owned_tun = match platform.configure_tunnel(server_network_cfg.as_ref())? {
+        Some(fd) => fd,
+        None => {
+            let fd = unsafe { libc::dup(tun_fd) };
+            if fd < 0 {
+                return Err(Error::Io(std::io::Error::last_os_error()));
+            }
+            unsafe { OwnedFd::from_raw_fd(fd) }
+        }
+    };
+    if session.stop_requested.load(Ordering::SeqCst) {
+        return Ok(());
+    }
+    let fcntl_ret = unsafe { libc::fcntl(owned_tun.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK) };
+    if fcntl_ret < 0 {
+        return Err(Error::Io(std::io::Error::last_os_error()));
+    }
+    let owned_tun_fd = std::os::fd::IntoRawFd::into_raw_fd(owned_tun);
+    session.tun_write_fd.store(owned_tun_fd, Ordering::SeqCst);
+    let tun = AsyncFd::new(TunFd(owned_tun_fd))?;
+
     let base_keepalive = server_network_cfg
         .as_ref()
         .and_then(|c| c.keepalive_secs)
@@ -1191,23 +1194,8 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
             biased;
 
             _ = wait_for_stop(&stop_signal) => {
-                // Send Shutdown 3× (50 ms apart) so the server drops the session
-                // immediately even if one UDP packet is lost on the mobile path.
-                // Route Shutdown through the upload task's single encryptor so it
-                // uses that encryptor's own counter — building it here with the
-                // receive loop's separate `send_counter` would reuse a (key, nonce)
-                // pair the upload task already consumed. Enqueue 3x so the server
-                // drops the session even if a packet is lost, then give the upload
-                // task a brief moment to flush before aborting it.
-                for _ in 0..3u8 {
-                    if ctrl_tx_recv_loop
-                        .try_send(ControlPayload::Shutdown { reason: 0 })
-                        .is_err()
-                    {
-                        break;
-                    }
-                }
-                tokio::time::sleep(Duration::from_millis(120)).await;
+                // Сокет уже закрывается stop_active_tunnel: отправка Shutdown
+                // через него невозможна. Прерываем задачи без ожидания отправки.
                 tun_reader_task.abort();
                 upload_sender_task.abort();
                 return Ok(());

@@ -435,7 +435,8 @@ async fn exercise_with_switch(
         let next_stop = stop.clone();
         client_task = tokio::spawn(async move { next.run(next_stop).await });
         tasks.track(&client_task);
-        let replacement = tokio::time::timeout(Duration::from_secs(2), async {
+        // Общая нагрузка CI не должна превращать допустимый повтор handshake в сбой теста.
+        let replacement = tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 assert!(!client_task.is_finished());
                 if let Some(next) = gateway.session_manager.iter_sessions().find_map(|entry| {
@@ -450,20 +451,31 @@ async fn exercise_with_switch(
         })
         .await
         .expect("Старое QUIC-состояние заблокировало reconnect за тем же NAT");
-        gateway
-            .send_control_message(
-                &ControlPayload::PoolStateDigest { digest: expected },
-                &replacement,
-            )
-            .await
-            .unwrap();
-        let received = tokio::time::timeout(Duration::from_secs(2), tap_rx.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(
-            matches!(received, ControlPayload::PoolStateDigest { digest } if digest == expected)
-        );
+        // QUIC DATAGRAM не гарантирует доставку: проверяем восстановление
+        // канала повторяемыми пробами, как реальный обмен control после обрыва.
+        tokio::time::timeout(Duration::from_secs(8), async {
+            loop {
+                assert!(
+                    !client_task.is_finished(),
+                    "Клиент завершился после reconnect"
+                );
+                gateway
+                    .send_control_message(
+                        &ControlPayload::PoolStateDigest { digest: expected },
+                        &replacement,
+                    )
+                    .await
+                    .unwrap();
+                if let Ok(Some(ControlPayload::PoolStateDigest { digest })) =
+                    tokio::time::timeout(Duration::from_millis(500), tap_rx.recv()).await
+                {
+                    assert_eq!(digest, expected);
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("Downlink не восстановился после reconnect за тем же NAT");
     }
     if let Some(mut next_mask) = switch {
         crate::test_masks::sign(

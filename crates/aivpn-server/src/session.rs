@@ -1309,26 +1309,31 @@ impl SessionManager {
     ) -> Result<Arc<Mutex<Session>>> {
         let _allocation = self.allocation_lock.lock();
         let mut previous = None;
+        let mut abandoned = Vec::new();
         if let Some(client_id) = client_id {
             for entry in self.sessions.iter() {
                 let session = entry.value().lock();
                 if session.client_id.as_deref() == Some(client_id) {
-                    if previous.is_some() {
-                        return Err(Error::Session(
-                            "Client replacement is already pending".into(),
-                        ));
+                    if !session.is_ratcheted && !session.client_admitted {
+                        abandoned.push((session.session_id, session.client_addr.ip()));
+                    } else {
+                        if previous.is_some() {
+                            return Err(Error::Session(
+                                "Client replacement is already pending".into(),
+                            ));
+                        }
+                        previous = Some(session.client_addr.ip());
                     }
-                    previous = Some(session.client_addr.ip());
                 }
             }
         }
         // Резерв ограничен общим лимитом; старый сеанс жив до принятия нового.
-        let global_limit = if client_id.is_some() && previous.is_none() {
+        let global_limit = if client_id.is_some() && previous.is_none() && abandoned.is_empty() {
             MAX_SESSIONS - 10
         } else {
             MAX_SESSIONS
         };
-        if self.sessions.len() >= global_limit {
+        if self.sessions.len().saturating_sub(abandoned.len()) >= global_limit {
             return Err(Error::Session("Max sessions reached".into()));
         }
 
@@ -1339,7 +1344,11 @@ impl SessionManager {
             .filter(|e| e.value().lock().client_addr.ip() == client_addr.ip())
             .count();
         let replaces_same_ip = previous.is_some_and(|ip| ip == client_addr.ip());
-        if ip_count.saturating_sub(usize::from(replaces_same_ip)) >= 5 {
+        let abandoned_ip_count = abandoned
+            .iter()
+            .filter(|(_, ip)| *ip == client_addr.ip())
+            .count();
+        if ip_count.saturating_sub(abandoned_ip_count + usize::from(replaces_same_ip)) >= 5 {
             return Err(Error::Session("Per-IP session limit reached".into()));
         }
 
@@ -1363,7 +1372,13 @@ impl SessionManager {
             let replaces_same_subnet = previous.is_some_and(
                 |ip| matches!(ip, std::net::IpAddr::V4(ip) if u32::from(ip) >> 8 == subnet24),
             );
-            if subnet_count.saturating_sub(usize::from(replaces_same_subnet)) >= 10 {
+            let abandoned_subnet_count = abandoned.iter().filter(|(_, ip)| {
+                matches!(ip, std::net::IpAddr::V4(ip) if u32::from(*ip) >> 8 == subnet24)
+            }).count();
+            if subnet_count
+                .saturating_sub(abandoned_subnet_count + usize::from(replaces_same_subnet))
+                >= 10
+            {
                 return Err(Error::Session(
                     "Per-subnet (/24) session limit reached".into(),
                 ));
@@ -1373,8 +1388,14 @@ impl SessionManager {
         // DH1: server_static * client_eph → initial keys (0-RTT)
         let dh1 = self.server_keys.compute_shared(&eph_pub)?;
 
-        let session =
-            self.build_and_insert_session(client_addr, eph_pub, dh1, preshared_key, false)?;
+        let session = self.build_and_insert_session(
+            client_addr,
+            eph_pub,
+            dh1,
+            preshared_key,
+            false,
+            &abandoned,
+        )?;
         let session_id = {
             let mut session = session.lock();
             session.client_id = client_id.map(str::to_owned);
@@ -1412,7 +1433,7 @@ impl SessionManager {
         // DH1: shared pool server keypair * dialer's ephemeral pub → initial keys
         let dh1 = pool_kp.compute_shared(&eph_pub)?;
 
-        self.build_and_insert_session(client_addr, eph_pub, dh1, Some(*pool_psk), true)
+        self.build_and_insert_session(client_addr, eph_pub, dh1, Some(*pool_psk), true, &[])
     }
 
     /// Shared core of `create_session` and `create_masked_pool_peer_session`:
@@ -1433,6 +1454,7 @@ impl SessionManager {
         dh1: [u8; 32],
         preshared_key: Option<[u8; 32]>,
         is_masked_pool_peer: bool,
+        abandoned: &[([u8; 16], std::net::IpAddr)],
     ) -> Result<Arc<Mutex<Session>>> {
         // Never log key material (DH shared secret, PSK, tag_secret) — even at
         // trace, RUST_LOG is operator-controllable and these secrets are what
@@ -1474,6 +1496,12 @@ impl SessionManager {
             initial_keys,
             eph_pub,
         )));
+
+        // Удаляем только незавершенные handshake той же подтвержденной PSK-личности.
+        // Новый keyspace уже захвачен: replay не может вытеснить текущую попытку.
+        for (id, _) in abandoned {
+            self.remove_session(id);
+        }
 
         // Setup ratchet state + populate tag maps
         {
@@ -2056,6 +2084,16 @@ impl SessionManager {
 
     /// Complete PFS ratchet for a session: switch to ratcheted keys, remove old tags
     pub fn complete_session_ratchet(&self, session_id: &[u8; 16]) {
+        // Готовая сессия не должна захватывать общий lock на каждом DATA-пакете.
+        let pending = self
+            .sessions
+            .get(session_id)
+            .is_some_and(|entry| entry.value().lock().ratcheted_keys.is_some());
+        if !pending {
+            return;
+        }
+        // Не допускаем превращения вытесняемого handshake в живую сессию.
+        let _allocation = self.allocation_lock.lock();
         if let Some(session) = self.sessions.get(session_id) {
             let mut sess = session.lock();
             if sess.ratcheted_keys.is_none() {
@@ -2994,6 +3032,65 @@ mod tests {
                 &tag,
             )
             .unwrap()
+    }
+
+    #[test]
+    fn replayed_initial_cannot_discard_the_pending_handshake() {
+        let manager = make_manager();
+        let pending = pending_authenticated_client(&manager, 1000);
+        let (id, eph, secret) = {
+            let session = pending.lock();
+            (session.session_id, session.eph_pub, session.keys.tag_secret)
+        };
+        let tag = crypto::generate_resonance_tag(
+            &secret,
+            0,
+            crypto::compute_time_window(crypto::current_timestamp_ms(), DEFAULT_WINDOW_MS),
+        );
+        let error = manager
+            .create_authenticated_session(
+                "127.0.0.1:2000".parse().unwrap(),
+                eph,
+                [2; 32],
+                "10.0.0.8".parse().unwrap(),
+                "client",
+                &tag,
+            )
+            .err()
+            .expect("Повторный initial должен быть отклонен");
+        assert!(matches!(
+            error,
+            Error::InvalidPacket("Replayed initial handshake")
+        ));
+        assert_eq!(manager.session_count(), 1);
+        assert!(manager.get_session(&id).is_some());
+        assert!(!pending.lock().is_removed());
+    }
+
+    #[test]
+    fn abandoned_replacement_can_be_superseded_without_dropping_the_live_owner() {
+        let manager = make_manager();
+        let live = pending_authenticated_client(&manager, 1000);
+        let live_id = live.lock().session_id;
+        manager.complete_session_ratchet(&live_id);
+        live.lock().client_admitted = true;
+        let vip = "10.0.0.8".parse().unwrap();
+        manager.bind_vpn_ip(&vip, &live_id);
+        let abandoned = pending_authenticated_client(&manager, 2000);
+        let abandoned_id = abandoned.lock().session_id;
+        let replacement = pending_authenticated_client(&manager, 3000);
+        assert_eq!(manager.session_count(), 2);
+        assert!(manager.get_session(&abandoned_id).is_none());
+        assert!(abandoned.lock().is_removed());
+        assert!(!replacement.lock().is_removed());
+        assert_eq!(
+            manager
+                .get_session_by_vpn_ip(&vip)
+                .unwrap()
+                .lock()
+                .session_id,
+            live_id
+        );
     }
 
     #[test]

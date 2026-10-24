@@ -43,6 +43,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var profilesAdapter: ProfilesAdapter
     private lateinit var viewModel: MainViewModel
     private var isConnected = false
+    private var isConnecting = false
     private var currentQualityScore: Int = 0
     private var currentRecordingService: String = ""
 
@@ -128,7 +129,7 @@ class MainActivity : AppCompatActivity() {
 
         profilesAdapter = ProfilesAdapter(
             onProfileClick = { profile ->
-                if (!isConnected) {
+                if (!isConnected && !isConnecting && !AivpnService.isServiceActive) {
                     activeProfileId = profile.id
                     SecureStorage.saveActiveProfileId(this, profile.id)
                     binding.editConnectionKey.setText(profile.key)
@@ -204,7 +205,7 @@ class MainActivity : AppCompatActivity() {
         }
 
         binding.btnConnect.setOnClickListener {
-            if (AivpnService.isServiceActive) disconnect() else connect()
+            if (isConnecting || AivpnService.isServiceActive) disconnect() else connect()
         }
 
         binding.btnLanguage.setOnClickListener {
@@ -241,20 +242,21 @@ class MainActivity : AppCompatActivity() {
 
     /** Renders the current AivpnService.uiState. Used by onCreate and onResume. */
     private fun resyncFromService() {
+        val statusText = AivpnService.localizedStatus(this)
         when (AivpnService.uiState) {
             AivpnService.UiState.CONNECTED -> {
                 isConnected = true
-                updateUI(true, AivpnService.lastStatusText)
+                updateUI(true, statusText)
             }
             AivpnService.UiState.CONNECTING -> {
                 isConnected = false
-                updateUI(false, AivpnService.lastStatusText, connecting = true)
+                updateUI(false, statusText, connecting = true)
             }
             AivpnService.UiState.DISCONNECTED -> {
                 isConnected = false
                 updateUI(
                     false,
-                    AivpnService.lastStatusText.ifEmpty { getString(R.string.status_disconnected) }
+                    statusText.ifEmpty { getString(R.string.status_disconnected) }
                 )
             }
         }
@@ -294,14 +296,14 @@ class MainActivity : AppCompatActivity() {
 
     private fun renderProfiles() {
         profilesAdapter.activeProfileId = activeProfileId
-        profilesAdapter.editingEnabled = !isConnected
+        profilesAdapter.editingEnabled = !isConnected && !isConnecting && !AivpnService.isServiceActive
         profilesAdapter.submitList(profiles.toList())
         binding.textProfilesEmpty.visibility =
             if (profiles.isEmpty()) View.VISIBLE else View.GONE
     }
 
     private fun showProfileDialog(existing: SecureStorage.ConnectionProfile?) {
-        if (isConnected) return
+        if (isConnected || isConnecting || AivpnService.isServiceActive) return
         // Saving from this dialog persists the whole list — not before it loaded
         // (see [profilesLoaded]).
         if (!profilesLoaded) return
@@ -485,7 +487,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun confirmDeleteProfile(profile: SecureStorage.ConnectionProfile) {
-        if (isConnected) return
+        if (isConnected || isConnecting || AivpnService.isServiceActive) return
         AlertDialog.Builder(this, R.style.Theme_AIVPN_Dialog)
             .setMessage(getString(R.string.confirm_delete_profile, profile.name))
             .setPositiveButton(getString(R.string.btn_delete)) { _, _ ->
@@ -539,11 +541,8 @@ class MainActivity : AppCompatActivity() {
         // Register callbacks when activity becomes visible.
         // Using onResume/onPause instead of onCreate/onDestroy prevents the race condition
         // where a destroyed (rotated) Activity nullifies callbacks registered by the new one.
-        AivpnService.statusCallback = { connected, statusText ->
-            runOnUiThread {
-                isConnected = connected
-                updateUI(connected, statusText)
-            }
+        AivpnService.statusCallback = { _, _ ->
+            runOnUiThread { resyncFromService() }
         }
 
         AivpnService.trafficCallback = { uploadBytes, downloadBytes ->
@@ -688,6 +687,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun updateUI(connected: Boolean, statusText: String, connecting: Boolean = false) {
         isConnected = connected
+        isConnecting = connecting
         val serviceActive = connected || connecting || AivpnService.isServiceActive
         // When not connected, append the active profile name so the user can see
         // which profile will be used without having to look at the profile list.

@@ -288,7 +288,12 @@ async fn drive_client(
             },
             packet = raw.recv(&mut buffer) => {
                 let length = match packet {
-                    Ok(0) => continue,
+                    Ok(0) => {
+                        // После shutdown UDP может немедленно возвращать ноль.
+                        // Оставляем время таймерам и отмене соседних задач.
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                        continue;
+                    },
                     Ok(length) => length,
                     Err(error) if transient(&error) => {
                         // Не крутим CPU, если внешний адаптер повторяет ошибку
@@ -556,6 +561,60 @@ impl DatagramTransport for ClientMaskIo {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn repeated_empty_datagrams_do_not_starve_the_runtime() {
+        use std::future::Future;
+        use std::sync::atomic::AtomicUsize;
+        use std::task::{Context, Poll, Wake, Waker};
+        struct EmptyTransport(AtomicUsize);
+        #[async_trait::async_trait]
+        impl DatagramTransport for EmptyTransport {
+            async fn send(&self, data: &[u8]) -> io::Result<usize> {
+                Ok(data.len())
+            }
+            async fn recv(&self, _: &mut [u8]) -> io::Result<usize> {
+                if self.0.fetch_add(1, Ordering::Relaxed) < 32 {
+                    Ok(0)
+                } else {
+                    std::future::pending().await
+                }
+            }
+            fn kind(&self) -> crate::transport::TransportKind {
+                crate::transport::TransportKind::Udp
+            }
+            fn max_datagram(&self) -> usize {
+                1380
+            }
+        }
+        struct Noop;
+        impl Wake for Noop {
+            fn wake(self: Arc<Self>) {}
+        }
+        let raw = Arc::new(EmptyTransport(AtomicUsize::new(0)));
+        let (_sender, commands) = mpsc::channel(QUEUE);
+        let (received, _receiver) = mpsc::channel(QUEUE);
+        let mut driver = Box::pin(drive_client(
+            raw.clone(),
+            commands,
+            received,
+            "127.0.0.1:443".parse().unwrap(),
+            "localhost".into(),
+            Arc::new(WireSamples::default()),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicU64::new(0)),
+        ));
+        let waker = Waker::from(Arc::new(Noop));
+        assert!(matches!(
+            driver.as_mut().poll(&mut Context::from_waker(&waker)),
+            Poll::Pending
+        ));
+        assert_eq!(
+            raw.0.load(Ordering::Relaxed),
+            1,
+            "Пустые датаграммы не должны занимать весь опрос задачи"
+        );
+    }
 
     #[test]
     fn derived_turn_profiles_preserve_the_base_realm() {

@@ -1754,15 +1754,17 @@ fn reconnect_at_nat_limit_preserves_other_clients_and_bounds_reserve() {
     .unwrap();
     assert_eq!(manager.session_count(), 6);
     assert!(manager.get_session(&original[0]).is_some());
-    assert!(authenticated_session(
+    let abandoned_id = replacement.lock().session_id;
+    let replacement = authenticated_session(
         &manager,
         &server,
         "203.0.113.1:20002",
         "10.0.0.2",
         "client-0",
-        [0; 32]
+        [0; 32],
     )
-    .is_err());
+    .unwrap();
+    assert!(manager.get_session(&abandoned_id).is_none());
     assert_eq!(manager.session_count(), 6);
     let id = replacement.lock().session_id;
     manager.complete_session_ratchet(&id);
@@ -1799,7 +1801,9 @@ fn reconnect_at_subnet_limit_requires_a_valid_handshake() {
             &format!("client-{i}"),
             [i as u8; 32],
         )
-        .unwrap();
+        .unwrap()
+        .lock()
+        .is_ratcheted = true;
     }
     let key = KeyPair::generate();
     assert!(manager
@@ -1849,7 +1853,9 @@ fn global_reserve_accepts_reconnect_but_not_a_new_client() {
                 None,
             )
             .unwrap();
-        session.lock().client_id = Some(format!("client-{i}"));
+        let mut state = session.lock();
+        state.client_id = Some(format!("client-{i}"));
+        state.is_ratcheted = true;
     }
     assert!(authenticated_session(
         &manager,

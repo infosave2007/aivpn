@@ -156,6 +156,37 @@ fn vpn_protect(vm: &JavaVM, vpn_service: &GlobalRef, fd: RawFd) -> Result<()> {
 }
 
 impl PlatformIo for AndroidPlatform {
+    fn configure_tunnel(
+        &self,
+        network: Option<&aivpn_common::network_config::ClientNetworkConfig>,
+    ) -> Result<Option<std::os::fd::OwnedFd>> {
+        use std::os::fd::FromRawFd;
+        let network = serde_json::to_string(&network)?;
+        let mut env = self
+            .vm
+            .attach_current_thread()
+            .map_err(|error| Error::Session(format!("JNI attach: {error}")))?;
+        let result = (|| -> jni::errors::Result<i32> {
+            let json = env.new_string(network)?;
+            env.call_method(
+                &self.vpn_service,
+                "configureTunnel",
+                "(Ljava/lang/String;)I",
+                &[jni::objects::JValue::Object(json.as_ref())],
+            )?
+            .i()
+        })();
+        if env.exception_check().unwrap_or(false) {
+            let _ = env.exception_clear();
+        }
+        let fd = result.map_err(|error| Error::Session(format!("Настройка TUN: {error}")))?;
+        if fd < 0 {
+            return Err(Error::Session("Настройка TUN отменена".into()));
+        }
+        // Kotlin передает отдельный dup, который теперь закрывает Rust.
+        Ok(Some(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) }))
+    }
+
     fn resolve_host(
         &self,
         host: String,
