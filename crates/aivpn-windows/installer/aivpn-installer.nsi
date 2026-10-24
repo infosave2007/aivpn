@@ -3,7 +3,7 @@ Unicode True
 !include "MUI2.nsh"
 
 !ifndef APP_VERSION
-!define APP_VERSION "0.4.0"
+!error "APP_VERSION is required"
 !endif
 
 !ifndef STAGE_DIR

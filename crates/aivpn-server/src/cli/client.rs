@@ -102,6 +102,9 @@ pub(crate) fn build_connection_server_addr(args: &ServerArgs, server_ip: &str) -
         .map(|addr| addr.port())
         .unwrap_or(443);
 
+    if let Ok(ip) = server_ip.parse::<std::net::IpAddr>() {
+        return SocketAddr::new(ip, port).to_string();
+    }
     format!("{}:{}", server_ip, port)
 }
 
@@ -321,8 +324,8 @@ pub(crate) fn handle_list_clients(db: &ClientDatabase) {
     }
 
     println!(
-        "{:<18} {:<20} {:<12} {:<8} {:<12} {:<12} {}",
-        "ID", "NAME", "VPN IP", "STATUS", "UPLOAD", "DOWNLOAD", "LAST SEEN"
+        "{:<18} {:<20} {:<12} {:<8} {:<12} {:<12} LAST SEEN",
+        "ID", "NAME", "VPN IP", "STATUS", "UPLOAD", "DOWNLOAD"
     );
     println!("{}", "-".repeat(100));
 

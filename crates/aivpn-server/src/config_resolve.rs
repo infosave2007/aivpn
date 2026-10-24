@@ -104,21 +104,34 @@ pub(crate) fn resolve_mask_operator_pubkey(
     })
 }
 
-/// Resolve the mask verification mode: CLI/env → server.json → default (warn).
+/// Определить режим проверки: CLI/env имеют приоритет над server.json.
+/// production-secure отклоняет off/warn и отсутствие ключа подписи.
 pub(crate) fn resolve_mask_verify_mode(
     args: &ServerArgs,
     file_config: Option<&ServerFileConfig>,
 ) -> aivpn_common::mask::MaskVerifyMode {
-    let raw = args
+    let signing = args
+        .mask_signing_key
+        .clone()
+        .or_else(|| file_config.and_then(|c| c.mask_signing_key.clone()));
+    let pubkey = args
+        .mask_operator_pubkey
+        .clone()
+        .or_else(|| file_config.and_then(|c| c.mask_operator_pubkey.clone()));
+    let mode = args
         .mask_verify_mode
         .clone()
         .or_else(|| file_config.and_then(|c| c.mask_verify_mode.clone()));
-    match raw {
-        None => aivpn_common::mask::MaskVerifyMode::default(),
-        Some(s) => s.parse().unwrap_or_else(|e| {
+    match aivpn_server::server_config::resolved_mask_verify_mode(
+        signing.as_deref(),
+        pubkey.as_deref(),
+        mode.as_deref(),
+    ) {
+        Ok(resolved) => resolved,
+        Err(e) => {
             eprintln!("{}", e);
             std::process::exit(1);
-        }),
+        }
     }
 }
 

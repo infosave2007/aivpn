@@ -25,21 +25,19 @@ client-dpi-gate = ["aivpn-common/client-dpi-gate"]
 # platforms/android/build-rust-android.sh) passes no --features flag, so the
 # in-app installer must ship in the default .so build to be usable at all.
 ssh-install = ["aivpn-common/ssh-install"]
+# Protected build: strict mask mode and both trust keys. The shipping app
+# passes maskVerifyMode=1 (historical default). This feature raises that
+# default to enforce and rejects an explicit off.
+production-secure = ["aivpn-common/production-secure"]
 
 [dependencies]
 aivpn-common = { path = "../aivpn-common", version = "*", features = ["client-upload", "qr", "mobile-tunnel"] }
 
 jni       = "0.21"
-libc      = "0.2"
-portable-atomic = "1"
 serde_json.workspace = true
 tokio     = { version = "1.35", features = ["rt", "net", "time", "io-util", "macros", "sync"] }
-rand      = "0.8"
 log       = "0.4"
 android_logger = "0.14"
 # device-pubkey getter (devicePubkey JNI): same version pin as
 # aivpn-client's local_device_pubkey_b64.
 base64    = "0.22"
-# Transport-level verification of server-signed MaskUpdate control payloads
-# (mirrors aivpn-client/aivpn-common's use of the same crate/version).
-ed25519-dalek = "2.0"

@@ -6,6 +6,9 @@
 extern "C" {
 #endif
 
+// Диагностика активной сессии. Вызывать в фоне с буфером от 4096 байт.
+intptr_t aivpn_run_benchmark(uint8_t *out_buf, size_t out_cap);
+
 /// Callback invoked from Rust when the VPN tunnel is ready (handshake complete).
 /// @param host  NUL-terminated server hostname (valid only for the duration of the callback).
 /// @param ctx   Opaque pointer passed back from aivpn_run_tunnel.
@@ -138,6 +141,7 @@ int aivpn_get_adaptive_level_hint(void);
 /// pool re-home — re-apply tunnel network settings with this address or the
 /// server's anti-spoof check silently drops all uplink data.
 unsigned int aivpn_get_assigned_vpn_ip(void);
+size_t aivpn_get_assigned_network_config(char *buf, size_t capacity);
 
 /// Monotonically increasing counter, bumped each time new mask-recording
 /// feedback (RecordingAck/RecordingComplete/RecordingFailed/RecordingStatus)

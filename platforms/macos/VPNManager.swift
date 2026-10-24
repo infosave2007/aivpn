@@ -76,6 +76,7 @@ struct HelperResponse: Codable {
     let pid: Int?
     let version: String?
     let log: String?
+    let session: String?
 }
 
 struct RecordingInfoSnapshot: Codable {
@@ -211,22 +212,12 @@ class VPNManager: ObservableObject {
         startNetworkPathMonitor()
     }
 
-    /// Returns the bundled aivpn-client path that is acceptable to the privileged helper.
-    /// Only paths inside /Applications/ or /Library/ are in the helper's allowlist.
-    /// Returns nil when running from DerivedData/Downloads — helper then uses DEFAULT_CLIENT_PATH.
+    /// Перемещенное приложение использует системную копию через helper.
     private func helperClientBinaryPath() -> String? {
-        let candidates = [
-            Bundle.main.bundlePath + "/Contents/Resources/aivpn-client",
-            Bundle.main.bundlePath + "/Contents/MacOS/aivpn-client",
-        ]
-        let trustedPrefixes = ["/Applications/", "/Library/"]
-        for path in candidates {
-            let trusted = trustedPrefixes.contains(where: { path.hasPrefix($0) })
-            if trusted, FileManager.default.isExecutableFile(atPath: path) {
-                return path
-            }
-        }
-        return nil
+        ClientBinaryPolicy.bundledPath(
+            bundlePath: Bundle.main.bundlePath,
+            isExecutable: { FileManager.default.isExecutableFile(atPath: $0) }
+        )
     }
 
     /// Returns the bundled aivpn-client path for use as the current user (proxy mode, no helper).
@@ -253,7 +244,7 @@ class VPNManager: ObservableObject {
         DispatchQueue.global(qos: .userInitiated).async {
             let task = Process()
             task.executableURL = URL(fileURLWithPath: binaryPath)
-            task.arguments = args
+            task.arguments = ["--admin-listen", "127.0.0.1:44301"] + args
 
             let outputPipe = Pipe()
             task.standardOutput = outputPipe
@@ -475,6 +466,7 @@ class VPNManager: ObservableObject {
     private func sendToHelper(_ request: HelperRequest, timeoutSeconds: Double = 3.0,
                               completion: @escaping (HelperResponse?) -> Void) {
         let sockPath = self.socketPath
+        let generation = self.connectGeneration
         DispatchQueue.global(qos: .userInitiated).async {
             let fd = socket(AF_UNIX, SOCK_STREAM, 0)
             guard fd >= 0 else {
@@ -592,7 +584,10 @@ class VPNManager: ObservableObject {
                     NSLog("AIVPN IPC[%@]: helper replied status=%@ message=%@",
                           request.action, response.status, response.message)
                 }
-                DispatchQueue.main.async { completion(response) }
+                DispatchQueue.main.async {
+                    if self.connectGeneration == generation { AdminApi.updateHelperSession(response.session) }
+                    completion(response)
+                }
             } else {
                 NSLog("AIVPN IPC[%@]: undecodable response (%d bytes): %@",
                       request.action, accum.count,
@@ -652,6 +647,7 @@ class VPNManager: ObservableObject {
         lastConnectCountryCode = countryCode
 
         connectGeneration += 1
+        AdminApi.invalidateSession()
         isConnecting = true
         lastError = nil
         bytesSent = 0
@@ -761,7 +757,7 @@ class VPNManager: ObservableObject {
         // process via `ps`. The Rust client falls back to the env var when -k
         // is absent and scrubs it from its own environment after parsing
         // (crates/aivpn-client/src/main.rs). Mirrors the Linux/Windows GUIs.
-        var processArgs = ["--proxy-listen", "127.0.0.1:\(proxyPort)"]
+        var processArgs = ["--admin-listen", "127.0.0.1:44301", "--proxy-listen", "127.0.0.1:\(proxyPort)"]
         // Polymorphic base takes precedence over preferredMask, mirroring the
         // helper's startClient() behavior for the full-tunnel connect path.
         // Same pattern gate as aivpn-helper/main.swift's isAcceptableMaskId —
@@ -902,21 +898,20 @@ class VPNManager: ObservableObject {
     /// Run `aivpn-client bench --server <addr> --json` and return parsed result.
     /// Calls completion on the main thread; passes nil on failure.
     func runBench(serverAddr: String, completion: @escaping (BenchDisplayResult?) -> Void) {
-        runBundledClientCommand(["bench", "--server", serverAddr, "--json"]) { success, output in
-            guard success,
-                  let data = output.data(using: .utf8),
-                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-                completion(nil)
-                return
+        let binding = AdminApi.captureSession()
+        DispatchQueue.global(qos: .utility).async {
+            let json = AdminApi.withSession(binding) { AdminApi.benchmark() }
+            DispatchQueue.main.async {
+                guard AdminApi.isCurrent(binding), let json, json["error"] == nil else { completion(nil); return }
+                completion(BenchDisplayResult(
+                    uploadKbps: json["throughput_up_kbps"] as? Double ?? 0,
+                    downloadKbps: json["throughput_down_kbps"] as? Double ?? 0,
+                    p50: json["latency_p50_ms"] as? Double ?? 0,
+                    p95: json["latency_p95_ms"] as? Double ?? 0,
+                    p99: json["latency_p99_ms"] as? Double ?? 0,
+                    lossPct: json["packet_loss_pct"] as? Double ?? 0,
+                    qualityScore: json["quality_score"] as? Int ?? 0))
             }
-            let result = BenchDisplayResult(
-                p50: json["latency_p50_ms"] as? Double ?? 0,
-                p95: json["latency_p95_ms"] as? Double ?? 0,
-                p99: json["latency_p99_ms"] as? Double ?? 0,
-                lossPct: json["packet_loss_pct"] as? Double ?? 0,
-                qualityScore: json["quality_score"] as? Int ?? 0
-            )
-            completion(result)
         }
     }
 
@@ -925,6 +920,8 @@ class VPNManager: ObservableObject {
     ///   mode). Used by performFastReconnect() to sequence a reconnect without racing
     ///   isConnected/isConnecting, which are only flipped once the helper responds.
     func disconnect(completion: (() -> Void)? = nil) {
+        connectGeneration += 1
+        AdminApi.invalidateSession()
         if isProxyMode {
             stopProxyMode()
             completion?()

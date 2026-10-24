@@ -5,7 +5,7 @@
   import MetricCard from '$lib/components/MetricCard.svelte';
   import StatusBadge from '$lib/components/StatusBadge.svelte';
   import { Activity, Users, Cpu, Server } from 'lucide-svelte';
-  import { Chart, Svg, Area, Line, Axis, Spline } from 'layerchart';
+  import { Chart, Svg, Area, Axis, Spline } from 'layerchart';
   import { scaleTime, scaleLinear } from 'd3-scale';
 
   const statusQuery = createQuery({ queryKey: ['status'], queryFn: () => status.get(), refetchInterval: 10_000 });
@@ -331,7 +331,7 @@
           >
             <Svg>
               <Area class="fill-indigo-500/20" />
-              <Line class="stroke-indigo-500 stroke-2" />
+              <Spline class="stroke-indigo-500 stroke-2" />
               <Axis placement="bottom" />
               <Axis placement="left" />
             </Svg>

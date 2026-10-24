@@ -16,6 +16,7 @@ name = "aivpn-mask-repair"
 path = "src/bin/aivpn-mask-repair.rs"
 
 [dependencies]
+tempfile = { version = "3", optional = true }
 aivpn-common = { path = "../aivpn-common", version = "*" }
 # FORK-B pool-sync dialer: the server embeds a headless control-only
 # `AivpnClient` to dial pool peers as a masked pool-client (see
@@ -25,7 +26,6 @@ aivpn-client = { path = "../aivpn-client", version = "*" }
 
 # Crypto
 chacha20poly1305.workspace = true
-x25519-dalek.workspace = true
 blake3.workspace = true
 ed25519-dalek = "2.0"
 subtle.workspace = true
@@ -33,7 +33,6 @@ zeroize.workspace = true
 
 # Async
 tokio.workspace = true
-tokio-util.workspace = true
 
 # Networking
 tun = { version = "0.7", features = ["async"] }
@@ -57,10 +56,10 @@ flate2 = "1"
 tar = "0.4"
 tracing.workspace = true
 tracing-subscriber.workspace = true
-thiserror.workspace = true
 bytes.workspace = true
 chrono.workspace = true
 base64 = "0.22"
+image = { version = "0.25", default-features = false, features = ["png"] }
 clap = { version = "4.4", features = ["derive", "env"] }
 
 # Monitoring (Phase 5)
@@ -85,8 +84,8 @@ dns = ["reqwest"]
 # Structured-event webhook delivery (`AIVPN_EVENT_WEBHOOK` → HTTP POST per
 # event) — see `bootstrap.rs::install_webhook_forwarder`.
 event-webhook = ["reqwest"]
-management-api = ["axum", "tower", "hyper", "hyper-util", "tokio-stream", "anyhow"]
-production-secure = []
+management-api = ["axum", "tower", "hyper", "hyper-util", "tokio-stream", "anyhow", "dep:tempfile"]
+production-secure = ["aivpn-client/production-secure"]
 bootstrap-publish = ["reqwest", "hmac"]
 
 # Management API (Unix socket HTTP server)
@@ -119,6 +118,7 @@ version = "1"
 optional = true
 
 [dev-dependencies]
+async-trait.workspace = true
 tempfile = "3"
 http-body-util = "0.1"
 hyper = { version = "1", features = ["full"] }

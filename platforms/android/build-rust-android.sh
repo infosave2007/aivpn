@@ -39,7 +39,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
 # --exclude-libs hides the symbols of static archives. For this .so that is
-# lethal and silent: the 35 JNI exports arrive here from aivpn-android-core,
+# lethal and silent: the JNI exports arrive here from aivpn-android-core,
 # which an extended build links as an rlib — with this flag not one of them
 # survives. The .so still links; System.loadLibrary then fails with
 # UnsatisfiedLinkError on the device, far from the cause.
@@ -156,10 +156,11 @@ for entry in "${TARGETS[@]}"; do
         cargo ndk \
             -t "${ABI}" \
             -o "${JNI_LIBS_DIR}" \
-            -- build -p aivpn-android-core \
+            -- build --locked -p aivpn-android-core \
             ${RELEASE_FLAG}
     )
 
+    python3 "${REPO_ROOT}/deploy/ci/check-android-jni.py" "${JNI_LIBS_DIR}/${ABI}/libaivpn_core.so"
     echo "    Written to ${JNI_LIBS_DIR}/${ABI}/libaivpn_core.so"
 done
 

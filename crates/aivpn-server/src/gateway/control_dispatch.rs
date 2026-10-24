@@ -6,6 +6,52 @@
 use super::*;
 
 impl super::Gateway {
+    pub(super) fn telemetry_snapshot(
+        &self,
+        session: &Arc<parking_lot::Mutex<Session>>,
+    ) -> ControlPayload {
+        let sess = session.lock();
+        let buffer_pct = self
+            .tun_write_tx
+            .as_ref()
+            .map(|tx| {
+                let capacity = tx.max_capacity();
+                (capacity.saturating_sub(tx.capacity()) * 100 / capacity.max(1)) as u8
+            })
+            .unwrap_or(0);
+        ControlPayload::TelemetryResponse {
+            packet_loss: (sess.client_loss_ppm.min(1_000_000) / 100) as u16,
+            rtt_ms: sess.client_srtt_ms.min(u16::MAX as u32) as u16,
+            jitter_ms: sess.client_jitter_ms,
+            buffer_pct,
+        }
+    }
+
+    fn record_client_telemetry(
+        &self,
+        session: &Arc<parking_lot::Mutex<Session>>,
+        loss: f64,
+        rtt_ms: f64,
+    ) {
+        let (mask_id, client_id) = {
+            let sess = session.lock();
+            (
+                sess.mask.as_ref().map(|mask| mask.mask_id.clone()),
+                sess.client_id.clone(),
+            )
+        };
+        if let (Some(mask_id), Some(client_id)) = (mask_id, client_id) {
+            let mut hash = blake3::Hasher::new();
+            hash.update(b"aivpn-telemetry-reporter\0");
+            hash.update(client_id.as_bytes());
+            let mut reporter = [0; 16];
+            reporter.copy_from_slice(&hash.finalize().as_bytes()[..16]);
+            self.neural_module
+                .lock()
+                .record_telemetry(&mask_id, reporter, loss, rtt_ms);
+        }
+    }
+
     /// Build the `mgmt_service::MgmtCtx` inputs this `Gateway` actually
     /// holds and run `mgmt_service::dispatch` on a blocking thread — it
     /// does synchronous `ClientDatabase` file IO
@@ -57,12 +103,7 @@ impl super::Gateway {
         let masked_exit_addr = self.masked_exit_addr.clone();
         let pool_dialer_for_exit = self.pool_dialer.clone();
 
-        // Wave B1 (pool topology read endpoints): build the snapshot from
-        // live state BEFORE the `spawn_blocking` closure (all its inputs are
-        // already owned `Arc`/`Vec`/`String` clones, so this is cheap and
-        // doesn't need the blocking pool) — see `mgmt_service`'s "Pool
-        // topology views" doc comment for the legacy-transport /
-        // no-pool-sync degradation this implements.
+        // Снимок топологии готовится до переноса управления в блокирующую задачу.
         let pool = match self.pool_dialer() {
             Some(dialer) => {
                 let (registry_nodes, revoked) = match self.node_registry() {
@@ -78,7 +119,7 @@ impl super::Gateway {
                     transport: "masked",
                 })
             }
-            None if self.pool_configured => mgmt_service::PoolSnapshot::empty("legacy"),
+            None if self.pool_configured => mgmt_service::PoolSnapshot::empty("masked"),
             None => mgmt_service::PoolSnapshot::empty("none"),
         };
 
@@ -190,19 +231,7 @@ impl super::Gateway {
         client_addr: SocketAddr,
         subnets_json: &[u8],
     ) {
-        // PHASE 3 (site-to-site over masked transport): accept
-        // RouteSync from EITHER the legacy synthetic site-peer role
-        // (`is_site_peer`, authenticated via the site_sync directional
-        // sync_key) OR a FORK-B masked pool-client (`is_masked_pool_peer`
-        // — a sibling node that dialed us through the normal masked
-        // handshake, see `pool_dialer.rs`). An ordinary VPN client
-        // session has neither flag set and is still rejected below.
-        // PHASE 4 (per-node crypto identity): also read the
-        // session's `verified_node_id` — set by the NodeEnrollment
-        // arm below once this peer's Ed25519 proof verifies against
-        // the node registry — so `handle_route_sync` can key the
-        // route allowlist to the cryptographically-proven identity
-        // instead of trusting the payload's self-asserted node_id.
+        // Подсети площадки привязаны к доказанной идентичности узла.
         let (is_site, is_masked_pool, verified_node_id) = {
             let sess = session.lock();
             (
@@ -252,7 +281,7 @@ impl super::Gateway {
     /// Handle an inbound `NodeEnrollment` control message (per-node Ed25519
     /// identity proof for masked pool-peers). Extracted verbatim from the
     /// `handle_control_message` match arm — thin dispatch, no behavior change.
-    fn on_node_enrollment(
+    async fn on_node_enrollment(
         &self,
         session: &Arc<parking_lot::Mutex<Session>>,
         client_addr: SocketAddr,
@@ -281,6 +310,13 @@ impl super::Gateway {
             let sess = session.lock();
             (sess.is_masked_pool_peer, sess.server_eph_pub, sess.eph_pub)
         };
+        if {
+            let current = session.lock();
+            current.is_site_peer && !current.site_peer_names.contains(&node_id)
+        } {
+            warn!("Site peer attempted enrollment under another node identity");
+            return;
+        }
         if !is_masked_pool {
             debug!(
                 "NodeEnrollment from {} ignored — not a masked pool-peer session",
@@ -296,7 +332,7 @@ impl super::Gateway {
             // theoretically-unreachable `None` case rather than
             // panicking or skipping the check.
             let server_eph_pub_for_check = session_server_eph_pub.unwrap_or([0u8; 32]);
-            match registry.authenticate(
+            let accepted = match registry.authenticate(
                 &node_id,
                 &node_pub,
                 time_window,
@@ -305,18 +341,28 @@ impl super::Gateway {
                 &session_client_eph_pub,
             ) {
                 NodeAuthOutcome::Verified => {
-                    session.lock().verified_node_id = Some(node_id.clone());
+                    {
+                        let mut current = session.lock();
+                        current.verified_node_id = Some(node_id.clone());
+                        current.verified_node_pub = Some(node_pub);
+                    }
                     debug!(
                         "NodeEnrollment from {} verified node_id",
                         hash_addr(&client_addr)
                     );
+                    true
                 }
                 NodeAuthOutcome::BoundNew => {
-                    session.lock().verified_node_id = Some(node_id.clone());
+                    {
+                        let mut current = session.lock();
+                        current.verified_node_id = Some(node_id.clone());
+                        current.verified_node_pub = Some(node_pub);
+                    }
                     info!(
                         "NodeEnrollment from {} bound a new pool-node identity (TOFU)",
                         hash_addr(&client_addr)
                     );
+                    true
                 }
                 NodeAuthOutcome::Rejected(reason) => {
                     warn!(
@@ -324,6 +370,15 @@ impl super::Gateway {
                         hash_addr(&client_addr),
                         reason
                     );
+                    false
+                }
+            };
+            if accepted {
+                let session_id = session.lock().session_id;
+                self.session_manager
+                    .cleanup_masked_peer_identity(&node_id, &session_id);
+                if !session.lock().is_removed() {
+                    self.send_reverse_node_enrollment(session).await;
                 }
             }
         } else {
@@ -331,6 +386,99 @@ impl super::Gateway {
                 "NodeEnrollment from {} ignored — no node registry configured",
                 hash_addr(&client_addr)
             );
+        }
+    }
+
+    /// Обратное доказательство: тот же транскрипт сессии, наш node_id.
+    async fn send_reverse_node_enrollment(&self, session: &Arc<parking_lot::Mutex<Session>>) {
+        let (Some(key), Some(node_id)) = (
+            self.local_node_identity.as_ref(),
+            self.local_node_id.as_deref(),
+        ) else {
+            return;
+        };
+        let (server_eph, client_eph) = {
+            let sess = session.lock();
+            let Some(server_eph) = sess.server_eph_pub else {
+                return;
+            };
+            (server_eph, sess.eph_pub)
+        };
+        let node_pub = key.verifying_key().to_bytes();
+        let time_window = aivpn_common::crypto::compute_time_window(
+            aivpn_common::crypto::current_timestamp_ms(),
+            60_000,
+        );
+        let msg = aivpn_common::crypto::node_enrollment_signing_bytes(
+            node_id,
+            &node_pub,
+            time_window,
+            &server_eph,
+            &client_eph,
+        );
+        use ed25519_dalek::Signer;
+        let signature = key.sign(&msg).to_bytes();
+        let payload = ControlPayload::NodeEnrollment {
+            node_id: node_id.to_string(),
+            node_pub,
+            time_window,
+            signature,
+        };
+        if let Err(e) = self.send_control_message(&payload, session).await {
+            warn!("reverse NodeEnrollment send failed: {}", e);
+        }
+    }
+
+    fn on_site_data(
+        &self,
+        session: &Arc<parking_lot::Mutex<Session>>,
+        client_addr: SocketAddr,
+        payload: Vec<u8>,
+    ) {
+        let (is_masked_pool, verified_node_id) = {
+            let sess = session.lock();
+            (sess.is_masked_pool_peer, sess.verified_node_id.clone())
+        };
+        if route_sync_must_be_dropped_unverified(
+            is_masked_pool,
+            self.require_node_enrollment,
+            &verified_node_id,
+        ) {
+            warn!(
+                "site_sync: SiteData from masked pool-peer {} dropped, no verified node identity",
+                hash_addr(&client_addr)
+            );
+            return;
+        }
+        if !is_masked_pool {
+            warn!(
+                "site_sync: SiteData from non-peer session {} dropped",
+                hash_addr(&client_addr)
+            );
+            return;
+        }
+        let Some(header) = aivpn_common::ip_packet::IpPacket::parse(&payload) else {
+            warn!(
+                "site_sync: SiteData from {} is not an IP packet",
+                hash_addr(&client_addr)
+            );
+            return;
+        };
+        let src = header.source;
+        if !crate::site_sync::source_allowed_for_node(verified_node_id.as_deref(), src) {
+            warn!(
+                "site_sync: SiteData source {} from {} is outside that peer remote_subnets",
+                src,
+                hash_addr(&client_addr)
+            );
+            return;
+        }
+        let packet = payload[..header.length].to_vec();
+        match self.tun_write_tx.as_ref() {
+            Some(tx) => {
+                let _ = tx.try_send(packet);
+            }
+            None => debug!("site_sync: SiteData dropped, TUN writer is not ready"),
         }
     }
 
@@ -343,19 +491,11 @@ impl super::Gateway {
         client_addr: SocketAddr,
         clients_json: Vec<u8>,
     ) {
-        // Accept PoolSync from sessions registered as EITHER the
-        // legacy synthetic pool-peer role, or a FORK-B masked
-        // pool-client (a sibling node that dialed us through the
-        // normal masked handshake path — see `masked_peer` in
-        // `handle_packet`). A regular VPN client sending PoolSync
-        // would be able to inject or overwrite arbitrary client
-        // records in the database, so both checks still gate on an
-        // explicit peer-role flag rather than trusting any session.
-        let (is_pool, is_masked_pool) = {
+        let is_pool = {
             let sess = session.lock();
-            (sess.is_pool_peer, sess.is_masked_pool_peer)
+            sess.is_masked_pool_peer && !sess.is_site_peer
         };
-        if !is_pool && !is_masked_pool {
+        if !is_pool {
             warn!(
                 "pool_sync: rejected from non-pool session {}",
                 hash_addr(&client_addr)
@@ -438,13 +578,7 @@ impl super::Gateway {
         // that echo used to make the peer's own inbound-digest arm
         // fire again and echo back, an unbounded digest ping-pong.
         //
-        // Gated strictly on `is_masked_pool_peer` (never the legacy
-        // `is_pool_peer` role, and never an ordinary client session):
-        // the legacy synthetic pool-peer path has its own push-only
-        // pool_sync mechanism and never sends this control message,
-        // so treating it as authoritative for a role it doesn't use
-        // would be a silent no-op at best; an ordinary client
-        // session sending this is not a peer at all.
+        // Клиенты VPN не имеют права синхронизировать БД пула.
         let is_masked_pool = session.lock().is_masked_pool_peer;
         if !is_masked_pool {
             debug!(
@@ -576,151 +710,52 @@ impl super::Gateway {
         client_addr: SocketAddr,
         payload: Vec<u8>,
     ) {
-        if self.config.exit_node_enabled {
-            let ip_version = payload.first().map(|b| b >> 4);
-            let min_len = match ip_version {
-                Some(4) => 20,
-                Some(6) => 40,
-                _ => usize::MAX,
-            };
-            if payload.len() < min_len {
-                warn!(
-                    "chain_forward: invalid IP payload from {} (version={:?} len={}) — dropping",
-                    hash_addr(&client_addr),
-                    ip_version,
-                    payload.len()
-                );
+        if !self.config.exit_node_enabled {
+            return;
+        }
+        let Some(header) = aivpn_common::ip_packet::IpPacket::parse(&payload) else {
+            return;
+        };
+        let (source_allowed, peer, session_id) = {
+            let current = session.lock();
+            let peer = current.is_masked_pool_peer;
+            let allowed = if peer {
+                (!self.require_node_enrollment || current.verified_node_id.is_some())
+                    && inner_client_ipv4(&self.config.network_config, header.source).is_some_and(
+                        |ip| {
+                            self.config.network_config.is_usable_host(ip)
+                                && ip != self.config.network_config.server_vpn_ip
+                        },
+                    )
             } else {
-                // C-S-4: Validate that the injected packet's source IP
-                // matches the session's assigned VPN IP to prevent
-                // IP spoofing through the exit-node relay path.
-                //
-                // Pool/site peer sessions (chain-forward entry nodes)
-                // never carry a per-session vpn_ip — they relay
-                // traffic on behalf of many downstream clients that
-                // are authenticated by the *entry* node, not by us.
-                // The AEAD decrypt that got us here already
-                // authenticated the sender as the registered peer
-                // under its directional key, so for those sessions
-                // we only need to confirm the packet's source IP is
-                // plausibly one of our own VPN clients (i.e. inside
-                // our configured VPN subnet) rather than requiring
-                // an exact match against a field that is always
-                // None. Ordinary (non-peer) client sessions keep the
-                // strict exact-match check — no relaxation there.
-                // PHASE 4 (reverse chain-forward): also surface
-                // whether THIS session is a masked pool-peer and, if
-                // so, the packet's parsed IPv4 source — needed below
-                // to populate `chain_reverse_routes` so a downlink
-                // reply to that source can find its way back over
-                // this exact session. `pkt_src_ipv4` deliberately
-                // mirrors the same parse already done for the
-                // src-IP-spoofing check rather than re-parsing the
-                // payload a second time.
-                let (src_ip_ok, is_masked_pool_entry, pkt_src_ipv4) = {
-                    let sess = session.lock();
-                    // PHASE 3: also accept a masked pool-peer session
-                    // as a chain-forward entry node (a sibling node
-                    // that dialed us via `pool_dialer.rs`'s masked
-                    // pool-client handshake) — same relaxed
-                    // subnet-contains check as the legacy
-                    // `is_pool_peer`/`is_site_peer` roles, since it
-                    // likewise relays on behalf of many downstream
-                    // clients authenticated by the entry node.
-                    let is_peer_session =
-                        sess.is_pool_peer || sess.is_site_peer || sess.is_masked_pool_peer;
-                    match ip_version {
-                        Some(4) => {
-                            if payload.len() >= 20 {
-                                let src: [u8; 4] = payload[12..16].try_into().unwrap();
-                                let pkt_src = std::net::Ipv4Addr::from(src);
-                                let ok = if is_peer_session {
-                                    self.config.network_config.contains(pkt_src)
-                                } else {
-                                    sess.vpn_ip.map_or(false, |vpn| vpn == pkt_src)
-                                };
-                                (ok, sess.is_masked_pool_peer, Some(pkt_src))
-                            } else {
-                                (false, false, None)
-                            }
-                        }
-                        // IPv6: no per-session IPv6 address assigned — reject
-                        _ => (false, false, None),
-                    }
-                };
-                if !src_ip_ok {
-                    warn!(
-                        "chain_forward: source IP mismatch from {} — dropping",
-                        hash_addr(&client_addr)
-                    );
-                } else {
-                    // PHASE 4 (reverse chain-forward): remember that
-                    // this client VPN IP's uplink traffic arrived on
-                    // THIS masked pool-peer session, so the TUN read
-                    // loop's downlink worker can route a reply back
-                    // here instead of dropping it (see
-                    // `Gateway::chain_reverse_routes`'s doc comment).
-                    // Strictly gated on `is_masked_pool_peer` — the
-                    // legacy dedicated-socket `ChainForwarder` roles
-                    // (`is_pool_peer`/`is_site_peer`) have no
-                    // session-based return channel to record here.
-                    if is_masked_pool_entry {
-                        if let Some(src_ip) = pkt_src_ipv4 {
-                            let session_id = session.lock().session_id;
-                            chain_reverse_route_insert(
-                                &self.chain_reverse_routes,
-                                &self.chain_reverse_insert_count,
-                                src_ip,
-                                session_id,
-                                Instant::now(),
-                                |sid| self.session_manager.get_session(sid).is_some(),
-                            );
-                        }
-                    }
-                    // BUG C4 fix: apply the SAME `allow_peer_routing`
-                    // gate ordinary client Data packets already get
-                    // (see "Block intra-VPN routing at ingress" in
-                    // the DATA arm above) to ChainForward-relayed
-                    // packets too. Without this, a masked pool-peer
-                    // relaying on behalf of many downstream clients
-                    // could reach another LOCAL VPN client's session
-                    // via `inner_dst` even when peer routing is
-                    // disabled — the exact intra-VPN routing the
-                    // DATA-path gate exists to block, just reached
-                    // through a different arm. Parses `inner_dst`
-                    // straight out of the (already length-validated
-                    // for IPv4, `min_len == 20`) payload; IPv6
-                    // ChainForward payloads have no per-session VPN
-                    // IP to match against here, so they fall through
-                    // unaffected by this check (existing IPv6
-                    // handling is unchanged).
-                    let drop_for_peer_routing = !self.config.allow_peer_routing
-                        && payload.len() >= 20
-                        && ip_version == Some(4)
-                        && {
-                            let inner_dst = std::net::Ipv4Addr::new(
-                                payload[16],
-                                payload[17],
-                                payload[18],
-                                payload[19],
-                            );
-                            self.session_manager
-                                .get_session_by_vpn_ip(&inner_dst)
-                                .is_some()
-                        };
-                    if drop_for_peer_routing {
-                        debug!(
-                            "chain_forward: peer routing disabled — dropping relayed packet to local VPN session from {}",
-                            hash_addr(&client_addr)
-                        );
-                    } else if let Some(ref tx) = self.tun_write_tx {
-                        let _ = tx.send(payload).await;
-                    }
-                }
-            }
-        } else {
+                self.session_allows_source(&current, header.source)
+            };
+            (allowed, peer, current.session_id)
+        };
+        if !source_allowed {
+            return;
+        }
+        if !self.config.allow_peer_routing
+            && self.session_for_inner_ip(header.destination).is_some()
+        {
+            return;
+        }
+        if peer {
+            chain_reverse_route_insert(
+                &self.chain_reverse_routes,
+                &self.chain_reverse_insert_count,
+                header.source,
+                session_id,
+                Instant::now(),
+                |id| self.session_manager.get_session(id).is_some(),
+            );
+        }
+        if let Err(error) = self
+            .forward_client_data(session, &payload[..header.length], true)
+            .await
+        {
             warn!(
-                "chain_forward: ChainForward from {} rejected — exit_node_enabled is false",
+                "Chain forwarding failed for {}: {error}",
                 hash_addr(&client_addr)
             );
         }
@@ -909,7 +944,7 @@ impl super::Gateway {
 
         match self
             .session_manager
-            .build_mask_update_packet(session, &variant)
+            .build_mask_update_packets(session, &variant)
         {
             Ok(packet) => {
                 // FIX L: `udp_socket` is `None` until `run()` binds
@@ -917,7 +952,7 @@ impl super::Gateway {
                 // window (or a `Gateway` is driven without `run()`,
                 // e.g. tests).
                 if let Some(sock) = self.udp_socket.as_ref() {
-                    if let Err(e) = sock.send_to(&packet, client_addr).await {
+                    if let Err(e) = sock.send_packets_to(&packet, client_addr).await {
                         warn!(
                             "Failed to send polymorphic MaskUpdate to {}: {}",
                             client_addr, e
@@ -1101,6 +1136,33 @@ impl super::Gateway {
             self.send_server_hello(session, client_addr).await?;
             return Ok(());
         }
+        let (expired, retry) = {
+            let mut sess = session.lock();
+            let pending = sess.client_id.is_some() && !sess.client_admitted;
+            let now = Instant::now();
+            let expired = pending && now.duration_since(sess.created_at) >= Duration::from_secs(60);
+            let retry = pending
+                && !expired
+                && sess
+                    .authentication_retry_at
+                    .is_none_or(|last| now.duration_since(last) >= Duration::from_secs(1));
+            if retry {
+                sess.authentication_retry_at = Some(now);
+            }
+            (expired, retry)
+        };
+        if expired {
+            let _ = self
+                .send_control_message(&ControlPayload::Shutdown { reason: 3 }, session)
+                .await;
+            let sid = session.lock().session_id;
+            self.session_manager.remove_session(&sid);
+            return Ok(());
+        }
+        if retry {
+            // Hello с тем же ephemeral не меняет ключи, но просит повторить proof/cert.
+            self.send_server_hello(session, client_addr).await?;
+        }
         // Echo the client's own send_ts so it can measure RTT without
         // clock-skew between client and server.
         self.send_control_message(&ControlPayload::KeepaliveAck { echo_ts: send_ts }, session)
@@ -1121,23 +1183,16 @@ impl super::Gateway {
                 Err(e) => debug!("MaskCatalog send failed: {}", e),
             }
         }
-        // P1.2: announce this session's server-assigned management
-        // role once, so the client knows whether to surface
-        // admin/viewer management UI. Gated exactly like the
-        // MaskCatalog push above — post-ratchet Keepalive only
-        // (guarded at the top of this arm), send-once via
-        // `capabilities_sent`, self-healing if the send is lost
-        // (retried on the next Keepalive).
-        if !session.lock().capabilities_sent {
-            let role = self.session_role(session);
-            let caps = ControlPayload::Capabilities {
-                role: role.as_u8(),
-                features: 0,
-            };
-            match self.send_control_message(&caps, session).await {
-                Ok(()) => session.lock().capabilities_sent = true,
-                Err(e) => debug!("Capabilities send failed: {}", e),
-            }
+        // UDP send_to не подтверждает доставку. Повторяем роль на keepalive,
+        // чтобы потерянный ответ и изменение прав не оставляли GUI со старой ролью.
+        let role = self.session_role(session);
+        let caps = ControlPayload::Capabilities {
+            role: role.as_u8(),
+            features: 0,
+        };
+        match self.send_control_message(&caps, session).await {
+            Ok(()) => session.lock().capabilities_sent = true,
+            Err(e) => debug!("Capabilities send failed: {}", e),
         }
         Ok(())
     }
@@ -1154,7 +1209,7 @@ impl super::Gateway {
         dh_proof: [u8; 32],
     ) -> Result<()> {
         let client_id = { session.lock().client_id.clone() };
-        if let (Some(ref db), Some(ref cid)) = (&self.client_db, &client_id) {
+        {
             // Verify the session-bound proof: dh_shared =
             // X25519(server_static_priv, client_static_pub) ==
             // client's X25519(static_priv, server_static_pub) (X25519
@@ -1192,7 +1247,7 @@ impl super::Gateway {
                 self.audit_log.log(
                     AuditActor::System,
                     "device_enrollment_rejected",
-                    cid,
+                    client_id.as_deref().unwrap_or("unbound"),
                     "denied",
                 );
                 let shutdown = ControlPayload::Shutdown { reason: 3 };
@@ -1201,33 +1256,56 @@ impl super::Gateway {
                 self.session_manager.remove_session(&session_id);
                 return Ok(());
             }
-            match db.enroll_device(cid, &static_pub) {
-                Ok(true) => info!("Device enrolled and bound for client {}", cid),
-                Ok(false) => debug!("Device binding verified for client {}", cid),
-                Err(e) => {
-                    // 3f: one-time key already used — a DIFFERENT
-                    // device already bound this one_time credential.
-                    // The session is already tag-validated/AEAD
-                    // established (this is a decrypted, authenticated
-                    // in-session control message), so PSK possession
-                    // is proven — send the specific, authenticated
-                    // HandshakeReject{reason:1} instead of the
-                    // generic Shutdown so the client can show why and
-                    // stop retrying.
-                    warn!("Device binding mismatch for {}: {}", cid, e);
-                    self.audit_log.log(
-                        AuditActor::System,
-                        "device_binding_mismatch",
-                        cid,
-                        "denied",
-                    );
-                    let reject = ControlPayload::HandshakeReject { reason: 1 };
-                    let _ = self.send_control_message(&reject, session).await;
-                    let session_id = session.lock().session_id;
-                    self.session_manager.remove_session(&session_id);
+            if session
+                .lock()
+                .verified_device_pub
+                .is_some_and(|key| key != static_pub)
+            {
+                let session_id = session.lock().session_id;
+                self.session_manager.remove_session(&session_id);
+                return Ok(());
+            }
+            if let (Some(db), Some(cid)) = (&self.client_db, &client_id) {
+                match db.enroll_device(cid, &static_pub) {
+                    Ok(true) => info!("Device enrolled and bound for client {}", cid),
+                    Ok(false) => debug!("Device binding verified for client {}", cid),
+                    Err(e) => {
+                        // 3f: one-time key already used — a DIFFERENT
+                        // device already bound this one_time credential.
+                        // The session is already tag-validated/AEAD
+                        // established (this is a decrypted, authenticated
+                        // in-session control message), so PSK possession
+                        // is proven — send the specific, authenticated
+                        // HandshakeReject{reason:1} instead of the
+                        // generic Shutdown so the client can show why and
+                        // stop retrying.
+                        warn!("Device binding mismatch for {}: {}", cid, e);
+                        self.audit_log.log(
+                            AuditActor::System,
+                            "device_binding_mismatch",
+                            cid,
+                            "denied",
+                        );
+                        let reject = ControlPayload::HandshakeReject { reason: 1 };
+                        let _ = self.send_control_message(&reject, session).await;
+                        let session_id = session.lock().session_id;
+                        self.session_manager.remove_session(&session_id);
+                        return Ok(());
+                    }
                 }
             }
+            let mut sess = session.lock();
+            if !sess.record_verified_device(static_pub) {
+                let session_id = sess.session_id;
+                drop(sess);
+                self.session_manager.remove_session(&session_id);
+                return Ok(());
+            }
+            self.refresh_mtls_gate(&mut sess);
+            sess.capabilities_sent = false;
+            self.refresh_kernel_session(&mut sess);
         }
+        self.finish_client_admission(session).await;
         Ok(())
     }
 
@@ -1249,6 +1327,37 @@ impl super::Gateway {
         // below replies with SOME `MgmtResponse` — a caller
         // waiting on `req_id` must never hang, whether the
         // outcome is throttled/denied/dispatched.
+        if aivpn_common::diagnostics::is_diagnostic(&path) {
+            let status = {
+                let mut current = session.lock();
+                if !current.client_admitted
+                    || !current.mtls_ok
+                    || current.is_masked_pool_peer
+                    || current.is_site_peer
+                {
+                    403
+                } else if !current.diagnostic_budget.take(Instant::now()) {
+                    429
+                } else {
+                    200
+                }
+            };
+            let (status, body) = if status == 200 {
+                aivpn_common::diagnostics::response(method, &path, &body)
+            } else {
+                (status, Vec::new())
+            };
+            return self
+                .send_control_message(
+                    &ControlPayload::MgmtResponse {
+                        req_id,
+                        status,
+                        body,
+                    },
+                    session,
+                )
+                .await;
+        }
         let session_id = session.lock().session_id;
         if !self.try_claim_mgmt_slot(session_id, Instant::now()) {
             let resp = ControlPayload::MgmtResponse {
@@ -1324,8 +1433,92 @@ impl super::Gateway {
         client_addr: SocketAddr,
     ) -> Result<()> {
         let control = ControlPayload::decode(payload)?;
+        let identity = {
+            let current = session.lock();
+            current
+                .verified_node_id
+                .clone()
+                .zip(current.verified_node_pub)
+        };
+        if identity.is_none()
+            && session.lock().is_masked_pool_peer
+            && self
+                .node_registry
+                .as_ref()
+                .is_some_and(|registry| registry.check_health().is_err())
+        {
+            return Ok(());
+        }
+        if let (Some(registry), Some((node_id, node_pub))) = (&self.node_registry, identity) {
+            if !registry.is_authorized(&node_id, &node_pub) {
+                return Ok(());
+            }
+        }
 
+        let unverified_peer = {
+            let current = session.lock();
+            current.is_masked_pool_peer
+                && self.require_node_enrollment
+                && current.verified_node_id.is_none()
+        };
+        if unverified_peer
+            && !matches!(
+                &control,
+                ControlPayload::NodeEnrollment { .. }
+                    | ControlPayload::Keepalive { .. }
+                    | ControlPayload::KeepaliveAck { .. }
+                    | ControlPayload::ControlAck { .. }
+                    | ControlPayload::KeyRotate { .. }
+            )
+        {
+            return Ok(());
+        }
+
+        // Ключ площадки не дает прав на клиентскую БД пула, exit relay или управление.
+        if session.lock().is_site_peer
+            && !matches!(
+                &control,
+                ControlPayload::NodeEnrollment { .. }
+                    | ControlPayload::RouteSync { .. }
+                    | ControlPayload::MaskState(_)
+                    | ControlPayload::SiteData { .. }
+                    | ControlPayload::Keepalive { .. }
+                    | ControlPayload::KeepaliveAck { .. }
+                    | ControlPayload::ControlAck { .. }
+                    | ControlPayload::KeyRotate { .. }
+            )
+        {
+            return Ok(());
+        }
         match control {
+            ControlPayload::MaskState(state) => {
+                {
+                    let current = session.lock();
+                    if current.is_removed()
+                        || !current.is_ratcheted
+                        || !current.client_admitted
+                        || state.answer
+                        || !current.mask.as_ref().is_some_and(|mask| {
+                            aivpn_common::mask_io::uses_rtc(mask)
+                                && mask.mask_id == state.mask_id
+                                && mask.version == state.mask_version
+                        })
+                    {
+                        return Err(Error::InvalidPacket(
+                            "Согласование RTC не соответствует установленной сессии",
+                        ));
+                    }
+                }
+                let socket = self
+                    .udp_socket
+                    .as_ref()
+                    .ok_or(Error::InvalidPacket("Нет сокета RTC"))?;
+                let answer = socket.accept_rtc_offer(&state, session, client_addr)?;
+                self.send_control_message(&ControlPayload::MaskState(answer), session)
+                    .await?;
+            }
+            // Подсказка профиля принимается только в начальном AEAD-обмене.
+            ControlPayload::ClientHello { .. } => {}
             ControlPayload::KeyRotate { new_eph_pub } => {
                 let (session_id, has_pending) = {
                     let sess = session.lock();
@@ -1366,13 +1559,7 @@ impl super::Gateway {
             }
             ControlPayload::TelemetryRequest { metric_flags: _ } => {
                 debug!("Telemetry request from {}", hash_addr(&client_addr));
-                // Send response
-                let response = ControlPayload::TelemetryResponse {
-                    packet_loss: 0,
-                    rtt_ms: 10,
-                    jitter_ms: 2,
-                    buffer_pct: 25,
-                };
+                let response = self.telemetry_snapshot(session);
                 self.send_control_message(&response, session).await?;
             }
             ControlPayload::TelemetryResponse {
@@ -1380,24 +1567,11 @@ impl super::Gateway {
                 rtt_ms,
                 ..
             } => {
-                let (mask_id, reporter) = {
-                    let sess = session.lock();
-                    (
-                        sess.mask.as_ref().map(|m| m.mask_id.clone()),
-                        sess.session_id,
-                    )
-                };
-                if let Some(ref mid) = mask_id {
-                    // Pass the authenticated session id as the reporter so the
-                    // anomaly detector can require multi-reporter corroboration
-                    // before believing a client-reported compromise (anti-DoS).
-                    self.neural_module.lock().record_telemetry(
-                        mid,
-                        reporter,
-                        packet_loss as f64,
-                        rtt_ms as f64,
-                    );
-                }
+                self.record_client_telemetry(
+                    session,
+                    packet_loss.min(10_000) as f64 / 10_000.0,
+                    rtt_ms as f64,
+                );
                 debug!("Telemetry response received — recorded to anomaly detector");
             }
             ControlPayload::TimeSync { .. } => {
@@ -1409,6 +1583,7 @@ impl super::Gateway {
                     hash_addr(&client_addr),
                     reason
                 );
+                self.flush_session_traffic(session);
                 // Close session and stop active recording if any
                 let session_id = session.lock().session_id;
                 self.session_manager.remove_session(&session_id);
@@ -1467,6 +1642,7 @@ impl super::Gateway {
                         service.clone(),
                         admin_key_id.unwrap_or_else(|| "admin".into()),
                     );
+                    self.refresh_kernel_session(&mut session.lock());
                     let ack = ControlPayload::RecordingAck {
                         session_id,
                         status: "started".into(),
@@ -1581,7 +1757,8 @@ impl super::Gateway {
                     node_pub,
                     time_window,
                     signature,
-                );
+                )
+                .await;
             }
             ControlPayload::PartitionAnnounce {
                 subnet_cidr: peer_cidr,
@@ -1604,16 +1781,30 @@ impl super::Gateway {
             ControlPayload::ChainForward { payload } => {
                 self.on_chain_forward(session, client_addr, payload).await;
             }
+            ControlPayload::SiteData { payload } => {
+                self.on_site_data(session, client_addr, payload);
+            }
             ControlPayload::ClientCert { cert_bytes } => {
                 if let Some(ref mtls_cfg) = self.config.mtls {
-                    let session_eph_pub = session.lock().eph_pub;
-                    let ok = crate::mtls::SimpleCert::from_bytes(&cert_bytes)
-                        .map(|c| {
-                            c.client_pub_key == session_eph_pub
-                                && crate::mtls::verify_cert(&c, mtls_cfg)
-                        })
-                        .unwrap_or(false);
-                    session.lock().mtls_ok = ok;
+                    let cert = crate::mtls::SimpleCert::from_bytes(&cert_bytes)
+                        .filter(|cert| crate::mtls::verify_cert(cert, mtls_cfg));
+                    let ok = {
+                        let mut sess = session.lock();
+                        let ok = cert.as_ref().is_some_and(|cert| {
+                            sess.verified_device_pub
+                                .is_none_or(|key| key == cert.client_pub_key)
+                        });
+                        if ok {
+                            sess.record_mtls_cert(cert.unwrap());
+                        } else {
+                            sess.mtls_cert = None;
+                        }
+                        self.refresh_mtls_gate(&mut sess);
+                        sess.capabilities_sent = false;
+                        self.refresh_kernel_session(&mut sess);
+                        ok
+                    };
+                    self.finish_client_admission(session).await;
                     if ok {
                         debug!("mtls: client {} cert accepted", hash_addr(&client_addr));
                         self.audit_log.log(
@@ -1683,9 +1874,19 @@ impl super::Gateway {
                 // the rekey/ratchet grace window (A5).
                 {
                     let mut s = session.lock();
-                    s.client_quality = quality;
-                    s.observe_client_rtt(rtt_ms as u32);
+                    s.client_quality = quality.min(100);
+                    if rtt_ms > 0 {
+                        s.observe_client_rtt(rtt_ms as u32);
+                    }
+                    s.client_loss_ppm = loss_ppm.min(1_000_000);
+                    s.client_jitter_ms = jitter_ms;
                 }
+                // Текущие клиенты передают QualityReport, а не устаревший TelemetryResponse.
+                self.record_client_telemetry(
+                    session,
+                    loss_ppm.min(1_000_000) as f64 / 1_000_000.0,
+                    rtt_ms as f64,
+                );
                 // Push adaptive hint back so client adjusts keepalive + FEC immediately.
                 let level = aivpn_common::quality::AdaptiveLevel::suggest(quality);
                 if let Err(e) = self
@@ -1742,12 +1943,13 @@ impl super::Gateway {
                     hash_addr(&client_addr)
                 );
             }
-            ControlPayload::Capabilities { .. } => {
-                // Server→client only; a client should never send this. Ignore.
-                debug!(
-                    "Unexpected Capabilities from client {} ignored",
-                    hash_addr(&client_addr)
-                );
+            ControlPayload::Capabilities { features, .. } => {
+                if features & aivpn_common::protocol::CLIENT_PACKET_FEATURES != 0 {
+                    let mut current = session.lock();
+                    // FEC задается при запуске потока и не меняется до reconnect.
+                    // Поле role из клиентского сообщения не используется.
+                    current.client_packet_features.get_or_insert(features);
+                }
             }
             ControlPayload::MgmtResponse { .. } => {
                 // Server→client only; a client should never send this. Ignore.

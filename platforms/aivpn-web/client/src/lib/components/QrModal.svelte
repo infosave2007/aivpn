@@ -33,7 +33,7 @@
 
 {#if open}
   <div class="fixed inset-0 z-50 flex items-center justify-center">
-    <button class="absolute inset-0 bg-black/60" onclick={onClose}></button>
+    <button aria-label="Close dialog" class="absolute inset-0 bg-black/60" onclick={onClose}></button>
     <div class="relative bg-white dark:bg-gray-800 rounded-xl p-6 shadow-2xl max-w-sm w-full mx-4">
       <div class="flex items-center justify-between mb-4">
         <h2 class="text-lg font-semibold text-gray-900 dark:text-white">{title}</h2>

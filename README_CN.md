@@ -5,7 +5,7 @@
 [![CI](https://github.com/infosave2007/aivpn/actions/workflows/ci.yml/badge.svg?branch=master)](https://github.com/infosave2007/aivpn/actions/workflows/ci.yml)
 [![Crates.io Server](https://img.shields.io/crates/v/aivpn-server.svg?label=aivpn-server)](https://crates.io/crates/aivpn-server)
 [![Crates.io Client](https://img.shields.io/crates/v/aivpn-client.svg?label=aivpn-client)](https://crates.io/crates/aivpn-client)
-![Rust](https://img.shields.io/badge/rust-1.75%2B-blue.svg)
+![Rust](https://img.shields.io/badge/rust-1.97%2B-blue.svg)
 ![Platforms](https://img.shields.io/badge/platforms-Linux%20%7C%20macOS%20%7C%20Windows%20%7C%20Android%20%7C%20iOS%20%7C%20MikroTik-informational)
 
 ---
@@ -16,7 +16,7 @@ AIVPN 是一款基于 UDP 的 VPN 系统，将标准隧道加密与**流量拟�
 
 核心技术特性：
 
-- **零 RTT 数据启动** — 加密载荷可从第一个数据包开始传输，无需强制握手往返。
+- **InitialV2/PFS** - данные и управляющие команды передаются только после подтверждения PFS; требования к устройству и mTLS описаны в [контракте совместимости](README.md#совместимость-начального-обмена-и-ускорителя).
 - **O(1) 会话查找** — 明文中不传输会话 ID。每个数据包携带一个 8 字节的*共振标签*，由时间戳和每会话密钥派生。服务器通过 `DashMap` 以常数时间解析会话。
 - **完美前向保密** — 通过 X25519 棘轮机制进行飞行中会话密钥轮换。服务器密钥泄露不会暴露过去的流量。
 - **神经共振模块** — 每个掩码的微型 MLP（约 66 KB）实时监控流量统计；高重建误差触发自动掩码轮换，不中断客户端连接。
@@ -60,10 +60,12 @@ deploy/ci/               — 由 Makefile 调用的 CI 门禁（见 `make help`�
 | `mask.rs` | `aivpn-common` | `MaskProfile` — 流量整形：头部模板、FSM 状态、IAT 分布 |
 | `gateway.rs` | `aivpn-server` | 核心事件循环：UDP 接收、会话分发、NAT 转发、神经检查 |
 | `session.rs` | `aivpn-server` | `SessionManager` — `DashMap` O(1) 查找，256 条目重放窗口 |
-| `neural.rs` | `aivpn-server` | 神经共振：每掩码 MLP 64→128→64，MSE 阈值 0.35，自动轮换 |
+| `neural.rs` | `aivpn-server` | 神经共振：每掩码 MLP 64→16→64，备用投影 64→128→64，MSE 阈值 0.35，自动轮换 |
 | `client.rs` | `aivpn-client` | 状态机：未配置 → 连接中 → 已连接，密钥交换，重连 |
 | `tunnel.rs` | `aivpn-client` | 跨平台 TUN：`/dev/net/tun`（Linux）、`utun`（macOS）、Wintun（Windows） |
 | `mimicry.rs` | `aivpn-client` | `MimicryEngine` — 对出站数据包应用 `MaskProfile` |
+
+内置训练权重使用 WebRTC 和 QUIC 流量族的参考样本，网络为 64→16→64。未知签名使用 64→128→64 确定性投影和在线校准。这些参考样本不能证明单个服务的行为或 DPI 抵抗能力。
 
 ### 节点池同步
 
@@ -417,7 +419,7 @@ aivpn-server --show-client "姓名" --key-file /etc/aivpn/server.key \
   "network_config": {
     "server_vpn_ip": "10.0.0.1",
     "prefix_len": 24,
-    "mtu": 1346,
+    "mtu": 1280,
     "keepalive_secs": 8,
     "ipv6_enabled": false,
     "ipv6_prefix": "fd10:cafe::/48"
@@ -433,7 +435,7 @@ aivpn-server --show-client "姓名" --key-file /etc/aivpn/server.key \
 |------|--------|------|
 | `listen_addr` | `0.0.0.0:443` | UDP 绑定地址，端口自动嵌入连接密钥 |
 | `tun_name` | 随机 | TUN 接口名称 |
-| `tun_mtu` | _（未设置）_ | `"auto"` = 物理 MTU 减去 64 字节开销（回退 1346）；或固定整数 |
+| `tun_mtu` | _（未设置）_ | `"auto"` = 物理 MTU 减去 64 字节开销，上限 1280（回退 1280）；或不超过 1500 的固定整数 |
 | `mask_dir` | `/var/lib/aivpn/masks` | 扫描 `.json` 掩码配置文件的目录 |
 | `bootstrap_mask_files` | `[]` | 启动时预加载的掩码文件，降低首次连接延迟 |
 | `session_timeout_secs` | `0` | 会话硬性上限；`0` = 无限制 |
@@ -441,7 +443,7 @@ aivpn-server --show-client "姓名" --key-file /etc/aivpn/server.key \
 | `allow_peer_routing` | `false` | 在子网内路由 VPN 客户端间的数据包 |
 | `network_config.server_vpn_ip` | `10.0.0.1` | 服务器 TUN IP |
 | `network_config.prefix_len` | `24` | VPN 子网前缀 |
-| `network_config.mtu` | `1346` | 通过 `ServerHello` 发送给客户端的内部 MTU |
+| `network_config.mtu` | `1280` | 通过 `ServerHello` 发送给客户端的内部 MTU |
 | `network_config.keepalive_secs` | `8` | 与客户端协商的心跳间隔 |
 | `network_config.ipv6_enabled` | `false` | 启用 IPv6 NAT66 |
 | `network_config.ipv6_prefix` | `fd10:cafe::/48` | 客户端 IPv6 地址的 ULA /48 前缀 |
@@ -466,7 +468,7 @@ cargo build --release --bin aivpn-server --features "management-api,metrics,neur
 
 ## 从源码构建
 
-要求：Rust 1.75+、`cargo`、`make`。
+要求：Rust 1.97+、`cargo`、`make`。
 
 ```
 git clone https://github.com/infosave2007/aivpn
@@ -587,6 +589,8 @@ aivpn-client -k "aivpn://..." --adaptive
 ```
 
 ### 前向纠错（FEC）
+
+TUN MTU 默认是 1280 字节，显式设置可保留至 1500。超过载体预算的 DATA 和 FEC 修复包分别加密分片，并在接收端重组。FEC 对每个原始 IP 包只计数一次。接收端必须支持 1.2.0 分片格式。 每个 FEC 数据包都携带经过认证的组号和组内位置，包括短包。乱序和 FEC 暂停不会混合不同组，已完成组的迟到原包在分片分配前被丢弃。即使内核会话安装后才启用 FEC，其帧仍进入 userspace 接收路径。
 
 每 N 个上行数据包发送一个 XOR 修复包。如果一组中恰好丢失一个包，服务器立即重建 — 无需重传往返。N 由自适应模式控制。清洁链路上 FEC 禁用。
 
@@ -811,6 +815,11 @@ aivpn/
 ```
 
 ---
+
+### ML-DPI 验证
+
+GBDT 接收经过客户端认证和传输层校验的 QUIC、RTC 和 STUN 外部帧，不把解封装后的内部数据当作线上数据。训练和测试按独立会话抓包划分，nDPI 对完整交换进行标注。[tools/dpi](tools/dpi/README.md) 包含训练工具，[模型报告](assets/dpi/report.md) 给出指标与限制。使用相同负载生成器的测试不能证明对任意 DPI 系统的抵抗能力。
+
 
 ## 许可证
 

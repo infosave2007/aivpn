@@ -6,8 +6,7 @@ mod views;
 use i18n::t;
 use iced::futures::SinkExt;
 use iced::widget::{
-    button, checkbox, container, horizontal_rule, image, pick_list, scrollable, text, text_input,
-    Space,
+    button, checkbox, container, image, pick_list, rule, scrollable, text, text_input, Space,
 };
 use iced::{Alignment, Background, Border, Color, Element, Length, Subscription, Task, Theme};
 pub use messages::Message;
@@ -27,9 +26,6 @@ use crate::vpn_manager::{
     self, extract_server_addr, find_client_binary, format_bytes, read_recording_status,
     read_traffic_stats, RecordingSnapshot, TrafficStats, VpnStatus,
 };
-#[allow(unused_imports)]
-use notify_rust;
-
 const MAX_LOG_LINES: usize = 200;
 
 /// G-A3: client-side estimate of the server's `PENDING_CONFIG_TIMEOUT`
@@ -242,6 +238,7 @@ pub fn acquire_single_instance_lock() -> Result<Option<std::fs::File>, ()> {
     let _ = std::fs::create_dir_all(&dir);
     let Ok(file) = std::fs::OpenOptions::new()
         .create(true)
+        .truncate(false)
         .write(true)
         .open(dir.join("gui.lock"))
     else {
@@ -553,8 +550,14 @@ fn exit_node_choices(lang: &str, pool_nodes: &[PoolNode]) -> Vec<ExitNodeChoice>
         selection: ExitNodeSelection::Default,
         display: t(lang, "(default)").to_string(),
     }];
-    for n in pool_nodes {
+    for n in pool_nodes.iter().filter(|n| !n.revoked) {
         if let Some(addr) = n.address.as_ref().filter(|a| !a.trim().is_empty()) {
+            if choices
+                .iter()
+                .any(|choice| choice.selection == ExitNodeSelection::Node(addr.clone()))
+            {
+                continue;
+            }
             choices.push(ExitNodeChoice {
                 selection: ExitNodeSelection::Node(addr.clone()),
                 display: addr.clone(),
@@ -804,6 +807,7 @@ pub struct App {
     /// Server-assigned role cached by the daemon (0=User,1=Viewer,2=Admin),
     /// fetched fresh on every new Connected transition. `None` until loaded.
     admin_role: Option<u8>,
+    admin_generation: u64,
     admin_clients: Vec<ClientRecord>,
     admin_clients_loading: bool,
     admin_error: Option<String>,
@@ -869,6 +873,7 @@ pub struct App {
     /// per-client override elsewhere in this panel, applying this only
     /// takes effect after the server process restarts.
     server_settings_exit_node: String,
+    server_settings_exit_selected: bool,
     /// Set while an apply/confirm call is in flight — disables both Apply
     /// buttons and the Confirm button rather than allowing a second
     /// concurrent request.
@@ -1007,6 +1012,7 @@ impl App {
                 bootstrap_fallback: false,
                 admin_open: false,
                 admin_role: None,
+                admin_generation: 0,
                 admin_clients: Vec::new(),
                 admin_clients_loading: false,
                 admin_error: None,
@@ -1038,6 +1044,7 @@ impl App {
                 server_settings_mask_client: None,
                 server_settings_mask_id: None,
                 server_settings_exit_node: String::new(),
+                server_settings_exit_selected: false,
                 server_settings_busy: false,
                 server_settings_pending: None,
                 server_settings_countdown: 0,
@@ -1077,7 +1084,9 @@ impl App {
             // reconnect. `role` only needs the running daemon's local admin
             // socket — no connection key — so fetch it right away.
             if adopted_client.is_some() {
-                Task::perform(admin::get_role(), Message::AdminRoleLoaded)
+                session_task(admin::get_role(), |role| {
+                    Message::SessionReply(0, Box::new(Message::AdminRoleLoaded(role)))
+                })
             } else {
                 Task::none()
             },
@@ -1147,7 +1156,62 @@ impl App {
     }
 
     pub fn update(&mut self, msg: Message) -> Task<Message> {
+        let msg = match msg {
+            Message::SessionReply(generation, reply) => {
+                if generation != self.admin_generation {
+                    return Task::none();
+                }
+                *reply
+            }
+            other => other,
+        };
+        let task = self.update_inner(msg);
+        let generation = self.admin_generation;
+        task.map(move |reply| {
+            if reply.belongs_to_session() {
+                Message::SessionReply(generation, Box::new(reply))
+            } else {
+                reply
+            }
+        })
+    }
+
+    fn invalidate_session_views(&mut self) {
+        self.admin_generation = self.admin_generation.wrapping_add(1);
+        self.admin_role = None;
+        self.admin_open = false;
+        self.admin_clients.clear();
+        self.admin_clients_loading = false;
+        self.admin_error = None;
+        self.admin_busy_id = None;
+        self.admin_key_view = None;
+        self.admin_qr = None;
+        self.admin_qr_loading = None;
+        self.admin_pending_revoke = None;
+        self.admin_edit_id = None;
+        self.pool_nodes.clear();
+        self.pool_health = None;
+        self.pool_loading = false;
+        self.pool_error = None;
+        self.audit_entries.clear();
+        self.audit_verified = None;
+        self.audit_broken_at = None;
+        self.audit_loading = false;
+        self.audit_error = None;
+        self.server_settings_exit_selected = false;
+        self.server_settings_exit_node.clear();
+        self.server_settings_open = false;
+        self.server_settings_busy = false;
+        self.server_settings_pending = None;
+        self.server_settings_countdown = 0;
+        self.server_settings_error = None;
+        self.bench_running = false;
+        self.bench_result = None;
+    }
+
+    fn update_inner(&mut self, msg: Message) -> Task<Message> {
         match msg {
+            Message::SessionReply(..) => return Task::none(),
             Message::Connect => {
                 // 3c: a new connection attempt starts clean — any fallback
                 // badge from a previous session must not persist into this
@@ -1155,6 +1219,7 @@ impl App {
                 self.bootstrap_fallback = false;
                 if let Some(k) = self.storage.selected_key() {
                     let key = k.key.clone();
+                    self.invalidate_session_views();
                     // Kill any existing child before starting a new connection to
                     // avoid leaking a zombie VPN process when the user reconnects.
                     let mut guard = match self.child_handle.lock() {
@@ -1170,7 +1235,7 @@ impl App {
                         // reconnect path below.
                         self.pending_connect = true;
                         self.connection_key = None;
-                        return Task::perform(terminate_adopted_wait(pid, starttime), |_| {
+                        return session_task(terminate_adopted_wait(pid, starttime), |_| {
                             Message::OldClientReaped
                         });
                     }
@@ -1185,7 +1250,7 @@ impl App {
                         // Task — the UI thread is never blocked.
                         self.pending_connect = true;
                         self.connection_key = None;
-                        return Task::perform(
+                        return session_task(
                             terminate_child_wait(child, self.launched_kill_switch, true),
                             |_| Message::OldClientReaped,
                         );
@@ -1220,6 +1285,7 @@ impl App {
                 }
             }
             Message::Disconnect => {
+                self.invalidate_session_views();
                 self.pending_connect = false;
                 self.connection_key = None;
                 let reap_task = if let Some((pid, starttime)) = self.adopted_client.take() {
@@ -1229,7 +1295,7 @@ impl App {
                     // old client's late route restore / kill-switch clear
                     // would tear down the new session.
                     self.adopted_reap_in_flight = true;
-                    Task::perform(terminate_adopted_wait(pid, starttime), |_| {
+                    session_task(terminate_adopted_wait(pid, starttime), |_| {
                         Message::OldClientReaped
                     })
                 } else {
@@ -1252,6 +1318,11 @@ impl App {
                 return reap_task;
             }
             Message::StatusReceived(s) => {
+                if matches!(s, VpnStatus::Disconnected)
+                    && matches!(self.status, VpnStatus::Error(_))
+                {
+                    return Task::none();
+                }
                 // While a reconnect waits for the old client's reap, the old
                 // (cancelled) worker stream may still deliver stale statuses —
                 // including a stale Connected. Drop them ALL so a dead session
@@ -1307,6 +1378,7 @@ impl App {
                     }
                 }
                 if became_disconnected {
+                    self.invalidate_session_views();
                     self.admin_role = None;
                     self.admin_open = false;
                     self.admin_clients.clear();
@@ -1331,7 +1403,7 @@ impl App {
                     self.admin_clients.clear();
                     self.admin_clients_loading = false;
                     self.admin_error = None;
-                    return Task::perform(admin::get_role(), Message::AdminRoleLoaded);
+                    return session_task(admin::get_role(), Message::AdminRoleLoaded);
                 }
             }
             Message::BootstrapFallbackDetected => {
@@ -1347,7 +1419,7 @@ impl App {
                 self.logs_open = !self.logs_open;
             }
             Message::SaveLog => {
-                return Task::perform(
+                return session_task(
                     async {
                         rfd::AsyncFileDialog::new()
                             .set_file_name("aivpn-debug.log")
@@ -1367,6 +1439,7 @@ impl App {
             Message::SelectProfile(idx) => {
                 if idx < self.storage.keys.len() {
                     self.storage.selected = Some(idx);
+                    self.storage.save();
                 }
             }
             Message::ShowAddDialog => {
@@ -1618,7 +1691,7 @@ impl App {
                     // (kill-switch rules) before the window closes and
                     // kill_on_drop SIGKILLs it.
                     self.shutdown_child_blocking();
-                    return iced::window::get_oldest().then(|opt_id| {
+                    return iced::window::oldest().then(|opt_id| {
                         if let Some(wid) = opt_id {
                             iced::window::close(wid)
                         } else {
@@ -1628,7 +1701,7 @@ impl App {
                 }
                 crate::tray::TrayAction::Open => {
                     // Restore window from tray (it may have been minimized via close button)
-                    return iced::window::get_oldest().then(|opt_id| {
+                    return iced::window::oldest().then(|opt_id| {
                         if let Some(wid) = opt_id {
                             iced::window::minimize(wid, false)
                         } else {
@@ -1666,10 +1739,11 @@ impl App {
                 };
                 self.recording_state = RecordingState::Active(svc.clone());
                 let binary = find_client_binary().ok();
-                return Task::perform(
+                return session_task(
                     async move {
                         if let Some(bin) = binary {
                             let _ = tokio::process::Command::new(&bin)
+                                .env_remove("AIVPN_ADMIN_LISTEN")
                                 .args(["record", "start", "--service", &svc])
                                 .output()
                                 .await;
@@ -1681,10 +1755,11 @@ impl App {
             Message::StopRecording => {
                 self.recording_state = RecordingState::Stopping;
                 let binary = find_client_binary().ok();
-                return Task::perform(
+                return session_task(
                     async move {
                         if let Some(bin) = binary {
                             let _ = tokio::process::Command::new(&bin)
+                                .env_remove("AIVPN_ADMIN_LISTEN")
                                 .args(["record", "stop"])
                                 .output()
                                 .await;
@@ -1743,7 +1818,7 @@ impl App {
                     .map(|k| k.key.clone())
                     .unwrap_or_default();
                 let binary = find_client_binary().ok();
-                return Task::perform(
+                return session_task(
                     async move {
                         let bin = binary?;
                         if key.is_empty() {
@@ -1757,6 +1832,9 @@ impl App {
                         // scrubs it from its own env right after parsing.
                         let out = tokio::process::Command::new(&bin)
                             .env("AIVPN_CONNECTION_KEY", &key)
+                            .env("AIVPN_ADMIN_TOKEN", admin::pinned_token()?)
+                            .env_remove("AIVPN_ADMIN_LISTEN")
+                            .kill_on_drop(true)
                             .args(["bench", "--duration", "5", "--json"])
                             .output()
                             .await
@@ -1767,11 +1845,13 @@ impl App {
                             let srv =
                                 extract_server_addr(&key).unwrap_or_else(|| "unknown".to_string());
                             Some(format!(
-                                "{srv}  P50: {:.0}ms  P95: {:.0}ms  Loss: {:.1}%  Q: {}%",
+                                "{srv}  P50: {:.0}ms  P95: {:.0}ms  Loss: {:.1}%  Q: {}%  ↑ {:.0} ↓ {:.0} kbps",
                                 v["latency_p50_ms"].as_f64().unwrap_or(0.0),
                                 v["latency_p95_ms"].as_f64().unwrap_or(0.0),
                                 v["packet_loss_pct"].as_f64().unwrap_or(0.0),
                                 v["quality_score"].as_u64().unwrap_or(0),
+                                v["throughput_up_kbps"].as_f64().unwrap_or(0.0),
+                                v["throughput_down_kbps"].as_f64().unwrap_or(0.0),
                             ))
                         } else {
                             let stderr = String::from_utf8_lossy(&out.stderr).to_string();
@@ -1805,7 +1885,7 @@ impl App {
                 {
                     self.admin_clients_loading = true;
                     self.admin_error = None;
-                    tasks.push(Task::perform(
+                    tasks.push(session_task(
                         admin::list_clients(),
                         Message::AdminClientsLoaded,
                     ));
@@ -1823,7 +1903,7 @@ impl App {
                     && !self.pool_loading
                 {
                     self.pool_loading = true;
-                    tasks.push(Task::perform(admin::pool_nodes(), Message::PoolNodesLoaded));
+                    tasks.push(session_task(admin::pool_nodes(), Message::PoolNodesLoaded));
                 }
                 return Task::batch(tasks);
             }
@@ -1837,7 +1917,7 @@ impl App {
                         && !self.admin_clients_loading
                     {
                         self.admin_clients_loading = true;
-                        tasks.push(Task::perform(
+                        tasks.push(session_task(
                             admin::list_clients(),
                             Message::AdminClientsLoaded,
                         ));
@@ -1852,7 +1932,7 @@ impl App {
                         && !self.pool_loading
                     {
                         self.pool_loading = true;
-                        tasks.push(Task::perform(admin::pool_nodes(), Message::PoolNodesLoaded));
+                        tasks.push(session_task(admin::pool_nodes(), Message::PoolNodesLoaded));
                     }
                     return Task::batch(tasks);
                 }
@@ -1871,7 +1951,7 @@ impl App {
             Message::AdminRefreshClients => {
                 self.admin_clients_loading = true;
                 self.admin_error = None;
-                return Task::perform(admin::list_clients(), Message::AdminClientsLoaded);
+                return session_task(admin::list_clients(), Message::AdminClientsLoaded);
             }
             Message::AdminClientsLoaded(result) => {
                 self.admin_clients_loading = false;
@@ -1905,18 +1985,19 @@ impl App {
                     expires_at: self.admin_new_expires.trim().to_string(),
                     exit_node: self.admin_new_exit_node.trim().to_string(),
                 };
-                return Task::perform(admin::add_client(args), Message::AdminAddClientResult);
+                return session_task(admin::add_client(args), Message::AdminAddClientResult);
             }
             Message::AdminAddClientResult(result) => {
                 self.admin_busy_id = None;
                 match result {
-                    Ok(client) => {
+                    Ok(outcome) => {
+                        let client = outcome.client;
                         self.admin_clients.push(client);
                         self.admin_new_name.clear();
                         self.admin_new_one_time = false;
                         self.admin_new_expires.clear();
                         self.admin_new_exit_node.clear();
-                        self.admin_error = None;
+                        self.admin_error = outcome.warning;
                     }
                     Err(e) => self.admin_error = Some(e),
                 }
@@ -1930,7 +2011,7 @@ impl App {
                     enabled: Some(enabled),
                     ..Default::default()
                 };
-                return Task::perform(
+                return session_task(
                     async move { admin::update_client(&id, args).await },
                     Message::AdminToggleEnabledResult,
                 );
@@ -1992,7 +2073,7 @@ impl App {
                             Some(exit_node)
                         }),
                     };
-                    return Task::perform(
+                    return session_task(
                         async move { admin::update_client(&id, args).await },
                         Message::AdminEditResult,
                     );
@@ -2020,7 +2101,7 @@ impl App {
                     return Task::none();
                 }
                 self.admin_busy_id = Some(id.clone());
-                return Task::perform(
+                return session_task(
                     async move {
                         let r = admin::reset_device(&id).await;
                         (id, r)
@@ -2035,7 +2116,7 @@ impl App {
                         self.admin_error = None;
                         self.push_log(format!("[admin] Device binding reset for {id}"));
                         self.admin_clients_loading = true;
-                        return Task::perform(admin::list_clients(), Message::AdminClientsLoaded);
+                        return session_task(admin::list_clients(), Message::AdminClientsLoaded);
                     }
                     Err(e) => self.admin_error = Some(e),
                 }
@@ -2052,7 +2133,7 @@ impl App {
                     return Task::none();
                 }
                 self.admin_busy_id = Some(id.clone());
-                return Task::perform(
+                return session_task(
                     async move {
                         let r = admin::revoke_client(&id).await;
                         (id, r)
@@ -2080,7 +2161,7 @@ impl App {
                     return Task::none();
                 }
                 self.admin_busy_id = Some(id.clone());
-                return Task::perform(
+                return session_task(
                     async move {
                         let r = admin::connection_key(&id).await;
                         (id, r)
@@ -2107,7 +2188,7 @@ impl App {
                 return iced::clipboard::write(text);
             }
             Message::AdminSaveKeyToFile => {
-                return Task::perform(
+                return session_task(
                     async {
                         rfd::AsyncFileDialog::new()
                             .set_file_name("aivpn-connection-key.txt")
@@ -2135,7 +2216,7 @@ impl App {
                     return Task::none();
                 };
                 self.admin_qr_loading = Some(id.clone());
-                return Task::perform(
+                return session_task(
                     async move {
                         let r = admin::qr_png(text).await;
                         (id, r)
@@ -2154,7 +2235,7 @@ impl App {
                 }
             }
             Message::AdminSaveQrToFile => {
-                return Task::perform(
+                return session_task(
                     async {
                         rfd::AsyncFileDialog::new()
                             .set_file_name("aivpn-connection-qr.png")
@@ -2180,8 +2261,8 @@ impl App {
                     self.pool_loading = true;
                     self.pool_error = None;
                     return Task::batch([
-                        Task::perform(admin::pool_nodes(), Message::PoolNodesLoaded),
-                        Task::perform(admin::pool_health(), Message::PoolHealthLoaded),
+                        session_task(admin::pool_nodes(), Message::PoolNodesLoaded),
+                        session_task(admin::pool_health(), Message::PoolHealthLoaded),
                     ]);
                 }
             }
@@ -2189,8 +2270,8 @@ impl App {
                 self.pool_loading = true;
                 self.pool_error = None;
                 return Task::batch([
-                    Task::perform(admin::pool_nodes(), Message::PoolNodesLoaded),
-                    Task::perform(admin::pool_health(), Message::PoolHealthLoaded),
+                    session_task(admin::pool_nodes(), Message::PoolNodesLoaded),
+                    session_task(admin::pool_health(), Message::PoolHealthLoaded),
                 ]);
             }
             Message::PoolNodesLoaded(result) => {
@@ -2217,13 +2298,13 @@ impl App {
                 if self.audit_open && self.audit_entries.is_empty() && !self.audit_loading {
                     self.audit_loading = true;
                     self.audit_error = None;
-                    return Task::perform(admin::audit_log(), Message::AuditLogLoaded);
+                    return session_task(admin::audit_log(), Message::AuditLogLoaded);
                 }
             }
             Message::AuditRefresh => {
                 self.audit_loading = true;
                 self.audit_error = None;
-                return Task::perform(admin::audit_log(), Message::AuditLogLoaded);
+                return session_task(admin::audit_log(), Message::AuditLogLoaded);
             }
             Message::AuditLogLoaded(result) => {
                 self.audit_loading = false;
@@ -2251,14 +2332,14 @@ impl App {
                     if self.admin_clients.is_empty() && !self.admin_clients_loading {
                         self.admin_clients_loading = true;
                         self.admin_error = None;
-                        tasks.push(Task::perform(
+                        tasks.push(session_task(
                             admin::list_clients(),
                             Message::AdminClientsLoaded,
                         ));
                     }
                     if self.pool_nodes.is_empty() && !self.pool_loading {
                         self.pool_loading = true;
-                        tasks.push(Task::perform(admin::pool_nodes(), Message::PoolNodesLoaded));
+                        tasks.push(session_task(admin::pool_nodes(), Message::PoolNodesLoaded));
                     }
                 }
                 return Task::batch(tasks);
@@ -2278,7 +2359,7 @@ impl App {
                         self.server_settings_busy = true;
                         self.server_settings_error = None;
                         self.server_settings_rolled_back = false;
-                        return Task::perform(
+                        return session_task(
                             admin::apply_config(ConfigSetting::ActiveMask { client, mask }),
                             |result| {
                                 Message::ServerSettingsApplyResult(
@@ -2290,13 +2371,25 @@ impl App {
                     }
                 }
             }
-            Message::ServerSettingsExitNodeChanged(s) => self.server_settings_exit_node = s,
-            Message::ServerSettingsExitNodePicked(choice) => match choice.selection {
-                ExitNodeSelection::Default => self.server_settings_exit_node.clear(),
-                ExitNodeSelection::Node(addr) => self.server_settings_exit_node = addr,
-                ExitNodeSelection::Custom => {}
-            },
+            Message::ServerSettingsExitNodeChanged(s) => {
+                self.server_settings_exit_selected = !s.trim().is_empty();
+                self.server_settings_exit_node = s;
+            }
+            Message::ServerSettingsExitNodePicked(choice) => {
+                self.server_settings_exit_selected = true;
+                match choice.selection {
+                    ExitNodeSelection::Default => self.server_settings_exit_node.clear(),
+                    ExitNodeSelection::Node(addr) => self.server_settings_exit_node = addr,
+                    ExitNodeSelection::Custom => {
+                        self.server_settings_exit_selected =
+                            !self.server_settings_exit_node.trim().is_empty()
+                    }
+                }
+            }
             Message::ServerSettingsApplyExitNode => {
+                if !self.server_settings_exit_selected {
+                    return Task::none();
+                }
                 if !self.server_settings_busy && self.server_settings_pending.is_none() {
                     self.server_settings_busy = true;
                     self.server_settings_error = None;
@@ -2307,7 +2400,7 @@ impl App {
                     } else {
                         Some(trimmed.to_string())
                     };
-                    return Task::perform(
+                    return session_task(
                         admin::apply_config(ConfigSetting::ExitNode(addr)),
                         |result| {
                             Message::ServerSettingsApplyResult(
@@ -2344,7 +2437,7 @@ impl App {
                     if let Some((token, _)) = self.server_settings_pending.clone() {
                         self.server_settings_busy = true;
                         self.server_settings_error = None;
-                        return Task::perform(
+                        return session_task(
                             admin::confirm_config(token),
                             Message::ServerSettingsConfirmResult,
                         );
@@ -2420,7 +2513,7 @@ impl App {
             Message::InstallBinaryUrlChanged(s) => self.install_binary_url = s,
             Message::InstallBinaryFileChanged(s) => self.install_binary_file = s,
             Message::InstallBinaryFileBrowse => {
-                return Task::perform(
+                return session_task(
                     async {
                         rfd::AsyncFileDialog::new()
                             .pick_file()
@@ -2442,7 +2535,7 @@ impl App {
             Message::InstallShowScript => {
                 self.install_script_open = true;
                 if self.install_script.is_none() {
-                    return Task::perform(
+                    return session_task(
                         install_wizard::fetch_script(),
                         Message::InstallScriptLoaded,
                     );
@@ -2471,7 +2564,7 @@ impl App {
                 };
                 self.install_probing = true;
                 self.install_error = None;
-                return Task::perform(
+                return session_task(
                     install_wizard::probe(host, port, user),
                     Message::InstallProbeResult,
                 );
@@ -2610,14 +2703,9 @@ impl App {
                         line.push_str(&format!(": {m}"));
                     }
                     self.install_log.push(line);
-                    if let Some(ck) = connection_key {
-                        self.install_connection_key = Some(ck.clone());
-                        // G-C1: auto-import — "install → immediately
-                        // connected as admin", no mandatory manual click.
-                        // Guarded so a re-delivered/duplicate marker line
-                        // can never add the same profile twice.
-                        if self.install_profile_imported.is_none() {
-                            self.import_installed_key(ck);
+                    if status == "ok" && matches!(step.as_str(), "done" | "client_done") {
+                        if let Some(ck) = connection_key {
+                            self.install_connection_key = Some(ck);
                         }
                     }
                 }
@@ -2626,6 +2714,11 @@ impl App {
                 self.install_running = false;
                 self.install_exit_code = Some(code);
                 self.install_target = None;
+                if code == 0 && self.install_profile_imported.is_none() {
+                    if let Some(key) = self.install_connection_key.clone() {
+                        self.import_installed_key(key);
+                    }
+                }
             }
             Message::InstallWizardSpawnError(e) => {
                 self.install_running = false;
@@ -2744,221 +2837,202 @@ impl App {
                 let bootstrap_github = self.settings.bootstrap_github.clone();
                 let server_signing_key = self.settings.server_signing_key.clone();
                 let lang_clone = self.settings.lang.clone();
-                let stream = iced::stream::channel(64, move |mut sender| async move {
-                    let binary = match find_client_binary() {
-                        Ok(b) => b,
-                        Err(e) => {
-                            let _ = sender.try_send(Message::StatusReceived(VpnStatus::Error(e)));
-                            return;
-                        }
-                    };
-
-                    let binary = if is_root() {
-                        binary
-                    } else {
-                        match privilege::ensure_capable_binary(&binary, &lang_clone, &mut sender)
-                            .await
-                        {
-                            Ok(p) => p,
-                            Err(hint) => {
-                                let _ = sender.try_send(Message::LogLine(hint));
-                                binary
+                let stream = iced::stream::channel(
+                    64,
+                    move |mut sender: iced::futures::channel::mpsc::Sender<Message>| async move {
+                        let binary = match find_client_binary() {
+                            Ok(b) => b,
+                            Err(e) => {
+                                let _ =
+                                    sender.try_send(Message::StatusReceived(VpnStatus::Error(e)));
+                                return;
                             }
-                        }
-                    };
-                    let launch_params = vpn_manager::ClientLaunchParams {
-                        full_tunnel,
-                        mtls_cert,
-                        kill_switch,
-                        adaptive_level,
-                        dns_proxy,
-                        exclude_routes,
-                        include_routes,
-                        socks5_enabled,
-                        socks5_addr,
-                        preferred_mask,
-                        polymorphic_mask,
-                        share_mask_feedback,
-                        receive_mask_hints,
-                        country_code,
-                        bootstrap_cdn_url,
-                        bootstrap_telegram_token,
-                        bootstrap_telegram_chat,
-                        bootstrap_github,
-                        server_signing_key,
-                    };
-                    let mut cmd = vpn_manager::build_client_command(&binary, &key, &launch_params);
-                    // The section may have selected an alternative transport.
-                    // It travels neutrally: a name plus a base64 parameter blob
-                    // this GUI never parses. Absent → the client uses direct UDP.
-                    if let Some(cfg) = &ext_transport {
-                        use base64::Engine as _;
-                        cmd.env("AIVPN_TRANSPORT", cfg.name());
-                        cmd.env(
-                            "AIVPN_TRANSPORT_PARAMS",
-                            base64::engine::general_purpose::STANDARD.encode(cfg.params()),
-                        );
-                    }
+                        };
 
-                    let mut child = match cmd.spawn() {
-                        Ok(c) => c,
-                        Err(e) => {
+                        let binary = if is_root() {
+                            binary
+                        } else {
+                            match privilege::ensure_capable_binary(
+                                &binary,
+                                &lang_clone,
+                                &mut sender,
+                            )
+                            .await
+                            {
+                                Ok(p) => p,
+                                Err(hint) => {
+                                    let _ = sender.try_send(Message::LogLine(hint));
+                                    binary
+                                }
+                            }
+                        };
+                        let launch_params = vpn_manager::ClientLaunchParams {
+                            full_tunnel,
+                            mtls_cert,
+                            kill_switch,
+                            adaptive_level,
+                            dns_proxy,
+                            exclude_routes,
+                            include_routes,
+                            socks5_enabled,
+                            socks5_addr,
+                            preferred_mask,
+                            polymorphic_mask,
+                            share_mask_feedback,
+                            receive_mask_hints,
+                            country_code,
+                            bootstrap_cdn_url,
+                            bootstrap_telegram_token,
+                            bootstrap_telegram_chat,
+                            bootstrap_github,
+                            server_signing_key,
+                        };
+                        let mut cmd =
+                            vpn_manager::build_client_command(&binary, &key, &launch_params);
+                        // The section may have selected an alternative transport.
+                        // It travels neutrally: a name plus a base64 parameter blob
+                        // this GUI never parses. Absent → the client uses direct UDP.
+                        if let Some(cfg) = &ext_transport {
+                            use base64::Engine as _;
+                            cmd.env("AIVPN_TRANSPORT", cfg.name());
+                            cmd.env(
+                                "AIVPN_TRANSPORT_PARAMS",
+                                base64::engine::general_purpose::STANDARD.encode(cfg.params()),
+                            );
+                        }
+
+                        let mut child = match cmd.spawn() {
+                            Ok(c) => c,
+                            Err(e) => {
+                                let _ = sender.try_send(Message::StatusReceived(VpnStatus::Error(
+                                    format!("Launch failed: {e}"),
+                                )));
+                                return;
+                            }
+                        };
+
+                        // Take the pipes and publish the child handle immediately -
+                        // no awaits or early returns in between. Any path that
+                        // drops the Child before it reaches child_handle fires
+                        // kill_on_drop's SIGKILL, bypassing the client's
+                        // kill-switch cleanup (traffic blackout).
+                        let stdout = child.stdout.take();
+                        let stderr = child.stderr.take();
+                        let child_pid = child.id();
+                        match child_handle.lock() {
+                            Ok(mut guard) => *guard = Some(child),
+                            Err(e) => *e.into_inner() = Some(child),
+                        }
+                        if let Some(pid) = child_pid {
+                            write_client_pidfile(pid);
+                        }
+                        let (Some(stdout), Some(stderr)) = (stdout, stderr) else {
+                            // Should be impossible with piped stdio - terminate
+                            // the already-published child gracefully, never drop
+                            // it.
+                            let taken = match child_handle.lock() {
+                                Ok(mut g) => g.take(),
+                                Err(e) => e.into_inner().take(),
+                            };
+                            if let Some(c) = taken {
+                                terminate_child_graceful(c, kill_switch);
+                            }
                             let _ = sender.try_send(Message::StatusReceived(VpnStatus::Error(
-                                format!("Launch failed: {e}"),
+                                "stdout/stderr pipe unavailable".to_string(),
                             )));
                             return;
-                        }
-                    };
+                        };
+                        let _ = sender
+                            .send(Message::StatusReceived(VpnStatus::Connecting))
+                            .await;
 
-                    // Take the pipes and publish the child handle immediately —
-                    // no awaits or early returns in between. Any path that
-                    // drops the Child before it reaches child_handle fires
-                    // kill_on_drop's SIGKILL, bypassing the client's
-                    // kill-switch cleanup (traffic blackout).
-                    let stdout = child.stdout.take();
-                    let stderr = child.stderr.take();
-                    let child_pid = child.id();
-                    match child_handle.lock() {
-                        Ok(mut guard) => *guard = Some(child),
-                        Err(e) => *e.into_inner() = Some(child),
-                    }
-                    if let Some(pid) = child_pid {
-                        write_client_pidfile(pid);
-                    }
-                    let (Some(stdout), Some(stderr)) = (stdout, stderr) else {
-                        // Should be impossible with piped stdio — terminate
-                        // the already-published child gracefully, never drop
-                        // it.
-                        let taken = match child_handle.lock() {
+                        let mut out = BufReader::new(stdout).lines();
+                        let mut err = BufReader::new(stderr).lines();
+
+                        // Preferred, machine-readable status protocol: newer
+                        // clients print "AIVPN-STATUS connected <vpn_ip>" /
+                        // "AIVPN-STATUS reconnecting" / "AIVPN-STATUS disconnected"
+                        // on stdout. A reconnecting client DEMOTES the UI to
+                        // Connecting instead of showing Connected over a dead,
+                        // silently-retrying tunnel.
+                        let parse_status_line = vpn_manager::parse_output_line;
+
+                        // Локальная настройка TUN не подтверждает ответ сервера.
+                        let line_messages = |l: &str| -> Vec<Message> {
+                            let mut msgs = Vec::new();
+                            // 3c: orthogonal to VpnStatus (can co-occur with
+                            // Connecting/Connected), so it's dispatched
+                            // separately rather than through parse_status_line.
+                            if l.trim() == "AIVPN-STATUS bootstrap-fallback" {
+                                msgs.push(Message::BootstrapFallbackDetected);
+                            }
+                            if let Some(status) = parse_status_line(l) {
+                                msgs.push(Message::StatusReceived(status));
+                            }
+                            msgs
+                        };
+
+                        // Drain BOTH streams to their own EOF (same fix as the
+                        // install-wizard subscription): on child exit both pipes
+                        // EOF and `select!` polls in random order - a bare
+                        // `_ => break` on whichever EOF lands first silently
+                        // dropped final status lines (e.g. "AIVPN-STATUS
+                        // rejected <reason>") still buffered on the OTHER
+                        // stream. Status/log messages are `send().await`ed (not
+                        // `try_send`) so a burst of log lines can never overflow
+                        // the channel and silently drop a status transition.
+                        let mut out_done = false;
+                        let mut err_done = false;
+                        loop {
+                            tokio::select! {
+                                line = out.next_line(), if !out_done => match line {
+                                    Ok(Some(l)) => {
+                                        for m in line_messages(&l) {
+                                            let _ = sender.send(m).await;
+                                        }
+                                        let _ = sender.send(Message::LogLine(strip_ansi(&l))).await;
+                                    }
+                                    _ => out_done = true,
+                                },
+                                line = err.next_line(), if !err_done => match line {
+                                    Ok(Some(l)) => {
+                                        for m in line_messages(&l) {
+                                            let _ = sender.send(m).await;
+                                        }
+                                        let _ = sender
+                                            .send(Message::LogLine(format!("[err] {}", strip_ansi(&l))))
+                                            .await;
+                                    }
+                                    _ => err_done = true,
+                                },
+                                else => break,
+                            }
+                            if out_done && err_done {
+                                break;
+                            }
+                        }
+
+                        // The child has exited; reap it so it doesn't linger as a zombie
+                        // until the next Connect/Disconnect. Take it out of the shared
+                        // handle first (Disconnect may have already taken it) and wait
+                        // without holding the std mutex across the await.
+                        let reaped = match child_handle.lock() {
                             Ok(mut g) => g.take(),
                             Err(e) => e.into_inner().take(),
                         };
-                        if let Some(c) = taken {
-                            terminate_child_graceful(c, kill_switch);
+                        if let Some(mut c) = reaped {
+                            let _ = c.wait().await;
                         }
-                        let _ = sender.try_send(Message::StatusReceived(VpnStatus::Error(
-                            "stdout/stderr pipe unavailable".to_string(),
-                        )));
-                        return;
-                    };
-                    let _ = sender
-                        .send(Message::StatusReceived(VpnStatus::Connecting))
-                        .await;
-
-                    let mut out = BufReader::new(stdout).lines();
-                    let mut err = BufReader::new(stderr).lines();
-
-                    // Preferred, machine-readable status protocol: newer
-                    // clients print "AIVPN-STATUS connected <vpn_ip>" /
-                    // "AIVPN-STATUS reconnecting" / "AIVPN-STATUS disconnected"
-                    // on stdout. A reconnecting client DEMOTES the UI to
-                    // Connecting instead of showing Connected over a dead,
-                    // silently-retrying tunnel.
-                    let parse_status_line = vpn_manager::parse_status_line;
-
-                    // Fallback heuristic for OLDER clients only: detects the
-                    // "Connected to server at ..." / TUN-ready log line. The
-                    // client's tracing subscriber writes to stderr (not stdout —
-                    // see 9c84bf7, so bench --json's stdout output stays clean),
-                    // so this line always arrives via `err`, never `out`; still
-                    // checked on both streams in case a future client build ever
-                    // emits it differently.
-                    let check_connected = |l: &str| -> Option<Message> {
-                        if l.contains("Connected") || l.contains("TUN interface") {
-                            let ip = l
-                                .split_whitespace()
-                                .find(|t| t.contains('.') && t.contains('/'))
-                                .map(|s| s.to_string())
-                                .unwrap_or_default();
-                            Some(Message::StatusReceived(VpnStatus::Connected { vpn_ip: ip }))
-                        } else {
-                            None
-                        }
-                    };
-
-                    // Once one machine-readable line has been seen the
-                    // heuristic is disabled for the rest of the session: it
-                    // substring-matches log prose ("Reconnected", pre-handshake
-                    // "TUN interface") and would fight the authoritative
-                    // protocol.
-                    let mut saw_status_line = false;
-                    let mut line_messages = |l: &str| -> Vec<Message> {
-                        let mut msgs = Vec::new();
-                        // 3c: orthogonal to VpnStatus (can co-occur with
-                        // Connecting/Connected), so it's dispatched
-                        // separately rather than through parse_status_line.
-                        if l.trim() == "AIVPN-STATUS bootstrap-fallback" {
-                            msgs.push(Message::BootstrapFallbackDetected);
-                        }
-                        if let Some(status) = parse_status_line(l) {
-                            saw_status_line = true;
-                            msgs.push(Message::StatusReceived(status));
-                        } else if !saw_status_line {
-                            msgs.extend(check_connected(l));
-                        }
-                        msgs
-                    };
-
-                    // Drain BOTH streams to their own EOF (same fix as the
-                    // install-wizard subscription): on child exit both pipes
-                    // EOF and `select!` polls in random order — a bare
-                    // `_ => break` on whichever EOF lands first silently
-                    // dropped final status lines (e.g. "AIVPN-STATUS
-                    // rejected <reason>") still buffered on the OTHER
-                    // stream. Status/log messages are `send().await`ed (not
-                    // `try_send`) so a burst of log lines can never overflow
-                    // the channel and silently drop a status transition.
-                    let mut out_done = false;
-                    let mut err_done = false;
-                    loop {
-                        tokio::select! {
-                            line = out.next_line(), if !out_done => match line {
-                                Ok(Some(l)) => {
-                                    for m in line_messages(&l) {
-                                        let _ = sender.send(m).await;
-                                    }
-                                    let _ = sender.send(Message::LogLine(strip_ansi(&l))).await;
-                                }
-                                _ => out_done = true,
-                            },
-                            line = err.next_line(), if !err_done => match line {
-                                Ok(Some(l)) => {
-                                    for m in line_messages(&l) {
-                                        let _ = sender.send(m).await;
-                                    }
-                                    let _ = sender
-                                        .send(Message::LogLine(format!("[err] {}", strip_ansi(&l))))
-                                        .await;
-                                }
-                                _ => err_done = true,
-                            },
-                            else => break,
-                        }
-                        if out_done && err_done {
-                            break;
-                        }
-                    }
-
-                    // The child has exited; reap it so it doesn't linger as a zombie
-                    // until the next Connect/Disconnect. Take it out of the shared
-                    // handle first (Disconnect may have already taken it) and wait
-                    // without holding the std mutex across the await.
-                    let reaped = match child_handle.lock() {
-                        Ok(mut g) => g.take(),
-                        Err(e) => e.into_inner().take(),
-                    };
-                    if let Some(mut c) = reaped {
-                        let _ = c.wait().await;
-                    }
-                    remove_client_pidfile();
-                    // send().await, not try_send: this terminal status is what
-                    // lets the UI leave Connected/Connecting — if it were
-                    // dropped on a full channel the status would stick forever.
-                    let _ = sender
-                        .send(Message::StatusReceived(VpnStatus::Disconnected))
-                        .await;
-                });
-                Subscription::run_with_id("aivpn_worker", stream)
+                        remove_client_pidfile();
+                        // send().await, not try_send: this terminal status is what
+                        // lets the UI leave Connected/Connecting - if it were
+                        // dropped on a full channel the status would stick forever.
+                        let _ = sender
+                            .send(Message::StatusReceived(VpnStatus::Disconnected))
+                            .await;
+                    },
+                );
+                crate::subscription::from_stream("aivpn_worker", stream)
             }
             None => Subscription::none(),
         };
@@ -2972,14 +3046,17 @@ impl App {
             None => Subscription::none(),
         };
 
-        let stats_stream = iced::stream::channel(4, |mut sender| async move {
-            loop {
-                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                let stats = read_traffic_stats();
-                let _ = sender.try_send(Message::StatsRefresh(stats));
-            }
-        });
-        let stats_sub = Subscription::run_with_id("stats_poll", stats_stream);
+        let stats_stream = iced::stream::channel(
+            4,
+            |mut sender: iced::futures::channel::mpsc::Sender<Message>| async move {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    let stats = read_traffic_stats();
+                    let _ = sender.try_send(Message::StatsRefresh(stats));
+                }
+            },
+        );
+        let stats_sub = crate::subscription::from_stream("stats_poll", stats_stream);
 
         let tray_sub = Self::tray_subscription();
         let close_sub = Self::close_subscription();
@@ -2989,14 +3066,17 @@ impl App {
             self.recording_state,
             RecordingState::Active(_) | RecordingState::Stopping
         ) {
-            let stream = iced::stream::channel(4, |mut sender| async move {
-                loop {
-                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                    let snap = read_recording_status();
-                    let _ = sender.try_send(Message::RecordingPoll(snap));
-                }
-            });
-            Subscription::run_with_id("recording_poll", stream)
+            let stream = iced::stream::channel(
+                4,
+                |mut sender: iced::futures::channel::mpsc::Sender<Message>| async move {
+                    loop {
+                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                        let snap = read_recording_status();
+                        let _ = sender.try_send(Message::RecordingPoll(snap));
+                    }
+                },
+            );
+            crate::subscription::from_stream("recording_poll", stream)
         } else {
             Subscription::none()
         };
@@ -3007,13 +3087,16 @@ impl App {
         // that flips (same conditional-inclusion pattern as `recording_sub`
         // above) rather than needing its own explicit start/stop messages.
         let server_settings_countdown_sub = if self.server_settings_pending.is_some() {
-            let stream = iced::stream::channel(4, |mut sender| async move {
-                loop {
-                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                    let _ = sender.try_send(Message::ServerSettingsCountdownTick);
-                }
-            });
-            Subscription::run_with_id("server_settings_countdown", stream)
+            let stream = iced::stream::channel(
+                4,
+                |mut sender: iced::futures::channel::mpsc::Sender<Message>| async move {
+                    loop {
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                        let _ = sender.try_send(Message::ServerSettingsCountdownTick);
+                    }
+                },
+            );
+            crate::subscription::from_stream("server_settings_countdown", stream)
         } else {
             Subscription::none()
         };
@@ -3030,19 +3113,22 @@ impl App {
     }
 
     fn tray_subscription() -> Subscription<Message> {
-        let stream = iced::stream::channel(8, |mut sender| async move {
-            let mut rx = match crate::tray::spawn().await {
-                Ok(rx) => rx,
-                Err(e) => {
-                    tracing::warn!("Tray icon creation failed: {e}");
-                    return;
+        let stream = iced::stream::channel(
+            8,
+            |mut sender: iced::futures::channel::mpsc::Sender<Message>| async move {
+                let mut rx = match crate::tray::spawn().await {
+                    Ok(rx) => rx,
+                    Err(e) => {
+                        tracing::warn!("Tray icon creation failed: {e}");
+                        return;
+                    }
+                };
+                while let Some(action) = rx.recv().await {
+                    let _ = sender.try_send(Message::TrayEvent(action));
                 }
-            };
-            while let Some(action) = rx.recv().await {
-                let _ = sender.try_send(Message::TrayEvent(action));
-            }
-        });
-        Subscription::run_with_id("tray_ksni", stream)
+            },
+        );
+        crate::subscription::from_stream("tray_ksni", stream)
     }
 
     fn close_subscription() -> Subscription<Message> {
@@ -3070,4 +3156,11 @@ impl App {
             self.log_lines.drain(0..excess);
         }
     }
+}
+
+fn session_task<A: Send + 'static>(
+    future: impl std::future::Future<Output = A> + Send + 'static,
+    mapper: impl FnOnce(A) -> Message + Send + 'static,
+) -> Task<Message> {
+    Task::perform(admin::pin_session(future), mapper)
 }

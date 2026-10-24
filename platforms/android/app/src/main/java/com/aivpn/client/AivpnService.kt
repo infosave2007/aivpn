@@ -22,7 +22,6 @@ import kotlinx.coroutines.*
 import org.json.JSONObject
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
-import java.net.Inet4Address
 import java.net.InetAddress
 
 /**
@@ -57,7 +56,7 @@ class AivpnService : VpnService() {
         private const val NOTIFICATION_ALERT_ID = 3
         // Match the desktop client's WAN-safe TUN MTU so encrypted outer UDP
         // datagrams stay below the path-MTU ceiling on real networks.
-        private const val DEFAULT_TUN_MTU = 1346
+        private const val DEFAULT_TUN_MTU = TunnelMtu.DEFAULT
         private const val ADAPTIVE_TUN_MTU = 1200
         private const val LEGACY_PREFIX_LEN = 24
         private const val INITIAL_RETRY_DELAY_MS = 500L
@@ -163,6 +162,11 @@ class AivpnService : VpnService() {
     @Volatile private var vpnInterface: ParcelFileDescriptor? = null
     /** MTU the current [vpnInterface] was built with; 0 when no interface exists. */
     @Volatile private var currentTunMtu: Int = 0
+    @Volatile private var currentTunIpv6: String? = null
+    @Volatile private var currentTunIpv6Prefix: Int = 0
+    @Volatile private var currentTunPrefix: Int = 0
+    @Volatile private var currentExcludedIPs: Set<String> = emptySet()
+    @Volatile private var currentAllowedApps: Set<String> = emptySet()
     // Address the live TUN was established with; a pool re-home changes the
     // desired address and forces ensureVpnInterface() to rebuild (see there).
     @Volatile private var currentTunAddress: String? = null
@@ -187,6 +191,8 @@ class AivpnService : VpnService() {
     @Volatile private var savedServerVpnIp: String? = null
     @Volatile private var savedVpnPrefixLen: Int = LEGACY_PREFIX_LEN
     @Volatile private var savedVpnMtu: Int = DEFAULT_TUN_MTU
+    @Volatile private var savedIpv6: String? = null
+    @Volatile private var savedIpv6Prefix: Int = 0
     @Volatile private var savedDnsServers: List<String> = emptyList()
     /** Preferred mask profile name, null/"auto" = server chooses. Forwarded to JNI as maskProfile. */
     @Volatile private var savedMaskProfile: String? = null
@@ -396,7 +402,7 @@ class AivpnService : VpnService() {
         }
 
         val normalizedPrefixLen = vpnPrefixLen.coerceIn(1, 30)
-        val normalizedMtu = vpnMtu.coerceIn(576, 1500)
+        val normalizedMtu = vpnMtu.coerceIn(576, TunnelMtu.MAXIMUM)
         // Same normalization applied when storing savedMaskProfile below, so the
         // duplicate-CONNECT guard compares like with like.
         val normalizedMask = preferredMask?.takeIf { it.isNotBlank() && it != "auto" }
@@ -451,6 +457,8 @@ class AivpnService : VpnService() {
         savedServerVpnIp = serverVpnIp
         savedVpnPrefixLen = normalizedPrefixLen
         savedVpnMtu = normalizedMtu
+        savedIpv6 = null
+        savedIpv6Prefix = 0
         savedDnsServers = dnsServers
         savedMaskProfile = normalizedMask
         manualDisconnect = false
@@ -785,35 +793,15 @@ class AivpnService : VpnService() {
         }
         if (serverKey.size != 32) throw FatalConfigException("Invalid server key size: ${serverKey.size}")
 
-        // Optional key material: an undecodable value degrades the feature (same as a
-        // wrong-size value already did) instead of crash-looping the whole tunnel.
-        val psk: ByteArray? = snapPsk?.let {
-            val decoded = try {
-                android.util.Base64.decode(it, android.util.Base64.DEFAULT)
-            } catch (e: IllegalArgumentException) {
-                Log.w(TAG, "PSK is not valid base64 — ignoring")
-                null
-            }
-            if (decoded != null && decoded.size == 32) decoded else null
+        // Поврежденный ключ останавливает подключение, а не отключает проверку.
+        fun checkedKey(value: String?, field: String): ByteArray? = try {
+            decodeOptionalKey(value, field)
+        } catch (e: IllegalArgumentException) {
+            throw FatalConfigException(e.message ?: "Invalid optional key")
         }
-        val serverSigningKey: ByteArray? = snapServerSigningKey?.let {
-            val decoded = try {
-                android.util.Base64.decode(it, android.util.Base64.DEFAULT)
-            } catch (e: IllegalArgumentException) {
-                Log.w(TAG, "Server signing key is not valid base64 — ignoring")
-                null
-            }
-            if (decoded != null && decoded.size == 32) decoded else null
-        }
-        val maskOperatorPubkey: ByteArray? = snapMaskOperatorPubkey?.let {
-            val decoded = try {
-                android.util.Base64.decode(it, android.util.Base64.DEFAULT)
-            } catch (e: IllegalArgumentException) {
-                Log.w(TAG, "Mask operator pubkey is not valid base64 — ignoring")
-                null
-            }
-            if (decoded != null && decoded.size == 32) decoded else null
-        }
+        val psk = checkedKey(snapPsk, "p")
+        val serverSigningKey = checkedKey(snapServerSigningKey, "sk")
+        val maskOperatorPubkey = checkedKey(snapMaskOperatorPubkey, "mop")
         // R2 Phase B: Android has no CLI/config-file surface for mask verify mode
         // yet, so always request the same default desktop uses absent an explicit
         // --mask-verify-mode override (warn: log+accept on a bad/missing operator
@@ -869,20 +857,29 @@ class AivpnService : VpnService() {
                     // session looks connected but passes no traffic. Adopt the server's
                     // address, persist it per-server, and bounce the tunnel once so the
                     // TUN is rebuilt with the working IP.
-                    val assigned = AivpnJni.getAssignedVpnIp()
-                    if (assigned.isNotEmpty() && assigned != savedVpnIp) {
-                        Log.w(TAG, "Server assigned VPN IP $assigned (key has $savedVpnIp) — adopting and rebuilding TUN")
-                        savedVpnIp = assigned
-                        // M2: persist under the per-profile override key so two
-                        // profiles sharing host:port can't clobber each other.
-                        savedVpnIpOverrideKey?.let { key ->
-                            getSharedPreferences(PrefsKeys.PREFS_NAME, MODE_PRIVATE)
-                                .edit()
-                                .putString(key, assigned)
-                                .apply()
+                    val networkJson = AivpnJni.getAssignedNetworkConfig()
+                    if (networkJson.isNotEmpty()) {
+                        val cfg = org.json.JSONObject(networkJson)
+                        val assigned = cfg.getString("client_ip")
+                        val ipv6 = cfg.optString("ipv6_address", "").takeIf { it.isNotEmpty() && it != "null" }
+                        val prefix6 = cfg.optInt("ipv6_prefix_len", 0)
+                        val prefix4 = cfg.getInt("prefix_len")
+                        val mtu = cfg.getInt("mtu")
+                        val gateway = cfg.getString("server_vpn_ip")
+                        if (assigned != savedVpnIp || ipv6 != savedIpv6 || prefix6 != savedIpv6Prefix ||
+                            prefix4 != savedVpnPrefixLen || mtu != savedVpnMtu || gateway != savedServerVpnIp) {
+                            savedVpnIp = assigned
+                            savedIpv6 = ipv6
+                            savedIpv6Prefix = prefix6
+                            savedVpnPrefixLen = prefix4
+                            savedVpnMtu = mtu
+                            savedServerVpnIp = gateway
+                            savedVpnIpOverrideKey?.let { key ->
+                                getSharedPreferences(PrefsKeys.PREFS_NAME, MODE_PRIVATE).edit().putString(key, assigned).apply()
+                            }
+                            networkTrigger = true
+                            AivpnJni.stopTunnel()
                         }
-                        networkTrigger = true
-                        AivpnJni.stopTunnel()
                     }
                     // Forward any pending recording ack/complete/failed/status message to
                     // whoever is currently observing (MainActivity, if visible). The core
@@ -949,11 +946,12 @@ class AivpnService : VpnService() {
                 // registers a provider that can produce one). Absent → null →
                 // the core uses the built-in default transport. Params are only
                 // meaningful alongside a name, so they are gated on it.
-                val extTransportName = feedbackPrefs
+                val transportPrefs = SecureStorage.transportPreferences(this@AivpnService)
+                val extTransportName = transportPrefs
                     .getString(PrefsKeys.PREF_EXT_TRANSPORT_NAME, null)
                     ?.takeIf { it.isNotBlank() }
                 val extTransportParams = if (extTransportName != null) {
-                    feedbackPrefs.getString(PrefsKeys.PREF_EXT_TRANSPORT_PARAMS, null)
+                    transportPrefs.getString(PrefsKeys.PREF_EXT_TRANSPORT_PARAMS, null)
                 } else null
                 val error = withContext(Dispatchers.IO) {
                     AivpnJni.runTunnel(
@@ -1641,12 +1639,31 @@ class AivpnService : VpnService() {
         }
     }
 
-    private fun ensureVpnInterface() {
-        val tunMtu = if (isAdaptiveEnabled()) ADAPTIVE_TUN_MTU else savedVpnMtu.coerceAtLeast(576)
+    /** JNI использует DNS физической сети, даже когда полный маршрут уже направлен в VPN. */
+    fun resolveTransportHost(host: String): Array<String> {
+        val cm = getSystemService(ConnectivityManager::class.java)
+        fun physical(network: Network): Boolean = cm.getNetworkCapabilities(network)?.let {
+            it.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN) &&
+                it.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+        } ?: false
+        val network = currentUnderlyingNetwork?.takeIf(::physical)
+            ?: cm.allNetworks.firstOrNull(::physical)
+            ?: throw java.net.UnknownHostException("Физическая сеть недоступна")
+        return network.getAllByName(host).mapNotNull { it.hostAddress }.toTypedArray()
+    }
+
+    private suspend fun ensureVpnInterface() {
+        val tunMtu = TunnelMtu.effective(savedVpnMtu, isAdaptiveEnabled(), savedIpv6 != null)
         val tunAddress4 = savedVpnIp ?: "10.0.0.2"
         val tunPrefixLen = savedVpnPrefixLen.coerceIn(1, 30)
+        val excludedIPs = resolveDomainExclusions()
+        currentCoroutineContext().ensureActive()
+        val excludedNames = excludedIPs.map { it.hostAddress ?: "" }.toSet()
+        val allowedApps = SecureStorage.loadAllowedApps(this).toSet()
         if (vpnInterface != null) {
-            if (currentTunMtu == tunMtu && currentTunAddress == tunAddress4) {
+            if (currentTunMtu == tunMtu && currentTunAddress == tunAddress4 &&
+                currentTunIpv6 == savedIpv6 && currentTunIpv6Prefix == savedIpv6Prefix &&
+                currentTunPrefix == tunPrefixLen && currentExcludedIPs == excludedNames && currentAllowedApps == allowedApps) {
                 return
             }
             // The desired MTU or address changed since this interface was built —
@@ -1669,7 +1686,7 @@ class AivpnService : VpnService() {
         Log.i(
             TAG,
             "Establishing TUN: addr=$tunAddress4/$tunPrefixLen mtu=$tunMtu " +
-                "serverVpnIp=$savedServerVpnIp v6=fd00::2/64",
+                "serverVpnIp=$savedServerVpnIp v6=${savedIpv6 ?: "disabled"}",
         )
 
         // Build TUN (must stay in Kotlin — Android API).
@@ -1677,26 +1694,10 @@ class AivpnService : VpnService() {
         // allowBypass() is intentionally NOT called — default VpnService.Builder behaviour
         // prevents any app from bypassing the VPN tunnel.
         //
-        // IPv6: we do NOT tunnel v6 (the Rust data path drops non-IPv4 payloads),
-        // but we MUST still CAPTURE it. Omitting IPv6 config does not disable v6 —
-        // Android then routes v6-capable sockets over the real (non-VPN) interface
-        // with the device's real address, a full deanonymisation leak on any
-        // dual-stack network. Add a ULA address + a ::/0 catch-all so all v6
-        // traffic enters the tun and is dropped rather than leaking.
+        // IPv6 включается только после согласованного ServerHello.
         val dnsList = savedDnsServers.ifEmpty { listOf("8.8.8.8", "1.1.1.1") }
-        val allowedApps = SecureStorage.loadAllowedApps(this)
 
-        // Build a fresh Builder. `includeIpv6` adds the ULA + ::/0 capture (see
-        // below); we drop it on the v4-only retry because some ROMs (observed
-        // on ColorOS) reject the IPv6 address at establish() with an opaque
-        // "Cannot set address" even though addAddress() accepted it.
-        //
-        // IPv6 rationale: we do NOT tunnel v6 (the Rust data path drops non-IPv4
-        // payloads), but we MUST still CAPTURE it. Omitting IPv6 config does not
-        // disable v6 — Android then routes v6-capable sockets over the real
-        // (non-VPN) interface with the device's real address, a deanonymisation
-        // leak on any dual-stack network. So v6 capture is preferred; v4-only is
-        // the fallback that keeps the tunnel working (v4 still fully protected).
+        // Если сервер не назначил IPv6, Android блокирует это семейство.
         fun buildTun(includeIpv6: Boolean): Builder {
             // setBlocking(false): Rust uses epoll/AsyncFd on the raw fd.
             // allowBypass() is intentionally NOT called — default behaviour
@@ -1704,21 +1705,29 @@ class AivpnService : VpnService() {
             val b = Builder()
                 .setSession("AIVPN")
                 .addAddress(tunAddress4, tunPrefixLen)
-                .addRoute("0.0.0.0", 0)
                 .setMtu(tunMtu)
                 .setBlocking(false)
             if (includeIpv6) {
-                try {
-                    // Valid ULA (fd00::/8). A non-numeric literal would make
-                    // addAddress throw and skip BOTH the address AND the ::/0
-                    // route, leaking IPv6 around the tunnel.
-                    b.addAddress("fd00::2", 64)
-                    b.addRoute("::", 0)
-                } catch (e: Exception) {
-                    Log.w(TAG, "Failed to add IPv6 capture route: ${e.message}")
+                b.addAddress(requireNotNull(savedIpv6), savedIpv6Prefix)
+            }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                b.addRoute("0.0.0.0", 0)
+                if (includeIpv6) b.addRoute("::", 0)
+                for (address in excludedIPs) {
+                    if (address.address.size == 4 || includeIpv6) {
+                        b.excludeRoute(android.net.IpPrefix(address, address.address.size * 8))
+                    }
+                }
+            } else {
+                for (bits in if (includeIpv6) listOf(32, 128) else listOf(32)) {
+                    for (route in routesAroundExcludedAddresses(excludedIPs, bits)) {
+                        b.addRoute(route.address, route.prefix)
+                    }
                 }
             }
             for (dns in dnsList) {
+                // IPv6 DNS разрешил бы семейство даже без перехвата ::/0.
+                if (!includeIpv6 && dns.contains(':')) continue
                 try { b.addDnsServer(dns) } catch (e: Exception) {
                     Log.w(TAG, "Skipping invalid DNS server: $dns")
                 }
@@ -1730,97 +1739,42 @@ class AivpnService : VpnService() {
                     // Package may have been uninstalled — skip silently
                 }
             }
-            // Domain-based split tunnel: resolve each excluded domain to IPv4
-            // addresses and add /32 exclusion routes so that traffic to those
-            // IPs bypasses the VPN. Re-resolved on every (re)connect.
-            applyDomainExclusions(b)
             return b
         }
 
         vpnInterface = try {
-            buildTun(includeIpv6 = true).establish()
+            buildTun(includeIpv6 = savedIpv6 != null).establish()
                 ?: throw Exception("Failed to establish VPN interface")
         } catch (e: IllegalArgumentException) {
-            // establish() rejected the address set (kernel jniSetAddresses).
-            // Most likely the IPv6 ULA on a ROM that refuses it. Retry v4-only
-            // before giving up — a working v4 tunnel beats an infinite reconnect
-            // loop (the reported symptom). The v4 address itself is validated as
-            // an assignable host by ConnectionKeyParser, so if THIS also fails
-            // the config is genuinely unusable → stop the loop (FatalConfig)
-            // with a message naming the address, instead of retrying every 8 s.
-            Log.w(TAG, "establish() rejected addr set (${e.message}) — retrying IPv4-only")
-            try {
-                val v4only = buildTun(includeIpv6 = false).establish()
-                    ?: throw Exception("Failed to establish VPN interface (v4-only)")
-                Log.w(TAG, "Established IPv4-only TUN (IPv6 capture disabled on this device)")
-                v4only
-            } catch (e2: IllegalArgumentException) {
-                Log.e(TAG, "establish() rejected addr=$tunAddress4/$tunPrefixLen even v4-only: ${e2.message}")
-                throw FatalConfigException(
-                    "Android rejected VPN address $tunAddress4/$tunPrefixLen (${e2.message}). " +
-                        "Clear app data and re-add the connection key.",
-                )
-            }
+            throw FatalConfigException(
+                "Android rejected VPN addresses $tunAddress4/$tunPrefixLen, " +
+                    "IPv6=${savedIpv6 ?: "disabled"}: ${e.message}",
+            )
         }
+        currentTunIpv6 = savedIpv6
+        currentTunIpv6Prefix = savedIpv6Prefix
+        currentTunPrefix = tunPrefixLen
+        currentExcludedIPs = excludedNames
+        currentAllowedApps = allowedApps
         currentTunMtu = tunMtu
         currentTunAddress = tunAddress4
     }
 
-    /**
-     * Resolve each excluded domain to IPv4 addresses and register them as exclusion routes
-     * via [Builder.excludeRoute] so traffic to those IPs bypasses the VPN tunnel.
-     *
-     * [Builder.excludeRoute] was added in API 33 (Android 13). On older devices the builder
-     * has no exclusion-route primitive; we log a warning and skip — the stored domain list
-     * will take effect once the device is on API 33+.
-     *
-     * Limitation: CDN IPs rotate and vary per client. Domains are re-resolved on every
-     * tunnel (re)connect. DNS resolution runs synchronously here because
-     * [ensureVpnInterface] is already called from a background coroutine (Dispatchers.IO).
-     */
-    private fun applyDomainExclusions(builder: Builder) {
-        val domains = SecureStorage.loadExcludedDomains(this)
-        if (domains.isEmpty()) return
-
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) {
-            Log.w(TAG, "Domain split tunnel requires API 33 (Android 13); " +
-                "${domains.size} domain(s) configured but skipped on API ${Build.VERSION.SDK_INT}")
-            return
-        }
-
-        val resolvedIps = mutableSetOf<Inet4Address>()
-
-        for (domain in domains) {
+    /** Адреса исключений обновляются при подключении через DNS физической сети. */
+    private fun resolveDomainExclusions(): List<InetAddress> {
+        val resolved = DomainExclusionResolver.resolve(SecureStorage.loadExcludedDomains(this)) { domain ->
             try {
-                val addrs = InetAddress.getAllByName(domain)
-                val v4addrs = addrs.filterIsInstance<Inet4Address>()
-                if (v4addrs.isEmpty()) {
-                    Log.d(TAG, "Domain $domain: no IPv4 addresses returned — skipping")
-                } else {
-                    Log.d(TAG, "Domain $domain resolved: ${v4addrs.map { it.hostAddress }}")
-                    resolvedIps.addAll(v4addrs)
-                }
-            } catch (e: Exception) {
-                Log.w(TAG, "DNS resolution failed for excluded domain $domain: ${e.message}")
+                resolveTransportHost(domain).map { InetAddress.getByName(it) }
+            } catch (error: Exception) {
+                Log.w(TAG, "Cannot resolve excluded domain: ${error.message}")
+                emptyList()
             }
         }
-
-        if (resolvedIps.isEmpty()) {
-            Log.d(TAG, "No IPv4 addresses resolved for excluded domains")
-            return
+        val addresses = boundedExcludedAddresses(resolved)
+        if (addresses.size < resolved.size) {
+            Log.w(TAG, "Domain exclusions exceed the address limit; remaining addresses stay inside the VPN")
         }
-
-        for (addr in resolvedIps) {
-            try {
-                // Builder.excludeRoute(IpPrefix) — API 33+. Traffic to this /32 prefix
-                // is routed through the underlying network, not through the VPN tunnel.
-                @Suppress("NewApi")
-                builder.excludeRoute(android.net.IpPrefix(addr, 32))
-                Log.d(TAG, "Exclusion route applied: ${addr.hostAddress}/32")
-            } catch (e: Exception) {
-                Log.w(TAG, "Failed to add exclusion route for ${addr.hostAddress}: ${e.message}")
-            }
-        }
+        return addresses
     }
 
     // ──────────── Network waiting ────────────

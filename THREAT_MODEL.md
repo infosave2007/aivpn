@@ -79,7 +79,7 @@ Outbound packets are shaped to match a selected traffic profile (`MaskProfile`):
 
 ### 4.2 Neural Resonance (automated mask rotation)
 
-A per-mask MLP (~66 KB, deterministically derived from the mask signature vector) monitors live traffic statistics. When the reconstruction error (MSE) exceeds `compromised_threshold = 0.50`, the server triggers a mask rotation and pushes the new mask to connected clients.
+The shipped reference encoders load learned MLP weights matched to each mask's signature hash; section 5.1 describes training, validation and the projection fallback for unknown signatures. During warm-up, the server uses the configured MSE threshold. After 500 live checks for a mask, its own `mean + 3σ` threshold applies. Crossing the threshold triggers rotation and pushes the new mask to clients. MSE measures statistical drift and does not prove that DPI identified the tunnel. The separate GBDT classifier in section 5.2 estimates tunnel resemblance and is included in the standard `make server` build.
 
 Features monitored: packet size distribution, IAT statistics, entropy, burst patterns, packet direction ratio, and IAT periodicity.
 
@@ -95,7 +95,7 @@ Features monitored: packet size distribution, IAT statistics, entropy, burst pat
 
 ## 5. Machine Learning Components
 
-AIVPN ships two small, self-contained ML components that defend the masks described in Section 4. Neither is an LLM and neither needs a GPU — both are baked into the binary as constant weights and run in microseconds. They answer two different questions:
+AIVPN uses two local ML components to monitor the masks in section 4. Neither needs a GPU or a remote inference service. MLP weights load from the bundled reference library or a configured validated file; the GBDT tables are embedded in the binary. They answer two different questions:
 
 | Component | Question it answers | Family | Where |
 |---|---|---|---|
@@ -104,42 +104,19 @@ AIVPN ships two small, self-contained ML components that defend the masks descri
 
 Both feed the same action: **rotate the mask** when it looks compromised.
 
-### 5.1 Neural Resonance — the reconstruction autoencoder
+### 5.1 Neural Resonance - trained reconstruction model
 
-#### What kind of network
+The shipped reference encoders use a `64 -> 16 -> 64` MLP with ReLU. Weights are learned by backpropagation and Adam, then loaded from `assets/neural/models.json`. The runtime checks the model version, feature version, finite weights, tensor sizes and the hash of the mask's signature vector. `neural.trained_models_file` can select another validated library.
 
-A **feed-forward, fully-connected multilayer perceptron (MLP)** used as an **autoencoder** — *not* convolutional, *not* recurrent, *not* a transformer.
+`neural_dataset` prepares 64-dimensional features from recorded packet sizes and timestamps. It uses the gateway's sampling stride of 16; encrypted-payload entropy is modeled with uniform bytes of the same length. The current reference data covers the WebRTC and QUIC families. It does not establish a separate validated fingerprint for every named service. Input payloads, addresses and credentials are not exported.
 
-```
-input (64) ──▶ Linear(64→128) ──▶ ReLU ──▶ Linear(128→64) ──▶ output (64)
-                                                                    │
-              reconstruction error  MSE(input, output)  ◀──────────┘
-```
+Each capture is split chronologically into train, validation and test, with disjoint packets, fresh statistics per partition and a 256-packet gap at each boundary. Adam uses train only; validation selects the epoch; test is scored after that choice. `assets/neural/heldout.json` contains aggregate held-out feature windows so CI can verify reconstruction and drift without private PCAP files. The metadata records the capture digest and partition ranges.
 
-- **Input**: a 64-dimensional feature vector summarising the session's recent traffic — a packet-size histogram (16 bins from 0 to ≥1280 B), byte entropy, packets/sec, bytes/sec, and inter-arrival-time statistics — normalised through a saturating transform (`saturate()`) so heavy tails don't blow up the scale.
-- **Output**: a 64-dimensional *reconstruction* of that same vector.
-- **Score**: `MSE(input, output)` — the mean-squared reconstruction error, aka the **resonance score**.
+A mask without a model matching its signature uses the deterministic projection from `BakedMaskEncoder::from_signature`. That fallback is not trained reconstruction. An operator can train and install a reference library for a new mask with `neural_dataset`, `neural_train` and `neural_evaluate`.
 
-Because input and output share the same 64 dimensions and the model is trained (here: *baked*) to reproduce the mask's "normal" fingerprint, it behaves as a classic **unsupervised novelty detector**:
+The score is mean squared reconstruction error. It measures statistical deviation from a reference, not proof that DPI recognized the tunnel. Ordinary workload or network changes can also raise it. The separate GBDT classifier remains responsible for the tunnel-resemblance estimate.
 
-- **Low MSE** → live traffic matches the mask → healthy.
-- **High MSE** → live traffic has drifted from the mask's signature → the mask is likely fingerprinted by DPI → **rotate**.
-
-#### What makes it unusual: weights are *derived*, not *trained*
-
-The distinctive design choice: the MLP's weights are **not learned by backpropagation**. They are **deterministically baked** from the mask's own 64-float `signature_vector` — each weight is seeded from a BLAKE3 hash of the signature (`MaskNet::from_signature`). Consequences:
-
-- Every mask induces its **own** network — a per-mask "resonance chamber."
-- No training data, no gradient descent, no model files: the network is a pure function of the mask, so client and server derive the identical net.
-- Conceptually this is closer to a **random-projection / Extreme-Learning-Machine (ELM)-style** fixed-weight autoencoder than to a conventionally trained one. Reconstruction works because the fixed projection is *tuned to that mask's* fingerprint, so on-fingerprint input reconstructs well and off-fingerprint input does not.
-
-#### Thresholds & rotation logic
-
-- Defaults (`NeuralConfig`): `warning_threshold = 0.35`, `compromised_threshold = 0.50`, check every `30 s`, rotation cooldown `60 s`. Calibrated against the realcap2 real-capture corpora replayed through every bundled mask (healthy-traffic MSE: overall p99 ≈ 0.26, max ≈ 0.26; live stand observed up to ≈ 0.31) — see `crates/aivpn-server/examples/neural_calib.rs`.
-- These fixed defaults only gate the **warm-up window**. After `MIN_CALIBRATION_SAMPLES`, a **per-mask adaptive calibration** takes over: the thresholds become `mean + 1.5σ` (warning) and `mean + 3σ` (compromised) of that mask's own observed MSE distribution — so each mask is judged against its own baseline rather than a global constant.
-- Crossing `compromised_threshold` (subject to cooldown) triggers **mask rotation** in the gateway.
-
-> Patent-pending. The point is O(1), stateless, per-mask anomaly detection that needs no labelled attack data — it detects *deviation from self*, so it reacts to novel DPI fingerprinting it has never seen.
+The configured warm-up thresholds remain `warning_threshold = 0.35` and `compromised_threshold = 0.50`, with checks every 30 seconds and a 60-second rotation cooldown. After 500 live MSE checks for a mask, its observed `mean + 1.5σ` and `mean + 3σ` thresholds apply. These are counts of checks, not packets. Offline training does not silently lower the operator's warm-up thresholds.
 
 ### 5.2 The ML-DPI gate — GBDT "reads-as-tunnel" classifier (R2 Phase D)
 
@@ -152,7 +129,7 @@ A **gradient-boosted decision-tree ensemble (GBDT)** — an ensemble of shallow 
 Full deep-packet-inspection (running nDPI) is far too heavy for the live data path. The GBDT is a **cheap inline approximation** of a DPI verdict: given a window of a session's packets it outputs the probability that the flow **reads as an obfuscated tunnel** rather than as its declared target protocol.
 
 - **Features (23, all cheap, no deep payload parsing)**: packet-size moments and histogram, first-16-byte entropy, and a few protocol-structure checks (STUN message-type / magic-cookie / length-consistency, QUIC long-header form). Inter-arrival time was deliberately **excluded** — it proved leaky/unstable in the offline study.
-- **Training** (offline, `research/mask-generation/r2/`): a teacher/student setup — nDPI labels the synthetic + real captures, the GBDT learns to reproduce the verdict. Honest **grouped** cross-validation (split by mask, so no leakage): **93.3 %** masked-domain accuracy, and the binary "reads-as-tunnel" gate reached **precision + recall = 1.000** — it never rejected a genuine masked flow and caught every broken one.
+- **Training**: `tools/dpi/train_gbdt.py` uses external frames collected after authenticated VPN admission and transport decryption checks. nDPI labels the complete session capture; only verified target protocols and teacher-confirmed negative variants enter training. Whole independent captures stay in train, validation or test, including all derived variants. Hyperparameters and the decision threshold are fixed before test scoring. Current metrics, baselines and limits are in [the model report](assets/dpi/report.md). The held-out captures use the same workload generator, so these results do not establish generalization to arbitrary applications or DPI systems.
 - **Deployment**: the trained tree ensemble is exported to **constant weights embedded in the server binary** (the same idea as the baked MLP), traversed in place — no model file, no allocation on the hot path. Gated behind the `neural` Cargo feature.
 
 #### How it composes with Neural Resonance
@@ -162,7 +139,9 @@ The GBDT verdict is a **sibling signal**, not a replacement. Both feed the same 
 - **Neural Resonance** watches for *drift from self* (this mask stopped looking like itself).
 - **ML-DPI gate** watches for *reads-as-tunnel* (this mask looks like obfuscation to a DPI-style classifier).
 
-Either crossing its threshold ⇒ the mask is considered compromised ⇒ rotate. Two independent detectors of different families make the trigger robust: a DPI technique that fools one is unlikely to fool both.
+Crossing either configured threshold requests rotation. The signals can correlate and both can produce false alarms. Their combination does not establish resistance to an external DPI system.
+
+The unchanged GBDT also detected 15 of 15 non-overlapping windows from three independent WireGuard sessions, each with 2048 acknowledged UDP exchanges; nDPI confirmed WireGuard. These windows were excluded from training. This validates one known VPN and workload, not detection of unknown tunnels that retain QUIC/STUN classification. Normalized evidence is in `assets/dpi/external_vpn_fixtures.json`.
 
 ### 5.3 Related offline ML (not on the data path)
 

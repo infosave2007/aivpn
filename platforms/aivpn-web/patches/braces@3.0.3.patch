@@ -1,0 +1,20 @@
+diff --git a/lib/parse.js b/lib/parse.js
+index 3a6988e629f52aee6609dc5ec290a5e9ff47cecb..d18fd61dcc5301dba1e7d472b58e7f3be478318e 100644
+--- a/lib/parse.js
++++ b/lib/parse.js
+@@ -3 +3,2 @@
+ const stringify = require('./stringify');
++const MAX_DEPTH = 128;
+@@ -145,3 +146,6 @@
+     if (value === CHAR_LEFT_PARENTHESES) {
+       block = push({ type: 'paren', nodes: [] });
++      if (stack.length >= MAX_DEPTH) {
++        throw new SyntaxError('Brace pattern nesting exceeds maximum depth');
++      }
+       stack.push(block);
+@@ -212,2 +216,5 @@
+       block = push(brace);
++      if (stack.length >= MAX_DEPTH) {
++        throw new SyntaxError('Brace pattern nesting exceeds maximum depth');
++      }
+       stack.push(block);

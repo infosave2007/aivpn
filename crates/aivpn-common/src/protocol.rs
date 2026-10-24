@@ -12,6 +12,12 @@ use crate::network_config::ClientNetworkConfig;
 
 /// Maximum UDP packet size (optimized for VPN MTU 1420 + overhead)
 pub const MAX_PACKET_SIZE: usize = 1500;
+pub const MAX_MGMT_BODY_SIZE: usize = 512 * 1024;
+pub const MAX_MGMT_PATH_SIZE: usize = 512;
+
+/// Клиент объявляет формат потока. Эти биты не дают прав управления.
+pub const CLIENT_PACKET_FEATURES: u32 = 1 << 31;
+pub const CLIENT_FEC_ACTIVE: u32 = 1 << 30;
 
 /// UDP receive-buffer size for the client downlink loop. Control packets — most
 /// notably `MaskUpdate`, which carries a full serialized `MaskProfile` (several
@@ -138,6 +144,13 @@ pub enum ControlSubtype {
     /// session may send it; a receiver that itself has a partition should
     /// reply with its own (0x27)
     PartitionAnnounce = 0x27,
+    /// Пакет IPv4/IPv6 между площадками внутри masked-сессии.
+    /// Поле длины совпадает с ChainForward. Получатель передает пакет в свой TUN.
+    SiteData = 0x28,
+    /// Зашифрованное указание встроенного профиля начального обмена.
+    ClientHello = 0x29,
+    /// Согласование ICE и отпечатка DTLS только внутри сессии после PFS.
+    MaskState = 0x2A,
 }
 
 impl ControlSubtype {
@@ -182,6 +195,9 @@ impl ControlSubtype {
             0x25 => Some(Self::MgmtRequest),
             0x26 => Some(Self::MgmtResponse),
             0x27 => Some(Self::PartitionAnnounce),
+            0x28 => Some(Self::SiteData),
+            0x29 => Some(Self::ClientHello),
+            0x2A => Some(Self::MaskState),
             _ => None,
         }
     }
@@ -352,6 +368,7 @@ pub enum ControlPayload {
         metric_flags: u8,
     },
     TelemetryResponse {
+        /// Потери в сотых долях процента: 10000 соответствует 100%.
         packet_loss: u16,
         rtt_ms: u16,
         jitter_ms: u16,
@@ -565,7 +582,7 @@ pub enum ControlPayload {
     /// admin). `method`: 0=GET, 1=POST, 2=PATCH, 3=DELETE, 4=PUT. `path` is
     /// a curated REST-shaped path (e.g. "/api/v1/clients"), capped at 512
     /// bytes on encode. `body` is an optional JSON payload, capped at
-    /// 262144 bytes (256 KiB) on encode. `req_id` correlates the eventual
+    /// 524288 bytes (512 KiB) on encode. `req_id` correlates the eventual
     /// `MgmtResponse`.
     MgmtRequest {
         req_id: u32,
@@ -575,7 +592,7 @@ pub enum ControlPayload {
     },
     /// Server → client: the response to a `MgmtRequest`, correlated by the
     /// same `req_id`. `status` mirrors an HTTP status code (200, 403, 404,
-    /// 429, ...). `body` is capped at 262144 bytes (256 KiB) on encode.
+    /// 429, ...). `body` is capped at 524288 bytes (512 KiB) on encode.
     MgmtResponse {
         req_id: u32,
         status: u16,
@@ -603,6 +620,16 @@ pub enum ControlPayload {
         /// `pool.node_ip_partition` rather than a hash of `node_id`.
         explicit: bool,
     },
+    /// Один внутренний IPv4 пакет между площадками. Не ChainForward: выходной
+    /// NAT его не обрабатывает, приемник пишет пакет в свой TUN.
+    SiteData {
+        payload: Vec<u8>,
+    },
+    /// Не дает прав и не выполняет операции до PFS.
+    ClientHello {
+        mask_id: String,
+    },
+    MaskState(crate::mask_state::MaskState),
 }
 
 /// Aggregated success/fail outcome counters for a single mask, as reported by
@@ -619,10 +646,15 @@ impl ControlPayload {
         let mut buf = Vec::new();
 
         match self {
+            Self::MaskState(state) => return state.encode_control(),
             Self::KeyRotate { new_eph_pub } => {
                 buf.push(ControlSubtype::KeyRotate as u8);
                 buf.push(0); // reserved
-                buf.extend_from_slice(&(new_eph_pub.len() as u16).to_le_bytes());
+                buf.extend_from_slice(
+                    &u16::try_from(new_eph_pub.len())
+                        .map_err(|_| Error::InvalidPacket("Поле управления длиннее u16"))?
+                        .to_le_bytes(),
+                );
                 buf.extend_from_slice(new_eph_pub);
             }
             Self::MaskUpdate {
@@ -630,7 +662,11 @@ impl ControlPayload {
                 signature,
             } => {
                 buf.push(ControlSubtype::MaskUpdate as u8);
-                buf.extend_from_slice(&(mask_data.len() as u16).to_le_bytes());
+                buf.extend_from_slice(
+                    &u16::try_from(mask_data.len())
+                        .map_err(|_| Error::InvalidPacket("Поле управления длиннее u16"))?
+                        .to_le_bytes(),
+                );
                 buf.extend_from_slice(mask_data);
                 buf.extend_from_slice(signature);
             }
@@ -714,20 +750,29 @@ impl ControlPayload {
                 buf.extend_from_slice(server_eph_pub);
                 buf.extend_from_slice(signature);
                 if let Some(network_config) = network_config {
+                    network_config.validate()?;
                     buf.extend_from_slice(&network_config.encode_wire());
                 }
             }
             Self::RecordingStart { service } => {
                 buf.push(ControlSubtype::RecordingStart as u8);
                 let service_bytes = service.as_bytes();
-                buf.extend_from_slice(&(service_bytes.len() as u16).to_le_bytes());
+                buf.extend_from_slice(
+                    &u16::try_from(service_bytes.len())
+                        .map_err(|_| Error::InvalidPacket("Поле управления длиннее u16"))?
+                        .to_le_bytes(),
+                );
                 buf.extend_from_slice(service_bytes);
             }
             Self::RecordingAck { session_id, status } => {
                 buf.push(ControlSubtype::RecordingAck as u8);
                 buf.extend_from_slice(session_id);
                 let status_bytes = status.as_bytes();
-                buf.extend_from_slice(&(status_bytes.len() as u16).to_le_bytes());
+                buf.extend_from_slice(
+                    &u16::try_from(status_bytes.len())
+                        .map_err(|_| Error::InvalidPacket("Поле управления длиннее u16"))?
+                        .to_le_bytes(),
+                );
                 buf.extend_from_slice(status_bytes);
             }
             Self::RecordingStop { session_id } => {
@@ -741,17 +786,29 @@ impl ControlPayload {
             } => {
                 buf.push(ControlSubtype::RecordingComplete as u8);
                 let service_bytes = service.as_bytes();
-                buf.extend_from_slice(&(service_bytes.len() as u16).to_le_bytes());
+                buf.extend_from_slice(
+                    &u16::try_from(service_bytes.len())
+                        .map_err(|_| Error::InvalidPacket("Поле управления длиннее u16"))?
+                        .to_le_bytes(),
+                );
                 buf.extend_from_slice(service_bytes);
                 let mask_id_bytes = mask_id.as_bytes();
-                buf.extend_from_slice(&(mask_id_bytes.len() as u16).to_le_bytes());
+                buf.extend_from_slice(
+                    &u16::try_from(mask_id_bytes.len())
+                        .map_err(|_| Error::InvalidPacket("Поле управления длиннее u16"))?
+                        .to_le_bytes(),
+                );
                 buf.extend_from_slice(mask_id_bytes);
                 buf.extend_from_slice(&confidence.to_le_bytes());
             }
             Self::RecordingFailed { reason } => {
                 buf.push(ControlSubtype::RecordingFailed as u8);
                 let reason_bytes = reason.as_bytes();
-                buf.extend_from_slice(&(reason_bytes.len() as u16).to_le_bytes());
+                buf.extend_from_slice(
+                    &u16::try_from(reason_bytes.len())
+                        .map_err(|_| Error::InvalidPacket("Поле управления длиннее u16"))?
+                        .to_le_bytes(),
+                );
                 buf.extend_from_slice(reason_bytes);
             }
             Self::RecordingStatusRequest => {
@@ -772,13 +829,21 @@ impl ControlPayload {
                 buf.push(flags);
                 if let Some(service) = active_service {
                     let service_bytes = service.as_bytes();
-                    buf.extend_from_slice(&(service_bytes.len() as u16).to_le_bytes());
+                    buf.extend_from_slice(
+                        &u16::try_from(service_bytes.len())
+                            .map_err(|_| Error::InvalidPacket("Поле управления длиннее u16"))?
+                            .to_le_bytes(),
+                    );
                     buf.extend_from_slice(service_bytes);
                 }
             }
             Self::BootstrapDescriptorUpdate { descriptor_data } => {
                 buf.push(ControlSubtype::BootstrapDescriptorUpdate as u8);
-                buf.extend_from_slice(&(descriptor_data.len() as u16).to_le_bytes());
+                buf.extend_from_slice(
+                    &u16::try_from(descriptor_data.len())
+                        .map_err(|_| Error::InvalidPacket("Поле управления длиннее u16"))?
+                        .to_le_bytes(),
+                );
                 buf.extend_from_slice(descriptor_data);
             }
             Self::PoolSync { clients_json } => {
@@ -832,10 +897,24 @@ impl ControlPayload {
                 buf.push(ControlSubtype::AdaptiveHint as u8);
                 buf.push(*level);
             }
+            Self::ClientHello { mask_id } => {
+                if mask_id.is_empty() || mask_id.len() > 96 {
+                    return Err(Error::InvalidPacket(
+                        "Некорректная длина профиля ClientHello",
+                    ));
+                }
+                buf.push(ControlSubtype::ClientHello as u8);
+                buf.push(mask_id.len() as u8);
+                buf.extend_from_slice(mask_id.as_bytes());
+            }
             Self::MaskPreference { base_mask_id } => {
                 buf.push(ControlSubtype::MaskPreference as u8);
                 let id_bytes = base_mask_id.as_bytes();
-                buf.extend_from_slice(&(id_bytes.len() as u16).to_le_bytes());
+                buf.extend_from_slice(
+                    &u16::try_from(id_bytes.len())
+                        .map_err(|_| Error::InvalidPacket("Поле управления длиннее u16"))?
+                        .to_le_bytes(),
+                );
                 buf.extend_from_slice(id_bytes);
             }
             Self::MaskFeedback {
@@ -847,7 +926,11 @@ impl ControlPayload {
                 buf.push(count as u8);
                 for entry in entries.iter().take(count) {
                     let id_bytes = entry.mask_id.as_bytes();
-                    buf.extend_from_slice(&(id_bytes.len() as u16).to_le_bytes());
+                    buf.extend_from_slice(
+                        &u16::try_from(id_bytes.len())
+                            .map_err(|_| Error::InvalidPacket("Поле управления длиннее u16"))?
+                            .to_le_bytes(),
+                    );
                     buf.extend_from_slice(id_bytes);
                     buf.extend_from_slice(&entry.success.to_le_bytes());
                     buf.extend_from_slice(&entry.fail.to_le_bytes());
@@ -864,7 +947,11 @@ impl ControlPayload {
                 buf.push(count as u8);
                 for (mask_id, score) in masks.iter().take(count) {
                     let id_bytes = mask_id.as_bytes();
-                    buf.extend_from_slice(&(id_bytes.len() as u16).to_le_bytes());
+                    buf.extend_from_slice(
+                        &u16::try_from(id_bytes.len())
+                            .map_err(|_| Error::InvalidPacket("Поле управления длиннее u16"))?
+                            .to_le_bytes(),
+                    );
                     buf.extend_from_slice(id_bytes);
                     buf.extend_from_slice(&score.to_le_bytes());
                 }
@@ -883,10 +970,18 @@ impl ControlPayload {
                 buf.push(count as u8);
                 for (mask_id, label, generated) in masks.iter().take(count) {
                     let id_bytes = mask_id.as_bytes();
-                    buf.extend_from_slice(&(id_bytes.len() as u16).to_le_bytes());
+                    buf.extend_from_slice(
+                        &u16::try_from(id_bytes.len())
+                            .map_err(|_| Error::InvalidPacket("Поле управления длиннее u16"))?
+                            .to_le_bytes(),
+                    );
                     buf.extend_from_slice(id_bytes);
                     let label_bytes = label.as_bytes();
-                    buf.extend_from_slice(&(label_bytes.len() as u16).to_le_bytes());
+                    buf.extend_from_slice(
+                        &u16::try_from(label_bytes.len())
+                            .map_err(|_| Error::InvalidPacket("Поле управления длиннее u16"))?
+                            .to_le_bytes(),
+                    );
                     buf.extend_from_slice(label_bytes);
                     buf.push(if *generated { 1 } else { 0 });
                 }
@@ -903,16 +998,20 @@ impl ControlPayload {
                 body,
             } => {
                 let path_bytes = path.as_bytes();
-                if path_bytes.len() > 512 {
+                if path_bytes.len() > MAX_MGMT_PATH_SIZE {
                     return Err(Error::InvalidPacket("MgmtRequest path too long"));
                 }
-                if body.len() > 262_144 {
+                if body.len() > MAX_MGMT_BODY_SIZE {
                     return Err(Error::InvalidPacket("MgmtRequest body too long"));
                 }
                 buf.push(ControlSubtype::MgmtRequest as u8);
                 buf.extend_from_slice(&req_id.to_le_bytes());
                 buf.push(*method);
-                buf.extend_from_slice(&(path_bytes.len() as u16).to_le_bytes());
+                buf.extend_from_slice(
+                    &u16::try_from(path_bytes.len())
+                        .map_err(|_| Error::InvalidPacket("Поле управления длиннее u16"))?
+                        .to_le_bytes(),
+                );
                 buf.extend_from_slice(path_bytes);
                 buf.extend_from_slice(&(body.len() as u32).to_le_bytes());
                 buf.extend_from_slice(body);
@@ -922,7 +1021,7 @@ impl ControlPayload {
                 status,
                 body,
             } => {
-                if body.len() > 262_144 {
+                if body.len() > MAX_MGMT_BODY_SIZE {
                     return Err(Error::InvalidPacket("MgmtResponse body too long"));
                 }
                 buf.push(ControlSubtype::MgmtResponse as u8);
@@ -945,12 +1044,21 @@ impl ControlPayload {
                     ));
                 }
                 buf.push(ControlSubtype::PartitionAnnounce as u8);
-                buf.extend_from_slice(&(cidr_bytes.len() as u16).to_le_bytes());
+                buf.extend_from_slice(
+                    &u16::try_from(cidr_bytes.len())
+                        .map_err(|_| Error::InvalidPacket("Поле управления длиннее u16"))?
+                        .to_le_bytes(),
+                );
                 buf.extend_from_slice(cidr_bytes);
                 buf.extend_from_slice(&partition_index.to_le_bytes());
                 buf.extend_from_slice(&partition_size.to_le_bytes());
                 buf.extend_from_slice(&num_partitions.to_le_bytes());
                 buf.push(*explicit as u8);
+            }
+            Self::SiteData { payload } => {
+                buf.push(ControlSubtype::SiteData as u8);
+                buf.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+                buf.extend_from_slice(payload);
             }
         }
 
@@ -966,6 +1074,9 @@ impl ControlPayload {
             .ok_or(Error::InvalidPacket("Unknown control subtype"))?;
 
         match subtype {
+            ControlSubtype::MaskState => {
+                crate::mask_state::MaskState::decode_control(data).map(Self::MaskState)
+            }
             ControlSubtype::KeyRotate => {
                 if data.len() < 6 {
                     return Err(Error::InvalidPacket("KeyRotate too short"));
@@ -1094,7 +1205,7 @@ impl ControlPayload {
                 // node_id_len + node_pub + time_window + signature — this
                 // rejects an inconsistent (attacker-crafted) pair of length
                 // fields instead of silently misreading the trailing bytes.
-                if total_len != 4 + node_id_len + 32 + 8 + 64 {
+                if node_id_len != total_len - (4 + 32 + 8 + 64) {
                     return Err(Error::InvalidPacket("NodeEnrollment length mismatch"));
                 }
 
@@ -1313,6 +1424,18 @@ impl ControlPayload {
                     payload: data[5..5 + len].to_vec(),
                 })
             }
+            ControlSubtype::SiteData => {
+                if data.len() < 5 {
+                    return Err(Error::InvalidPacket("SiteData too short"));
+                }
+                let len = u32::from_le_bytes([data[1], data[2], data[3], data[4]]) as usize;
+                if data.len().saturating_sub(5) < len {
+                    return Err(Error::InvalidPacket("SiteData invalid length"));
+                }
+                Ok(Self::SiteData {
+                    payload: data[5..5 + len].to_vec(),
+                })
+            }
             ControlSubtype::ClientCert => {
                 if data.len() < 5 {
                     return Err(Error::InvalidPacket("ClientCert too short"));
@@ -1363,6 +1486,19 @@ impl ControlPayload {
                     return Err(Error::InvalidPacket("AdaptiveHint too short"));
                 }
                 Ok(Self::AdaptiveHint { level: data[1] })
+            }
+            ControlSubtype::ClientHello => {
+                if data.len() < 2
+                    || data[1] == 0
+                    || data[1] > 96
+                    || data.len() != 2 + data[1] as usize
+                {
+                    return Err(Error::InvalidPacket("Некорректный ClientHello"));
+                }
+                let mask_id = std::str::from_utf8(&data[2..])
+                    .map_err(|_| Error::InvalidPacket("Некорректный ID профиля ClientHello"))?
+                    .to_owned();
+                Ok(Self::ClientHello { mask_id })
             }
             ControlSubtype::MaskPreference => {
                 if data.len() < 3 {
@@ -1525,6 +1661,9 @@ impl ControlPayload {
                 let req_id = u32::from_le_bytes([data[1], data[2], data[3], data[4]]);
                 let method = data[5];
                 let path_len = u16::from_le_bytes([data[6], data[7]]) as usize;
+                if path_len > MAX_MGMT_PATH_SIZE {
+                    return Err(Error::InvalidPacket("MgmtRequest path too long"));
+                }
                 if data.len().saturating_sub(8) < path_len {
                     return Err(Error::InvalidPacket("MgmtRequest path truncated"));
                 }
@@ -1541,6 +1680,9 @@ impl ControlPayload {
                     data[path_end + 3],
                 ]) as usize;
                 let body_start = path_end + 4;
+                if body_len > MAX_MGMT_BODY_SIZE {
+                    return Err(Error::InvalidPacket("MgmtRequest body too long"));
+                }
                 // Overflow-safe on 32-bit targets (see PoolSync above).
                 if data.len().saturating_sub(body_start) < body_len {
                     return Err(Error::InvalidPacket("MgmtRequest body truncated"));
@@ -1560,6 +1702,9 @@ impl ControlPayload {
                 let req_id = u32::from_le_bytes([data[1], data[2], data[3], data[4]]);
                 let status = u16::from_le_bytes([data[5], data[6]]);
                 let body_len = u32::from_le_bytes([data[7], data[8], data[9], data[10]]) as usize;
+                if body_len > MAX_MGMT_BODY_SIZE {
+                    return Err(Error::InvalidPacket("MgmtResponse body too long"));
+                }
                 // Overflow-safe on 32-bit targets (see PoolSync above).
                 if data.len().saturating_sub(11) < body_len {
                     return Err(Error::InvalidPacket("MgmtResponse body truncated"));
@@ -1657,6 +1802,68 @@ impl AckPacket {
 mod tests {
     use super::*;
 
+    fn rtc_mask_state_fixture() -> Vec<u8> {
+        let mut wire = vec![0x2a, 1, 0, 6, 0];
+        wire.extend_from_slice(&[7; 16]);
+        wire.extend_from_slice(&[5, 16, 24, 4]);
+        wire.extend_from_slice(&[192, 0, 2, 2, 0x01, 0xbb]);
+        wire.extend_from_slice(&[8; 32]);
+        wire.extend_from_slice(&[1, 2, 3, 4]);
+        wire.extend_from_slice(b"videoabcdefghijklmnopABCDEFGHIJKLMNOPQRSTUVWX");
+        wire
+    }
+
+    #[test]
+    fn rtc_mask_state_has_bounded_exact_wire_encoding() {
+        let wire = rtc_mask_state_fixture();
+        let decoded =
+            ControlPayload::decode(&wire).expect("Согласование RTC должно декодироваться");
+        assert_eq!(decoded.encode().unwrap(), wire);
+        assert!(!format!("{decoded:?}").contains("ABCDEFGHIJKLMNOPQRSTUVWX"));
+        for length in 0..wire.len() {
+            assert!(
+                ControlPayload::decode(&wire[..length]).is_err(),
+                "Длина {length}"
+            );
+        }
+        let mut trailing = wire.clone();
+        trailing.push(0);
+        assert!(ControlPayload::decode(&trailing).is_err());
+        for (offset, value) in [(1, 3), (2, 2), (21, 255), (22, 3), (23, 0), (24, 5)] {
+            let mut malformed = wire.clone();
+            malformed[offset] = value;
+            assert!(ControlPayload::decode(&malformed).is_err(), "Поле {offset}");
+        }
+    }
+
+    #[test]
+    fn srtp_mask_state_is_typed_and_hides_secrets_in_debug() {
+        let mut wire = rtc_mask_state_fixture();
+        wire[1] = 2;
+        let decoded = ControlPayload::decode(&wire).unwrap();
+        let ControlPayload::MaskState(state) = &decoded else {
+            panic!("Нужен MaskState");
+        };
+        assert!(state.parameters.rtc().is_err());
+        assert_eq!(state.parameters.srtp().unwrap().master_secret, [8; 32]);
+        assert_eq!(decoded.encode().unwrap(), wire);
+        assert!(!format!("{decoded:?}").contains("ABCDEFGHIJKLMNOPQRSTUVWX"));
+        for n in 0..wire.len() {
+            assert!(ControlPayload::decode(&wire[..n]).is_err());
+        }
+        wire[31..63].fill(0);
+        assert!(ControlPayload::decode(&wire).is_err());
+    }
+
+    #[test]
+    fn node_enrollment_rejects_overflowing_id_length() {
+        let mut packet = vec![0; 5 + 108];
+        packet[0] = ControlSubtype::NodeEnrollment as u8;
+        packet[1..5].copy_from_slice(&108u32.to_le_bytes());
+        packet[5..9].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(ControlPayload::decode(&packet).is_err());
+    }
+
     // -----------------------------------------------------------------------
     // InnerType::from_u16
     // -----------------------------------------------------------------------
@@ -1723,6 +1930,8 @@ mod tests {
             (0x25, ControlSubtype::MgmtRequest),
             (0x26, ControlSubtype::MgmtResponse),
             (0x27, ControlSubtype::PartitionAnnounce),
+            (0x28, ControlSubtype::SiteData),
+            (0x29, ControlSubtype::ClientHello),
         ];
         for (byte, expected) in pairs {
             assert_eq!(
@@ -1733,7 +1942,11 @@ mod tests {
             );
         }
         assert_eq!(ControlSubtype::from_u8(0x00), None);
-        assert_eq!(ControlSubtype::from_u8(0x28), None);
+        assert_eq!(
+            ControlSubtype::from_u8(0x2a),
+            Some(ControlSubtype::MaskState)
+        );
+        assert_eq!(ControlSubtype::from_u8(0x2b), None);
     }
 
     // -----------------------------------------------------------------------
@@ -2460,6 +2673,28 @@ mod tests {
         }
     }
 
+    #[test]
+    fn client_hello_has_bounded_exact_wire_encoding() {
+        for mask in crate::mask::preset_masks::all() {
+            let hello = ControlPayload::ClientHello {
+                mask_id: mask.mask_id,
+            };
+            let bytes = hello.encode().unwrap();
+            assert_eq!(bytes[0], 0x29);
+            assert_eq!(ControlPayload::decode(&bytes).unwrap(), hello);
+            for end in 1..bytes.len() {
+                assert!(ControlPayload::decode(&bytes[..end]).is_err());
+            }
+            let mut trailing = bytes;
+            trailing.push(0);
+            assert!(ControlPayload::decode(&trailing).is_err());
+        }
+        for mask_id in [String::new(), "a".repeat(97)] {
+            assert!(ControlPayload::ClientHello { mask_id }.encode().is_err());
+        }
+        assert!(ControlPayload::decode(&[0x29, 1, 0xff]).is_err());
+    }
+
     // -----------------------------------------------------------------------
     // ControlPayload::decode — malformed / too short inputs
     // -----------------------------------------------------------------------
@@ -2852,7 +3087,7 @@ mod tests {
         // (usize == u32), passed, and the `data[5..5+len]` slice panicked —
         // a one-datagram DoS from any authenticated peer. The check must
         // reject with Err on every target width.
-        for subtype in [0x12u8, 0x13, 0x14, 0x15] {
+        for subtype in [0x12u8, 0x13, 0x14, 0x15, 0x28] {
             // PoolSync, RouteSync, ChainForward, ClientCert
             for len in [u32::MAX, u32::MAX - 4, u32::MAX - 5] {
                 let mut data = vec![subtype];
@@ -2938,7 +3173,7 @@ mod tests {
             req_id: 1,
             method: 0,
             path: "/x".into(),
-            body: vec![0u8; 262_145],
+            body: vec![0u8; MAX_MGMT_BODY_SIZE + 1],
         };
         assert!(too_long_body.encode().is_err());
     }
@@ -3025,5 +3260,80 @@ mod tests {
 
         // Also assert a minimal too-short buffer (just the subtype byte).
         assert!(ControlPayload::decode(&[0x25u8]).is_err());
+    }
+}
+
+#[cfg(test)]
+mod length_regression_tests {
+    use super::*;
+
+    #[test]
+    fn management_body_limit_survives_fragmentation_in_both_directions() {
+        for payload in [
+            ControlPayload::MgmtRequest {
+                req_id: 17,
+                method: 1,
+                path: "/".repeat(MAX_MGMT_PATH_SIZE),
+                body: vec![7; MAX_MGMT_BODY_SIZE],
+            },
+            ControlPayload::MgmtResponse {
+                req_id: 17,
+                status: 200,
+                body: vec![9; MAX_MGMT_BODY_SIZE],
+            },
+        ] {
+            let encoded = payload.encode().unwrap();
+            let mut receiver = crate::fragment::Reassembler::default();
+            let mut result = None;
+            let now = std::time::Instant::now();
+            for part in crate::fragment::split(InnerType::Control, &encoded)
+                .unwrap()
+                .into_iter()
+                .rev()
+            {
+                result = receiver.accept(&part, now).unwrap().or(result);
+            }
+            let (_, assembled) = result.unwrap();
+            assert_eq!(assembled, encoded);
+            let decoded = ControlPayload::decode(&assembled).unwrap();
+            assert_eq!(decoded.encode().unwrap(), encoded);
+        }
+        assert!(ControlPayload::MgmtResponse {
+            req_id: 1,
+            status: 200,
+            body: vec![0; MAX_MGMT_BODY_SIZE + 1]
+        }
+        .encode()
+        .is_err());
+    }
+
+    #[test]
+    fn variable_fields_never_wrap_wire_lengths() {
+        let oversized = vec![0; u16::MAX as usize + 1];
+        for value in [
+            ControlPayload::MaskUpdate {
+                mask_data: oversized.clone(),
+                signature: [0; 64],
+            },
+            ControlPayload::BootstrapDescriptorUpdate {
+                descriptor_data: oversized,
+            },
+            ControlPayload::RecordingStart {
+                service: "a".repeat(u16::MAX as usize + 1),
+            },
+            ControlPayload::MaskPreference {
+                base_mask_id: "a".repeat(u16::MAX as usize + 1),
+            },
+        ] {
+            assert!(value.encode().is_err());
+        }
+        let original = ControlPayload::MaskUpdate {
+            mask_data: vec![1; u16::MAX as usize],
+            signature: [7; 64],
+        };
+        let decoded = ControlPayload::decode(&original.encode().unwrap()).unwrap();
+        assert!(
+            matches!(decoded, ControlPayload::MaskUpdate { mask_data, signature } if mask_data.len() == u16::MAX as usize && signature == [7; 64])
+        );
     }
 }

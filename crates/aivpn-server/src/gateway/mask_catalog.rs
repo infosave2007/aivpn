@@ -37,6 +37,12 @@ pub struct MaskCatalog {
 /// substitute for the DPI/anomaly detectors' own judgement.
 const COMPROMISED_TTL: Duration = Duration::from_secs(3600);
 
+impl Default for MaskCatalog {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl MaskCatalog {
     pub fn new() -> Self {
         Self {
@@ -417,11 +423,11 @@ mod tests {
         let payload_start = TAG_SIZE + handshake_mdh_len;
 
         assert_eq!(
-            packet_mdh_len, 20,
-            "regular STUN packet MDH length must stay at 20 bytes"
+            packet_mdh_len, 24,
+            "STUN MDH должен вмещать заголовок атрибута"
         );
         assert_eq!(
-            handshake_mdh_len, 52,
+            handshake_mdh_len, 56,
             "handshake MDH length must include embedded eph_pub"
         );
         assert_eq!(&packet[eph_start..eph_start + eph_len], &expected_eph);

@@ -198,6 +198,33 @@ object SecureStorage {
         }
     }
 
+    /** Переносит параметры транспорта целиком, сохраняя старые данные при ошибке записи. */
+    fun transportPreferences(context: Context): SharedPreferences = synchronized(this) {
+        val secure = getPrefs(context)
+        val legacy = context.getSharedPreferences(PrefsKeys.PREFS_NAME, Context.MODE_PRIVATE)
+        val values = legacy.all.filterKeys {
+            it.startsWith("ext_field_") || it == PrefsKeys.PREF_EXT_TRANSPORT_NAME ||
+                it == PrefsKeys.PREF_EXT_TRANSPORT_PARAMS
+        }
+        if (values.isNotEmpty()) {
+            val update = secure.edit()
+            for ((key, value) in values) {
+                if (secure.contains(key)) continue
+                when (value) {
+                    is String -> update.putString(key, value)
+                    is Boolean -> update.putBoolean(key, value)
+                    is Int -> update.putInt(key, value)
+                    else -> throw IllegalStateException("Неверный тип параметра транспорта")
+                }
+            }
+            check(update.commit()) { "Не удалось сохранить параметры транспорта" }
+            val cleanup = legacy.edit()
+            values.keys.forEach { cleanup.remove(it) }
+            check(cleanup.commit()) { "Не удалось удалить старые параметры транспорта" }
+        }
+        secure
+    }
+
     fun saveString(context: Context, key: String, value: String) {
         try {
             getPrefs(context).edit().putString(key, value).apply()

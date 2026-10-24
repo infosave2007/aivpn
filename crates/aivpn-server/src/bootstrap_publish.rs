@@ -373,6 +373,29 @@ mod publish_impl {
 
     // ──────────────────── Telegram ────────────────────
 
+    fn telegram_request_error(error: reqwest::Error) -> String {
+        let error = error.without_url();
+        format!("Telegram request failed: {error}")
+    }
+
+    #[cfg(test)]
+    mod tests {
+        #[tokio::test]
+        async fn telegram_request_error_does_not_expose_token() {
+            let error = reqwest::Client::builder()
+                .no_proxy()
+                .timeout(std::time::Duration::from_secs(1))
+                .build()
+                .unwrap()
+                .get("http://127.0.0.1:0/botFAKE_PRIVATE_TOKEN/sendDocument")
+                .send()
+                .await
+                .unwrap_err();
+            let text = super::telegram_request_error(error);
+            assert!(!text.contains("FAKE_PRIVATE_TOKEN"), "request URL leaked");
+        }
+    }
+
     async fn publish_telegram(json: &str, channel: &PublishChannel) -> Result<(), String> {
         let PublishChannel::Telegram { bot_token, chat_id } = channel else {
             unreachable!()
@@ -393,7 +416,7 @@ mod publish_impl {
             .multipart(form)
             .send()
             .await
-            .map_err(|e| format!("Telegram request failed: {e}"))?;
+            .map_err(telegram_request_error)?;
 
         if !resp.status().is_success() {
             let status = resp.status();

@@ -21,7 +21,6 @@ aes = "0.8"
 serde.workspace = true
 serde_json.workspace = true
 rmp-serde.workspace = true
-bincode.workspace = true
 serde_bytes = "0.11"
 
 # Security
@@ -44,6 +43,7 @@ tokio = { workspace = true, optional = true }
 # Object-safe async traits (optional — only pulled in by the `transport`
 # feature, i.e. by the client-side datagram transport abstraction).
 async-trait = { workspace = true, optional = true }
+hickory-proto = { version = "0.26.1", default-features = false, features = ["std"], optional = true }
 
 # Logging (optional — only pulled in by the shared mobile tunnel core, which
 # was hoisted from the mobile FFI crates where `log` is the established
@@ -64,6 +64,17 @@ qrcode = { version = "0.14", default-features = false, features = ["image"], opt
 image = { version = "0.25", default-features = false, features = ["png"], optional = true }
 anyhow = { version = "1", optional = true }
 
+# Протокольное состояние маски. Сокеты остаются в общем транспортном слое.
+quinn-proto = { version = "=0.11.18", default-features = false, features = ["rustls-ring"], optional = true }
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std"], optional = true }
+rcgen = { version = "0.14.9", default-features = false, features = ["ring"], optional = true }
+str0m = { version = "=0.21.0", default-features = false, features = ["aws-lc-rs"], optional = true }
+stun = { version = "=0.17.2", optional = true }
+qpack = { version = "=0.1.0", default-features = false, optional = true }
+ice = { package = "is", version = "=0.10.0", optional = true }
+srtp = { package = "webrtc-srtp", version = "=0.17.2", default-features = false, optional = true }
+time = { version = "0.3.55", optional = true }
+
 # Pure-Rust SSH client for the in-app server installer (optional — only
 # pulled in by the `ssh-install` feature). Hoisted here (from aivpn-client)
 # so the mobile FFI cores (aivpn-android-core / aivpn-ios-core), which
@@ -79,6 +90,9 @@ russh-sftp = { version = "2.3", optional = true }
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis", "Win32_Networking_WinSock"], optional = true }
+
 [dev-dependencies]
 # `test-util` is not part of the workspace `tokio` "full" feature set — needed
 # by mgmt.rs tests that pause/advance virtual time to deterministically
@@ -93,11 +107,11 @@ default = []
 # masks — is transport-agnostic and lives above this seam. Today the only
 # implementation is `UdpTransport`, a thin wrapper over the connected
 # `tokio::net::UdpSocket` the clients already used.
-transport = ["tokio", "dep:async-trait"]
+transport = ["tokio", "dep:async-trait", "dep:hickory-proto", "dep:windows-sys"]
 # Descriptor-driven extra settings sections for the desktop GUIs. Off by
 # default; the public GUI holds no descriptor and renders nothing extra.
 ui-ext = ["transport"]
-client-upload = ["tokio", "transport"]
+client-upload = ["tokio", "transport", "dep:quinn-proto", "dep:rustls", "dep:rcgen", "dep:str0m", "dep:stun", "dep:qpack", "dep:ice", "dep:srtp", "dep:time"]
 # Shared mobile VPN tunnel core (state/encryptor/io) hoisted from
 # aivpn-ios-core / aivpn-android-core. Unix-only in practice (libc, eventfd /
 # pipe stop signal); only the mobile FFI crates enable it.
@@ -118,6 +132,10 @@ qr = ["dep:qrcode", "dep:image", "dep:anyhow"]
 # default aivpn-common build or the mobile FFI cores (aivpn-android-core /
 # aivpn-ios-core), neither of which enables this feature.
 ssh-install = ["dep:russh", "dep:russh-sftp", "tokio"]
+# Protected mobile build. Empty feature: policy gates in mask resolution and
+# the shared tunnel loop compile to the strict path. Android and iOS enable
+# it via their own `production-secure` feature. The desktop client does not.
+production-secure = []
 
 # The descriptor contract test needs the module it tests. Without
 # `required-features` a plain `cargo test --workspace` — which does not enable
@@ -126,3 +144,11 @@ ssh-install = ["dep:russh", "dep:russh-sftp", "tokio"]
 [[test]]
 name = "ui_ext_descriptor"
 required-features = ["ui-ext"]
+
+[package.metadata.cargo-machete]
+# Используется в атрибутах serde(with), которые анализатор не распознает.
+ignored = ["serde_bytes"]
+
+[[example]]
+name = "maskpcap"
+required-features = ["client-upload"]

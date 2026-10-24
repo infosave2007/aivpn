@@ -9,6 +9,14 @@ import { goto } from '$app/navigation';
 // only the first 401-caller starts a refresh; everyone else awaits the same
 // in-flight promise. Reset on settle so a later 401 can refresh again.
 let refreshPromise: Promise<string> | null = null;
+let refreshGeneration = -1;
+let refreshAbort: AbortController | null = null;
+authStore.onSessionChange(() => {
+  refreshAbort?.abort();
+  refreshAbort = null;
+  refreshPromise = null;
+  refreshGeneration = -1;
+});
 
 /**
  * Mint a fresh access token from the httpOnly refresh cookie.
@@ -16,17 +24,27 @@ let refreshPromise: Promise<string> | null = null;
  * Rejects if the refresh cookie is missing/expired/rotated away.
  */
 export function refreshAccessToken(): Promise<string> {
-  if (!refreshPromise) {
+  const generation = authStore.sessionGeneration;
+  if (!refreshPromise || refreshGeneration !== generation) {
+    refreshGeneration = generation;
+    const controller = new AbortController();
+    refreshAbort = controller;
     refreshPromise = (async () => {
-      const refreshRes = await fetch('/web/auth/refresh', { method: 'POST' });
+      const refreshRes = await fetch('/web/auth/refresh', { method: 'POST', signal: controller.signal });
       if (!refreshRes.ok) {
         throw new Error(`refresh failed: HTTP ${refreshRes.status}`);
       }
       const data = await refreshRes.json() as { access_token: string };
+      if (authStore.sessionGeneration !== generation) {
+        throw new DOMException('Session changed', 'AbortError');
+      }
       authStore.setToken(data.access_token);
       return data.access_token;
     })().finally(() => {
-      refreshPromise = null;
+      if (refreshAbort === controller) {
+        refreshAbort = null;
+        refreshPromise = null;
+      }
     });
   }
   return refreshPromise;
@@ -44,6 +62,7 @@ function isRawBody(body: BodyInit | null | undefined): boolean {
 }
 
 async function apiFetch(path: string, options: RequestInit = {}): Promise<Response> {
+  const generation = authStore.sessionGeneration;
   // Default to JSON only for string bodies (and body-less requests) — a
   // File/Blob/FormData upload must NOT be labeled application/json, and
   // FormData needs the browser-generated multipart boundary.
@@ -57,19 +76,29 @@ async function apiFetch(path: string, options: RequestInit = {}): Promise<Respon
   }
 
   let res = await fetch(path, { ...options, headers });
+  if (authStore.sessionGeneration !== generation) {
+    throw new DOMException('Session changed', 'AbortError');
+  }
 
   if (res.status === 401) {
     // Try refresh (coalesced across concurrent 401s)
     let newToken: string;
     try {
       newToken = await refreshAccessToken();
-    } catch {
+    } catch (error) {
+      if (authStore.sessionGeneration !== generation) throw error;
       authStore.clearToken();
       goto('/login');
       return res;
     }
+    if (authStore.accessToken !== newToken) {
+      throw new DOMException('Session changed', 'AbortError');
+    }
     headers['Authorization'] = `Bearer ${newToken}`;
     res = await fetch(path, { ...options, headers });
+    if (authStore.accessToken !== newToken) {
+      throw new DOMException('Session changed', 'AbortError');
+    }
     if (res.status === 401) {
       authStore.clearToken();
       goto('/login');
@@ -80,12 +109,25 @@ async function apiFetch(path: string, options: RequestInit = {}): Promise<Respon
 }
 
 async function apiJson<T>(path: string, options: RequestInit = {}): Promise<T> {
+  const generation = authStore.sessionGeneration;
   const res = await apiFetch(path, options);
   if (!res.ok) {
     const text = await res.text();
     throw new Error(text || `HTTP ${res.status}`);
   }
-  return res.json() as Promise<T>;
+  const data = await res.json() as T;
+  if (authStore.sessionGeneration !== generation) throw new DOMException('Session changed', 'AbortError');
+  return data;
+}
+
+async function loginJson<T>(path: string, body: unknown): Promise<T> {
+  authStore.clearToken();
+  const generation = authStore.sessionGeneration;
+  const response = await fetch(path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+  if (!response.ok) throw new Error(await response.text() || `HTTP ${response.status}`);
+  const data = await response.json() as T;
+  if (authStore.sessionGeneration !== generation) throw new DOMException('Session changed', 'AbortError');
+  return data;
 }
 
 /**
@@ -196,16 +238,10 @@ export interface KernelStatus {
 
 export const auth = {
   async login(username: string, password: string): Promise<{ access_token?: string; totp_required?: boolean }> {
-    return apiJson('/web/auth/login', {
-      method: 'POST',
-      body: JSON.stringify({ username, password }),
-    });
+    return loginJson('/web/auth/login', { username, password });
   },
   async loginTotp(username: string, password: string, totp_token: string): Promise<{ access_token: string }> {
-    return apiJson('/web/auth/login', {
-      method: 'POST',
-      body: JSON.stringify({ username, password, totp_token }),
-    });
+    return loginJson('/web/auth/login', { username, password, totp_token });
   },
   async logout(): Promise<void> {
     await apiFetch('/web/auth/logout', { method: 'POST' });
@@ -250,10 +286,7 @@ export const auth = {
     return apiJson(`/web/auth/passkey/authentication-options${q}`);
   },
   async passkeyAuthenticate(response: unknown): Promise<{ access_token: string }> {
-    return apiJson('/web/auth/passkey/authenticate', {
-      method: 'POST',
-      body: JSON.stringify({ response }),
-    });
+    return loginJson('/web/auth/passkey/authenticate', { response });
   },
   async passkeys(): Promise<Array<{ id: string; name: string; created_at: string; last_used_at: string | null }>> {
     return apiJson('/web/auth/passkeys');

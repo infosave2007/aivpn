@@ -342,6 +342,13 @@ struct ContentView: View {
                         if vpn.isConnected { trafficCard }
                         keysCard
                         if !vpn.isConnected { settingsCard }
+                        if vpn.isConnected {
+                            CardView {
+                                maskPicker
+                                Text(loc.t("mask_next_connection"))
+                                    .font(.caption2).foregroundColor(.secondary).padding(.bottom, 12)
+                            }
+                        }
                         if vpn.isConnected && vpn.recordingCapabilityKnown && vpn.canRecordMasks {
                             RecordingSection()
                                 .environmentObject(vpn)
@@ -438,7 +445,10 @@ struct ContentView: View {
                     }
                     guard vpn.updateKey(id: key.id, name: name, keyValue: val, mtlsCert: cert,
                                         serverSigningKey: signingKey) else {
-                        return loc.t("duplicate_key")
+                        let normalized = val.trimmingCharacters(in: .whitespacesAndNewlines)
+                            .replacingOccurrences(of: "aivpn://", with: "")
+                        return vpn.keys.contains(where: { $0.id != key.id && $0.keyValue == normalized })
+                            ? loc.t("duplicate_key") : loc.t("key_save_failed")
                     }
                     editingKey = nil
                     return nil
@@ -487,9 +497,15 @@ struct ContentView: View {
                                 .foregroundColor(result.quality >= 80 ? .green : result.quality >= 50 ? .orange : .red)
                             Text("\(loc.t("bench_p50_label")): \(result.p50ms) \(loc.t("bench_ms"))")
                                 .font(.subheadline).foregroundColor(.secondary)
+                            Text("P95: \(result.p95ms) \(loc.t("bench_ms"))  \(loc.t("bench_loss")): \(String(format: "%.1f", result.lossPct))%")
+                                .font(.subheadline).foregroundColor(.secondary)
+                            Text("↑ \(String(format: "%.0f", result.uploadKbps))  ↓ \(String(format: "%.0f", result.downloadKbps)) \(loc.t("bench_kbps"))")
+                                .font(.subheadline).foregroundColor(.secondary)
                             Text(result.serverAddr)
                                 .font(.caption2).foregroundColor(.secondary)
                         }
+                    } else if let error = vpn.benchError {
+                        Text(error).foregroundColor(.red)
                     } else {
                         Text(loc.t("bench_idle"))
                             .foregroundColor(.secondary)
@@ -500,7 +516,7 @@ struct ContentView: View {
                         vpn.runBenchmark()
                     }
                     .buttonStyle(.borderedProminent)
-                    .disabled(vpn.isBenchRunning || vpn.selectedKey == nil)
+                    .disabled(vpn.isBenchRunning || !vpn.isConnected)
                 }
                 .navigationTitle(loc.t("diagnostics"))
                 .navigationBarTitleDisplayMode(.inline)
@@ -705,6 +721,33 @@ struct ContentView: View {
         }
     }
 
+    private var maskPicker: some View {
+        HStack {
+            Text(loc.t("mask_profile"))
+            Spacer()
+            Picker("", selection: $vpn.preferredMask) {
+                Text(loc.t("mask_auto")).tag("auto")
+                if vpn.maskCatalog.isEmpty {
+                    // Пресеты используются до получения каталога сервера.
+                    Text("WebRTC Zoom").tag("webrtc_zoom_v3")
+                    Text("QUIC/HTTPS").tag("quic_https_v2")
+                    Text("Yandex Telemost").tag("webrtc_yandex_telemost_v1")
+                    Text("VK Teams").tag("webrtc_vk_teams_v1")
+                    Text("SberJazz").tag("webrtc_sberjazz_v1")
+                } else {
+                    ForEach(vpn.maskCatalog.filter { $0.mask_id != "auto" }) { item in
+                        Text(item.label + (item.generated ? loc.t("mask_auto_marker") : ""))
+                            .tag(item.mask_id)
+                    }
+                }
+            }
+            .pickerStyle(.menu)
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 12)
+
+    }
+
     // MARK: - Settings card
 
     private var settingsCard: some View {
@@ -748,29 +791,7 @@ struct ContentView: View {
 
                 Divider().padding(.leading, 16)
 
-                HStack {
-                    Text(loc.t("mask_profile"))
-                    Spacer()
-                    Picker("", selection: $vpn.preferredMask) {
-                        Text(loc.t("mask_auto")).tag("auto")
-                        if vpn.maskCatalog.isEmpty {
-                            // Fallback until the server catalog has been received.
-                            Text("WebRTC Zoom").tag("webrtc_zoom_v3")
-                            Text("QUIC/HTTPS").tag("quic_https_v2")
-                            Text("Yandex Telemost").tag("webrtc_yandex_telemost_v1")
-                            Text("VK Teams").tag("webrtc_vk_teams_v1")
-                            Text("SberJazz").tag("webrtc_sberjazz_v1")
-                        } else {
-                            ForEach(vpn.maskCatalog.filter { $0.mask_id != "auto" }) { item in
-                                Text(item.label + (item.generated ? loc.t("mask_auto_marker") : ""))
-                                    .tag(item.mask_id)
-                            }
-                        }
-                    }
-                    .pickerStyle(.menu)
-                }
-                .padding(.horizontal, 16)
-                .padding(.vertical, 12)
+                maskPicker
 
                 Divider().padding(.leading, 16)
 

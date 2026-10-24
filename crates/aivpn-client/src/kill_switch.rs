@@ -9,6 +9,12 @@
 //! keeping the user protected until they explicitly run `kill-switch clear`.
 
 use aivpn_common::error::{Error, Result};
+
+#[cfg(any(target_os = "macos", test))]
+mod macos_pf;
+#[cfg(target_os = "windows")]
+mod windows;
+#[cfg(not(target_os = "windows"))]
 use std::io;
 use tracing::info;
 #[allow(unused_imports)]
@@ -30,7 +36,11 @@ pub struct KillSwitch {
     /// socket guard stamps, so exactly the sockets that were deliberately kept
     /// out of the tunnel are the ones allowed out here — nothing broader.
     mark: Option<u32>,
+    #[cfg(any(target_os = "macos", windows))]
+    guard: Option<aivpn_common::transport::SharedGuard>,
     active: bool,
+    /// Даже прерванная настройка может оставить защитные правила до явного выхода.
+    cleanup_needed: bool,
 }
 
 impl KillSwitch {
@@ -39,8 +49,32 @@ impl KillSwitch {
             tun_name,
             server_ip,
             mark: None,
+            #[cfg(any(target_os = "macos", windows))]
+            guard: None,
             active: false,
+            cleanup_needed: false,
         }
+    }
+
+    /// Подключить исключения транспорта и к защите, оставшейся после перезапуска.
+    #[cfg(any(target_os = "macos", windows))]
+    pub(crate) fn prepare_transport_guard(
+        guard: &aivpn_common::transport::SharedGuard,
+    ) -> Result<()> {
+        #[cfg(windows)]
+        guard.set_firewall_peer_handler(Some(std::sync::Arc::new(|peer| {
+            windows::allow_transport_peer(peer).map_err(Error::Io)
+        })))?;
+        #[cfg(target_os = "macos")]
+        {
+            let rules = std::process::Command::new("/sbin/pfctl")
+                .args(["-a", "aivpn_ks", "-s", "rules"])
+                .output()?;
+            if rules.status.success() && !rules.stdout.is_empty() {
+                guard.set_firewall(true)?;
+            }
+        }
+        Ok(())
     }
 
     /// Also let out traffic carrying `mark` (see the field's documentation).
@@ -48,6 +82,12 @@ impl KillSwitch {
     /// until the next activation.
     pub fn with_mark(mut self, mark: u32) -> Self {
         self.mark = Some(mark);
+        self
+    }
+
+    #[cfg(any(target_os = "macos", windows))]
+    pub fn with_guard(mut self, guard: aivpn_common::transport::SharedGuard) -> Self {
+        self.guard = Some(guard);
         self
     }
 
@@ -62,6 +102,7 @@ impl KillSwitch {
     /// A bare `:` test is enough: `server_ip` is an address, never a
     /// host:port pair (the port lives separately in the connection key), so
     /// the only colons that can appear are an IPv6 separator.
+    #[cfg(any(target_os = "linux", test))]
     fn nft_family(&self) -> &'static str {
         if self.server_ip.contains(':') {
             "ip6"
@@ -79,6 +120,7 @@ impl KillSwitch {
         if self.active {
             return Ok(());
         }
+        self.cleanup_needed = true;
         self.activate_impl()?;
         self.active = true;
         info!("Kill-switch activated — non-VPN traffic blocked");
@@ -87,19 +129,24 @@ impl KillSwitch {
 
     /// Remove kill-switch rules (called on graceful disconnect).
     pub fn deactivate(&mut self) {
-        if !self.active {
+        if !self.active && !self.cleanup_needed {
             return;
         }
         self.deactivate_impl();
         self.active = false;
+        self.cleanup_needed = false;
         info!("Kill-switch deactivated");
     }
 
     /// Remove any stale rules left by a previous session (e.g. after SIGKILL).
     /// Safe to call when no rules are present.
-    pub fn clear_stale() {
+    pub fn clear_stale() -> Result<()> {
+        #[cfg(target_os = "windows")]
+        windows::clear().map_err(Error::Io)?;
+        #[cfg(not(target_os = "windows"))]
         Self::clear_stale_impl();
         info!("Kill-switch stale rules cleared");
+        Ok(())
     }
 
     // ──────────────────── Linux ────────────────────
@@ -121,8 +168,7 @@ impl KillSwitch {
                 .map(|s| s.success())
                 .unwrap_or(false);
             if !ok {
-                return Err(Error::Io(io::Error::new(
-                    io::ErrorKind::Other,
+                return Err(Error::Io(io::Error::other(
                     "kill-switch: nft failed to create aivpn_ks table",
                 )));
             }
@@ -133,13 +179,8 @@ impl KillSwitch {
                 .map(|s| s.success())
                 .unwrap_or(false);
             if !chain_ok {
-                // Roll back the table so we don't leave a policy-less table behind,
-                // then fail loud instead of reporting "active" with nothing blocked.
-                let _ = Command::new("nft")
-                    .args(["delete", "table", "inet", "aivpn_ks"])
-                    .status();
-                return Err(Error::Io(io::Error::new(
-                    io::ErrorKind::Other,
+                // Не удаляем прежнюю защиту при неудачном reconnect.
+                return Err(Error::Io(io::Error::other(
                     "kill-switch: nft failed to create drop-policy chain",
                 )));
             }
@@ -152,9 +193,16 @@ impl KillSwitch {
             // process could still reach the old server IP unblocked. The drop
             // policy set above is preserved by flushing only the chain's rules
             // (mirrors the iptables path's `-F AIVPN_KS`).
-            let _ = Command::new("nft")
+            let flushed = Command::new("nft")
                 .args(["flush", "chain", "inet", "aivpn_ks", "output"])
-                .status();
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            if !flushed {
+                return Err(Error::Io(io::Error::other(
+                    "kill-switch: cannot clear stale nft rules",
+                )));
+            }
             let ip_family = self.nft_family();
             let mut rules: Vec<Vec<String>> = vec![
                 vec![
@@ -218,11 +266,8 @@ impl KillSwitch {
                     .map(|s| s.success())
                     .unwrap_or(false);
                 if !rule_ok {
-                    let _ = Command::new("nft")
-                        .args(["delete", "table", "inet", "aivpn_ks"])
-                        .status();
-                    return Err(Error::Io(io::Error::new(
-                        io::ErrorKind::Other,
+                    // DROP policy остается до следующей попытки или явного выхода.
+                    return Err(Error::Io(io::Error::other(
                         "kill-switch: nft failed to add accept rule (tunnel would be blocked)",
                     )));
                 }
@@ -230,51 +275,109 @@ impl KillSwitch {
             return Ok(());
         }
 
-        // Fallback: iptables / ip6tables
+        self.activate_iptables(&mut |program, args| {
+            Command::new(program)
+                .args(args)
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        })
+    }
+
+    #[cfg(target_os = "linux")]
+    fn activate_iptables(&self, run: &mut impl FnMut(&str, &[&str]) -> bool) -> Result<()> {
         let tun = self.tun_name.as_str();
         let sip = self.server_ip.as_str();
-        // Use ip6tables for IPv6 server addresses
-        let ipt = if self.server_ip.contains(':') {
+        let server_family = if self.server_ip.contains(':') {
             "ip6tables"
         } else {
             "iptables"
         };
-        for cmd in &[vec![ipt, "-N", "AIVPN_KS"], vec![ipt, "-F", "AIVPN_KS"]] {
-            let _ = Command::new(cmd[0]).args(&cmd[1..]).status();
+        for ipt in ["iptables", "ip6tables"] {
+            // Guard остается после прерванной перестройки и не дублируется.
+            let exists = run(
+                ipt,
+                &[
+                    "-C",
+                    "OUTPUT",
+                    "-m",
+                    "comment",
+                    "--comment",
+                    "AIVPN_KS_UPDATE",
+                    "-j",
+                    "DROP",
+                ],
+            );
+            if !exists
+                && !run(
+                    ipt,
+                    &[
+                        "-I",
+                        "OUTPUT",
+                        "1",
+                        "-m",
+                        "comment",
+                        "--comment",
+                        "AIVPN_KS_UPDATE",
+                        "-j",
+                        "DROP",
+                    ],
+                )
+            {
+                return Err(Error::Io(io::Error::other(
+                    "kill-switch: cannot protect rule update",
+                )));
+            }
         }
-        // -D may legitimately fail (no pre-existing jump rule); ignore its result.
-        let _ = Command::new(ipt)
-            .args(["-D", "OUTPUT", "-j", "AIVPN_KS"])
-            .status();
-        let mark_arg = self.mark.map(|m| format!("0x{m:x}"));
-        let mut cmds: Vec<Vec<&str>> = vec![
-            vec![ipt, "-I", "OUTPUT", "1", "-j", "AIVPN_KS"],
-            vec![ipt, "-A", "AIVPN_KS", "-o", "lo", "-j", "ACCEPT"],
-            vec![ipt, "-A", "AIVPN_KS", "-o", tun, "-j", "ACCEPT"],
-            vec![ipt, "-A", "AIVPN_KS", "-d", sip, "-j", "ACCEPT"],
-        ];
-        // Marked traffic — the transport's own sockets (see `mark`). Must be
-        // appended before the DROP that terminates the chain.
-        if let Some(m) = mark_arg.as_deref() {
-            cmds.push(vec![
-                ipt, "-A", "AIVPN_KS", "-m", "mark", "--mark", m, "-j", "ACCEPT",
-            ]);
-        }
-        cmds.push(vec![ipt, "-A", "AIVPN_KS", "-j", "DROP"]);
-        for cmd in &cmds {
-            let ok = Command::new(cmd[0])
-                .args(&cmd[1..])
-                .status()
-                .map(|s| s.success())
-                .unwrap_or(false);
-            if !ok {
-                let _ = Command::new(ipt)
-                    .args(["-D", "OUTPUT", "-j", "AIVPN_KS"])
-                    .status();
-                let _ = Command::new(ipt).args(["-F", "AIVPN_KS"]).status();
-                return Err(Error::Io(io::Error::new(
-                    io::ErrorKind::Other,
-                    format!("kill-switch: {ipt} rule setup failed (nothing is blocked)"),
+        for ipt in ["iptables", "ip6tables"] {
+            run(ipt, &["-N", "AIVPN_KS"]);
+            if !run(ipt, &["-F", "AIVPN_KS"]) {
+                return Err(Error::Io(io::Error::other(
+                    "kill-switch: cannot clear stale iptables rules",
+                )));
+            }
+            // -D may legitimately fail (no pre-existing jump rule); ignore its result.
+            run(ipt, &["-D", "OUTPUT", "-j", "AIVPN_KS"]);
+            let mark_arg = self.mark.map(|m| format!("0x{m:x}"));
+            let mut cmds: Vec<Vec<&str>> = vec![
+                vec![ipt, "-A", "AIVPN_KS", "-o", "lo", "-j", "ACCEPT"],
+                vec![ipt, "-A", "AIVPN_KS", "-o", tun, "-j", "ACCEPT"],
+            ];
+            if ipt == server_family {
+                cmds.push(vec![ipt, "-A", "AIVPN_KS", "-d", sip, "-j", "ACCEPT"]);
+            }
+            // Marked traffic — the transport's own sockets (see `mark`). Must be
+            // appended before the DROP that terminates the chain.
+            if let Some(m) = mark_arg.as_deref() {
+                cmds.push(vec![
+                    ipt, "-A", "AIVPN_KS", "-m", "mark", "--mark", m, "-j", "ACCEPT",
+                ]);
+            }
+            cmds.push(vec![ipt, "-A", "AIVPN_KS", "-j", "DROP"]);
+            cmds.push(vec![ipt, "-I", "OUTPUT", "1", "-j", "AIVPN_KS"]);
+            for cmd in &cmds {
+                let ok = run(cmd[0], &cmd[1..]);
+                if !ok {
+                    return Err(Error::Io(io::Error::other(format!(
+                        "kill-switch: {ipt} rule setup failed; drop protection retained"
+                    ))));
+                }
+            }
+            if !run(
+                ipt,
+                &[
+                    "-D",
+                    "OUTPUT",
+                    "-m",
+                    "comment",
+                    "--comment",
+                    "AIVPN_KS_UPDATE",
+                    "-j",
+                    "DROP",
+                ],
+            ) {
+                return Err(Error::Io(io::Error::other(
+                    "kill-switch: cannot release update guard",
                 )));
             }
         }
@@ -282,26 +385,30 @@ impl KillSwitch {
     }
 
     #[cfg(target_os = "linux")]
-    fn deactivate_impl(&self) {
-        use std::process::Command;
-        // Try nftables
-        if Command::new("sh")
-            .args(["-c", "nft list table inet aivpn_ks 2>/dev/null"])
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
-        {
-            let _ = Command::new("nft")
-                .args(["delete", "table", "inet", "aivpn_ks"])
-                .status();
-            return;
+    fn clear_iptables(run: &mut impl FnMut(&str, &[&str]) -> bool) {
+        for program in ["iptables", "ip6tables"] {
+            run(program, &["-D", "OUTPUT", "-j", "AIVPN_KS"]);
+            run(program, &["-F", "AIVPN_KS"]);
+            run(program, &["-X", "AIVPN_KS"]);
+            run(
+                program,
+                &[
+                    "-D",
+                    "OUTPUT",
+                    "-m",
+                    "comment",
+                    "--comment",
+                    "AIVPN_KS_UPDATE",
+                    "-j",
+                    "DROP",
+                ],
+            );
         }
-        // Fallback: iptables
-        let _ = Command::new("iptables")
-            .args(["-D", "OUTPUT", "-j", "AIVPN_KS"])
-            .status();
-        let _ = Command::new("iptables").args(["-F", "AIVPN_KS"]).status();
-        let _ = Command::new("iptables").args(["-X", "AIVPN_KS"]).status();
+    }
+
+    #[cfg(target_os = "linux")]
+    fn deactivate_impl(&self) {
+        Self::clear_stale_impl();
     }
 
     #[cfg(target_os = "linux")]
@@ -310,11 +417,13 @@ impl KillSwitch {
         let _ = Command::new("nft")
             .args(["delete", "table", "inet", "aivpn_ks"])
             .status();
-        let _ = Command::new("iptables")
-            .args(["-D", "OUTPUT", "-j", "AIVPN_KS"])
-            .status();
-        let _ = Command::new("iptables").args(["-F", "AIVPN_KS"]).status();
-        let _ = Command::new("iptables").args(["-X", "AIVPN_KS"]).status();
+        Self::clear_iptables(&mut |program, args| {
+            Command::new(program)
+                .args(args)
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        });
     }
 
     // ──────────────────── macOS ────────────────────
@@ -324,11 +433,18 @@ impl KillSwitch {
         use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
         use std::process::Command;
 
-        let rules = format!(
+        let mut rules = format!(
             "block out all\npass out on lo0 all\npass out on {tun} all\npass out proto {{tcp,udp}} from any to {sip}\n",
             tun = self.tun_name,
             sip = self.server_ip,
         );
+        if self
+            .guard
+            .as_ref()
+            .is_some_and(|guard| guard.uses_firewall_table())
+        {
+            rules = format!("table <aivpn_transport> persist\n{rules}pass out proto {{tcp,udp}} from any to <aivpn_transport>\n");
+        }
 
         // Write anchor rules to a root-only directory, not world-writable /tmp.
         // O_NOFOLLOW ensures we fail if the path is a symlink (symlink attack prevention).
@@ -375,21 +491,29 @@ impl KillSwitch {
             )));
         }
 
-        // Enable pf if not already running (best-effort)
+        // Уже включенный PF может вернуть ошибку на повторный -e.
         let _ = Command::new("pfctl").args(["-e"]).status();
+        let status = Command::new("pfctl").args(["-s", "info"]).output()?;
+        if !status.status.success()
+            || !String::from_utf8_lossy(&status.stdout)
+                .lines()
+                .any(|line| line.starts_with("Status: Enabled"))
+        {
+            return Err(io::Error::other("kill-switch: PF не включен").into());
+        }
 
         // Inject anchor reference into running pf config if not present
-        let already = Command::new("sh")
-            .args(["-c", "pfctl -s all 2>/dev/null | grep -q aivpn_ks"])
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
+        let root_rules = Command::new("pfctl").args(["-s", "rules"]).output()?;
+        if !root_rules.status.success() {
+            return Err(io::Error::other("kill-switch: правила PF недоступны").into());
+        }
+        let already = macos_pf::anchor_is_first(&String::from_utf8_lossy(&root_rules.stdout));
         if !already {
-            let existing = std::fs::read_to_string("/etc/pf.conf").unwrap_or_default();
-            let with_anchor = format!("{}\nanchor \"aivpn_ks\"\n", existing);
+            let existing = std::fs::read_to_string("/etc/pf.conf")?;
+            let with_anchor = macos_pf::with_first_anchor(&existing);
             let ref_file = "/var/run/aivpn/aivpn_ks_ref.conf";
             let _ = std::fs::remove_file(ref_file);
-            let wrote = std::fs::OpenOptions::new()
+            std::fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
                 .mode(0o600)
@@ -398,18 +522,29 @@ impl KillSwitch {
                 .and_then(|mut f| {
                     use std::io::Write;
                     f.write_all(with_anchor.as_bytes())
-                })
-                .is_ok();
-            if wrote {
-                let _ = Command::new("pfctl").args(["-f", ref_file]).status();
+                })?;
+            if !Command::new("pfctl")
+                .args(["-f", ref_file])
+                .status()?
+                .success()
+            {
+                return Err(
+                    io::Error::other("kill-switch: не удалось подключить anchor PF").into(),
+                );
             }
         }
 
+        if let Some(guard) = &self.guard {
+            guard.set_firewall(true)?;
+        }
         Ok(())
     }
 
     #[cfg(target_os = "macos")]
     fn deactivate_impl(&self) {
+        if let Some(guard) = &self.guard {
+            let _ = guard.set_firewall(false);
+        }
         use std::process::Command;
         let _ = Command::new("pfctl")
             .args(["-a", "aivpn_ks", "-F", "rules"])
@@ -431,190 +566,24 @@ impl KillSwitch {
     // ──────────────────── Windows ────────────────────
 
     #[cfg(target_os = "windows")]
-    fn policy_save_path() -> std::path::PathBuf {
-        std::path::PathBuf::from(
-            std::env::var("SYSTEMROOT").unwrap_or_else(|_| "C:\\Windows".to_string()),
-        )
-        .join("Temp")
-        .join("aivpn_ks_policy.txt")
-    }
-
-    #[cfg(target_os = "windows")]
     fn activate_impl(&self) -> Result<()> {
-        use std::process::Command;
-
-        // Save the current firewall policy so we can restore it on deactivate —
-        // but ONLY on the first activation of this process. `tunnel.rs` builds a
-        // brand-new `KillSwitch` (and `main.rs`'s reconnect loop a brand-new
-        // `AivpnClient`) on every reconnect iteration, and kill-switch state is
-        // intentionally left active across reconnect backoffs (deactivate only
-        // runs on clean shutdown). If we re-query+overwrite the save file on
-        // every activation, the second reconnect captures the ALREADY-BLOCKED
-        // "allowinbound,blockoutbound" state as the "restore to" target — so
-        // eventual deactivate() "restores" into a permanently blocked policy
-        // with no allow rules, locking the user off the network. Only write
-        // the save file if one doesn't already exist so the true pre-VPN
-        // policy captured by the first activation always wins.
-        let save_path = Self::policy_save_path();
-        if !save_path.exists() {
-            if let Ok(out) = Command::new("netsh")
-                .args(["advfirewall", "show", "currentprofile", "firewallpolicy"])
-                .output()
-            {
-                if let Some(p) = save_path.parent() {
-                    let _ = std::fs::create_dir_all(p);
-                }
-                let _ = std::fs::write(&save_path, &out.stdout);
-            }
+        windows::activate(&self.tun_name, &self.server_ip).map_err(Error::Io)?;
+        if let Some(guard) = &self.guard {
+            guard.set_firewall_peer_handler(Some(std::sync::Arc::new(|peer| {
+                windows::allow_transport_peer(peer).map_err(Error::Io)
+            })))?;
         }
-
-        // Set default outbound to block — allow rules below override this for
-        // specific interfaces/IPs, so VPN traffic still flows.
-        let status = Command::new("netsh")
-            .args([
-                "advfirewall",
-                "set",
-                "currentprofile",
-                "firewallpolicy",
-                "allowinbound,blockoutbound",
-            ])
-            .status()
-            .map_err(Error::Io)?;
-        if !status.success() {
-            return Err(Error::Io(io::Error::new(
-                io::ErrorKind::Other,
-                "kill-switch: failed to set outbound block policy — Windows Firewall may be disabled, nothing is blocked",
-            )));
-        }
-
-        // Add allow rules that override the default block for VPN traffic.
-        // The block policy above is already live, so a failure here means
-        // outbound traffic — including to the VPN server itself — stays
-        // fully blocked with no way to reconnect. Fail loud and roll back
-        // to the pre-activation policy instead of reporting "active".
-        //
-        // Delete any pre-existing rule of the same name first: every reconnect
-        // picks a fresh random tun name (main.rs) and can select a different
-        // pool server, so without this an `add rule` across reconnects leaves
-        // every previous tun-name/server-IP allow rule in place — unbounded
-        // firewall-table growth plus a widening allow-list for the process
-        // lifetime. `delete rule` is a no-op (best-effort) when nothing matches.
-        for (name, extra) in &[
-            ("AIVPN_KS_ALLOW_VPN", format!("interface={}", self.tun_name)),
-            (
-                "AIVPN_KS_ALLOW_SERVER",
-                format!("remoteip={}", self.server_ip),
-            ),
-            ("AIVPN_KS_ALLOW_LOCAL", "remoteip=127.0.0.0/8".to_string()),
-        ] {
-            let _ = Command::new("netsh")
-                .args([
-                    "advfirewall",
-                    "firewall",
-                    "delete",
-                    "rule",
-                    &format!("name={}", name),
-                ])
-                .status();
-            let ok = Command::new("netsh")
-                .args([
-                    "advfirewall",
-                    "firewall",
-                    "add",
-                    "rule",
-                    &format!("name={}", name),
-                    "dir=out",
-                    "action=allow",
-                    extra.as_str(),
-                ])
-                .status()
-                .map(|s| s.success())
-                .unwrap_or(false);
-            if !ok {
-                self.deactivate_impl();
-                return Err(Error::Io(io::Error::new(
-                    io::ErrorKind::Other,
-                    format!(
-                        "kill-switch: failed to add allow rule '{name}' — rolled back \
-                         (outbound was fully blocked with no allow rules, which would \
-                         have locked out the VPN server itself)"
-                    ),
-                )));
-            }
-        }
-
         Ok(())
     }
 
     #[cfg(target_os = "windows")]
     fn deactivate_impl(&self) {
-        use std::process::Command;
-
-        // Remove allow rules
-        for name in &[
-            "AIVPN_KS_ALLOW_VPN",
-            "AIVPN_KS_ALLOW_SERVER",
-            "AIVPN_KS_ALLOW_LOCAL",
-        ] {
-            let _ = Command::new("netsh")
-                .args([
-                    "advfirewall",
-                    "firewall",
-                    "delete",
-                    "rule",
-                    &format!("name={}", name),
-                ])
-                .status();
+        if let Some(guard) = &self.guard {
+            let _ = guard.set_firewall_peer_handler(None);
         }
-
-        // Restore saved policy, or fall back to allow
-        let save_path = Self::policy_save_path();
-        let restored = if save_path.exists() {
-            if let Ok(saved) = std::fs::read_to_string(&save_path) {
-                // The policy label is locale-specific ("Firewall Policy" in EN,
-                // "Firewallrichtlinie" in DE, "Политика брандмауэра" in RU, …) but
-                // the VALUE is always English: "(Block|Allow)Inbound,(Block|Allow)Outbound".
-                // Match by value shape, not by label, so any Windows locale works.
-                saved.lines().find_map(|l| {
-                    let v = l.split(':').last().unwrap_or(l).trim().to_lowercase();
-                    if (v.starts_with("allowinbound") || v.starts_with("blockinbound"))
-                        && (v.ends_with("allowoutbound") || v.ends_with("blockoutbound"))
-                    {
-                        Some(v)
-                    } else {
-                        None
-                    }
-                })
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
-        let policy = restored.as_deref().unwrap_or("allowinbound,allowoutbound");
-        let _ = Command::new("netsh")
-            .args([
-                "advfirewall",
-                "set",
-                "currentprofile",
-                "firewallpolicy",
-                policy,
-            ])
-            .status();
-        let _ = std::fs::remove_file(&save_path);
-    }
-
-    #[cfg(target_os = "windows")]
-    fn clear_stale_impl() {
-        // Reuse deactivate_impl logic via a temporary instance
-        let ks = KillSwitch {
-            tun_name: String::new(),
-            server_ip: String::new(),
-            mark: None,
-            active: true,
-        };
-        ks.deactivate_impl();
+        if let Err(error) = windows::clear() {
+            warn!("kill-switch cleanup failed: {error}");
+        }
     }
 
     // ──────────────────── Unsupported platforms ────────────────────
@@ -635,6 +604,188 @@ impl KillSwitch {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn stale_accept_rules_cannot_survive_failed_flush() {
+        let ks = KillSwitch::new("tun0".into(), "192.0.2.1".into());
+        assert!(ks
+            .activate_iptables(&mut |_program, args| args != ["-F", "AIVPN_KS"])
+            .is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn reconnect_guard_precedes_flush_and_leaves_after_jump() {
+        let ks = KillSwitch::new("tun0".into(), "192.0.2.1".into());
+        let mut commands = Vec::new();
+        ks.activate_iptables(&mut |program, args| {
+            commands.push(format!("{} {}", program, args.join(" ")));
+            args.first() != Some(&"-C")
+        })
+        .unwrap();
+        for family in ["iptables", "ip6tables"] {
+            let guard = commands
+                .iter()
+                .position(|c| {
+                    c == &format!(
+                        "{family} -I OUTPUT 1 -m comment --comment AIVPN_KS_UPDATE -j DROP"
+                    )
+                })
+                .unwrap();
+            let flush = commands
+                .iter()
+                .position(|c| c == &format!("{family} -F AIVPN_KS"))
+                .unwrap();
+            let jump = commands
+                .iter()
+                .position(|c| c == &format!("{family} -I OUTPUT 1 -j AIVPN_KS"))
+                .unwrap();
+            let release = commands
+                .iter()
+                .position(|c| {
+                    c == &format!("{family} -D OUTPUT -m comment --comment AIVPN_KS_UPDATE -j DROP")
+                })
+                .unwrap();
+            assert!(guard < flush && flush < jump && jump < release);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fallback_blocks_both_families_and_bypasses_only_server_family() {
+        for server in ["192.0.2.1", "2001:db8::1"] {
+            let ks = KillSwitch::new("tun0".into(), server.into()).with_mark(0x4149);
+            let mut commands = Vec::new();
+            ks.activate_iptables(&mut |program, args| {
+                commands.push(format!("{} {}", program, args.join(" ")));
+                true
+            })
+            .unwrap();
+            for family in ["iptables", "ip6tables"] {
+                assert!(commands.contains(&format!("{family} -A AIVPN_KS -j DROP")));
+                assert!(commands.contains(&format!("{family} -I OUTPUT 1 -j AIVPN_KS")));
+            }
+            assert_eq!(commands.iter().filter(|c| c.contains(" -d ")).count(), 1);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fallback_partial_failure_preserves_drop_guards() {
+        let ks = KillSwitch::new("tun0".into(), "192.0.2.1".into());
+        let mut commands = Vec::new();
+        assert!(ks
+            .activate_iptables(&mut |program, args| {
+                commands.push(format!("{} {}", program, args.join(" ")));
+                !(program == "ip6tables" && args == ["-A", "AIVPN_KS", "-j", "DROP"])
+            })
+            .is_err());
+        for family in ["iptables", "ip6tables"] {
+            assert!(!commands.contains(&format!("{family} -X AIVPN_KS")));
+        }
+        assert!(
+            !commands.contains(
+                &"ip6tables -D OUTPUT -m comment --comment AIVPN_KS_UPDATE -j DROP".to_owned()
+            ),
+            "Ошибка настройки не должна снимать DROP guard неготовой семьи"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn nft_failure_fixture() {
+        let Ok(kind) = std::env::var("AIVPN_KS_FIXTURE_KIND") else {
+            return;
+        };
+        let log = std::env::var("AIVPN_KS_FIXTURE_LOG").unwrap();
+        let mut ks = if kind == "tunnel" {
+            let mut config = crate::tunnel::TunnelConfig::default();
+            config.kill_switch = true;
+            let mut tunnel = crate::tunnel::Tunnel::new(config);
+            assert!(tunnel.activate_kill_switch().is_err());
+            tunnel
+                .take_kill_switch()
+                .expect("Неудачная активация тоже владеет очисткой правил")
+        } else {
+            let mut ks = KillSwitch::new("tun0".into(), "192.0.2.1".into());
+            assert!(ks.activate().is_err());
+            assert!(!ks.is_active());
+            ks
+        };
+        use std::io::Write;
+        writeln!(
+            std::fs::OpenOptions::new().append(true).open(log).unwrap(),
+            "BEFORE_INTENTIONAL_EXIT"
+        )
+        .unwrap();
+        ks.deactivate();
+    }
+
+    #[cfg(target_os = "linux")]
+    fn nft_failure_log(kind: &str) -> String {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let root =
+            std::env::temp_dir().join(format!("aivpn-ks-test-{:032x}", rand::random::<u128>()));
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&root)
+            .unwrap();
+        let _cleanup = Cleanup(root.clone());
+        let nft = root.join("nft");
+        std::fs::write(&nft, "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$AIVPN_KS_FIXTURE_LOG\"\nif [ \"$1 $2\" = 'add rule' ]; then exit 1; fi\n").unwrap();
+        std::fs::set_permissions(&nft, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let log = root.join("commands");
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "kill_switch::tests::nft_failure_fixture",
+                "--nocapture",
+            ])
+            .env("PATH", &root)
+            .env("AIVPN_KS_FIXTURE_KIND", kind)
+            .env("AIVPN_KS_FIXTURE_LOG", &log)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        std::fs::read_to_string(log).unwrap()
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn nft_partial_failure_stays_closed_until_intentional_exit() {
+        let log = nft_failure_log("direct");
+        let (before, after) = log.split_once("BEFORE_INTENTIONAL_EXIT").unwrap();
+        assert!(
+            !before.contains("delete table"),
+            "Неудачная настройка сняла DROP policy"
+        );
+        assert!(
+            after.contains("delete table"),
+            "Intentional exit должен очистить частичную настройку"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn tunnel_keeps_failed_activation_owner_for_intentional_cleanup() {
+        let log = nft_failure_log("tunnel");
+        assert!(log
+            .split_once("BEFORE_INTENTIONAL_EXIT")
+            .unwrap()
+            .1
+            .contains("delete table"));
+    }
 
     /// No mark by default: a session that talks to the server directly needs
     /// only the address bypass, and accepting an unset mark would widen the

@@ -2,7 +2,7 @@
   import '../app.css';
   import { page } from '$app/stores';
   import { goto } from '$app/navigation';
-  import { onMount } from 'svelte';
+  import { onMount, onDestroy } from 'svelte';
   import { QueryClient, QueryClientProvider } from '@tanstack/svelte-query';
   import { authStore } from '$lib/stores/auth.svelte';
   import { themeStore } from '$lib/stores/theme.svelte';
@@ -17,6 +17,8 @@
       queries: { retry: 1, staleTime: 30_000 },
     },
   });
+  const unsubscribeSession = authStore.onSessionChange(() => queryClient.clear());
+  onDestroy(unsubscribeSession);
 
   const isLoginPage = $derived($page.url.pathname === '/login');
 

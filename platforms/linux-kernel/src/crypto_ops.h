@@ -10,52 +10,22 @@
 #include "session_table.h"
 
 /**
- * aivpn_decrypt - decrypt an inbound skb, leaving the plaintext in @skb.
- * @s:        session. Caller holds rcu_read_lock() (which keeps @s alive) but
- *            NOT s->lock — only the immutable fields (tfm, nonce_suffix) are
- *            read here, so the AEAD runs without serializing the session.
- *            RX stats are accounted by the caller under s->lock afterwards.
- * @skb:      full wire packet; the ciphertext + 16-byte Poly1305 tag begin at
- *            byte offset @ct_start (Variant A layout, per session).
- * @counter:  counter from the tag-window lookup (NOT extracted from wire bytes).
- * @ct_start: byte offset of the ciphertext within the packet.
+ * aivpn_decrypt - расшифровать пакет в отдельный буфер, skb не менять.
  *
- * Decrypts OUT OF PLACE into a scratch buffer so the original skb is left
- * untouched on authentication failure — the caller can then hand the packet to
- * user-space, which has decode paths (quic-initial coalescing, ratchet
- * transitions, catalog-mask window) the kernel fast path deliberately does not
- * replicate.
- *
- * Returns:
- *   0        success — skb->data now holds the decrypted inner plaintext.
- *   -EBADMSG authentication failed; skb is INTACT — caller should fall back.
- *   other <0 malformed/allocation error — caller should drop.
+ * Успех: *plain_out это один kmalloc с внутренним IP в начале, вызывающий
+ * освобождает его через kfree_sensitive. skb остается проводом, чтобы отказ
+ * политики мог вернуть пакет в userspace. -EBADMSG и -ENOMSG тоже оставляют
+ * skb целым и ставят *plain_out в NULL.
  */
 int aivpn_decrypt(struct aivpn_kern_session *s, struct sk_buff *skb, u64 counter,
-		  unsigned int ct_start);
+		  unsigned int ct_start, u8 **plain_out, unsigned int *plain_len);
 
 /**
- * aivpn_encrypt - encrypt an outbound skb in-place.
- * @s:   session (spinlock held by caller).
- * @skb: plaintext IP packet; caller ensures headroom >= 8 and
- *       tailroom >= 16 bytes.
+ * aivpn_downlink_encrypt - собрать один server to client Data пакет в @out.
  *
- * Prepends 8-byte resonance tag and appends 16-byte auth tag.
- * Returns 0 on success, -errno on failure.
- */
-int aivpn_encrypt(struct aivpn_kern_session *s, struct sk_buff *skb);
-
-/**
- * aivpn_downlink_encrypt - build one server->client Data packet into @out.
- * @s:       session (caller holds rcu_read_lock(); no spinlock held).
- * @r:       reservation from aivpn_session_dl_reserve() (tag/counter/seq/mdh).
- * @ip:      inner cleartext IP packet.
- * @ip_len:  its length (> 0).
- * @out:     wire buffer of @out_cap bytes.
- * @out_len: filled with the wire length on success.
- *
- * Produces: tag || mdh || AEAD_s2c(pad_len=0 || Data || seq || ip).
- * Returns 0 on success, -errno otherwise.
+ * Раскладка берется из r->tag_pos. 0xFFFF: tag, затем mdh, затем AEAD.
+ * Иначе tag лежит внутри mdh, шифротекст начинается с mdh_len.
+ * Возвращает 0 или -errno. При ошибке вызывающий сам решает судьбу skb.
  */
 int aivpn_downlink_encrypt(struct aivpn_kern_session *s,
 			   const struct aivpn_dl_reservation *r,

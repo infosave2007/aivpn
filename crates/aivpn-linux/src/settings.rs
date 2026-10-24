@@ -169,6 +169,26 @@ fn autostart_path() -> Option<PathBuf> {
     dirs::config_dir().map(|d| d.join("autostart").join("aivpn.desktop"))
 }
 
+fn desktop_exec_argument(path: &str) -> String {
+    let mut quoted = String::from("\"");
+    for character in path.chars() {
+        match character {
+            '\\' | '"' | '$' | '`' => {
+                quoted.push('\\');
+                quoted.push(character);
+            }
+            '%' => quoted.push_str("%%"),
+            _ => quoted.push(character),
+        }
+    }
+    quoted.push('"');
+    quoted
+        .replace('\\', "\\\\")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+        .replace('\t', "\\t")
+}
+
 /// Write an XDG autostart .desktop entry so AIVPN launches at login.
 pub fn write_autostart_entry() {
     let path = match autostart_path() {
@@ -190,6 +210,7 @@ pub fn write_autostart_entry() {
                 .map(|p| p.to_string_lossy().to_string())
                 .unwrap_or_else(|_| "aivpn-linux".to_string())
         });
+    let exe = desktop_exec_argument(&exe);
     let content = format!(
         "[Desktop Entry]\nType=Application\nExec={exe}\nName=AIVPN\nX-GNOME-Autostart-enabled=true\n"
     );
@@ -200,5 +221,24 @@ pub fn write_autostart_entry() {
 pub fn remove_autostart_entry() {
     if let Some(path) = autostart_path() {
         let _ = std::fs::remove_file(path);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn autostart_escapes_paths_and_field_codes() {
+        assert_eq!(
+            desktop_exec_argument("/home/a b/AIVPN.AppImage"),
+            "\"/home/a b/AIVPN.AppImage\""
+        );
+        assert_eq!(
+            desktop_exec_argument("/home/50%/AIVPN"),
+            "\"/home/50%%/AIVPN\""
+        );
+        assert_eq!(desktop_exec_argument("a\\b\"$`"), r#""a\\\\b\\"\\$\\`""#);
+        assert!(!desktop_exec_argument("a\nb").contains('\n'));
     }
 }

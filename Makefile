@@ -33,7 +33,7 @@ RUSER  ?= root
 endif
 REMOTE ?= /opt/aivpn
 
-.PHONY: help setup check test clippy fmt mask-gate hygiene-gate selfcontained swift-parse \
+.PHONY: help setup check test clippy fmt mask-gate hygiene-gate version-gate selfcontained swift-parse \
         linux \
         server server-tiny client server-docker \
         server-arm64 client-arm64 \
@@ -61,6 +61,7 @@ help:
 	@printf "    %-40s %s\n" "make fmt"                 "cargo fmt --all"
 	@printf "    %-40s %s\n" "make mask-gate"           "nDPI-gate every assets/masks/*.json (R2 Phase A)"
 	@printf "    %-40s %s\n" "make hygiene-gate"        "Vocabulary gate over the publicly distributed tree"
+	@printf "    %-40s %s\n" "make version-gate"        "Check release version consistency"
 	@printf "    %-40s %s\n" "make selfcontained"       "Prove the public tree builds with nothing beside it"
 	@printf "    %-40s %s\n" "make swift-parse"         "Syntax-check platforms/ios + platforms/macos (no Xcode needed)"
 	@printf "\n  Server / Client — Linux x86_64\n"
@@ -84,7 +85,7 @@ help:
 	@printf "    %-40s %s\n" "make ios [TEAM_ID=XX]"    "iOS IPA            (macOS + Xcode only)"
 	@printf "    %-40s %s\n" "make macos"               "macOS .app + .pkg + .dmg (macOS only)"
 	@printf "    %-40s %s\n" "make linux-appimage"      "Linux AppImage"
-	@printf "\n  Kernel module (Linux 6.1+, requires kernel headers)\n"
+	@printf "\n  Kernel module (совместимые Rust-for-Linux API и headers)\n"
 	@printf "    %-40s %s\n" "make kernel"              "Build aivpn-linux-kernel .ko (+ XDP BPF if clang)"
 	@printf "    %-40s %s\n" "make kernel-install"      "Install kernel module + depmod (root)"
 	@printf "\n  MikroTik RouterOS container\n"
@@ -133,21 +134,16 @@ clippy:
 fmt:
 	cargo fmt --all
 
-# Offline nDPI provenance gate (R2 Phase A). Synthesises every mask's real
-# uplink packets and fails if nDPI does not classify a mask as its declared
-# target protocol. Gracefully SKIPS (exit 0) when the research DPI toolchain
-# (nDPI + maskpcap under the gitignored research/ tree) is not built, so devs
-# without it are not blocked. See docs/R2_PHASE_A.md.
+# Обязательная DPI-проверка кадров масок. Классификатор собирает deploy/ci/build-dpi-tools.sh.
 mask-gate:
 	deploy/ci/ci-mask-gate.sh
 
-# The public tree carries a seam for pluggable datagram transports. The seam
-# itself is unremarkable; what must not leak is vocabulary naming a specific
-# out-of-tree implementation. Those slip in during ordinary work — a doc
-# comment, a debug log, a translation — so this is a build gate, not a review
-# item.
+# Проверка границы публичного дерева и служебных файлов.
 hygiene-gate:
 	deploy/ci/ci-public-hygiene.sh
+
+version-gate:
+	deploy/ci/ci-version-sync.sh
 
 # Cargo resolves every declared dependency, including switched-off optional
 # ones, so a path dependency reaching outside this repository breaks the build
@@ -272,6 +268,7 @@ define _musl
 	  printf 'WORKDIR /app\n'; \
 	  printf 'COPY Cargo.toml Cargo.lock ./\n'; \
 	  printf 'COPY crates crates/\n'; \
+	  printf 'COPY vendor vendor/\n'; \
 	  printf 'COPY assets/masks assets/masks/\n'; \
 	  printf 'RUN if [ -n "$$BUILD_FEATURES" ]; then cargo build --locked --release --target "$$TARGET_TRIPLE" -p "$$CRATE_NAME" --bin "$$BINARY_NAME" --features "$$BUILD_FEATURES"; else cargo build --locked --release --target "$$TARGET_TRIPLE" -p "$$CRATE_NAME" --bin "$$BINARY_NAME"; fi\n'; \
 	} > "$$TMPDF"; \
@@ -354,13 +351,11 @@ windows: releases/
 	WINTUN_DLL="$$PACKAGE_DIR/wintun.dll"; \
 	if [ ! -f "$$WINTUN_DLL" ]; then \
 	    echo "Downloading wintun.dll..."; \
-	    WINTUN_ZIP=/tmp/wintun-0.14.1.zip; \
-	    [ -f "$$WINTUN_ZIP" ] || curl -L -o "$$WINTUN_ZIP" "https://www.wintun.net/builds/wintun-0.14.1.zip"; \
-	    unzip -o "$$WINTUN_ZIP" "wintun/bin/amd64/wintun.dll" -d /tmp/; \
-	    cp /tmp/wintun/bin/amd64/wintun.dll "$$WINTUN_DLL"; \
+	    sh deploy/ci/fetch-wintun.sh "$$WINTUN_DLL"; \
 	fi; \
 	cp assets/brand/win/aivpn.ico "$$PACKAGE_DIR/aivpn.ico"; \
 	if command -v zip >/dev/null 2>&1; then \
+	    rm -f "$$ZIP_NAME"; \
 	    (cd "$$PACKAGE_DIR" && zip -r "../aivpn-windows-gui.zip" ./*); \
 	else \
 	    python3 -c "import zipfile,pathlib; pkg=pathlib.Path('$$PACKAGE_DIR'); \
@@ -460,6 +455,7 @@ ios:
 	    PAYLOAD="$$IOS_DIR/build/Payload"; \
 	    rm -rf "$$PAYLOAD"; mkdir -p "$$PAYLOAD"; \
 	    cp -r "$$APP_PATH" "$$PAYLOAD/"; \
+	    rm -f "$$DEST"; \
 	    (cd "$$IOS_DIR/build" && zip -qr "$$DEST" Payload); \
 	    rm -rf "$$PAYLOAD"; \
 	fi; \
@@ -637,6 +633,13 @@ print(ipaddress.IPv4Network(f'{sip}/{pl}',strict=False).with_prefixlen)" 2>/dev/
 #                                                                   SSH_PASS_FILE or key auth instead)
 #   make server-deploy HOST=vps.example.com USER=ubuntu SSH_OPTS="-p 2222"
 # ─────────────────────────────────────────────────────────────────────────────
+server-deploy: SHELL := /bin/bash
+server-deploy: export SSH_PASS := $(SSH_PASS)
+server-deploy: export SSH_PASS_FILE := $(SSH_PASS_FILE)
+server-deploy: export SSH_OPTS := $(SSH_OPTS)
+server-deploy: export HOST := $(HOST)
+server-deploy: export RUSER := $(RUSER)
+server-deploy: export REMOTE := $(REMOTE)
 server-deploy:
 	@[ -n "$(HOST)" ] || { \
 	    printf "ERROR: HOST is required.\nUsage: make server-deploy HOST=vps.example.com [USER=root] [SSH_PASS_FILE=path]\n" >&2; \
@@ -645,34 +648,37 @@ server-deploy:
 	    echo "ERROR: releases/aivpn-server-linux-x86_64 not found. Run 'make server' or 'make server-docker' first." >&2; \
 	    exit 1; }
 	@set -e; \
-	if [ -n "$(SSH_PASS_FILE)" ]; then \
-	    [ -f "$(SSH_PASS_FILE)" ] || { echo "ERROR: SSH_PASS_FILE '$(SSH_PASS_FILE)' not found" >&2; exit 1; }; \
+	if [ -n "$$SSH_PASS_FILE" ]; then \
+	    [ -f "$$SSH_PASS_FILE" ] || { echo "ERROR: SSH_PASS_FILE not found" >&2; exit 1; }; \
 	    command -v sshpass >/dev/null 2>&1 || { echo "ERROR: SSH_PASS_FILE requires sshpass (apt install sshpass)" >&2; exit 1; }; \
-	    SSH_PFX="sshpass -f '$(SSH_PASS_FILE)'"; \
+	    SSH_PFX=(sshpass -f "$$SSH_PASS_FILE"); \
 	    PASS_AUTH=1; \
-	elif [ -n "$(SSH_PASS)" ]; then \
+	elif [ -n "$$SSH_PASS" ]; then \
 	    echo "WARNING: SSH_PASS on the command line is visible in shell history and to other" >&2; \
 	    echo "         local users via 'ps' while this recipe runs. Prefer SSH_PASS_FILE=<path>" >&2; \
 	    echo "         (chmod 600 file with just the password) or key-based auth instead." >&2; \
 	    command -v sshpass >/dev/null 2>&1 || { echo "ERROR: SSH_PASS requires sshpass (apt install sshpass)" >&2; exit 1; }; \
-	    SSH_PFX="SSHPASS='$(SSH_PASS)' sshpass -e"; \
+	    export SSHPASS="$$SSH_PASS"; \
+	    SSH_PFX=(sshpass -e); \
 	    PASS_AUTH=1; \
 	else \
-	    SSH_PFX=""; \
+	    SSH_PFX=(); \
 	    PASS_AUTH=0; \
 	fi; \
-	SSHOPTS="$(SSH_OPTS) -o StrictHostKeyChecking=accept-new -o BatchMode=$$([ "$$PASS_AUTH" = 1 ] && echo no || echo yes)"; \
-	R="$(RUSER)@$(HOST)"; \
-	SSH="$$SSH_PFX ssh $$SSHOPTS $$R"; \
-	SCP="$$SSH_PFX scp $$SSHOPTS"; \
+	read -r -a SSHOPTS <<< "$$SSH_OPTS"; \
+	SSHOPTS+=(-o StrictHostKeyChecking=accept-new -o "BatchMode=$$([ "$$PASS_AUTH" = 1 ] && echo no || echo yes)"); \
+	R="$$RUSER@$$HOST"; \
+	SSH=("$${SSH_PFX[@]}" ssh "$${SSHOPTS[@]}" "$$R"); \
+	SCP=("$${SSH_PFX[@]}" scp "$${SSHOPTS[@]}"); \
+	printf -v REMOTE_Q '%q' "$$REMOTE"; \
 	echo "==> Creating remote directories on $(HOST)..."; \
-	eval "$$SSH" "mkdir -p $(REMOTE)/releases $(REMOTE)/deploy/config $(REMOTE)/deploy/docker $(REMOTE)/masks"; \
+	"$${SSH[@]}" "mkdir -p $$REMOTE_Q/releases $$REMOTE_Q/deploy/config $$REMOTE_Q/deploy/docker $$REMOTE_Q/assets/masks $$REMOTE_Q/masks"; \
 	echo "==> Computing local checksum..."; \
 	LOCAL_SHA=$$(sha256sum releases/aivpn-server-linux-x86_64 | awk '{print $$1}'); \
 	echo "==> Uploading server binary..."; \
-	eval "$$SCP" "releases/aivpn-server-linux-x86_64" "$$R:$(REMOTE)/releases/"; \
+	"$${SCP[@]}" "releases/aivpn-server-linux-x86_64" "$$R:$$REMOTE/releases/"; \
 	echo "==> Verifying transferred binary integrity (sha256sum -c)..."; \
-	REMOTE_SHA=$$(eval "$$SSH" "sha256sum $(REMOTE)/releases/aivpn-server-linux-x86_64" | awk '{print $$1}'); \
+	REMOTE_SHA=$$("$${SSH[@]}" "sha256sum $$REMOTE_Q/releases/aivpn-server-linux-x86_64" | awk '{print $$1}'); \
 	if [ "$$LOCAL_SHA" != "$$REMOTE_SHA" ]; then \
 	    echo "ERROR: checksum mismatch after transfer (local=$$LOCAL_SHA remote=$$REMOTE_SHA)." >&2; \
 	    echo "       Refusing to build/run the remote binary." >&2; \
@@ -680,22 +686,24 @@ server-deploy:
 	fi; \
 	echo "Checksum verified: $$LOCAL_SHA"; \
 	echo "==> Uploading Docker files..."; \
-	eval "$$SCP" "docker-compose.yml" "$$R:$(REMOTE)/"; \
-	eval "$$SCP" "deploy/docker/Dockerfile.prebuilt" "deploy/docker/docker-entrypoint.sh" "$$R:$(REMOTE)/deploy/docker/"; \
+	"$${SCP[@]}" "docker-compose.yml" "$$R:$$REMOTE/"; \
+	"$${SCP[@]}" "deploy/docker/Dockerfile.prebuilt" "deploy/docker/docker-entrypoint.sh" "$$R:$$REMOTE/deploy/docker/"; \
+	"$${SCP[@]}" "deploy/config/server.json.example" "$$R:$$REMOTE/deploy/config/"; \
+	"$${SCP[@]}" assets/masks/*.json "$$R:$$REMOTE/assets/masks/"; \
 	if [ -f deploy/config/server.json ]; then \
 	    echo "==> Uploading config..."; \
-	    eval "$$SCP" "deploy/config/server.json" "$$R:$(REMOTE)/deploy/config/"; \
+	    "$${SCP[@]}" "deploy/config/server.json" "$$R:$$REMOTE/deploy/config/"; \
 	fi; \
 	echo "==> Installing Docker on remote (if needed)..."; \
-	eval "$$SSH" "export DEBIAN_FRONTEND=noninteractive && \
+	"$${SSH[@]}" "export DEBIAN_FRONTEND=noninteractive && \
 	    apt-get update -y -qq && \
 	    (apt-get install -y docker.io docker-compose-plugin iptables iproute2 ca-certificates curl openssl 2>/dev/null || \
 	     apt-get install -y docker.io docker-compose iptables iproute2 ca-certificates curl openssl) && \
 	    systemctl enable docker && systemctl start docker"; \
 	echo "==> Generating server key if missing..."; \
-	eval "$$SSH" "test -f $(REMOTE)/deploy/config/server.key || { openssl rand 32 > $(REMOTE)/deploy/config/server.key && chmod 600 $(REMOTE)/deploy/config/server.key; }"; \
+	"$${SSH[@]}" "test -f $$REMOTE_Q/deploy/config/server.key || { umask 077; openssl rand 32 > $$REMOTE_Q/deploy/config/server.key; }"; \
 	echo "==> Starting server via Docker Compose..."; \
-	eval "$$SSH" "cd $(REMOTE) && \
+	"$${SSH[@]}" "cd $$REMOTE_Q && \
 	    if docker compose version >/dev/null 2>&1; then DC='docker compose'; else DC='docker-compose'; fi && \
 	    AIVPN_SERVER_DOCKERFILE=deploy/docker/Dockerfile.prebuilt \$$DC up -d --build --force-recreate aivpn-server"; \
 	echo ""; \
@@ -728,7 +736,7 @@ test-docker:
 	docker compose -f deploy/docker/docker-compose.test.yml down
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Linux kernel module (requires kernel headers ≥ 6.1)
+# Модуль ядра требует совместимые Rust API, headers и toolchain.
 # Usage:
 #   make kernel              → build .ko in platforms/linux-kernel/
 #   make kernel KVER=6.6.0  → target a specific kernel

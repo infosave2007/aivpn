@@ -6,19 +6,13 @@
 //! 3. Self-test via Kolmogorov-Smirnov test
 //! 4. Store and broadcast
 
-// R2 Phase B: generated masks ARE now signed with the operator Ed25519 key
-// (`--mask-signing-key` / server.json `mask_signing_key`) after the KS
-// self-test passes — see `generate_and_store_mask`. However the key is still
-// OPTIONAL: without it, masks are generated with signature=[0u8;64] exactly as
-// before. production-secure stays a compile error until the remaining step
-// lands: make the signing key mandatory (refuse to generate unsigned) and
-// default `mask_verify_mode` to `enforce` in production-secure builds.
-#[cfg(feature = "production-secure")]
-compile_error!(
-    "mask_gen can still produce MaskProfile with signature=[0u8;64] when no \
-    --mask-signing-key is configured. Make the operator signing key mandatory \
-    (and default mask_verify_mode to enforce) before enabling production-secure."
-);
+// После самопроверки KS маска подписывается ключом оператора
+// (`--mask-signing-key` / server.json `mask_signing_key`).
+// Обычная сборка оставляет ключ необязательным: без него подпись нулевая,
+// режим проверки по умолчанию warn, уже выпущенные маски продолжают грузиться.
+// Сборка production-secure ключ требует. Генерация без него завершается
+// ошибкой и не записывает маску с нулевой подписью. Режим проверки в этой
+// сборке фиксирует MaskStore: действует только enforce.
 
 use std::sync::Arc;
 
@@ -152,6 +146,18 @@ pub async fn generate_and_store_mask(
     packets: &[PacketMetadata],
     store: &Arc<MaskStore>,
 ) -> Result<String> {
+    // В production-secure отказ раньше анализа: неподписанную маску не из чего
+    // выпускать, даже если запись не прошла бы самопроверку.
+    if store.operator_signing_key().is_none()
+        && crate::server_config::mask_generation_requires_signing_key()
+    {
+        return Err(Error::Mask(
+            "production-secure: генерация маски отклонена, не задан ключ подписи оператора \
+             (--mask-signing-key или mask_signing_key). Неподписанная маска не создается."
+                .into(),
+        ));
+    }
+
     // 1. Analyze traffic
     let analysis = analyze_traffic(service, packets)?;
     info!(
@@ -192,21 +198,26 @@ pub async fn generate_and_store_mask(
         test.confidence
     );
 
-    // 3b. R2 Phase B: sign with the operator key — ONLY after the self-test
-    // gate passed, so a signature attests "this mask went through the gates".
-    // Sign the reverse profile first: `signing_message()` serializes the whole
-    // struct, so the outer signature then also covers the (already signed)
-    // reverse profile, and the reverse profile stays independently verifiable
-    // if it is ever extracted standalone.
-    if let Some(key) = store.operator_signing_key() {
-        if let Some(rev) = profile.reverse_profile.as_mut() {
-            rev.sign(key);
+    // Подпись ставится только после самопроверки: она подтверждает, что маска
+    // прошла пороги. Сначала подписывается обратный профиль. Сообщение внешней
+    // подписи сериализует всю структуру, поэтому оно покрывает уже подписанный
+    // обратный профиль, и тот остается проверяемым отдельно.
+    match store.operator_signing_key().cloned() {
+        Some(key) => {
+            profile.sign(&key)?;
+            info!(
+                "Mask '{}' signed with operator Ed25519 key",
+                profile.mask_id
+            );
         }
-        profile.sign(key);
-        info!(
-            "Mask '{}' signed with operator Ed25519 key",
-            profile.mask_id
-        );
+        None => {
+            // Обычная сборка. В production-secure эта ветка недостижима:
+            // отсутствие ключа уже вернуло ошибку до анализа.
+            info!(
+                "Mask '{}' stored unsigned: no operator signing key configured",
+                profile.mask_id
+            );
+        }
     }
 
     // 4. Store
@@ -237,6 +248,14 @@ pub async fn generate_and_store_mask(
 // ─── Traffic Analysis ────────────────────────────────────────────────────────
 
 fn analyze_traffic(_service: &str, packets: &[PacketMetadata]) -> Result<AnalysisResult> {
+    if packets
+        .iter()
+        .any(|packet| !packet.iat_ms.is_finite() || !packet.entropy.is_finite())
+    {
+        return Err(Error::Mask(
+            "запись содержит неконечные IAT или энтропию".into(),
+        ));
+    }
     let uplink: Vec<&PacketMetadata> = packets
         .iter()
         .filter(|p| p.direction == Direction::Uplink)
@@ -463,10 +482,10 @@ fn build_fsm_from_sizes(sizes: &[u16]) -> (Vec<FSMState>, u16) {
     for i in window..sizes.len().saturating_sub(window) {
         let before = sizes[i - window..i].iter().map(|&x| x as f32).sum::<f32>() / window as f32;
         let after = sizes[i..i + window].iter().map(|&x| x as f32).sum::<f32>() / window as f32;
-        if (before - after).abs() > threshold {
-            if change_points.is_empty() || i - *change_points.last().unwrap() > 10 {
-                change_points.push(i);
-            }
+        if (before - after).abs() > threshold
+            && (change_points.is_empty() || i - *change_points.last().unwrap() > 10)
+        {
+            change_points.push(i);
         }
     }
 
@@ -971,7 +990,7 @@ fn score_quic(headers: &[Vec<u8>], consistency: &[f32]) -> Option<(HeaderSpec, f
     let score = (0.35 * long_header_ratio
         + 0.35 * version_ratio
         + 0.20 * dcid_len_ratio
-        + 0.10 * consistency.get(0).copied().unwrap_or(0.0))
+        + 0.10 * consistency.first().copied().unwrap_or(0.0))
         - penalty;
 
     if score > 0.45 {
@@ -1003,7 +1022,7 @@ fn score_dns(headers: &[Vec<u8>], consistency: &[f32]) -> Option<(HeaderSpec, f3
         / headers.len() as f32;
     let txid_variability = 1.0
         - consistency
-            .get(0)
+            .first()
             .copied()
             .unwrap_or(1.0)
             .min(consistency.get(1).copied().unwrap_or(1.0));
@@ -1037,7 +1056,7 @@ fn score_tls(headers: &[Vec<u8>], consistency: &[f32]) -> Option<(HeaderSpec, f3
 
     let content_ratio = headers
         .iter()
-        .filter(|h| h.len() >= 1 && matches!(h[0], 0x14 | 0x15 | 0x16 | 0x17))
+        .filter(|h| !h.is_empty() && matches!(h[0], 0x14..=0x17))
         .count() as f32
         / headers.len() as f32;
     let version_ratio = headers
@@ -1065,7 +1084,7 @@ fn score_tls(headers: &[Vec<u8>], consistency: &[f32]) -> Option<(HeaderSpec, f3
     let score = (0.35 * content_ratio
         + 0.35 * version_ratio
         + 0.15 * len_variability
-        + 0.15 * consistency.get(0).copied().unwrap_or(0.0))
+        + 0.15 * consistency.first().copied().unwrap_or(0.0))
         - penalty;
 
     if score > 0.45 {
@@ -1257,7 +1276,7 @@ fn build_mask_profile(service: &str, analysis: &AnalysisResult) -> Result<MaskPr
         size_distribution,
         iat_distribution,
         size_iat_joint: analysis.size_iat_joint.clone(),
-        padding_strategy: PaddingStrategy::RandomUniform { min: 0, max: 64 },
+        padding_strategy: PaddingStrategy::MatchDistribution,
         fsm_states: analysis.fsm_states.clone(),
         fsm_initial_state: analysis.fsm_initial_state,
         signature_vector,
@@ -1310,7 +1329,7 @@ fn build_reverse_profile(mask_id: &str, analysis: &AnalysisResult) -> Option<Box
         // Downlink is server-shaped (A7); the joint model is applied to uplink
         // client shaping, so the reverse profile keeps the 1-D marginals.
         size_iat_joint: None,
-        padding_strategy: PaddingStrategy::RandomUniform { min: 0, max: 64 },
+        padding_strategy: PaddingStrategy::MatchDistribution,
         fsm_states: vec![FSMState {
             state_id: 0,
             transitions: vec![],
@@ -1754,43 +1773,12 @@ fn detect_mimic_protocol(recorded_header_prefix: &[u8]) -> Option<(SpoofProtocol
     None
 }
 
-/// Canonical STUN `HeaderSpec` for detected-protocol masks: mirrors the
-/// hand-authored `webrtc_zoom_v3` preset's structure exactly — binding
-/// request type@0 (2 bytes), STUN message-length@2 (a `Length` field, 2
-/// bytes big-endian), magic cookie@4 (4 bytes), an 8-byte tag-carrier slot@8,
-/// and the remaining 4-byte transaction-id tail@16 (20 bytes total).
-///
-/// A raw recorded header cannot be trusted as-is: `MimicProtocol::Stun`'s
-/// post-assembly fixup (`MaskProfile::patch_stun_length`) needs a `Length`
-/// field at a known offset to satisfy nDPI's `is_stun` invariant
-/// (`msg_len + 20 == udp_payload_len`), which recorded bytes have no reason
-/// to expose correctly. The empirical value of the recording (size/IAT/FSM
-/// distributions) is kept; only the header structure is replaced with this
-/// known-valid one.
+/// Новые маски используют ту же раскладку STUN, что и встроенный профиль.
 fn canonical_stun_header_spec() -> HeaderSpec {
-    HeaderSpec::structured(vec![
-        HeaderField::Fixed {
-            bytes: vec![0x00, 0x01],
-        },
-        HeaderField::Length {
-            len: 2,
-            endian: HeaderEndian::Big,
-        },
-        HeaderField::Fixed {
-            bytes: vec![0x21, 0x12, 0xA4, 0x42],
-        },
-        HeaderField::Id {
-            len: 8,
-            mode: IdFieldMode::Random,
-        },
-        HeaderField::Id {
-            len: 4,
-            mode: IdFieldMode::Random,
-        },
-    ])
+    aivpn_common::mask::preset_masks::webrtc_zoom_v3()
+        .header_spec
+        .expect("Встроенный STUN-профиль содержит header_spec")
 }
-
-/// Header/protocol/tag-layout fields derived for a generated `MaskProfile`.
 struct MimicFields {
     spoof_protocol: SpoofProtocol,
     header_spec: Option<HeaderSpec>,
@@ -1897,7 +1885,14 @@ fn entropy_penalty(real_entropy: f64) -> f32 {
 /// Correct merge-walk that handles tied values: at each unique value,
 /// advance BOTH pointers past all duplicates before comparing CDFs.
 fn ks_test(sample1: &[f64], sample2: &[f64]) -> f32 {
-    if sample1.is_empty() || sample2.is_empty() {
+    // NaN не проходит сравнение <= и иначе останавливает продвижение индексов.
+    if sample1.is_empty()
+        || sample2.is_empty()
+        || sample1
+            .iter()
+            .chain(sample2)
+            .any(|value| !value.is_finite())
+    {
         return 1.0;
     }
 
@@ -2000,6 +1995,24 @@ mod tests {
         assert_eq!(entropy_penalty(6.03), 0.0);
         assert_eq!(entropy_penalty(7.8), 0.0);
         assert!(entropy_penalty(5.2) > 0.5);
+    }
+
+    #[test]
+    fn ks_test_rejects_nonfinite_samples() {
+        for invalid in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert_eq!(ks_test(&[1.0], &[invalid]), 1.0);
+            assert_eq!(ks_test(&[invalid], &[1.0]), 1.0);
+        }
+    }
+
+    #[test]
+    fn analyze_traffic_rejects_nonfinite_metadata() {
+        let mut packets = signable_recording();
+        packets[0].iat_ms = f64::NAN;
+        assert!(analyze_traffic("nonfinite", &packets).is_err());
+        packets[0].iat_ms = 10.0;
+        packets[0].entropy = f32::INFINITY;
+        assert!(analyze_traffic("nonfinite", &packets).is_err());
     }
 
     #[test]
@@ -2533,6 +2546,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[cfg(not(feature = "production-secure"))]
     #[tokio::test]
     async fn phase_b_generated_mask_unsigned_without_key() {
         // No operator key configured → exactly the legacy behavior: all-zero
@@ -2559,6 +2573,37 @@ mod tests {
             .expect("generation must succeed");
         let entry = store.get_mask(&mask_id).expect("mask stored");
         assert!(entry.profile.is_unsigned());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(feature = "production-secure")]
+    #[tokio::test]
+    async fn production_secure_generation_rejects_missing_signing_key() {
+        let dir = std::env::temp_dir().join(format!(
+            "aivpn-maskgen-nokey-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let store = std::sync::Arc::new(crate::mask_store::MaskStore::new(
+            std::sync::Arc::new(crate::gateway::MaskCatalog::new()),
+            dir.clone(),
+            None,
+            None,
+            aivpn_common::mask::MaskVerifyMode::Warn,
+        ));
+        let err = super::generate_and_store_mask("phaseb_nokey", &[], &store)
+            .await
+            .expect_err("production-secure must not mint an unsigned mask");
+        let text = err.to_string();
+        assert!(text.contains("production-secure"), "{text}");
+        assert!(
+            store.list_masks().is_empty(),
+            "rejected generation must not leave a mask behind"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2631,6 +2676,13 @@ mod tests {
         let mask = build_mask_profile("zoom_stun", &analysis).expect("mask should build");
 
         assert_eq!(mask.spoof_protocol, SpoofProtocol::WebRTC_STUN);
+        assert!(
+            matches!(
+                mask.padding_strategy,
+                aivpn_common::mask::PaddingStrategy::MatchDistribution
+            ),
+            "Генератор не применяет выбранные размеры"
+        );
         assert_eq!(mask.tag_offset, 8);
         assert_eq!(mask.embedded_tag_offset(), Some(8));
 
@@ -2639,11 +2691,7 @@ mod tests {
             .as_ref()
             .expect("STUN mask must carry a header_spec");
         let generated = spec.generate_static();
-        assert_eq!(
-            generated.len(),
-            20,
-            "canonical STUN header must be exactly 20 bytes"
-        );
+        assert_eq!(generated.len(), 24, "Заголовок STUN должен вмещать атрибут");
         assert_eq!(
             &generated[4..8],
             &[0x21, 0x12, 0xA4, 0x42],
@@ -2657,8 +2705,9 @@ mod tests {
         assert_eq!(proto, MimicProtocol::Stun);
 
         let mut packet = generated.clone();
-        packet.extend_from_slice(&[0xABu8; 137]); // stand-in ciphertext tail
-        proto.finalize(&mut packet, &mask);
+        packet.extend_from_slice(&[0xABu8; 136]);
+        mask.finalize_packet(&mut packet).unwrap();
+        aivpn_common::stun_wire::validate(&packet).unwrap();
 
         let msg_len = u16::from_be_bytes([packet[2], packet[3]]) as usize;
         assert_eq!(
@@ -2684,9 +2733,9 @@ mod tests {
 
         let proto = MimicProtocol::for_spoof(mask.spoof_protocol);
         assert_eq!(proto, MimicProtocol::Quic);
-        // QUIC is fully constructed at build time (RFC 9001 Initial); the
-        // detector only needs to route the mask to that path.
-        assert!(proto.is_constructed());
+        // Внешние кадры создает движок состояния, а не статический профиль.
+        assert!(!proto.is_constructed());
+        assert!(aivpn_common::mask_io::needs_state(&mask));
     }
 
     #[test]

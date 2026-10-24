@@ -55,7 +55,13 @@ class TransportSettingsActivity : AppCompatActivity() {
         }
         descriptor = desc
 
-        val prefs = getSharedPreferences(PrefsKeys.PREFS_NAME, MODE_PRIVATE)
+        val prefs = try {
+            SecureStorage.transportPreferences(this)
+        } catch (_: Exception) {
+            Toast.makeText(this, getString(R.string.status_storage_unavailable), Toast.LENGTH_LONG).show()
+            finish()
+            return
+        }
 
         val container = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -161,7 +167,12 @@ class TransportSettingsActivity : AppCompatActivity() {
 
     private fun applyAll() {
         val desc = descriptor ?: return
-        val prefs = getSharedPreferences(PrefsKeys.PREFS_NAME, MODE_PRIVATE)
+        val prefs = try {
+            SecureStorage.transportPreferences(this)
+        } catch (_: Exception) {
+            Toast.makeText(this, getString(R.string.status_storage_unavailable), Toast.LENGTH_LONG).show()
+            return
+        }
         val editor = prefs.edit()
 
         // Read every rendered field back, persisting the raw state generically
@@ -201,7 +212,10 @@ class TransportSettingsActivity : AppCompatActivity() {
             editor.remove(PrefsKeys.PREF_EXT_TRANSPORT_NAME)
             editor.remove(PrefsKeys.PREF_EXT_TRANSPORT_PARAMS)
         }
-        editor.apply()
+        if (!editor.commit()) {
+            Toast.makeText(this, getString(R.string.status_storage_unavailable), Toast.LENGTH_LONG).show()
+            return
+        }
 
         Toast.makeText(this, getString(R.string.transport_applied), Toast.LENGTH_SHORT).show()
         finish()

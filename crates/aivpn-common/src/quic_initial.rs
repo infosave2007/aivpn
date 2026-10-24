@@ -1,6 +1,10 @@
-//! RFC 9001 QUIC v1 Initial packet construction for the `Quic` mimic protocol.
+//! Генератор прежней синтетической заготовки QUIC Initial для тестов.
 //!
-//! aivpn's QUIC mask emits a **coalesced datagram**:
+//! Не реализует соединение, ACK или TLS handshake и не используется
+//! в сетевом пути клиента и сервера. Внешний QUIC формирует `quic_mask`
+//! с состоянием обеих сторон. Разбор этой заготовки не заменяет живой DPI-gate.
+//!
+//! Старый генератор создает составную дейтаграмму:
 //!
 //! ```text
 //! [ real RFC 9001 v1 QUIC Initial (header-protected, AEAD-encrypted) ]
@@ -16,8 +20,8 @@
 //!
 //! The 8-byte aivpn resonance tag rides inside the DCID (offset 6), so the
 //! per-packet key material is per-packet — the QUIC crypto is recomputed for
-//! every packet. The aivpn server extracts the tag from the DCID and skips
-//! the Initial (using its Length field) to reach the real ciphertext.
+//! every packet. Прежний декодер извлекал тег из DCID и пропускал Initial.
+//! В текущем gateway этот путь удален.
 //!
 //! Crypto (RFC 9001 §5.2, all SHA-256 / AES-128-GCM):
 //! - `initial_secret        = HKDF-Extract(initial_salt, DCID)`
@@ -364,11 +368,13 @@ pub fn parse_quic_initial(datagram: &[u8]) -> Option<QuicInitialLayout> {
     let mut pos = scid_len_pos + 1 + scid_len;
     // Token length varint (must be 0 for a client Initial we built).
     let (token_len, tl) = decode_varint(datagram.get(pos..)?)?;
-    pos += tl + token_len as usize;
+    pos = pos
+        .checked_add(tl)?
+        .checked_add(usize::try_from(token_len).ok()?)?;
     // Length varint bounds the Initial (packet number + payload + AEAD tag).
     let (length_value, ll) = decode_varint(datagram.get(pos..)?)?;
-    pos += ll;
-    let payload_offset = pos.checked_add(length_value as usize)?;
+    pos = pos.checked_add(ll)?;
+    let payload_offset = pos.checked_add(usize::try_from(length_value).ok()?)?;
     if payload_offset > datagram.len() {
         return None;
     }
@@ -383,6 +389,25 @@ pub fn parse_quic_initial(datagram: &[u8]) -> Option<QuicInitialLayout> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn protocol_audit_quic_rejects_oversized_varint_offsets() {
+        for huge in [u32::MAX as u64 - 15, 1u64 << 32, (1u64 << 62) - 1] {
+            let mut packet = vec![0xc0, 0, 0, 0, 1, 8];
+            packet.extend_from_slice(&[0; 8]);
+            packet.push(0);
+            encode_varint(huge, &mut packet);
+            packet.extend_from_slice(&[0; 32]);
+            assert!(parse_quic_initial(&packet).is_none());
+
+            let mut packet = vec![0xc0, 0, 0, 0, 1, 8];
+            packet.extend_from_slice(&[0; 8]);
+            packet.extend_from_slice(&[0, 0]);
+            encode_varint(huge, &mut packet);
+            packet.extend_from_slice(&[0; 32]);
+            assert!(parse_quic_initial(&packet).is_none());
+        }
+    }
 
     #[test]
     fn roundtrip_layout() {

@@ -13,8 +13,8 @@ use aivpn_common::network_config::{ClientNetworkConfig, VpnNetworkConfig, LEGACY
 
 // Real worst-case outer overhead per packet:
 //   TAG(8) + MDH(varies, default 20) + pad_len(2) + inner_hdr(4) + random_padding(≤24) + Poly1305(16) ≈ 74 bytes.
-// Masks with MDH > ~40 bytes require a lower negotiated client MTU via ServerHello network_config.
-const WAN_SAFE_TUN_MTU: u16 = 1346;
+// Вмещает DATA и FEC во все встроенные носители при переключении масок.
+const WAN_SAFE_TUN_MTU: u16 = aivpn_common::network_config::DEFAULT_VPN_MTU;
 
 /// Whether the current process has an elevated (Administrator) token.
 /// Creating a Wintun adapter always requires this on Windows — there is no
@@ -63,6 +63,7 @@ pub struct TunnelConfig {
     pub server_vpn_ip: String,
     pub tun_netmask: String,
     pub prefix_len: u8,
+    pub ipv6: Option<(std::net::Ipv6Addr, u8)>,
     pub mtu: u16,
     /// Route all traffic through VPN (full tunnel mode)
     pub full_tunnel: bool,
@@ -86,6 +87,7 @@ impl Default for TunnelConfig {
             server_vpn_ip: LEGACY_SERVER_VPN_IP.to_string(),
             tun_netmask: "255.255.255.0".to_string(),
             prefix_len: 24,
+            ipv6: None,
             mtu: WAN_SAFE_TUN_MTU,
             full_tunnel: false,
             mdh_len: 20u16,
@@ -102,27 +104,18 @@ impl TunnelConfig {
         network_config: ClientNetworkConfig,
         full_tunnel: bool,
     ) -> Self {
-        // Clamp to MAX_PACKET_SIZE (1500): client.rs's FecEncoder is
-        // hardcoded to a 1500-byte parity buffer
-        // (`FecEncoder::new(fec_n, 1500)`), and `FecEncoder::feed()` silently
-        // truncates anything longer — bytes beyond 1500 never get XORed into
-        // repair parity, so any lost packet in a group containing an
-        // oversized member gets "recovered" corrupted/truncated instead of
-        // failing loudly. `network_config.mtu` is server-controlled (pushed
-        // in `apply_server_network_override`) as well as
-        // config-file/bootstrap-controlled here at startup, up to u16::MAX —
-        // this is the single choke point both paths route through before a
-        // `TunnelConfig` (and the MTU actually applied to the TUN device) is
-        // produced.
+        // Назначение сервера и ключ подключения не могут увеличить MTU
+        // сверх бюджета носителя. Это также меньше буфера FEC на 1500 байт.
         let mtu = network_config
             .mtu
-            .min(aivpn_common::protocol::MAX_PACKET_SIZE as u16);
+            .min(aivpn_common::network_config::MAX_MASK_TUN_MTU);
         Self {
             tun_name,
             tun_addr: network_config.client_ip.to_string(),
             server_vpn_ip: network_config.server_vpn_ip.to_string(),
             tun_netmask: network_config.netmask_string(),
             prefix_len: network_config.prefix_len,
+            ipv6: network_config.client_ipv6().ok().flatten(),
             mtu,
             full_tunnel,
             mdh_len: network_config.mdh_len,
@@ -142,7 +135,8 @@ impl TunnelConfig {
             mtu: self.mtu,
             mdh_len: self.mdh_len,
             keepalive_secs: None,
-            ipv6_address: None,
+            ipv6_address: self.ipv6.map(|(address, _)| address.to_string()),
+            ipv6_prefix_len: self.ipv6.map(|(_, prefix)| prefix),
         };
         network_config.validate()?;
         Ok(network_config)
@@ -190,31 +184,31 @@ pub struct Tunnel {
     writer: Option<tun::DeviceWriter>,
     /// Saved default gateway for full-tunnel restore
     saved_default_gw: Option<String>,
+    full_tunnel_routes_active: bool,
     /// Saved default device for full-tunnel restore on Linux (e.g. "eth0").
     /// Stored alongside saved_default_gw; used in disable_full_tunnel().
+    #[cfg(target_os = "linux")]
     saved_default_dev: Option<String>,
     /// Server IP for bypass route cleanup
     server_ip: Option<String>,
-    /// Active IPv6 interface name saved before we add the blackhole route.
-    /// Used to restore the route on disconnect instead of guessing (e.g. hard-coding en0).
-    /// Only read in the macOS restore_ipv6 path; allow(dead_code) silences Linux build warnings.
-    #[allow(dead_code)]
-    saved_ipv6_iface: Option<String>,
     /// Windows: wintun adapter interface index for explicit route binding.
     /// Without this, `route add` may bind VPN routes to the physical NIC.
     /// Only read in Windows-gated code paths; allow(dead_code) silences Linux/macOS build warnings.
     #[allow(dead_code)]
     wintun_if_index: Option<String>,
     /// CIDRs added by apply_split_routes — removed on Drop.
+    #[cfg(not(target_os = "linux"))]
     split_routes_applied: Vec<String>,
-    /// Whether this Tunnel instance installed the IPv6 blackhole default
-    /// route (macOS: configure_macos; Linux: enable_full_tunnel). Drop must
-    /// only remove a blackhole we added ourselves — unconditionally deleting
-    /// `blackhole default` could tear down a route some other tool owns.
-    /// Never touched by the Windows code paths; allow(dead_code) silences
-    /// that build's warning.
-    #[allow(dead_code)]
-    ipv6_blackhole_added: bool,
+    #[cfg(target_os = "linux")]
+    owned_split_routes: Vec<Vec<String>>,
+    ipv6_routes_added: bool,
+    ipv6_server_bypass: Option<(String, String)>,
+    transport_mark: Option<u32>,
+    #[cfg(any(target_os = "macos", windows))]
+    transport_guard: Option<aivpn_common::transport::SharedGuard>,
+    #[cfg(target_os = "linux")]
+    transport_routes: Option<crate::transport_routes::TransportRoutes>,
+    ipv6_address_applied: Option<(std::net::Ipv6Addr, u8)>,
     /// Active kill-switch instance; deactivated on graceful Drop.
     kill_switch_state: Option<KillSwitch>,
 }
@@ -259,18 +253,32 @@ fn kill_orphaned_pkexec_child() {
 }
 
 impl Tunnel {
-    pub fn new(config: TunnelConfig) -> Self {
+    pub fn new(mut config: TunnelConfig) -> Self {
+        config.mtu = config
+            .mtu
+            .min(aivpn_common::network_config::MAX_MASK_TUN_MTU);
         Self {
             config,
             reader: None,
             writer: None,
             saved_default_gw: None,
+            full_tunnel_routes_active: false,
+            #[cfg(target_os = "linux")]
             saved_default_dev: None,
             server_ip: None,
-            saved_ipv6_iface: None,
             wintun_if_index: None,
+            #[cfg(not(target_os = "linux"))]
             split_routes_applied: Vec::new(),
-            ipv6_blackhole_added: false,
+            #[cfg(target_os = "linux")]
+            owned_split_routes: Vec::new(),
+            ipv6_routes_added: false,
+            ipv6_server_bypass: None,
+            transport_mark: None,
+            #[cfg(any(target_os = "macos", windows))]
+            transport_guard: None,
+            #[cfg(target_os = "linux")]
+            transport_routes: None,
+            ipv6_address_applied: None,
             kill_switch_state: None,
         }
     }
@@ -427,7 +435,7 @@ impl Tunnel {
                 ));
             }
             #[cfg(not(target_os = "windows"))]
-            Error::Io(io::Error::new(io::ErrorKind::Other, msg))
+            Error::Io(io::Error::other(msg))
         })?;
 
         // Get actual device name before split (on macOS, name is assigned by kernel as utunN)
@@ -512,6 +520,7 @@ impl Tunnel {
             self.configure_windows()?;
         }
 
+        self.configure_ipv6()?;
         Ok(())
     }
 
@@ -520,15 +529,10 @@ impl Tunnel {
         mut network_config: ClientNetworkConfig,
     ) -> Result<()> {
         network_config.validate()?;
-        // Clamp to MAX_PACKET_SIZE — see the matching comment in
-        // `TunnelConfig::from_network_config`. This is the live path that
-        // sets the TUN device's actual MTU on a server-pushed
-        // (ServerHello/mid-session) network-config override, so it must be
-        // clamped independently of that other choke point, not just rely on
-        // it.
+        // Live override соблюдает тот же бюджет, что и начальный TUN.
         network_config.mtu = network_config
             .mtu
-            .min(aivpn_common::protocol::MAX_PACKET_SIZE as u16);
+            .min(aivpn_common::network_config::MAX_MASK_TUN_MTU);
         // Remember the address the device carried BEFORE this override: on
         // Linux `ip addr replace <new>` with a different IP ADDS it as a
         // secondary address, the old one stays primary and keeps winning
@@ -546,6 +550,7 @@ impl Tunnel {
         self.config.tun_netmask = network_config.netmask_string();
         self.config.prefix_len = network_config.prefix_len;
         self.config.mtu = network_config.mtu;
+        self.config.ipv6 = network_config.client_ipv6()?;
 
         if self.reader.is_none() && self.writer.is_none() {
             return Ok(());
@@ -559,7 +564,7 @@ impl Tunnel {
             // default-route overrides were wiped by the ifconfig/route cleanup above.
             // Re-install them so internet traffic keeps flowing through the tunnel
             // after a server-pushed network-config update (ServerHello override).
-            if self.config.full_tunnel && self.saved_default_gw.is_some() {
+            if self.config.full_tunnel && self.full_tunnel_routes_active {
                 self.enable_full_tunnel()?;
             }
         }
@@ -576,6 +581,7 @@ impl Tunnel {
         #[cfg(target_os = "windows")]
         self.configure_windows()?;
 
+        self.configure_ipv6()?;
         Ok(())
     }
 
@@ -741,45 +747,6 @@ impl Tunnel {
             );
         }
 
-        // Block IPv6 to prevent traffic leaks (IPv6 bypasses the IPv4-only VPN tunnel).
-        // First, discover and save the current IPv6 default interface so we can restore
-        // it precisely on disconnect — avoids the "hardcode en0" problem.
-        info!("Blocking IPv6 to prevent traffic leak...");
-        let ipv6_iface = Command::new("/sbin/route")
-            .args(["-n", "get", "-inet6", "default"])
-            .output()
-            .ok()
-            .and_then(|out| String::from_utf8(out.stdout).ok())
-            .and_then(|text| {
-                text.lines()
-                    .find(|l| l.trim().starts_with("interface:"))
-                    .and_then(|l| l.split(':').nth(1))
-                    .map(|s| s.trim().to_string())
-            });
-        if let Some(ref iface) = ipv6_iface {
-            info!(
-                "Saving IPv6 default interface: {} (will restore on disconnect)",
-                iface
-            );
-        } else {
-            info!("No IPv6 default route found — nothing to restore on disconnect");
-        }
-        self.saved_ipv6_iface = ipv6_iface;
-
-        // Add a blackhole for ::/0 — any IPv6 packet hits a dead end inside the OS.
-        let _ = Command::new("/sbin/route")
-            .args(["-n", "delete", "-inet6", "default"])
-            .status();
-        let blackhole_ok = Command::new("/sbin/route")
-            .args(["-n", "add", "-inet6", "-net", "::/0", "-blackhole"])
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
-        // Remember that WE added the blackhole so Drop only restores IPv6
-        // when there is actually something of ours to remove.
-        self.ipv6_blackhole_added = blackhole_ok;
-        info!("IPv6 blocked — all v6 traffic goes to blackhole (no leak possible)");
-
         // Verify routes — diagnostic-only (just logs which routes are
         // present). Best-effort: this must never fail the whole connect
         // attempt just because `netstat` couldn't exec (missing from PATH,
@@ -830,7 +797,7 @@ impl Tunnel {
     /// integration, etc.), recover unconditionally by asking pkexec for
     /// one-shot root privilege instead of relying on the file capability.
     #[cfg(target_os = "linux")]
-    fn run_ip_privileged(args: &[&str]) -> io::Result<i32> {
+    pub(crate) fn run_ip_privileged(args: &[&str]) -> io::Result<i32> {
         Ok(Self::run_ip_batch_privileged(&[("cmd", args)])?
             .into_iter()
             .next()
@@ -922,7 +889,29 @@ impl Tunnel {
         {
             return None;
         }
+        let owned = args.strip_prefix(&["-6"]).unwrap_or(args);
+        match owned {
+            ["route", action @ ("add" | "del"), cidr, "dev", device, "proto", "242"] => {
+                return Some(format!("{name}\tsplit_{action}\t{cidr}\t{device}\t-"));
+            }
+            ["route", action @ ("add" | "del"), cidr, "via", gateway, "dev", device, "proto", "242"] =>
+            {
+                return Some(format!(
+                    "{name}\tsplit_{action}\t{cidr}\t{device}\t{gateway}"
+                ));
+            }
+            _ => {}
+        }
         match args {
+            ["-6", "addr", action @ ("replace" | "del"), cidr, "dev", iface] => {
+                Some(format!("{name}\taddr6_{action}\t{cidr}\t{iface}"))
+            }
+            ["-6", "route", action @ ("replace" | "del" | "add"), cidr, "dev", iface] => {
+                Some(format!("{name}\troute6_{action}\t{cidr}\t{iface}"))
+            }
+            ["-6", "route", "add", cidr, "dev", iface, "via", gateway] => Some(format!(
+                "{name}\troute6_add_via\t{cidr}\t{iface}\t{gateway}"
+            )),
             ["route", "replace", "0.0.0.0/1", "dev", iface] => {
                 Some(format!("{name}\troute_replace_fulltunnel_lower\t{iface}"))
             }
@@ -1178,29 +1167,34 @@ impl Tunnel {
         let cidr = self.config.client_network_config()?.cidr_string();
         let vpn_cidr = self.config.vpn_network_config()?.cidr_string();
 
+        let mtu = self.config.mtu.to_string();
         let results = Self::run_ip_batch_privileged(&[
+            ("mtu", &["link", "set", "dev", tun_name, "mtu", &mtu]),
             ("addr", &["addr", "replace", &cidr, "dev", tun_name]),
             ("route", &["route", "replace", &vpn_cidr, "dev", tun_name]),
         ])
         .map_err(|e| {
-            Error::Io(io::Error::new(
-                io::ErrorKind::Other,
-                format!("Failed to configure tunnel: {}", e),
-            ))
+            Error::Io(io::Error::other(format!(
+                "Failed to configure tunnel: {}",
+                e
+            )))
         })?;
 
+        if !results
+            .iter()
+            .any(|(name, code)| name == "mtu" && *code == 0)
+        {
+            return Err(Error::Io(io::Error::other("Failed to apply tunnel MTU")));
+        }
         let addr_ok = results
             .iter()
             .find(|(name, _)| name == "addr")
             .is_some_and(|(_, c)| *c == 0);
         if !addr_ok {
-            return Err(Error::Io(io::Error::new(
-                io::ErrorKind::Other,
-                format!(
-                    "Failed to configure tunnel address {} on {}",
-                    cidr, tun_name
-                ),
-            )));
+            return Err(Error::Io(io::Error::other(format!(
+                "Failed to configure tunnel address {} on {}",
+                cidr, tun_name
+            ))));
         }
 
         let route_ok = results
@@ -1328,6 +1322,36 @@ impl Tunnel {
         Ok(())
     }
 
+    /// Настроить обход до открытия сокетов альтернативного транспорта.
+    pub fn set_transport_guard(
+        &mut self,
+        guard: aivpn_common::transport::SharedGuard,
+    ) -> Result<()> {
+        self.set_transport_mark(guard.routing_mark())?;
+        #[cfg(any(target_os = "macos", windows))]
+        {
+            if self.config.kill_switch {
+                KillSwitch::prepare_transport_guard(&guard)?;
+            }
+            self.transport_guard = Some(guard);
+        }
+        Ok(())
+    }
+
+    /// Настроить отдельную таблицу маршрутов для помеченных сокетов.
+    pub fn set_transport_mark(&mut self, mark: Option<u32>) -> Result<()> {
+        #[cfg(target_os = "linux")]
+        {
+            self.transport_routes = None;
+            if let Some(mark) = mark {
+                self.transport_routes =
+                    Some(crate::transport_routes::TransportRoutes::install(mark)?);
+            }
+        }
+        self.transport_mark = mark;
+        Ok(())
+    }
+
     /// Set VPN server IP (call before enable_full_tunnel)
     pub fn set_server_ip(&mut self, server_ip: String) {
         self.server_ip = Some(server_ip);
@@ -1360,6 +1384,7 @@ impl Tunnel {
 
         let gw = match default_gw {
             Some(g) => g,
+            None if self.server_ip.as_ref().is_some_and(|ip| ip.contains(':')) => String::new(),
             None => {
                 error!("Could not determine default gateway");
                 return Err(Error::Io(io::Error::new(
@@ -1370,10 +1395,11 @@ impl Tunnel {
         };
 
         info!("Current default gateway: {}", gw);
-        self.saved_default_gw = Some(gw.clone());
+        self.saved_default_gw = (!gw.is_empty()).then(|| gw.clone());
+        self.full_tunnel_routes_active = true;
 
         // 2. Add bypass route for VPN server IP via original gateway
-        if let Some(ref server_ip) = self.server_ip {
+        if let Some(server_ip) = self.server_ip.as_ref().filter(|ip| !ip.contains(':')) {
             let _ = Command::new("route")
                 .args(["-n", "delete", "-host", server_ip])
                 .status();
@@ -1389,7 +1415,9 @@ impl Tunnel {
             if status.success() {
                 info!("Added bypass route: {} via {}", server_ip, gw);
             } else {
-                error!("Failed to add bypass route for {}", server_ip);
+                return Err(Error::Io(io::Error::other(format!(
+                    "Не удалось добавить обходной маршрут для {server_ip}"
+                ))));
             }
         }
 
@@ -1422,6 +1450,7 @@ impl Tunnel {
             }
         }
 
+        self.configure_ipv6()?;
         info!("Full tunnel mode enabled — all traffic routed through VPN");
         Ok(())
     }
@@ -1438,10 +1467,10 @@ impl Tunnel {
             .args(["route", "show", "default"])
             .output()
             .map_err(|e| {
-                Error::Io(io::Error::new(
-                    io::ErrorKind::Other,
-                    format!("Failed to get default route: {}", e),
-                ))
+                Error::Io(io::Error::other(format!(
+                    "Failed to get default route: {}",
+                    e
+                )))
             })?;
 
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -1454,14 +1483,16 @@ impl Tunnel {
             .windows(2)
             .find(|window| window[0] == "dev")
             .map(|window| window[1].to_string());
-        let default_onlink = route_fields.iter().any(|field| *field == "onlink");
+        let default_onlink = route_fields.contains(&"onlink");
 
         let (gw, default_dev) = match (default_gw, default_dev) {
             (Some(gw), Some(default_dev)) => (gw, default_dev),
+            _ if self.server_ip.as_ref().is_some_and(|ip| ip.contains(':')) => {
+                (String::new(), String::new())
+            }
             _ => {
                 error!("Could not determine default gateway/interface");
-                return Err(Error::Io(io::Error::new(
-                    io::ErrorKind::Other,
+                return Err(Error::Io(io::Error::other(
                     "Could not determine default gateway/interface",
                 )));
             }
@@ -1473,8 +1504,9 @@ impl Tunnel {
             default_dev,
             if default_onlink { " onlink" } else { "" }
         );
-        self.saved_default_gw = Some(gw.clone());
-        self.saved_default_dev = Some(default_dev.clone());
+        self.saved_default_gw = (!gw.is_empty()).then(|| gw.clone());
+        self.full_tunnel_routes_active = true;
+        self.saved_default_dev = (!default_dev.is_empty()).then(|| default_dev.clone());
 
         // 2 & 3. Bypass route for the VPN server IP + the 0/1+128/1
         // full-tunnel trick, all issued as ONE privileged batch (at most one
@@ -1486,7 +1518,7 @@ impl Tunnel {
         // the valid variant already installed — order doesn't matter, only
         // "did at least one succeed".
         let mut batch: Vec<(&str, Vec<&str>)> = Vec::new();
-        if let Some(ref server_ip) = self.server_ip {
+        if let Some(server_ip) = self.server_ip.as_ref().filter(|ip| !ip.contains(':')) {
             if default_onlink {
                 batch.push((
                     "bypass_onlink",
@@ -1565,50 +1597,30 @@ impl Tunnel {
             "ft_1",
             vec!["route", "replace", "128.0.0.0/1", "dev", tun_name],
         ));
-        // Blackhole IPv6. Unlike macOS (configure_macos), the Linux full-tunnel
-        // path only rerouted IPv4 (0/1 + 128/1), so on a dual-stack host every
-        // IPv6 packet — including IPv6 DNS and dual-stack sites — leaked outside
-        // the tunnel whenever full-tunnel was used without the kill-switch (the
-        // nft inet table only blocks v6 when the kill-switch is on). Send the v6
-        // default to a blackhole; restore_ipv6 removes it on teardown. Best
-        // effort — on an IPv4-only host this simply fails harmlessly, so success
-        // is not gated on it.
-        batch.push((
-            "ipv6_blackhole",
-            vec!["-6", "route", "replace", "blackhole", "default"],
-        ));
-
         let named_args: Vec<(&str, &[&str])> = batch
             .iter()
             .map(|(name, args)| (*name, args.as_slice()))
             .collect();
         let results = Self::run_ip_batch_privileged(&named_args).map_err(|e| {
-            Error::Io(io::Error::new(
-                io::ErrorKind::Other,
-                format!("Failed to configure full-tunnel routes: {}", e),
-            ))
+            Error::Io(io::Error::other(format!(
+                "Failed to configure full-tunnel routes: {}",
+                e
+            )))
         })?;
 
         let succeeded = |name: &str| results.iter().any(|(n, c)| n == name && *c == 0);
 
-        // Remember whether the IPv6 blackhole actually landed so teardown
-        // (restore_ipv6 / Drop) only removes a route we added ourselves.
-        self.ipv6_blackhole_added = succeeded("ipv6_blackhole");
-
-        if self.server_ip.is_some() {
+        if self.server_ip.as_ref().is_some_and(|ip| !ip.contains(':')) {
             let bypass_added = succeeded("bypass_onlink")
                 || succeeded("bypass_plain")
                 || succeeded("bypass_after_gw_link");
             if !bypass_added {
-                return Err(Error::Io(io::Error::new(
-                    io::ErrorKind::Other,
-                    format!(
-                        "Failed to add bypass route for {} via {} dev {}",
-                        self.server_ip.as_deref().unwrap_or(""),
-                        gw,
-                        default_dev
-                    ),
-                )));
+                return Err(Error::Io(io::Error::other(format!(
+                    "Failed to add bypass route for {} via {} dev {}",
+                    self.server_ip.as_deref().unwrap_or(""),
+                    gw,
+                    default_dev
+                ))));
             }
             info!(
                 "Added bypass route: {} via {} dev {}",
@@ -1619,8 +1631,7 @@ impl Tunnel {
         }
 
         if !succeeded("ft_0") || !succeeded("ft_1") {
-            return Err(Error::Io(io::Error::new(
-                io::ErrorKind::Other,
+            return Err(Error::Io(io::Error::other(
                 "Failed to add full-tunnel 0.0.0.0/1 + 128.0.0.0/1 routes",
             )));
         }
@@ -1629,6 +1640,7 @@ impl Tunnel {
             tun_name
         );
 
+        self.configure_ipv6()?;
         info!("Full tunnel mode enabled — all traffic routed through VPN");
         Ok(())
     }
@@ -1655,7 +1667,7 @@ impl Tunnel {
             })?;
 
         let gw = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if gw.is_empty() {
+        if gw.is_empty() && !self.server_ip.as_ref().is_some_and(|ip| ip.contains(':')) {
             error!("Could not determine default gateway");
             return Err(Error::Io(io::Error::new(
                 io::ErrorKind::Other,
@@ -1664,10 +1676,11 @@ impl Tunnel {
         }
 
         info!("Current default gateway: {}", gw);
-        self.saved_default_gw = Some(gw.clone());
+        self.saved_default_gw = (!gw.is_empty()).then(|| gw.clone());
+        self.full_tunnel_routes_active = true;
 
         // 2. Add bypass route for VPN server IP via original gateway
-        if let Some(ref server_ip) = self.server_ip {
+        if let Some(server_ip) = self.server_ip.as_ref().filter(|ip| !ip.contains(':')) {
             let success_message = format!("Added bypass route: {} via {}", server_ip, gw);
             let add_args = [
                 "add",
@@ -1732,36 +1745,7 @@ impl Tunnel {
             )?;
         }
 
-        // IPv4 is now fully routed through the TUN via the 0/1+128/1 trick, but
-        // that leaves the OS's pre-existing IPv6 default route untouched — on
-        // any dual-stack network (most residential/mobile ISPs) IPv6-capable
-        // destinations reach the physical NIC directly, fully bypassing the
-        // VPN, while the user believes "full tunnel" protects them. Windows
-        // has no direct equivalent of macOS/Linux's "route ::/0 to a
-        // blackhole" (route.exe doesn't do IPv6; a netsh blackhole route needs
-        // a real interface). `Disable-NetAdapterBinding -ComponentID
-        // ms_tcpip6` is the standard, no-reboot way to pull IPv6 off every
-        // adapter for the session; `disable_full_tunnel` re-enables it.
-        // Best-effort: a failure here (e.g. no admin rights on the binding
-        // call, which differs from the route-add rights already required
-        // above) must not abort an otherwise fully working IPv4 tunnel.
-        let ipv6_disabled = Command::new("powershell")
-            .args([
-                "-Command",
-                "Disable-NetAdapterBinding -Name '*' -ComponentID ms_tcpip6",
-            ])
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
-        if ipv6_disabled {
-            info!("IPv6 disabled on all adapters for the session — no v6 leak around full-tunnel");
-        } else {
-            warn!(
-                "Failed to disable IPv6 bindings — full-tunnel mode may not protect IPv6 traffic \
-                 on this dual-stack network"
-            );
-        }
-
+        self.configure_ipv6()?;
         info!("Full tunnel mode enabled — all traffic routed through VPN");
         Ok(())
     }
@@ -1776,7 +1760,7 @@ impl Tunnel {
                 .args(["-n", "delete", "-net", net])
                 .status();
         }
-        if let Some(ref server_ip) = self.server_ip {
+        if let Some(server_ip) = self.server_ip.as_ref().filter(|ip| !ip.contains(':')) {
             let _ = Command::new("route")
                 .args(["-n", "delete", "-host", server_ip])
                 .status();
@@ -1800,7 +1784,7 @@ impl Tunnel {
             ("del_ft_0", vec!["route", "del", "0.0.0.0/1"]),
             ("del_ft_1", vec!["route", "del", "128.0.0.0/1"]),
         ];
-        if let Some(ref server_ip) = self.server_ip {
+        if let Some(server_ip) = self.server_ip.as_ref().filter(|ip| !ip.contains(':')) {
             batch.push(("del_bypass", vec!["route", "del", server_ip.as_str()]));
         }
         // Restore default gateway
@@ -1828,8 +1812,7 @@ impl Tunnel {
             }
             Err(e) => warn!("Full-tunnel route cleanup failed: {}", e),
         }
-        // Remove the IPv6 blackhole added by enable_full_tunnel so v6 works
-        // again after disconnect.
+        // Удаляем только IPv6-маршруты этого туннеля.
         self.restore_ipv6();
         info!("Full tunnel routes removed");
     }
@@ -1844,16 +1827,9 @@ impl Tunnel {
                 .args(["delete", net.0, "mask", net.1])
                 .status();
         }
-        if let Some(ref server_ip) = self.server_ip {
+        if let Some(server_ip) = self.server_ip.as_ref().filter(|ip| !ip.contains(':')) {
             let _ = Command::new("route").args(["delete", server_ip]).status();
         }
-        // Symmetric restore for the IPv6 binding disabled in enable_full_tunnel.
-        let _ = Command::new("powershell")
-            .args([
-                "-Command",
-                "Enable-NetAdapterBinding -Name '*' -ComponentID ms_tcpip6",
-            ])
-            .status();
         info!("Full tunnel routes removed");
     }
 
@@ -1892,57 +1868,107 @@ impl Tunnel {
             // IPv6 prefixes need `ip -6` — a bare `ip route replace <v6>`
             // is rejected by iproute2 and the route silently never lands
             // (DNS leak in split mode when the DNS upstream is v6).
-            let ok = if cidr.contains(':') {
-                Self::run_ip_privileged(&["-6", "route", "replace", &cidr, "dev", &tun])
-            } else {
-                Self::run_ip_privileged(&["route", "replace", &cidr, "dev", &tun])
-            }
-            .map(|c| c == 0)
-            .unwrap_or(false);
-            if ok {
-                info!("Split-tunnel include: {} via {}", cidr, tun);
-                self.split_routes_applied.push(cidr);
-            } else {
-                error!("Split-tunnel: failed to add include route {}", cidr);
-            }
+            let args = Self::linux_split_args(&cidr, &tun, None);
+            self.add_owned_split_route(args, Self::run_ip_privileged)?;
+            info!("Split-tunnel include: {} via {}", cidr, tun);
         }
 
-        let gw_opt = self.saved_default_gw.clone().or_else(|| {
-            Command::new("ip")
-                .args(["route", "show", "default"])
+        for cidr in self.config.exclude_routes.clone() {
+            let ipv6 = cidr.contains(':');
+            let output = Command::new("ip")
+                .args(Self::linux_default_route_query(ipv6))
                 .output()
-                .ok()
-                .and_then(|o| {
-                    let s = String::from_utf8_lossy(&o.stdout).to_string();
-                    let fields: Vec<&str> = s.split_whitespace().collect();
-                    fields
-                        .windows(2)
-                        .find(|w| w[0] == "via")
-                        .map(|w| w[1].to_string())
-                })
-        });
-
-        if let Some(gw) = gw_opt {
-            for cidr in self.config.exclude_routes.clone() {
-                let ok = if cidr.contains(':') {
-                    Self::run_ip_privileged(&["-6", "route", "replace", &cidr, "via", &gw])
-                } else {
-                    Self::run_ip_privileged(&["route", "replace", &cidr, "via", &gw])
-                }
-                .map(|c| c == 0)
-                .unwrap_or(false);
-                if ok {
-                    info!("Split-tunnel exclude: {} via {} (bypass VPN)", cidr, gw);
-                    self.split_routes_applied.push(cidr);
-                } else {
-                    error!("Split-tunnel: failed to exclude route {}", cidr);
-                }
+                .map_err(Error::Io)?;
+            if !output.status.success() {
+                return Err(Error::Io(io::Error::other("Cannot read default route")));
             }
-        } else if !self.config.exclude_routes.is_empty() {
-            error!("Split-tunnel: no default gateway found for exclude_routes");
+            let (gateway, device) =
+                Self::parse_split_default(&String::from_utf8_lossy(&output.stdout), ipv6)
+                    .ok_or_else(|| {
+                        Error::Io(io::Error::other(format!(
+                            "No usable default route for {cidr}"
+                        )))
+                    })?;
+            let args = Self::linux_split_args(&cidr, &device, gateway.as_deref());
+            self.add_owned_split_route(args, Self::run_ip_privileged)?;
         }
 
         Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn add_owned_split_route(
+        &mut self,
+        args: Vec<String>,
+        mut run: impl FnMut(&[&str]) -> io::Result<i32>,
+    ) -> Result<()> {
+        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        if run(&refs).map_err(Error::Io)? != 0 {
+            return Err(Error::Io(io::Error::other(
+                "Cannot add split route; existing route preserved",
+            )));
+        }
+        self.owned_split_routes.push(args);
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn take_split_cleanup(&mut self) -> Vec<Vec<String>> {
+        let mut routes = std::mem::take(&mut self.owned_split_routes);
+        for route in &mut routes {
+            let action = if route.first().map(String::as_str) == Some("-6") {
+                2
+            } else {
+                1
+            };
+            route[action] = "del".to_owned();
+        }
+        routes
+    }
+
+    #[cfg(target_os = "linux")]
+    fn linux_split_args(cidr: &str, device: &str, gateway: Option<&str>) -> Vec<String> {
+        let mut args = vec![];
+        if cidr.contains(':') {
+            args.push("-6");
+        }
+        args.extend(["route", "add", cidr]);
+        if let Some(gateway) = gateway {
+            args.extend(["via", gateway]);
+        }
+        args.extend(["dev", device]);
+        args.extend(["proto", "242"]);
+        args.into_iter().map(String::from).collect()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn linux_default_route_query(ipv6: bool) -> Vec<&'static str> {
+        if ipv6 {
+            vec!["-6", "route", "show", "default"]
+        } else {
+            vec!["-4", "route", "show", "default"]
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn parse_split_default(output: &str, ipv6: bool) -> Option<(Option<String>, String)> {
+        output.lines().find_map(|line| {
+            let words: Vec<&str> = line.split_whitespace().collect();
+            if words.first() != Some(&"default") {
+                return None;
+            }
+            let device = words.windows(2).find(|w| w[0] == "dev")?[1].to_owned();
+            let gateway = words
+                .windows(2)
+                .find(|w| w[0] == "via")
+                .map(|w| w[1].to_owned());
+            if let Some(gateway) = &gateway {
+                if gateway.parse::<std::net::IpAddr>().ok()?.is_ipv6() != ipv6 {
+                    return None;
+                }
+            }
+            Some((gateway, device))
+        })
     }
 
     #[cfg(target_os = "linux")]
@@ -1952,16 +1978,17 @@ impl Tunnel {
         // EPERM here). `ip -6` for IPv6 prefixes, symmetric with how they
         // were added. Already-absent routes fail with ESRCH, which is fine
         // and neither escalates nor counts as fatal.
-        let cidrs: Vec<String> = self.split_routes_applied.drain(..).collect();
-        let mut batch: Vec<(String, Vec<&str>)> = Vec::with_capacity(cidrs.len());
-        for (i, cidr) in cidrs.iter().enumerate() {
-            let args: Vec<&str> = if cidr.contains(':') {
-                vec!["-6", "route", "del", cidr.as_str()]
-            } else {
-                vec!["route", "del", cidr.as_str()]
-            };
-            batch.push((format!("split_{i}"), args));
-        }
+        let routes = self.take_split_cleanup();
+        let batch: Vec<(String, Vec<&str>)> = routes
+            .iter()
+            .enumerate()
+            .map(|(i, args)| {
+                (
+                    format!("split_{i}"),
+                    args.iter().map(String::as_str).collect(),
+                )
+            })
+            .collect();
         if !batch.is_empty() {
             let named_args: Vec<(&str, &[&str])> = batch
                 .iter()
@@ -2140,9 +2167,17 @@ impl Tunnel {
             .clone()
             .unwrap_or_else(|| self.config.server_vpn_ip.clone());
         let mut ks = KillSwitch::new(self.config.tun_name.clone(), server_ip);
-        ks.activate()?;
+        if let Some(mark) = self.transport_mark {
+            ks = ks.with_mark(mark);
+        }
+        #[cfg(any(target_os = "macos", windows))]
+        if let Some(guard) = &self.transport_guard {
+            ks = ks.with_guard(guard.clone());
+        }
+        let result = ks.activate();
+        // Ошибка не снимает DROP guard. Владелец нужен и для его явной очистки.
         self.kill_switch_state = Some(ks);
-        Ok(())
+        result
     }
 
     /// Explicitly deactivate the kill-switch. Call this on intentional disconnect,
@@ -2154,67 +2189,287 @@ impl Tunnel {
         self.kill_switch_state = None;
     }
 
-    /// Restore IPv6 on macOS when disconnecting
-    #[cfg(target_os = "macos")]
-    fn restore_ipv6(&mut self) {
-        use std::process::Command;
+    pub fn take_kill_switch(&mut self) -> Option<KillSwitch> {
+        self.kill_switch_state.take()
+    }
 
-        // Only remove the blackhole if WE added it (configure_macos) —
-        // unconditionally deleting `blackhole default` here could tear down
-        // a route owned by something else.
-        if !self.ipv6_blackhole_added {
-            return;
-        }
-        self.ipv6_blackhole_added = false;
-
-        info!("Restoring IPv6...");
-        // Remove the blackhole.  If we saved the interface before blocking,
-        // restore the default route through it.  If not — the macOS network
-        // stack will re-discover the gateway via ND/SLAAC automatically.
-        let _ = Command::new("/sbin/route")
-            .args(["-n", "delete", "-inet6", "-net", "::/0", "-blackhole"])
-            .status();
-
-        if let Some(ref iface) = self.saved_ipv6_iface {
-            let status = Command::new("/sbin/route")
-                .args(["-n", "add", "-inet6", "default", "-interface", iface])
-                .status();
-            match status {
-                Ok(s) if s.success() => info!("IPv6 default route restored via {}", iface),
-                _ => info!(
-                    "IPv6 blackhole removed — macOS will auto-restore via ND (iface {})",
-                    iface
-                ),
+    /// Адрес и маршруты принадлежат только интерфейсу туннеля.
+    fn configure_ipv6(&mut self) -> Result<()> {
+        if self.ipv6_address_applied != self.config.ipv6 {
+            if let Some(old) = self.ipv6_address_applied {
+                self.ipv6_address_command(old, false)?;
+                self.ipv6_address_applied = None;
             }
+            if let Some(address) = self.config.ipv6 {
+                self.ipv6_address_command(address, true)?;
+                self.ipv6_address_applied = Some(address);
+            }
+        }
+        if self.config.full_tunnel && self.full_tunnel_routes_active && !self.ipv6_routes_added {
+            self.add_ipv6_server_bypass()?;
+            // Без согласованного IPv6 сервер отклоняет пакеты этого семейства.
+            // Маршруты через TUN все равно нужны, чтобы исключить обход VPN.
+            self.ipv6_routes_added = true;
+            for prefix in ["::/1", "8000::/1"] {
+                self.ipv6_route_command(prefix, true)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn add_ipv6_server_bypass(&mut self) -> Result<()> {
+        let Some(server) = self
+            .server_ip
+            .as_ref()
+            .filter(|ip| ip.contains(':'))
+            .cloned()
+        else {
+            return Ok(());
+        };
+        if self.ipv6_server_bypass.is_some() {
+            return Ok(());
+        }
+        server
+            .parse::<std::net::Ipv6Addr>()
+            .map_err(|_| Error::InvalidPacket("Invalid IPv6 server address"))?;
+        let destination = format!("{server}/128");
+        #[cfg(target_os = "linux")]
+        {
+            let output = std::process::Command::new("ip")
+                .args(["-6", "route", "get", &server])
+                .output()?;
+            if !output.status.success() {
+                return Err(Error::InvalidPacket("IPv6 server route lookup failed"));
+            }
+            let text = String::from_utf8_lossy(&output.stdout);
+            let fields: Vec<_> = text.split_whitespace().collect();
+            let interface = fields
+                .windows(2)
+                .find(|p| p[0] == "dev")
+                .map(|p| p[1])
+                .filter(|dev| *dev != self.config.tun_name)
+                .ok_or(Error::InvalidPacket("No physical IPv6 server route"))?;
+            let gateway = fields.windows(2).find(|p| p[0] == "via").map(|p| p[1]);
+            let mut args = vec!["-6", "route", "add", &destination, "dev", interface];
+            if let Some(gateway) = gateway {
+                args.extend_from_slice(&["via", gateway]);
+            }
+            self.ipv6_ip_command(&args)?;
+            self.ipv6_server_bypass = Some((destination, interface.to_string()));
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let output = std::process::Command::new("/sbin/route")
+                .args(["-n", "get", "-inet6", &server])
+                .output()?;
+            if !output.status.success() {
+                return Err(Error::InvalidPacket("IPv6 server route lookup failed"));
+            }
+            let text = String::from_utf8_lossy(&output.stdout);
+            let field = |name: &str| {
+                text.lines()
+                    .find_map(|line| line.trim().strip_prefix(name).map(str::trim))
+            };
+            let interface = field("interface:")
+                .filter(|dev| *dev != self.config.tun_name)
+                .ok_or(Error::InvalidPacket("No physical IPv6 server interface"))?;
+            let gateway =
+                field("gateway:").ok_or(Error::InvalidPacket("No physical IPv6 server gateway"))?;
+            Self::checked_ipv6_command(
+                "/sbin/route",
+                &["-n", "add", "-inet6", "-host", &server, gateway],
+            )?;
+            self.ipv6_server_bypass = Some((destination, interface.to_string()));
+        }
+        #[cfg(target_os = "windows")]
+        {
+            // server уже разобран как IPv6, строка не может содержать код PowerShell.
+            let script = format!("$r=Find-NetRoute -RemoteIPAddress '{server}' | Where-Object {{ $_.DestinationPrefix }} | Select-Object -First 1; if (!$r) {{ exit 1 }}; Write-Output ($r.InterfaceIndex.ToString()+' '+$r.NextHop)");
+            let output = std::process::Command::new("powershell")
+                .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+                .output()?;
+            let text = String::from_utf8_lossy(&output.stdout);
+            let fields: Vec<_> = text.split_whitespace().collect();
+            if !output.status.success()
+                || fields.len() != 2
+                || fields[0].parse::<u32>().is_err()
+                || fields[1].parse::<std::net::Ipv6Addr>().is_err()
+            {
+                return Err(Error::InvalidPacket("No physical IPv6 server route"));
+            }
+            Self::checked_ipv6_command(
+                "netsh",
+                &[
+                    "interface",
+                    "ipv6",
+                    "add",
+                    "route",
+                    &destination,
+                    fields[0],
+                    fields[1],
+                    "store=active",
+                ],
+            )?;
+            self.ipv6_server_bypass = Some((destination, fields[0].to_string()));
+        }
+        Ok(())
+    }
+
+    fn ipv6_address_command(&self, address: (std::net::Ipv6Addr, u8), add: bool) -> Result<()> {
+        let cidr = format!("{}/{}", address.0, address.1);
+        #[cfg(target_os = "windows")]
+        let bare_address = address.0.to_string();
+        #[cfg(target_os = "linux")]
+        return self.ipv6_ip_command(&[
+            "-6",
+            "addr",
+            if add { "replace" } else { "del" },
+            &cidr,
+            "dev",
+            &self.config.tun_name,
+        ]);
+        #[cfg(target_os = "macos")]
+        return Self::checked_ipv6_command(
+            "/sbin/ifconfig",
+            &[
+                &self.config.tun_name,
+                "inet6",
+                &cidr,
+                if add { "alias" } else { "-alias" },
+            ],
+        );
+        #[cfg(target_os = "windows")]
+        return Self::checked_ipv6_command(
+            "netsh",
+            &[
+                "interface",
+                "ipv6",
+                if add { "add" } else { "delete" },
+                "address",
+                &self.config.tun_name,
+                if add { &cidr } else { &bare_address },
+            ],
+        );
+        #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+        Err(Error::InvalidPacket(
+            "IPv6 interface configuration is unsupported",
+        ))
+    }
+
+    fn ipv6_route_command(&self, prefix: &str, add: bool) -> Result<()> {
+        #[cfg(target_os = "linux")]
+        return self.ipv6_ip_command(&[
+            "-6",
+            "route",
+            if add { "replace" } else { "del" },
+            prefix,
+            "dev",
+            &self.config.tun_name,
+        ]);
+        #[cfg(target_os = "macos")]
+        return Self::checked_ipv6_command(
+            "/sbin/route",
+            &[
+                "-n",
+                if add { "add" } else { "delete" },
+                "-inet6",
+                "-net",
+                prefix,
+                "-interface",
+                &self.config.tun_name,
+            ],
+        );
+        #[cfg(target_os = "windows")]
+        return Self::checked_ipv6_command(
+            "netsh",
+            &[
+                "interface",
+                "ipv6",
+                if add { "add" } else { "delete" },
+                "route",
+                prefix,
+                &self.config.tun_name,
+                "store=active",
+            ],
+        );
+        #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+        Err(Error::InvalidPacket("IPv6 routing is unsupported"))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn ipv6_ip_command(&self, args: &[&str]) -> Result<()> {
+        let result = Self::run_ip_batch_privileged(&[("ipv6", args)]).map_err(Error::Io)?;
+        if result
+            .iter()
+            .any(|(name, code)| name == "ipv6" && *code == 0)
+        {
+            return Ok(());
+        }
+        Err(Error::Io(io::Error::other("IPv6 configuration failed")))
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    fn checked_ipv6_command(program: &str, args: &[&str]) -> Result<()> {
+        let status = std::process::Command::new(program)
+            .args(args)
+            .status()
+            .map_err(Error::Io)?;
+        if status.success() {
+            Ok(())
         } else {
-            info!("IPv6 blackhole removed — macOS will auto-restore via ND");
+            Err(Error::Io(io::Error::other("IPv6 configuration failed")))
         }
     }
 
-    /// Restore IPv6 on Linux
-    #[cfg(target_os = "linux")]
     fn restore_ipv6(&mut self) {
-        // Only remove the blackhole if WE added it (enable_full_tunnel) —
-        // unconditionally deleting `blackhole default` here could tear down
-        // a route owned by something else.
-        if !self.ipv6_blackhole_added {
-            return;
+        if self.ipv6_routes_added {
+            for prefix in ["::/1", "8000::/1"] {
+                if let Err(error) = self.ipv6_route_command(prefix, false) {
+                    warn!("IPv6 route cleanup: {error}");
+                }
+            }
+            self.ipv6_routes_added = false;
         }
-        self.ipv6_blackhole_added = false;
-
-        info!("Restoring IPv6...");
-        // Remove the blackhole (if any).  Let the kernel re-discover the gateway.
-        // Same privileged batch path as the addition: a bare `ip` call would
-        // silently EPERM on hosts where file capabilities are voided at exec
-        // time, leaving the blackhole (and the v6 outage) in place.
-        let _ = Self::run_ip_batch_privileged(&[
-            (
-                "del_v6_blackhole",
-                &["-6", "route", "del", "blackhole", "default"],
-            ),
-            ("del_v6_default", &["-6", "route", "del", "::/0"]),
-        ]);
-        info!("IPv6 blackhole removed — kernel will auto-restore via ND/RA");
+        if let Some((destination, interface)) = self.ipv6_server_bypass.take() {
+            #[cfg(target_os = "linux")]
+            let result =
+                self.ipv6_ip_command(&["-6", "route", "del", &destination, "dev", &interface]);
+            #[cfg(target_os = "macos")]
+            let result = Self::checked_ipv6_command(
+                "/sbin/route",
+                &[
+                    "-n",
+                    "delete",
+                    "-inet6",
+                    "-host",
+                    destination.trim_end_matches("/128"),
+                    "-ifscope",
+                    &interface,
+                ],
+            );
+            #[cfg(target_os = "windows")]
+            let result = Self::checked_ipv6_command(
+                "netsh",
+                &[
+                    "interface",
+                    "ipv6",
+                    "delete",
+                    "route",
+                    &destination,
+                    &interface,
+                    "store=active",
+                ],
+            );
+            #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+            if let Err(error) = result {
+                warn!("IPv6 server route cleanup: {error}");
+            }
+        }
+        if let Some(address) = self.ipv6_address_applied.take() {
+            if let Err(error) = self.ipv6_address_command(address, false) {
+                warn!("IPv6 address cleanup: {error}");
+            }
+        }
     }
 
     /// Take the TUN reader (moves ownership to caller, e.g. spawned task)
@@ -2267,15 +2522,10 @@ impl Drop for Tunnel {
 
         self.remove_split_routes();
 
-        if self.config.full_tunnel && self.saved_default_gw.is_some() {
+        if self.config.full_tunnel && self.full_tunnel_routes_active {
             self.disable_full_tunnel();
         }
 
-        // Restore IPv6 blackhole route removed during full-tunnel setup.
-        // Runs unconditionally, but restore_ipv6() itself is a no-op unless
-        // this Tunnel actually installed the blackhole (ipv6_blackhole_added),
-        // so a blackhole owned by something else is never touched.
-        #[cfg(any(target_os = "macos", target_os = "linux"))]
         self.restore_ipv6();
 
         if self.writer.is_some() || self.reader.is_some() {
@@ -2294,6 +2544,94 @@ impl Drop for Tunnel {
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn split_route_add_never_replaces_foreign_route_and_tracks_owner() {
+        assert_eq!(
+            Tunnel::linux_split_args("10.0.0.0/8", "tun0", None),
+            ["route", "add", "10.0.0.0/8", "dev", "tun0", "proto", "242"]
+        );
+        assert_eq!(
+            Tunnel::linux_split_args("2001:db8::/64", "eth0", Some("fe80::1")),
+            [
+                "-6",
+                "route",
+                "add",
+                "2001:db8::/64",
+                "via",
+                "fe80::1",
+                "dev",
+                "eth0",
+                "proto",
+                "242"
+            ]
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn split_default_preserves_ipv6_linklocal_device_and_family() {
+        assert_eq!(
+            Tunnel::linux_default_route_query(true),
+            ["-6", "route", "show", "default"]
+        );
+        assert_eq!(
+            Tunnel::parse_split_default("default via fe80::1 dev eth0 proto ra metric 100", true),
+            Some((Some("fe80::1".into()), "eth0".into()))
+        );
+        assert!(Tunnel::parse_split_default("default via 192.0.2.1 dev eth0", true).is_none());
+        let args = Tunnel::linux_split_args("2001:db8::/64", "eth0", Some("fe80::1"));
+        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        assert_eq!(
+            Tunnel::helper_line_for("split", &refs),
+            Some("split\tsplit_add\t2001:db8::/64\teth0\tfe80::1".into())
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn split_conflict_is_not_owned_and_cleanup_is_exact() {
+        let mut tunnel = Tunnel::new(TunnelConfig::default());
+        let args = Tunnel::linux_split_args("10.0.0.0/8", "tun0", None);
+        assert!(tunnel
+            .add_owned_split_route(args.clone(), |_| Ok(2))
+            .is_err());
+        assert!(tunnel.take_split_cleanup().is_empty());
+        tunnel.add_owned_split_route(args, |_| Ok(0)).unwrap();
+        let cleanup = tunnel.take_split_cleanup();
+        assert_eq!(
+            cleanup,
+            vec![vec![
+                "route",
+                "del",
+                "10.0.0.0/8",
+                "dev",
+                "tun0",
+                "proto",
+                "242"
+            ]]
+        );
+    }
+
+    #[test]
+    fn ipv6_assignment_survives_tunnel_conversion() {
+        let network = VpnNetworkConfig {
+            ipv6_enabled: true,
+            ..Default::default()
+        };
+        let assigned = network.client_config("10.0.0.2".parse().unwrap()).unwrap();
+        let config = TunnelConfig::from_network_config("tun-test".into(), assigned.clone(), true);
+        assert_eq!(
+            config
+                .client_network_config()
+                .unwrap()
+                .client_ipv6()
+                .unwrap(),
+            assigned.client_ipv6().unwrap()
+        );
+        assert!(config.ipv6.is_some());
+    }
+
     #[test]
     fn test_tunnel_config() {
         let config = TunnelConfig::default();
@@ -2304,6 +2642,21 @@ mod tests {
         assert_eq!(config.tun_addr, "10.0.0.2");
         assert_eq!(config.server_vpn_ip, "10.0.0.1");
         assert_eq!(config.mtu, WAN_SAFE_TUN_MTU);
+    }
+
+    #[tokio::test]
+    async fn explicit_and_live_tun_mtu_leave_room_for_all_mask_carriers() {
+        let network = aivpn_common::network_config::VpnNetworkConfig {
+            mtu: 1500,
+            ..Default::default()
+        };
+        let mut assigned = network.client_config("10.0.0.2".parse().unwrap()).unwrap();
+        assigned.mtu = 1500;
+        let config = TunnelConfig::from_network_config("tun-test".into(), assigned.clone(), false);
+        assert_eq!(config.mtu, 1500);
+        let mut tunnel = Tunnel::new(config);
+        tunnel.apply_network_config(assigned).await.unwrap();
+        assert_eq!(tunnel.config.mtu, 1500);
     }
 
     #[cfg(target_os = "linux")]

@@ -4,6 +4,49 @@
 
 const EWMA_ALPHA_INV: u64 = 8;
 
+#[cfg(test)]
+mod window_tests {
+    use super::*;
+
+    #[test]
+    fn late_packets_close_gaps_and_a_new_epoch_starts_a_fresh_window() {
+        let mut window = crate::client_wire::RecvWindow::new();
+        let mut quality = QualityTracker::new();
+        for (counter, expected_loss) in [(100, 0), (103, 500_000), (101, 250_000), (102, 0)] {
+            window.mark(counter);
+            let (received, span) = window.observation_counts();
+            quality.record_window(received, span);
+            assert_eq!(quality.loss_ppm(), expected_loss);
+        }
+        window.reset();
+        window.mark(80_000);
+        let (received, span) = window.observation_counts();
+        quality.record_window(received, span);
+        assert_eq!(quality.loss_ppm(), 0);
+    }
+
+    #[test]
+    fn kernel_replay_window_counts_data_and_control_together() {
+        let mut words = [u64::MAX; 8];
+        words[3] &= !(1 << 20);
+        assert_eq!(replay_observation_counts(&words), (511, 512));
+        words[3] |= 1 << 20;
+        assert_eq!(replay_observation_counts(&words), (512, 512));
+        assert_eq!(replay_observation_counts(&[0; 8]), (0, 0));
+    }
+}
+
+/// Считаем пропуски между крайними полученными пакетами рабочего replay-окна.
+pub fn replay_observation_counts(words: &[u64]) -> (u64, u64) {
+    let received = words.iter().map(|word| word.count_ones() as u64).sum();
+    let span = words
+        .iter()
+        .rposition(|word| *word != 0)
+        .map(|index| index as u64 * 64 + 64 - words[index].leading_zeros() as u64)
+        .unwrap_or(0);
+    (received, span)
+}
+
 /// Per-session quality tracker — updated on each keepalive exchange.
 #[derive(Debug, Clone, Default)]
 pub struct QualityTracker {
@@ -44,6 +87,12 @@ impl QualityTracker {
     /// Record a successfully received packet.
     pub fn record_received(&mut self) {
         self.sent = self.sent.saturating_add(1);
+    }
+
+    /// Поздний пакет закрывает пропуск, а смена ключевой эпохи начинает новое окно.
+    pub fn record_window(&mut self, received: u64, span: u64) {
+        self.sent = span;
+        self.lost = span.saturating_sub(received);
     }
 
     /// RTT in milliseconds (EWMA).

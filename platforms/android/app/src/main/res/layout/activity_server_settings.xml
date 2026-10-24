@@ -237,6 +237,12 @@
                         android:singleLine="true"
                         android:textSize="13sp" />
 
+                    <CheckBox
+                        android:id="@+id/checkClearExitNode"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:text="@string/server_settings_clear_exit" />
+
                     <Button
                         android:id="@+id/btnApplyExit"
                         style="?android:attr/buttonBarButtonStyle"

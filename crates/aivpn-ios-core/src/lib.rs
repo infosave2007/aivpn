@@ -22,6 +22,10 @@ use ios_tunnel::{
     HANDSHAKE_FAIL_STREAK, MASK_FEEDBACK_SENT, RECORDING_FEEDBACK_SEQ, REGIONAL_HINTS_SEQ,
 };
 
+fn optional_buffer_valid(pointer: *const u8, length: libc::c_int, expected: libc::c_int) -> bool {
+    (pointer.is_null() && length == 0) || (!pointer.is_null() && length == expected)
+}
+
 /// Runs the full VPN tunnel session on the calling thread.
 /// Returns 0 on clean rekey-triggered exit, -1 on error.
 #[no_mangle]
@@ -94,7 +98,12 @@ pub unsafe extern "C" fn aivpn_run_tunnel(
     // default desktop uses with no --mask-verify-mode/config override).
     mask_verify_mode: *const libc::c_char,
 ) -> libc::c_int {
-    if server_host.is_null() || server_key.is_null() {
+    if server_host.is_null()
+        || server_key.is_null()
+        || !(1..=65535).contains(&server_port)
+        || !optional_buffer_valid(cert_bytes, cert_len, 104)
+        || !optional_buffer_valid(static_privkey, static_privkey_len, 32)
+    {
         return -1;
     }
 
@@ -227,20 +236,38 @@ pub unsafe extern "C" fn aivpn_run_tunnel(
         Some(arr)
     };
 
-    // R2 Phase B: parse the mode string the same way desktop's
-    // `MaskVerifyMode::from_str` does (off|warn|enforce, case-insensitive);
-    // NULL/empty/unrecognized all collapse to the default (`Warn`) rather
-    // than erroring — this FFI boundary must never fail closed on a typo.
-    let mask_verify_mode_val: aivpn_common::mask::MaskVerifyMode = if mask_verify_mode.is_null() {
-        aivpn_common::mask::MaskVerifyMode::default()
+    // NULL и пустая строка - историческое значение по умолчанию. Обычная
+    // сборка оставляет warn, в том числе для нераспознанной строки.
+    // production-secure поднимает пустое значение до enforce, явные off/warn
+    // и нераспознанную строку отклоняет.
+    let mask_verify_mode_text: Option<String> = if mask_verify_mode.is_null() {
+        None
     } else {
         // SAFETY: mask_verify_mode is a NUL-terminated C string from Swift.
         unsafe { std::ffi::CStr::from_ptr(mask_verify_mode) }
             .to_str()
             .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or_default()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
     };
+    let explicit_mode = match mask_verify_mode_text.as_deref() {
+        None => None,
+        Some(text) => text.parse::<aivpn_common::mask::MaskVerifyMode>().ok(),
+    };
+    let mask_verify_mode_val =
+        match aivpn_common::mask::resolve_protected_mask_verify_mode(explicit_mode) {
+            Ok(mode) => mode,
+            Err(_) => return -1,
+        };
+    if aivpn_common::mask::protected_build_requires_keys(
+        server_signing_key_opt.is_some(),
+        mask_operator_pubkey_opt.is_some(),
+    )
+    .is_err()
+    {
+        return -1;
+    }
 
     let rt = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -1124,6 +1151,32 @@ fn verify_bootstrap_descriptor_bytes(json: &[u8], pubkey: &[u8; 32]) -> bool {
     matches!(descriptor.verify_signature(pubkey), Ok(true))
 }
 
+/// Копирует сетевые настройки JSON целиком; 0 означает отсутствие снимка или малый буфер.
+///
+/// # Safety
+/// `buf` должен указывать на доступные для записи `capacity` байт.
+#[no_mangle]
+pub unsafe extern "C" fn aivpn_get_assigned_network_config(
+    buf: *mut libc::c_char,
+    capacity: usize,
+) -> usize {
+    let json = aivpn_common::mobile_tunnel::assigned_network_config_json();
+    if buf.is_null() || capacity == 0 {
+        return 0;
+    }
+    unsafe {
+        *buf = 0;
+    }
+    if json.is_empty() || json.len() >= capacity {
+        return 0;
+    }
+    unsafe {
+        std::ptr::copy_nonoverlapping(json.as_ptr(), buf.cast::<u8>(), json.len());
+        *buf.add(json.len()) = 0;
+    }
+    json.len()
+}
+
 #[cfg(test)]
 mod bootstrap_verify_tests {
     use super::verify_bootstrap_descriptor_bytes;
@@ -1169,5 +1222,52 @@ mod bootstrap_verify_tests {
             "signature": [1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63,64]
         }"#;
         assert!(!verify_bootstrap_descriptor_bytes(json, &[0u8; 32]));
+    }
+}
+
+#[cfg(test)]
+mod ffi_buffer_tests {
+    use super::*;
+    #[test]
+    fn supplied_identity_and_certificate_cannot_silently_disappear() {
+        let bytes = [0; 104];
+        assert!(optional_buffer_valid(std::ptr::null(), 0, 104));
+        assert!(optional_buffer_valid(bytes.as_ptr(), 104, 104));
+        assert!(!optional_buffer_valid(bytes.as_ptr(), 103, 104));
+        assert!(!optional_buffer_valid(bytes.as_ptr(), -1, 104));
+        assert!(!optional_buffer_valid(std::ptr::null(), 104, 104));
+        assert!(!optional_buffer_valid(bytes.as_ptr(), 0, 32));
+    }
+}
+
+/// Запускается в процессе расширения, вне главной очереди. Результат JSON до 4096 байт.
+#[no_mangle]
+pub unsafe extern "C" fn aivpn_run_benchmark(out_buf: *mut u8, out_cap: usize) -> isize {
+    if out_buf.is_null() || out_cap < 4096 {
+        return -1;
+    }
+    let value = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let result = (|| {
+            let tx = crate::ios_tunnel::active_control_tx()
+                .ok_or_else(|| "No active VPN session".to_string())?;
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| e.to_string())?;
+            rt.block_on(aivpn_common::diagnostics::run(
+                crate::ios_tunnel::active_mgmt().clone(),
+                tx,
+                std::time::Duration::from_secs(9),
+            ))
+            .map_err(|e| e.to_string())
+        })();
+        match result {
+            Ok(result) => serde_json::to_value(result).unwrap_or_default(),
+            Err(error) => serde_json::json!({"error": error}),
+        }
+    }));
+    match value {
+        Ok(value) => unsafe { copy_bytes_getter(value.to_string().as_bytes(), out_buf, out_cap) },
+        Err(_) => -1,
     }
 }

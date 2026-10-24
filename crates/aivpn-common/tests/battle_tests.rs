@@ -41,8 +41,8 @@ fn battle_key_exchange_deterministic_from_private() {
     let _a = KeyPair::generate();
     let priv_bytes = {
         // Re-generate from same private — we'll use a known key
-        let key = [0x42u8; 32];
-        key
+
+        [0x42u8; 32]
     };
     let k1 = KeyPair::from_private_key(priv_bytes);
     let k2 = KeyPair::from_private_key(priv_bytes);
@@ -500,6 +500,7 @@ fn battle_wire_format_multiple_packets() {
 #[test]
 fn battle_wire_format_zero_padding() {
     let keys = SessionKeys {
+        packet_cipher: aivpn_common::crypto::PacketCipher::Established,
         session_key: crypto::blake3_hash(b"key"),
         session_key_s2c: crypto::blake3_hash(b"key"),
         tag_secret: crypto::blake3_hash(b"tag"),
@@ -526,6 +527,7 @@ fn battle_wire_format_zero_padding() {
 #[test]
 fn battle_wire_format_max_padding() {
     let keys = SessionKeys {
+        packet_cipher: aivpn_common::crypto::PacketCipher::Established,
         session_key: crypto::blake3_hash(b"key"),
         session_key_s2c: crypto::blake3_hash(b"key"),
         tag_secret: crypto::blake3_hash(b"tag"),
@@ -707,7 +709,7 @@ fn battle_mask_signature_verification() {
     // Sign the whole mask (signature now covers every field via signing_message).
     let signing_key = SigningKey::from_bytes(&[0x42u8; 32]);
     let verifying_key = signing_key.verifying_key();
-    mask.sign(&signing_key);
+    mask.sign(&signing_key).unwrap();
 
     // Verify with correct key
     assert!(mask.verify_signature(&verifying_key.to_bytes()).unwrap());
@@ -726,7 +728,7 @@ fn battle_mask_signature_tamper_detected() {
     let mut mask = webrtc_zoom_v3();
     let signing_key = SigningKey::from_bytes(&[0x42u8; 32]);
     let verifying_key = signing_key.verifying_key();
-    mask.sign(&signing_key);
+    mask.sign(&signing_key).unwrap();
 
     // Tamper with mask_id
     mask.mask_id = "tampered".to_string();

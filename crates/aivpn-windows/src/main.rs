@@ -5,7 +5,7 @@ mod admin;
 mod admin_ops;
 #[cfg(windows)]
 mod app_update;
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 mod assets;
 mod install_wizard;
 mod key_storage;
@@ -96,8 +96,8 @@ fn main() {
 struct TrayHandles {
     _icon: tray_icon::TrayIcon,
     connect_item: tray_icon::menu::MenuItem,
-    show_item: tray_icon::menu::MenuItem,
-    quit_item: tray_icon::menu::MenuItem,
+    _show_item: tray_icon::menu::MenuItem,
+    _quit_item: tray_icon::menu::MenuItem,
 }
 
 // ── App struct ─────────────────────────────────────────────────────────────
@@ -109,7 +109,7 @@ use assets::{app_icon, apply_theme_to_ctx, make_tray_icon};
 #[cfg(windows)]
 use key_storage::KeyStorage;
 #[cfg(windows)]
-use localization::{t, AppSettings, Lang};
+use localization::{t, AppSettings};
 #[cfg(windows)]
 use platform_win::{
     bring_window_to_front, claim_single_instance_mutex, focus_existing_instance, is_elevated,
@@ -118,9 +118,7 @@ use platform_win::{
 #[cfg(windows)]
 use std::time::Instant;
 #[cfg(windows)]
-use vpn_manager::{
-    format_bytes, gui_log, BenchResult, ConnectionState, RecordingState, VpnManager,
-};
+use vpn_manager::{format_bytes, gui_log, BenchResult, ConnectionState, VpnManager};
 
 #[cfg(windows)]
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -302,6 +300,7 @@ struct AivpnApp {
 
     /// `host:port`, empty = clear the global default (`None`).
     admin_settings_exit_node: String,
+    admin_settings_exit_selected: bool,
     /// Same rationale as `admin_add_exit_custom_mode` — G-B1's picker
     /// convention reused here via `Self::draw_exit_node_picker`.
     admin_settings_exit_custom_mode: bool,
@@ -380,7 +379,6 @@ enum SshWizardStage {
     /// Target host/auth/options form, not yet probed.
     Form,
     /// Fingerprint confirmed ("I trust this host") — ready to install.
-    Confirmed,
     /// `spawn_install` running, streaming `ssh_install_log`.
     Installing,
     /// Terminal state reached (`ssh_install_done_ok` is `Some`).
@@ -466,6 +464,7 @@ impl AivpnApp {
             admin_settings_mask_confirm_busy: false,
             admin_settings_mask_rolled_back: false,
             admin_settings_exit_node: String::new(),
+            admin_settings_exit_selected: false,
             admin_settings_exit_custom_mode: false,
             admin_settings_exit_busy: false,
             admin_settings_exit_error: None,
@@ -614,8 +613,8 @@ impl AivpnApp {
                 self.tray = Some(TrayHandles {
                     _icon: icon,
                     connect_item,
-                    show_item,
-                    quit_item,
+                    _show_item: show_item,
+                    _quit_item: quit_item,
                 });
                 // Background thread: poll TrayIconEvent + MenuEvent and restore the window
                 // via Win32. Must run in bg thread so Quit/Connect/Show work even when
@@ -749,7 +748,9 @@ impl AivpnApp {
         }
         if let Some(at) = self.dirty_at {
             if at.elapsed().as_secs() >= 2 {
-                self.settings.save();
+                if let Err(error) = self.settings.save() {
+                    self.show_error(error);
+                }
                 self.dirty_at = None;
             }
         }
@@ -779,7 +780,9 @@ impl AivpnApp {
                     // Hand off entirely to the elevated instance — save
                     // settings first since this process is about to exit
                     // and never reach its normal on-exit save path.
-                    self.settings.save();
+                    if let Err(error) = self.settings.save() {
+                        self.show_error(error);
+                    }
                     std::process::exit(0);
                 }
                 Err(e) => {
@@ -865,9 +868,5 @@ impl AivpnApp {
                 let _ = tray._icon.set_icon(Some(icon));
             }
         }
-    }
-
-    fn show_window_win32(&self) {
-        bring_window_to_front();
     }
 }

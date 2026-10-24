@@ -9,6 +9,7 @@ import android.widget.TextView
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 import androidx.lifecycle.lifecycleScope
+import androidx.core.widget.doAfterTextChanged
 import com.aivpn.client.databinding.ActivityServerSettingsBinding
 import kotlinx.coroutines.launch
 import org.json.JSONArray
@@ -100,6 +101,13 @@ class ServerSettingsActivity : AppCompatActivity() {
         binding.btnApplyMask.setOnClickListener { onApplyMask() }
         binding.btnConfirmMask.setOnClickListener { onConfirmMask() }
         binding.btnApplyExit.setOnClickListener { onApplyExit() }
+        fun updateExitAction() {
+            binding.editExitNode.isEnabled = !binding.checkClearExitNode.isChecked
+            binding.btnApplyExit.isEnabled = !exitBusy && (binding.checkClearExitNode.isChecked || binding.editExitNode.text.toString().trim().isNotEmpty())
+        }
+        binding.editExitNode.doAfterTextChanged { updateExitAction() }
+        binding.checkClearExitNode.setOnCheckedChangeListener { _, _ -> updateExitAction() }
+        updateExitAction()
         binding.btnConfirmExit.setOnClickListener { onConfirmExit() }
 
         // Survive a configuration change (e.g. rotation) with a still-live pending
@@ -315,14 +323,13 @@ class ServerSettingsActivity : AppCompatActivity() {
     private fun onApplyExit() {
         if (exitBusy) return
         val addr = binding.editExitNode.text.toString().trim()
+        if (!binding.checkClearExitNode.isChecked && addr.isEmpty()) return
         exitBusy = true
         binding.btnApplyExit.isEnabled = false
         lifecycleScope.launch {
-            // Empty field = explicit `null` — clears the global default entirely
-            // (see AdminApi.applyGlobalExitNode's doc comment for the wire shape).
-            val result = AdminApi.applyGlobalExitNode(addr.ifEmpty { null })
+            val result = AdminApi.applyGlobalExitNode(if (binding.checkClearExitNode.isChecked) null else addr)
             exitBusy = false
-            binding.btnApplyExit.isEnabled = true
+            binding.btnApplyExit.isEnabled = binding.checkClearExitNode.isChecked || binding.editExitNode.text.toString().trim().isNotEmpty()
             handleApplyResult(result, exitSection)
         }
     }

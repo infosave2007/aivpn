@@ -8,6 +8,64 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
 
+/// Небольшая копия раскладки для упаковки пакета без клонирования профиля.
+#[derive(Clone, Copy)]
+pub struct PacketFraming {
+    tag_offset: Option<usize>,
+    stun_attributes: bool,
+    stun_length_offset: Option<usize>,
+}
+
+impl PacketFraming {
+    pub fn prefix_len(self) -> usize {
+        if self.tag_offset.is_some() {
+            0
+        } else {
+            crate::crypto::TAG_SIZE
+        }
+    }
+
+    pub fn padding(self, base: usize, requested: u16, maximum: u16) -> Result<u16> {
+        if self.stun_attributes {
+            crate::stun_wire::aligned_padding(base, requested, maximum)
+        } else {
+            Ok(requested.min(maximum))
+        }
+    }
+
+    pub fn assemble_into(
+        self,
+        output: &mut Vec<u8>,
+        mdh: &[u8],
+        tag: &[u8; crate::crypto::TAG_SIZE],
+        ciphertext: &[u8],
+    ) -> Result<()> {
+        output.clear();
+        if let Some(offset) = self.tag_offset {
+            if offset + crate::crypto::TAG_SIZE > mdh.len() {
+                return Err(Error::InvalidPacket("Тег выходит за границу MDH"));
+            }
+            output.extend_from_slice(mdh);
+            output[offset..offset + crate::crypto::TAG_SIZE].copy_from_slice(tag);
+            output.extend_from_slice(ciphertext);
+            if self.stun_attributes {
+                crate::stun_wire::finalize(output)?;
+            } else if let Some(offset) = self.stun_length_offset {
+                if output.len() >= 20 && offset + 2 <= output.len() {
+                    let length = u16::try_from(output.len() - 20)
+                        .map_err(|_| Error::InvalidPacket("Слишком большой STUN-пакет"))?;
+                    output[offset..offset + 2].copy_from_slice(&length.to_be_bytes());
+                }
+            }
+        } else {
+            output.extend_from_slice(tag);
+            output.extend_from_slice(mdh);
+            output.extend_from_slice(ciphertext);
+        }
+        Ok(())
+    }
+}
+
 /// Rotating bootstrap descriptor.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BootstrapDescriptor {
@@ -39,12 +97,12 @@ impl BootstrapDescriptor {
 
     /// Verify the ed25519 signature of this descriptor against an operator signing key.
     pub fn verify_signature(&self, public_key: &[u8; 32]) -> Result<bool> {
-        use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+        use ed25519_dalek::{Signature, VerifyingKey};
         let vk = VerifyingKey::from_bytes(public_key)
             .map_err(|e| Error::Crypto(format!("Invalid Ed25519 public key: {}", e)))?;
         let message = self.signing_bytes();
         let sig = Signature::from_bytes(&self.signature);
-        match vk.verify(&message, &sig) {
+        match vk.verify_strict(&message, &sig) {
             Ok(()) => Ok(true),
             Err(_) => Ok(false),
         }
@@ -120,6 +178,9 @@ impl BootstrapChannel {
 /// Configuration for multi-channel bootstrap descriptor distribution.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BootstrapConfig {
+    /// Доверенный ключ подписи дескрипторов из сетевых каналов.
+    #[serde(default)]
+    pub trusted_signing_key: Option<[u8; 32]>,
     /// List of channels to try (in order of preference)
     pub channels: Vec<BootstrapChannel>,
     /// Maximum age of descriptors to accept (seconds)
@@ -135,6 +196,7 @@ pub struct BootstrapConfig {
 impl Default for BootstrapConfig {
     fn default() -> Self {
         Self {
+            trusted_signing_key: None,
             channels: Vec::new(),
             max_descriptor_age: 86400, // 24 hours
             min_success_channels: 1,
@@ -304,10 +366,8 @@ pub fn decode_bootstrap_descriptor(bytes: &[u8]) -> Option<BootstrapDescriptor> 
 ///    a present-but-invalid signature is REJECTED; only descriptors whose
 ///    signature verifies against `k` are accepted. A forged/tampered persisted
 ///    descriptor can never steer the handshake mask.
-///  - `trusted_key = None` → signature is not checked (no key to check it
-///    against — same trust model as the AEAD-authenticated in-session store
-///    path that produced these descriptors in the first place). Only the
-///    validity window is enforced.
+///  - При `trusted_key = None` обычная сборка проверяет срок действия.
+///    production-secure требует ключ и отклоняет такой дескриптор.
 ///
 /// Never panics; malformed JSON yields an empty vec. The result is sorted
 /// newest-first by `created_at`.
@@ -334,7 +394,16 @@ pub fn accept_persisted_descriptors(
                 // trusted operator key is configured.
                 d.signature != [0u8; 64] && matches!(d.verify_signature(key), Ok(true))
             }
-            None => true,
+            None => {
+                #[cfg(feature = "production-secure")]
+                {
+                    false
+                }
+                #[cfg(not(feature = "production-secure"))]
+                {
+                    true
+                }
+            }
         })
         .collect();
     out.sort_by_key(|d| std::cmp::Reverse(d.created_at));
@@ -349,7 +418,7 @@ pub fn accept_persisted_descriptors(
 /// must pick the same handshake mask the same way, or the server's per-mask
 /// layout-aware tag scan can't match it. The historical per-core snippet was
 ///
-/// ```ignore
+/// ```text
 /// preferred.and_then(preset_masks::by_id).unwrap_or_else(|| bootstrap_mask_for_psk(psk))
 /// ```
 ///
@@ -406,9 +475,22 @@ pub fn resolve_handshake_mask(
         .filter(|s| !s.is_empty() && *s != "auto");
 
     // 1. Explicit named preset (user's deliberate mask-picker selection).
+    //    production-secure не подменяет уже имеющийся дескриптор неподписанным
+    //    пресетом. Если дескрипторов нет, явный пресет по-прежнему выбирается.
     if let Some(name) = pref {
         if let Some(mask) = preset_masks::by_id(name) {
-            return mask;
+            #[cfg(feature = "production-secure")]
+            let keep_descriptor = !descriptors.is_empty();
+            #[cfg(not(feature = "production-secure"))]
+            let keep_descriptor = false;
+            if keep_descriptor {
+                tracing::warn!(
+                    "production-secure: пресет '{}' не заменяет аутентифицированный дескриптор",
+                    name
+                );
+            } else {
+                return mask;
+            }
         }
     }
 
@@ -452,18 +534,7 @@ pub fn resolve_handshake_mask(
     //    exactly (kept inline so the resolver stays usable without the
     //    `client-upload`-gated `mimicry` module) and is no more preset-happy
     //    than the legacy path: it only runs when no covert mask can be produced.
-    let presets = preset_masks::all();
-    if presets.is_empty() {
-        return preset_masks::bootstrap_default();
-    }
-    match preshared_key {
-        Some(key) => {
-            let hash = blake3::derive_key("aivpn-bootstrap-mask-v1", key);
-            let idx = hash[0] as usize % presets.len();
-            presets[idx].clone()
-        }
-        None => presets[0].clone(),
-    }
+    preset_masks::bootstrap_for_psk(preshared_key)
 }
 
 /// Consecutive never-connected handshake attempts after which a client
@@ -475,24 +546,60 @@ pub fn resolve_handshake_mask(
 /// client's `HANDSHAKE_FALLBACK_THRESHOLD` (main.rs) for the mobile cores.
 pub const HANDSHAKE_FALLBACK_THRESHOLD: u32 = 3;
 
-/// `resolve_handshake_mask` with the desktop client's resilience net: once
-/// `fail_streak` reaches `HANDSHAKE_FALLBACK_THRESHOLD`, resolve as if no
-/// descriptor were held, so the handshake uses a builtin preset every server
-/// matches via its builtin candidate set. An explicit preset in `preferred`
-/// (the user's deliberate mask-picker choice) is honored either way. The
-/// availability-over-covertness trade is deliberate and bounded: the caller
-/// resets the streak on the first real connection, and the server re-pushes
-/// fresh descriptors in-session, so subsequent handshakes are covert again.
+/// Перебирает кандидаты проверенного вызывающим кодом каталога.
+/// Временная потеря связи не отзывает подпись и не исчерпывает каталог.
+pub fn bootstrap_candidate_for_attempt(
+    descriptors: &[BootstrapDescriptor],
+    preshared_key: Option<&[u8; 32]>,
+    fail_streak: u32,
+) -> Option<MaskProfile> {
+    let now = current_unix_secs();
+    let groups: Vec<_> = descriptors
+        .iter()
+        .filter(|descriptor| descriptor.is_valid_at(now))
+        .filter_map(|descriptor| {
+            (0..descriptor.candidate_count)
+                .find(|slot| derive_bootstrap_candidate(descriptor, preshared_key, *slot).is_some())
+                .map(|first_slot| (descriptor, first_slot))
+        })
+        .collect();
+    if groups.is_empty() {
+        return None;
+    }
+    let round = (fail_streak / HANDSHAKE_FALLBACK_THRESHOLD) as usize;
+    let (descriptor, first_slot) = groups[round % groups.len()];
+    let slot = ((round / groups.len()) % usize::from(descriptor.candidate_count)) as u8;
+    derive_bootstrap_candidate(descriptor, preshared_key, slot)
+        .or_else(|| derive_bootstrap_candidate(descriptor, preshared_key, first_slot))
+}
+
+/// После неудач защищенная сборка меняет доверенный кандидат, обычная допускает пресет.
 pub fn resolve_handshake_mask_resilient(
     preferred: Option<&str>,
     descriptors: &[BootstrapDescriptor],
     preshared_key: Option<&[u8; 32]>,
     fail_streak: u32,
 ) -> MaskProfile {
-    if fail_streak >= HANDSHAKE_FALLBACK_THRESHOLD {
-        resolve_handshake_mask(preferred, &[], preshared_key)
-    } else {
+    // production-secure не сбрасывает дескрипторы на встроенный пресет после
+    // серии неудачных рукопожатий. Доступность здесь не важнее подписи.
+    #[cfg(feature = "production-secure")]
+    {
+        if fail_streak >= HANDSHAKE_FALLBACK_THRESHOLD {
+            if let Some(candidate) =
+                bootstrap_candidate_for_attempt(descriptors, preshared_key, fail_streak)
+            {
+                return candidate;
+            }
+        }
         resolve_handshake_mask(preferred, descriptors, preshared_key)
+    }
+    #[cfg(not(feature = "production-secure"))]
+    {
+        if fail_streak >= HANDSHAKE_FALLBACK_THRESHOLD {
+            resolve_handshake_mask(preferred, &[], preshared_key)
+        } else {
+            resolve_handshake_mask(preferred, descriptors, preshared_key)
+        }
     }
 }
 
@@ -622,6 +729,49 @@ pub fn verify_mask_artifact(
         MaskVerifyMode::Enforce => matches!(detail, MaskVerifyDetail::Valid),
     };
     MaskVerifyResult { accept, detail }
+}
+
+/// Режим проверки маски для защищенной сборки.
+///
+/// `None` - историческое значение по умолчанию (Android передает 1, iOS
+/// передает пустую строку). В production-secure оно поднимается до enforce.
+/// Явные off и warn в этой сборке - ошибка, а не тихая подмена.
+pub fn resolve_protected_mask_verify_mode(
+    explicit: Option<MaskVerifyMode>,
+) -> std::result::Result<MaskVerifyMode, String> {
+    #[cfg(feature = "production-secure")]
+    {
+        match explicit {
+            None | Some(MaskVerifyMode::Enforce) => Ok(MaskVerifyMode::Enforce),
+            Some(other) => Err(format!(
+                "production-secure принимает только mask_verify_mode=enforce, получено '{other:?}'"
+            )),
+        }
+    }
+    #[cfg(not(feature = "production-secure"))]
+    {
+        Ok(explicit.unwrap_or(MaskVerifyMode::Warn))
+    }
+}
+
+/// Защищенная сборка требует оба ключа: подпись сервера и ключ оператора масок.
+pub fn protected_build_requires_keys(
+    signing: bool,
+    operator: bool,
+) -> std::result::Result<(), String> {
+    #[cfg(feature = "production-secure")]
+    {
+        if signing && operator {
+            Ok(())
+        } else {
+            Err("production-secure требует server signing key и mask operator pubkey".to_string())
+        }
+    }
+    #[cfg(not(feature = "production-secure"))]
+    {
+        let _ = (signing, operator);
+        Ok(())
+    }
 }
 
 /// Perturb `mask` in place into a polymorphic variant, deterministically from
@@ -891,6 +1041,24 @@ pub enum SpoofProtocol {
     WebRTC_STUN,
     HTTPS_H2,
     DNS_over_UDP,
+    /// STUN-bootstrap, затем согласованные ICE/DTLS/SRTP в общем слое масок.
+    WebRTC_DTLS_SRTP,
+    /// TURN-канал с вложенными ICE/DTLS/SRTP на прежнем UDP-сокете.
+    WebRTC_TURN_DTLS_SRTP,
+    /// ICE/SRTP без DTLS, секрет передается через защищенное согласование.
+    WebRTC_SDES_SRTP,
+}
+
+impl SpoofProtocol {
+    pub fn is_stun(self) -> bool {
+        matches!(
+            self,
+            Self::WebRTC_STUN
+                | Self::WebRTC_DTLS_SRTP
+                | Self::WebRTC_TURN_DTLS_SRTP
+                | Self::WebRTC_SDES_SRTP
+        )
+    }
 }
 
 /// Packet size distribution
@@ -1152,16 +1320,20 @@ impl IATDistribution {
         // jitter range; gen_range panics on those, so fall back to no jitter.
         let (lo, hi) = self.jitter_range_ms;
         let jitter = if lo.is_finite() && hi.is_finite() && lo <= hi {
+            // Ограничиваем и ширину диапазона: конечные края еще не гарантируют
+            // конечную разность внутри генератора случайного числа.
+            let lo = lo.clamp(-MAX_BASE_IAT_MS, MAX_BASE_IAT_MS);
+            let hi = hi.clamp(-MAX_BASE_IAT_MS, MAX_BASE_IAT_MS);
             rng.gen_range(lo..=hi)
         } else {
             0.0
         };
-        (base_iat + jitter).max(0.0)
+        (base_iat + jitter).clamp(0.0, MAX_BASE_IAT_MS)
     }
 }
 
 /// Padding strategy
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PaddingStrategy {
     RandomUniform { min: u16, max: u16 },
     MatchDistribution,
@@ -1534,7 +1706,7 @@ impl SizeIatGmm2d {
             return false;
         }
         let k = k as usize;
-        self.params.len() >= 1 + k * Self::STRIDE
+        self.params.len() > k * Self::STRIDE
     }
 
     /// Sample a joint `(size_bytes, iat_ms)`. Falls back to a benign default if
@@ -1634,30 +1806,39 @@ impl MaskProfile {
     /// NOTE: this is intentionally NOT the pre-0.10 message (which covered only
     /// mask_id/version/header_template/eph_pub_*). Signatures produced before
     /// this change do not verify — an accepted breaking change for 0.10.
-    pub fn signing_message(&self) -> Vec<u8> {
+    pub fn signing_message(&self) -> Result<Vec<u8>> {
         let mut canonical = self.clone();
         canonical.signature = [0u8; 64];
-        serde_json::to_vec(&canonical).unwrap_or_default()
+        let bytes = serde_json::to_vec(&canonical)?;
+        // JSON превращает NaN/Infinity в null. Обратный разбор отклоняет
+        // такие значения вместо подписи неоднозначного представления.
+        let _: Self = serde_json::from_slice(&bytes)?;
+        Ok(bytes)
     }
 
     /// Sign this mask in place with the operator's Ed25519 key over
     /// [`Self::signing_message`].
-    pub fn sign(&mut self, signing_key: &ed25519_dalek::SigningKey) {
+    pub fn sign(&mut self, signing_key: &ed25519_dalek::SigningKey) -> Result<()> {
         use ed25519_dalek::Signer;
         self.signature = [0u8; 64];
-        let msg = self.signing_message();
+        if let Some(reverse) = self.reverse_profile.as_mut() {
+            // Обратный профиль может передаваться клиенту отдельно от внешнего.
+            reverse.sign(signing_key)?;
+        }
+        let msg = self.signing_message()?;
         self.signature = signing_key.sign(&msg).to_bytes();
+        Ok(())
     }
 
     pub fn verify_signature(&self, public_key: &[u8; 32]) -> Result<bool> {
-        use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+        use ed25519_dalek::{Signature, VerifyingKey};
 
         let vk = VerifyingKey::from_bytes(public_key)
             .map_err(|e| Error::Crypto(format!("Invalid Ed25519 public key: {}", e)))?;
 
-        let message = self.signing_message();
+        let message = self.signing_message()?;
         let sig = Signature::from_bytes(&self.signature);
-        match vk.verify(&message, &sig) {
+        match vk.verify_strict(&message, &sig) {
             Ok(()) => Ok(true),
             Err(_) => Ok(false),
         }
@@ -1710,7 +1891,7 @@ impl MaskProfile {
     /// non-STUN `Length` field (e.g. a TLS-record length) would be wrong. For
     /// the shipped STUN presets this resolves to offset 2, width 2, big-endian.
     pub fn stun_length_field_offset(&self) -> Option<usize> {
-        if self.spoof_protocol != SpoofProtocol::WebRTC_STUN {
+        if !self.spoof_protocol.is_stun() {
             return None;
         }
         self.header_spec
@@ -1738,12 +1919,8 @@ impl MaskProfile {
     /// internal length offset would corrupt the tag — callers gate this to the
     /// embedded branch.
     ///
-    /// LIMITATION: this assumes the STUN header occupies exactly the first 20
-    /// bytes. A polymorphic variant that inserts header-gap bytes (see
-    /// [`apply_polymorphic_perturbation`]) would push the real STUN header past
-    /// offset 20 and break the `+ 20` assumption — polymorphism and STUN DPI
-    /// pass-through are therefore in tension and must not be combined for a mask
-    /// that has to classify as STUN.
+    /// Дополнительные байты после заголовка входят в длину сообщения.
+    /// Начало заголовка остается на нулевом смещении и при полиморфизме.
     pub fn patch_stun_length(&self, packet: &mut [u8]) {
         const STUN_HEADER_LEN: usize = 20;
         let Some(offset) = self.stun_length_field_offset() else {
@@ -1754,6 +1931,52 @@ impl MaskProfile {
         }
         let msg_len = (packet.len() - STUN_HEADER_LEN) as u16;
         packet[offset..offset + 2].copy_from_slice(&msg_len.to_be_bytes());
+    }
+
+    /// Явная раскладка новых STUN-профилей. Старые подписанные маски не меняем.
+    pub fn uses_stun_attributes(&self) -> bool {
+        self.spoof_protocol.is_stun()
+            && self.header_template.get(20..24) == Some(&crate::stun_wire::ATTRIBUTE_TEMPLATE)
+            && self.tag_offset == 8
+            && self.eph_pub_offset >= 24
+    }
+
+    pub fn wire_padding(&self, base: usize, requested: u16, maximum: u16) -> Result<u16> {
+        if self.uses_stun_attributes() {
+            crate::stun_wire::aligned_padding(base, requested, maximum)
+        } else {
+            Ok(requested.min(maximum))
+        }
+    }
+
+    pub fn finalize_packet(&self, packet: &mut [u8]) -> Result<()> {
+        if self.uses_stun_attributes() {
+            crate::stun_wire::finalize(packet)
+        } else {
+            self.patch_stun_length(packet);
+            Ok(())
+        }
+    }
+
+    /// Единая упаковка обоих направлений и управляющих сообщений.
+    pub fn assemble_packet_into(
+        &self,
+        output: &mut Vec<u8>,
+        mdh: &[u8],
+        tag: &[u8; crate::crypto::TAG_SIZE],
+        ciphertext: &[u8],
+    ) -> Result<()> {
+        self.packet_framing(mdh.len())
+            .assemble_into(output, mdh, tag, ciphertext)
+    }
+
+    pub fn packet_framing(&self, mdh_len: usize) -> PacketFraming {
+        let embedded = self.uses_embedded_layout(mdh_len);
+        PacketFraming {
+            tag_offset: embedded.then_some(self.tag_offset as usize),
+            stun_attributes: embedded && self.uses_stun_attributes(),
+            stun_length_offset: self.stun_length_field_offset(),
+        }
     }
 
     /// True when the embedded-tag slot `[tag_offset, tag_offset + tag_size)`
@@ -1829,6 +2052,25 @@ impl MaskProfile {
         Option<IATDistribution>,
         Option<PaddingStrategy>,
     ) {
+        self.matching_transition(current_state, packets_in_state, duration_in_state_ms)
+            .map(|transition| {
+                (
+                    transition.next_state,
+                    transition.size_override.clone(),
+                    transition.iat_override.clone(),
+                    transition.padding_override.clone(),
+                )
+            })
+            .unwrap_or((current_state, None, None, None))
+    }
+
+    /// Отличает сработавший переход без overrides от отсутствия перехода.
+    pub fn matching_transition(
+        &self,
+        current_state: u16,
+        packets_in_state: u32,
+        duration_in_state_ms: u64,
+    ) -> Option<&FSMTransition> {
         let state = self.fsm_states.iter().find(|s| s.state_id == current_state);
         if let Some(state) = state {
             for transition in &state.transitions {
@@ -1842,16 +2084,11 @@ impl MaskProfile {
                 };
 
                 if should_transition {
-                    return (
-                        transition.next_state,
-                        transition.size_override.clone(),
-                        transition.iat_override.clone(),
-                        transition.padding_override.clone(),
-                    );
+                    return Some(transition);
                 }
             }
         }
-        (current_state, None, None, None)
+        None
     }
 }
 
@@ -1922,11 +2159,50 @@ pub mod preset_masks {
     use super::*;
     use std::sync::OnceLock;
 
+    #[test]
+    fn registry_contains_every_shipped_asset() {
+        let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../assets/masks");
+        let assets: std::collections::BTreeSet<String> = std::fs::read_dir(directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
+            .map(|path| {
+                serde_json::from_slice::<MaskProfile>(&std::fs::read(path).unwrap())
+                    .unwrap()
+                    .mask_id
+            })
+            .collect();
+        let registered: std::collections::BTreeSet<_> =
+            all().into_iter().map(|mask| mask.mask_id).collect();
+        assert_eq!(registered, assets);
+        for id in assets {
+            assert_eq!(by_id(&id).unwrap().mask_id, id);
+        }
+    }
+
+    #[test]
+    fn expanded_registry_preserves_original_psk_bootstrap_selection() {
+        let original = [
+            "webrtc_zoom_v3",
+            "quic_https_v2",
+            "webrtc_yandex_telemost_v1",
+            "webrtc_vk_teams_v1",
+            "webrtc_sberjazz_v1",
+        ];
+        for byte in 0..=255 {
+            let psk = [byte; 32];
+            let index =
+                blake3::derive_key("aivpn-bootstrap-mask-v1", &psk)[0] as usize % original.len();
+            assert_eq!(bootstrap_for_psk(Some(&psk)).mask_id, original[index]);
+        }
+    }
+
     static WEBRTC_ZOOM_V3: OnceLock<MaskProfile> = OnceLock::new();
     static QUIC_HTTPS_V2: OnceLock<MaskProfile> = OnceLock::new();
     static WEBRTC_YANDEX_TELEMOST_V1: OnceLock<MaskProfile> = OnceLock::new();
     static WEBRTC_VK_TEAMS_V1: OnceLock<MaskProfile> = OnceLock::new();
     static WEBRTC_SBERJAZZ_V1: OnceLock<MaskProfile> = OnceLock::new();
+    static CATALOG: OnceLock<Vec<MaskProfile>> = OnceLock::new();
 
     fn parse_mask(json: &str) -> MaskProfile {
         serde_json::from_str(json).expect("valid preset mask asset")
@@ -1984,25 +2260,44 @@ pub mod preset_masks {
             .clone()
     }
 
+    fn catalog() -> &'static [MaskProfile] {
+        CATALOG.get_or_init(|| {
+            vec![
+                webrtc_zoom_v3(),
+                quic_https_v2(),
+                webrtc_yandex_telemost_v1(),
+                webrtc_vk_teams_v1(),
+                webrtc_sberjazz_v1(),
+                parse_mask(include_str!("../../../assets/masks/sber_salute_v1.json")),
+                parse_mask(include_str!("../../../assets/masks/whatsapp_voip_v1.json")),
+                parse_mask(include_str!("../../../assets/masks/avito_api_v1.json")),
+                parse_mask(include_str!("../../../assets/masks/telegram_calls_v1.json")),
+                parse_mask(include_str!("../../../assets/masks/vk_video_v1.json")),
+            ]
+        })
+    }
+
     pub fn all() -> Vec<MaskProfile> {
-        vec![
-            webrtc_zoom_v3(),
-            quic_https_v2(),
-            webrtc_yandex_telemost_v1(),
-            webrtc_vk_teams_v1(),
-            webrtc_sberjazz_v1(),
-        ]
+        catalog().to_vec()
+    }
+
+    pub fn ids() -> impl Iterator<Item = &'static str> {
+        catalog().iter().map(|mask| mask.mask_id.as_str())
+    }
+
+    /// Расширение каталога не меняет прежний выбор по PSK.
+    pub fn bootstrap_for_psk(psk: Option<&[u8; 32]>) -> MaskProfile {
+        let index = psk
+            .map(|key| blake3::derive_key("aivpn-bootstrap-mask-v1", key)[0] as usize % 5)
+            .unwrap_or(0);
+        catalog()[index].clone()
     }
 
     pub fn by_id(mask_id: &str) -> Option<MaskProfile> {
-        match mask_id {
-            "webrtc_zoom_v3" => Some(webrtc_zoom_v3()),
-            "quic_https_v2" => Some(quic_https_v2()),
-            "webrtc_yandex_telemost_v1" => Some(webrtc_yandex_telemost_v1()),
-            "webrtc_vk_teams_v1" => Some(webrtc_vk_teams_v1()),
-            "webrtc_sberjazz_v1" => Some(webrtc_sberjazz_v1()),
-            _ => None,
-        }
+        catalog()
+            .iter()
+            .find(|mask| mask.mask_id == mask_id)
+            .cloned()
     }
 
     pub fn bootstrap_default() -> MaskProfile {
@@ -2053,6 +2348,26 @@ mod tests {
     use super::*;
     use rand::rngs::StdRng;
     use rand::SeedableRng;
+
+    #[test]
+    fn protocol_audit_iat_bounds_include_jitter() {
+        let mut rng = StdRng::seed_from_u64(42);
+        for jitter_range_ms in [(1e30, 1e30), (-f64::MAX, f64::MAX), (f64::MAX, f64::MAX)] {
+            let distribution = IATDistribution {
+                dist_type: IATDistType::Empirical,
+                params: vec![MAX_BASE_IAT_MS],
+                jitter_range_ms,
+            };
+            for _ in 0..32 {
+                let sample = distribution.sample(&mut rng);
+                assert!(
+                    sample.is_finite() && (0.0..=MAX_BASE_IAT_MS).contains(&sample),
+                    "{sample}"
+                );
+                let _ = std::time::Duration::from_secs_f64(sample / 1000.0);
+            }
+        }
+    }
 
     #[test]
     fn size_iat_joint_reproduces_correlation() {
@@ -2280,12 +2595,9 @@ mod tests {
     fn test_preset_masks_have_header_spec() {
         let mask = preset_masks::webrtc_zoom_v3();
         assert!(mask.header_spec.is_some());
-        // Bumped to v3 to signal the Variant A embedded-tag wire layout.
-        assert_eq!(mask.version, 3);
 
         let mask2 = preset_masks::quic_https_v2();
         assert!(mask2.header_spec.is_some());
-        assert_eq!(mask2.version, 3);
     }
 
     #[test]
@@ -2350,7 +2662,10 @@ mod tests {
         // All shipped STUN presets declare the Length field at byte offset 2.
         for mask in preset_masks::all() {
             match mask.spoof_protocol {
-                SpoofProtocol::WebRTC_STUN => {
+                SpoofProtocol::WebRTC_STUN
+                | SpoofProtocol::WebRTC_DTLS_SRTP
+                | SpoofProtocol::WebRTC_TURN_DTLS_SRTP
+                | SpoofProtocol::WebRTC_SDES_SRTP => {
                     assert_eq!(
                         mask.stun_length_field_offset(),
                         Some(2),
@@ -2368,6 +2683,23 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    #[test]
+    fn recorded_dtls_profiles_use_stateful_rtc_after_stun_bootstrap() {
+        for mask in [
+            preset_masks::webrtc_zoom_v3(),
+            preset_masks::webrtc_yandex_telemost_v1(),
+        ] {
+            assert_eq!(
+                mask.spoof_protocol,
+                SpoofProtocol::WebRTC_DTLS_SRTP,
+                "{}",
+                mask.mask_id
+            );
+            assert!(mask.uses_stun_attributes());
+            assert_eq!(mask.stun_length_field_offset(), Some(2));
         }
     }
 
@@ -2531,13 +2863,25 @@ mod tests {
             resolve_handshake_mask(Some("auto"), std::slice::from_ref(&descriptor), Some(&psk));
         assert!(auto.mask_id.starts_with("bootstrap:epoch-42:"));
 
-        // Explicit preset name is honored (deliberate user mask-picker choice).
+        // Обычная сборка разрешает пресет, защищенная сохраняет дескриптор.
         let preset = resolve_handshake_mask(
             Some("webrtc_zoom_v3"),
             std::slice::from_ref(&descriptor),
             Some(&psk),
         );
+        #[cfg(not(feature = "production-secure"))]
         assert_eq!(preset.mask_id, "webrtc_zoom_v3");
+        #[cfg(feature = "production-secure")]
+        assert!(
+            preset.mask_id.starts_with("bootstrap:epoch-42:"),
+            "preset must not replace a descriptor, got {}",
+            preset.mask_id
+        );
+        #[cfg(feature = "production-secure")]
+        {
+            let bare = resolve_handshake_mask(Some("webrtc_zoom_v3"), &[], Some(&psk));
+            assert_eq!(bare.mask_id, "webrtc_zoom_v3");
+        }
     }
 
     #[test]
@@ -2577,24 +2921,29 @@ mod tests {
         );
         assert!(covert.mask_id.starts_with("bootstrap:epoch-77:"));
 
-        // At the threshold the descriptor is abandoned for a builtin preset
-        // (the unmatchable-descriptor reconnect-loop breaker).
+        // Порог ошибок разрешает пресет только в обычной сборке.
         let fallback = resolve_handshake_mask_resilient(
             None,
             descriptors,
             Some(&psk),
             HANDSHAKE_FALLBACK_THRESHOLD,
         );
+        #[cfg(not(feature = "production-secure"))]
         assert!(preset_masks::by_id(&fallback.mask_id).is_some());
+        #[cfg(feature = "production-secure")]
+        assert!(fallback.mask_id.starts_with("bootstrap:epoch-77:"));
 
-        // An explicit preset choice is honored on both sides of the threshold.
+        // Явный пресет не заменяет дескриптор в защищенной сборке.
         let chosen = resolve_handshake_mask_resilient(
             Some("webrtc_zoom_v3"),
             descriptors,
             Some(&psk),
             HANDSHAKE_FALLBACK_THRESHOLD,
         );
+        #[cfg(not(feature = "production-secure"))]
         assert_eq!(chosen.mask_id, "webrtc_zoom_v3");
+        #[cfg(feature = "production-secure")]
+        assert!(chosen.mask_id.starts_with("bootstrap:epoch-77:"));
     }
 
     #[test]
@@ -2771,7 +3120,7 @@ mod tests {
         let pk = sk.verifying_key().to_bytes();
 
         let mut mask = preset_masks::all()[0].clone();
-        mask.sign(&sk);
+        mask.sign(&sk).unwrap();
         assert!(
             mask.verify_signature(&pk).unwrap(),
             "freshly signed must verify"
@@ -2820,10 +3169,8 @@ mod tests {
         let pk = sk.verifying_key().to_bytes();
 
         let mut mask = generated_style_mask();
-        // Sign the reverse first, then the outer — the mask_gen order — so the
-        // outer signature covers the signed reverse profile.
-        mask.reverse_profile.as_mut().unwrap().sign(&sk);
-        mask.sign(&sk);
+        // Один вызов подписывает обратный профиль и покрывающую его маску.
+        mask.sign(&sk).unwrap();
 
         assert!(!mask.is_unsigned());
         let outer = verify_mask_artifact(&mask, Some(&pk), MaskVerifyMode::Enforce);
@@ -2858,7 +3205,7 @@ mod tests {
 
         // Wrong-key signature: accepted in warn, flagged Invalid.
         let mut wrong = generated_style_mask();
-        wrong.sign(&SigningKey::from_bytes(&[2u8; 32]));
+        wrong.sign(&SigningKey::from_bytes(&[2u8; 32])).unwrap();
         let v = verify_mask_artifact(&wrong, Some(&pk), MaskVerifyMode::Warn);
         assert!(v.accept);
         assert_eq!(v.detail, MaskVerifyDetail::Invalid);
@@ -2879,7 +3226,7 @@ mod tests {
 
         // Wrong-key signature → rejected.
         let mut wrong = generated_style_mask();
-        wrong.sign(&SigningKey::from_bytes(&[2u8; 32]));
+        wrong.sign(&SigningKey::from_bytes(&[2u8; 32])).unwrap();
         let v = verify_mask_artifact(&wrong, Some(&pk), MaskVerifyMode::Enforce);
         assert!(!v.accept);
         assert_eq!(v.detail, MaskVerifyDetail::Invalid);
@@ -2989,7 +3336,10 @@ mod tests {
 
 #[cfg(test)]
 mod persisted_descriptor_tests {
-    use super::{accept_persisted_descriptors, current_unix_secs, BootstrapDescriptor};
+    use super::{
+        accept_persisted_descriptors, current_unix_secs, protected_build_requires_keys,
+        resolve_protected_mask_verify_mode, BootstrapDescriptor, MaskVerifyMode,
+    };
 
     fn valid_descriptor(id: &str, created: u64) -> BootstrapDescriptor {
         let now = current_unix_secs();
@@ -3006,6 +3356,7 @@ mod persisted_descriptor_tests {
         }
     }
 
+    #[cfg(not(feature = "production-secure"))]
     #[test]
     fn parses_array_filters_expired_sorts_newest_first() {
         let now = current_unix_secs();
@@ -3021,6 +3372,7 @@ mod persisted_descriptor_tests {
         assert_eq!(accepted[1].descriptor_id, "d1");
     }
 
+    #[cfg(not(feature = "production-secure"))]
     #[test]
     fn accepts_single_object_without_trusted_key() {
         let now = current_unix_secs();
@@ -3049,5 +3401,189 @@ mod persisted_descriptor_tests {
     fn malformed_json_yields_empty() {
         assert!(accept_persisted_descriptors("not json", None).is_empty());
         assert!(accept_persisted_descriptors("", Some(&[0u8; 32])).is_empty());
+    }
+
+    #[test]
+    fn accepts_signed_descriptor_and_rejects_a_missing_key_when_protected() {
+        use ed25519_dalek::Signer;
+        let key = ed25519_dalek::SigningKey::from_bytes(&[3u8; 32]);
+        let now = current_unix_secs();
+        let mut expired = valid_descriptor("old", now.saturating_sub(100));
+        expired.expires_at = now.saturating_sub(10);
+        let d1 = valid_descriptor("d1", now.saturating_sub(50));
+        let d2 = valid_descriptor("d2", now.saturating_sub(5));
+        let sign = |mut item: BootstrapDescriptor| {
+            item.signature = key.sign(&item.signing_bytes()).to_bytes();
+            item
+        };
+        let json = serde_json::to_string(&vec![sign(expired), sign(d1), sign(d2)]).unwrap();
+        let pubkey = key.verifying_key().to_bytes();
+        let accepted = accept_persisted_descriptors(&json, Some(&pubkey));
+        assert_eq!(accepted.len(), 2, "expired descriptor must be dropped");
+        assert_eq!(accepted[0].descriptor_id, "d2");
+        assert_eq!(accepted[1].descriptor_id, "d1");
+        #[cfg(feature = "production-secure")]
+        assert!(accept_persisted_descriptors(&json, None).is_empty());
+        #[cfg(not(feature = "production-secure"))]
+        assert_eq!(accept_persisted_descriptors(&json, None).len(), 2);
+    }
+
+    #[test]
+    fn weak_operator_key_cannot_authenticate_an_artifact() {
+        let mut public_key = [0u8; 32];
+        public_key[0] = 1;
+        let mut forged_signature = [0u8; 64];
+        forged_signature[0] = 1;
+        let mut descriptor = valid_descriptor("weak-key", current_unix_secs());
+        descriptor.signature = forged_signature;
+        assert!(!descriptor.verify_signature(&public_key).unwrap());
+        let mut profile = super::preset_masks::webrtc_zoom_v3();
+        profile.signature = forged_signature;
+        assert!(!profile.verify_signature(&public_key).unwrap());
+    }
+
+    #[test]
+    fn protected_mode_and_keys_follow_the_build() {
+        #[cfg(not(feature = "production-secure"))]
+        {
+            assert_eq!(
+                resolve_protected_mask_verify_mode(None).unwrap(),
+                MaskVerifyMode::Warn
+            );
+            assert_eq!(
+                resolve_protected_mask_verify_mode(Some(MaskVerifyMode::Off)).unwrap(),
+                MaskVerifyMode::Off
+            );
+            assert!(protected_build_requires_keys(false, false).is_ok());
+        }
+        #[cfg(feature = "production-secure")]
+        {
+            assert_eq!(
+                resolve_protected_mask_verify_mode(None).unwrap(),
+                MaskVerifyMode::Enforce
+            );
+            assert_eq!(
+                resolve_protected_mask_verify_mode(Some(MaskVerifyMode::Enforce)).unwrap(),
+                MaskVerifyMode::Enforce
+            );
+            assert!(resolve_protected_mask_verify_mode(Some(MaskVerifyMode::Off)).is_err());
+            assert!(resolve_protected_mask_verify_mode(Some(MaskVerifyMode::Warn)).is_err());
+            assert!(protected_build_requires_keys(true, true).is_ok());
+            assert!(protected_build_requires_keys(true, false).is_err());
+            assert!(protected_build_requires_keys(false, true).is_err());
+        }
+    }
+}
+
+#[cfg(test)]
+mod finite_signature_tests {
+    use super::*;
+    #[test]
+    fn nonfinite_msgpack_profiles_are_never_signed_or_verified() {
+        let key = ed25519_dalek::SigningKey::from_bytes(&[17; 32]);
+        let mut mask = preset_masks::webrtc_zoom_v3();
+        mask.sign(&key).unwrap();
+        for value in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let mut invalid = mask.clone();
+            invalid.signature_vector[0] = value;
+            let wire = rmp_serde::to_vec(&invalid).unwrap();
+            let mut received: MaskProfile = rmp_serde::from_slice(&wire).unwrap();
+            assert!(received
+                .verify_signature(&key.verifying_key().to_bytes())
+                .is_err());
+            assert!(received.sign(&key).is_err());
+            assert_eq!(received.signature, [0; 64]);
+        }
+    }
+}
+
+#[cfg(test)]
+mod reverse_signature_tests {
+    use super::*;
+
+    #[test]
+    fn signed_presets_and_reverse_profiles_survive_json_roundtrip() {
+        let signer = ed25519_dalek::SigningKey::from_bytes(&[73; 32]);
+        let public = signer.verifying_key().to_bytes();
+        for mut mask in preset_masks::all() {
+            mask.sign(&signer).unwrap();
+            let bytes = serde_json::to_vec_pretty(&mask).unwrap();
+            let decoded: MaskProfile = serde_json::from_slice(&bytes).unwrap();
+            assert!(
+                decoded.verify_signature(&public).unwrap(),
+                "{}: outer",
+                mask.mask_id
+            );
+            if let Some(reverse) = decoded.reverse_profile.as_ref() {
+                assert!(
+                    reverse.verify_signature(&public).unwrap(),
+                    "{}: reverse",
+                    mask.mask_id
+                );
+                let mut changed = decoded.clone();
+                changed.reverse_profile.as_mut().unwrap().version += 1;
+                assert!(!changed.verify_signature(&public).unwrap());
+                assert!(!changed
+                    .reverse_profile
+                    .unwrap()
+                    .verify_signature(&public)
+                    .unwrap());
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod signed_candidate_rotation_tests {
+    use super::*;
+
+    #[test]
+    fn failures_cycle_trusted_epochs_and_slots_without_exhausting_the_catalog() {
+        use ed25519_dalek::Signer;
+        let now = current_unix_secs();
+        let key = ed25519_dalek::SigningKey::from_bytes(&[91; 32]);
+        let make = |id: &str, created_at| {
+            let mut descriptor = BootstrapDescriptor {
+                descriptor_id: id.into(),
+                version: 1,
+                created_at,
+                expires_at: now + 3600,
+                base_mask_ids: vec!["webrtc_zoom_v3".into()],
+                embedded_masks: Vec::new(),
+                candidate_count: 2,
+                kdf_salt: [7; 32],
+                signature: [0; 64],
+            };
+            descriptor.signature = key.sign(&descriptor.signing_bytes()).to_bytes();
+            assert!(descriptor
+                .verify_signature(&key.verifying_key().to_bytes())
+                .unwrap());
+            descriptor
+        };
+        let descriptors = [make("new", now - 1), make("old", now - 2)];
+        let psk = [9; 32];
+        let chosen: Vec<_> = (0..5)
+            .map(|round| {
+                bootstrap_candidate_for_attempt(
+                    &descriptors,
+                    Some(&psk),
+                    round * HANDSHAKE_FALLBACK_THRESHOLD,
+                )
+                .unwrap()
+                .mask_id
+            })
+            .collect();
+        assert!(chosen[0].starts_with("bootstrap:new:"));
+        assert!(chosen[1].starts_with("bootstrap:old:"));
+        assert_ne!(chosen[0], chosen[2]);
+        assert_eq!(chosen[0], chosen[4]);
+        assert!(bootstrap_candidate_for_attempt(&descriptors, Some(&psk), 10000).is_some());
+        let mut expired = descriptors[0].clone();
+        expired.expires_at = now - 1;
+        let valid = [expired, descriptors[1].clone()];
+        assert!(bootstrap_candidate_for_attempt(&valid, Some(&psk), 0)
+            .unwrap()
+            .mask_id
+            .starts_with("bootstrap:old:"));
     }
 }

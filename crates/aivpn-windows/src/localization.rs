@@ -85,7 +85,9 @@ impl AppSettings {
                     // KeyStorage::load()'s handling of legacy plaintext keys below).
                     let mut needs_save = false;
                     if !s.bootstrap_telegram_token.is_empty() {
-                        match crate::key_storage::unprotect_key(&s.bootstrap_telegram_token) {
+                        match crate::key_storage::unprotect_bootstrap_token(
+                            &s.bootstrap_telegram_token,
+                        ) {
                             Ok(decrypted) => {
                                 if decrypted == s.bootstrap_telegram_token {
                                     // Didn't change → base64 decode failed → legacy
@@ -108,7 +110,9 @@ impl AppSettings {
                         }
                     }
                     if needs_save {
-                        s.save();
+                        if let Err(error) = s.save() {
+                            crate::vpn_manager::gui_log(&error);
+                        }
                     }
                     return s;
                 }
@@ -147,75 +151,30 @@ impl AppSettings {
         }
     }
 
-    pub fn save(&self) {
+    pub fn save(&self) -> Result<(), String> {
         let path = settings_path();
-        if let Some(p) = path.parent() {
-            let _ = std::fs::create_dir_all(p);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         }
-        // Encrypt the Telegram bootstrap token before it touches disk — build a
-        // disk-only copy rather than mutating `self`, so the in-memory value the
-        // rest of the app uses (e.g. passed to aivpn-client.exe via env var)
-        // stays plaintext. Best-effort: if DPAPI is ever unavailable, fall back
-        // to writing it in plaintext (this field's pre-existing behavior) rather
-        // than losing every other setting sharing this file.
         let mut on_disk = self.clone();
         if !on_disk.bootstrap_telegram_token.is_empty() {
-            match crate::key_storage::protect_key(&on_disk.bootstrap_telegram_token) {
-                Ok(encrypted) => on_disk.bootstrap_telegram_token = encrypted,
-                Err(e) => {
-                    crate::vpn_manager::gui_log(&format!(
-                        "aivpn: bootstrap_telegram_token DPAPI encryption failed, saving plaintext: {e}"
-                    ));
-                }
-            }
+            on_disk.bootstrap_telegram_token = crate::key_storage::protect_key(
+                &on_disk.bootstrap_telegram_token,
+            )
+            .map_err(|e| format!("Cannot encrypt bootstrap token; settings were not saved: {e}"))?;
         }
-        let Ok(json) = serde_json::to_string_pretty(&on_disk) else {
-            return;
-        };
-        // Atomic write: write to .tmp then rename to prevent corrupt settings.json on crash
+        let json = serde_json::to_vec_pretty(&on_disk).map_err(|e| e.to_string())?;
         let tmp = path.with_extension("json.tmp");
-        if std::fs::write(&tmp, &json).is_ok() {
-            if let Err(e) = std::fs::rename(&tmp, &path) {
-                crate::vpn_manager::gui_log(&format!(
-                    "AppSettings::save rename {tmp:?} → {path:?}: {e}"
-                ));
-                let _ = std::fs::remove_file(&tmp);
-            }
+        std::fs::write(&tmp, json).map_err(|e| e.to_string())?;
+        if let Err(error) = std::fs::rename(&tmp, &path) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(format!("Cannot save settings: {error}"));
         }
+        Ok(())
     }
-}
-
-/// Load theme preference (defaults to dark).
-pub fn load_theme() -> bool {
-    AppSettings::load().dark_mode
-}
-
-/// Persist theme preference alongside language setting.
-pub fn save_theme(dark: bool) {
-    let mut s = AppSettings::load();
-    s.dark_mode = dark;
-    s.save();
 }
 
 impl Lang {
-    pub fn load() -> Self {
-        AppSettings::load().lang
-    }
-
-    pub fn save(&self) {
-        let mut s = AppSettings::load();
-        s.lang = *self;
-        s.save();
-    }
-
-    pub fn toggle(&mut self) {
-        *self = match self {
-            Lang::En => Lang::Ru,
-            Lang::Ru => Lang::En,
-        };
-        self.save();
-    }
-
     pub fn label(&self) -> &'static str {
         match self {
             Lang::En => "EN",
@@ -543,6 +502,10 @@ pub fn t(lang: Lang, key: &str) -> &'static str {
         (Lang::Ru, "admin_pool_revoked") => "отозван",
         (Lang::En, "admin_pool_last_seen") => "Last seen",
         (Lang::Ru, "admin_pool_last_seen") => "Последний раз в сети",
+        (Lang::En, "admin_device_bound") => "Device binding enabled",
+        (Lang::Ru, "admin_device_bound") => "Включена привязка к устройству",
+        (Lang::En, "admin_pool_diverged") => "Pool databases have diverged",
+        (Lang::Ru, "admin_pool_diverged") => "Базы узлов пула различаются",
         (Lang::En, "admin_pool_partition_conflict") => {
             "⚠ Partition conflict: a peer claims the same VPN-IP partition as this node"
         }

@@ -74,7 +74,7 @@ struct AuditLogView: View {
                                 Spacer()
                             }
                             if !verified, let brokenAt {
-                                Text("\(loc.t("audit_broken_at")) \(brokenAt)")
+                                Text("\(loc.t("audit_broken_at")) \(entries.count - brokenAt)")
                                     .font(.caption2)
                                     .foregroundColor(.red)
                             }
@@ -84,8 +84,9 @@ struct AuditLogView: View {
                         // `broken_at`'s index convention above), so this
                         // reverses only for display.
                         Section {
-                            ForEach(entries.reversed()) { entry in
+                            ForEach(Array(entries.reversed().enumerated()), id: \.element.id) { index, entry in
                                 AuditEntryRow(entry: entry, loc: loc)
+                                    .listRowBackground(!verified && brokenAt == entries.count - 1 - index ? Color.red.opacity(0.12) : Color.clear)
                             }
                         }
                     }

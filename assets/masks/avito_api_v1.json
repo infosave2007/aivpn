@@ -1,6 +1,6 @@
 {
   "mask_id": "avito_api_v1",
-  "version": 1,
+  "version": 2,
   "created_at": 0,
   "expires_at": 18446744073709551615,
   "spoof_protocol": "QUIC",
@@ -335,6 +335,6 @@
     ]
   },
   "perturbation_bounds": null,
-  "tag_offset": 65535,
+  "tag_offset": 6,
   "generated": false
 }

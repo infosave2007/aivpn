@@ -99,7 +99,7 @@ export async function runMigrations(): Promise<void> {
       try { sqlite.exec(`ALTER TABLE users ADD COLUMN ${col}`) } catch { /* already exists */ }
     }
     // Refresh-rotation grace columns (cross-tab refresh race, routes/auth.ts)
-    for (const col of ['prev_token_hash TEXT', 'prev_expires_at INTEGER']) {
+    for (const col of ['prev_token_hash TEXT', 'prev_expires_at INTEGER', 'session_version INTEGER NOT NULL DEFAULT 0']) {
       try { sqlite.exec(`ALTER TABLE sessions ADD COLUMN ${col}`) } catch { /* already exists */ }
     }
     try {
@@ -180,6 +180,8 @@ export async function runMigrations(): Promise<void> {
 
       -- 0003: TOTP replay protection — last accepted RFC 6238 time step
       ALTER TABLE users ADD COLUMN IF NOT EXISTS totp_last_step INTEGER;
+
+      ALTER TABLE sessions ADD COLUMN IF NOT EXISTS session_version INTEGER NOT NULL DEFAULT 0;
     `)
   } finally {
     await migrationClient.end()

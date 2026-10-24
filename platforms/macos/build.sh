@@ -18,6 +18,7 @@ APP_VERSION="$(awk -F'"' '/^\[workspace.package\]/{flag=1; next} flag && /^versi
 APP_BUILD_NUMBER="${AIVPN_BUILD_NUMBER:-$(echo "$APP_VERSION" | awk -F. '{ printf "%d%02d%02d", $1, $2, $3 }')}"
 
 SWIFT_SOURCES=(
+    "$SCRIPT_DIR/ClientBinaryPolicy.swift"
     "$SCRIPT_DIR/AivpnApp.swift"
     "$SCRIPT_DIR/ContentView.swift"
     "$SCRIPT_DIR/VPNManager.swift"
@@ -26,6 +27,7 @@ SWIFT_SOURCES=(
     "$SCRIPT_DIR/ConnectionKey.swift"
     "$SCRIPT_DIR/LaunchAgentManager.swift"
     "$SCRIPT_DIR/AdminApi.swift"
+    "$SCRIPT_DIR/LocalAdminIPC.swift"
     "$SCRIPT_DIR/AdminView.swift"
     "$SCRIPT_DIR/PoolView.swift"
     "$SCRIPT_DIR/AuditLogView.swift"
@@ -35,6 +37,8 @@ SWIFT_SOURCES=(
 )
 
 HELPER_SOURCES=(
+    "$SCRIPT_DIR/LocalAdminIPC.swift"
+    "$SCRIPT_DIR/ClientBinaryPolicy.swift"
     "$SCRIPT_DIR/aivpn-helper/main.swift"
 )
 

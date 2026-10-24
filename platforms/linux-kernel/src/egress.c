@@ -213,11 +213,30 @@ static unsigned int aivpn_egress_hook(void *priv, struct sk_buff *skb,
 		return NF_ACCEPT; /* not a kernel-known client — user-space path */
 	}
 
-	/* Claim a reserved downlink slot. -EAGAIN => block exhausted, fall back. */
-	ret = aivpn_session_dl_reserve(s, &r);
+	/* Префикс IP до резерва слота: checksum и skb еще не трогаем.
+	 * -EAGAIN оставляет пакет userspace. -EPERM это отказ политики, без fallback. */
+	{
+		u8 iphdr_buf[40];
+		unsigned int hdr_n = skb->len < sizeof(iphdr_buf) ? skb->len
+								  : sizeof(iphdr_buf);
+
+		if (skb_copy_bits(skb, 0, iphdr_buf, hdr_n) < 0) {
+			rcu_read_unlock();
+			aivpn_stat_inc(AIVPN_STAT_POLICY_FALLBACK);
+			return NF_ACCEPT;
+		}
+		ret = aivpn_session_dl_reserve(s, iphdr_buf, hdr_n, skb->len, &r);
+	}
+	if (ret == -EAGAIN) {
+		rcu_read_unlock();
+		aivpn_stat_inc(AIVPN_STAT_POLICY_FALLBACK);
+		return NF_ACCEPT;
+	}
 	if (ret) {
 		rcu_read_unlock();
-		return NF_ACCEPT;
+		aivpn_stat_inc(AIVPN_STAT_POLICY_DROP);
+		kfree_skb(skb);
+		return NF_STOLEN;
 	}
 
 	/* From here the slot is committed. Any failure drops this packet (a

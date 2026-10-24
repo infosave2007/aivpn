@@ -6,7 +6,6 @@ aivpn-y    := src/session_table.o \
                src/tun_inject.o   \
                src/egress.o       \
                src/stats.o        \
-               src/dev.o          \
                src/main.o
 
 ccflags-y  := -I$(src)/include

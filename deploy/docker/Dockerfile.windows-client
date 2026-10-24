@@ -31,6 +31,7 @@ ENV CXX_x86_64_pc_windows_gnu=x86_64-w64-mingw32-g++
 # per-crate list: cargo needs every member listed in Cargo.toml to be present.
 COPY Cargo.toml Cargo.lock ./
 COPY crates crates/
+COPY vendor vendor/
 COPY assets/masks assets/masks/
 
 # Build Windows client in release mode (GNU ABI)

@@ -40,29 +40,23 @@ class KeychainHelper {
         return .failure(status)
     }
 
-    /// Writes (delete + add) one Keychain item. Returns false when the item
-    /// was NOT written — encoding failed, or SecItemAdd was refused (e.g.
-    /// errSecAuthFailed / errSecInteractionNotAllowed while the machine is
-    /// locked or after an ad-hoc re-sign changed our code identity).
-    ///
-    /// The result MUST NOT be ignored by slot-indexed callers (`ck_0`,
-    /// `ck_1`, …): the delete above has already happened by then, so a
-    /// discarded failure leaves a HOLE in the slot sequence, and
-    /// `loadKeys()` treats the first missing slot as end-of-list — every
-    /// key after it disappears from the app for good. See
-    /// `KeychainStorage.saveKeys()`, which aborts the whole sequence on a
-    /// false return instead of writing past the hole.
+    /// Обновляет существующий элемент без предварительного удаления.
     @discardableResult
     func save(key: String, value: String) -> Bool {
         guard let data = value.data(using: .utf8) else { return false }
 
-        // Delete existing
-        let deleteQuery: [String: Any] = [
+        let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrAccount as String: key,
             kSecAttrService as String: "com.aivpn.client"
         ]
-        SecItemDelete(deleteQuery as CFDictionary)
+        let updated = SecItemUpdate(query as CFDictionary,
+            [kSecValueData as String: data] as CFDictionary)
+        if updated == errSecSuccess { return true }
+        guard updated == errSecItemNotFound else {
+            NSLog("AIVPN: Keychain update failed (OSStatus %d)", updated)
+            return false
+        }
 
         // Add new
         let addQuery: [String: Any] = [

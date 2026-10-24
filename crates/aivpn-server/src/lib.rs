@@ -22,6 +22,7 @@ pub mod node_registry;
 pub mod pending_config;
 pub mod server;
 pub mod session;
+mod udp_source;
 
 #[cfg(all(feature = "management-api", unix))]
 pub mod management_api;
@@ -35,6 +36,9 @@ pub mod key_rotation;
 pub mod mask_feedback;
 pub mod metrics;
 pub mod neural;
+pub mod neural_corpus;
+pub mod neural_models;
+pub mod neural_training;
 pub mod passive_distribution;
 
 // Auto Mask Recording modules
@@ -55,7 +59,6 @@ pub mod qos;
 pub mod tc_loader;
 
 // 0.9.0 modules
-pub mod chain_forwarder;
 #[cfg(feature = "dns")]
 pub mod dns_proxy;
 pub mod mtls;
@@ -84,3 +87,5 @@ pub use passive_distribution::{PassiveDistributionConfig, PassiveMaskReceiver};
 // Auto Mask Recording exports
 pub use mask_store::MaskStore;
 pub use recording::RecordingManager;
+#[cfg(test)]
+mod test_masks;

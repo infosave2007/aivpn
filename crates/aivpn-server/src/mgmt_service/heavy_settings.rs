@@ -233,7 +233,11 @@ pub fn apply_heavy(
         }
     };
 
-    let prior = std::fs::read(&resolved.target_path).ok();
+    let prior = match std::fs::read(&resolved.target_path) {
+        Ok(bytes) => Some(bytes),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(MgmtError::Internal(format!("read prior config: {error}"))),
+    };
 
     if let Some(parent) = resolved.target_path.parent() {
         if let Err(e) = std::fs::create_dir_all(parent) {
@@ -251,10 +255,9 @@ pub fn apply_heavy(
     // share one `<file>.tmp` — interleaved write/rename of a shared name
     // can rename the OTHER writer's half-written content into place.
     // Mirrors `backup.rs`'s randomized temp-file pattern.
-    let tmp = resolved
-        .target_path
-        .with_extension(format!("tmp.{}", generate_token()));
-    if let Err(e) = std::fs::write(&tmp, &resolved.new_content) {
+    if let Err(e) =
+        crate::client_db::write_bytes_atomic(&resolved.target_path, &resolved.new_content)
+    {
         audit(
             ctx,
             "ConfigApply",
@@ -263,31 +266,6 @@ pub fn apply_heavy(
         );
         return Err(MgmtError::Internal(format!("write failed: {}", e)));
     }
-    // The ExitNode heavy setting targets `server.json`, which can hold
-    // plaintext secrets (bootstrap_publish tokens). std::fs::write() creates
-    // the temp file with the process umask (commonly 0644 under root), so
-    // the rename would silently DOWNGRADE an operator-set 0600 on the live
-    // file. Harden the temp file BEFORE the rename — same pattern as
-    // `ClientDatabase::save` / `backup::import_server`.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if let Err(e) = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600)) {
-            tracing::warn!("Failed to set pending config permissions to 0600: {}", e);
-        }
-    }
-    if let Err(e) = std::fs::rename(&tmp, &resolved.target_path) {
-        // Best-effort: don't leave the orphaned temp file behind.
-        let _ = std::fs::remove_file(&tmp);
-        audit(
-            ctx,
-            "ConfigApply",
-            &resolved.descriptor,
-            &format!("failed: rename: {}", e),
-        );
-        return Err(MgmtError::Internal(format!("rename failed: {}", e)));
-    }
-
     let token = generate_token();
     manager.begin_locked(
         PendingConfig::begin(

@@ -5,6 +5,7 @@ use super::*;
 
 #[derive(Debug, Clone)]
 pub enum Message {
+    SessionReply(u64, Box<Message>),
     /// Extra settings section (see `aivpn_common::ui_ext`): open/close the
     /// panel, edit one field, apply. The GUI treats these generically — it
     /// never learns what a field means.
@@ -90,7 +91,7 @@ pub enum Message {
     /// `Custom` is a no-op (see `ExitNodeSelection`).
     AdminNewExitNodePicked(ExitNodeChoice),
     AdminAddClient,
-    AdminAddClientResult(Result<ClientRecord, String>),
+    AdminAddClientResult(Result<admin::CreatedClient, String>),
     AdminToggleEnabled(String, bool),
     AdminToggleEnabledResult(Result<ClientRecord, String>),
     AdminStartEdit(String),
@@ -178,4 +179,30 @@ pub enum Message {
     InstallImportProfile,
     // Misc
     Noop,
+}
+
+impl Message {
+    pub(super) fn belongs_to_session(&self) -> bool {
+        matches!(
+            self,
+            Self::AdminRoleLoaded(_)
+                | Self::AdminClientsLoaded(_)
+                | Self::AdminAddClientResult(_)
+                | Self::AdminToggleEnabledResult(_)
+                | Self::AdminEditResult(_)
+                | Self::AdminResetDeviceResult(..)
+                | Self::AdminRevokeResult(..)
+                | Self::AdminKeyLoaded(..)
+                | Self::AdminQrLoaded(..)
+                | Self::PoolNodesLoaded(_)
+                | Self::PoolHealthLoaded(_)
+                | Self::AuditLogLoaded(_)
+                | Self::ServerSettingsApplyResult(..)
+                | Self::ServerSettingsConfirmResult(_)
+                | Self::DiagnosticsResult(_)
+                | Self::RecordingPoll(_)
+                | Self::AdminSaveKeyPathChosen(_)
+                | Self::AdminSaveQrPathChosen(_)
+        )
+    }
 }

@@ -38,7 +38,7 @@
       if (res.totp_required) {
         requiresTotp = true;
       } else if (res.access_token) {
-        authStore.setToken(res.access_token);
+        authStore.startSession(res.access_token);
         const user = await auth.me();
         authStore.setUser(user);
         goto('/dashboard');
@@ -55,7 +55,7 @@
     error = '';
     try {
       const res = await auth.loginTotp(username, password, totpCode);
-      authStore.setToken(res.access_token);
+      authStore.startSession(res.access_token);
       const user = await auth.me();
       authStore.setUser(user);
       goto('/dashboard');
@@ -73,7 +73,7 @@
       const options = await auth.passkeyAuthOptions();
       const credential = await startAuthentication({ optionsJSON: options as Parameters<typeof startAuthentication>[0]['optionsJSON'] });
       const res = await auth.passkeyAuthenticate(credential);
-      authStore.setToken(res.access_token);
+      authStore.startSession(res.access_token);
       const user = await auth.me();
       authStore.setUser(user);
       goto('/dashboard');

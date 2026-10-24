@@ -1,12 +1,7 @@
 //! Platform seam for the shared mobile tunnel run loop.
 //!
-//! `run_tunnel_generic` is identical on iOS and Android except for three
-//! things, all captured by [`PlatformIo`]: socket protection (Android must
-//! call `VpnService.protect(int)` through JNI; the iOS NEPacketTunnelProvider
-//! process is automatically outside the VPN), the tunnel-ready notification
-//! (JNI `onTunnelReady` vs. a C callback), and how recording feedback is
-//! published to the app (a take-once JSON static read by JNI vs. a static
-//! plus sequence counter polled from Swift).
+//! [`PlatformIo`] задает разрешение DNS через физическую сеть, защиту сокета,
+//! уведомление о готовности туннеля и передачу результатов записи приложению.
 
 use std::os::unix::io::RawFd;
 
@@ -20,6 +15,17 @@ use crate::error::Result;
 // force iOS to promise its raw Swift context pointer is safe to alias across
 // threads, which nothing synchronises.
 pub trait PlatformIo: Send + 'static {
+    /// Разрешает адрес сервера через сеть, доступную до подключения туннеля.
+    fn resolve_host(
+        &self,
+        host: String,
+        port: u16,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Vec<std::net::SocketAddr>>> + Send>,
+    > {
+        Box::pin(async move { Ok(tokio::net::lookup_host((host, port)).await?.collect()) })
+    }
+
     /// Exempt the freshly created UDP socket from the VPN so its own packets
     /// are not routed back into the tunnel. Android calls
     /// `VpnService.protect(int)`; iOS needs nothing (default impl).

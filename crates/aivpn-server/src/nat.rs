@@ -14,12 +14,8 @@ use tracing::{debug, info};
 use aivpn_common::error::{Error, Result};
 use aivpn_common::network_config::VpnNetworkConfig;
 
-/// Default server TUN MTU.  Aligned with DEFAULT_VPN_MTU (1346) so the server→client
-/// outer UDP datagram stays ≤ 1424 bytes on the wire (inner 1346 + ~50 aivpn overhead
-/// + 28 outer IP/UDP).  This safely clears LTE/GTP-U paths (≈1464 effective MTU) and
-/// CGNAT carriers such as Megafon/MTS.  Higher values like 1420 produce ≥1498-byte
-/// datagrams that fragment on cellular paths — CGNAT drops fragments → RX=0.
-pub const DEFAULT_TUN_MTU: u16 = 1346;
+/// Общий MTU оставляет место для DATA и FEC во всех встроенных масках.
+pub const DEFAULT_TUN_MTU: u16 = aivpn_common::network_config::DEFAULT_VPN_MTU;
 
 // ── Firewall backend ───────────────────────────────────────────────────────
 
@@ -80,27 +76,27 @@ fn iptables_forward_compat_chain() -> Option<&'static str> {
 
 /// Add an iptables rule only if an identical rule does not already exist.
 #[cfg(target_os = "linux")]
-fn ipt_ensure(table: &str, chain: &str, rule: &[&str]) {
+fn ipt_ensure(table: &str, chain: &str, rule: &[&str]) -> Result<()> {
     use std::process::Command;
     let mut check: Vec<&str> = vec!["-t", table, "-C", chain];
     check.extend_from_slice(rule);
     let exists = Command::new("iptables")
         .args(&check)
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
+        .output()?
+        .status
+        .success();
     if !exists {
         let mut add: Vec<&str> = vec!["-t", table, "-A", chain];
         add.extend_from_slice(rule);
-        if let Ok(out) = Command::new("iptables").args(&add).output() {
-            if !out.status.success() {
-                warn!(
-                    "iptables add failed: {}",
-                    String::from_utf8_lossy(&out.stderr)
-                );
-            }
+        let output = Command::new("iptables").args(&add).output()?;
+        if !output.status.success() {
+            return Err(Error::Io(io::Error::other(format!(
+                "iptables: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ))));
         }
     }
+    Ok(())
 }
 
 /// Delete an iptables rule (best-effort; silently ignores "not found").
@@ -160,10 +156,22 @@ pub fn setup_nat66(tun_name: &str, prefix: &str) -> std::result::Result<(), Stri
     use std::io::Write as _;
     use std::process::{Command, Stdio};
 
-    // Enable IPv6 forwarding (idempotent).
+    NatForwarder::validate_tun_name(tun_name).map_err(|e| e.to_string())?;
+    let (address, length) = prefix.split_once('/').ok_or("invalid IPv6 prefix")?;
+    let address: std::net::Ipv6Addr = address.parse().map_err(|_| "invalid IPv6 address")?;
+    let length: u8 = length.parse().map_err(|_| "invalid IPv6 prefix length")?;
+    if !(1..=96).contains(&length) {
+        return Err("invalid IPv6 prefix length".into());
+    }
+    let prefix = format!("{address}/{length}");
+    let prefix = prefix.as_str();
+
+    // Ошибка настройки forwarding должна остановить запуск IPv6.
+
     let fwd = std::fs::read_to_string("/proc/sys/net/ipv6/conf/all/forwarding").unwrap_or_default();
     if fwd.trim() != "1" {
-        let _ = std::fs::write("/proc/sys/net/ipv6/conf/all/forwarding", "1");
+        std::fs::write("/proc/sys/net/ipv6/conf/all/forwarding", "1")
+            .map_err(|e| format!("enable IPv6 forwarding: {e}"))?;
     }
 
     let use_nft = Command::new("nft")
@@ -200,12 +208,19 @@ pub fn setup_nat66(tun_name: &str, prefix: &str) -> std::result::Result<(), Stri
             .spawn()
             .map_err(|e| format!("nft spawn (nat66): {e}"))?;
 
-        if let Some(stdin) = child.stdin.as_mut() {
-            let _ = stdin.write_all(ruleset.as_bytes());
-        }
+        let written = child
+            .stdin
+            .take()
+            .ok_or_else(|| "nft stdin недоступен".to_string())
+            .and_then(|mut stdin| {
+                stdin
+                    .write_all(ruleset.as_bytes())
+                    .map_err(|error| format!("write NAT66 rules: {error}"))
+            });
         let out = child
             .wait_with_output()
             .map_err(|e| format!("nft wait (nat66): {e}"))?;
+        written?;
         if !out.status.success() {
             return Err(format!(
                 "nftables nat66 setup failed: {}",
@@ -229,7 +244,7 @@ pub fn setup_nat66(tun_name: &str, prefix: &str) -> std::result::Result<(), Stri
                 "-j",
                 "MASQUERADE",
             ],
-        );
+        )?;
         ip6t_ensure(
             "filter",
             "FORWARD",
@@ -243,7 +258,7 @@ pub fn setup_nat66(tun_name: &str, prefix: &str) -> std::result::Result<(), Stri
                 "-j",
                 "ACCEPT",
             ],
-        );
+        )?;
         ip6t_ensure(
             "filter",
             "FORWARD",
@@ -261,7 +276,7 @@ pub fn setup_nat66(tun_name: &str, prefix: &str) -> std::result::Result<(), Stri
                 "-j",
                 "ACCEPT",
             ],
-        );
+        )?;
         info!("ip6tables: aivpn NAT66 + forward rules installed");
     }
 
@@ -350,27 +365,29 @@ pub fn teardown_nat66(_tun_name: &str, _prefix: &str) -> std::result::Result<(),
 
 /// Add an ip6tables rule only if an identical rule does not already exist.
 #[cfg(target_os = "linux")]
-fn ip6t_ensure(table: &str, chain: &str, rule: &[&str]) {
+fn ip6t_ensure(table: &str, chain: &str, rule: &[&str]) -> std::result::Result<(), String> {
     use std::process::Command;
-    let mut check: Vec<&str> = vec!["-t", table, "-C", chain];
+    let mut check = vec!["-t", table, "-C", chain];
     check.extend_from_slice(rule);
-    let exists = Command::new("ip6tables")
+    let output = Command::new("ip6tables")
         .args(&check)
         .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
-    if !exists {
-        let mut add: Vec<&str> = vec!["-t", table, "-A", chain];
+        .map_err(|e| format!("ip6tables check: {e}"))?;
+    if !output.status.success() {
+        let mut add = vec!["-t", table, "-A", chain];
         add.extend_from_slice(rule);
-        if let Ok(out) = Command::new("ip6tables").args(&add).output() {
-            if !out.status.success() {
-                warn!(
-                    "ip6tables add failed: {}",
-                    String::from_utf8_lossy(&out.stderr)
-                );
-            }
+        let output = Command::new("ip6tables")
+            .args(&add)
+            .output()
+            .map_err(|e| format!("ip6tables add: {e}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "ip6tables add failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ));
         }
     }
+    Ok(())
 }
 
 /// Delete an ip6tables rule (best-effort; silently ignores "not found").
@@ -409,7 +426,7 @@ impl NatForwarder {
             tun_name: tun_name.to_string(),
             tun_addr: tun_addr.to_string(),
             tun_netmask: tun_netmask.to_string(),
-            tun_mtu,
+            tun_mtu: tun_mtu.min(aivpn_common::network_config::MAX_MASK_TUN_MTU),
             network_config,
             writer_taken: None,
             reader: None,
@@ -438,11 +455,11 @@ impl NatForwarder {
         });
 
         let dev = tun::create_as_async(&config)
-            .map_err(|e| Error::Io(io::Error::new(io::ErrorKind::Other, e.to_string())))?;
+            .map_err(|e| Error::Io(io::Error::other(e.to_string())))?;
 
         let (writer, reader) = dev
             .split()
-            .map_err(|e| Error::Io(io::Error::new(io::ErrorKind::Other, e.to_string())))?;
+            .map_err(|e| Error::Io(io::Error::other(e.to_string())))?;
         self.writer_taken = Some(Mutex::new(Some(writer)));
         self.reader = Some(Mutex::new(Some(reader)));
 
@@ -464,11 +481,12 @@ impl NatForwarder {
                 FwBackend::Nftables => {
                     match self.setup_nftables() {
                         Ok(()) => {
+                            self.fw_backend = Some(FwBackend::Nftables);
                             // See `iptables_forward_compat_chain`: on a host where Docker
                             // set `-P FORWARD DROP`, nft accepts alone are not enough.
                             if let Some(chain) = iptables_forward_compat_chain() {
                                 let tun = self.tun_name.clone();
-                                ipt_ensure("filter", chain, &["-i", &tun, "-j", "ACCEPT"]);
+                                ipt_ensure("filter", chain, &["-i", &tun, "-j", "ACCEPT"])?;
                                 ipt_ensure(
                                     "filter",
                                     chain,
@@ -482,7 +500,7 @@ impl NatForwarder {
                                         "-j",
                                         "ACCEPT",
                                     ],
-                                );
+                                )?;
                                 info!(
                                     "iptables: FORWARD policy is DROP — added {chain} accepts for {tun} \
                                      so nftables-forwarded client traffic is not dropped by the legacy hook"
@@ -500,9 +518,9 @@ impl NatForwarder {
                             // partial `aivpn` table behind for the iptables path to
                             // conflict with.
                             warn!("nftables setup failed ({}) — falling back to iptables", e);
+                            self.fw_backend = Some(FwBackend::Iptables);
                             self.setup_iptables().map_err(|ipt_e| {
-                                Error::Io(io::Error::new(
-                                    io::ErrorKind::Other,
+                                Error::Io(io::Error::other(
                                     format!(
                                         "firewall setup failed on both backends: nftables: {}; iptables: {}",
                                         e, ipt_e
@@ -514,6 +532,7 @@ impl NatForwarder {
                     }
                 }
                 FwBackend::Iptables => {
+                    self.fw_backend = Some(FwBackend::Iptables);
                     self.setup_iptables()?;
                     self.fw_backend = Some(FwBackend::Iptables);
                 }
@@ -546,7 +565,7 @@ impl NatForwarder {
 
     /// Validate that tun_name is safe to interpolate into nftables/iptables
     /// format strings (H-S-3). Accepts names matching ^[a-z][a-z0-9_-]{0,14}$.
-    fn validate_tun_name(name: &str) -> Result<()> {
+    pub(crate) fn validate_tun_name(name: &str) -> Result<()> {
         let ok = !name.is_empty()
             && name.len() <= 15
             && name.starts_with(|c: char| c.is_ascii_lowercase())
@@ -606,23 +625,15 @@ impl NatForwarder {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .map_err(|e| {
-                Error::Io(io::Error::new(
-                    io::ErrorKind::Other,
-                    format!("nft spawn: {e}"),
-                ))
-            })?;
+            .map_err(|e| Error::Io(io::Error::other(format!("nft spawn: {e}"))))?;
 
         if let Some(stdin) = child.stdin.as_mut() {
             let _ = stdin.write_all(ruleset.as_bytes());
         }
 
-        let out = child.wait_with_output().map_err(|e| {
-            Error::Io(io::Error::new(
-                io::ErrorKind::Other,
-                format!("nft wait: {e}"),
-            ))
-        })?;
+        let out = child
+            .wait_with_output()
+            .map_err(|e| Error::Io(io::Error::other(format!("nft wait: {e}"))))?;
 
         if out.status.success() {
             info!("nftables: aivpn table installed (NAT + forward + MSS clamp)");
@@ -635,23 +646,20 @@ impl NatForwarder {
             // mirroring setup_nat66, which already fails hard here.
             let stderr = String::from_utf8_lossy(&out.stderr);
             let stdout = String::from_utf8_lossy(&out.stdout);
-            Err(Error::Io(io::Error::new(
-                io::ErrorKind::Other,
-                format!(
-                    "nftables setup failed (status: {}): {}{}",
-                    out.status,
-                    if stderr.trim().is_empty() {
-                        "<no stderr>"
-                    } else {
-                        stderr.trim()
-                    },
-                    if stdout.trim().is_empty() {
-                        String::new()
-                    } else {
-                        format!(" | stdout: {}", stdout.trim())
-                    }
-                ),
-            )))
+            Err(Error::Io(io::Error::other(format!(
+                "nftables setup failed (status: {}): {}{}",
+                out.status,
+                if stderr.trim().is_empty() {
+                    "<no stderr>"
+                } else {
+                    stderr.trim()
+                },
+                if stdout.trim().is_empty() {
+                    String::new()
+                } else {
+                    format!(" | stdout: {}", stdout.trim())
+                }
+            ))))
         }
     }
 
@@ -678,12 +686,12 @@ impl NatForwarder {
                 "-j",
                 "MASQUERADE",
             ],
-        );
+        )?;
         ipt_ensure(
             "filter",
             "FORWARD",
             &["-i", tun, "-m", "comment", "--comment", c, "-j", "ACCEPT"],
-        );
+        )?;
         ipt_ensure(
             "filter",
             "FORWARD",
@@ -701,7 +709,7 @@ impl NatForwarder {
                 "-j",
                 "ACCEPT",
             ],
-        );
+        )?;
         ipt_ensure(
             "mangle",
             "FORWARD",
@@ -721,7 +729,7 @@ impl NatForwarder {
                 "TCPMSS",
                 "--clamp-mss-to-pmtu",
             ],
-        );
+        )?;
         ipt_ensure(
             "mangle",
             "FORWARD",
@@ -741,7 +749,7 @@ impl NatForwarder {
                 "TCPMSS",
                 "--clamp-mss-to-pmtu",
             ],
-        );
+        )?;
 
         info!("iptables: aivpn NAT + forward + MSS clamp rules installed");
         Ok(())
@@ -919,6 +927,52 @@ impl Drop for NatForwarder {
                 }
                 None => {}
             }
+        }
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod firewall_tests {
+    use super::*;
+    #[test]
+    fn iptables_failures_propagate_without_touching_host_rules() {
+        const CHILD: &str = "AIVPN_IPTABLES_TEST_CHILD";
+        if let Ok(mode) = std::env::var(CHILD) {
+            let result = ipt_ensure("nat", "POSTROUTING", &["-j", "MASQUERADE"]);
+            assert_eq!(result.is_ok(), mode == "success");
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let binary = directory.path().join("iptables");
+        for mode in ["missing", "failed", "success"] {
+            if mode != "missing" {
+                std::fs::write(
+                    &binary,
+                    format!(
+                        "#!/bin/sh\n[ \\\"$3\\\" = -C ] && exit 1\nexit {}\n",
+                        if mode == "success" { 0 } else { 1 }
+                    )
+                    .replace("\\\"", "\""),
+                )
+                .unwrap();
+                std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+            }
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "nat::firewall_tests::iptables_failures_propagate_without_touching_host_rules",
+                    "--nocapture",
+                ])
+                .env("PATH", directory.path())
+                .env(CHILD, mode)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
         }
     }
 }

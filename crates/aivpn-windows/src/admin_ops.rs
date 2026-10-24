@@ -62,7 +62,7 @@ impl super::AivpnApp {
                         self.admin_add_busy = false;
                     }
                     match result {
-                        Ok(_) => {
+                        Ok((_, warning)) => {
                             if editing {
                                 self.admin_edit_id = None;
                                 self.admin_edit_error = None;
@@ -71,6 +71,9 @@ impl super::AivpnApp {
                                 self.admin_add_error = None;
                             }
                             self.refresh_admin_clients();
+                            if let Some(warning) = warning {
+                                self.show_error(warning);
+                            }
                         }
                         Err(e) => {
                             if editing {
@@ -79,13 +82,6 @@ impl super::AivpnApp {
                                 self.admin_add_error = Some(e);
                             }
                         }
-                    }
-                }
-                AdminResponse::ClientDeleted { id, result } => {
-                    self.admin_busy_ids.remove(&id);
-                    match result {
-                        Ok(()) => self.refresh_admin_clients(),
-                        Err(e) => self.show_error(e),
                     }
                 }
                 AdminResponse::ClientRevoked { id, result } => {
@@ -174,6 +170,13 @@ impl super::AivpnApp {
                     }
                 }
                 AdminResponse::ConfigApplied { setting, result } => {
+                    let result = result.and_then(|response| {
+                        if response.applied {
+                            Ok(response)
+                        } else {
+                            Err("Server did not apply the requested configuration".to_string())
+                        }
+                    });
                     match setting {
                         admin::ConfigSetting::ActiveMask => self.admin_settings_mask_busy = false,
                         admin::ConfigSetting::ExitNode => self.admin_settings_exit_busy = false,
@@ -622,6 +625,10 @@ impl super::AivpnApp {
     /// (and its cached role/clients/dialogs) belongs to that one session
     /// only, never carries over to the next connect.
     pub(crate) fn reset_admin_state(&mut self) {
+        // Ответы фоновых запросов завершенной сессии остаются в старом канале.
+        let (sender, receiver) = std::sync::mpsc::channel();
+        self.admin_tx = sender;
+        self.admin_rx = receiver;
         self.admin_role = None;
         self.admin_clients_loaded = false;
         self.admin_clients.clear();
@@ -670,6 +677,7 @@ impl super::AivpnApp {
         self.admin_settings_mask_confirm_busy = false;
         self.admin_settings_mask_rolled_back = false;
         self.admin_settings_exit_node.clear();
+        self.admin_settings_exit_selected = false;
         self.admin_settings_exit_custom_mode = false;
         self.admin_settings_exit_busy = false;
         self.admin_settings_exit_error = None;

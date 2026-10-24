@@ -4,7 +4,20 @@
 //! by sending appropriate ControlPayload messages to the server.
 
 use serde::{Deserialize, Serialize};
-use tracing::{info, warn};
+use std::net::{Ipv4Addr, SocketAddrV4};
+use tracing::info;
+
+pub const DEFAULT_ADMIN_ADDR: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 44301);
+
+pub fn parse_admin_addr(value: &str) -> Result<SocketAddrV4, String> {
+    let addr: SocketAddrV4 = value
+        .parse()
+        .map_err(|_| "Expected 127.0.0.1:port".to_string())?;
+    if *addr.ip() != Ipv4Addr::LOCALHOST || addr.port() == 0 {
+        return Err("Admin address must be 127.0.0.1 with a nonzero port".into());
+    }
+    Ok(addr)
+}
 
 /// Returns platform-appropriate paths for recording status files.
 pub fn recording_status_paths() -> Vec<std::path::PathBuf> {
@@ -59,7 +72,7 @@ fn admin_token_path() -> std::path::PathBuf {
                 .join("admin.token");
         }
         // Per-uid SUBDIRECTORY under /tmp, never a bare file in /tmp:
-        // ensure_admin_token() chmods the token's PARENT to 0700, so the parent
+        // bind_admin_at() chmods the token's PARENT to 0700, so the parent
         // must be our own `/tmp/aivpn-{uid}` dir. A bare `/tmp/aivpn-admin-{uid}.token`
         // makes the parent `/tmp` itself and flips /tmp to 0700, breaking the
         // whole system's temp dir (this process usually runs as root for TUN).
@@ -67,50 +80,83 @@ fn admin_token_path() -> std::path::PathBuf {
     }
 }
 
-/// Generate a fresh admin-socket auth token and persist it for this run.
-/// Called once by the daemon at startup; invalidates any token from a prior
-/// run (each connection gets its own).
-pub fn ensure_admin_token() -> String {
-    use rand::Rng;
-    let mut rng = rand::thread_rng();
-    const CHARSET: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-    let token: String = (0..32)
-        .map(|_| CHARSET[rng.gen_range(0..CHARSET.len())] as char)
-        .collect();
-
-    let path = admin_token_path();
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
-        }
+/// Основной экземпляр сохраняет пути GUI, остальные пишут в отдельные файлы.
+pub fn local_status_paths(addr: SocketAddrV4, name: &str) -> Vec<std::path::PathBuf> {
+    if addr != DEFAULT_ADMIN_ADDR {
+        return vec![admin_token_path_at(addr).with_extension(name)];
     }
-    // Best-effort unlink of any prior file (ours from a previous run, or an
-    // attacker's pre-created symlink/file) before creating fresh with O_EXCL
-    // so the permission window never opens and symlinks aren't followed.
-    let _ = std::fs::remove_file(&path);
+    recording_status_paths()
+        .into_iter()
+        .map(|path| {
+            let fallback = path
+                .file_name()
+                .is_some_and(|file| file.to_string_lossy().starts_with("aivpn-"));
+            path.with_file_name(if fallback {
+                format!("aivpn-{name}")
+            } else {
+                name.to_string()
+            })
+        })
+        .collect()
+}
+
+/// У каждого адреса свой токен. Основной адрес сохраняет путь для GUI.
+fn admin_token_path_at(addr: SocketAddrV4) -> std::path::PathBuf {
+    let path = admin_token_path();
+    if addr == DEFAULT_ADMIN_ADDR {
+        path
+    } else {
+        path.with_file_name(format!("admin-{}.token", addr.port()))
+    }
+}
+
+pub async fn bind_admin(
+    addr: SocketAddrV4,
+) -> std::io::Result<(tokio::net::UdpSocket, tokio::net::TcpListener, String)> {
+    parse_admin_addr(&addr.to_string())
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    let tcp = tokio::net::TcpListener::bind(addr).await?;
+    let (udp, token) = bind_admin_at(addr, &admin_token_path_at(addr)).await?;
+    Ok((udp, tcp, token))
+}
+
+async fn bind_admin_at(
+    addr: SocketAddrV4,
+    path: &std::path::Path,
+) -> std::io::Result<(tokio::net::UdpSocket, String)> {
+    // Сначала занимаем порт: конкурент не может затереть токен владельца.
+    let socket = tokio::net::UdpSocket::bind(addr).await?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| std::io::Error::other("Missing token directory"))?;
+    std::fs::create_dir_all(parent)?;
     #[cfg(unix)]
     {
-        use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&path)
-            .and_then(|mut f| f.write_all(token.as_bytes()))
-        {
-            Ok(()) => {}
-            Err(e) => warn!("Failed to write admin token to {}: {e}", path.display()),
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let metadata = std::fs::symlink_metadata(parent)?;
+        if !metadata.is_dir() || metadata.uid() != unsafe { libc::getuid() } {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "Unsafe admin token directory",
+            ));
         }
+        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
     }
-    #[cfg(not(unix))]
-    {
-        let _ = std::fs::write(&path, &token);
+    let token = format!(
+        "{:032x}{:032x}",
+        rand::random::<u128>(),
+        rand::random::<u128>()
+    );
+    if !crate::secure_write::write_status_best_effort(path, token.as_bytes()) {
+        return Err(std::io::Error::other("Cannot persist admin token"));
     }
-    token
+    Ok((socket, token))
+}
+
+pub fn read_admin_token_at(addr: SocketAddrV4) -> Option<String> {
+    std::fs::read_to_string(admin_token_path_at(addr))
+        .ok()
+        .map(|s| s.trim().to_string())
 }
 
 /// Read the admin-socket auth token written by the running daemon. Used by
@@ -163,6 +209,163 @@ impl Default for RecordingLocalStatus {
     }
 }
 
+/// Файлы записи принадлежат конкретному локальному admin-адресу.
+#[derive(Clone)]
+pub struct RecordingStatusStore {
+    paths: Vec<std::path::PathBuf>,
+}
+impl RecordingStatusStore {
+    pub fn for_endpoint(addr: SocketAddrV4) -> Self {
+        let paths = local_status_paths(addr, "recording.status");
+        Self { paths }
+    }
+    fn write_status(&self, status: &RecordingLocalStatus) {
+        if let Ok(json) = serde_json::to_vec(status) {
+            for path in &self.paths {
+                // Atomic temp+rename (not plain std::fs::write, which
+                // open+truncate+writes in place) so a CLI `record status` poll
+                // landing mid-write never sees a 0-byte/partial file — and
+                // O_NOFOLLOW/create_new-hardened, since this can fall back to a
+                // predictable world-writable /tmp path (see secure_write.rs).
+                crate::secure_write::write_status_best_effort(path, &json);
+            }
+        }
+    }
+    pub fn reset_local_status(&self) {
+        self.write_status(&RecordingLocalStatus::default());
+    }
+    pub fn read_local_status(&self) -> Option<RecordingLocalStatus> {
+        self.paths.iter().find_map(|path| {
+            let data = std::fs::read(path).ok()?;
+            serde_json::from_slice::<RecordingLocalStatus>(&data).ok()
+        })
+    }
+    pub fn handle_recording_status(&self, can_record: bool, active_service: Option<&str>) {
+        let message = if can_record {
+            if let Some(service) = active_service {
+                format!("Recording is active for '{}'", service)
+            } else {
+                "Recording is available for this key".to_string()
+            }
+        } else {
+            "This key is not allowed to record masks".to_string()
+        };
+        self.write_status(&RecordingLocalStatus {
+            can_record: Some(can_record),
+            state: if active_service.is_some() {
+                "recording".into()
+            } else {
+                "idle".into()
+            },
+            service: active_service.map(|value| value.to_string()),
+            message: Some(message),
+            mask_id: None,
+            confidence: None,
+            updated_at_ms: current_timestamp_ms(),
+        });
+    }
+    pub fn mark_recording_stop_requested(&self, service: Option<&str>) {
+        self.write_status(&RecordingLocalStatus {
+            can_record: Some(true),
+            state: "stopping".into(),
+            service: service.map(|value| value.to_string()),
+            message: Some("Recording stop requested".into()),
+            mask_id: None,
+            confidence: None,
+            updated_at_ms: current_timestamp_ms(),
+        });
+    }
+    pub fn handle_recording_ack(&self, session_id: &[u8; 16], status: &str) {
+        let sid_hex = session_id
+            .iter()
+            .take(4)
+            .map(|b| format!("{:02x}", b))
+            .collect::<String>();
+
+        match status {
+            "started" => {
+                info!("📹 Recording started (session: {}...)", sid_hex);
+                self.write_status(&RecordingLocalStatus {
+                    can_record: Some(true),
+                    state: "recording".into(),
+                    service: self.read_local_status().and_then(|status| status.service),
+                    message: Some("Recording started. Use the service normally.".into()),
+                    mask_id: None,
+                    confidence: None,
+                    updated_at_ms: current_timestamp_ms(),
+                });
+                println!("Recording started. Use the service normally.");
+                println!("No manual stop needed — recording will finish automatically.");
+                println!("It will analyze the capture once enough traffic is collected or the session goes idle.");
+            }
+            "analyzing" => {
+                info!("🔍 Recording finished, server analyzing...");
+                let service = self.read_local_status().and_then(|status| status.service);
+                self.write_status(&RecordingLocalStatus {
+                    can_record: Some(true),
+                    state: "analyzing".into(),
+                    service,
+                    message: Some("Recording finished. Server is analyzing traffic.".into()),
+                    mask_id: None,
+                    confidence: None,
+                    updated_at_ms: current_timestamp_ms(),
+                });
+                println!("Recording finished. Server is analyzing traffic...");
+            }
+            other => {
+                info!("Recording status: {}", other);
+                println!("Recording status: {}", other);
+            }
+        }
+    }
+    pub fn handle_recording_complete(&self, service: &str, mask_id: &str, confidence: f32) {
+        info!("✅ Mask generated for '{}'", service);
+        self.write_status(&RecordingLocalStatus {
+            can_record: Some(true),
+            state: "success".into(),
+            service: Some(service.to_string()),
+            message: Some("Mask generated and tested".into()),
+            mask_id: Some(mask_id.to_string()),
+            confidence: Some(confidence),
+            updated_at_ms: current_timestamp_ms(),
+        });
+        println!();
+        println!("✅ Mask generated and tested!");
+        println!();
+        println!("   Mask ID:     {}", mask_id);
+        println!("   Service:     {}", service);
+        println!("   Confidence:  {:.2}", confidence);
+        println!();
+        println!("   Broadcasting to all clients...");
+    }
+    pub fn handle_recording_failed(&self, reason: &str) {
+        info!("❌ Recording failed: {}", reason);
+        let can_record = if reason.to_lowercase().contains("recording-admin") {
+            Some(false)
+        } else {
+            self.read_local_status()
+                .and_then(|status| status.can_record)
+        };
+        self.write_status(&RecordingLocalStatus {
+            can_record,
+            state: "failed".into(),
+            service: self.read_local_status().and_then(|status| status.service),
+            message: Some(reason.to_string()),
+            mask_id: None,
+            confidence: None,
+            updated_at_ms: current_timestamp_ms(),
+        });
+        println!();
+        println!("❌ Recording failed!");
+        println!("   Reason: {}", reason);
+        println!();
+        println!("   Tips:");
+        println!("   - Use the service for at least 1 minute");
+        println!("   - Ensure active traffic (not idle)");
+        println!("   - Need at least 500 packets captured");
+    }
+}
+
 fn current_timestamp_ms() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
@@ -171,28 +374,12 @@ fn current_timestamp_ms() -> u64 {
         .unwrap_or(0)
 }
 
-fn write_status(status: &RecordingLocalStatus) {
-    if let Ok(json) = serde_json::to_vec(status) {
-        for path in recording_status_paths() {
-            // Atomic temp+rename (not plain std::fs::write, which
-            // open+truncate+writes in place) so a CLI `record status` poll
-            // landing mid-write never sees a 0-byte/partial file — and
-            // O_NOFOLLOW/create_new-hardened, since this can fall back to a
-            // predictable world-writable /tmp path (see secure_write.rs).
-            crate::secure_write::write_status_best_effort(&path, &json);
-        }
-    }
-}
-
 pub fn reset_local_status() {
-    write_status(&RecordingLocalStatus::default());
+    RecordingStatusStore::for_endpoint(DEFAULT_ADMIN_ADDR).reset_local_status()
 }
 
 pub fn read_local_status() -> Option<RecordingLocalStatus> {
-    recording_status_paths().iter().find_map(|path| {
-        let data = std::fs::read(path).ok()?;
-        serde_json::from_slice::<RecordingLocalStatus>(&data).ok()
-    })
+    RecordingStatusStore::for_endpoint(DEFAULT_ADMIN_ADDR).read_local_status()
 }
 
 pub fn print_local_status(status: &RecordingLocalStatus) {
@@ -229,107 +416,23 @@ pub fn print_local_status(status: &RecordingLocalStatus) {
 }
 
 pub fn handle_recording_status(can_record: bool, active_service: Option<&str>) {
-    let message = if can_record {
-        if let Some(service) = active_service {
-            format!("Recording is active for '{}'", service)
-        } else {
-            "Recording is available for this key".to_string()
-        }
-    } else {
-        "This key is not allowed to record masks".to_string()
-    };
-    write_status(&RecordingLocalStatus {
-        can_record: Some(can_record),
-        state: if active_service.is_some() {
-            "recording".into()
-        } else {
-            "idle".into()
-        },
-        service: active_service.map(|value| value.to_string()),
-        message: Some(message),
-        mask_id: None,
-        confidence: None,
-        updated_at_ms: current_timestamp_ms(),
-    });
+    RecordingStatusStore::for_endpoint(DEFAULT_ADMIN_ADDR)
+        .handle_recording_status(can_record, active_service)
 }
 
 pub fn mark_recording_stop_requested(service: Option<&str>) {
-    write_status(&RecordingLocalStatus {
-        can_record: Some(true),
-        state: "stopping".into(),
-        service: service.map(|value| value.to_string()),
-        message: Some("Recording stop requested".into()),
-        mask_id: None,
-        confidence: None,
-        updated_at_ms: current_timestamp_ms(),
-    });
+    RecordingStatusStore::for_endpoint(DEFAULT_ADMIN_ADDR).mark_recording_stop_requested(service)
 }
 
 /// Display recording acknowledgment from server
 pub fn handle_recording_ack(session_id: &[u8; 16], status: &str) {
-    let sid_hex = session_id
-        .iter()
-        .take(4)
-        .map(|b| format!("{:02x}", b))
-        .collect::<String>();
-
-    match status {
-        "started" => {
-            info!("📹 Recording started (session: {}...)", sid_hex);
-            write_status(&RecordingLocalStatus {
-                can_record: Some(true),
-                state: "recording".into(),
-                service: read_local_status().and_then(|status| status.service),
-                message: Some("Recording started. Use the service normally.".into()),
-                mask_id: None,
-                confidence: None,
-                updated_at_ms: current_timestamp_ms(),
-            });
-            println!("Recording started. Use the service normally.");
-            println!("No manual stop needed — recording will finish automatically.");
-            println!("It will analyze the capture once enough traffic is collected or the session goes idle.");
-        }
-        "analyzing" => {
-            info!("🔍 Recording finished, server analyzing...");
-            let service = read_local_status().and_then(|status| status.service);
-            write_status(&RecordingLocalStatus {
-                can_record: Some(true),
-                state: "analyzing".into(),
-                service,
-                message: Some("Recording finished. Server is analyzing traffic.".into()),
-                mask_id: None,
-                confidence: None,
-                updated_at_ms: current_timestamp_ms(),
-            });
-            println!("Recording finished. Server is analyzing traffic...");
-        }
-        other => {
-            info!("Recording status: {}", other);
-            println!("Recording status: {}", other);
-        }
-    }
+    RecordingStatusStore::for_endpoint(DEFAULT_ADMIN_ADDR).handle_recording_ack(session_id, status)
 }
 
 /// Display recording completion
 pub fn handle_recording_complete(service: &str, mask_id: &str, confidence: f32) {
-    info!("✅ Mask generated for '{}'", service);
-    write_status(&RecordingLocalStatus {
-        can_record: Some(true),
-        state: "success".into(),
-        service: Some(service.to_string()),
-        message: Some("Mask generated and tested".into()),
-        mask_id: Some(mask_id.to_string()),
-        confidence: Some(confidence),
-        updated_at_ms: current_timestamp_ms(),
-    });
-    println!();
-    println!("✅ Mask generated and tested!");
-    println!();
-    println!("   Mask ID:     {}", mask_id);
-    println!("   Service:     {}", service);
-    println!("   Confidence:  {:.2}", confidence);
-    println!();
-    println!("   Broadcasting to all clients...");
+    RecordingStatusStore::for_endpoint(DEFAULT_ADMIN_ADDR)
+        .handle_recording_complete(service, mask_id, confidence)
 }
 
 /// P2.3-desktop: parsed form of an admin-socket command, once the
@@ -344,6 +447,7 @@ pub enum AdminCommand {
     RecordStart(String),
     RecordStop,
     RecordStatus,
+    Bench(u64),
     /// Report `AivpnClient::cached_role()`.
     Role,
     /// Generate a QR PNG for the given (UTF-8) text.
@@ -395,6 +499,12 @@ pub fn parse_admin_command(rest: &str) -> Option<AdminCommand> {
     if rest == "record_status" {
         return Some(AdminCommand::RecordStatus);
     }
+    if let Some(duration) = rest.strip_prefix("bench:") {
+        let duration: u64 = duration.parse().ok()?;
+        return (3..=30)
+            .contains(&duration)
+            .then_some(AdminCommand::Bench(duration));
+    }
     if rest == "role" {
         return Some(AdminCommand::Role);
     }
@@ -438,34 +548,90 @@ pub fn parse_mgmt_reply(reply: &str) -> Option<(u16, Vec<u8>)> {
 
 /// Display recording failure
 pub fn handle_recording_failed(reason: &str) {
-    info!("❌ Recording failed: {}", reason);
-    let can_record = if reason.to_lowercase().contains("recording-admin") {
-        Some(false)
-    } else {
-        read_local_status().and_then(|status| status.can_record)
-    };
-    write_status(&RecordingLocalStatus {
-        can_record,
-        state: "failed".into(),
-        service: read_local_status().and_then(|status| status.service),
-        message: Some(reason.to_string()),
-        mask_id: None,
-        confidence: None,
-        updated_at_ms: current_timestamp_ms(),
-    });
-    println!();
-    println!("❌ Recording failed!");
-    println!("   Reason: {}", reason);
-    println!();
-    println!("   Tips:");
-    println!("   - Use the service for at least 1 minute");
-    println!("   - Ensure active traffic (not idle)");
-    println!("   - Need at least 500 packets captured");
+    RecordingStatusStore::for_endpoint(DEFAULT_ADMIN_ADDR).handle_recording_failed(reason)
 }
 
 #[cfg(test)]
 mod admin_command_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn conflicting_admin_bind_preserves_owner_token() {
+        let dir =
+            std::env::temp_dir().join(format!("aivpn-admin-test-{:032x}", rand::random::<u128>()));
+        let path = dir.join("admin.token");
+        let (first, token) = bind_admin_at(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0), &path)
+            .await
+            .unwrap();
+        let std::net::SocketAddr::V4(addr) = first.local_addr().unwrap() else {
+            panic!()
+        };
+        let error = bind_admin_at(addr, &path).await.unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::AddrInUse);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), token);
+        let second_path = dir.join("second.token");
+        let (second, second_token) =
+            bind_admin_at(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0), &second_path)
+                .await
+                .unwrap();
+        assert_ne!(token, second_token);
+        assert_ne!(first.local_addr().unwrap(), second.local_addr().unwrap());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), token);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        drop((first, second));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn recording_instances_do_not_overwrite_each_other() {
+        let dir =
+            std::env::temp_dir().join(format!("aivpn-record-test-{:032x}", rand::random::<u128>()));
+        std::fs::create_dir(&dir).unwrap();
+        let first = RecordingStatusStore {
+            paths: vec![dir.join("first")],
+        };
+        let second = RecordingStatusStore {
+            paths: vec![dir.join("second")],
+        };
+        first.handle_recording_status(true, Some("first-service"));
+        second.reset_local_status();
+        second.handle_recording_status(true, Some("second-service"));
+        first.handle_recording_ack(&[1; 16], "started");
+        assert_eq!(
+            first.read_local_status().unwrap().service.as_deref(),
+            Some("first-service")
+        );
+        assert_eq!(
+            second.read_local_status().unwrap().service.as_deref(),
+            Some("second-service")
+        );
+        assert_ne!(
+            admin_token_path_at(DEFAULT_ADMIN_ADDR),
+            admin_token_path_at(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 44302))
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn admin_addresses_are_local_and_unambiguous() {
+        for bad in [
+            "0.0.0.0:44301",
+            "192.0.2.1:44301",
+            "127.0.0.1:0",
+            "localhost:44301",
+            "[::1]:44301",
+        ] {
+            assert!(parse_admin_addr(bad).is_err(), "{bad}");
+        }
+        assert_eq!(parse_admin_addr("127.0.0.1:44302").unwrap().port(), 44302);
+    }
 
     #[test]
     fn tokens_match_rejects_bad_token() {
@@ -617,7 +783,7 @@ mod admin_command_tests {
             })
         );
 
-        let bad_raw = format!("wrong-token:mgmt:2:/api/v1/clients/1:");
+        let bad_raw = "wrong-token:mgmt:2:/api/v1/clients/1:".to_string();
         let (tok2, _rest2) = bad_raw
             .split_once(':')
             .expect("datagram has a token prefix");

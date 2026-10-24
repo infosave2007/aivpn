@@ -1,6 +1,6 @@
 #!/usr/bin/env swift
 // ═══════════════════════════════════════════════════════════════
-// AIVPN Privileged Helper Daemon v1.1.0
+// AIVPN Privileged Helper Daemon v1.2.0
 //
 // Manages aivpn-client process on behalf of the AIVPN GUI app.
 // Communicates via JSON over Unix domain socket.
@@ -15,21 +15,39 @@ import SystemConfiguration
 // MARK: - Constants
 
 let SOCKET_PATH = "/var/run/aivpn/helper.sock"
-let DEFAULT_CLIENT_PATH = "/Library/Application Support/AIVPN/aivpn-client"
-let ALLOWED_CLIENT_PATHS = [
-    // build.sh produces "Aivpn.app"; the filesystem is case-insensitive but
-    // this string comparison is not — keep both historical capitalizations.
-    "/Applications/Aivpn.app/Contents/MacOS/aivpn-client",
-    "/Applications/Aivpn.app/Contents/Resources/aivpn-client",
-    "/Applications/AIVPN.app/Contents/MacOS/aivpn-client",
-    "/Applications/AIVPN.app/Contents/Resources/aivpn-client",
-    DEFAULT_CLIENT_PATH,
-]
+let DEFAULT_CLIENT_PATH = ClientBinaryPolicy.defaultPath
+let ALLOWED_CLIENT_PATHS = ClientBinaryPolicy.allowedPaths
 let LOG_PATH = "/var/run/aivpn/client.log"
 let PID_PATH = "/var/run/aivpn/client.pid"
 let RECORDING_STATUS_PATH = "/var/run/aivpn/recording.status"
 let RECORDING_STATUS_FALLBACK_PATH = "/tmp/aivpn-recording.status"
-let HELPER_VERSION = "1.1.0"
+let HELPER_VERSION = "1.2.0"
+
+// Открываем каждый компонент относительно дескриптора родителя. Подмена
+// каталога или файла ссылкой не меняет уже открытый путь.
+func openCertificate(_ path: String) -> Int32 {
+    let parts = path.split(separator: "/").map(String.init)
+    guard path.hasPrefix("/"), !parts.isEmpty else { return -1 }
+    var parent = open("/", O_RDONLY | O_DIRECTORY | O_CLOEXEC)
+    guard parent >= 0 else { return -1 }
+    for part in parts.dropLast() {
+        let next = openat(parent, part, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+        close(parent)
+        guard next >= 0 else { return -1 }
+        parent = next
+    }
+    let fd = openat(parent, parts.last!, O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK)
+    close(parent)
+    guard fd >= 0 else { return -1 }
+    var metadata = stat()
+    guard fstat(fd, &metadata) == 0,
+          (metadata.st_mode & mode_t(S_IFMT)) == mode_t(S_IFREG),
+          metadata.st_size > 0, metadata.st_size <= 4096 else {
+        close(fd)
+        return -1
+    }
+    return fd
+}
 
 // MARK: - Protocol Types
 
@@ -70,16 +88,18 @@ struct HelperResponse: Codable {
     let pid: Int?
     let version: String?
     let log: String?
+    var session: String?
 
     init(status: String, message: String,
          connected: Bool? = nil, pid: Int? = nil,
-         version: String? = nil, log: String? = nil) {
+         version: String? = nil, log: String? = nil, session: String? = nil) {
         self.status = status
         self.message = message
         self.connected = connected
         self.pid = pid
         self.version = version
         self.log = log
+        self.session = session
     }
 }
 
@@ -92,6 +112,9 @@ var isConnected = false
 // reported), and this flag preserves the one-shot "Process exited" + last
 // error line report that getStatus owes the GUI's next status poll.
 var clientExited = false
+var managedAdminSession = UUID().uuidString
+let adminRelaySlots = DispatchSemaphore(value: 8)
+let adminRelayQueue = DispatchQueue(label: "aivpn.helper.admin", attributes: .concurrent)
 var childReapSources: [pid_t: DispatchSourceProcess] = [:]
 
 // Serial queue that serialises all connection state mutations (managedPID,
@@ -179,29 +202,6 @@ func killExistingClient() {
 
     try? FileManager.default.removeItem(atPath: PID_PATH)
     
-    // Restore IPv6 after stopping client
-    restoreIPv6()
-}
-
-/// Restore IPv6 routing after VPN disconnect.
-/// The Rust client's Drop impl already removes the blackhole and restores the
-/// saved interface on clean exit.  This function is a safety net for cases where
-/// the client process is killed externally (e.g. `killall`).
-/// We only remove the blackhole here — we do NOT try to add the default route
-/// back because we don't know which interface was active (that knowledge lives
-/// in the Rust process).  macOS re-discovers the IPv6 gateway automatically
-/// via ND/SLAAC once the blackhole is gone.
-func restoreIPv6() {
-    log("Clearing IPv6 blackhole (safety net)...")
-
-    // Remove the blackhole if it still exists.
-    let removed = runCommand("/sbin/route",
-                             args: ["-n", "delete", "-inet6", "-net", "::/0", "-blackhole"])
-    if removed {
-        log("IPv6 blackhole removed — macOS will auto-restore via ND/SLAAC")
-    } else {
-        log("No IPv6 blackhole found (already removed by Rust client on clean exit)")
-    }
 }
 
 /// Run a command and return success
@@ -297,7 +297,10 @@ func startClient(key: String, fullTunnel: Bool, binaryPath: String?, mtlsCertPat
     // child's environment is only readable by root/same-uid. The Rust client
     // reads the env var when -k is absent (crates/aivpn-client/src/main.rs)
     // and removes it from its own environment immediately after parsing.
-    var args: [String] = [clientPath]
+    var args: [String] = [clientPath, "--admin-listen", "127.0.0.1:44301"]
+    var certificateFd: Int32 = -1
+    defer { if certificateFd >= 0 { close(certificateFd) } }
+
     if fullTunnel {
         args.append("--full-tunnel")
     }
@@ -344,8 +347,12 @@ func startClient(key: String, fullTunnel: Bool, binaryPath: String?, mtlsCertPat
             log("ERROR: invalid mtlsCertPath '\(certPath)' — rejected")
             return HelperResponse(status: "error", message: "Invalid mTLS cert path")
         }
+        certificateFd = openCertificate(resolvedCertPath)
+        guard certificateFd >= 0 else {
+            return HelperResponse(status: "error", message: "Cannot safely open mTLS cert")
+        }
         args.append("--mtls-cert")
-        args.append(resolvedCertPath)
+        args.append("/dev/fd/198")
     }
     if adaptiveLevel > 0 {
         args.append("--adaptive-level")
@@ -474,6 +481,14 @@ func startClient(key: String, fullTunnel: Bool, binaryPath: String?, mtlsCertPat
         return HelperResponse(status: "error", message: "Internal spawn setup failure")
     }
 
+    // Клиент читает уже открытый файл, не разрешая пользовательский путь повторно.
+    if certificateFd >= 0 {
+        guard posix_spawn_file_actions_adddup2(&fileActions, certificateFd, 198) == 0 else {
+            posix_spawn_file_actions_destroy(&fileActions)
+            return HelperResponse(status: "error", message: "Cannot pass mTLS cert descriptor")
+        }
+    }
+
     // Redirect stdout/stderr to log file (root-only for security)
     let logFd = open(LOG_PATH, O_WRONLY | O_CREAT | O_APPEND, 0o600)
     if logFd >= 0 {
@@ -551,6 +566,7 @@ func startClient(key: String, fullTunnel: Bool, binaryPath: String?, mtlsCertPat
     }
 
     managedPID = pid
+    managedAdminSession = UUID().uuidString
     isConnected = false
     try? "\(pid)".write(toFile: PID_PATH, atomically: true, encoding: .utf8)
     log("Started aivpn-client (PID: \(pid))")
@@ -620,7 +636,7 @@ func runClientCommand(args: [String], binaryPath: String?) -> HelperResponse {
 
     let task = Process()
     task.executableURL = URL(fileURLWithPath: clientPath)
-    task.arguments = args
+    task.arguments = ["--admin-listen", "127.0.0.1:44301"] + args
 
     let outputPipe = Pipe()
     task.standardOutput = outputPipe
@@ -685,12 +701,8 @@ func stopClient() -> HelperResponse {
                           message: wasConnected ? "Disconnected" : "No active connection")
 }
 
-/// True while the client's data-plane evidence is FRESH: the traffic.stats
-/// file carries a session `since:` epoch (the pre-session zero-writes in the
-/// client's reconnect loop deliberately omit it) and was rewritten recently —
-/// the client's stats task rewrites it once per second while a session is up.
-/// Stale/absent evidence means the client is between sessions (in-process
-/// reconnect loop), even though historic log lines still say "Connected".
+/// Проверяет свежесть статистики процесса. Сам по себе since не подтверждает
+/// ServerHello: писатель статистики запускается еще до ответа сервера.
 func connectionEvidenceFresh(maxAgeSeconds: TimeInterval = 10) -> Bool {
     let statsPath = "/var/run/aivpn/traffic.stats"
     guard let attrs = try? FileManager.default.attributesOfItem(atPath: statsPath),
@@ -730,13 +742,11 @@ func rejectToken(in logContent: String) -> String? {
 /// line matched — even while the client was midway through its in-process
 /// reconnect loop ("Client run failed … Reconnecting in …").
 func lastLogTransitionIsConnected(_ logContent: String) -> Bool {
-    let connectedMarkers = ["Connected to server", "PFS ratchet complete",
-                            "forward secrecy established"]
-    let disconnectedMarkers = ["Reconnecting in", "Client run failed",
-                               "Failed to create client", "Shutdown requested"]
     for line in logContent.components(separatedBy: "\n").reversed() {
-        if connectedMarkers.contains(where: { line.contains($0) }) { return true }
-        if disconnectedMarkers.contains(where: { line.contains($0) }) { return false }
+        let status = line.trimmingCharacters(in: .whitespacesAndNewlines)
+        if status.hasPrefix("AIVPN-STATUS connected ") { return true }
+        if status == "AIVPN-STATUS reconnecting" || status == "AIVPN-STATUS disconnected"
+            || status.hasPrefix("AIVPN-STATUS rejected ") { return false }
     }
     return false
 }
@@ -744,17 +754,8 @@ func lastLogTransitionIsConnected(_ logContent: String) -> Bool {
 /// Get current connection status
 func getStatus() -> HelperResponse {
     if managedPID > 0 && kill(managedPID, 0) == 0 {
-        if isConnected {
-            if connectionEvidenceFresh() {
-                return HelperResponse(status: "ok", message: "Connected",
-                                      connected: true, pid: Int(managedPID),
-                                      version: HELPER_VERSION)
-            }
-            // Data-plane evidence went stale: the client is re-establishing
-            // in-process. Demote instead of reporting a stale Connected, and
-            // fall through to the log-derived state below.
-            isConnected = false
-        }
+        // Статистика обновляется и до ServerHello, поэтому кеш не подтверждает связь.
+        isConnected = false
         // Check log for connection status
         if let logContent = try? String(contentsOfFile: LOG_PATH, encoding: .utf8) {
             // G-A4: an authenticated terminal refusal takes priority over
@@ -973,7 +974,7 @@ func getTrafficStats() -> HelperResponse {
 /// for the root-owned primary path for defense-in-depth/consistency, even
 /// though /var/run/aivpn is not attacker-writable.
 func readRegularFileNoFollow(_ path: String, maxBytes: Int = 65536) -> Data? {
-    let fd = open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
+    let fd = open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK)
     guard fd >= 0 else { return nil }
     defer { close(fd) }
 
@@ -1285,7 +1286,7 @@ func handleConnection(_ clientFD: Int32) {
     guard let lenBytes = readExact(clientFD, count: 4) else { return }
     let payloadLen = Int(lenBytes[0]) << 24 | Int(lenBytes[1]) << 16
                    | Int(lenBytes[2]) << 8  | Int(lenBytes[3])
-    guard payloadLen > 0 && payloadLen <= 65535 else {
+    guard payloadLen > 0 && payloadLen <= 2 * LocalAdminIPC.maxFrame else {
         sendResponse(clientFD, HelperResponse(status: "error", message: "Invalid message length"))
         return
     }
@@ -1325,6 +1326,34 @@ func handleConnection(_ clientFD: Int32) {
                                bootstrapTelegramChat: request.bootstrapTelegramChat,
                                bootstrapGithub: request.bootstrapGithub,
                                serverSigningKey: request.serverSigningKey)
+
+    case "admin":
+        guard request.key == managedAdminSession, clientProcessAlive(),
+              let command = request.service, command.utf8.count <= LocalAdminIPC.maxFrame - 65,
+              command == "role" || command.hasPrefix("mgmt:") || command.hasPrefix("qr:") || command.hasPrefix("bench:"),
+              let token = try? String(contentsOfFile: "/tmp/aivpn-0/admin.token", encoding: .utf8),
+              token.trimmingCharacters(in: .whitespacesAndNewlines).count == 64 else {
+            response = HelperResponse(status: "error", message: "Admin session changed or unavailable")
+            break
+        }
+        guard adminRelaySlots.wait(timeout: .now()) == .success else {
+            response = HelperResponse(status: "error", message: "Too many admin requests")
+            break
+        }
+        let duplicate = dup(clientFD)
+        guard duplicate >= 0 else {
+            adminRelaySlots.signal()
+            response = HelperResponse(status: "error", message: "Admin request unavailable")
+            break
+        }
+        let session = managedAdminSession
+        adminRelayQueue.async {
+            defer { close(duplicate); adminRelaySlots.signal() }
+            let reply = relayAdminCommand(token: token.trimmingCharacters(in: .whitespacesAndNewlines), command: command)
+            sendResponse(duplicate, HelperResponse(status: reply == nil ? "error" : "ok",
+                message: reply == nil ? "Admin request failed" : "", log: reply, session: session))
+        }
+        return
 
     case "disconnect":
         response = stopClient()
@@ -1379,7 +1408,13 @@ func handleConnection(_ clientFD: Int32) {
                                   message: "Unknown action: \(request.action)")
     }
 
-    sendResponse(clientFD, response)
+    var boundResponse = response
+    boundResponse.session = managedPID > 0 ? managedAdminSession : nil
+    sendResponse(clientFD, boundResponse)
+}
+
+func relayAdminCommand(token: String, command: String) -> String? {
+    LocalAdminIPC.clientRequest("\(token):\(command)")
 }
 
 /// Send a JSON response to the client
@@ -1465,6 +1500,7 @@ func recoverExistingClient() {
             return
         }
         managedPID = pid
+    managedAdminSession = UUID().uuidString
         log("Recovered aivpn-client (PID: \(pid))")
         if let logContent = try? String(contentsOfFile: LOG_PATH, encoding: .utf8) {
             if logContent.contains("PFS ratchet complete") ||
@@ -1550,7 +1586,11 @@ func main() {
         }
 
         guard clientFD >= 0 else {
-            if errno == EINTR { continue }
+            if [EINTR, ECONNABORTED, EAGAIN, ENOBUFS, EMFILE, ENFILE].contains(errno) {
+                if errno != EINTR && errno != ECONNABORTED { usleep(100_000) }
+                continue
+            }
+            log("accept failed (errno \(errno))")
             break
         }
 

@@ -33,78 +33,110 @@ pub struct MultiChannelLoadStats {
     pub elapsed_ms: u64,
 }
 
-/// Validate a bootstrap URL before fetching.
-///
-/// Rejects:
-/// - Non-HTTPS schemes (prevents plaintext interception).
-/// - Private/loopback/link-local hostnames (prevents SSRF against internal services).
+/// Проверяет канонический URL тем же парсером, который использует HTTP-клиент.
 pub(crate) fn validate_bootstrap_url(url: &str) -> Result<()> {
-    // Must start with https:// — no HTTP, no custom schemes.
-    if !url.starts_with("https://") {
-        return Err(Error::Session(format!(
-            "Bootstrap URL '{}' rejected: only HTTPS is allowed",
-            url
-        )));
+    let parsed =
+        reqwest::Url::parse(url).map_err(|_| Error::Session("Invalid bootstrap URL".into()))?;
+    if parsed.scheme() != "https" {
+        return Err(Error::Session("Bootstrap URL requires HTTPS".into()));
     }
-
-    // Reject any URL that contains userinfo credentials (user:pass@ or user@).
-    // A crafted URL like https://user@169.254.169.254/path would otherwise bypass
-    // the private-range checks below because host_and_port becomes "user@169.254.169.254".
-    if url["https://".len()..].contains('@') {
-        return Err(Error::Session(format!(
-            "Bootstrap URL '{}' rejected: userinfo credentials are not allowed",
-            url
-        )));
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(Error::Session(
+            "Bootstrap URL credentials are not allowed".into(),
+        ));
     }
-
-    // Extract the host portion (between "https://" and the next '/', ':', or '?').
-    let after_scheme = &url["https://".len()..];
-    let host_end = after_scheme
-        .find(|c| c == '/' || c == '?' || c == '#')
-        .unwrap_or(after_scheme.len());
-    let host_and_port = &after_scheme[..host_end];
-    // Strip optional port suffix (e.g., "host:8443" → "host").
-    let host = match host_and_port.rfind(':') {
-        Some(pos) => {
-            // Only strip as port if the suffix is digits (avoids mangling IPv6 literals).
-            let suffix = &host_and_port[pos + 1..];
-            if suffix.chars().all(|c| c.is_ascii_digit()) {
-                &host_and_port[..pos]
-            } else {
-                host_and_port
-            }
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| Error::Session("Bootstrap URL has no host".into()))?;
+    let host = host
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .trim_end_matches('.');
+    let blocked = match host.parse::<std::net::IpAddr>() {
+        Ok(ip) => !is_public_bootstrap_ip(ip),
+        Err(_) => {
+            matches!(host, "localhost" | "ip6-localhost" | "ip6-loopback")
+                || host.ends_with(".localhost")
         }
-        None => host_and_port,
     };
-
-    // Reject loopback and private-range hostnames.
-    let blocked = matches!(
-        host,
-        "localhost" | "ip6-localhost" | "ip6-loopback" | "[::1]" | "::1"
-    ) || host.starts_with("127.")
-        || host.starts_with("10.")
-        || host.starts_with("192.168.")
-        || host.starts_with("169.254.")
-        || {
-            // 172.16.0.0/12 — second octet 16..=31
-            if let Some(rest) = host.strip_prefix("172.") {
-                rest.split('.')
-                    .next()
-                    .and_then(|octet| octet.parse::<u8>().ok())
-                    .map_or(false, |n| (16..=31).contains(&n))
-            } else {
-                false
-            }
-        };
-
     if blocked {
-        return Err(Error::Session(format!(
-            "Bootstrap URL '{}' rejected: private/loopback addresses are not allowed",
-            url
-        )));
+        return Err(Error::Session(
+            "Bootstrap URL requires a public address".into(),
+        ));
     }
-
     Ok(())
+}
+
+fn is_public_bootstrap_ip(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(ip) => {
+            let [a, b, c, _] = ip.octets();
+            !(ip.is_private()
+                || ip.is_loopback()
+                || ip.is_link_local()
+                || ip.is_broadcast()
+                || ip.is_documentation()
+                || a == 0
+                || a >= 224
+                || (a == 100 && (64..=127).contains(&b))
+                || (a == 198 && (18..=19).contains(&b))
+                || (a == 192 && b == 0 && c == 0))
+        }
+        std::net::IpAddr::V6(ip) => {
+            if let Some(v4) = ip.to_ipv4_mapped() {
+                return is_public_bootstrap_ip(std::net::IpAddr::V4(v4));
+            }
+            let segments = ip.segments();
+            // Принимаем глобальный unicast, исключая документационный диапазон.
+            (segments[0] & 0xe000) == 0x2000 && !(segments[0] == 0x2001 && segments[1] == 0x0db8)
+        }
+    }
+}
+
+fn public_bootstrap_addrs(
+    addrs: impl Iterator<Item = std::net::SocketAddr>,
+) -> std::io::Result<reqwest::dns::Addrs> {
+    let addrs: Vec<_> = addrs.collect();
+    if addrs.is_empty() || addrs.iter().any(|addr| !is_public_bootstrap_ip(addr.ip())) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "Bootstrap DNS must resolve only to public addresses",
+        ));
+    }
+    Ok(Box::new(addrs.into_iter()))
+}
+
+struct BootstrapResolver;
+
+impl reqwest::dns::Resolve for BootstrapResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        Box::pin(async move {
+            // Проверяем именно адреса подключения, без повторного DNS-запроса.
+            let addrs = tokio::net::lookup_host((name.as_str(), 0)).await?;
+            Ok(public_bootstrap_addrs(addrs)?)
+        })
+    }
+}
+
+pub(crate) fn bootstrap_http_client(timeout: Duration) -> Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .timeout(timeout)
+        .https_only(true)
+        .user_agent("aivpn-client")
+        // Системный прокси разрешает имена удаленно и обходит наш DNS-фильтр.
+        .no_proxy()
+        .dns_resolver(std::sync::Arc::new(BootstrapResolver))
+        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+            if attempt.previous().len() >= 10 {
+                attempt.error("Too many bootstrap redirects")
+            } else if validate_bootstrap_url(attempt.url().as_str()).is_err() {
+                attempt.error("Bootstrap redirect requires a public HTTPS URL")
+            } else {
+                attempt.follow()
+            }
+        }))
+        .build()
+        .map_err(|e| Error::Session(format!("Failed to create HTTP client: {}", e)))
 }
 
 /// Hard cap on any bootstrap channel response body. Descriptor payloads are a
@@ -139,12 +171,9 @@ pub(crate) async fn read_body_capped(
 }
 
 /// Load descriptors from a CDN channel
-async fn load_from_cdn(url: &str) -> Result<Vec<BootstrapDescriptor>> {
+async fn load_from_cdn(url: &str, signing_key: &[u8; 32]) -> Result<Vec<BootstrapDescriptor>> {
     validate_bootstrap_url(url)?;
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .build()
-        .map_err(|e| Error::Session(format!("Failed to create HTTP client: {}", e)))?;
+    let client = bootstrap_http_client(Duration::from_secs(10))?;
 
     let response = client
         .get(url)
@@ -163,7 +192,7 @@ async fn load_from_cdn(url: &str) -> Result<Vec<BootstrapDescriptor>> {
         .await
         .map_err(|e| Error::Session(format!("Failed to read CDN response: {}", e)))?;
 
-    parse_descriptors_from_json(&body, None)
+    parse_descriptors_from_json(&body, Some(signing_key))
 }
 
 /// Describe a `reqwest::Error` without ever including its `Display` output,
@@ -191,11 +220,9 @@ fn describe_reqwest_error(e: &reqwest::Error) -> &'static str {
 async fn load_from_telegram(
     bot_token: &str,
     chat_id: Option<&str>,
+    signing_key: &[u8; 32],
 ) -> Result<Vec<BootstrapDescriptor>> {
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(15))
-        .build()
-        .map_err(|e| Error::Session(format!("Failed to create HTTP client: {}", e)))?;
+    let client = bootstrap_http_client(Duration::from_secs(15))?;
 
     let updates_url = format!(
         "https://api.telegram.org/bot{}/getUpdates?limit=50",
@@ -249,7 +276,7 @@ async fn load_from_telegram(
                 .and_then(|c| c.get("id"))
                 .map(|id| match id {
                     serde_json::Value::String(s) => s == want_chat,
-                    other => other.to_string() == want_chat,
+                    other => other == want_chat,
                 })
                 .unwrap_or(false);
             let username_matches = chat
@@ -302,7 +329,7 @@ async fn load_from_telegram(
             continue;
         };
 
-        if let Ok(descriptors) = parse_descriptors_from_json(&file_body, None) {
+        if let Ok(descriptors) = parse_descriptors_from_json(&file_body, Some(signing_key)) {
             if !descriptors.is_empty() {
                 return Ok(descriptors);
             }
@@ -317,24 +344,17 @@ async fn load_from_telegram(
 }
 
 /// Load descriptors from a GitHub releases channel
-async fn load_from_github(repo: &str, asset_name: &str) -> Result<Vec<BootstrapDescriptor>> {
+async fn load_from_github(
+    repo: &str,
+    asset_name: &str,
+    signing_key: &[u8; 32],
+) -> Result<Vec<BootstrapDescriptor>> {
     // The GitHub API URL is constructed from the repo slug, not user input, so
     // it is always a safe HTTPS URL. The asset download URL from the release JSON
     // is user-influenced via the connection key and must be validated.
     let url = format!("https://api.github.com/repos/{}/releases/latest", repo);
 
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .default_headers({
-            let mut headers = reqwest::header::HeaderMap::new();
-            headers.insert(
-                reqwest::header::USER_AGENT,
-                reqwest::header::HeaderValue::from_static("aivpn-client"),
-            );
-            headers
-        })
-        .build()
-        .map_err(|e| Error::Session(format!("Failed to create HTTP client: {}", e)))?;
+    let client = bootstrap_http_client(Duration::from_secs(10))?;
 
     let response = client
         .get(&url)
@@ -382,7 +402,7 @@ async fn load_from_github(repo: &str, asset_name: &str) -> Result<Vec<BootstrapD
                             .await
                             .map_err(|e| Error::Session(format!("Failed to read asset: {}", e)))?;
 
-                        return parse_descriptors_from_json(&asset_body, None);
+                        return parse_descriptors_from_json(&asset_body, Some(signing_key));
                     }
                 }
             }
@@ -395,14 +415,140 @@ async fn load_from_github(repo: &str, asset_name: &str) -> Result<Vec<BootstrapD
     )))
 }
 
-/// Load descriptors from an Email channel (simulated - actual implementation would use SMTP/IMAP)
+/// Читает подписанные дескрипторы из текстовых частей писем через JMAP.
+/// URL сессии и токен задаются переменными AIVPN_BOOTSTRAP_JMAP_URL и
+/// AIVPN_BOOTSTRAP_JMAP_TOKEN. Письма не отправляются и не изменяются.
 async fn load_from_email(
-    _address: &str,
-    _subject_pattern: &str,
+    address: &str,
+    subject_pattern: &str,
+    signing_key: &[u8; 32],
 ) -> Result<Vec<BootstrapDescriptor>> {
-    // Email-based loading would require integration with mail servers
-    // For now, this is a placeholder that returns an error
-    Err(Error::Session("Email channel not yet implemented".into()))
+    use serde_json::json;
+    const MAIL: &str = "urn:ietf:params:jmap:mail";
+    let session_url = std::env::var("AIVPN_BOOTSTRAP_JMAP_URL")
+        .map_err(|_| Error::Session("Email bootstrap requires AIVPN_BOOTSTRAP_JMAP_URL".into()))?;
+    let token = std::env::var("AIVPN_BOOTSTRAP_JMAP_TOKEN").map_err(|_| {
+        Error::Session("Email bootstrap requires AIVPN_BOOTSTRAP_JMAP_TOKEN".into())
+    })?;
+    if token.is_empty() || address.is_empty() || subject_pattern.is_empty() {
+        return Err(Error::Session(
+            "Email bootstrap requires token, sender and subject".into(),
+        ));
+    }
+    validate_bootstrap_url(&session_url)?;
+    let client = bootstrap_http_client(Duration::from_secs(10))?;
+    let session = jmap_response(client.get(&session_url).bearer_auth(&token)).await?;
+    let api_url = session["apiUrl"]
+        .as_str()
+        .ok_or_else(|| Error::Session("JMAP session has no API URL".into()))?;
+    validate_bootstrap_url(api_url)?;
+    let origin =
+        reqwest::Url::parse(&session_url).map_err(|_| Error::Session("Invalid JMAP URL".into()))?;
+    let api =
+        reqwest::Url::parse(api_url).map_err(|_| Error::Session("Invalid JMAP API URL".into()))?;
+    if origin.origin() != api.origin() {
+        return Err(Error::Session(
+            "JMAP API must share the configured session origin".into(),
+        ));
+    }
+    let account = session["primaryAccounts"][MAIL]
+        .as_str()
+        .ok_or_else(|| Error::Session("JMAP session has no primary mail account".into()))?;
+    let request = json!({
+        "using": ["urn:ietf:params:jmap:core", MAIL],
+        "methodCalls": [
+            ["Email/query", {"accountId": account,
+                "filter": {"from": address, "subject": subject_pattern},
+                "sort": [{"property": "receivedAt", "isAscending": false}],
+                "limit": 16}, "query"],
+            ["Email/get", {"accountId": account,
+                "#ids": {"resultOf": "query", "name": "Email/query", "path": "/ids"},
+                "properties": ["from", "subject", "textBody", "bodyValues"],
+                "fetchTextBodyValues": true, "maxBodyValueBytes": MAX_RESPONSE_BODY_BYTES}, "get"]
+        ]
+    });
+    let response = jmap_response(client.post(api).bearer_auth(&token).json(&request)).await?;
+    parse_jmap_descriptors(&response, address, subject_pattern, signing_key)
+}
+
+async fn jmap_response(request: reqwest::RequestBuilder) -> Result<serde_json::Value> {
+    let response = request.send().await.map_err(|e| {
+        Error::Session(format!(
+            "JMAP request failed: {}",
+            describe_reqwest_error(&e)
+        ))
+    })?;
+    if !response.status().is_success() {
+        return Err(Error::Session(format!(
+            "JMAP returned status {}",
+            response.status()
+        )));
+    }
+    let body = read_body_capped(response)
+        .await
+        .map_err(|e| Error::Session(e.into()))?;
+    serde_json::from_str(&body).map_err(|_| Error::Session("Invalid JMAP response".into()))
+}
+
+fn parse_jmap_descriptors(
+    response: &serde_json::Value,
+    address: &str,
+    subject: &str,
+    signing_key: &[u8; 32],
+) -> Result<Vec<BootstrapDescriptor>> {
+    let calls = response["methodResponses"]
+        .as_array()
+        .ok_or_else(|| Error::Session("JMAP response has no methods".into()))?;
+    let messages = calls
+        .iter()
+        .find(|call| call[0] == "Email/get" && call[2] == "get")
+        .and_then(|call| call[1]["list"].as_array())
+        .ok_or_else(|| Error::Session("JMAP Email/get failed".into()))?;
+    let mut descriptors = Vec::new();
+    for message in messages.iter().take(16) {
+        let sender_matches = message["from"].as_array().is_some_and(|senders| {
+            senders.iter().any(|sender| {
+                sender["email"]
+                    .as_str()
+                    .is_some_and(|email| email.eq_ignore_ascii_case(address))
+            })
+        });
+        if !sender_matches
+            || !message["subject"]
+                .as_str()
+                .is_some_and(|value| value.contains(subject))
+        {
+            continue;
+        }
+        if let Some(parts) = message["textBody"].as_array() {
+            for part in parts {
+                let Some(id) = part["partId"].as_str() else {
+                    continue;
+                };
+                let body = &message["bodyValues"][id];
+                if body["isTruncated"].as_bool() == Some(true)
+                    || body["isEncodingProblem"].as_bool() == Some(true)
+                {
+                    continue;
+                }
+                if let Some(value) = body["value"].as_str() {
+                    if value.len() <= MAX_RESPONSE_BODY_BYTES {
+                        if let Ok(values) = parse_descriptors_from_json(value, Some(signing_key)) {
+                            descriptors.extend(values);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if descriptors.is_empty() {
+        return Err(Error::Session(
+            "Mailbox contains no valid signed bootstrap descriptors".into(),
+        ));
+    }
+    descriptors.sort_by(|a, b| a.descriptor_id.cmp(&b.descriptor_id));
+    descriptors.dedup_by(|a, b| a.descriptor_id == b.descriptor_id);
+    Ok(descriptors)
 }
 
 /// Parse descriptors from JSON body
@@ -428,24 +574,41 @@ fn parse_descriptors_from_json(
             valid_descriptors.push(descriptor);
         }
     }
-
+    if valid_descriptors.is_empty() {
+        return Err(Error::Session("No verified bootstrap descriptors".into()));
+    }
     Ok(valid_descriptors)
 }
 
 /// Load descriptors from a single channel
-async fn load_from_channel(channel: &BootstrapChannel) -> ChannelLoadResult {
+async fn load_from_channel(
+    channel: &BootstrapChannel,
+    signing_key: Option<&[u8; 32]>,
+) -> ChannelLoadResult {
     let start = std::time::Instant::now();
 
+    let Some(signing_key) = signing_key else {
+        return ChannelLoadResult {
+            channel_name: channel.name().to_string(),
+            channel_type: channel.channel_type().to_string(),
+            success: false,
+            descriptors_loaded: 0,
+            error: Some("Network bootstrap requires a trusted signing key".into()),
+            latency_ms: 0,
+        };
+    };
     let result = match channel {
-        BootstrapChannel::CDN { url, provider: _ } => load_from_cdn(url).await,
+        BootstrapChannel::CDN { url, provider: _ } => load_from_cdn(url, signing_key).await,
         BootstrapChannel::Telegram { bot_token, chat_id } => {
-            load_from_telegram(bot_token, chat_id.as_deref()).await
+            load_from_telegram(bot_token, chat_id.as_deref(), signing_key).await
         }
-        BootstrapChannel::GitHub { repo, asset_name } => load_from_github(repo, asset_name).await,
+        BootstrapChannel::GitHub { repo, asset_name } => {
+            load_from_github(repo, asset_name, signing_key).await
+        }
         BootstrapChannel::Email {
             address,
             subject_pattern,
-        } => load_from_email(address, subject_pattern).await,
+        } => load_from_email(address, subject_pattern, signing_key).await,
     };
 
     let latency_ms = start.elapsed().as_millis() as u64;
@@ -486,7 +649,8 @@ pub async fn load_multi_channel(config: &BootstrapConfig) -> MultiChannelLoadSta
         .iter()
         .map(|ch| {
             let ch = (*ch).clone();
-            tokio::spawn(async move { load_from_channel(&ch).await })
+            let signing_key = config.trusted_signing_key;
+            tokio::spawn(async move { load_from_channel(&ch, signing_key.as_ref()).await })
         })
         .collect();
 
@@ -549,10 +713,11 @@ impl BackgroundRefresher {
             tokio::time::sleep(delay).await;
         }
 
-        let mut interval = tokio::time::interval(Duration::from_secs(self.config.refresh_interval));
+        let mut interval =
+            tokio::time::interval(Duration::from_secs(self.config.refresh_interval.max(1)));
 
         let mut last_refresh = std::time::Instant::now()
-            .checked_sub(Duration::from_secs(self.config.refresh_interval))
+            .checked_sub(Duration::from_secs(self.config.refresh_interval.max(1)))
             .unwrap_or_else(std::time::Instant::now);
 
         loop {
@@ -563,7 +728,7 @@ impl BackgroundRefresher {
             // means has_valid_descriptors() stays true long after actual expiry).
             let elapsed = last_refresh.elapsed();
             if has_valid_descriptors()
-                && elapsed < Duration::from_secs(self.config.refresh_interval)
+                && elapsed < Duration::from_secs(self.config.refresh_interval.max(1))
             {
                 continue;
             }
@@ -584,9 +749,166 @@ impl BackgroundRefresher {
     }
 }
 
+/// Загружает публичный HTTPS-ресурс с проверкой каждого адреса и лимитом размера.
+pub async fn fetch_public_bytes(url: &str, max_bytes: usize) -> Result<Vec<u8>> {
+    validate_bootstrap_url(url)?;
+    let mut response = bootstrap_http_client(Duration::from_secs(15))?
+        .get(url)
+        .send()
+        .await
+        .map_err(|_| Error::Session("Public download failed".into()))?;
+    if !response.status().is_success() {
+        return Err(Error::Session("Public download HTTP error".into()));
+    }
+    if response
+        .content_length()
+        .is_some_and(|size| size > max_bytes as u64)
+    {
+        return Err(Error::Session("Public download exceeds byte limit".into()));
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|_| Error::Session("Public download interrupted".into()))?
+    {
+        if chunk.len() > max_bytes.saturating_sub(body.len()) {
+            return Err(Error::Session("Public download exceeds byte limit".into()));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn email_bootstrap_checks_sender_subject_signature_and_complete_body() {
+        use ed25519_dalek::Signer;
+        use serde_json::json;
+        let key = ed25519_dalek::SigningKey::from_bytes(&[23; 32]);
+        let mut descriptor = BootstrapDescriptor {
+            descriptor_id: "mail-test".into(),
+            version: 1,
+            created_at: 0,
+            expires_at: u64::MAX,
+            base_mask_ids: vec![],
+            embedded_masks: vec![],
+            candidate_count: 1,
+            kdf_salt: [0; 32],
+            signature: [0; 64],
+        };
+        descriptor.signature = key.sign(&descriptor.signing_bytes()).to_bytes();
+        let response = json!({"methodResponses": [["Email/get", {"list": [{
+            "from": [{"email": "bootstrap@example.com"}], "subject": "AIVPN descriptors",
+            "textBody": [{"partId": "1"}], "bodyValues": {"1": {
+                "value": serde_json::to_string(&descriptor).unwrap(),
+                "isTruncated": false, "isEncodingProblem": false
+            }}
+        }]}, "get"]]});
+        let public = key.verifying_key().to_bytes();
+        assert_eq!(
+            parse_jmap_descriptors(&response, "bootstrap@example.com", "AIVPN", &public)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(parse_jmap_descriptors(&response, "other@example.com", "AIVPN", &public).is_err());
+        assert!(
+            parse_jmap_descriptors(&response, "bootstrap@example.com", "other", &public).is_err()
+        );
+        let other = ed25519_dalek::SigningKey::from_bytes(&[24; 32])
+            .verifying_key()
+            .to_bytes();
+        assert!(
+            parse_jmap_descriptors(&response, "bootstrap@example.com", "AIVPN", &other).is_err()
+        );
+        let mut truncated = response;
+        truncated["methodResponses"][0][1]["list"][0]["bodyValues"]["1"]["isTruncated"] =
+            json!(true);
+        assert!(
+            parse_jmap_descriptors(&truncated, "bootstrap@example.com", "AIVPN", &public).is_err()
+        );
+    }
+
+    #[test]
+    fn bootstrap_dns_rejects_private_and_mixed_answers() {
+        for answers in [
+            vec![],
+            vec!["127.0.0.1:443"],
+            vec!["1.1.1.1:443", "10.0.0.1:443"],
+            vec!["[::ffff:192.168.1.1]:443"],
+        ] {
+            assert!(
+                public_bootstrap_addrs(answers.into_iter().map(|s| s.parse().unwrap())).is_err()
+            );
+        }
+        assert!(public_bootstrap_addrs(
+            ["1.1.1.1:443", "[2606:4700:4700::1111]:443"]
+                .into_iter()
+                .map(|s| s.parse().unwrap())
+        )
+        .is_ok());
+    }
+
+    #[tokio::test]
+    async fn network_channels_require_a_trusted_signing_key() {
+        let config = BootstrapConfig::default().with_cdn("https://example.com/", "test");
+        let stats = load_multi_channel(&config).await;
+        assert_eq!(stats.successful_channels, 0);
+        assert_eq!(stats.total_descriptors, 0);
+        assert!(stats.results[0]
+            .error
+            .as_ref()
+            .unwrap()
+            .contains("trusted signing key"));
+    }
+
+    #[test]
+    fn network_descriptors_reject_forged_signatures() {
+        let descriptor = BootstrapDescriptor {
+            descriptor_id: "forged".into(),
+            version: 1,
+            created_at: 0,
+            expires_at: u64::MAX,
+            base_mask_ids: vec![],
+            embedded_masks: vec![],
+            candidate_count: 1,
+            kdf_salt: [0; 32],
+            signature: [0; 64],
+        };
+        let key = ed25519_dalek::SigningKey::from_bytes(&[1; 32])
+            .verifying_key()
+            .to_bytes();
+        assert!(parse_descriptors_from_json(
+            &serde_json::to_string(&descriptor).unwrap(),
+            Some(&key)
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn bootstrap_url_rejects_non_public_canonical_addresses() {
+        for url in [
+            "https://127.1/",
+            "https://2130706433/",
+            "https://0x7f000001/",
+            "https://LOCALHOST/",
+            "https://localhost./",
+            "https://[::1]/",
+            "https://[::ffff:127.0.0.1]/",
+            "https://[fc00::1]/",
+            "https://[fe80::1]/",
+            "https://0.0.0.0/",
+            "https://100.64.0.1/",
+            "https://224.0.0.1/",
+            "https://user:password@example.com/",
+        ] {
+            assert!(validate_bootstrap_url(url).is_err(), "{url}");
+        }
+    }
 
     #[test]
     fn test_bootstrap_channel_names() {
@@ -623,6 +945,7 @@ mod tests {
         assert!(validate_bootstrap_url("https://cdn.example.com/descriptors.json").is_ok());
         assert!(validate_bootstrap_url("https://cdn.example.com:8443/path").is_ok());
         assert!(validate_bootstrap_url("https://example.org").is_ok());
+        assert!(validate_bootstrap_url("https://192.0.1.10/").is_ok());
     }
 
     #[test]
@@ -662,12 +985,7 @@ mod tests {
 
     #[test]
     fn test_parse_descriptors_from_json_single_object() {
-        // parse_descriptors_from_json accepts a single JSON object as well as an array.
-        // A well-formed but unsigned descriptor with zero signature should round-trip through
-        // the parser (store_verified_descriptor with None key accepts zero-sig descriptors).
-        // HOME is process-wide and cargo test runs tests in parallel threads
-        // within the same process — without this mutex, another test
-        // mutating/reading HOME concurrently races with this one.
+        // Одиночный подписанный объект принимается так же, как массив.
         let _guard = crate::TEST_HOME_MUTEX
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -688,7 +1006,13 @@ mod tests {
             "signature": [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
         }"#;
 
-        let result = parse_descriptors_from_json(desc_json, None);
+        use ed25519_dalek::Signer;
+        let key = ed25519_dalek::SigningKey::from_bytes(&[31; 32]);
+        let mut descriptor: BootstrapDescriptor = serde_json::from_str(desc_json).unwrap();
+        descriptor.signature = key.sign(&descriptor.signing_bytes()).to_bytes();
+        let signed_json = serde_json::to_string(&descriptor).unwrap();
+        let result =
+            parse_descriptors_from_json(&signed_json, Some(&key.verifying_key().to_bytes()));
         assert!(result.is_ok());
         let descs = result.unwrap();
         assert_eq!(descs.len(), 1);

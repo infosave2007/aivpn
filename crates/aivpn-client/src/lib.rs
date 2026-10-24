@@ -17,6 +17,7 @@ pub(crate) static TEST_HOME_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(
 extern crate self as aivpn_client;
 
 pub mod adaptive;
+mod admin_ipc;
 pub mod bench;
 pub mod bootstrap_cache;
 pub mod bootstrap_loader;
@@ -51,3 +52,6 @@ pub use aivpn_common::ssh_install;
 pub use client::AivpnClient;
 pub use run::run;
 pub use tunnel::Tunnel;
+
+#[cfg(target_os = "linux")]
+mod transport_routes;

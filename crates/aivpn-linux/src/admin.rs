@@ -9,7 +9,7 @@
 //!    REST-shaped admin API and the cached role — the same "shell out to the
 //!    client binary" pattern `vpn_manager.rs`/`app.rs` already use for
 //!    connect/bench/record.
-//!  - a direct UDP datagram to the client's local admin socket
+//!  - a framed TCP request to the client's local admin socket
 //!    (`127.0.0.1:44301`) for `qr:` PNG generation. There is no CLI
 //!    subcommand for this (only `record_start`/`record_stop`/`record_status`
 //!    and now `mgmt`/`role` do), so this reuses the exact wire pattern
@@ -111,18 +111,6 @@ impl MgmtMethod {
     }
 }
 
-/// Unique-enough filename suffix for a scratch body file — avoids pulling in
-/// a uuid dependency just for this. Collisions are not a correctness issue
-/// even so (last writer for a given nanosecond+pid wins, and each mgmt call
-/// deletes its own file), just a name-reuse cosmetic.
-fn scratch_suffix() -> String {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    format!("{}-{nanos}", std::process::id())
-}
-
 /// Run `aivpn-client mgmt --method <M> --path <P> [--body-file <F>]` and
 /// parse the `{status}\n` (stderr) / body (stdout) result the subcommand
 /// prints (see `main.rs::ClientCommand::Mgmt`).
@@ -133,37 +121,34 @@ pub async fn mgmt_call(
 ) -> Result<(u16, Vec<u8>), String> {
     let bin = find_client_binary()?;
 
-    let mut tmp_path: Option<PathBuf> = None;
+    let token = pinned_token().ok_or_else(|| "No active admin session".to_string())?;
     let mut cmd = tokio::process::Command::new(&bin);
+    cmd.env_remove("AIVPN_ADMIN_LISTEN");
+    cmd.env("AIVPN_ADMIN_TOKEN", token);
+    cmd.kill_on_drop(true);
     cmd.args(["mgmt", "--method", method.as_clap_arg(), "--path", path]);
-    if let Some(b) = body {
-        let p = std::env::temp_dir().join(format!("aivpn-admin-body-{}.json", scratch_suffix()));
-        // The body can carry client names / exit-node ids / confirm tokens,
-        // and temp_dir() is world-readable — create the scratch file 0600 so
-        // no other local user can read it during its (short) lifetime.
-        let mut opts = tokio::fs::OpenOptions::new();
-        opts.write(true).create(true).truncate(true);
-        #[cfg(unix)]
-        opts.mode(0o600);
-        let mut f = opts
-            .open(&p)
-            .await
-            .map_err(|e| format!("Failed to write request body: {e}"))?;
+    let out = if let Some(body) = body {
         use tokio::io::AsyncWriteExt;
-        f.write_all(&b)
+        cmd.args(["--body-file", "-"]);
+        cmd.stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let mut child = cmd.spawn().map_err(|e| e.to_string())?;
+        let mut input = child
+            .stdin
+            .take()
+            .ok_or_else(|| "Missing request pipe".to_string())?;
+        input.write_all(&body).await.map_err(|e| e.to_string())?;
+        drop(input);
+        child
+            .wait_with_output()
             .await
-            .map_err(|e| format!("Failed to write request body: {e}"))?;
-        cmd.arg("--body-file").arg(&p);
-        tmp_path = Some(p);
-    }
-
-    let out = cmd
-        .output()
-        .await
-        .map_err(|e| format!("Failed to run aivpn-client: {e}"));
-    if let Some(p) = tmp_path {
-        let _ = tokio::fs::remove_file(p).await;
-    }
+            .map_err(|e| format!("Failed to run aivpn-client: {e}"))
+    } else {
+        cmd.output()
+            .await
+            .map_err(|e| format!("Failed to run aivpn-client: {e}"))
+    };
     let out = out?;
 
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -302,7 +287,11 @@ pub async fn audit_log() -> Result<AuditLogView, String> {
 
 pub async fn get_role() -> Result<u8, String> {
     let bin = find_client_binary()?;
+    let token = pinned_token().ok_or_else(|| "No active admin session".to_string())?;
     let out = tokio::process::Command::new(&bin)
+        .env("AIVPN_ADMIN_TOKEN", token)
+        .kill_on_drop(true)
+        .env_remove("AIVPN_ADMIN_LISTEN")
         .arg("role")
         .output()
         .await
@@ -326,7 +315,13 @@ pub struct NewClientArgs {
     pub exit_node: String,
 }
 
-pub async fn add_client(args: NewClientArgs) -> Result<ClientRecord, String> {
+#[derive(Debug, Clone)]
+pub struct CreatedClient {
+    pub client: ClientRecord,
+    pub warning: Option<String>,
+}
+
+pub async fn add_client(args: NewClientArgs) -> Result<CreatedClient, String> {
     let mut obj = serde_json::json!({
         "name": args.name,
         "one_time": args.one_time,
@@ -339,9 +334,12 @@ pub async fn add_client(args: NewClientArgs) -> Result<ClientRecord, String> {
     let created: ClientRecord = parse_json(&resp)?;
     let exit_node = args.exit_node.trim();
     if exit_node.is_empty() {
-        return Ok(created);
+        return Ok(CreatedClient {
+            client: created,
+            warning: None,
+        });
     }
-    update_client(
+    match update_client(
         &created.id,
         EditClientArgs {
             exit_node: Some(Some(exit_node.to_string())),
@@ -349,6 +347,18 @@ pub async fn add_client(args: NewClientArgs) -> Result<ClientRecord, String> {
         },
     )
     .await
+    {
+        Ok(client) => Ok(CreatedClient {
+            client,
+            warning: None,
+        }),
+        Err(error) => Ok(CreatedClient {
+            warning: Some(format!(
+                "Client created; configure its exit node in the client details: {error}"
+            )),
+            client: created,
+        }),
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -524,33 +534,24 @@ fn read_admin_token() -> Option<String> {
         .map(|s| s.trim().to_string())
 }
 
-/// Request a QR-code PNG for `text` from the running client daemon's admin
-/// socket: `"{token}:qr:{base64(text)}"` -> `"{base64(png)}"` (see
-/// `record_cmd.rs::parse_admin_command`/`AdminCommand::Qr`,
-/// `client.rs`'s admin-socket loop). Run on a blocking thread since
-/// `std::net::UdpSocket` doesn't yield to the async runtime — the same
-/// approach the CLI's own `send_admin_request` (main.rs) uses synchronously
-/// from its one-shot process.
+/// Запрашивает QR-код у работающего клиента с токеном исходной сессии.
+/// Блокирующий TCP IPC выполняется в spawn_blocking.
 pub async fn qr_png(text: String) -> Result<Vec<u8>, String> {
-    let token = read_admin_token()
-        .ok_or_else(|| "No admin token found (is the VPN connected?)".to_string())?;
+    let token =
+        pinned_token().ok_or_else(|| "No admin token found (is the VPN connected?)".to_string())?;
     tokio::task::spawn_blocking(move || -> Result<Vec<u8>, String> {
         let payload = format!(
             "{token}:qr:{}",
             base64::engine::general_purpose::STANDARD.encode(text.as_bytes())
         );
-        let socket = std::net::UdpSocket::bind("127.0.0.1:0").map_err(|e| e.to_string())?;
-        socket
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .map_err(|e| e.to_string())?;
-        socket
-            .send_to(payload.as_bytes(), ADMIN_SOCKET_ADDR)
-            .map_err(|e| e.to_string())?;
-        let mut buf = vec![0u8; 65536];
-        let (len, _addr) = socket
-            .recv_from(&mut buf)
-            .map_err(|_| "No reply from aivpn-client daemon".to_string())?;
-        let reply = std::str::from_utf8(&buf[..len]).map_err(|_| "Malformed reply".to_string())?;
+        let reply = aivpn_common::local_admin::request(
+            ADMIN_SOCKET_ADDR
+                .parse()
+                .map_err(|e: std::net::AddrParseError| e.to_string())?,
+            &payload,
+            Duration::from_secs(12),
+        )
+        .map_err(|e| e.to_string())?;
         base64::engine::general_purpose::STANDARD
             .decode(reply.trim())
             .map_err(|e| format!("Malformed QR reply: {e}"))
@@ -586,5 +587,41 @@ mod tests {
             0
         );
         assert_eq!(parse_mgmt_status(""), 0);
+    }
+}
+
+tokio::task_local! { static SESSION_TOKEN: Option<String>; }
+
+pub(crate) fn pinned_token() -> Option<String> {
+    SESSION_TOKEN
+        .try_with(Clone::clone)
+        .unwrap_or_else(|_| read_admin_token())
+}
+
+/// Реквизиты фиксируются до запуска фоновой задачи и не меняются при переподключении.
+pub fn pin_session<F: std::future::Future>(
+    future: F,
+) -> impl std::future::Future<Output = F::Output> {
+    let token = pinned_token();
+    SESSION_TOKEN.scope(token, future)
+}
+
+#[cfg(test)]
+mod session_scope_tests {
+    use super::*;
+    #[tokio::test]
+    async fn queued_operation_keeps_the_token_captured_before_a_reconnect() {
+        let result = SESSION_TOKEN
+            .scope(Some("old-session".into()), async {
+                let pending = pin_session(async {
+                    tokio::task::yield_now().await;
+                    pinned_token()
+                });
+                SESSION_TOKEN
+                    .scope(Some("new-session".into()), pending)
+                    .await
+            })
+            .await;
+        assert_eq!(result.as_deref(), Some("old-session"));
     }
 }

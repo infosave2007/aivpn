@@ -86,19 +86,62 @@ pub fn find_ip_helper_binary() -> Result<PathBuf, String> {
 fn read_trusted_stats_file(path: &std::path::Path) -> Option<(std::time::SystemTime, String)> {
     use std::io::Read;
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-    let mut file = std::fs::OpenOptions::new()
+    let file = std::fs::OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)
         .ok()?;
     let meta = file.metadata().ok()?; // fstat — same inode as the read below
+    const MAX_STATUS_BYTES: u64 = 65_536;
+    if !meta.is_file() || meta.len() > MAX_STATUS_BYTES {
+        return None;
+    }
     if meta.uid() != unsafe { libc::geteuid() } && meta.uid() != 0 {
         return None;
     }
     let mtime = meta.modified().ok()?;
     let mut content = String::new();
-    file.read_to_string(&mut content).ok()?;
+    file.take(MAX_STATUS_BYTES + 1)
+        .read_to_string(&mut content)
+        .ok()?;
+    if content.len() as u64 > MAX_STATUS_BYTES {
+        return None;
+    }
     Some((mtime, content))
+}
+
+#[cfg(test)]
+mod status_file_tests {
+    use super::*;
+    #[test]
+    fn fifo_status_is_rejected_without_waiting_for_writer() {
+        let path = std::env::temp_dir().join(format!(
+            "aivpn-fifo-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let cpath = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(cpath.as_ptr(), 0o600) }, 0);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker_path = path.clone();
+        let thread = std::thread::spawn(move || {
+            tx.send(read_trusted_stats_file(&worker_path)).unwrap();
+        });
+        let result = rx.recv_timeout(std::time::Duration::from_millis(100));
+        let writer = unsafe { libc::open(cpath.as_ptr(), libc::O_WRONLY | libc::O_NONBLOCK) };
+        if writer >= 0 {
+            unsafe {
+                libc::close(writer);
+            }
+        }
+        thread.join().unwrap();
+        std::fs::remove_file(path).unwrap();
+        assert!(result.is_ok(), "status reader blocked opening a FIFO");
+        assert!(result.unwrap().is_none());
+    }
 }
 
 pub fn read_traffic_stats() -> TrafficStats {
@@ -254,6 +297,7 @@ pub fn build_client_command(
     params: &ClientLaunchParams,
 ) -> tokio::process::Command {
     let mut cmd = tokio::process::Command::new(binary);
+    cmd.env_remove("AIVPN_ADMIN_LISTEN");
     // Ensure the VPN client is killed if this GUI process exits
     // (e.g. Quit from the tray). Without this, dropping the Child
     // on shutdown leaves aivpn-client orphaned with the tunnel up.
@@ -364,6 +408,34 @@ pub fn parse_status_line(l: &str) -> Option<VpnStatus> {
             Some(VpnStatus::Error(msg.to_string()))
         }
         _ => None,
+    }
+}
+
+pub use parse_status_line as parse_output_line;
+
+#[cfg(test)]
+mod output_status_tests {
+    use super::*;
+
+    #[test]
+    fn local_setup_logs_do_not_confirm_a_server_connection() {
+        for line in [
+            "Connected to server at 192.0.2.1:443",
+            "TUN interface tun0 created",
+            "Reconnected",
+        ] {
+            assert!(parse_output_line(line).is_none());
+        }
+        assert_eq!(
+            parse_output_line("AIVPN-STATUS connected 10.0.0.2"),
+            Some(VpnStatus::Connected {
+                vpn_ip: "10.0.0.2".into()
+            })
+        );
+        assert_eq!(
+            parse_output_line("AIVPN-STATUS reconnecting"),
+            Some(VpnStatus::Connecting)
+        );
     }
 }
 

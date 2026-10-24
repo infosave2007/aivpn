@@ -9,7 +9,7 @@ use std::time::Duration;
 use crate::client_wire::{build_inner_packet, build_random_mdh_packet, DEFAULT_MDH_LEN};
 use crate::crypto::SessionKeys;
 use crate::error::{Error, Result};
-use crate::fec::FecEncoder;
+use crate::fec::FecSender;
 use crate::protocol::{ControlPayload, InnerType};
 use crate::transport::DatagramTransport;
 use tokio::sync::mpsc;
@@ -46,12 +46,81 @@ impl Default for UploadConfig {
 ///
 /// The CLI client implements this via its MimicryEngine (variable MDH,
 /// traffic-shaped padding, FSM updates). Android implements it via
-/// [`ZeroMdhEncryptor`] (fixed zero-length MDH, random padding).
+/// [`ZeroMdhEncryptor`] (random MDH, random padding).
 pub trait PacketEncryptor: Send {
-    /// Encrypt a TUN data payload into a ready-to-send UDP datagram.
+    /// Интервал перед следующим пакетом данных. Управление его не ожидает.
+    fn data_send_delay(&mut self) -> Duration {
+        Duration::ZERO
+    }
+    fn encrypt_mask_bootstrap(&mut self) -> Result<Vec<u8>> {
+        self.encrypt_keepalive()
+    }
+    /// Профиль именно собранного пакета, а не еще ожидающего MaskUpdate.
+    fn active_mask(&self) -> Option<&crate::mask::MaskProfile> {
+        None
+    }
+    /// До подтвержденного handshake данные остаются в ограниченной очереди.
+    fn data_ready(&self) -> bool {
+        true
+    }
+    /// Шифрует один DATA без FEC. Для отправки TUN с FEC нужен encrypt_data_packets.
     fn encrypt_data(&mut self, payload: &[u8]) -> Result<Vec<u8>>;
+
+    fn max_data_payload(&mut self, datagram_limit: usize) -> usize {
+        datagram_limit.saturating_sub(8 + DEFAULT_MDH_LEN + 2 + 4 + 16 + 32)
+    }
+
+    fn encrypt_data_packets(
+        &mut self,
+        payload: &[u8],
+        datagram_limit: usize,
+    ) -> Result<Vec<Vec<u8>>> {
+        let limit = self.max_data_payload(datagram_limit);
+        let metadata = self.fec_metadata(payload.len());
+        if metadata.is_none() && payload.len() <= limit {
+            return Ok(vec![self.encrypt_data(payload)?]);
+        }
+        // Все участники FEC несут защищенный номер группы и позицию.
+        // Даже один короткий фрагмент проходит userspace, в том числе при
+        // включении FEC после установки политики ядра без FEC.
+        let fragments = if let Some(metadata) = metadata {
+            crate::fragment::split_fec_data(payload, metadata)?
+        } else {
+            crate::fragment::split(InnerType::Data, payload)?
+        };
+        let packets = fragments
+            .iter()
+            .map(|fragment| self.encrypt_fragment(fragment))
+            .collect::<Result<Vec<_>>>()?;
+        if metadata.is_some() {
+            self.feed_fragmented_data(payload);
+        }
+        Ok(packets)
+    }
+    fn fec_metadata(&self, _payload_len: usize) -> Option<crate::fec::FecMetadata> {
+        None
+    }
+    fn feed_fragmented_data(&mut self, _payload: &[u8]) {}
+
     /// Encrypt an arbitrary control message into a ready-to-send UDP datagram.
     fn encrypt_control(&mut self, payload: &ControlPayload) -> Result<Vec<u8>>;
+    /// Разбивает крупное управляющее сообщение до шифрования.
+    fn encrypt_control_packets(&mut self, payload: &ControlPayload) -> Result<Vec<Vec<u8>>> {
+        let bytes = payload.encode()?;
+        if bytes.len() <= crate::fragment::FRAGMENT_DATA_SIZE {
+            return Ok(vec![self.encrypt_control(payload)?]);
+        }
+        crate::fragment::split(InnerType::Control, &bytes)?
+            .iter()
+            .map(|fragment| self.encrypt_fragment(fragment))
+            .collect()
+    }
+    fn encrypt_fragment(&mut self, _payload: &[u8]) -> Result<Vec<u8>> {
+        Err(crate::error::Error::InvalidPacket(
+            "Encryptor does not support fragments",
+        ))
+    }
+
     /// Encrypt a keepalive control message into a ready-to-send UDP datagram.
     fn encrypt_keepalive(&mut self) -> Result<Vec<u8>>;
     /// Called after a data datagram has been successfully sent.
@@ -89,16 +158,14 @@ pub trait OutboundInspector: Send {
 
 // ──────────── Ready-made encryptor: zero MDH ────────────
 
-/// Encryptor using random MDH — suitable for Android and any
-/// client that does not require Mimicry traffic shaping.
-/// Each packet gets fresh random MDH bytes (Issue #30 fix).
+/// Шифратор со случайным MDH без профиля шейпинга.
+/// Встроенные клиенты используют MimicryEncryptor; этот API остается общим.
 pub struct ZeroMdhEncryptor {
     keys: SessionKeys,
     counter: u64,
     seq: u16,
     mdh_len: usize,
-    fec_encoder: Option<FecEncoder>,
-    pending_fec: Option<Vec<u8>>,
+    fec: FecSender,
 }
 
 impl ZeroMdhEncryptor {
@@ -108,8 +175,7 @@ impl ZeroMdhEncryptor {
             counter,
             seq,
             mdh_len: DEFAULT_MDH_LEN,
-            fec_encoder: None,
-            pending_fec: None,
+            fec: FecSender::default(),
         }
     }
 
@@ -119,44 +185,62 @@ impl ZeroMdhEncryptor {
             counter,
             seq,
             mdh_len,
-            fec_encoder: None,
-            pending_fec: None,
+            fec: FecSender::default(),
         }
     }
 
     /// Enable XOR FEC with the given group size. group_size=0 disables FEC.
     pub fn set_fec_group(&mut self, group_size: u8) {
-        self.fec_encoder = if group_size > 0 {
-            Some(FecEncoder::new(group_size, 1500))
-        } else {
-            None
-        };
+        self.fec.set_group(group_size);
+    }
+
+    fn queue_fec(&mut self, payload: &[u8]) {
+        let limit = self.max_data_payload(crate::protocol::MAX_PACKET_SIZE);
+        self.fec.feed(payload, limit, |kind, payload| {
+            let inner = build_inner_packet(kind, self.seq, payload);
+            self.seq = self.seq.wrapping_add(1);
+            build_random_mdh_packet(&self.keys, &mut self.counter, &inner, None, self.mdh_len)
+        });
     }
 }
 
 impl PacketEncryptor for ZeroMdhEncryptor {
+    fn fec_metadata(&self, len: usize) -> Option<crate::fec::FecMetadata> {
+        self.fec.metadata_for(len)
+    }
+    fn feed_fragmented_data(&mut self, payload: &[u8]) {
+        self.queue_fec(payload);
+    }
+    fn max_data_payload(&mut self, datagram_limit: usize) -> usize {
+        datagram_limit
+            .min(crate::protocol::MAX_PACKET_SIZE)
+            .saturating_sub(
+                8 + self.mdh_len
+                    + crate::crypto::session_payload_overhead(&self.keys)
+                    + 2
+                    + 4
+                    + 16
+                    + 32
+                    + 3,
+            )
+    }
+
+    fn data_ready(&self) -> bool {
+        !self.keys.packet_cipher.is_initial()
+    }
+
     fn encrypt_data(&mut self, payload: &[u8]) -> Result<Vec<u8>> {
         let inner = build_inner_packet(InnerType::Data, self.seq, payload);
         self.seq = self.seq.wrapping_add(1);
         let pkt =
             build_random_mdh_packet(&self.keys, &mut self.counter, &inner, None, self.mdh_len)?;
-        if let Some(fec) = self.fec_encoder.as_mut() {
-            if let Some(repair) = fec.feed(payload) {
-                let repair_inner =
-                    build_inner_packet(InnerType::FecRepair, self.seq, &repair.encode());
-                self.seq = self.seq.wrapping_add(1);
-                if let Ok(enc) = build_random_mdh_packet(
-                    &self.keys,
-                    &mut self.counter,
-                    &repair_inner,
-                    None,
-                    self.mdh_len,
-                ) {
-                    self.pending_fec = Some(enc);
-                }
-            }
-        }
         Ok(pkt)
+    }
+
+    fn encrypt_fragment(&mut self, payload: &[u8]) -> Result<Vec<u8>> {
+        let inner = build_inner_packet(InnerType::Fragment, self.seq, payload);
+        self.seq = self.seq.wrapping_add(1);
+        build_random_mdh_packet(&self.keys, &mut self.counter, &inner, None, self.mdh_len)
     }
 
     fn encrypt_control(&mut self, payload: &ControlPayload) -> Result<Vec<u8>> {
@@ -180,7 +264,7 @@ impl PacketEncryptor for ZeroMdhEncryptor {
     fn on_data_sent(&mut self, _payload_len: usize) {}
 
     fn take_fec_repair(&mut self) -> Option<Vec<u8>> {
-        self.pending_fec.take()
+        self.fec.take_packet()
     }
 }
 
@@ -197,6 +281,9 @@ fn is_transient_send_error(e: &std::io::Error) -> bool {
             | NetworkDown
             | AddrNotAvailable
             | Interrupted
+            | WouldBlock
+            | TimedOut
+            | ConnectionRefused
             // EPERM: a local firewall dropped the datagram. Our own kill-switch
             // briefly flushes and re-adds its accept rules on reactivation, so a
             // send to the server can transiently hit EPERM. Dropping the packet
@@ -208,8 +295,29 @@ fn is_transient_send_error(e: &std::io::Error) -> bool {
 /// Send helper that tolerates transient network errors (e.g. mid-switch on mobile).
 /// Returns Ok(()) on success or transient error (logged, packet dropped).
 /// Returns Err only on fatal errors (e.g. EBADF = socket closed).
-async fn send_tolerant(transport: &dyn DatagramTransport, data: &[u8]) -> Result<()> {
-    match transport.send(data).await {
+async fn send_tolerant(
+    transport: &dyn DatagramTransport,
+    data: &[u8],
+    enc: &mut impl PacketEncryptor,
+    is_data: bool,
+) -> Result<()> {
+    if let Some(mask) = enc.active_mask() {
+        transport.set_mask_profile(mask);
+    }
+    if transport.needs_mask_bootstrap() {
+        let bootstrap = enc.encrypt_mask_bootstrap()?;
+        match transport.send(&bootstrap).await {
+            Ok(_) => {}
+            Err(error) if is_transient_send_error(&error) => return Ok(()),
+            Err(error) => return Err(Error::Io(error)),
+        }
+    }
+    let result = if is_data {
+        transport.send_data(data).await
+    } else {
+        transport.send(data).await
+    };
+    match result {
         Ok(_) => Ok(()),
         Err(e) if is_transient_send_error(&e) => {
             tracing::debug!("upload: transient send error (dropped packet): {e}");
@@ -259,6 +367,10 @@ pub async fn run_upload_loop(
 ) -> Result<()> {
     use std::sync::atomic::Ordering;
 
+    if inspector.is_some() {
+        transport.observe_wire();
+    }
+
     // Feed one just-sent data datagram to the optional outbound inspector; if it
     // asks for a control message (e.g. a MaskPreference rotate-request from the
     // client self-gate), encrypt and send it through the normal control path.
@@ -270,9 +382,17 @@ pub async fn run_upload_loop(
         wire: &[u8],
     ) -> Result<()> {
         if let Some(insp) = inspector.as_deref_mut() {
-            if let Some(req) = insp.observe(wire) {
-                let enc_req = enc.encrypt_control(&req)?;
-                send_tolerant(transport.as_ref(), &enc_req).await?;
+            let samples = transport.take_wire_samples();
+            let packets: Vec<&[u8]> = match samples.as_ref() {
+                Some(packets) => packets.iter().map(Vec::as_slice).collect(),
+                None => vec![wire],
+            };
+            for packet in packets {
+                if let Some(req) = insp.observe(packet) {
+                    for enc_req in enc.encrypt_control_packets(&req)? {
+                        send_tolerant(transport.as_ref(), &enc_req, enc, false).await?;
+                    }
+                }
             }
         }
         Ok(())
@@ -285,6 +405,12 @@ pub async fn run_upload_loop(
     // probe, so unbounded suppression leaves connection quality stuck at 0/100 on
     // a busy tunnel.
     let mut last_keepalive = tokio::time::Instant::now();
+    let handshake_start = time::Instant::now();
+    let mut handshake_retry = crate::handshake_retry::HandshakeRetry::default();
+    let mut pending_data: Option<(Vec<u8>, time::Instant)> = None;
+    let mut last_data_sent: Option<time::Instant> = None;
+    let mut readiness_poll = time::interval(Duration::from_millis(20));
+    readiness_poll.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
 
     // Drains and sends every control payload currently queued, without
     // blocking. Called between data sends so control traffic (especially a
@@ -299,8 +425,9 @@ pub async fn run_upload_loop(
             loop {
                 match crx.try_recv() {
                     Ok(payload) => {
-                        let encrypted = enc.encrypt_control(&payload)?;
-                        send_tolerant(transport.as_ref(), &encrypted).await?;
+                        for encrypted in enc.encrypt_control_packets(&payload)? {
+                            send_tolerant(transport.as_ref(), &encrypted, enc, false).await?;
+                        }
                     }
                     Err(mpsc::error::TryRecvError::Empty) => break,
                     Err(mpsc::error::TryRecvError::Disconnected) => break,
@@ -314,21 +441,74 @@ pub async fn run_upload_loop(
         tokio::select! {
             biased;
 
-            // ── Data path (highest priority) ──
-            maybe_pkt = rx.recv() => {
+            _ = time::sleep_until(handshake_start + handshake_retry.next_at()), if !enc.data_ready() => {
+                let elapsed = handshake_start.elapsed();
+                if handshake_retry.expired(elapsed) {
+                    return Err(Error::Session("Handshake timeout (10 s)".into()));
+                }
+                let encrypted = enc.encrypt_keepalive()?;
+                send_tolerant(transport.as_ref(), &encrypted, enc, false).await?;
+                handshake_retry.sent(handshake_start.elapsed());
+            }
+
+            // Готовая RTT-проба не должна ждать опустошения очереди данных.
+            _ = ka_interval.tick() => {
+                if let Some(ref ka_atomic) = config.keepalive_ms {
+                    let new_ms = ka_atomic.load(Ordering::Relaxed);
+                    if new_ms > 0 && new_ms != current_ka_ms {
+                        current_ka_ms = new_ms;
+                        ka_interval = time::interval_at(
+                            time::Instant::now() + Duration::from_millis(new_ms),
+                            Duration::from_millis(new_ms),
+                        );
+                    }
+                }
+                let encrypted = enc.encrypt_keepalive()?;
+                send_tolerant(transport.as_ref(), &encrypted, enc, false).await?;
+                last_keepalive = tokio::time::Instant::now();
+            }
+
+            // Пакеты данных обрабатываются ограниченными сериями.
+            _ = readiness_poll.tick(), if !enc.data_ready() || !transport.mask_data_ready() => {}
+
+            maybe_pkt = rx.recv(), if pending_data.is_none() && enc.data_ready() && transport.mask_data_ready() => {
                 let pkt_data = match maybe_pkt {
                     Some(p) => p,
                     None => return Err(Error::Channel("TUN->UDP channel closed".into())),
                 };
 
-                let encrypted = enc.encrypt_data(&pkt_data)?;
-                send_tolerant(transport.as_ref(), &encrypted).await?;
-                inspect_sent(&mut inspector, transport, enc, &encrypted).await?;
-                if let Some(repair) = enc.take_fec_repair() {
-                    send_tolerant(transport.as_ref(), &repair).await?;
+                if !enc.data_ready() || !transport.mask_data_ready() {
+                    pending_data = Some((pkt_data, time::Instant::now()));
+                    drain_pending_control(&mut control_rx, transport, enc).await?;
+                    continue;
+                }
+                let delay = enc.data_send_delay();
+                let deadline = last_data_sent.unwrap_or_else(time::Instant::now) + delay;
+                pending_data = Some((pkt_data, deadline));
+            }
+
+            _ = time::sleep_until(pending_data.as_ref().map(|(_, deadline)| *deadline).unwrap_or_else(time::Instant::now)), if pending_data.is_some() && enc.data_ready() && transport.mask_data_ready() => {
+                let (pkt_data, deadline) = pending_data.take().unwrap();
+                if !enc.data_ready() || !transport.mask_data_ready() {
+                    pending_data = Some((pkt_data, deadline));
+                    continue;
+                }
+                drain_pending_control(&mut control_rx, transport, enc).await?;
+                if !enc.data_ready() || !transport.mask_data_ready() {
+                    pending_data = Some((pkt_data, deadline));
+                    continue;
+                }
+
+                for encrypted in enc.encrypt_data_packets(&pkt_data, transport.max_datagram())? {
+                    send_tolerant(transport.as_ref(), &encrypted, enc, true).await?;
+                    inspect_sent(&mut inspector, transport, enc, &encrypted).await?;
+                }
+                while let Some(repair) = enc.take_fec_repair() {
+                    send_tolerant(transport.as_ref(), &repair, enc, true).await?;
                 }
                 data_packet_count = data_packet_count.wrapping_add(1);
                 enc.on_data_sent(pkt_data.len());
+                last_data_sent = Some(time::Instant::now());
 
                 // Burst drain: process up to burst_size without yielding.
                 // Check control_rx on every iteration (not just once the
@@ -337,16 +517,28 @@ pub async fn run_upload_loop(
                 // traffic — see the starvation note on this function.
                 for _ in 0..config.burst_size {
                     drain_pending_control(&mut control_rx, transport, enc).await?;
+                    if !enc.data_ready() || !transport.mask_data_ready() { break; }
                     match rx.try_recv() {
                         Ok(pkt) => {
-                            let encrypted = enc.encrypt_data(&pkt)?;
-                            send_tolerant(transport.as_ref(), &encrypted).await?;
-                            inspect_sent(&mut inspector, transport, enc, &encrypted).await?;
-                            if let Some(repair) = enc.take_fec_repair() {
-                                send_tolerant(transport.as_ref(), &repair).await?;
+                            if !enc.data_ready() || !transport.mask_data_ready() {
+                                pending_data = Some((pkt, time::Instant::now()));
+                                break;
+                            }
+                            let delay = enc.data_send_delay();
+                            if !delay.is_zero() {
+                                pending_data = Some((pkt, last_data_sent.unwrap() + delay));
+                                break;
+                            }
+                            for encrypted in enc.encrypt_data_packets(&pkt, transport.max_datagram())? {
+                                send_tolerant(transport.as_ref(), &encrypted, enc, true).await?;
+                                inspect_sent(&mut inspector, transport, enc, &encrypted).await?;
+                            }
+                            while let Some(repair) = enc.take_fec_repair() {
+                                send_tolerant(transport.as_ref(), &repair, enc, true).await?;
                             }
                             data_packet_count = data_packet_count.wrapping_add(1);
                             enc.on_data_sent(pkt.len());
+                            last_data_sent = Some(time::Instant::now());
                         }
                         Err(mpsc::error::TryRecvError::Empty) => break,
                         Err(mpsc::error::TryRecvError::Disconnected) => {
@@ -369,21 +561,6 @@ pub async fn run_upload_loop(
                 }
             }
 
-            // ── Keepalive (fires only when data path is idle) ──
-            _ = ka_interval.tick() => {
-                // Check if keepalive interval was updated dynamically
-                if let Some(ref ka_atomic) = config.keepalive_ms {
-                    let new_ms = ka_atomic.load(Ordering::Relaxed);
-                    if new_ms > 0 && new_ms != current_ka_ms {
-                        current_ka_ms = new_ms;
-                        ka_interval = time::interval(Duration::from_millis(new_ms));
-                    }
-                }
-                let encrypted = enc.encrypt_keepalive()?;
-                send_tolerant(transport.as_ref(), &encrypted).await?;
-                last_keepalive = tokio::time::Instant::now();
-            }
-
             // ── Control payloads ──
             maybe_ctrl = async {
                 if let Some(crx) = control_rx.as_mut() {
@@ -403,8 +580,9 @@ pub async fn run_upload_loop(
                     // channel does ("TUN->UDP channel closed" above).
                     None => return Err(Error::Channel("control channel closed".into())),
                 };
-                let encrypted = enc.encrypt_control(&payload)?;
-                send_tolerant(transport.as_ref(), &encrypted).await?;
+                for encrypted in enc.encrypt_control_packets(&payload)? {
+                    send_tolerant(transport.as_ref(), &encrypted, enc, false).await?;
+                }
             }
         }
     }
@@ -415,6 +593,268 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use tokio::net::UdpSocket;
+
+    struct ShapedWire {
+        ready: std::sync::atomic::AtomicBool,
+        keys: SessionKeys,
+        window: std::sync::Mutex<crate::client_wire::RecvWindow>,
+        records: std::sync::Mutex<Vec<(crate::protocol::InnerType, Duration)>>,
+        start: time::Instant,
+    }
+
+    #[async_trait::async_trait]
+    impl DatagramTransport for ShapedWire {
+        fn mask_data_ready(&self) -> bool {
+            self.ready.load(AtomicOrdering::Acquire)
+        }
+        async fn send(&self, wire: &[u8]) -> std::io::Result<usize> {
+            let decoded = crate::client_wire::decode_downlink_with_offsets(
+                wire,
+                &self.keys,
+                &mut self.window.lock().unwrap(),
+                &mut vec![24],
+                &[8],
+            )
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+            let mut records = self.records.lock().unwrap();
+            records.push((decoded.header.inner_type, self.start.elapsed()));
+            if records
+                .iter()
+                .filter(|(kind, _)| *kind == InnerType::Data)
+                .count()
+                == 4
+            {
+                return Err(std::io::ErrorKind::BrokenPipe.into());
+            }
+            Ok(wire.len())
+        }
+        async fn recv(&self, _: &mut [u8]) -> std::io::Result<usize> {
+            std::future::pending().await
+        }
+        fn kind(&self) -> crate::transport::TransportKind {
+            crate::transport::TransportKind::Udp
+        }
+        fn max_datagram(&self) -> usize {
+            65507
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn real_mimicry_encryptor_spaces_saturated_data_by_profile_iat() {
+        let keys = SessionKeys {
+            packet_cipher: crate::crypto::PacketCipher::Established,
+            session_key: [1; 32],
+            session_key_s2c: [1; 32],
+            tag_secret: [2; 32],
+            prng_seed: [3; 32],
+        };
+        let wire = Arc::new(ShapedWire {
+            ready: std::sync::atomic::AtomicBool::new(true),
+            keys: keys.clone(),
+            window: std::sync::Mutex::new(Default::default()),
+            records: std::sync::Mutex::new(Vec::new()),
+            start: time::Instant::now(),
+        });
+        let transport: Arc<dyn DatagramTransport> = wire.clone();
+        let mut mask = crate::mask::preset_masks::webrtc_zoom_v3();
+        mask.size_iat_joint = None;
+        mask.fsm_states.clear();
+        mask.iat_distribution = crate::mask::IATDistribution {
+            dist_type: crate::mask::IATDistType::Empirical,
+            params: vec![40.0, 40.0],
+            jitter_range_ms: (0.0, 0.0),
+        };
+        let mut encryptor = crate::mimicry::MimicryEncryptor::new(
+            keys,
+            0,
+            0,
+            mask,
+            Arc::new(std::sync::Mutex::new(None)),
+        );
+        let (sender, mut receiver) = mpsc::channel(8);
+        for _ in 0..4 {
+            sender.send(vec![42; 64]).await.unwrap();
+        }
+        let config = UploadConfig {
+            burst_size: 63,
+            keepalive_interval: Duration::from_secs(8),
+            keepalive_ms: None,
+        };
+        let (control_sender, mut control_receiver) = mpsc::channel(8);
+        let scheduled_control = control_sender.clone();
+        let control_task = tokio::spawn(async move {
+            time::sleep(Duration::from_millis(10)).await;
+            scheduled_control
+                .send(ControlPayload::Keepalive { send_ts: 42 })
+                .await
+                .unwrap();
+        });
+        let outcome = run_upload_loop(
+            &mut receiver,
+            Some(&mut control_receiver),
+            &transport,
+            &mut encryptor,
+            &config,
+            None,
+        )
+        .await;
+        control_task.await.unwrap();
+        assert!(
+            matches!(outcome, Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::BrokenPipe)
+        );
+        let records = wire.records.lock().unwrap();
+        assert!(
+            records
+                .iter()
+                .any(|(kind, at)| *kind == InnerType::Control && *at == Duration::from_millis(10)),
+            "Управляющий пакет ждет срок отправки данных"
+        );
+        let data: Vec<_> = records
+            .iter()
+            .filter(|(kind, _)| *kind == InnerType::Data)
+            .map(|(_, at)| *at)
+            .collect();
+        assert_eq!(data.len(), 4);
+        for pair in data.windows(2) {
+            assert_eq!(
+                pair[1] - pair[0],
+                Duration::from_millis(40),
+                "Профиль IAT потерян при насыщенном uplink"
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pending_carrier_blocks_data_but_not_control() {
+        let keys = SessionKeys {
+            packet_cipher: crate::crypto::PacketCipher::Established,
+            session_key: [1; 32],
+            session_key_s2c: [1; 32],
+            tag_secret: [2; 32],
+            prng_seed: [3; 32],
+        };
+        let wire = Arc::new(ShapedWire {
+            ready: std::sync::atomic::AtomicBool::new(false),
+            keys: keys.clone(),
+            window: std::sync::Mutex::new(Default::default()),
+            records: std::sync::Mutex::new(Vec::new()),
+            start: time::Instant::now(),
+        });
+        let transport: Arc<dyn DatagramTransport> = wire.clone();
+        let mut mask = crate::mask::preset_masks::webrtc_zoom_v3();
+        mask.iat_distribution.params = vec![0.0, 0.0];
+        mask.iat_distribution.jitter_range_ms = (0.0, 0.0);
+        mask.size_iat_joint = None;
+        let mut encryptor = crate::mimicry::MimicryEncryptor::new(
+            keys,
+            0,
+            0,
+            mask,
+            Arc::new(std::sync::Mutex::new(None)),
+        );
+        let (sender, mut receiver) = mpsc::channel(8);
+        let (control_sender, mut control_receiver) = mpsc::channel(8);
+        let task = tokio::spawn(async move {
+            run_upload_loop(
+                &mut receiver,
+                Some(&mut control_receiver),
+                &transport,
+                &mut encryptor,
+                &UploadConfig::default(),
+                None,
+            )
+            .await
+        });
+        control_sender
+            .send(ControlPayload::Keepalive { send_ts: 42 })
+            .await
+            .unwrap();
+        for _ in 0..4 {
+            sender.send(vec![42; 64]).await.unwrap();
+        }
+        time::sleep(Duration::from_millis(100)).await;
+        {
+            let records = wire.records.lock().unwrap();
+            assert!(records.iter().any(|(kind, _)| *kind == InnerType::Control));
+            assert!(
+                records.iter().all(|(kind, _)| *kind != InnerType::Data),
+                "Data вышел до готовности внешней маски"
+            );
+        }
+        wire.ready.store(true, AtomicOrdering::Release);
+        assert!(time::timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .is_err());
+        assert_eq!(
+            wire.records
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(kind, _)| *kind == InnerType::Data)
+                .count(),
+            4
+        );
+    }
+
+    struct ClockedTransport(AtomicUsize);
+
+    #[async_trait::async_trait]
+    impl DatagramTransport for ClockedTransport {
+        async fn send(&self, packet: &[u8]) -> std::io::Result<usize> {
+            if packet[0] == 0 {
+                self.0.fetch_add(1, AtomicOrdering::Relaxed);
+                time::advance(Duration::from_millis(10)).await;
+            } else if packet[0] == 2 && self.0.load(AtomicOrdering::Relaxed) > 0 {
+                return Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe));
+            }
+            Ok(packet.len())
+        }
+
+        async fn recv(&self, _buffer: &mut [u8]) -> std::io::Result<usize> {
+            std::future::pending().await
+        }
+
+        fn kind(&self) -> crate::transport::TransportKind {
+            crate::transport::TransportKind::Udp
+        }
+
+        fn max_datagram(&self) -> usize {
+            65507
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn protocol_audit_keepalive_is_not_starved_by_data() {
+        let clocked = Arc::new(ClockedTransport(AtomicUsize::new(0)));
+        let transport: Arc<dyn DatagramTransport> = clocked.clone();
+        let (sender, mut receiver) = mpsc::channel(128);
+        for _ in 0..128 {
+            sender.try_send(vec![0]).unwrap();
+        }
+        let config = UploadConfig {
+            burst_size: 3,
+            keepalive_interval: Duration::from_millis(25),
+            keepalive_ms: None,
+        };
+        let mut encryptor = MarkerEncryptor { next_seq: 0 };
+        assert!(run_upload_loop(
+            &mut receiver,
+            None,
+            &transport,
+            &mut encryptor,
+            &config,
+            None
+        )
+        .await
+        .is_err());
+        let data_sent = clocked.0.load(AtomicOrdering::Relaxed);
+        assert!(
+            data_sent <= 8,
+            "keepalive waited for {data_sent} data packets"
+        );
+    }
 
     /// Minimal `PacketEncryptor` test double: no real crypto, just tags each
     /// outgoing datagram with a marker byte (0 = data, 1 = control, 2 =

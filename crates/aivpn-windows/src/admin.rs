@@ -1,34 +1,13 @@
-//! Admin panel bridge — in-tunnel client-management commands (P3.4).
+//! Управление через работающий процесс aivpn-client.
 //!
-//! The Windows GUI never links the Rust client core directly (see
-//! `vpn_manager.rs`'s module doc) — it drives `aivpn-client.exe` as a
-//! subprocess. Wave 2 (commit defa271) added a desktop admin-socket bridge
-//! to that binary: `aivpn-client mgmt --method M --path P [--body-file F]`
-//! issues a curated REST-shaped call against the server's management API
-//! over the *live tunnel* (no separate network path, no extra credentials —
-//! it rides the same PSK/device-key session), and `aivpn-client role`
-//! reports the server-assigned role (0=User, 1=Viewer, 2=Admin) the running
-//! daemon cached from the handshake.
-//!
-//! There is no CLI subcommand for QR rendering yet, so `qr_png_for` speaks
-//! the daemon's raw UDP admin-socket protocol directly instead (the same
-//! `"{token}:qr:{base64(text)}"` -> `"{base64(png)}"` datagram exchange the
-//! `mgmt`/`role` subcommands use internally under the hood) — this crate
-//! never links `aivpn-client`, so the admin-token file path logic is
-//! duplicated here from `record_cmd.rs::admin_token_path()`'s Windows
-//! branch rather than imported.
-//!
-//! Every call in this module is blocking (subprocess spawn + wait, or a
-//! bounded-timeout UDP round-trip) — `spawn()` always runs it on a fresh
-//! `std::thread`, reporting back through an `mpsc::Sender<AdminResponse>`
-//! polled once per frame in `main.rs`'s `tick()`, so the egui update loop
-//! is never blocked waiting on the client daemon (a `mgmt` call can take up
-//! to ~5s if the daemon is unreachable).
+//! Команды mgmt и role вызываются через CLI, QR и диагностика используют
+//! общий клиент локального TCP IPC. Управляющие запросы идут через VPN-сессию.
+//! Каждая операция получает токен исходной сессии до запуска фонового потока.
+//! Результаты приходят через mpsc, чтобы ожидание не блокировало интерфейс.
 
 use base64::Engine as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
 
 /// Default admin-socket address of the running `aivpn-client` daemon —
@@ -583,9 +562,6 @@ pub enum AdminRequest {
     ListClients,
     AddClient(NewClientForm),
     EditClient(EditClientForm),
-    DeleteClient {
-        id: String,
-    },
     RevokeClient {
         id: String,
     },
@@ -640,11 +616,7 @@ pub enum AdminResponse {
     /// form, whenever the two overlapped).
     ClientSaved {
         editing: bool,
-        result: Result<AdminClient, String>,
-    },
-    ClientDeleted {
-        id: String,
-        result: Result<(), String>,
+        result: Result<(AdminClient, Option<String>), String>,
     },
     ClientRevoked {
         id: String,
@@ -687,7 +659,9 @@ pub enum AdminResponse {
 /// `AdminResponse` back over `tx`. Safe to call from the egui update loop —
 /// never blocks the caller.
 pub fn spawn(client_binary: PathBuf, req: AdminRequest, tx: Sender<AdminResponse>) {
+    let token = read_admin_token();
     std::thread::spawn(move || {
+        SESSION_TOKEN.with(|slot| *slot.borrow_mut() = token);
         let resp = match req {
             AdminRequest::Role => AdminResponse::Role(run_role(&client_binary)),
             AdminRequest::ListClients => AdminResponse::Clients(list_clients(&client_binary)),
@@ -697,12 +671,8 @@ pub fn spawn(client_binary: PathBuf, req: AdminRequest, tx: Sender<AdminResponse
             },
             AdminRequest::EditClient(form) => AdminResponse::ClientSaved {
                 editing: true,
-                result: edit_client(&client_binary, &form),
+                result: edit_client(&client_binary, &form).map(|client| (client, None)),
             },
-            AdminRequest::DeleteClient { id } => {
-                let result = mgmt_status_only(&client_binary, "DELETE", &path_client(&id));
-                AdminResponse::ClientDeleted { id, result }
-            }
             AdminRequest::RevokeClient { id } => {
                 let result = mgmt_status_only(&client_binary, "POST", &path_revoke(&id));
                 AdminResponse::ClientRevoked { id, result }
@@ -755,46 +725,33 @@ fn mgmt_call(
     path: &str,
     body: &[u8],
 ) -> Result<(u16, Vec<u8>), String> {
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-
-    let body_file = if body.is_empty() {
-        None
-    } else {
-        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        let p = std::env::temp_dir().join(format!(
-            "aivpn-admin-body-{}-{ts}-{n}.json",
-            std::process::id()
-        ));
-        std::fs::write(&p, body).map_err(|e| format!("Failed to write request body: {e}"))?;
-        Some(p)
-    };
-
+    let token = pinned_token().ok_or_else(|| "No active admin session".to_string())?;
     let mut cmd = Command::new(client_binary);
-    cmd.arg("mgmt")
-        .arg("--method")
-        .arg(method)
-        .arg("--path")
-        .arg(path);
-    if let Some(p) = &body_file {
-        cmd.arg("--body-file").arg(p);
-    }
+    cmd.env_remove("AIVPN_ADMIN_LISTEN");
+    cmd.env("AIVPN_ADMIN_TOKEN", token);
+    cmd.args(["mgmt", "--method", method, "--path", path]);
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x08000000;
-        cmd.creation_flags(CREATE_NO_WINDOW);
+        cmd.creation_flags(0x08000000);
     }
-
-    let out = cmd.output();
-    if let Some(p) = &body_file {
-        let _ = std::fs::remove_file(p);
-    }
-    let out = out.map_err(|e| format!("Failed to run aivpn-client: {e}"))?;
-
+    let out = if body.is_empty() {
+        cmd.output().map_err(|e| e.to_string())?
+    } else {
+        use std::io::Write;
+        cmd.args(["--body-file", "-"]);
+        cmd.stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let mut child = cmd.spawn().map_err(|e| e.to_string())?;
+        let written = match child.stdin.take() {
+            Some(mut pipe) => pipe.write_all(body),
+            None => Err(std::io::Error::other("Missing request pipe")),
+        };
+        let output = child.wait_with_output().map_err(|e| e.to_string())?;
+        written.map_err(|e| e.to_string())?;
+        output
+    };
     let stderr = String::from_utf8_lossy(&out.stderr);
     match parse_mgmt_status(&stderr) {
         Some(status) => {
@@ -853,7 +810,10 @@ fn list_clients(client_binary: &Path) -> Result<Vec<AdminClient>, String> {
     parse_client_list(&body)
 }
 
-fn add_client(client_binary: &Path, form: &NewClientForm) -> Result<AdminClient, String> {
+fn add_client(
+    client_binary: &Path,
+    form: &NewClientForm,
+) -> Result<(AdminClient, Option<String>), String> {
     // Matches the server's `TunnelAddClientRequest` (mgmt_service.rs): name
     // (required), one_time (defaults false if omitted), expires_at
     // (plain `Option<DateTime<Utc>>` — omitting the key deserializes as
@@ -875,7 +835,7 @@ fn add_client(client_binary: &Path, form: &NewClientForm) -> Result<AdminClient,
 
     let exit_node = form.exit_node.trim();
     if exit_node.is_empty() {
-        return Ok(created);
+        return Ok((created, None));
     }
     // The create route can't set `exit_node`, so apply it as a second
     // in-tunnel call against the client id the server just handed back. If
@@ -889,11 +849,14 @@ fn add_client(client_binary: &Path, form: &NewClientForm) -> Result<AdminClient,
         expires_at: created.expires_at.clone().unwrap_or_default(),
         exit_node: exit_node.to_string(),
     };
-    edit_client(client_binary, &patch_form).map_err(|e| {
-        format!(
-            "Client \"{}\" was created, but setting its exit node failed: {e}",
-            created.name
-        )
+    Ok(match edit_client(client_binary, &patch_form) {
+        Ok(client) => (client, None),
+        Err(error) => (
+            created,
+            Some(format!(
+                "Client created; configure its exit node in the client details: {error}"
+            )),
+        ),
     })
 }
 
@@ -995,7 +958,10 @@ fn get_audit_log(client_binary: &Path) -> Result<AuditLogView, String> {
 /// Run `aivpn-client role` and parse the bare decimal digit it prints to
 /// stdout on success (0=User, 1=Viewer, 2=Admin).
 fn run_role(client_binary: &Path) -> Result<u8, String> {
+    let token = pinned_token().ok_or_else(|| "No active admin session".to_string())?;
     let mut cmd = Command::new(client_binary);
+    cmd.env_remove("AIVPN_ADMIN_LISTEN");
+    cmd.env("AIVPN_ADMIN_TOKEN", token);
     cmd.arg("role");
     #[cfg(windows)]
     {
@@ -1033,41 +999,28 @@ fn admin_token_path() -> PathBuf {
     std::env::temp_dir().join("aivpn-admin.token")
 }
 
-fn read_admin_token() -> Option<String> {
+pub(crate) fn read_admin_token() -> Option<String> {
     std::fs::read_to_string(admin_token_path())
         .ok()
         .map(|s| s.trim().to_string())
 }
 
-/// Ask the running daemon to render `text` (typically a client's
-/// `aivpn://` connection key) as a QR code PNG, via the admin socket's
-/// `"{token}:qr:{base64(text)}"` -> `"{base64(png)}"` datagram exchange —
-/// the same wire protocol the `mgmt`/`role` CLI subcommands use
-/// internally (`send_admin_request` in aivpn-client's `main.rs`),
-/// reimplemented here since this crate has no way to call that function
-/// directly and no CLI subcommand wraps it.
+/// Запрашивает QR-код по локальному TCP IPC с токеном исходной сессии.
 fn qr_png_for(text: &str) -> Result<Vec<u8>, String> {
-    let token = read_admin_token().ok_or_else(|| {
+    let token = pinned_token().ok_or_else(|| {
         "No admin token found — is the VPN client running and connected as Admin?".to_string()
     })?;
     let b64_text = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
     let line = format!("{token}:qr:{b64_text}");
 
-    let socket =
-        std::net::UdpSocket::bind("127.0.0.1:0").map_err(|e| format!("Socket bind failed: {e}"))?;
-    socket
-        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
-        .map_err(|e| format!("Socket configuration failed: {e}"))?;
-    socket
-        .send_to(line.as_bytes(), ADMIN_SOCKET_ADDR)
-        .map_err(|e| format!("Failed to reach the VPN client: {e}"))?;
-
-    let mut buf = [0u8; 65536];
-    let (len, _addr) = socket.recv_from(&mut buf).map_err(|e| {
-        format!("No reply from the VPN client at {ADMIN_SOCKET_ADDR} (is it running?): {e}")
-    })?;
-    let reply =
-        std::str::from_utf8(&buf[..len]).map_err(|_| "Invalid reply encoding".to_string())?;
+    let reply = aivpn_common::local_admin::request(
+        ADMIN_SOCKET_ADDR
+            .parse()
+            .map_err(|e: std::net::AddrParseError| e.to_string())?,
+        &line,
+        std::time::Duration::from_secs(12),
+    )
+    .map_err(|e| format!("No reply from the VPN client: {e}"))?;
     base64::engine::general_purpose::STANDARD
         .decode(reply.trim())
         .map_err(|e| format!("Failed to decode QR image: {e}"))
@@ -1363,4 +1316,9 @@ mod tests {
         );
         assert_eq!(parse_mgmt_status(""), None);
     }
+}
+
+thread_local! { static SESSION_TOKEN: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) }; }
+fn pinned_token() -> Option<String> {
+    SESSION_TOKEN.with(|slot| slot.borrow().clone())
 }

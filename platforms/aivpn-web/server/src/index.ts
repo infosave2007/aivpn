@@ -34,6 +34,13 @@ scheduleRateLimitCleaner(Math.max(config.AUTH_RATE_WINDOW_MS, config.API_RATE_WI
 
 const app = new Hono()
 
+const privateResponse = async (c: Context, next: Next) => {
+  await next()
+  c.header('Cache-Control', 'no-store')
+}
+app.use('/web/*', privateResponse)
+app.use('/api/v1/*', privateResponse)
+
 // Security headers
 app.use('*', secureHeaders({
   contentSecurityPolicy: {

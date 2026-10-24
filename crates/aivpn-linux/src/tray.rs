@@ -28,7 +28,7 @@ fn brand_icon() -> &'static Icon {
         // ksni::Icon wants ARGB32 (network byte order, A,R,G,B per pixel);
         // png decodes to RGBA (R,G,B,A per pixel) for this asset's color type.
         let mut argb = Vec::with_capacity(rgba.len());
-        for px in rgba.chunks_exact(4) {
+        for px in rgba.as_chunks::<4>().0 {
             argb.extend_from_slice(&[px[3], px[0], px[1], px[2]]);
         }
         Icon {

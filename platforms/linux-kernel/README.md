@@ -27,8 +27,9 @@ Expected improvement at high packet rates: 2–4× throughput, 3–5× latency r
 
 | Requirement | Minimum |
 |---|---|
-| Kernel version | 6.1 |
+| Kernel version | Номер версии сам по себе не определяет совместимость Rust API |
 | `CONFIG_RUST=y` | Required for Rust control-plane glue |
+| Rust miscdevice API | `MiscDeviceOptions::into_raw` и `file_operations.owner`, указывающий на модуль |
 | `CONFIG_CRYPTO_CHACHA20POLY1305=y` | Required for in-kernel AEAD |
 | `CONFIG_TUN=y` or `=m` | Required (same as user-space path) |
 | `CONFIG_CRYPTO_USER_API_AEAD` | Not required (module uses in-kernel API directly) |
@@ -39,7 +40,11 @@ Check your kernel config:
 grep -E 'CONFIG_RUST|CONFIG_CRYPTO_CHACHA|CONFIG_TUN' /boot/config-$(uname -r)
 ```
 
-All three must be `y` or `m`.
+`CONFIG_RUST` должен быть `y`; криптография и TUN должны быть доступны в ядре или модуле.
+
+Модуль использует нестабильный Rust-for-Linux API, поэтому поддержки всех ядер начиная с 6.1 нет. В upstream Linux до 7.2 включительно miscdevice vtable не задает `owner`. Такое API не удерживает код модуля, пока открыт `/dev/aivpn`, и небезопасно при выгрузке. Нужен kernel с исправленным miscdevice API, в том числе возможен backport. Перед регистрацией устройства AIVPN проверяет настоящую vtable: при NULL `fops` или `owner` загрузка завершается с `ENODEV`, устройство не публикуется. Ручного закрепления модуля нет. Без ускорителя клиент и сервер остаются на userspace TUN.
+
+Контракт API проверен по [Linux v7.2](https://raw.githubusercontent.com/torvalds/linux/v7.2/rust/kernel/miscdevice.rs) и [исправленной реализации upstream](https://github.com/torvalds/linux/blob/master/rust/kernel/miscdevice.rs). Совпадение номера ядра или успешная компиляция C-части не заменяют проверку загрузки и работы Rust-модуля.
 
 ### Build Dependencies
 
@@ -54,12 +59,7 @@ dnf install dkms kernel-devel gcc rustup
 pacman -S dkms linux-headers base-devel rustup
 ```
 
-Install the nightly Rust toolchain (required by Rust-for-Linux):
-
-```bash
-rustup toolchain install nightly
-rustup component add rust-src --toolchain nightly
-```
+Компилятор Rust и rust-src должны соответствовать toolchain, которым собраны Rust metadata выбранного ядра. Произвольный nightly или stable из rustup может дать `E0514` даже при подходящем API. Используйте toolchain пакета kernel headers или настройку сборки своего ядра.
 
 ---
 
@@ -191,6 +191,10 @@ The server process must run as root (or have read-write permission on `/dev/aivp
 
 The Rust-for-Linux kernel crate API changes between kernel versions. Check `dkms status` and the build log at `/var/lib/dkms/aivpn/<version>/<kernel>/build/make.log`. A crate API breakage will produce a Rust compile error. File an issue with the kernel version and the error output.
 
+**Загрузка завершается с ENODEV и сообщением о miscdevice API**
+
+`file_operations.owner` отсутствует в используемом Rust-for-Linux API. Это отказ до регистрации `/dev/aivpn`, а не ошибка VPN-сеанса. Обновите ядро или примените исправление его miscdevice API. Не обходите проверку owner: до исправления используйте userspace TUN.
+
 **Module loads but throughput improvement is not visible**
 
 Ensure `CONFIG_CRYPTO_CHACHA20_X86_64=y` (or `_ARM64=y`) is enabled so the kernel uses the SIMD-accelerated ChaCha20 implementation. Without it, the kernel falls back to the generic C implementation, which has similar throughput to the user-space crate.
@@ -208,9 +212,9 @@ Ensure `CONFIG_CRYPTO_CHACHA20_X86_64=y` (or `_ARM64=y`) is enabled so the kerne
 
 ## Compatibility Matrix
 
-| aivpn-server version | Module API version | Kernel range |
+| aivpn-server version | Module API version | Kernel contract |
 |---|---|---|
-| 0.5.x | 1 | 6.1 – 6.9 |
+| Текущий клиент и сервер | 7 | Совместимый Rust API с module owner в miscdevice vtable; проверка перед регистрацией |
 
 The module API version is checked at runtime. A version mismatch causes automatic fallback, not a crash.
 

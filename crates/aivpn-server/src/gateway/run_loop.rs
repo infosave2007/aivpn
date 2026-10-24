@@ -53,14 +53,10 @@ impl super::Gateway {
             if self.config.network_config.ipv6_enabled {
                 let tun = self.config.tun_name.as_str();
                 let prefix = self.config.network_config.ipv6_prefix.as_str();
-                match crate::nat::setup_nat66(tun, prefix) {
-                    Ok(()) => info!("NAT66 configured for prefix {}", prefix),
-                    Err(e) => warn!("NAT66 setup failed (non-fatal): {}", e),
-                }
-                match crate::nat::assign_ipv6_to_tun(tun, "fd10:cafe::1", 48) {
-                    Ok(()) => info!("Assigned fd10:cafe::1/48 to {}", tun),
-                    Err(e) => warn!("IPv6 TUN address assignment failed (non-fatal): {}", e),
-                }
+                crate::nat::setup_nat66(tun, prefix).map_err(Error::Session)?;
+                let (gateway, prefix_len) = self.config.network_config.ipv6_gateway()?;
+                crate::nat::assign_ipv6_to_tun(tun, &gateway.to_string(), prefix_len)
+                    .map_err(Error::Session)?;
             }
 
             self.nat_forwarder = Some(Arc::new(nat));
@@ -100,16 +96,35 @@ impl super::Gateway {
 
         let std_sock: std::net::UdpSocket = socket2_sock.into();
         let socket = UdpSocket::from_std(std_sock).map_err(Error::Io)?;
+        crate::udp_source::enable(&socket).map_err(Error::Io)?;
 
         info!(
             "UDP listener bound to {} (4MB buffers via socket2)",
             self.config.listen_addr
         );
 
-        self.udp_socket = Some(Arc::new(socket));
+        let wire_observer = {
+            #[cfg(feature = "neural")]
+            {
+                let gate = self.dpi_gate.clone();
+                self.config.enable_neural.then(|| {
+                    Arc::new(move |session_id, wire: &[u8]| gate.record_wire(session_id, wire))
+                        as super::mask_socket::WireObserver
+                })
+            }
+            #[cfg(not(feature = "neural"))]
+            {
+                None
+            }
+        };
+        self.udp_socket = Some(MaskSocket::with_wire_observer(
+            Arc::new(socket),
+            wire_observer,
+        ));
 
         // Wire kernel accelerator to live TUN + UDP socket.
-        if let Some(ref ka) = self.kernel_accel {
+        KERNEL_DOWNLINK_ARMED.store(false, std::sync::atomic::Ordering::Relaxed);
+        if let Some(ka) = self.kernel_accel.clone() {
             let mut tun_ifindex: u32 = 0;
             if self.config.enable_nat {
                 let tun_name = self.config.tun_name.as_str();
@@ -119,6 +134,7 @@ impl super::Gateway {
                         tun_ifindex = ifindex;
                         if let Err(e) = ka.set_tun(ifindex) {
                             warn!("aivpn: kernel set_tun failed: {e}");
+                            tun_ifindex = 0;
                         } else {
                             info!(
                                 "Kernel acceleration wired to TUN {} (ifindex={ifindex})",
@@ -128,34 +144,39 @@ impl super::Gateway {
                     }
                 }
             }
-            use std::os::unix::io::AsRawFd;
-            let udp_fd = self.udp_socket.as_ref().unwrap().as_raw_fd();
-            if let Err(e) = ka.set_udp_sock(udp_fd) {
-                warn!("aivpn: kernel set_udp_sock failed: {e}");
-            }
+            if tun_ifindex == 0 {
+                self.kernel_accel = None;
+            } else {
+                use std::os::unix::io::AsRawFd;
+                let udp_fd = self.udp_socket.as_ref().unwrap().as_raw_fd();
+                if let Err(e) = ka.set_udp_sock(udp_fd) {
+                    warn!("aivpn: kernel set_udp_sock failed: {e}");
+                    self.kernel_accel = None;
+                }
 
-            // Kernel downlink (server->client) encryption is OPT-IN and OFF by
-            // default: it is a new, live-unproven fast path. Enable it only when
-            // AIVPN_KERNEL_DOWNLINK=1 is set in the environment. With it off, the
-            // egress hook is never registered and the user-space downlink path
-            // (downlink_worker) runs exactly as before.
-            let downlink_enabled = std::env::var("AIVPN_KERNEL_DOWNLINK")
-                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-                .unwrap_or(false);
-            if downlink_enabled {
-                if tun_ifindex == 0 {
-                    warn!(
-                        "aivpn: AIVPN_KERNEL_DOWNLINK set but TUN ifindex unknown \
+                // Kernel downlink (server->client) encryption is OPT-IN and OFF by
+                // default: it is a new, live-unproven fast path. Enable it only when
+                // AIVPN_KERNEL_DOWNLINK=1 is set in the environment. With it off, the
+                // egress hook is never registered and the user-space downlink path
+                // (downlink_worker) runs exactly as before.
+                let downlink_enabled = std::env::var("AIVPN_KERNEL_DOWNLINK")
+                    .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                    .unwrap_or(false);
+                if downlink_enabled && self.kernel_accel.is_some() {
+                    if tun_ifindex == 0 {
+                        warn!(
+                            "aivpn: AIVPN_KERNEL_DOWNLINK set but TUN ifindex unknown \
                          (enable_nat off?) — downlink egress not enabled"
-                    );
-                } else if let Err(e) = ka.set_egress(udp_fd, tun_ifindex, true) {
-                    warn!("aivpn: kernel set_egress (downlink) failed: {e}");
-                } else {
-                    KERNEL_DOWNLINK_ARMED.store(true, std::sync::atomic::Ordering::Relaxed);
-                    info!(
-                        "Kernel downlink egress enabled (tun ifindex={tun_ifindex}) \
+                        );
+                    } else if let Err(e) = ka.set_egress(udp_fd, tun_ifindex, true) {
+                        warn!("aivpn: kernel set_egress (downlink) failed: {e}");
+                    } else {
+                        KERNEL_DOWNLINK_ARMED.store(true, std::sync::atomic::Ordering::Relaxed);
+                        info!(
+                            "Kernel downlink egress enabled (tun ifindex={tun_ifindex}) \
                          — server->client encryption offloaded to /dev/aivpn"
-                    );
+                        );
+                    }
                 }
             }
         }
@@ -206,7 +227,6 @@ impl super::Gateway {
                     error!("No masks loaded — cannot start gateway");
                     return Ok(());
                 };
-                let server_vpn_ip = self.config.network_config.server_vpn_ip;
                 let recorder = self.recording_manager.clone();
 
                 // Channel for writing packets to TUN device (upload + ICMP replies)
@@ -235,6 +255,10 @@ impl super::Gateway {
                 // `Gateway`.
                 let chain_reverse_routes = self.chain_reverse_routes.clone();
                 let chain_reverse_rx = self.chain_reverse_rx.take();
+                let pool_dialer = self.pool_dialer.clone();
+                let site_data_rx = self.site_data_rx.take();
+                let network = self.config.network_config.clone();
+                let kernel_accel = self.kernel_accel.clone();
                 tokio::spawn(async move {
                     Self::tun_read_loop(
                         tun_reader,
@@ -244,12 +268,15 @@ impl super::Gateway {
                         chain_reverse_routes,
                         chain_reverse_rx,
                         mask,
-                        server_vpn_ip,
+                        network,
                         recorder,
                         client_db,
                         qos_enforcer,
                         allow_peer_routing,
                         downlink_shaping,
+                        pool_dialer,
+                        site_data_rx,
+                        kernel_accel,
                     )
                     .await;
                 });
@@ -268,6 +295,11 @@ impl super::Gateway {
             #[cfg(feature = "neural")]
             let dpi_gate_cleanup = self.dpi_gate.clone();
             let ka_cleanup = self.kernel_accel.clone();
+            let network_cleanup = self.config.network_config.clone();
+            let allow_peer_cleanup = self.config.allow_peer_routing;
+            let exit_enabled_cleanup = self.config.exit_node_enabled;
+            let neural_enabled_cleanup = self.config.enable_neural;
+            let shaping_cleanup = self.config.downlink_shaping;
             let rate_limits_cleanup = self.rate_limits.clone();
             let handshake_cooldowns_cleanup = self.handshake_cooldowns.clone();
             let handshake_locks_cleanup = self.handshake_locks.clone();
@@ -354,6 +386,8 @@ impl super::Gateway {
                     // keepalives, so it never idles out). Drop any session whose
                     // client is now missing, disabled, or expired.
                     let mut revoked: Vec<[u8; 16]> = Vec::new();
+                    let mut revoked_sessions: Vec<([u8; 16], Arc<parking_lot::Mutex<Session>>)> =
+                        Vec::new();
                     if let Some(ref db) = client_db_cleanup {
                         // P1.3: keep the session handle alongside its id so
                         // the loop below can send `Shutdown{reason:4}`
@@ -368,10 +402,6 @@ impl super::Gateway {
                         // `Gateway` handle to force-disconnect immediately)
                         // saw its connection die with no explanation until
                         // this fix.
-                        let mut revoked_sessions: Vec<(
-                            [u8; 16],
-                            Arc<parking_lot::Mutex<Session>>,
-                        )> = Vec::new();
                         for entry in sessions.iter_sessions() {
                             let (sid, cid) = {
                                 let s = entry.value().lock();
@@ -391,41 +421,118 @@ impl super::Gateway {
                                 }
                             }
                         }
-                        for (sid, session) in &revoked_sessions {
-                            warn!(
+                    }
+                    if let Some(ref ka) = ka_cleanup {
+                        let revoked_ids: std::collections::HashSet<[u8; 16]> =
+                            revoked_sessions.iter().map(|(sid, _)| *sid).collect();
+                        let (catalog_mdh_len, _, _, _) = mask_catalog_cleanup.packet_layout();
+                        let catalog_tag_offset = mask_catalog_cleanup
+                            .primary_mask()
+                            .map(|mask| mask.tag_offset)
+                            .unwrap_or(0);
+                        let global_exit =
+                            exit_enabled_cleanup || masked_exit_addr_cleanup.read().is_some();
+                        let mut revoked_clients = std::collections::HashSet::new();
+                        for entry in sessions.iter_sessions() {
+                            let session = entry.value().clone();
+                            let mut sess = session.lock();
+                            let sid = sess.session_id;
+                            if revoked_ids.contains(&sid) {
+                                let (rx, tx) = harvest_kernel_counters(ka, &mut sess);
+                                let cid = sess.client_id.clone();
+                                drop(sess);
+                                if let (Some(db), Some(cid)) =
+                                    (client_db_cleanup.as_ref(), cid.as_ref())
+                                {
+                                    if rx != 0 || tx != 0 {
+                                        db.record_traffic(cid, rx, tx);
+                                    }
+                                    if revoked_clients.insert(cid.clone()) {
+                                        let _ = ka.client_revoke(&kernel_client_key(cid));
+                                    }
+                                }
+                                kernel_clear_offload(ka, &sid);
+                                continue;
+                            }
+                            let (tag_offset, mdh_len) = kernel_wire_layout(
+                                &sess,
+                                catalog_tag_offset,
+                                catalog_mdh_len as u16,
+                            );
+                            let mut input = kernel_input_from_session(
+                                &sess,
+                                client_db_cleanup.as_deref(),
+                                &network_cleanup,
+                                allow_peer_cleanup,
+                                global_exit,
+                            );
+                            let recording = recorder.as_ref().is_some_and(|r| r.is_recording(&sid));
+                            input.userspace_rx |= neural_enabled_cleanup || recording;
+                            input.userspace_tx |= recording || shaping_cleanup != ShapingLevel::Off;
+                            let _ =
+                                kernel_maintain(ka, &mut sess, tag_offset, mdh_len, &input, false);
+                            let (rx, tx) = harvest_kernel_counters(ka, &mut sess);
+                            let cid = sess.client_id.clone();
+                            drop(sess);
+                            if let (Some(db), Some(cid)) = (client_db_cleanup.as_ref(), cid) {
+                                if rx != 0 || tx != 0 {
+                                    db.record_traffic(&cid, rx, tx);
+                                }
+                            }
+                        }
+                    }
+                    // Сохраняем и малые порции трафика до удаления idle-сессий.
+                    if let Some(db) = client_db_cleanup.as_ref() {
+                        for entry in sessions.iter_sessions() {
+                            let (cid, received, sent) = {
+                                let mut sess = entry.value().lock();
+                                (
+                                    sess.client_id.clone(),
+                                    std::mem::take(&mut sess.pending_bytes_in),
+                                    std::mem::take(&mut sess.pending_bytes_out),
+                                )
+                            };
+                            if let Some(cid) = cid {
+                                if received != 0 || sent != 0 {
+                                    db.record_traffic(&cid, received, sent);
+                                }
+                            }
+                        }
+                    }
+                    for (sid, session) in &revoked_sessions {
+                        warn!(
                                 "Dropping active session {:02x}{:02x}{:02x}{:02x} — client revoked/disabled/expired",
                                 sid[0], sid[1], sid[2], sid[3]
                             );
-                            let shutdown = ControlPayload::Shutdown { reason: 4 };
-                            // Per-SESSION mask MDH (same pattern as the inline
-                            // rekey task below and `force_disconnect_client`'s
-                            // doc comment): a session on a generated/custom mask
-                            // has a different MDH length, and a catalog-mdh
-                            // packet lands at the wrong ciphertext offset
-                            // client-side — the client would never decode
-                            // reason=4 (it still gets disconnected server-side,
-                            // but silently).
-                            let session_mdh = session
-                                .lock()
-                                .mask
-                                .as_ref()
-                                .map(packet_mdh_bytes_for_mask)
-                                .unwrap_or_else(|| mdh.clone());
-                            if let Err(e) = Self::send_control_message_via(
-                                socket.as_ref(),
-                                &session_mdh,
-                                &shutdown,
-                                session,
-                            )
-                            .await
-                            {
-                                debug!(
+                        let shutdown = ControlPayload::Shutdown { reason: 4 };
+                        // Per-SESSION mask MDH (same pattern as the inline
+                        // rekey task below and `force_disconnect_client`'s
+                        // doc comment): a session on a generated/custom mask
+                        // has a different MDH length, and a catalog-mdh
+                        // packet lands at the wrong ciphertext offset
+                        // client-side - the client would never decode
+                        // reason=4 (it still gets disconnected server-side,
+                        // but silently).
+                        let session_mdh = session
+                            .lock()
+                            .mask
+                            .as_ref()
+                            .map(packet_mdh_bytes_for_mask)
+                            .unwrap_or_else(|| mdh.clone());
+                        if let Err(e) = Self::send_control_message_via(
+                            socket.as_ref(),
+                            &session_mdh,
+                            &shutdown,
+                            session,
+                        )
+                        .await
+                        {
+                            debug!(
                                     "revocation sweep: Shutdown send failed for session {:02x}{:02x}{:02x}{:02x}: {}",
                                     sid[0], sid[1], sid[2], sid[3], e
                                 );
-                            }
-                            sessions.remove_session(sid);
                         }
+                        sessions.remove_session(sid);
                     }
 
                     let expired = sessions.cleanup_expired();
@@ -440,7 +547,7 @@ impl super::Gateway {
                         #[cfg(feature = "neural")]
                         dpi_gate_cleanup.cleanup(session_id);
                         if let Some(ref ka) = ka_cleanup {
-                            let _ = ka.session_remove(session_id);
+                            kernel_clear_offload(ka, session_id);
                         }
                     }
                     // Stop active recordings for removed sessions
@@ -467,22 +574,10 @@ impl super::Gateway {
                     // didn't exist before the change, so it's removed.
                     let mut rolled_back_any = false;
                     {
-                        // Keep the same transaction lock through the restore:
-                        // removing an expired entry and writing its prior value
-                        // must not interleave with a new apply to that path.
-                        let mutation_guard = pending_config_cleanup.lock_mutation();
-                        for entry in
-                            pending_config_cleanup.tick_locked(Instant::now(), &mutation_guard)
+                        for (entry, restore_result) in
+                            pending_config_cleanup.rollback_expired(Instant::now())
                         {
-                            let path = entry.target_path().to_path_buf();
-                            let restore_result = match entry.rollback_value() {
-                                Some(prior_bytes) => std::fs::write(&path, prior_bytes),
-                                None => match std::fs::remove_file(&path) {
-                                    Ok(()) => Ok(()),
-                                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                                    Err(e) => Err(e),
-                                },
-                            };
+                            let path = entry.target_path();
                             match restore_result {
                                 Ok(()) => {
                                     rolled_back_any = true;
@@ -734,17 +829,15 @@ impl super::Gateway {
 
     /// Background task: periodic neural resonance checks (Patent 1)
     ///
-    /// For each active session, computes reconstruction error between
-    /// observed traffic features and the assigned mask's signature vector.
-    /// If MSE exceeds threshold → mask is detected as compromised by DPI.
-    /// Triggers automatic mask rotation (Patent 3).
+    /// Сравнивает статистику с обученным эталоном или резервной проекцией.
+    /// Превышение порога запускает смену маски, но не доказывает обнаружение DPI.
     async fn resonance_check_loop(
         neural: Arc<parking_lot::Mutex<NeuralResonanceModule>>,
         sessions: Arc<SessionManager>,
         catalog: Arc<MaskCatalog>,
         metrics: Arc<MetricsCollector>,
         check_interval_secs: u64,
-        socket: Arc<UdpSocket>,
+        socket: Arc<MaskSocket>,
         #[cfg(feature = "neural")] dpi_gate: Arc<crate::dpi_gate::DpiGate>,
     ) {
         let interval = Duration::from_secs(check_interval_secs);
@@ -770,8 +863,12 @@ impl super::Gateway {
 
             // Collect mask update packets to send AFTER releasing the neural lock
             // (parking_lot::MutexGuard is !Send, cannot hold across .await)
-            let mut pending_sends: Vec<(Vec<u8>, std::net::SocketAddr, [u8; 16], MaskProfile)> =
-                Vec::new();
+            let mut pending_sends: Vec<(
+                (Vec<Vec<u8>>, bool),
+                std::net::SocketAddr,
+                [u8; 16],
+                MaskProfile,
+            )> = Vec::new();
 
             {
                 let mut neural_guard = neural.lock();
@@ -823,7 +920,7 @@ impl super::Gateway {
                                         if let Some(session) = sessions.get_session(session_id) {
                                             let client_addr = session.lock().client_addr;
                                             match sessions
-                                                .build_mask_update_packet(&session, &new_mask)
+                                                .build_mask_update_packets(&session, &new_mask)
                                             {
                                                 Ok(packet) => {
                                                     pending_sends.push((
@@ -914,7 +1011,7 @@ impl super::Gateway {
                                 if let Some(session) = sessions.get_session(session_id) {
                                     let client_addr = session.lock().client_addr;
                                     if let Ok(packet) =
-                                        sessions.build_mask_update_packet(&session, &new_mask)
+                                        sessions.build_mask_update_packets(&session, &new_mask)
                                     {
                                         pending_sends.push((
                                             packet,
@@ -935,7 +1032,7 @@ impl super::Gateway {
                     }
 
                     // Check anomaly detection (DPI blocking indicators)
-                    if neural_guard.is_mask_anomalous(mask_id) {
+                    if neural_guard.is_mask_anomalous(mask_id) && neural_guard.can_rotate(mask_id) {
                         warn!(
                             "Anomaly detected for mask '{}' (packet loss / RTT spike)",
                             mask_id
@@ -944,11 +1041,13 @@ impl super::Gateway {
                         // H1: atomically check-then-mark so a single-mask
                         // catalog is never emptied.
                         if let Some(new_mask) = catalog.mark_compromised_with_fallback(mask_id) {
+                            neural_guard.record_rotation(mask_id);
+                            neural_guard.clear_mask_anomaly(mask_id);
                             info!("Anomaly-triggered rotation to mask '{}'", new_mask.mask_id);
                             if let Some(session) = sessions.get_session(session_id) {
                                 let client_addr = session.lock().client_addr;
                                 if let Ok(packet) =
-                                    sessions.build_mask_update_packet(&session, &new_mask)
+                                    sessions.build_mask_update_packets(&session, &new_mask)
                                 {
                                     pending_sends.push((
                                         packet,
@@ -966,7 +1065,7 @@ impl super::Gateway {
 
             // Send collected MaskUpdate packets (async, safe now)
             for (packet, client_addr, session_id, new_mask) in pending_sends {
-                if let Err(e) = socket.send_to(&packet, client_addr).await {
+                if let Err(e) = socket.send_packets_to(&packet, client_addr).await {
                     warn!("Failed to send MaskUpdate to {}: {}", client_addr, e);
                 } else {
                     sessions.update_session_mask(&session_id, new_mask);

@@ -20,7 +20,7 @@ use aivpn_server::dns_proxy::DnsProxyConfig;
 use aivpn_server::gateway::GatewayConfig;
 use aivpn_server::node_registry::NodeRegistry;
 use aivpn_server::pool_dialer::PoolDialer;
-use aivpn_server::pool_sync::{PeerSyncer, PoolSyncConfig};
+use aivpn_server::pool_sync::PoolSyncConfig;
 use aivpn_server::qos::QosEnforcer;
 use aivpn_server::server_config::ServerFileConfig;
 use aivpn_server::site_sync::SiteToSiteConfig;
@@ -299,15 +299,13 @@ pub async fn run_server(
     }
 
     // Clone client_db for pool sync before it is consumed by GatewayConfig.
-    let client_db_for_sync: Option<Arc<ClientDatabase>> =
-        pool_sync_config.as_ref().map(|_| client_db.clone());
+    let client_db_for_sync: Option<Arc<ClientDatabase>> = (pool_sync_config.is_some()
+        || file_config
+            .as_ref()
+            .is_some_and(|config| config.site_to_site.is_some()))
+    .then(|| client_db.clone());
 
-    // FORK-B pool-sync DIALER: decode `sync_key` once, up front, reused both
-    // to derive the gateway's masked-pool-client recognition keys below and
-    // to construct `PoolDialer` further down. Only meaningful when
-    // `transport = "masked"` — for the default/legacy transport this stays
-    // `None` and `GatewayConfig::pool_server_keypair`/`pool_client_psk` stay
-    // `None`, reproducing byte-for-byte the pre-existing behavior.
+    // Один sync_key задает ключи распознавания шлюза и исходящих соединений пула.
     let pool_masked_sync_key: Option<[u8; 32]> = pool_sync_config
         .as_ref()
         .filter(|c| c.transport_is_masked())
@@ -358,6 +356,7 @@ pub async fn run_server(
     #[cfg(feature = "dns")]
     let dns_config: Option<DnsProxyConfig> = file_config.as_ref().and_then(|c| c.dns.clone());
 
+    let site_tun_name = tun_name.clone();
     // Create config
     let config = GatewayConfig {
         listen_addr,
@@ -388,12 +387,11 @@ pub async fn run_server(
         tun_mtu: effective_tun_mtu,
         event_bus: event_bus.clone(),
         qos_enforcer,
-        chain_forwarder: None,
         mtls: file_config.as_ref().and_then(|c| c.mtls.clone()),
         exit_node_enabled: file_config
             .as_ref()
             .and_then(|c| c.pool.as_ref())
-            .map_or(false, |p| p.exit_node_enabled.unwrap_or(false)),
+            .is_some_and(|p| p.exit_node_enabled.unwrap_or(false)),
         audit_log: audit_logger, // H-S-8: wire audit logger into gateway
         allow_peer_routing: file_config
             .as_ref()
@@ -435,11 +433,6 @@ pub async fn run_server(
             &args,
             file_config.as_ref(),
         ),
-        // FORK-B pool-sync masked pool-client recognition: `Some` only when
-        // `pool.transport = "masked"` and a valid `sync_key` is configured
-        // (see `pool_masked_sync_key` above) — every other configuration
-        // (transport unset/"legacy", or no pool config at all) leaves both
-        // `None`, matching the gateway's pre-existing byte-for-byte behavior.
         pool_server_keypair: pool_masked_sync_key.map(|k| crypto::pool_server_keypair(&k)),
         pool_client_psk: pool_masked_sync_key.map(|k| crypto::pool_client_psk(&k)),
         // P1.2b: same values threaded into the REST API's `ServeConfig`
@@ -460,6 +453,18 @@ pub async fn run_server(
     // Create and run server
     match AivpnServer::new(config) {
         Ok(mut server) => {
+            let _passive_receiver = file_config
+                .as_ref()
+                .and_then(|config| config.passive_distribution.clone())
+                .filter(|config| config.enable)
+                .map(|config| {
+                    let store = server.mask_store().expect("mask store is initialized");
+                    aivpn_server::passive_distribution::spawn_receiver(config, store)
+                        .unwrap_or_else(|error| {
+                            eprintln!("Passive distribution configuration failed: {error}");
+                            std::process::exit(1);
+                        })
+                });
             // Spawn management API (Unix socket, optional). Placed after
             // AivpnServer::new() so ServeConfig can share the SAME live
             // bootstrap_descriptors Arc as the gateway's rotation task —
@@ -574,309 +579,127 @@ pub async fn run_server(
                 }
             }
 
-            // Start pool sync after session_manager and mask catalog are initialised.
-            // Sync packets ride the existing VPN UDP port — no extra TCP port needed.
-            //
-            // FORK-B: `transport = "masked"` switches to the new `PoolDialer`
-            // (each node dials its peers as a masked, headless pool-client and
-            // runs bidirectional DB anti-entropy over that session) INSTEAD OF
-            // the legacy mask-independent, push-only `PeerSyncer` — the two
-            // are mutually exclusive per node. Any other transport value
-            // (including unset, the default) keeps running the exact
-            // pre-existing `PeerSyncer` path below, unchanged.
-            // PHASE 3 (exit / chain-forward over masked transport): set when
-            // the masked-transport branch below already wired
-            // `server.set_masked_exit(..)` for a configured `exit_node`, so
-            // the legacy dedicated-socket `ChainForwarder` block further
-            // down skips building a second, redundant exit path. Stays
-            // `false` (and the legacy block runs exactly as before) for the
-            // default/legacy transport, or when masked transport has no
-            // `exit_node` configured.
-            let mut masked_exit_wired = false;
-            // BUG E1 fix: tracks whether the masked `PoolDialer` actually
-            // STARTED (set true only inside the `PoolDialer::new(..) =>
-            // Some(dialer)` success branch below), as opposed to merely
-            // being configured (`pool.transport == "masked"`). The
-            // site-to-site channel selection further down must key off
-            // this — not off the config value — so that a bad/missing
-            // `pool.sync_key` (or other `PoolDialer::new` failure) falls
-            // back to the working legacy `site_sync::start` path instead of
-            // going dark.
-            let mut masked_dialer_active = false;
-            if let (Some(ref pool_cfg), Some(db)) = (&pool_sync_config, client_db_for_sync) {
-                if pool_cfg.transport_is_masked() {
-                    // PHASE 3 (site-to-site over masked transport): when
-                    // site_to_site is ALSO configured, hand this node's
-                    // local_subnets to the dialer so it advertises them as
-                    // `RouteSync` over the same masked pool-peer sessions —
-                    // reusing pool.peers as the dial set. Empty when
-                    // site-to-site isn't configured, which makes the dialer's
-                    // RouteSync advertise path a no-op (plain pool-sync-only
-                    // masked transport, unchanged from Phase 1/2).
-                    let site_local_subnets: Vec<String> = s2s_config
+            // Межузловой обмен и площадки используют только handshake-сессии.
+            if pool_sync_config.is_some() || s2s_config.is_some() {
+                use base64::Engine as _;
+                let fail = |message: &str| -> ! {
+                    error!("Invalid peer configuration: {message}");
+                    std::process::exit(1)
+                };
+                let db = client_db_for_sync
+                    .clone()
+                    .unwrap_or_else(|| fail("client database is required"));
+                let identity_path = pool_sync_config
+                    .as_ref()
+                    .and_then(|p| p.node_identity_key.as_ref())
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| {
+                        Path::new(&args.clients_db).with_file_name("node_identity.key")
+                    });
+                let seed = crate::cli::node::load_or_generate_node_identity_seed(&identity_path);
+                let identity = crypto::node_identity_from_seed(&seed);
+                let registry = Arc::new(NodeRegistry::load(
+                    Path::new(&args.clients_db).with_file_name("pool_nodes.json"),
+                    pool_sync_config.as_ref().is_none_or(|p| p.allow_auto_add()),
+                ));
+                server.set_node_registry(registry.clone());
+                let local_node_id = pool_sync_config
+                    .as_ref()
+                    .and_then(|p| p.node_id.clone())
+                    .or_else(|| s2s_config.as_ref().and_then(|s| s.local_name.clone()))
+                    .unwrap_or_else(|| fail("node_id or site local_name is required"));
+                server.set_local_node_identity(identity.clone(), local_node_id.trim().to_string());
+                server.set_require_node_enrollment(
+                    pool_sync_config
                         .as_ref()
-                        .map(|c| c.local_subnets.clone())
-                        .unwrap_or_default();
-
-                    // PHASE 3 (exit / chain-forward): `pool.exit_node` is an
-                    // independent config knob from `pool.peers` — an
-                    // operator may point at an exit node that isn't also a
-                    // pool-sync peer. Make sure the dialer's dial set
-                    // includes it so a masked pool-client session to the
-                    // exit node exists for `ChainForward` to ride. A clone
-                    // is cheap here (a handful of small strings) and keeps
-                    // `PoolDialer::new`'s existing `&PoolSyncConfig`
-                    // interface untouched.
-                    // B2b (per-client exit routing): pre-seed the dial set
-                    // with every CLIENT's `exit_node` override too (not just
-                    // the global default above), so a masked pool-client
-                    // dial_loop already exists for any per-client exit an
-                    // operator configured before this node started. The
-                    // dial set is fixed at `PoolDialer::new` construction —
-                    // there is no runtime add-peer yet (that's a later
-                    // wave); a per-client exit_node added/changed AFTER
-                    // startup that isn't already in this union falls back
-                    // to the global default (`choose_exit` in gateway.rs)
-                    // until this node restarts.
-                    let dialer_cfg: PoolSyncConfig = {
-                        let mut cfg = pool_cfg.clone();
-                        if let Some(ref exit_node) = pool_cfg.exit_node {
-                            if !cfg.peers.iter().any(|p| p == exit_node) {
-                                cfg.peers.push(exit_node.clone());
-                            }
-                        }
-                        for client in db.list_clients() {
-                            if let Some(ref client_exit) = client.exit_node {
-                                if !cfg.peers.iter().any(|p| p == client_exit) {
-                                    cfg.peers.push(client_exit.clone());
-                                }
-                            }
-                        }
-                        cfg
-                    };
-
-                    // PHASE 4 (reverse chain-forward): only an entry node
-                    // that actually dials an exit (masked transport AND
-                    // `pool.exit_node` configured) needs anywhere to deliver
-                    // a reverse-direction `ChainForward` reply — every other
-                    // masked-transport node (plain pool-sync peer, or an
-                    // exit node itself, which routes replies via its own
-                    // `chain_reverse_routes` table instead) leaves this
-                    // `None` and the dialer's inbound tap for `ChainForward`
-                    // simply drops it.
-                    let reverse_downlink_tx = pool_cfg
-                        .exit_node
-                        .is_some()
-                        .then(|| server.chain_reverse_downlink_sender());
-
-                    // PHASE 4 (per-node cryptographic identity): resolve
-                    // this node's own durable Ed25519 identity — loaded from
-                    // `pool.node_identity_key` if configured, else generated
-                    // (and persisted) at `node_identity.key` sibling to the
-                    // clients-db file — and hand it to the dialer so it can
-                    // sign a `NodeEnrollment` proof for every peer it dials.
-                    // Also install the pool-node identity registry
-                    // (`pool_nodes.json`, likewise sibling to clients-db) so
-                    // the gateway's RECEIVE side can bind/verify peers that
-                    // dial IN to us. Both are scoped to masked transport
-                    // only — the legacy `PeerSyncer` branch below never
-                    // reaches this code, so it stays byte-for-byte
-                    // unchanged (no identity, no registry).
-                    let node_identity_key_path = pool_cfg
-                        .node_identity_key
-                        .as_ref()
-                        .map(PathBuf::from)
-                        .unwrap_or_else(|| {
-                            Path::new(&args.clients_db).with_file_name("node_identity.key")
-                        });
-                    let node_identity_seed = crate::cli::node::load_or_generate_node_identity_seed(
-                        &node_identity_key_path,
-                    );
-                    let node_signing_key = crypto::node_identity_from_seed(&node_identity_seed);
-
-                    let pool_nodes_path =
-                        Path::new(&args.clients_db).with_file_name("pool_nodes.json");
-                    let node_registry = Arc::new(NodeRegistry::load(
-                        pool_nodes_path,
-                        pool_cfg.allow_auto_add(),
-                    ));
-                    // Wave B1: fill the REST API's deferred-fill slot (see
-                    // that variable's doc comment) BEFORE `node_registry` is
-                    // moved into `set_node_registry` below.
-                    #[cfg(all(feature = "management-api", unix))]
-                    {
-                        *mgmt_pool_registry_slot.lock() = Some(node_registry.clone());
+                        .is_none_or(|p| p.require_node_enrollment()),
+                );
+                #[cfg(all(feature = "management-api", unix))]
+                {
+                    *mgmt_pool_registry_slot.lock() = Some(registry.clone());
+                }
+                let local_subnets = s2s_config
+                    .as_ref()
+                    .map(|s| s.local_subnets.clone())
+                    .unwrap_or_default();
+                let dialer = if let Some(pool) = pool_sync_config.as_ref() {
+                    if !pool.transport_is_masked() {
+                        fail("legacy transport removed; use masked");
                     }
-                    server.set_node_registry(node_registry);
-                    // D1: enforce crypto-proven node identity in route
-                    // authorization when the operator opts in
-                    // (pool.require_node_enrollment). Default false keeps the
-                    // migration-safe behavior (self-asserted node_id trusted
-                    // with a warning) until the whole cluster runs Phase 4.
-                    server.set_require_node_enrollment(pool_cfg.require_node_enrollment());
-
-                    if let Some(dialer) = PoolDialer::new(
+                    let mut config = pool.clone();
+                    for endpoint in pool
+                        .exit_node
+                        .iter()
+                        .cloned()
+                        .chain(db.list_clients().into_iter().filter_map(|c| c.exit_node))
+                    {
+                        if !config.peers.contains(&endpoint) {
+                            config.peers.push(endpoint);
+                        }
+                    }
+                    PoolDialer::new(
                         db,
-                        &dialer_cfg,
-                        site_local_subnets,
-                        reverse_downlink_tx,
-                        Some(node_signing_key),
-                    ) {
-                        // BUG E1 fix: the masked dialer actually started —
-                        // the site-to-site selection below relies on this,
-                        // not on the config-only `transport_is_masked()`.
-                        masked_dialer_active = true;
-
-                        // P1.3 (priority pool beacon): give the gateway a
-                        // `PoolDialer` handle regardless of whether this
-                        // node also dials an exit — `set_masked_exit` below
-                        // only wires it for the exit-dialing case. Lets the
-                        // admin "revoke" mgmt route trigger an immediate
-                        // beacon via `Gateway::trigger_priority_pool_beacon`
-                        // on every masked pool-sync node, not just exit
-                        // nodes.
-                        server.set_pool_dialer(dialer.clone());
-                        // Wave B1: fill the REST API's deferred-fill slot —
-                        // see `mgmt_pool_registry_slot`'s doc comment.
-                        #[cfg(all(feature = "management-api", unix))]
-                        {
-                            *mgmt_pool_dialer_slot.lock() = Some(dialer.clone());
-                        }
-
-                        // PHASE 3: wire the masked exit route BEFORE handing
-                        // the dialer's Arc off to `start` (which consumes
-                        // it) — `exit_addr` here must be byte-for-byte the
-                        // same string just ensured above to be in
-                        // `dialer_cfg.peers`, since it doubles as the
-                        // `PoolDialer::send_to_peer` lookup key.
-                        if let Some(ref exit_node) = pool_cfg.exit_node {
-                            server.set_masked_exit(dialer.clone(), exit_node.clone());
-                            info!(
-                                "Multi-hop: chain forwarding to exit node {} over masked \
-                                 pool-client transport",
-                                exit_node
-                            );
-                            masked_exit_wired = true;
-                        }
-
-                        // No process-wide graceful-shutdown flag exists yet for
-                        // background tasks in this server (the legacy
-                        // `PeerSyncer::start` loops likewise run until process
-                        // exit) — a fresh, never-flipped `AtomicBool` reproduces
-                        // that same "runs until the process exits" behavior
-                        // while still satisfying `AivpnClient::run`'s shutdown
-                        // signature.
-                        let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
-                        dialer.start(shutdown);
-                        info!(
-                            "Pool sync active ({} peers, masked pool-client transport)",
-                            dialer_cfg.peers.len()
+                        &config,
+                        local_subnets,
+                        Some(server.chain_reverse_downlink_sender()),
+                        Some(identity),
+                    )
+                    .unwrap_or_else(|| fail("pool requires a nonzero sync_key and node_id"))
+                } else {
+                    let site = s2s_config.as_ref().unwrap();
+                    let name = site
+                        .local_name
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or_else(|| fail("site_to_site.local_name is required"));
+                    PoolDialer::site_only(db, name, local_subnets, true, Some(identity))
+                        .unwrap_or_else(|| fail("cannot create site dialer"))
+                };
+                registry
+                    .check_health()
+                    .unwrap_or_else(|error| fail(&format!("node registry: {error}")));
+                dialer.set_node_registry(registry);
+                dialer.set_site_tun_tx(server.site_data_sender());
+                if let Some(site) = s2s_config.as_ref() {
+                    aivpn_server::site_sync::init_config_only(site, &site_tun_name)
+                        .unwrap_or_else(|error| fail(&error));
+                    for peer in &site.peers {
+                        let key: [u8; 32] = base64::engine::general_purpose::STANDARD
+                            .decode(&peer.sync_key)
+                            .ok()
+                            .and_then(|bytes| bytes.try_into().ok())
+                            .filter(|key| *key != [0; 32])
+                            .unwrap_or_else(|| {
+                                fail("each site peer requires a nonzero 32-byte sync_key")
+                            });
+                        let keypair = crypto::pool_server_keypair(&key);
+                        let psk = crypto::pool_client_psk(&key);
+                        server
+                            .add_masked_peer_key(
+                                keypair.clone(),
+                                psk,
+                                peer.node_id.clone().unwrap_or_else(|| peer.name.clone()),
+                            )
+                            .unwrap_or_else(|error| fail(&error.to_string()));
+                        dialer.queue_site_peer(
+                            peer.endpoint.clone(),
+                            keypair,
+                            psk,
+                            peer.node_id.clone().unwrap_or_else(|| peer.name.clone()),
                         );
                     }
-                } else if let Some(syncer) = PeerSyncer::new(db, pool_cfg, event_bus.clone()) {
-                    syncer.start(server.session_manager());
-                    info!(
-                        "Pool sync active ({} peers, in-protocol UDP)",
-                        pool_cfg.peers.len()
-                    );
                 }
-            }
-            // Multi-hop: create the legacy dedicated-socket chain forwarder
-            // if exit_node is configured — but only when the masked
-            // transport branch above didn't already wire the exit route via
-            // `server.set_masked_exit` (`masked_exit_wired`). Under the
-            // default/legacy transport this `if` is always true and the
-            // block below runs exactly as before, byte-for-byte.
-            if !masked_exit_wired {
-                if let Some(ref pool_cfg) = pool_sync_config {
-                    if let Some(ref exit_node) = pool_cfg.exit_node {
-                        use base64::Engine as _;
-                        let sync_key_opt: Option<[u8; 32]> = pool_cfg
-                            .sync_key
-                            .as_deref()
-                            .and_then(|k| base64::engine::general_purpose::STANDARD.decode(k).ok())
-                            .and_then(|b| b.try_into().ok())
-                            .filter(|k: &[u8; 32]| k != &[0u8; 32]);
-                        match sync_key_opt {
-                            None => {
-                                tracing::error!(
-                                    "Multi-hop: pool.sync_key is missing, invalid, or all-zero \
-                                     — chain forwarder NOT started (exit_node={})",
-                                    exit_node
-                                );
-                            }
-                            Some(sync_key) => {
-                                match aivpn_server::chain_forwarder::ChainForwarder::new(
-                                    exit_node,
-                                    sync_key,
-                                    pool_cfg.node_id.as_deref(),
-                                )
-                                .await
-                                {
-                                    Some(cf) => {
-                                        server.set_chain_forwarder(cf);
-                                        info!(
-                                            "Multi-hop: chain forwarding to exit node {}",
-                                            exit_node
-                                        );
-                                    }
-                                    None => {
-                                        error!(
-                                            "Multi-hop: chain forwarder FAILED to start \
-                                             (exit_node={}) — multi-hop is disabled; see the \
-                                             preceding warnings for the cause",
-                                            exit_node
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                    }
+                server.set_pool_dialer(dialer.clone());
+                #[cfg(all(feature = "management-api", unix))]
+                {
+                    *mgmt_pool_dialer_slot.lock() = Some(dialer.clone());
                 }
-            }
-
-            // Start site-to-site route sync — pass session_manager so peer sessions are registered.
-            //
-            // PHASE 3: when the masked `PoolDialer` actually STARTED
-            // (`masked_dialer_active`), it already advertises
-            // `s2s_config.local_subnets` (and installs peers' routes) over
-            // the masked pool-peer sessions — see `site_local_subnets`
-            // above. Starting the legacy `site_sync::start` path here TOO
-            // would double-advertise routes over two independent channels
-            // for the same subnets.
-            //
-            // BUG E1 fix: this selection used to key off the config-only
-            // `pool.transport == "masked"` value. If `PoolDialer::new`
-            // failed (missing/invalid/zero `pool.sync_key`, or missing
-            // `pool.node_id`) the masked dialer never started, yet
-            // site-to-site still took the `init_config_only` branch —
-            // silently disabling all outbound route advertising with no
-            // fallback, even though the legacy `site_sync::start` path
-            // (which uses its own independent per-peer sync_key) would have
-            // worked fine. Keying off `masked_dialer_active` — set only in
-            // the `PoolDialer::new` success branch above — makes this a
-            // real fallback: masked dialer up → masked-only advertising;
-            // masked dialer absent or failed to start → legacy
-            // `site_sync::start`. Under the default/legacy transport
-            // (unset or any value other than exactly "masked"),
-            // `masked_dialer_active` stays false and `site_sync` starts
-            // exactly as before.
-            if let Some(ref s2s_cfg) = s2s_config {
-                if masked_dialer_active {
-                    // Still populate SITE_CONFIG (needed by
-                    // `handle_route_sync`'s allowlist lookup for inbound
-                    // RouteSync arriving over the masked pool-peer session)
-                    // WITHOUT starting the legacy outbound loops/sessions.
-                    aivpn_server::site_sync::init_config_only(s2s_cfg);
-                    info!(
-                        "Site-to-site active ({} peers, advertised over masked pool-client \
-                         transport — legacy site_sync channel not started)",
-                        s2s_cfg.peers.len()
-                    );
-                } else {
-                    aivpn_server::site_sync::start(s2s_cfg, server.session_manager());
-                    info!("Site-to-site active ({} peers)", s2s_cfg.peers.len());
+                if let Some(exit) = pool_sync_config.as_ref().and_then(|p| p.exit_node.as_ref()) {
+                    server.set_masked_exit(dialer.clone(), exit.clone());
                 }
+                dialer.start(Arc::new(std::sync::atomic::AtomicBool::new(false)));
+                info!("Masked peer transport started");
             }
 
             // Start DNS-over-HTTPS proxy
@@ -884,6 +707,12 @@ pub async fn run_server(
             if let Some(dns_cfg) = dns_config {
                 let gw_ip = vpn_gateway_ip;
                 let iface = tun_iface_for_dns;
+                if dns_cfg.block_plain_dns {
+                    if let Err(e) = aivpn_server::dns_proxy::install_block_rule(&iface) {
+                        error!("Cannot enforce block_plain_dns: {e}");
+                        std::process::exit(1);
+                    }
+                }
                 tokio::spawn(async move {
                     aivpn_server::dns_proxy::run(dns_cfg, gw_ip, iface).await;
                 });
