@@ -134,6 +134,7 @@ use crate::session::{Session, SessionManager};
 use aivpn_common::event_log::EventBus;
 
 struct QueuedPacket {
+    local: Option<crate::udp_source::LocalEndpoint>,
     packet_data: Vec<u8>,
     client_addr: SocketAddr,
     masked: bool,

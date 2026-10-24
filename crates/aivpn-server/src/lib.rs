@@ -22,6 +22,7 @@ pub mod node_registry;
 pub mod pending_config;
 pub mod server;
 pub mod session;
+mod udp_source;
 
 #[cfg(all(feature = "management-api", unix))]
 pub mod management_api;

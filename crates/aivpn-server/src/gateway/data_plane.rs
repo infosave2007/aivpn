@@ -219,7 +219,7 @@ impl super::Gateway {
         // all into per-slot wire buffers, then push the whole batch out with
         // one sendmmsg. Order within the worker — and therefore per client —
         // is unchanged. Wire buffers are reused across batches.
-        let batch_io = crate::batch_io::BatchIo::new(socket.raw());
+        let batch_io = crate::batch_io::BatchIo::with_sources(socket.raw(), socket.reply_sources());
         let mut wire_bufs: Vec<Vec<u8>> = (0..crate::batch_io::MAX_BATCH)
             .map(|_| Vec::with_capacity(MAX_PACKET_SIZE))
             .collect();

@@ -830,16 +830,11 @@ impl AivpnClient {
         info!("Connecting to AIVPN server...");
         self.state = ClientState::Connecting;
 
-        // Create TUN device first (skipped in proxy mode and in headless
-        // control-only mode, where there is no OS network stack to route).
-        if self.config.proxy_listen.is_none() && !self.config.control_only {
-            self.tunnel.create().await?;
-        }
-
         // Resolve the server address with a hard 10 s timeout so a hung DNS
         // server cannot stall the reconnect loop indefinitely.
         if let Some(cfg) = self.config.transport.clone() {
             if self.config.proxy_listen.is_none() && !self.config.control_only {
+                self.tunnel.create().await?;
                 self.tunnel.set_transport_guard(self.socket_guard.clone())?;
             }
             let (host, port) = self
@@ -864,9 +859,18 @@ impl AivpnClient {
             return self.finish_connect(server_addr).await;
         }
 
+        let (host, port) = self
+            .config
+            .server_addr
+            .rsplit_once(':')
+            .ok_or(Error::InvalidPacket("В адресе сервера отсутствует порт"))?;
+        let port = port
+            .parse()
+            .map_err(|_| Error::InvalidPacket("Некорректный порт сервера"))?;
         let addresses = tokio::time::timeout(
             Duration::from_secs(10),
-            tokio::net::lookup_host(&self.config.server_addr),
+            self.socket_guard
+                .resolve(host.trim_matches(['[', ']']), port),
         )
         .await
         .map_err(|_| {
@@ -874,8 +878,7 @@ impl AivpnClient {
                 std::io::ErrorKind::TimedOut,
                 format!("DNS lookup timed out for {}", self.config.server_addr),
             ))
-        })?
-        .map_err(Error::Io)?;
+        })??;
         let server_addr = aivpn_common::dns_candidates::select(&self.config.server_addr, addresses)
             .ok_or_else(|| {
                 Error::Io(std::io::Error::new(
@@ -891,6 +894,11 @@ impl AivpnClient {
         // protocol above this point is unchanged either way — it only ever sees
         // `DatagramTransport`.
         self.open_udp_socket(server_addr).await?;
+        // DNS и выбор исходного адреса UDP предшествуют маршрутам TUN:
+        // подсеть VPN может совпадать с адресом физического DNS или сервера.
+        if self.config.proxy_listen.is_none() && !self.config.control_only {
+            self.tunnel.create().await?;
+        }
         self.finish_connect(server_addr).await
     }
 
@@ -1742,6 +1750,31 @@ mod tests {
             remote_enroll_hook: None,
             transport: None,
         }
+    }
+
+    #[tokio::test]
+    async fn direct_udp_uses_the_platform_resolver_before_network_setup() {
+        struct PhysicalDns;
+        impl aivpn_common::transport::SocketGuard for PhysicalDns {
+            fn resolve<'a>(
+                &'a self,
+                host: &'a str,
+                port: u16,
+            ) -> aivpn_common::transport::ResolveFuture<'a> {
+                assert_eq!(host, "vpn-physical-resolver.invalid");
+                assert_eq!(port, 443);
+                Box::pin(async { Err(Error::Session("physical DNS unavailable".into())) })
+            }
+        }
+        let mut config = make_test_config();
+        config.control_only = true;
+        config.server_addr = "vpn-physical-resolver.invalid:443".into();
+        let mut client = AivpnClient::new(config).unwrap();
+        client.socket_guard = Arc::new(PhysicalDns);
+        let error = client.connect().await.unwrap_err();
+        assert!(
+            matches!(error, Error::Session(ref message) if message == "physical DNS unavailable")
+        );
     }
 
     #[tokio::test]

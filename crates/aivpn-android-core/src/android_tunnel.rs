@@ -41,7 +41,7 @@ pub fn take_recording_feedback_json() -> String {
 /// Android's [`PlatformIo`]: JNI socket protection, the `onTunnelReady`
 /// callback, and the take-once recording-feedback static polled from Kotlin.
 struct AndroidPlatform {
-    vm: JavaVM,
+    vm: std::sync::Arc<JavaVM>,
     vpn_service: GlobalRef,
 }
 
@@ -156,6 +156,19 @@ fn vpn_protect(vm: &JavaVM, vpn_service: &GlobalRef, fd: RawFd) -> Result<()> {
 }
 
 impl PlatformIo for AndroidPlatform {
+    fn resolve_host(
+        &self,
+        host: String,
+        port: u16,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Vec<std::net::SocketAddr>>> + Send>,
+    > {
+        let guard = VpnProtectGuard::new(self.vm.clone(), self.vpn_service.clone());
+        Box::pin(
+            async move { aivpn_common::transport::SocketGuard::resolve(&guard, &host, port).await },
+        )
+    }
+
     fn protect_socket(&self, fd: RawFd) -> Result<()> {
         vpn_protect(&self.vm, &self.vpn_service, fd)
     }
@@ -252,7 +265,10 @@ pub async fn run_tunnel_android(
         build_alt_transport(&vm, &vpn_service, transport_name, transport_params_json).await?;
 
     run_tunnel_generic(
-        AndroidPlatform { vm, vpn_service },
+        AndroidPlatform {
+            vm: std::sync::Arc::new(vm),
+            vpn_service,
+        },
         tun_fd_int,
         server_host,
         server_port,

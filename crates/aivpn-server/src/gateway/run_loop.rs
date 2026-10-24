@@ -96,6 +96,7 @@ impl super::Gateway {
 
         let std_sock: std::net::UdpSocket = socket2_sock.into();
         let socket = UdpSocket::from_std(std_sock).map_err(Error::Io)?;
+        crate::udp_source::enable(&socket).map_err(Error::Io)?;
 
         info!(
             "UDP listener bound to {} (4MB buffers via socket2)",

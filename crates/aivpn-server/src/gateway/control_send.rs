@@ -213,7 +213,7 @@ impl Gateway {
             .is_some_and(aivpn_common::mask_io::uses_rtc);
         let sent = if rtc_bootstrap {
             // Новый клиент за прежним NAT еще не знает ключей старого SRTP.
-            socket.raw().send_to(&packet, client_addr).await?
+            socket.send_raw(&packet, client_addr).await?
         } else {
             socket
                 .send_with_mask(&packet, client_addr, stateful)

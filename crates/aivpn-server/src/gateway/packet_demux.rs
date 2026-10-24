@@ -171,8 +171,12 @@ impl super::Gateway {
                         )
                         .await
                     } else {
-                        gw.handle_packet(&packet.packet_data, packet.client_addr)
-                            .await
+                        gw.handle_packet_with_source(
+                            &packet.packet_data,
+                            packet.client_addr,
+                            packet.local,
+                        )
+                        .await
                     };
                     if let Err(e) = result {
                         debug!(
@@ -190,7 +194,7 @@ impl super::Gateway {
         // A2: pull datagrams in batches (recvmmsg on Linux) — one syscall per
         // up-to-64 packets instead of one per packet. Buffers are reused
         // across iterations; only the per-worker handoff copies.
-        let batch_io = crate::batch_io::BatchIo::new(socket.raw());
+        let batch_io = crate::batch_io::BatchIo::with_sources(socket.raw(), socket.reply_sources());
         let mut slots: Vec<crate::batch_io::RecvSlot> = (0..crate::batch_io::MAX_BATCH)
             .map(|_| crate::batch_io::RecvSlot::new(MAX_PACKET_SIZE))
             .collect();
@@ -200,7 +204,7 @@ impl super::Gateway {
                 payload = socket.decoded() => {
                     if let Some((packet, peer, quic)) = payload {
                         let index = gateway.worker_index_for_packet(&packet, peer, worker_count);
-                        let _ = worker_txs[index].try_send(QueuedPacket { packet_data: packet, client_addr: peer, masked: true, quic_inner: quic });
+                        let _ = worker_txs[index].try_send(QueuedPacket { local: None, packet_data: packet, client_addr: peer, masked: true, quic_inner: quic });
                     }
                     continue;
                 }
@@ -236,6 +240,7 @@ impl super::Gateway {
                             worker_count,
                         );
                         let packet = QueuedPacket {
+                            local: slot.local,
                             packet_data,
                             client_addr,
                             masked: false,

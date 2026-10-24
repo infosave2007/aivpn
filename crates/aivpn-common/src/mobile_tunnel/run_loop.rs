@@ -51,6 +51,23 @@ fn mobile_keepalive_interval(level: AdaptiveLevel, requested: Duration) -> Durat
     requested.min(KEEPALIVE_NAT_CAP)
 }
 
+fn resolve_direct_destination<P: PlatformIo>(
+    platform: &P,
+    host: &str,
+    port: u16,
+) -> impl std::future::Future<Output = Result<SocketAddr>> + Send + 'static {
+    let endpoint = format!("{host}:{port}");
+    let lookup = platform.resolve_host(host.to_owned(), port);
+    async move {
+        let mut addresses: Vec<_> = tokio::time::timeout(Duration::from_secs(5), lookup)
+            .await
+            .map_err(|_| Error::Session("DNS lookup timeout (5 s)".into()))??;
+        addresses.sort_by_key(|address| address.is_ipv6());
+        crate::dns_candidates::select(&endpoint, addresses)
+            .ok_or_else(|| Error::Session("Cannot resolve server host".into()))
+    }
+}
+
 /// Все фоновые задачи принадлежат одной попытке соединения.
 #[derive(Default)]
 struct TunnelTasks(Vec<tokio::task::AbortHandle>);
@@ -290,18 +307,7 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
             _ = wait_for_stop(&stop_signal) => {
                 return Ok(());
             }
-            result = tokio::time::timeout(
-                Duration::from_secs(5),
-                tokio::net::lookup_host((dest_host, server_port)),
-            ) => {
-                let mut addresses: Vec<_> = result
-                    .map_err(|_| Error::Session("DNS lookup timeout (5 s)".into()))?
-                    .map_err(Error::Io)?
-                    .collect();
-                addresses.sort_by_key(|address| address.is_ipv6());
-                crate::dns_candidates::select(&dns_endpoint, addresses)
-                    .ok_or_else(|| Error::Session("Cannot resolve server host".into()))?
-            }
+            result = resolve_direct_destination(&platform, dest_host, server_port) => result?,
         }
     };
 
@@ -2255,6 +2261,39 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
 #[cfg(test)]
 mod protocol_audit_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn direct_udp_resolves_the_server_on_the_platform_network() {
+        struct PhysicalNetwork;
+        impl PlatformIo for PhysicalNetwork {
+            fn resolve_host(
+                &self,
+                host: String,
+                port: u16,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<SocketAddr>>> + Send>>
+            {
+                assert_eq!(host, "vpn-platform-resolver.invalid");
+                assert_eq!(port, 443);
+                Box::pin(async {
+                    Ok(vec![
+                        "[2001:db8::1]:443".parse().unwrap(),
+                        "198.18.0.1:443".parse().unwrap(),
+                    ])
+                })
+            }
+            fn notify_ready(&self, _: &str) {
+                unreachable!()
+            }
+            fn publish_recording_feedback(&self, _: RecordingFeedback) {
+                unreachable!()
+            }
+        }
+        let selected =
+            resolve_direct_destination(&PhysicalNetwork, "vpn-platform-resolver.invalid", 443)
+                .await
+                .unwrap();
+        assert_eq!(selected, "198.18.0.1:443".parse().unwrap());
+    }
 
     #[test]
     fn duplicate_hello_reannounces_certificate_and_session_bound_device_proof() {

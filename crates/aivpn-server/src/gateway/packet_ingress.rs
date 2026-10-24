@@ -189,6 +189,11 @@ impl super::Gateway {
         // В ABI ядра нет срока сертификата, поэтому его проверяет userspace.
         input.userspace_rx |= mtls_required;
         input.userspace_tx |= mtls_required;
+        // В ABI ядра нет выбора локального IP для UDP-ответа через другой интерфейс.
+        input.userspace_tx |= self
+            .udp_socket
+            .as_ref()
+            .is_some_and(|socket| socket.reply_sources().needs_source(sess.client_addr));
         let _ = kernel_maintain(ka, sess, tag_offset, mdh_len, &input, false);
     }
 
@@ -260,10 +265,21 @@ impl super::Gateway {
     }
 
     /// Handle incoming packet
+    #[cfg(test)]
     pub(crate) async fn handle_packet(
         &self,
         packet_data: &[u8],
         client_addr: SocketAddr,
+    ) -> Result<()> {
+        self.handle_packet_with_source(packet_data, client_addr, None)
+            .await
+    }
+
+    pub(crate) async fn handle_packet_with_source(
+        &self,
+        packet_data: &[u8],
+        client_addr: SocketAddr,
+        local: Option<crate::udp_source::LocalEndpoint>,
     ) -> Result<()> {
         if let Some(socket) = self.udp_socket.as_ref() {
             if socket.route_incoming(packet_data, client_addr) {
@@ -274,7 +290,7 @@ impl super::Gateway {
                     return Ok(());
                 };
                 let result = self
-                    .handle_unmasked_packet(bootstrap, client_addr, true)
+                    .handle_unmasked_packet_with_source(bootstrap, client_addr, true, local)
                     .await;
                 // Даже ошибка обработки освобождает ограниченный слот admission.
                 let accepted = socket.finish_initial(client_addr);
@@ -282,7 +298,7 @@ impl super::Gateway {
                 return accepted;
             }
         }
-        self.handle_unmasked_packet(packet_data, client_addr, false)
+        self.handle_unmasked_packet_with_source(packet_data, client_addr, false, local)
             .await
     }
 
@@ -291,6 +307,17 @@ impl super::Gateway {
         packet_data: &[u8],
         client_addr: SocketAddr,
         quic_inner: bool,
+    ) -> Result<()> {
+        self.handle_unmasked_packet_with_source(packet_data, client_addr, quic_inner, None)
+            .await
+    }
+
+    async fn handle_unmasked_packet_with_source(
+        &self,
+        packet_data: &[u8],
+        client_addr: SocketAddr,
+        quic_inner: bool,
+        local: Option<crate::udp_source::LocalEndpoint>,
     ) -> Result<()> {
         // Minimum packet size check
         if packet_data.len() < TAG_SIZE + 2 {
@@ -1090,6 +1117,11 @@ impl super::Gateway {
         }
 
         if let Some(socket) = self.udp_socket.as_ref() {
+            if let Some(local) = local {
+                if socket.reply_sources().record(client_addr, local, &session) {
+                    self.refresh_kernel_session(&mut session.lock());
+                }
+            }
             {
                 let mut sess = session.lock();
                 if sess.confirm_mask_protocol(quic_inner) {

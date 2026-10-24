@@ -16,6 +16,7 @@
 
 ### Fixed
 
+- **Connection startup and reply addresses** - Android resolves the VPN server through the physical network before sending direct UDP traffic. Desktop clients resolve and open the transport before creating TUN routes, avoiding DNS overlap with the VPN subnet. Linux servers preserve the destination address of authenticated UDP packets when replying, including QUIC and RTC carriers on hosts with several IP addresses.
 - **Bootstrap cache after catalog upgrades** - the server restores the known profile requested in the authenticated initial exchange when a cached descriptor selects a different base from the expanded catalog. A matching STUN header no longer completes PFS with the wrong RTC profile and leaves the tunnel unable to carry data.
 - **Client configuration validation** - malformed local JSON and transport parameters now stop startup before network changes. Global runtime settings remain separate from connection profiles and survive reconnects.
 - **DNS address failover** - desktop and mobile direct UDP connections try other resolved addresses after unsuccessful attempts and prefer the last address confirmed by a PFS handshake. One unreachable A or AAAA record no longer traps reconnects on the same endpoint.
@@ -119,6 +120,7 @@
 
 ### Исправлено
 
+- **Подключение и адрес ответов сервера** - Android разрешает имя VPN-сервера через физическую сеть перед отправкой прямого UDP-трафика. Настольные клиенты разрешают адрес и открывают транспорт до создания маршрутов TUN, чтобы подсеть VPN не перекрывала доступ к DNS. Сервер Linux отвечает с того IP, на который пришел проверенный UDP-пакет, в том числе при использовании QUIC и RTC на узлах с несколькими адресами.
 - **Кеш bootstrap после обновления каталога** - сервер восстанавливает известный профиль, запрошенный в защищенном начальном обмене, если кешированный дескриптор выбирает другую базу из расширенного каталога. Совпадающий STUN-заголовок больше не приводит к завершению PFS с чужим RTC-профилем и остановке передачи данных.
 - **Проверка конфигурации клиента** - неверный локальный JSON и поврежденные параметры транспорта останавливают запуск до изменения сети. Общие настройки процесса отделены от профиля подключения и сохраняются при переподключении.
 - **Переключение DNS-адресов** - прямой UDP на desktop и мобильных устройствах перебирает адреса после неудачных попыток и предпочитает последний адрес, подтвержденный рукопожатием PFS. Недоступная запись A или AAAA больше не удерживает все реконнекты на одном адресе.

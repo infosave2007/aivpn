@@ -510,6 +510,7 @@ impl Drop for InitialGuard {
 
 pub(crate) struct MaskSocket {
     raw: Arc<UdpSocket>,
+    reply_sources: Arc<crate::udp_source::ReplySources>,
     peers: Arc<DashMap<SocketAddr, Peer>>,
     admissions: DashMap<SocketAddr, Admission>,
     decoded: mpsc::Sender<(Vec<u8>, SocketAddr, bool)>,
@@ -660,6 +661,7 @@ impl MaskSocket {
         }
         drop(session_guard);
         let raw = self.raw.clone();
+        let reply_sources = self.reply_sources.clone();
         let peers = self.peers.clone();
         let decoded = self.decoded.clone();
         let observer = self.wire_observer.clone();
@@ -668,6 +670,7 @@ impl MaskSocket {
             if let Err(error) = drive(
                 MaskEngine::Rtc(engine),
                 raw,
+                reply_sources,
                 receiver,
                 outgoing_rx,
                 decoded,
@@ -708,6 +711,7 @@ impl MaskSocket {
         let (decoded, received) = mpsc::channel(4096);
         Arc::new(Self {
             raw,
+            reply_sources: Arc::new(crate::udp_source::ReplySources::default()),
             peers: Arc::new(DashMap::new()),
             admissions: DashMap::new(),
             decoded,
@@ -719,6 +723,14 @@ impl MaskSocket {
 
     pub fn raw(&self) -> Arc<UdpSocket> {
         self.raw.clone()
+    }
+
+    pub(crate) fn reply_sources(&self) -> Arc<crate::udp_source::ReplySources> {
+        self.reply_sources.clone()
+    }
+
+    pub(crate) async fn send_raw(&self, packet: &[u8], peer: SocketAddr) -> io::Result<usize> {
+        crate::udp_source::send_to(&self.raw, &self.reply_sources, packet, peer).await
     }
 
     #[cfg(any(feature = "neural", test))]
@@ -894,7 +906,7 @@ impl MaskSocket {
             // До появления состояния маски пакет лучше потерять, чем раскрыть.
             return Err(io::ErrorKind::WouldBlock.into());
         }
-        self.raw.send_to(packet, peer).await
+        self.send_raw(packet, peer).await
     }
 
     pub async fn send_packets_to(
@@ -942,6 +954,7 @@ impl MaskSocket {
         );
         let admission = entry.remove();
         let raw = self.raw.clone();
+        let reply_sources = self.reply_sources.clone();
         let peers = self.peers.clone();
         let decoded = self.decoded.clone();
         let observer = self.wire_observer.clone();
@@ -950,6 +963,7 @@ impl MaskSocket {
             if let Err(error) = drive(
                 MaskEngine::Quic(engine),
                 raw,
+                reply_sources,
                 receiver,
                 outgoing_rx,
                 decoded,
@@ -987,6 +1001,7 @@ impl MaskSocket {
 async fn drive(
     mut engine: MaskEngine,
     raw: Arc<UdpSocket>,
+    reply_sources: Arc<crate::udp_source::ReplySources>,
     mut incoming: mpsc::Receiver<Vec<u8>>,
     mut outgoing: mpsc::Receiver<(Vec<u8>, bool)>,
     decoded: mpsc::Sender<(Vec<u8>, SocketAddr, bool)>,
@@ -1002,7 +1017,7 @@ async fn drive(
     }
     for reply in replies {
         if !engine.send(&reply, Instant::now())? {
-            raw.send_to(&reply, peer).await?;
+            crate::udp_source::send_to(&raw, &reply_sources, &reply, peer).await?;
         }
     }
     let mut lease_check = tokio::time::interval(std::time::Duration::from_secs(1));
@@ -1024,7 +1039,9 @@ async fn drive(
         }
         ready.store(output.connected, Ordering::Release);
         for packet in output.wire {
-            if let Err(error) = raw.send_to(&packet, peer).await {
+            if let Err(error) =
+                crate::udp_source::send_to(&raw, &reply_sources, &packet, peer).await
+            {
                 if quic && aivpn_common::quic_mask::mtu_probe_error(&error, packet.len()) {
                     continue;
                 }
@@ -1067,7 +1084,7 @@ async fn drive(
             packet = outgoing.recv() => match packet {
                 Some((packet, data)) => {
                     match engine.send(&packet, Instant::now()) {
-                        Ok(false) if !data => { let _ = raw.send_to(&packet, peer).await; }
+                        Ok(false) if !data => { let _ = crate::udp_source::send_to(&raw, &reply_sources, &packet, peer).await; }
                         Ok(false) => {},
                         Ok(true) => {},
                         Err(error) => tracing::debug!("Пакет маски не принят в очередь: {}", error),
@@ -1083,7 +1100,7 @@ async fn drive(
         }
     }
     for packet in engine.close(Instant::now())? {
-        let _ = raw.send_to(&packet, peer).await;
+        let _ = crate::udp_source::send_to(&raw, &reply_sources, &packet, peer).await;
     }
     Ok(())
 }
