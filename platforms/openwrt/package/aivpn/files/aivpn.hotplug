@@ -1,7 +1,7 @@
 #!/bin/sh
-# Restart aivpn when the WAN interface comes up
+# Переподключаем VPN после восстановления WAN, сохраняя правила блокировки
 
 [ "$ACTION" = "ifup" ] || exit 0
 [ "$INTERFACE" = "wan" ] || exit 0
 
-/etc/init.d/aivpn running && /etc/init.d/aivpn restart
+/etc/init.d/aivpn running && /etc/init.d/aivpn reconnect

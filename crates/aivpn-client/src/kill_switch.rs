@@ -153,16 +153,14 @@ impl KillSwitch {
 
     #[cfg(target_os = "linux")]
     fn activate_impl(&self) -> Result<()> {
-        use std::process::Command;
-
         // Try nftables first
-        if Command::new("nft")
+        if crate::tunnel::Tunnel::net_admin_command("nft")
             .arg("--version")
             .status()
             .map(|s| s.success())
             .unwrap_or(false)
         {
-            let ok = Command::new("nft")
+            let ok = crate::tunnel::Tunnel::net_admin_command("nft")
                 .args(["add", "table", "inet", "aivpn_ks"])
                 .status()
                 .map(|s| s.success())
@@ -173,7 +171,7 @@ impl KillSwitch {
                 )));
             }
             let chain_spec = "{ type filter hook output priority 0 ; policy drop ; }";
-            let chain_ok = Command::new("nft")
+            let chain_ok = crate::tunnel::Tunnel::net_admin_command("nft")
                 .args(["add", "chain", "inet", "aivpn_ks", "output", chain_spec])
                 .status()
                 .map(|s| s.success())
@@ -193,7 +191,7 @@ impl KillSwitch {
             // process could still reach the old server IP unblocked. The drop
             // policy set above is preserved by flushing only the chain's rules
             // (mirrors the iptables path's `-F AIVPN_KS`).
-            let flushed = Command::new("nft")
+            let flushed = crate::tunnel::Tunnel::net_admin_command("nft")
                 .args(["flush", "chain", "inet", "aivpn_ks", "output"])
                 .status()
                 .map(|s| s.success())
@@ -260,7 +258,7 @@ impl KillSwitch {
                 );
             }
             for rule in &rules {
-                let rule_ok = Command::new("nft")
+                let rule_ok = crate::tunnel::Tunnel::net_admin_command("nft")
                     .args(rule.as_slice())
                     .status()
                     .map(|s| s.success())
@@ -276,7 +274,7 @@ impl KillSwitch {
         }
 
         self.activate_iptables(&mut |program, args| {
-            Command::new(program)
+            crate::tunnel::Tunnel::net_admin_command(program)
                 .args(args)
                 .status()
                 .map(|s| s.success())
@@ -413,12 +411,11 @@ impl KillSwitch {
 
     #[cfg(target_os = "linux")]
     fn clear_stale_impl() {
-        use std::process::Command;
-        let _ = Command::new("nft")
+        let _ = crate::tunnel::Tunnel::net_admin_command("nft")
             .args(["delete", "table", "inet", "aivpn_ks"])
             .status();
         Self::clear_iptables(&mut |program, args| {
-            Command::new(program)
+            crate::tunnel::Tunnel::net_admin_command(program)
                 .args(args)
                 .status()
                 .map(|s| s.success())
@@ -603,6 +600,34 @@ impl KillSwitch {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "нужны отдельный network namespace и file capability CAP_NET_ADMIN"]
+    fn firewall_children_retain_available_net_admin() {
+        assert_ne!(unsafe { libc::geteuid() }, 0);
+        let own = std::fs::read_to_string("/proc/self/status").unwrap();
+        let caps = own
+            .lines()
+            .find_map(|line| line.strip_prefix("CapPrm:\t"))
+            .unwrap();
+        assert_ne!(u64::from_str_radix(caps.trim(), 16).unwrap() & (1 << 12), 0);
+        let mut protection = super::KillSwitch::new("reviewtun".into(), "192.0.2.1".into());
+        protection.activate().unwrap();
+        let listed = std::process::Command::new("/usr/sbin/nft")
+            .args(["list", "table", "inet", "aivpn_ks"])
+            .output()
+            .unwrap();
+        // Обычный exec теряет file capabilities, хотя родитель настроил правила.
+        assert!(!listed.status.success());
+        protection.deactivate();
+        let tables = crate::tunnel::Tunnel::net_admin_command("nft")
+            .args(["list", "tables"])
+            .output()
+            .unwrap();
+        assert!(tables.status.success());
+        assert!(!String::from_utf8_lossy(&tables.stdout).contains("aivpn_ks"));
+    }
+
     use super::*;
 
     #[cfg(target_os = "linux")]

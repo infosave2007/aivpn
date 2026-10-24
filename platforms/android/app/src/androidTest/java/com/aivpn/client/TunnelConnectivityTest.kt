@@ -28,6 +28,8 @@ class TunnelConnectivityTest {
         require(probeHost.matches(Regex("[A-Za-z0-9.:-]+")) && probePort in 1..65535)
         val oldProfiles = SecureStorage.loadProfiles(context)
         val oldActive = SecureStorage.loadActiveProfileId(context)
+        val oldApps = SecureStorage.loadAllowedApps(context)
+        val oldDomains = SecureStorage.loadExcludedDomains(context)
         val profile = SecureStorage.ConnectionProfile(
             id = "runtime-connectivity-test",
             name = "Runtime connectivity test",
@@ -46,6 +48,8 @@ class TunnelConnectivityTest {
             assertNull("Нет разрешения на тестовый VPN", VpnService.prepare(context))
             SecureStorage.saveProfiles(context, oldProfiles.filter { it.id != profile.id } + profile)
             SecureStorage.saveActiveProfileId(context, profile.id)
+            SecureStorage.saveAllowedApps(context, emptySet())
+            SecureStorage.saveExcludedDomains(context, emptyList())
             context.startForegroundService(Intent(context, AivpnService::class.java).apply {
                 action = AivpnService.ACTION_CONNECT
                 putExtra("profile_id", profile.id)
@@ -102,6 +106,8 @@ class TunnelConnectivityTest {
             }
             SecureStorage.saveProfiles(context, oldProfiles)
             SecureStorage.saveActiveProfileId(context, oldActive)
+            SecureStorage.saveAllowedApps(context, oldApps)
+            SecureStorage.saveExcludedDomains(context, oldDomains)
         }
     }
 }

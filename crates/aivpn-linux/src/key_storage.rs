@@ -31,8 +31,8 @@ impl ConnectionKey {
         name: impl Into<String>,
         key: impl Into<String>,
     ) -> Result<Self, String> {
-        let key = key.into();
-        let stripped = key.trim_start_matches("aivpn://");
+        let key = key.into().trim().to_owned();
+        let stripped = key.strip_prefix("aivpn://").unwrap_or(&key);
         let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .decode(stripped)
             .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(stripped))
@@ -46,7 +46,8 @@ impl ConnectionKey {
         let server_addr = json
             .get("s")
             .and_then(|v| v.as_str())
-            .unwrap_or("")
+            .filter(|value| !value.trim().is_empty() && !value.chars().any(char::is_control))
+            .ok_or_else(|| "Не указан корректный адрес сервера".to_string())?
             .to_string();
         let vpn_ip = json
             .get("i")
@@ -126,12 +127,16 @@ impl KeyStorage {
 
         // Write 0600 to a temp file then atomically rename, so a crash mid-write
         // can't corrupt the existing keys and the PSK is never world-readable.
-        let tmp = self.path.with_extension("json.tmp");
+        let nonce = base64::Engine::encode(
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+            aivpn_common::crypto::random_bytes(16),
+        );
+        let tmp = self.path.with_extension(format!("{nonce}.tmp"));
         let write_result = std::fs::OpenOptions::new()
             .write(true)
-            .create(true)
-            .truncate(true)
+            .create_new(true)
             .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
             .open(&tmp)
             .and_then(|mut f| f.write_all(json.as_bytes()).and_then(|_| f.sync_all()));
         match write_result {
@@ -195,4 +200,24 @@ fn storage_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
         .join("aivpn")
         .join("keys.json")
+}
+
+#[cfg(test)]
+mod import_validation_tests {
+    use super::*;
+    #[test]
+    fn rejects_empty_profiles_and_trims_pasted_keys() {
+        for value in ["null", "[]", "{}", r#"{"s":""}"#, r#"{"s":"   "}"#] {
+            let key = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(value);
+            assert!(
+                ConnectionKey::from_key_string("bad", key).is_err(),
+                "{value}"
+            );
+        }
+        let encoded =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(r#"{"s":"vpn.test:443"}"#);
+        let profile =
+            ConnectionKey::from_key_string("valid", format!(" \naivpn://{encoded}\n ")).unwrap();
+        assert_eq!(profile.key, format!("aivpn://{encoded}"));
+    }
 }

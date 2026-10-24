@@ -205,7 +205,7 @@ class TunnelLifecycleTest {
                             assertTrue(BootPrefs.prefs(context).getBoolean(PrefsKeys.PREF_VPN_DESIRED, false))
                             if (networkMode == "loss") {
                                 activity.onActivity {
-                                    assertEquals(it.getString(R.string.btn_disconnect), it.findViewById<Button>(R.id.btnConnect).text)
+                                    assertEquals(it.getString(R.string.ui_cancel_connect), it.findViewById<Button>(R.id.btnConnect).text)
                                     assertEquals(AivpnService.localizedStatus(it), it.findViewById<TextView>(R.id.textStatus).text.toString())
                                 }
                             }
@@ -240,6 +240,39 @@ class TunnelLifecycleTest {
                                 ?.hasTransport(android.net.NetworkCapabilities.TRANSPORT_WIFI) == true }
                         }
                         SystemClock.sleep(750)
+                    }
+                    if (arguments.getString("serverOutage") == "true") {
+                        instrumentation.sendStatus(2, android.os.Bundle().apply {
+                            putString("stream", "\nAIVPN_TEST_READY_FOR_SERVER_RESTART\n")
+                        })
+                        var outageObserved = false
+                        var restored = false
+                        val restartStarted = SystemClock.elapsedRealtime()
+                        val deadline = restartStarted + 90_000
+                        while (SystemClock.elapsedRealtime() < deadline) {
+                            assertTrue("Сбой сервера остановил службу", AivpnService.isServiceActive)
+                            assertTrue("Сбой сервера отменил желание держать VPN",
+                                BootPrefs.prefs(context).getBoolean(PrefsKeys.PREF_VPN_DESIRED, false))
+                            val received = try {
+                                java.net.Socket().use { socket ->
+                                    socket.soTimeout = 1_000
+                                    socket.connect(java.net.InetSocketAddress(probeHost, port), 1_000)
+                                    socket.getOutputStream().write("GET / HTTP/1.0\r\nHost: runtime-test\r\n\r\n".toByteArray())
+                                    socket.getInputStream().readBytes().toString(Charsets.US_ASCII).endsWith("aivpn-local-lab-ok\n")
+                                }
+                            } catch (_: Exception) { false }
+                            if (!received) outageObserved = true
+                            if (outageObserved && received && AivpnService.isEstablished) {
+                                restored = true
+                                break
+                            }
+                            SystemClock.sleep(150)
+                        }
+                        assertTrue("Сбой тестового сервера не наблюдался", outageObserved)
+                        assertTrue("После перезапуска сервера VPN сам не восстановился", restored)
+                        instrumentation.sendStatus(2, android.os.Bundle().apply {
+                            putString("stream", "\nВосстановление после сервера: ${SystemClock.elapsedRealtime() - restartStarted} мс\n")
+                        })
                     }
                     if (arguments.getString("background") == "true") {
                         activity.moveToState(androidx.lifecycle.Lifecycle.State.CREATED)

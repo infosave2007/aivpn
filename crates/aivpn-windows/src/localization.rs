@@ -164,8 +164,21 @@ impl AppSettings {
             .map_err(|e| format!("Cannot encrypt bootstrap token; settings were not saved: {e}"))?;
         }
         let json = serde_json::to_vec_pretty(&on_disk).map_err(|e| e.to_string())?;
-        let tmp = path.with_extension("json.tmp");
-        std::fs::write(&tmp, json).map_err(|e| e.to_string())?;
+        let nonce = base64::Engine::encode(
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+            aivpn_common::crypto::random_bytes(16),
+        );
+        let tmp = path.with_extension(format!("{nonce}.tmp"));
+        use std::io::Write;
+        let write = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+            .and_then(|mut file| file.write_all(&json).and_then(|_| file.sync_all()));
+        if let Err(error) = write {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(format!("Cannot save settings: {error}"));
+        }
         if let Err(error) = std::fs::rename(&tmp, &path) {
             let _ = std::fs::remove_file(&tmp);
             return Err(format!("Cannot save settings: {error}"));

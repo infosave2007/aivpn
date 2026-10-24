@@ -1,5 +1,5 @@
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -50,6 +50,16 @@ pub fn note_data_stall_and_maybe_explore(established: Instant) {
 
 const CACHE_FILE_NAME: &str = "bootstrap_descriptors.json";
 const MAX_CACHED_DESCRIPTORS: usize = 8;
+static CACHE_WRITE_LOCK: Mutex<()> = Mutex::new(());
+
+struct VolatileCache {
+    directory: Option<PathBuf>,
+    descriptors: Vec<BootstrapDescriptor>,
+}
+static VOLATILE_CACHE: Mutex<VolatileCache> = Mutex::new(VolatileCache {
+    directory: None,
+    descriptors: Vec::new(),
+});
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct BootstrapCacheFile {
@@ -63,21 +73,27 @@ fn cache_dir() -> PathBuf {
     std::env::temp_dir().join("aivpn")
 }
 
-fn cache_path() -> PathBuf {
-    cache_dir().join(CACHE_FILE_NAME)
-}
-
-fn load_cache_file() -> BootstrapCacheFile {
-    let path = cache_path();
-    fs::read_to_string(path)
+fn load_cache_file(path: &Path) -> BootstrapCacheFile {
+    crate::secure_write::read_state_file(path, 32 * 1024 * 1024)
         .ok()
-        .and_then(|json| serde_json::from_str(&json).ok())
+        .and_then(|json| serde_json::from_slice(&json).ok())
         .unwrap_or_default()
 }
 
 pub fn load_descriptors() -> Vec<BootstrapDescriptor> {
     let now = current_unix_secs();
-    let mut descriptors = load_cache_file().descriptors;
+    let directory = cache_dir();
+    let mut descriptors = load_cache_file(&directory.join(CACHE_FILE_NAME)).descriptors;
+    let memory = VOLATILE_CACHE
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    if memory.directory.as_ref() == Some(&directory) {
+        for descriptor in &memory.descriptors {
+            descriptors.retain(|saved| saved.descriptor_id != descriptor.descriptor_id);
+            descriptors.push(descriptor.clone());
+        }
+    }
+    drop(memory);
     descriptors.retain(|descriptor| descriptor.expires_at.saturating_add(24 * 3600) >= now);
     descriptors.sort_by(|left, right| right.created_at.cmp(&left.created_at));
     descriptors
@@ -128,9 +144,8 @@ fn select_cached_candidate(
 /// same pre-mutation state and each write back a version missing the
 /// other's newly-fetched descriptor — a silent lost update (the atomic
 /// tmp+rename already prevents outright file corruption, just not this).
-/// Held for the lifetime of the returned guard; released automatically when
-/// the underlying fd is closed on Drop. Unix-only (flock) — best-effort
-/// no-op elsewhere.
+/// Блокировка удерживается до завершения записи. Если файл занят, сохранение
+/// пропускается с ошибкой, а поток VPN продолжает работать. Unix использует flock.
 #[cfg(unix)]
 struct CacheFileLock {
     _file: std::fs::File,
@@ -138,35 +153,83 @@ struct CacheFileLock {
 
 #[cfg(unix)]
 impl CacheFileLock {
-    fn acquire() -> Option<Self> {
-        use std::os::unix::io::AsRawFd;
-        let dir = cache_dir();
-        let _ = fs::create_dir_all(&dir);
-        let lock_path = dir.join("bootstrap_descriptors.lock");
+    fn acquire(dir: &Path) -> Result<Self> {
+        use std::os::unix::{
+            fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
+            io::AsRawFd,
+        };
         let file = std::fs::OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(false)
-            .open(&lock_path)
-            .ok()?;
-        // SAFETY: flock(2) on a valid, owned fd with a plain integer
-        // operation flag. LOCK_EX blocks until the lock is available, so
-        // concurrent store_descriptor calls serialize their
-        // read-modify-write instead of interleaving. The lock is released
-        // automatically (by the kernel) when this fd is closed, including
-        // on process crash — no stale-lock cleanup needed.
-        let ret = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
-        if ret != 0 {
-            return None;
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(dir.join("bootstrap_descriptors.lock"))?;
+        let metadata = file.metadata()?;
+        if !metadata.is_file() || metadata.uid() != unsafe { libc::geteuid() } {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "Некорректный lock-файл кеша",
+            )
+            .into());
         }
-        Some(Self { _file: file })
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+        // Кеш необязателен: чужая блокировка не должна останавливать прием VPN.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        Ok(Self { _file: file })
     }
 }
 
 pub fn store_descriptor(descriptor: BootstrapDescriptor) -> Result<()> {
+    let directory = cache_dir();
+    // Проверенный сетевой дескриптор остается доступен, даже если диск занят.
+    let mut memory = VOLATILE_CACHE
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    if memory.directory.as_ref() != Some(&directory) {
+        memory.directory = Some(directory.clone());
+        memory.descriptors.clear();
+    }
+    memory
+        .descriptors
+        .retain(|saved| saved.descriptor_id != descriptor.descriptor_id);
+    memory.descriptors.insert(0, descriptor.clone());
+    memory.descriptors.truncate(MAX_CACHED_DESCRIPTORS);
+    drop(memory);
+    store_descriptor_at(descriptor, &directory)
+}
+
+fn store_descriptor_at(descriptor: BootstrapDescriptor, dir: &Path) -> Result<()> {
+    let _writer = CACHE_WRITE_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    fs::create_dir_all(&dir)?;
+    let metadata = fs::symlink_metadata(&dir)?;
+    if !metadata.is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "Кеш должен находиться в обычном каталоге",
+        )
+        .into());
+    }
     #[cfg(unix)]
-    let _lock = CacheFileLock::acquire();
-    let mut cache = load_cache_file();
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        if metadata.uid() != unsafe { libc::geteuid() } {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "Каталог кеша принадлежит другому пользователю",
+            )
+            .into());
+        }
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
+    }
+    #[cfg(unix)]
+    let _lock = CacheFileLock::acquire(&dir)?;
+    let final_path = dir.join(CACHE_FILE_NAME);
+    let mut cache = load_cache_file(&final_path);
     cache
         .descriptors
         .retain(|existing| existing.descriptor_id != descriptor.descriptor_id);
@@ -176,25 +239,13 @@ pub fn store_descriptor(descriptor: BootstrapDescriptor) -> Result<()> {
         .sort_by(|left, right| right.created_at.cmp(&left.created_at));
     cache.descriptors.truncate(MAX_CACHED_DESCRIPTORS);
 
-    let dir = cache_dir();
-    fs::create_dir_all(&dir).map_err(Error::Io)?;
-    // Lock the cache directory to the owner (0700). This matters most on the
-    // no-$HOME fallback to a shared, predictable /tmp/aivpn path: without it a
-    // local attacker could pre-create or symlink the directory and plant
-    // bootstrap descriptors (which select the initial mask, and are stored
-    // without signature verification when no signing key is configured). Owner
-    // dirs like ~/.aivpn are equally fine at 0700.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = fs::set_permissions(&dir, fs::Permissions::from_mode(0o700));
-    }
     let json = serde_json::to_string_pretty(&cache)
         .map_err(|e| Error::Session(format!("Failed to serialize bootstrap cache: {}", e)))?;
-    let final_path = cache_path();
-    let tmp_path = final_path.with_extension("tmp");
-    fs::write(&tmp_path, json).map_err(Error::Io)?;
-    fs::rename(&tmp_path, &final_path).map_err(Error::Io)
+    if crate::secure_write::write_status_best_effort(&final_path, json.as_bytes()) {
+        Ok(())
+    } else {
+        Err(std::io::Error::other("Не удалось сохранить кеш bootstrap").into())
+    }
 }
 
 fn validate_descriptor_signature(
@@ -244,14 +295,23 @@ pub fn store_verified_descriptor(
     descriptor: BootstrapDescriptor,
     trusted_key: Option<&[u8; 32]>,
 ) -> Result<()> {
+    verify_received_descriptor(&descriptor, trusted_key)?;
+    store_descriptor(descriptor)
+}
+
+/// Проверка подписи не зависит от возможности сохранить необязательный кеш.
+pub(crate) fn verify_received_descriptor(
+    descriptor: &BootstrapDescriptor,
+    trusted_key: Option<&[u8; 32]>,
+) -> Result<()> {
     #[cfg(feature = "production-secure")]
     if trusted_key.is_none() {
         return Err(Error::Session(
             "production-secure: сохранение дескриптора требует ключ подписи сервера".into(),
         ));
     }
-    validate_descriptor_signature(&descriptor, trusted_key)?;
-    store_descriptor(descriptor)
+    validate_descriptor_signature(descriptor, trusted_key)?;
+    Ok(())
 }
 
 pub async fn refresh_from_urls(urls: &[String], signing_key: Option<&[u8; 32]>) -> usize {
@@ -331,6 +391,31 @@ mod tests {
             kdf_salt: [0u8; 32],
             signature: [0u8; 64],
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cache_ignores_a_planted_temporary_symlink_and_does_not_wait_on_a_lock() {
+        let dir = std::env::temp_dir().join(format!(
+            "aivpn-bootstrap-write-{:032x}",
+            rand::random::<u128>()
+        ));
+        fs::create_dir(&dir).unwrap();
+        let victim = dir.join("victim");
+        fs::write(&victim, b"original").unwrap();
+        std::os::unix::fs::symlink(&victim, dir.join("bootstrap_descriptors.tmp")).unwrap();
+        store_descriptor_at(make_desc(), &dir).unwrap();
+        assert_eq!(fs::read(&victim).unwrap(), b"original");
+        assert_eq!(
+            load_cache_file(&dir.join(CACHE_FILE_NAME))
+                .descriptors
+                .len(),
+            1
+        );
+        let _held = CacheFileLock::acquire(&dir).unwrap();
+        assert!(store_descriptor_at(make_desc(), &dir).is_err());
+        drop(_held);
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

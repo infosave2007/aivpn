@@ -2,17 +2,23 @@ package com.aivpn.client
 
 import android.os.Bundle
 import android.text.InputType
+import android.view.View
 import android.view.ViewGroup
 import android.widget.ArrayAdapter
-import android.widget.Button
 import android.widget.CheckBox
 import android.widget.EditText
+import android.widget.ImageButton
+import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.Spinner
 import android.widget.TextView
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
+import com.google.android.material.button.MaterialButton
+import com.google.android.material.checkbox.MaterialCheckBox
+import com.google.android.material.textfield.TextInputEditText
+import com.google.android.material.textfield.TextInputLayout
 
 /**
  * Generic renderer for the descriptor returned by [loadTransportDescriptor].
@@ -63,18 +69,45 @@ class TransportSettingsActivity : AppCompatActivity() {
             return
         }
 
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setBackgroundColor(colorAttr(com.google.android.material.R.attr.colorSurface, R.color.background))
+        }
+        val toolbar = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = android.view.Gravity.CENTER_VERTICAL
+            minimumHeight = 64.dp
+            setPadding(4.dp, 4.dp, 16.dp, 4.dp)
+        }
+        toolbar.addView(ImageButton(this).apply {
+            setImageResource(R.drawable.ic_vpn_back)
+            scaleType = ImageView.ScaleType.CENTER_INSIDE
+            contentDescription = getString(R.string.ui_back)
+            setColorFilter(colorAttr(com.google.android.material.R.attr.colorOnSurface, R.color.text_primary))
+            val typed = android.util.TypedValue()
+            if (theme.resolveAttribute(android.R.attr.selectableItemBackgroundBorderless, typed, true) &&
+                typed.resourceId != 0
+            ) {
+                setBackgroundResource(typed.resourceId)
+            }
+            layoutParams = LinearLayout.LayoutParams(48.dp, 48.dp)
+            setOnClickListener { finish() }
+        })
+        toolbar.addView(TextView(this).apply {
+            text = getString(R.string.transport_settings_title)
+            setTextAppearance(com.google.android.material.R.style.TextAppearance_Material3_TitleLarge)
+            setTextColor(colorAttr(com.google.android.material.R.attr.colorOnSurface, R.color.text_primary))
+            maxLines = 2
+            ellipsize = android.text.TextUtils.TruncateAt.END
+            setPadding(4.dp, 0, 0, 0)
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+        })
+        root.addView(toolbar)
+
         val container = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(24.dp, 16.dp, 24.dp, 16.dp)
+            setPadding(20.dp, 8.dp, 20.dp, 24.dp)
         }
-
-        container.addView(TextView(this).apply {
-            text = getString(R.string.transport_settings_title)
-            textSize = 20f
-            setTextColor(getColor(R.color.text_primary))
-            setTypeface(null, android.graphics.Typeface.BOLD)
-            setPadding(0, 0, 0, 8.dp)
-        })
 
         // The section heading comes from the descriptor, never from this
         // build's own strings: an edition the module is not part of must
@@ -82,17 +115,21 @@ class TransportSettingsActivity : AppCompatActivity() {
         container.addView(TextView(this).apply {
             text = desc.title
             textSize = 16f
-            setTextColor(getColor(R.color.text_primary))
-            setTypeface(null, android.graphics.Typeface.BOLD)
-            setPadding(0, 12.dp, 0, 4.dp)
+            setTextColor(colorAttr(com.google.android.material.R.attr.colorOnSurface, R.color.text_primary))
+            setPadding(0, 8.dp, 0, 4.dp)
         })
 
         for (field in desc.fields) {
             renderField(container, prefs, desc.id, field)
         }
 
-        container.addView(Button(this).apply {
+        container.addView(MaterialButton(this).apply {
             text = getString(R.string.transport_apply)
+            textSize = 14f
+            isAllCaps = false
+            insetTop = 0
+            insetBottom = 0
+            minHeight = 48.dp
             setOnClickListener { applyAll() }
             layoutParams = LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
@@ -100,7 +137,16 @@ class TransportSettingsActivity : AppCompatActivity() {
             ).apply { setMargins(0, 16.dp, 0, 0) }
         })
 
-        setContentView(ScrollView(this).also { it.addView(container) })
+        root.addView(ScrollView(this).apply {
+            isFillViewport = true
+            addView(container)
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                0,
+                1f,
+            )
+        })
+        setContentView(root)
     }
 
     // ──────────── Rendering ────────────
@@ -114,37 +160,69 @@ class TransportSettingsActivity : AppCompatActivity() {
         val prefKey = fieldPrefKey(descriptorId, field.key)
         when (val kind = field.kind) {
             is FieldKind.Toggle -> {
-                val check = CheckBox(this).apply {
+                val check = MaterialCheckBox(this).apply {
                     text = field.label
-                    setTextColor(getColor(R.color.text_primary))
+                    textSize = 16f
+                    minHeight = 48.dp
+                    setTextColor(colorAttr(com.google.android.material.R.attr.colorOnSurface, R.color.text_primary))
                     isChecked = prefs.getBoolean(prefKey, false)
-                    setPadding(0, 8.dp, 0, 8.dp)
                 }
                 container.addView(check)
                 editors.add(field to FieldEditor.ToggleEditor(check))
             }
             is FieldKind.Text, is FieldKind.Secret -> {
-                container.addView(labelView(field.label))
                 val secret = kind is FieldKind.Secret
-                val edit = EditText(this).apply {
+                val edit = TextInputEditText(this).apply {
                     inputType = if (secret) {
                         InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
                     } else {
                         InputType.TYPE_CLASS_TEXT
                     }
                     setText(prefs.getString(prefKey, "") ?: "")
+                    setSingleLine(true)
+                    textSize = 16f
+                    importantForAutofill = View.IMPORTANT_FOR_AUTOFILL_NO
                 }
-                container.addView(edit)
+                val box = TextInputLayout(
+                    this,
+                    null,
+                    com.google.android.material.R.attr.textInputOutlinedStyle,
+                ).apply {
+                    hint = field.label
+                    addView(
+                        edit,
+                        LinearLayout.LayoutParams(
+                            LinearLayout.LayoutParams.MATCH_PARENT,
+                            LinearLayout.LayoutParams.WRAP_CONTENT,
+                        ),
+                    )
+                }
+                container.addView(
+                    box,
+                    LinearLayout.LayoutParams(
+                        LinearLayout.LayoutParams.MATCH_PARENT,
+                        LinearLayout.LayoutParams.WRAP_CONTENT,
+                    ).apply { topMargin = 8.dp },
+                )
                 editors.add(field to FieldEditor.TextEditor(edit))
             }
             is FieldKind.Select -> {
                 container.addView(labelView(field.label))
                 val spinner = Spinner(this).apply {
-                    adapter = ArrayAdapter(
+                    minimumHeight = 48.dp
+                    adapter = object : ArrayAdapter<String>(
                         this@TransportSettingsActivity,
-                        android.R.layout.simple_spinner_dropdown_item,
-                        kind.options
-                    )
+                        android.R.layout.simple_spinner_item,
+                        kind.options,
+                    ) {
+                        override fun getView(position: Int, convertView: View?, parent: ViewGroup): View {
+                            return styleSpinnerText(super.getView(position, convertView, parent))
+                        }
+
+                        override fun getDropDownView(position: Int, convertView: View?, parent: ViewGroup): View {
+                            return styleSpinnerText(super.getDropDownView(position, convertView, parent))
+                        }
+                    }.also { it.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item) }
                     if (kind.options.isNotEmpty()) {
                         val stored = prefs.getInt(prefKey, 0)
                         setSelection(stored.coerceIn(0, kind.options.size - 1))
@@ -158,9 +236,27 @@ class TransportSettingsActivity : AppCompatActivity() {
 
     private fun labelView(label: String): TextView = TextView(this).apply {
         text = label
-        textSize = 13f
-        setTextColor(getColor(R.color.text_secondary))
+        textSize = 14f
+        setTextColor(colorAttr(com.google.android.material.R.attr.colorOnSurfaceVariant, R.color.text_secondary))
         setPadding(0, 12.dp, 0, 2.dp)
+    }
+
+    private fun styleSpinnerText(view: View): View {
+        (view as? TextView)?.apply {
+            textSize = 16f
+            minHeight = 48.dp
+            setTextColor(colorAttr(com.google.android.material.R.attr.colorOnSurface, R.color.text_primary))
+        }
+        return view
+    }
+
+    private fun colorAttr(attr: Int, fallback: Int): Int {
+        val typed = android.util.TypedValue()
+        return if (theme.resolveAttribute(attr, typed, true)) {
+            if (typed.resourceId != 0) getColor(typed.resourceId) else typed.data
+        } else {
+            getColor(fallback)
+        }
     }
 
     // ──────────── Apply ────────────

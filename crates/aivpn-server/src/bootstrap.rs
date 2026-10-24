@@ -30,23 +30,14 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tracing::{error, info};
 
-/// Wire the event bus to the configured webhook (`AIVPN_EVENT_WEBHOOK`), if
-/// any. Delivery is best-effort: `emit()` hands each serialized JSON event
-/// line to an unbounded channel (synchronous, never blocks the data path),
-/// and a background task POSTs them one at a time with a hard timeout — a
-/// failing endpoint only logs, it can never stall or kill the event path.
-/// Requires the `event-webhook` cargo feature (pulls in reqwest); without it
-/// a configured URL is rejected loudly instead of silently ignored.
+/// Webhook получает события через ограниченную очередь и не задерживает VPN.
+/// Переполнение фиксируется в журнале; недоступный получатель не расходует всю память.
 #[cfg(feature = "event-webhook")]
 fn install_webhook_forwarder(event_bus: &EventBus) {
     let Some(url) = event_bus.webhook_url().map(str::to_owned) else {
         return;
     };
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-    event_bus.set_event_sink(Arc::new(move |line: &str| {
-        // A closed receiver (forwarder task died) must never fail emit().
-        let _ = tx.send(line.to_owned());
-    }));
+    let mut rx = webhook_queue(event_bus);
     tokio::spawn(async move {
         let client = match reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(5))
@@ -65,12 +56,62 @@ fn install_webhook_forwarder(event_bus: &EventBus) {
                 .body(line)
                 .send()
                 .await
+                .and_then(reqwest::Response::error_for_status)
             {
-                error!("event webhook: POST to {url} failed: {e}");
+                error!("event webhook: POST failed: {}", e.without_url());
             }
         }
     });
     info!("event webhook forwarder installed");
+}
+
+#[cfg(feature = "event-webhook")]
+fn webhook_queue(event_bus: &EventBus) -> tokio::sync::mpsc::Receiver<String> {
+    let (tx, rx) = tokio::sync::mpsc::channel(1024);
+    let dropped = std::sync::atomic::AtomicU64::new(0);
+    event_bus.set_event_sink(Arc::new(move |line: &str| {
+        if tx.try_send(line.to_owned()).is_err() {
+            let count = dropped.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            if count.is_power_of_two() {
+                tracing::warn!(
+                    count,
+                    "event webhook: очередь недоступна, события пропущены"
+                );
+            }
+        }
+    }));
+    rx
+}
+
+#[cfg(all(test, feature = "event-webhook"))]
+mod webhook_tests {
+    use super::*;
+    #[test]
+    fn stalled_receiver_has_a_bounded_queue_and_recovers_after_drain() {
+        use aivpn_common::event_log::{AivpnEvent, ConnectionAction};
+        let bus = EventBus::new(EventSinkConfig {
+            stdout: false,
+            webhook_url: None,
+        });
+        let mut queue = webhook_queue(&bus);
+        let emit = || {
+            bus.emit(AivpnEvent::Connection {
+                client_id: "test".into(),
+                vpn_ip: "10.0.0.2".into(),
+                action: ConnectionAction::Reconnect,
+                server_node: None,
+            })
+        };
+        for _ in 0..10_000 {
+            emit();
+        }
+        assert_eq!(queue.len(), 1024);
+        assert!(queue.try_recv().is_ok());
+        emit();
+        assert_eq!(queue.len(), 1024);
+        drop(queue);
+        emit();
+    }
 }
 
 #[cfg(not(feature = "event-webhook"))]

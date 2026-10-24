@@ -1,5 +1,6 @@
 mod i18n;
 mod messages;
+mod notification;
 mod privilege;
 mod views;
 
@@ -1343,19 +1344,13 @@ impl App {
                 if matches!(s, VpnStatus::Connected { .. })
                     && !matches!(self.status, VpnStatus::Connected { .. })
                 {
-                    let _ = notify_rust::Notification::new()
-                        .summary("AIVPN")
-                        .body("Connected")
-                        .show();
+                    notification::connection_changed(true);
                 }
                 #[cfg(unix)]
                 if matches!(s, VpnStatus::Disconnected)
                     && matches!(self.status, VpnStatus::Connected { .. })
                 {
-                    let _ = notify_rust::Notification::new()
-                        .summary("AIVPN")
-                        .body("Disconnected")
-                        .show();
+                    notification::connection_changed(false);
                 }
                 self.status = s;
                 // A terminal status means the worker stream has ended. Clear the

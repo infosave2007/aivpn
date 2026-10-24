@@ -62,6 +62,7 @@ const MAX_STDIN_BYTES: usize = 64 * 1024;
 /// / `run_ip_privileged` in `crates/aivpn-client/src/tunnel.rs`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Verb {
+    LinkSetMtu,
     Addr6ReplaceDev,
     Addr6DelDev,
     Route6ReplaceDev,
@@ -112,6 +113,7 @@ enum Verb {
 impl Verb {
     fn parse(s: &str) -> Option<Verb> {
         Some(match s {
+            "link_mtu" => Verb::LinkSetMtu,
             "addr6_replace" => Verb::Addr6ReplaceDev,
             "addr6_del" => Verb::Addr6DelDev,
             "route6_replace" => Verb::Route6ReplaceDev,
@@ -143,6 +145,7 @@ impl Verb {
     /// shape requires — enforced exactly, no optional/variadic fields.
     fn field_count(self) -> usize {
         match self {
+            Verb::LinkSetMtu => 2,
             Verb::Addr6ReplaceDev
             | Verb::Addr6DelDev
             | Verb::Route6ReplaceDev
@@ -268,6 +271,21 @@ fn parse_line(line: &str, line_no: usize) -> Result<ParsedCommand, String> {
     }
 
     let argv = match verb {
+        Verb::LinkSetMtu => {
+            let (interface, mtu) = (rest[0], rest[1]);
+            if !is_valid_iface(interface)
+                || !mtu.bytes().all(|byte| byte.is_ascii_digit())
+                || !mtu
+                    .parse::<u16>()
+                    .is_ok_and(|value| (576..=9000).contains(&value))
+            {
+                return Err("Неверный интерфейс или MTU".into());
+            }
+            ["link", "set", "dev", interface, "mtu", mtu]
+                .into_iter()
+                .map(str::to_owned)
+                .collect()
+        }
         Verb::Addr6ReplaceDev
         | Verb::Addr6DelDev
         | Verb::Route6ReplaceDev
@@ -604,6 +622,17 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mtu_command_is_validated_before_execution() {
+        assert_eq!(
+            parse_line("mtu\tlink_mtu\taivpn0\t1400", 1).unwrap().argv,
+            ["link", "set", "dev", "aivpn0", "mtu", "1400"]
+        );
+        for value in ["0", "65536", "1400;id", "-1"] {
+            assert!(parse_line(&format!("mtu\tlink_mtu\taivpn0\t{value}"), 1).is_err());
+        }
+    }
 
     #[test]
     fn owned_split_route_is_narrow_and_dual_stack() {

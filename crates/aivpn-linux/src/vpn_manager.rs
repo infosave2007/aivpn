@@ -144,6 +144,21 @@ mod status_file_tests {
     }
 }
 
+/// Файл текущего пользователя имеет приоритет над общими файлами старых версий.
+fn status_candidates(primary: &std::path::Path, legacy: &[PathBuf]) -> Vec<String> {
+    let mut fallback: Vec<_> = legacy
+        .iter()
+        .filter_map(|path| read_trusted_stats_file(path))
+        .collect();
+    fallback.sort_by(|a, b| b.0.cmp(&a.0));
+    let mut candidates = Vec::new();
+    if let Some((_, content)) = read_trusted_stats_file(primary) {
+        candidates.push(content);
+    }
+    candidates.extend(fallback.into_iter().map(|(_, content)| content));
+    candidates
+}
+
 pub fn read_traffic_stats() -> TrafficStats {
     let candidates: Vec<PathBuf> = vec![
         dirs::cache_dir()
@@ -156,12 +171,8 @@ pub fn read_traffic_stats() -> TrafficStats {
     // Rank candidates by mtime (exactly like quality.json below): with a
     // fixed first-parse-wins order, a stale file left at an earlier path by
     // a previous run shadows the live one being updated at a later path.
-    let mut traffic_by_freshness: Vec<_> = candidates
-        .iter()
-        .filter_map(|p| read_trusted_stats_file(p))
-        .collect();
-    traffic_by_freshness.sort_by(|a, b| b.0.cmp(&a.0));
-    for (_, content) in traffic_by_freshness {
+    let private_traffic = crate::admin::admin_token_path().with_file_name("traffic.stats");
+    for content in status_candidates(&private_traffic, &candidates) {
         if let Some(s) = parse_traffic_stats(&content) {
             stats.bytes_sent = s.bytes_sent;
             stats.bytes_received = s.bytes_received;
@@ -181,12 +192,8 @@ pub fn read_traffic_stats() -> TrafficStats {
         PathBuf::from("/var/run/aivpn/quality.json"),
         PathBuf::from("/tmp/aivpn-quality.json"),
     ];
-    let mut by_freshness: Vec<_> = quality_candidates
-        .iter()
-        .filter_map(|p| read_trusted_stats_file(p))
-        .collect();
-    by_freshness.sort_by(|a, b| b.0.cmp(&a.0));
-    for (_, content) in by_freshness {
+    let private_quality = crate::admin::admin_token_path().with_file_name("quality.json");
+    for content in status_candidates(&private_quality, &quality_candidates) {
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&content) {
             stats.quality_score = v.get("quality").and_then(|x| x.as_u64()).unwrap_or(0) as u8;
             stats.server_adaptive_level =
@@ -448,5 +455,36 @@ pub fn format_bytes(bytes: u64) -> String {
         format!("{:.1} MB", bytes as f64 / 1_048_576.0)
     } else {
         format!("{:.2} GB", bytes as f64 / 1_073_741_824.0)
+    }
+}
+
+#[cfg(test)]
+mod private_status_tests {
+    use super::*;
+    #[test]
+    fn another_sessions_newer_legacy_file_cannot_shadow_our_status() {
+        let dir = std::env::temp_dir().join(format!(
+            "aivpn-status-order-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let own = dir.join("own");
+        let legacy = dir.join("legacy");
+        std::fs::write(&own, "sent:123,received:456,since:1000").unwrap();
+        std::fs::write(&legacy, "sent:0,received:0").unwrap();
+        let values = status_candidates(&own, std::slice::from_ref(&legacy));
+        let stats = parse_traffic_stats(&values[0]).unwrap();
+        assert_eq!(stats.bytes_sent, 123);
+        assert_eq!(stats.bytes_received, 456);
+        std::fs::remove_file(&own).unwrap();
+        assert_eq!(
+            status_candidates(&own, &[legacy]),
+            vec!["sent:0,received:0"]
+        );
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

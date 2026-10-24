@@ -171,11 +171,13 @@ impl super::App {
                 .on_press(Message::Disconnect)
                 .style(button::danger)
                 .padding([6, 14])
+                .width(110)
                 .into()
         } else {
             let b = button(text(t(lang, "Connect")).size(13))
                 .style(button::primary)
-                .padding([6, 14]);
+                .padding([6, 14])
+                .width(110);
             if has_profile {
                 b.on_press(Message::Connect).into()
             } else {
@@ -209,10 +211,16 @@ impl super::App {
 
         let status_card = container(
             row![
-                text(status_str).color(status_color).size(14),
+                column![
+                    text(status_str)
+                        .color(status_color)
+                        .size(14)
+                        .width(Length::Fill),
+                    traffic_row
+                ]
+                .width(Length::Fill)
+                .spacing(4),
                 Space::new().width(8),
-                traffic_row,
-                Space::new().width(Length::Fill),
                 conn_btn,
             ]
             .align_y(Alignment::Center),

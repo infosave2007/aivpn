@@ -151,7 +151,12 @@ object SecureStorage {
         var depth = 0
         while (cause != null && depth < 6) {
             // Transient Android Keystore failure — data on disk is fine; never wipe.
-            if (cause is android.security.KeyStoreException) return false
+            // Класс был скрытым на старых Android; не связываем байткод с API 33.
+            var type: Class<*>? = cause.javaClass
+            while (type != null) {
+                if (type.name == "android.security.KeyStoreException") return false
+                type = type.superclass
+            }
             // AEAD tag mismatch: the keyset/master key genuinely no longer decrypts
             // the ciphertext (backup restore, OTA, Keystore wipe) — unrecoverable.
             if (cause is javax.crypto.AEADBadTagException) return true

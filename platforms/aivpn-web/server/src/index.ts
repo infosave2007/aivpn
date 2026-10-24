@@ -20,7 +20,7 @@ import { oidcRoute } from './routes/oidc'
 import { proxyRoute } from './routes/proxy'
 import { metricsRoute } from './routes/metrics'
 import { eventsRoute } from './routes/events'
-import { checkRateLimit, isRateLimited, recordRateLimitEvent, scheduleRateLimitCleaner } from './ratelimit'
+import { checkRateLimit, isRateLimited, recordRateLimitEvent, reserveRateLimit, scheduleRateLimitCleaner } from './ratelimit'
 import { getClientIp } from './lib/client-ip'
 import { verifyAccessToken } from './auth/jwt'
 
@@ -109,17 +109,18 @@ app.use('/web/auth/*', async (c, next) => {
     return c.json({ error: 'Too many requests. Please wait before retrying.' }, 429)
   }
 
-  await next()
-
-  // Only FAILED requests (4xx/5xx) consume per-IP slots. Successful read-only
-  // auth traffic (GET /me, POST /refresh, GET /oidc/config, passkey listing…)
-  // is free — a browser with several tabs fires many of those on startup and
-  // used to burn through the 10-request window, 429-ing legitimate logins.
-  // Brute-force protection is unchanged: every failed login/TOTP/passkey
-  // attempt still records an event, and the check above rejects before the
-  // handler once the window is full.
-  if (c.res.status >= 400) {
-    recordRateLimitEvent(key, config.AUTH_RATE_MAX)
+  const credentialCheck = c.req.method === 'POST' &&
+    ['/web/auth/login', '/web/auth/passkey/authenticate'].includes(c.req.path)
+  const attempt = credentialCheck
+    ? reserveRateLimit(key, config.AUTH_RATE_MAX, config.AUTH_RATE_WINDOW_MS) : undefined
+  if (credentialCheck && !attempt) {
+    return c.json({ error: 'Too many requests. Please wait before retrying.' }, 429)
+  }
+  try {
+    await next()
+  } finally {
+    if (attempt) attempt.finish(c.res.status >= 400)
+    else if (c.res.status >= 400) recordRateLimitEvent(key, config.AUTH_RATE_MAX)
   }
 })
 

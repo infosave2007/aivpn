@@ -143,17 +143,13 @@ class PoolActivity : AppCompatActivity() {
                 LinearLayout.LayoutParams.MATCH_PARENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT
             ).apply {
-                setMargins(12.dp, 6.dp, 12.dp, 0)
+                setMargins(20.dp, 8.dp, 20.dp, 0)
             }
-            setCardBackgroundColor(getColor(R.color.surface))
-            radius = 16f.dp
-            cardElevation = 0f
-            strokeWidth = 0
         }
 
         val content = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(14.dp, 14.dp, 14.dp, 14.dp)
+            setPadding(16.dp, 16.dp, 16.dp, 16.dp)
         }
 
         val header = LinearLayout(this).apply {
@@ -161,23 +157,22 @@ class PoolActivity : AppCompatActivity() {
             gravity = Gravity.CENTER_VERTICAL
         }
         header.addView(View(this).apply {
-            layoutParams = LinearLayout.LayoutParams(10.dp, 10.dp).apply { marginEnd = 10.dp }
+            layoutParams = LinearLayout.LayoutParams(12.dp, 12.dp).apply { marginEnd = 10.dp }
             setBackgroundResource(if (connected) R.drawable.dot_green else R.drawable.dot_grey)
         })
         header.addView(TextView(this).apply {
             layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
             text = nodeId
-            textSize = 15f
-            setTypeface(typeface, android.graphics.Typeface.BOLD)
-            setTextColor(getColor(R.color.text_primary))
-            maxLines = 1
+            textSize = 16f
+            setTextColor(colorAttr(com.google.android.material.R.attr.colorOnSurface, R.color.text_primary))
+            maxLines = 2
             ellipsize = android.text.TextUtils.TruncateAt.END
         })
         if (revoked) {
             header.addView(TextView(this).apply {
                 text = getString(R.string.pool_node_revoked)
-                textSize = 11f
-                setTextColor(getColor(R.color.disconnect))
+                textSize = 14f
+                setTextColor(colorAttr(com.google.android.material.R.attr.colorError, R.color.disconnect))
             })
         }
         content.addView(header)
@@ -196,8 +191,8 @@ class PoolActivity : AppCompatActivity() {
         )
         content.addView(TextView(this).apply {
             text = subtitleParts.joinToString("  •  ")
-            textSize = 12f
-            setTextColor(getColor(R.color.text_secondary))
+            textSize = 14f
+            setTextColor(colorAttr(com.google.android.material.R.attr.colorOnSurfaceVariant, R.color.text_secondary))
             setPadding(0, 4.dp, 0, 0)
         })
 
@@ -207,15 +202,23 @@ class PoolActivity : AppCompatActivity() {
                 if (lastSeenUnix != null) dateFormat.format(Date(lastSeenUnix * 1000)) + " UTC"
                 else getString(R.string.pool_node_never)
             )
-            textSize = 11f
-            setTextColor(getColor(R.color.text_secondary))
-            setPadding(0, 2.dp, 0, 0)
+            textSize = 14f
+            setTextColor(colorAttr(com.google.android.material.R.attr.colorOnSurfaceVariant, R.color.text_secondary))
+            setPadding(0, 4.dp, 0, 0)
         })
 
         card.addView(content)
         return card
     }
 
+    private fun colorAttr(attr: Int, fallback: Int): Int {
+        val typed = android.util.TypedValue()
+        return if (theme.resolveAttribute(attr, typed, true)) {
+            if (typed.resourceId != 0) getColor(typed.resourceId) else typed.data
+        } else {
+            getColor(fallback)
+        }
+    }
+
     private val Int.dp: Int get() = (this * resources.displayMetrics.density).toInt()
-    private val Float.dp: Float get() = this * resources.displayMetrics.density
 }

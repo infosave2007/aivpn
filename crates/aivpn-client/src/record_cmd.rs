@@ -35,6 +35,7 @@ pub fn recording_status_paths() -> Vec<std::path::PathBuf> {
     #[cfg(not(target_os = "windows"))]
     {
         vec![
+            admin_token_path().with_file_name("recording.status"),
             std::path::PathBuf::from("/var/run/aivpn/recording.status"),
             std::path::PathBuf::from("/tmp/aivpn-recording.status"),
         ]

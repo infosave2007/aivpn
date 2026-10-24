@@ -367,3 +367,33 @@ test('SSO проверяет cookie и создает одну учетную з
     await identityProvider.stop(true)
   }
 })
+
+
+test('параллельные неверные пароли не обходят ограничение попыток', async () => {
+  const username = await newUser()
+  const responses = await Promise.all(Array.from({ length: config.AUTH_RATE_MAX + 3 }, () =>
+    post('/web/auth/login', { username, password: 'wrong' })))
+  expect(responses.filter(response => response.status === 401).length).toBe(config.AUTH_RATE_MAX)
+  expect(responses.filter(response => response.status === 429).length).toBe(3)
+}, 30000)
+
+
+test('поздний ответ passkey не откатывает счетчик подписи', async () => {
+  const username = await newUser()
+  const db = await getDb() as any
+  const { sqlitePasskeys, pgPasskeys } = await import('../src/db')
+  const passkeys = IS_SQLITE ? sqlitePasskeys : pgPasskeys
+  const { claimPasskeyCounter } = await import('../src/auth/passkey-counter')
+  const [user] = await db.select().from(users).where(eq(users.username, username))
+  const id = randomUUID()
+  await db.insert(passkeys).values({ id, user_id: user.id, credential_id: randomUUID(), public_key: 'test', counter: 1 })
+  expect(await claimPasskeyCounter(db, passkeys, id, 3)).toBe(true)
+  expect(await claimPasskeyCounter(db, passkeys, id, 2)).toBe(false)
+  expect(await claimPasskeyCounter(db, passkeys, id, 0)).toBe(false)
+  const [stored] = await db.select().from(passkeys).where(eq(passkeys.id, id))
+  expect(stored.counter).toBe(3)
+  const zeroId = randomUUID()
+  await db.insert(passkeys).values({ id: zeroId, user_id: user.id, credential_id: randomUUID(), public_key: 'test', counter: 0 })
+  expect(await claimPasskeyCounter(db, passkeys, zeroId, 0)).toBe(true)
+  expect(await claimPasskeyCounter(db, passkeys, zeroId, 0)).toBe(true)
+})

@@ -180,6 +180,8 @@ class AivpnTileService : TileService() {
         }
     }
 
+    // До API 34 доступен только вариант с Intent; новая ветка отделена проверкой SDK.
+    @android.annotation.SuppressLint("StartActivityAndCollapseDeprecated")
     private fun openMainActivity() {
         val main = Intent(this, MainActivity::class.java).apply {
             flags = Intent.FLAG_ACTIVITY_NEW_TASK

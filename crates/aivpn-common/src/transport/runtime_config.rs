@@ -101,7 +101,7 @@ fn path_for(
     match kind {
         HostKind::Windows => match non_empty(appdata) {
             Some(dir) => PathBuf::from(dir).join("aivpn").join("config.json"),
-            None => PathBuf::from(r"C:\ProgramDataivpn\config.json"),
+            None => PathBuf::from(r"C:\ProgramData\aivpn\config.json"),
         },
         HostKind::Macos => match non_empty(home) {
             Some(dir) => PathBuf::from(dir)
@@ -297,6 +297,14 @@ mod tests {
         let result = RuntimeConfig::load_file(&path);
         std::fs::remove_file(&path).unwrap();
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn windows_service_uses_programdata_without_appdata() {
+        assert_eq!(
+            path_for(HostKind::Windows, None, None, None),
+            PathBuf::from(r"C:\ProgramData\aivpn\config.json"),
+        );
     }
 
     #[test]

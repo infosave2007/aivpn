@@ -182,8 +182,6 @@ pub struct Gateway {
     nat_forwarder: Option<Arc<NatForwarder>>,
     /// Channel-based TUN writer (replaces Mutex for upload throughput)
     tun_write_tx: Option<mpsc::Sender<Vec<u8>>>,
-    /// Per-IP rate limiter: (packet_count, window_start)
-    rate_limits: Arc<DashMap<IpAddr, (u64, Instant)>>,
     /// Per-peer handshake failure cooldown: (failure_count, last_failure_time)
     /// Prevents rapid session-creation loops when client retries with stale keys.
     ///
@@ -940,7 +938,6 @@ impl Gateway {
             udp_socket: None,
             nat_forwarder: None,
             tun_write_tx: None,
-            rate_limits: Arc::new(DashMap::new()),
             handshake_cooldowns: Arc::new(DashMap::new()),
             handshake_locks: Arc::new(DashMap::new()),
             fallback_scan_budget: Arc::new(parking_lot::Mutex::new((0, Instant::now()))),

@@ -22,27 +22,23 @@ import com.aivpn.client.databinding.ActivityBackgroundHealthBinding
 import com.google.android.material.button.MaterialButton
 
 /**
- * Shared status checks for "can Android silently kill the VPN in the background?".
- * Used by [BackgroundHealthActivity] (full checklist) and MainActivity (one-line
- * at-risk hint under the Background Health button, re-evaluated in onResume).
+ * Проверки, останется ли VPN работать, когда приложение свернуто.
+ * Ими пользуются [BackgroundHealthActivity] и короткая подсказка на главном экране.
  */
 object BackgroundHealth {
 
-    /** Whether the user will actually SEE the "VPN stopped" security alerts.
-     *  Covers both the Android 13+ POST_NOTIFICATIONS runtime grant and the
-     *  app-level notification toggle on older versions. */
+    /** Видит ли пользователь оповещение «VPN остановлен».
+     *  Учитывает POST_NOTIFICATIONS на Android 13+ и общий переключатель уведомлений. */
     fun notificationsEnabled(context: Context): Boolean =
         NotificationManagerCompat.from(context).areNotificationsEnabled()
 
-    /** Battery-optimization (Doze) exemption — the single most important setting
-     *  against OS/OEM foreground-service kills on Android 12+. */
+    /** Исключение из оптимизации батареи: режим сна не останавливает службу. */
     fun batteryExempt(context: Context): Boolean {
         val pm = context.getSystemService(Context.POWER_SERVICE) as PowerManager
         return pm.isIgnoringBatteryOptimizations(context.packageName)
     }
 
-    /** API 28+ "Restricted" battery state — Android WILL stop the FGS in background.
-     *  On API < 28 the state does not exist, so it counts as not restricted. */
+    /** Состояние «Ограничено» с API 28. Ниже этого API такого состояния нет. */
     fun backgroundRestricted(context: Context): Boolean {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.P) return false
         val am = context.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
@@ -57,8 +53,8 @@ object BackgroundHealth {
         return try { svc.isAlwaysOn } catch (e: Exception) { null }
     }
 
-    /** OS "Block connections without VPN" (lockdown) — the only real kill switch
-     *  available to a non-system VPN app. null = cannot verify right now. */
+    /** Системный переключатель «Блокировать соединения без VPN».
+     *  null значит, что сейчас это нельзя проверить. */
     fun lockdownEnabled(): Boolean? {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return null
         val svc = AivpnService.instance ?: return null
@@ -74,14 +70,9 @@ object BackgroundHealth {
 }
 
 /**
- * Background reliability & permissions health check — a checklist of the system
- * settings that let Android (or an OEM power manager) silently kill the VPN in
- * the background, each with a green/amber status dot and a one-tap deep link to
- * the exact system screen. Directly addresses the field bug where Android 12+
- * stopped the foreground service and traffic reverted to the real IP.
- *
- * Status is re-evaluated in [onResume], so returning from any system screen
- * immediately refreshes the checklist.
+ * Список системных разрешений, от которых зависит работа VPN в фоне.
+ * У каждого пункта свой переход в нужный системный экран.
+ * Состояние читается заново в [onResume], сразу после возврата из настроек.
  */
 class BackgroundHealthActivity : AppCompatActivity() {
 
@@ -125,17 +116,17 @@ class BackgroundHealthActivity : AppCompatActivity() {
         val mustHaveOk = notifications && battery && !bgRestricted
         when {
             !mustHaveOk -> {
-                binding.textSummary.text = getString(R.string.bg_health_summary_at_risk)
-                binding.textSummary.setTextColor(getColor(R.color.disconnect))
+                binding.textSummary.text = getString(R.string.secondary_bg_summary_at_risk)
+                binding.textSummary.setTextColor(colorAttr(com.google.android.material.R.attr.colorError, R.color.disconnect))
                 binding.summaryDot.setBackgroundResource(R.drawable.dot_yellow)
             }
             lockdown != true -> {
-                binding.textSummary.text = getString(R.string.bg_health_summary_mostly)
+                binding.textSummary.text = getString(R.string.secondary_bg_summary_mostly)
                 binding.textSummary.setTextColor(getColor(R.color.accent_lemon))
                 binding.summaryDot.setBackgroundResource(R.drawable.dot_yellow)
             }
             else -> {
-                binding.textSummary.text = getString(R.string.bg_health_summary_protected)
+                binding.textSummary.text = getString(R.string.secondary_bg_summary_protected)
                 binding.textSummary.setTextColor(getColor(R.color.green))
                 binding.summaryDot.setBackgroundResource(R.drawable.dot_green)
             }
@@ -147,17 +138,17 @@ class BackgroundHealthActivity : AppCompatActivity() {
         // 1. Notifications (POST_NOTIFICATIONS on 13+, app toggle everywhere)
         addRow(
             title = getString(R.string.bg_health_check_notifications),
-            desc = if (notifications) getString(R.string.bg_health_notifications_ok)
-                   else getString(R.string.bg_health_notifications_bad),
+            desc = if (notifications) getString(R.string.secondary_bg_notifications_ok)
+                   else getString(R.string.secondary_bg_notifications_bad),
             status = if (notifications) Status.OK else Status.WARN,
             actionLabel = if (notifications) null else getString(R.string.bg_health_fix),
         ) { requestNotifications() }
 
-        // 2. Battery-optimization exemption (the FGS-kill fix)
+        // 2. Исключение из оптимизации батареи
         addRow(
             title = getString(R.string.bg_health_check_battery),
-            desc = if (battery) getString(R.string.bg_health_battery_ok)
-                   else getString(R.string.bg_health_battery_bad),
+            desc = if (battery) getString(R.string.secondary_bg_battery_ok)
+                   else getString(R.string.secondary_bg_battery_bad),
             status = if (battery) Status.OK else Status.WARN,
             actionLabel = if (battery) null else getString(R.string.bg_health_fix),
         ) { requestBatteryExemption() }
@@ -165,19 +156,19 @@ class BackgroundHealthActivity : AppCompatActivity() {
         // 3. Background restriction (API 28+ "Restricted" state)
         addRow(
             title = getString(R.string.bg_health_check_bg_restriction),
-            desc = if (bgRestricted) getString(R.string.bg_health_bg_bad)
-                   else getString(R.string.bg_health_bg_ok),
+            desc = if (bgRestricted) getString(R.string.secondary_bg_bg_bad)
+                   else getString(R.string.secondary_bg_bg_ok),
             status = if (bgRestricted) Status.WARN else Status.OK,
             actionLabel = if (bgRestricted) getString(R.string.bg_health_fix) else null,
         ) { openAppDetailsSettings() }
 
-        // 4. Always-on VPN (system restarts the service after a kill)
+        // 4. Постоянный VPN: система поднимает службу снова
         addRow(
             title = getString(R.string.bg_health_check_always_on),
             desc = when (alwaysOn) {
-                true -> getString(R.string.bg_health_always_on_ok)
-                false -> getString(R.string.bg_health_always_on_off)
-                null -> getString(R.string.bg_health_unknown_service_off)
+                true -> getString(R.string.secondary_bg_always_on_ok)
+                false -> getString(R.string.secondary_bg_always_on_off)
+                null -> getString(R.string.secondary_bg_unknown)
             },
             status = when (alwaysOn) {
                 true -> Status.OK
@@ -187,13 +178,13 @@ class BackgroundHealthActivity : AppCompatActivity() {
             actionLabel = if (alwaysOn == true) null else getString(R.string.bg_health_open),
         ) { openVpnSettings() }
 
-        // 5. Lockdown — "Block connections without VPN" is the real kill switch
+        // 5. Блокировка соединений без VPN
         addRow(
             title = getString(R.string.bg_health_check_lockdown),
             desc = when (lockdown) {
-                true -> getString(R.string.bg_health_lockdown_ok)
-                false -> getString(R.string.bg_health_lockdown_off)
-                null -> getString(R.string.bg_health_unknown_service_off)
+                true -> getString(R.string.secondary_bg_lockdown_ok)
+                false -> getString(R.string.secondary_bg_lockdown_off)
+                null -> getString(R.string.secondary_bg_unknown)
             },
             status = when (lockdown) {
                 true -> Status.OK
@@ -208,7 +199,7 @@ class BackgroundHealthActivity : AppCompatActivity() {
         oemVendorLabel()?.let { vendor ->
             addRow(
                 title = getString(R.string.bg_health_check_oem, vendor),
-                desc = getString(R.string.bg_health_oem_desc),
+                desc = getString(R.string.secondary_bg_oem_desc),
                 status = Status.UNKNOWN,
                 actionLabel = getString(R.string.bg_health_open),
                 divider = false,
@@ -245,17 +236,17 @@ class BackgroundHealthActivity : AppCompatActivity() {
         }
         textCol.addView(TextView(this).apply {
             text = title
-            textSize = 14f
-            setTextColor(getColor(R.color.text_primary))
-            setTypeface(null, android.graphics.Typeface.BOLD)
+            textSize = 16f
+            setTextColor(colorAttr(com.google.android.material.R.attr.colorOnSurface, R.color.text_primary))
         })
         textCol.addView(TextView(this).apply {
             text = desc
-            textSize = 12f
+            textSize = 14f
             setTextColor(
-                getColor(if (status == Status.WARN) R.color.accent_lemon else R.color.text_secondary)
+                if (status == Status.WARN) getColor(R.color.accent_lemon)
+                else colorAttr(com.google.android.material.R.attr.colorOnSurfaceVariant, R.color.text_secondary)
             )
-            setPadding(0, 2.dp, 0, 0)
+            setPadding(0, 4.dp, 0, 0)
         })
         row.addView(textCol)
         if (actionLabel != null && action != null) {
@@ -264,15 +255,18 @@ class BackgroundHealthActivity : AppCompatActivity() {
                 com.google.android.material.R.attr.materialButtonOutlinedStyle
             ).apply {
                 text = actionLabel
-                textSize = 12f
+                textSize = 14f
                 isAllCaps = false
-                setTextColor(getColor(R.color.accent))
-                strokeColor = android.content.res.ColorStateList.valueOf(getColor(R.color.grey))
                 minWidth = 0
                 minimumWidth = 0
-                setPadding(12.dp, 0, 12.dp, 0)
+                minHeight = 48.dp
+                minimumHeight = 48.dp
+                insetTop = 0
+                insetBottom = 0
+                setPadding(12.dp, 8.dp, 12.dp, 8.dp)
                 layoutParams = LinearLayout.LayoutParams(
-                    LinearLayout.LayoutParams.WRAP_CONTENT, 36.dp
+                    LinearLayout.LayoutParams.WRAP_CONTENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT
                 ).apply { marginStart = 8.dp }
                 setOnClickListener { action() }
             })
@@ -283,8 +277,17 @@ class BackgroundHealthActivity : AppCompatActivity() {
                 layoutParams = LinearLayout.LayoutParams(
                     LinearLayout.LayoutParams.MATCH_PARENT, 1
                 ).apply { setMargins(16.dp, 0, 16.dp, 0) }
-                setBackgroundColor(getColor(R.color.grey))
+                setBackgroundColor(colorAttr(com.google.android.material.R.attr.colorOutline, R.color.grey))
             })
+        }
+    }
+
+    private fun colorAttr(attr: Int, fallback: Int): Int {
+        val typed = android.util.TypedValue()
+        return if (theme.resolveAttribute(attr, typed, true)) {
+            if (typed.resourceId != 0) getColor(typed.resourceId) else typed.data
+        } else {
+            getColor(fallback)
         }
     }
 

@@ -12,7 +12,7 @@ INIT = ROOT / 'platforms/openwrt/package/aivpn/files/aivpn.init'
 
 
 class InitTest(unittest.TestCase):
-    def start(self, **settings):
+    def start(self, action="start_service", **settings):
         with tempfile.TemporaryDirectory(prefix='aivpn-openwrt-') as temporary:
             directory = Path(temporary)
             logger = directory / 'record'
@@ -33,14 +33,15 @@ config_load() { :; }
 config_get() { eval "$1=\\\"\\${setting_$3-$4}\\\""; }
 config_get_bool() { config_get "$@"; }
 procd_open_instance() { record open; }
+procd_send_signal() { record signal "$@"; }
 procd_set_param() { record set "$@"; }
 procd_append_param() { record append "$@"; }
 procd_close_instance() { record close; }
 . "$INIT"
-start_service
+"$TEST_ACTION"
 '''
             environment = os.environ | {
-                'PATH': f'{directory}:/usr/bin:/bin', 'INIT': str(INIT),
+                'PATH': f'{directory}:/usr/bin:/bin', 'INIT': str(INIT), 'TEST_ACTION': action,
                 'CALL_LOG': str(directory / 'calls'), 'NFT_LOG': str(directory / 'nft-rules'),
             } | {f'setting_{key}': str(value) for key, value in settings.items()}
             result = subprocess.run(['sh', '-c', script], env=environment, capture_output=True, timeout=5)
@@ -72,6 +73,17 @@ start_service
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn(['set', 'env', 'AIVPN_PRESHARED_KEY=test-psk'], calls)
         self.assertFalse(any('test-psk' in call for call in calls if 'command' in call))
+
+    def test_reconnect_signals_client_without_removing_guard(self):
+        result, calls, _ = self.start(action='reconnect')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(calls, [['signal', 'aivpn', '', 'TERM']])
+
+    def test_invalid_configuration_preserves_an_explicit_kill_switch(self):
+        result, calls, rules = self.start(enabled=1, kill_switch=1)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('oifname != "aivpn0" drop', rules)
+        self.assertNotIn(['open'], calls)
 
     def test_disabled_service_clears_guard(self):
         result, calls, _ = self.start()

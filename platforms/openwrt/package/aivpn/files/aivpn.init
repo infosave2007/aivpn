@@ -5,6 +5,9 @@ USE_PROCD=1
 START=90
 STOP=10
 
+EXTRA_COMMANDS="reconnect"
+EXTRA_HELP="\treconnect Переподключить VPN без снятия правил блокировки"
+
 PROG=/usr/bin/aivpn-client
 # UCI config — procd watches this file and restarts the service on change
 CONFIG=/etc/config/aivpn
@@ -66,6 +69,11 @@ start_service() {
     procd_set_param stderr 1
     procd_set_param respawn 3600 5 0
     procd_close_instance
+}
+
+# procd повторно запустит клиент, сохранив защиту на время восстановления WAN.
+reconnect() {
+    procd_send_signal aivpn "" TERM
 }
 
 stop_service() {

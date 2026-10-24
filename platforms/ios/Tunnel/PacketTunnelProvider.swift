@@ -88,7 +88,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     // Rust session is stopped so the retry loop reconnects on the new path
     // immediately instead of waiting out the RX-silence watchdogs.
     private var pathMonitor: NWPathMonitor?
-    private var lastPathSignature: String?
+    private var pathChanges = NetworkPathChanges()
     // L5: count of inbound (packetFlow → Rust) packets dropped because the
     // bridge socket buffer was full (write() EAGAIN). Debug visibility only.
     // Touched exclusively on bridgeQueue.
@@ -1009,26 +1009,16 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     /// aivpn_stop_tunnel() so the in-extension retry loop (startTunnel's thread)
     /// reconnects on the NEW path immediately, instead of waiting for the
     /// RX-silence watchdogs to notice the dead flow on the old one. The handler
-    /// runs on bridgeQueue; lastPathSignature is touched only there.
+    /// runs on bridgeQueue; pathChanges is touched only there.
     private func startPathMonitor() {
         pathMonitor?.cancel()
+        pathChanges = NetworkPathChanges()
         let monitor = NWPathMonitor()
         monitor.pathUpdateHandler = { [weak self] path in
             guard let self = self, !self.isStopped else { return }
-            var sig = path.status == .satisfied ? "up" : "down"
-            for iface in path.availableInterfaces {
-                sig += "|\(iface.type)#\(iface.name)"
-            }
-            let previous = self.lastPathSignature
-            self.lastPathSignature = sig
-            // The first callback merely reports the current path — never
-            // restart on it.
-            guard let prev = previous, prev != sig else { return }
-            // While the path is down there is nothing to reconnect TO; the
-            // transition back to satisfied fires its own change event.
-            guard path.status == .satisfied else { return }
-            os_log(.info, "aivpn: network path changed (%{public}@ -> %{public}@) — restarting tunnel session",
-                   prev, sig)
+            let interfaces = path.availableInterfaces.map { "\($0.type)#\($0.name)" }
+            guard self.pathChanges.update(satisfied: path.status == .satisfied, interfaces: interfaces) else { return }
+            os_log(.info, "aivpn: primary network path changed - restarting tunnel session")
             // Stops ONLY the Rust session: isStopped stays false, so the retry
             // loop treats the exit as an internal error and reconnects.
             aivpn_stop_tunnel()

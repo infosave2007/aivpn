@@ -135,12 +135,16 @@ impl AppSettings {
         // Write 0600 to a temp file then atomically rename (same pattern as
         // key_storage.rs): a crash mid-write can't corrupt the existing
         // settings and the Telegram token is never world-readable.
-        let tmp = path.with_extension("json.tmp");
+        let nonce = base64::Engine::encode(
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+            aivpn_common::crypto::random_bytes(16),
+        );
+        let tmp = path.with_extension(format!("{nonce}.tmp"));
         let write_result = std::fs::OpenOptions::new()
             .write(true)
-            .create(true)
-            .truncate(true)
+            .create_new(true)
             .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
             .open(&tmp)
             .and_then(|mut f| f.write_all(json.as_bytes()).and_then(|_| f.sync_all()));
         match write_result {

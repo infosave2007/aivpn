@@ -11,8 +11,6 @@ use super::*;
 // share a numeric value (the two 5-minute sweeps) yet are independent knobs.
 /// How often the recording store is flushed to disk.
 const RECORDING_FLUSH_INTERVAL: Duration = Duration::from_secs(5);
-/// Age past which a stale per-IP rate-limit entry is pruned.
-const RATE_LIMIT_ENTRY_TTL: Duration = Duration::from_secs(30);
 /// Age past which a stale per-IP handshake-cooldown entry is pruned.
 const HANDSHAKE_COOLDOWN_ENTRY_TTL: Duration = Duration::from_secs(60);
 /// Interval of the mask-feedback / metrics / session sweep.
@@ -300,7 +298,6 @@ impl super::Gateway {
             let exit_enabled_cleanup = self.config.exit_node_enabled;
             let neural_enabled_cleanup = self.config.enable_neural;
             let shaping_cleanup = self.config.downlink_shaping;
-            let rate_limits_cleanup = self.rate_limits.clone();
             let handshake_cooldowns_cleanup = self.handshake_cooldowns.clone();
             let handshake_locks_cleanup = self.handshake_locks.clone();
             let mask_preference_throttle_cleanup = self.mask_preference_throttle.clone();
@@ -350,12 +347,11 @@ impl super::Gateway {
                         }
                     }
 
-                    // Prune stale per-IP rate-limit, handshake-cooldown, and
-                    // handshake-lock entries.  handshake_locks is never pruned
+                    // Prune stale handshake-cooldown and handshake-lock entries.
+                    // handshake_locks is never pruned
                     // elsewhere so it grows without bound under sustained churn.
                     // Entries whose Arc strong_count == 1 have no active waiters
                     // and are safe to remove.
-                    rate_limits_cleanup.retain(|_, v| v.1.elapsed() < RATE_LIMIT_ENTRY_TTL);
                     handshake_cooldowns_cleanup
                         .retain(|_, v| v.1.elapsed() < HANDSHAKE_COOLDOWN_ENTRY_TTL);
                     handshake_locks_cleanup.retain(|_, v| std::sync::Arc::strong_count(v) > 1);

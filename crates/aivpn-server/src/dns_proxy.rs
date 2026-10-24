@@ -20,11 +20,11 @@
 //! }
 //! ```
 
+use crate::source_rates::SourceRates;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use tokio::net::UdpSocket;
 use tracing::{debug, info, warn};
@@ -34,6 +34,9 @@ const MAX_DNS_PACKET: usize = 4096;
 const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(5);
 /// Max DNS queries per second per VPN client IP before the request is dropped.
 const MAX_DNS_RPS: u32 = 100;
+const MAX_DNS_SOURCES: usize = 4096;
+const MAX_IN_FLIGHT: usize = 256;
+
 /// Max DoH response body size — legitimate DNS responses are ≤65535 bytes.
 const MAX_DOH_RESPONSE: usize = 65535;
 
@@ -86,12 +89,21 @@ pub async fn run(config: DnsProxyConfig, bind_ip: IpAddr, _tun_iface: String) {
         }
     };
 
+    run_on(config, socket, http).await;
+}
+
+async fn run_on(config: DnsProxyConfig, socket: Arc<UdpSocket>, http: Arc<reqwest::Client>) {
     let cfg = Arc::new(config);
-    let rate_limits: Arc<DashMap<IpAddr, (u32, Instant)>> = Arc::new(DashMap::new());
+    let mut rate_limits = SourceRates::default();
+    let mut queries = tokio::task::JoinSet::new();
     let mut buf = vec![0u8; MAX_DNS_PACKET];
 
     loop {
-        let (len, peer) = match socket.recv_from(&mut buf).await {
+        let packet = tokio::select! {
+            _ = queries.join_next(), if !queries.is_empty() => continue,
+            packet = socket.recv_from(&mut buf) => packet,
+        };
+        let (len, peer) = match packet {
             Ok(r) => r,
             Err(e) => {
                 warn!("DNS proxy: recv error: {}", e);
@@ -99,20 +111,16 @@ pub async fn run(config: DnsProxyConfig, bind_ip: IpAddr, _tun_iface: String) {
             }
         };
 
-        // Per-source-IP rate limit: cap at MAX_DNS_RPS queries/second.
-        let from_ip = peer.ip();
+        if queries.len() >= MAX_IN_FLIGHT
+            || !rate_limits.allow(
+                peer.ip(),
+                Instant::now(),
+                MAX_DNS_SOURCES,
+                MAX_DNS_RPS.into(),
+            )
         {
-            let mut entry = rate_limits.entry(from_ip).or_insert((0u32, Instant::now()));
-            let (count, since) = entry.value_mut();
-            if since.elapsed().as_secs() >= 1 {
-                *count = 0;
-                *since = Instant::now();
-            }
-            if *count >= MAX_DNS_RPS {
-                debug!("DNS proxy: rate limit exceeded for {}", from_ip);
-                continue;
-            }
-            *count += 1;
+            debug!("DNS proxy: request budget exceeded for {}", peer.ip());
+            continue;
         }
 
         let query = buf[..len].to_vec();
@@ -120,7 +128,7 @@ pub async fn run(config: DnsProxyConfig, bind_ip: IpAddr, _tun_iface: String) {
         let http = http.clone();
         let cfg = cfg.clone();
 
-        tokio::spawn(async move {
+        queries.spawn(async move {
             match forward(&http, &cfg, &query).await {
                 Ok(resp) => {
                     if let Err(e) = sock.send_to(&resp, peer).await {
@@ -221,6 +229,51 @@ pub fn install_block_rule(tun_iface: &str) -> aivpn_common::error::Result<()> {
 mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn slow_upstream_cannot_create_unbounded_queries() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = upstream.local_addr().unwrap();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let observed = accepted.clone();
+        let server = tokio::spawn(async move {
+            let mut connections = Vec::new();
+            loop {
+                let (connection, _) = upstream.accept().await.unwrap();
+                connections.push(connection);
+                observed.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let listen = socket.local_addr().unwrap();
+        let cfg = DnsProxyConfig {
+            upstream_doh: format!("http://{address}/dns-query"),
+            fallback_doh: None,
+            block_plain_dns: false,
+        };
+        let proxy = tokio::spawn(run_on(cfg, socket, Arc::new(reqwest::Client::new())));
+        for host in 1..=3 {
+            let source = UdpSocket::bind((std::net::Ipv4Addr::new(127, 0, 0, host), 0))
+                .await
+                .unwrap();
+            for _ in 0..100 {
+                source.send_to(&[0; 12], listen).await.unwrap();
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let count = accepted.load(Ordering::Relaxed);
+        proxy.abort();
+        server.abort();
+        let _ = proxy.await;
+        let _ = server.await;
+        assert!(count > 0);
+        assert!(
+            count <= MAX_IN_FLIGHT,
+            "медленный upstream получил {count} одновременных запросов"
+        );
+    }
 
     #[test]
     fn dns_rules_are_scoped_and_cover_udp_and_tcp() {

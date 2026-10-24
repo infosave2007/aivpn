@@ -33,6 +33,13 @@ fn has_net_admin_cap(path: &std::path::Path) -> bool {
     const VFS_CAP_FLAGS_EFFECTIVE: u32 = 0x1;
     const CAP_NET_ADMIN_MASK: u32 = 1 << 12;
     let magic_etc = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+    // Чужая user namespace не относится к правам, выданным этим установщиком.
+    if magic_etc & 0xff00_0000 == 0x0300_0000
+        && n >= 24
+        && u32::from_le_bytes([buf[20], buf[21], buf[22], buf[23]]) != 0
+    {
+        return false;
+    }
     let permitted = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
     permitted & CAP_NET_ADMIN_MASK != 0 && magic_etc & VFS_CAP_FLAGS_EFFECTIVE != 0
 }
@@ -63,13 +70,7 @@ fn is_trusted_system_binary(_path: &std::path::Path) -> bool {
     false
 }
 
-/// Find every distinct `ip` binary reachable on this system: the one PATH
-/// would actually resolve for an unqualified `Command::new("ip")` call (what
-/// tunnel.rs uses), plus the common hardcoded locations. We grant
-/// capabilities to ALL of them — cheap, and removes any ambiguity about
-/// which one ends up exec'd. Paths are canonicalized and deduped by real
-/// file identity, since /usr/sbin is a symlink to /usr/bin on many distros
-/// (so granting both would otherwise setcap the same inode twice).
+/// Находим системные копии ip, чтобы снять выданные прежним установщиком права.
 fn find_ip_binaries() -> Vec<std::path::PathBuf> {
     let mut found = Vec::new();
 
@@ -172,6 +173,14 @@ fn read_stage_file(name: &str, size: usize) -> String {
     )
 }
 
+/// Удаляем только NET_ADMIN, сохраняя остальные права системной команды.
+fn revoke_ip_capability(path: &std::path::Path) -> String {
+    let path = shell_quote(&path.to_string_lossy());
+    format!(
+        "ip_path={path}\ncaps=$(getcap \"$ip_path\")\ncaps=${{caps#\"$ip_path \"}}\nsetcap \"$caps cap_net_admin-eip\" \"$ip_path\"\ncaps=$(getcap \"$ip_path\")\ncaps=${{caps#\"$ip_path \"}}\nif [ \"$caps\" = = ]; then setcap -r \"$ip_path\"; fi\n"
+    )
+}
+
 /// Устанавливает клиент и помощник в каталог root и проверяет результат.
 pub(super) async fn ensure_capable_binary(
     source: &std::path::Path,
@@ -203,7 +212,7 @@ pub(super) async fn ensure_capable_binary(
                 && policy_is_installed()
         })
     };
-    if client_ok() && helper_ok() && ip_bins.iter().all(|path| has_net_admin_cap(path)) {
+    if client_ok() && helper_ok() && ip_bins.iter().all(|path| !has_net_admin_cap(path)) {
         return Ok(persisted);
     }
     let mut files = vec![("client", client.as_slice(), persisted.as_path(), "0755")];
@@ -232,13 +241,12 @@ pub(super) async fn ensure_capable_binary(
         "setcap cap_net_admin+ep {}",
         shell_quote(&persisted.to_string_lossy())
     ));
-    for ip in &ip_bins {
-        script.push_str(&format!(
-            " cap_net_admin+ep {}",
-            shell_quote(&ip.to_string_lossy())
-        ));
-    }
     script.push('\n');
+    for ip in &ip_bins {
+        if has_net_admin_cap(ip) {
+            script.push_str(&revoke_ip_capability(ip));
+        }
+    }
     let mut child = tokio::process::Command::new("/usr/bin/pkexec")
         .args(["--disable-internal-agent", "sh", "-c", &script])
         .stdin(std::process::Stdio::piped())
@@ -262,7 +270,7 @@ pub(super) async fn ensure_capable_binary(
         || !status.success()
         || !client_ok()
         || !helper_ok()
-        || ip_bins.iter().any(|path| !has_net_admin_cap(path))
+        || ip_bins.iter().any(|path| has_net_admin_cap(path))
     {
         let _ = sender.try_send(Message::LogLine(format!(
             "[diag] privileged setup failed: {status}"
@@ -280,6 +288,45 @@ pub(super) async fn ensure_capable_binary(
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn capability_repair_preserves_other_flags_and_quotes_paths() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("aivpn-cap-repair-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let getcap = dir.join("getcap");
+        let setcap = dir.join("setcap");
+        std::fs::write(
+            &getcap,
+            "#!/bin/sh\nprintf '%s %s\\n' \"$1\" 'cap_net_admin,cap_net_raw=ep'\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &setcap,
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$CAP_CAPTURE\"\n",
+        )
+        .unwrap();
+        for path in [&getcap, &setcap] {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let path = dir.join("ip with 'quote");
+        let output = dir.join("result");
+        let result = std::process::Command::new("/bin/sh")
+            .args(["-ec", &revoke_ip_capability(&path)])
+            .env("PATH", &dir)
+            .env("CAP_CAPTURE", &output)
+            .status()
+            .unwrap();
+        assert!(result.success());
+        assert_eq!(
+            std::fs::read_to_string(&output).unwrap(),
+            format!(
+                "cap_net_admin,cap_net_raw=ep cap_net_admin-eip\n{}\n",
+                path.display()
+            )
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn staged_input_uses_snapshot_and_rejects_truncated_transfer() {

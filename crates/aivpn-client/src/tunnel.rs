@@ -779,23 +779,9 @@ impl Tunnel {
     /// anywhere near `ExitStatus::from_raw` (which expects `code << 8` and
     /// would classify exit code 128 as a success).
     ///
-    /// Background: aivpn-linux grants CAP_NET_ADMIN to both the client
-    /// binary and every `ip` binary it finds as a *file capability* (see
-    /// `ensure_capable_binary` in `aivpn-linux/src/app.rs`). File
-    /// capabilities are silently voided at exec time if the calling process
-    /// (or any ancestor) has the `no_new_privs` bit set: per `capabilities(7)`
-    /// and `Documentation/userspace-api/no_new_privs.rst`, "execve() promises
-    /// not to grant the privilege to do anything that could not have been
-    /// done without the execve call ... file capabilities will not add to
-    /// the permitted set." `getcap` only inspects the on-disk xattr, so it
-    /// keeps reporting the capability as present even when the kernel
-    /// refuses to grant it at exec time — exactly the "verified via getcap,
-    /// yet RTNETLINK EPERM at runtime" symptom seen in the field. Rather
-    /// than trying to pin down *why* `no_new_privs` ended up set somewhere
-    /// in the process ancestry (login shell, desktop launcher, a
-    /// `systemd --user` unit with `NoNewPrivileges=yes`, AppImage/Flatpak
-    /// integration, etc.), recover unconditionally by asking pkexec for
-    /// one-shot root privilege instead of relying on the file capability.
+    /// Сетевые команды выполняются через помощник с авторизацией polkit,
+    /// если у самого процесса нет необходимых прав. Системный ip не получает
+    /// постоянных привилегий от установщика приложения.
     #[cfg(target_os = "linux")]
     pub(crate) fn run_ip_privileged(args: &[&str]) -> io::Result<i32> {
         Ok(Self::run_ip_batch_privileged(&[("cmd", args)])?
@@ -853,10 +839,22 @@ impl Tunnel {
     #[cfg(target_os = "linux")]
     fn is_trusted_root_binary(path: &std::path::Path) -> bool {
         use std::os::unix::fs::MetadataExt;
-        match std::fs::metadata(path) {
-            Ok(meta) => meta.uid() == 0 && (meta.mode() & 0o022) == 0,
-            Err(_) => false,
-        }
+        let Ok(canonical) = std::fs::canonicalize(path) else {
+            return false;
+        };
+        // В user namespace владелец системного корня может отображаться как
+        // unmapped UID. Требуем единого владельца всей цепочки от корня.
+        let Ok(root) = std::fs::metadata("/") else {
+            return false;
+        };
+        canonical.is_file()
+            && canonical.ancestors().all(|ancestor| {
+                std::fs::symlink_metadata(ancestor).is_ok_and(|meta| {
+                    meta.uid() == root.uid()
+                        && meta.mode() & 0o022 == 0
+                        && !meta.file_type().is_symlink()
+                })
+            })
     }
 
     /// Translate one `(name, ip-args)` pair — exactly the shapes already
@@ -903,6 +901,9 @@ impl Tunnel {
             _ => {}
         }
         match args {
+            ["link", "set", "dev", iface, "mtu", mtu] => {
+                Some(format!("{name}\tlink_mtu\t{iface}\t{mtu}"))
+            }
             ["-6", "addr", action @ ("replace" | "del"), cidr, "dev", iface] => {
                 Some(format!("{name}\taddr6_{action}\t{cidr}\t{iface}"))
             }
@@ -1037,6 +1038,100 @@ impl Tunnel {
         child.wait_with_output()
     }
 
+    /// Даже пустой capability xattr сбрасывает ambient-права при exec.
+    /// Чужие права системного файла не меняем: используем помощник polkit.
+    #[cfg(target_os = "linux")]
+    fn can_inherit_net_admin(path: &std::path::Path) -> bool {
+        use std::os::unix::ffi::OsStrExt;
+        if unsafe { libc::geteuid() } == 0 {
+            return true;
+        }
+        let Ok(path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+            return false;
+        };
+        let result = unsafe {
+            libc::getxattr(
+                path.as_ptr(),
+                c"security.capability".as_ptr(),
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        result < 0
+            && matches!(
+                io::Error::last_os_error().raw_os_error(),
+                Some(libc::ENODATA | libc::ENOTSUP)
+            )
+    }
+
+    /// Команды firewall тоже получают имеющийся CAP_NET_ADMIN клиента.
+    /// Не передаем право исполняемым файлам из доступных пользователю каталогов.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn net_admin_command(program: &str) -> std::process::Command {
+        let resolved = std::env::var_os("PATH")
+            .and_then(|paths| {
+                std::env::split_paths(&paths)
+                    .map(|directory| directory.join(program))
+                    .find(|path| {
+                        use std::os::unix::fs::PermissionsExt;
+                        path.metadata().is_ok_and(|meta| {
+                            meta.is_file() && meta.permissions().mode() & 0o111 != 0
+                        })
+                    })
+            })
+            .and_then(|path| path.canonicalize().ok());
+        let mut command = std::process::Command::new(
+            resolved
+                .as_deref()
+                .unwrap_or_else(|| std::path::Path::new(program)),
+        );
+        if resolved.as_deref().is_some_and(|path| {
+            Self::is_trusted_root_binary(path) && Self::can_inherit_net_admin(path)
+        }) {
+            Self::inherit_net_admin(&mut command);
+        }
+        command
+    }
+
+    /// Передаем уже имеющееся право дочерней команде без изменения файла ip.
+    /// Вызывается только для проверенного системного исполняемого файла.
+    #[cfg(target_os = "linux")]
+    fn inherit_net_admin(command: &mut std::process::Command) {
+        use std::os::unix::process::CommandExt;
+        #[repr(C)]
+        struct Header {
+            version: u32,
+            pid: i32,
+        }
+        #[derive(Clone, Copy, Default)]
+        #[repr(C)]
+        struct Data {
+            effective: u32,
+            permitted: u32,
+            inheritable: u32,
+        }
+        // После fork разрешены только системные вызовы, без выделения памяти.
+        unsafe {
+            command.pre_exec(|| {
+                let mut header = Header {
+                    version: 0x2008_0522,
+                    pid: 0,
+                };
+                let mut data = [Data::default(); 2];
+                let bit = 1 << 12;
+                if libc::syscall(libc::SYS_capget, &mut header, data.as_mut_ptr()) == 0
+                    && data[0].permitted & bit != 0
+                {
+                    data[0].inheritable |= bit;
+                    if libc::syscall(libc::SYS_capset, &header, data.as_ptr()) == 0 {
+                        libc::prctl(libc::PR_CAP_AMBIENT, libc::PR_CAP_AMBIENT_RAISE, 12, 0, 0);
+                    }
+                }
+                Ok(())
+            });
+        }
+    }
+
     /// Run a batch of named `ip <args>` invocations as ONE shell script,
     /// falling back to a SINGLE `pkexec sh -c ...` prompt for the whole
     /// batch if (and only if) any of them hits what looks like a permission
@@ -1085,8 +1180,32 @@ impl Tunnel {
                 .collect()
         };
 
-        let output = Command::new("sh").arg("-c").arg(&script).output()?;
-        let direct_results = parse_marker_statuses(&output.stdout);
+        let trusted: Vec<_> = ["/usr/sbin/ip", "/usr/bin/ip", "/sbin/ip", "/bin/ip"]
+            .into_iter()
+            .map(std::path::Path::new)
+            .filter(|path| Self::is_trusted_root_binary(path))
+            .collect();
+        if trusted.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "Не найден системный ip",
+            ));
+        }
+        let ip = trusted
+            .into_iter()
+            .find(|path| Self::can_inherit_net_admin(path));
+        let mut direct_results = Vec::with_capacity(commands.len());
+        let mut stderr_bytes = Vec::new();
+        if let Some(ip) = ip {
+            for (name, args) in commands {
+                let mut command = Command::new(ip);
+                command.args(*args).env("LC_ALL", "C");
+                Self::inherit_net_admin(&mut command);
+                let output = command.output()?;
+                direct_results.push(((*name).to_owned(), output.status.code().unwrap_or(1)));
+                stderr_bytes.extend_from_slice(&output.stderr);
+            }
+        }
         // Every command must have produced a marker line, and every one of
         // those must itself have succeeded, for the batch to count as fully
         // resolved without escalation.
@@ -1094,7 +1213,7 @@ impl Tunnel {
             return Ok(direct_results);
         }
 
-        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stderr = String::from_utf8_lossy(&stderr_bytes);
         // "No such process" (ESRCH) from `ip route del` means the route was
         // already gone — the desired end state for a delete, not an error
         // worth echoing to the user's terminal on every disconnect.
@@ -1106,7 +1225,8 @@ impl Tunnel {
             eprintln!("{}", stderr_noteworthy.join("\n"));
         }
 
-        let looks_like_permission_denied = stderr.contains("Operation not permitted");
+        let looks_like_permission_denied =
+            ip.is_none() || stderr.contains("Operation not permitted");
         if !looks_like_permission_denied {
             // Some non-permission failure (e.g. "File exists" for a route
             // that's already there) — return what we have; pkexec would
@@ -1114,11 +1234,8 @@ impl Tunnel {
             return Ok(direct_results);
         }
 
-        error!(
-            "ip batch [{}] failed with a permission error despite file capabilities being \
-             granted (getcap only checks the on-disk xattr, not whether no_new_privs blocks \
-             it at exec time — see capabilities(7)). Falling back to a single pkexec prompt \
-             for the whole batch instead of one per command.",
+        debug!(
+            "ip batch [{}] requires authorization through polkit",
             commands
                 .iter()
                 .map(|(name, _)| *name)
@@ -2721,7 +2838,73 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn privileged_ip_file_requires_authorization_for_nonroot() {
+        let path = std::env::var("AIVPN_TEST_CAP_PATH").unwrap_or_else(|_| "/usr/bin/cat".into());
+        let expected =
+            std::env::var("AIVPN_TEST_CAP_EXPECTED").map_or(true, |value| value == "true");
+        assert_eq!(
+            Tunnel::can_inherit_net_admin(std::path::Path::new(&path)),
+            expected
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn privileged_command_executes_the_verified_path_not_a_writable_alias() {
+        let dir = std::env::temp_dir().join(format!(
+            "aivpn-command-alias-{:032x}",
+            rand::random::<u128>()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let alias = dir.join("system-cat");
+        std::os::unix::fs::symlink("/usr/bin/cat", &alias).unwrap();
+        let command = Tunnel::net_admin_command(alias.to_str().unwrap());
+        assert_eq!(
+            command.get_program(),
+            std::fs::canonicalize("/usr/bin/cat").unwrap()
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn ip_child_retains_only_available_net_admin() {
+        fn cap(status: &str, field: &str) -> u64 {
+            u64::from_str_radix(
+                status
+                    .lines()
+                    .find_map(|line| line.strip_prefix(field))
+                    .unwrap()
+                    .trim(),
+                16,
+            )
+            .unwrap()
+        }
+        let parent = std::fs::read_to_string("/proc/self/status").unwrap();
+        let mut command = std::process::Command::new("/usr/bin/cat");
+        command.arg("/proc/self/status");
+        Tunnel::inherit_net_admin(&mut command);
+        let output = command.output().unwrap();
+        assert!(output.status.success());
+        let child = String::from_utf8(output.stdout).unwrap();
+        let available = cap(&parent, "CapPrm:") & (1 << 12);
+        assert_eq!(cap(&child, "CapEff:") & (1 << 12), available);
+        assert_eq!(cap(&child, "CapAmb:") & (1 << 12), available);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn test_helper_line_for_delete_and_restore_shapes() {
+        assert!(Tunnel::build_helper_wire(&[
+            ("mtu", &["link", "set", "dev", "aivpn0", "mtu", "1400"]),
+            ("addr", &["addr", "replace", "10.8.0.2/24", "dev", "aivpn0"]),
+            (
+                "route",
+                &["route", "replace", "10.8.0.0/24", "dev", "aivpn0"]
+            ),
+        ])
+        .is_some());
+
         // The teardown paths (disable_full_tunnel / remove_split_routes /
         // restore_ipv6) feed these shapes into run_ip_batch_privileged; each
         // must map to a whitelisted helper verb so the helper path (rather

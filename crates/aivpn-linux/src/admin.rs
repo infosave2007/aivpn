@@ -520,7 +520,7 @@ pub async fn confirm_config(token: String) -> Result<(), String> {
 /// `aivpn-client::record_cmd::admin_token_path()` exactly (this crate has no
 /// dependency on `aivpn-client` as a library, only as a subprocess, so the
 /// lookup is duplicated rather than shared).
-fn admin_token_path() -> PathBuf {
+pub(crate) fn admin_token_path() -> PathBuf {
     if let Some(runtime_dir) = std::env::var_os("XDG_RUNTIME_DIR") {
         return PathBuf::from(runtime_dir).join("aivpn").join("admin.token");
     }

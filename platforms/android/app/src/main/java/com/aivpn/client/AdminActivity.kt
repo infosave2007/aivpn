@@ -12,15 +12,17 @@ import android.view.View
 import android.view.ViewGroup
 import android.widget.AdapterView
 import android.widget.ArrayAdapter
-import android.widget.CheckBox
 import android.widget.EditText
 import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.Spinner
 import android.widget.TextView
 import android.widget.Toast
-import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
+import com.google.android.material.checkbox.MaterialCheckBox
+import com.google.android.material.dialog.MaterialAlertDialogBuilder
+import com.google.android.material.textfield.TextInputEditText
+import com.google.android.material.textfield.TextInputLayout
 import androidx.lifecycle.lifecycleScope
 import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
@@ -154,65 +156,58 @@ class AdminActivity : AppCompatActivity() {
     }
 
     private fun showAddDialogWithOptions(exitOptions: List<ExitNodeOption>) {
-        val dialogCtx = android.view.ContextThemeWrapper(this, R.style.Theme_AIVPN_Dialog)
-        val layout = LinearLayout(dialogCtx).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(24.dp, 16.dp, 24.dp, 0)
-        }
-        val nameInput = EditText(dialogCtx).apply {
-            hint = getString(R.string.admin_hint_name)
-            setSingleLine(true)
-        }
-        val oneTimeCheck = CheckBox(dialogCtx).apply {
-            text = getString(R.string.admin_one_time)
-        }
-        val expiryLabel = TextView(dialogCtx).apply {
-            text = getString(R.string.admin_hint_expiry)
-            textSize = 12f
-            setTextColor(getColor(R.color.text_secondary))
-            setPadding(0, 8.dp, 0, 2.dp)
-        }
-        val expiryInput = EditText(dialogCtx).apply {
-            hint = "2026-12-31T00:00:00Z"
-            setSingleLine(true)
-            textSize = 13f
-        }
-        layout.addView(nameInput)
+        val layout = dialogForm()
+        val nameInput = layout.addOutlinedField(getString(R.string.admin_hint_name))
+        val oneTimeCheck = formCheck(getString(R.string.admin_one_time), false)
         layout.addView(oneTimeCheck)
-        layout.addView(expiryLabel)
-        layout.addView(expiryInput)
-        val exitNodeInput = addExitNodePicker(dialogCtx, layout, exitOptions, "")
+        val expiryInput = layout.addOutlinedField(
+            hint = getString(R.string.admin_hint_expiry),
+            placeholder = "2026-12-31T00:00:00Z",
+        )
+        val exitNodeInput = addExitNodePicker(this, layout, exitOptions, "")
 
-        AlertDialog.Builder(this)
+        MaterialAlertDialogBuilder(this)
             .setTitle(getString(R.string.admin_dialog_add_title))
-            .setView(layout)
-            .setPositiveButton(getString(R.string.btn_save)) { _, _ ->
-                val name = nameInput.text.toString().trim()
-                if (name.isEmpty()) {
-                    Toast.makeText(this, getString(R.string.admin_hint_name), Toast.LENGTH_SHORT).show()
-                    return@setPositiveButton
-                }
-                val expiry = expiryInput.text.toString().trim()
-                val exitNode = exitNodeInput.text.toString().trim()
-                lifecycleScope.launch {
-                    val result = AdminApi.addClient(name, oneTimeCheck.isChecked, expiry.ifEmpty { null })
-                    // AddClient's wire body has no exit_node field (server-side
-                    // TunnelAddClientRequest deliberately omits it) — an
-                    // exit-node value entered here is applied with an
-                    // immediate follow-up PATCH against the newly created id.
-                    if (result.ok && exitNode.isNotEmpty()) {
-                        val newId = result.bodyObject()?.optString("id", "") ?: ""
-                        if (newId.isNotEmpty()) {
-                            val patchResult = AdminApi.patchClient(id = newId, exitNode = exitNode)
-                            handleMutationResult(patchResult)
-                            return@launch
+            .setView(scrollableForm(layout))
+            .setPositiveButton(getString(R.string.btn_save), null)
+            .setNegativeButton(getString(R.string.btn_cancel), null)
+            .create().also { dialog ->
+                dialog.setOnShowListener {
+                    fitFormWindow(dialog)
+                    dialog.getButton(androidx.appcompat.app.AlertDialog.BUTTON_POSITIVE).setOnClickListener save@{
+                        val name = nameInput.text.toString().trim()
+                        if (name.isEmpty()) {
+                            Toast.makeText(this, getString(R.string.admin_hint_name), Toast.LENGTH_SHORT).show()
+                            return@save
+                        }
+                        val expiry = expiryInput.text.toString().trim()
+                        val exitNode = exitNodeInput.text.toString().trim()
+                        dialog.dismiss()
+                        lifecycleScope.launch {
+                            val result = AdminApi.addClient(name, oneTimeCheck.isChecked, expiry.ifEmpty { null })
+                            // AddClient's wire body has no exit_node field (server-side
+                            // TunnelAddClientRequest deliberately omits it) — an
+                            // exit-node value entered here is applied with an
+                            // immediate follow-up PATCH against the newly created id.
+                            if (result.ok && exitNode.isNotEmpty()) {
+                                val newId = result.bodyObject()?.optString("id", "") ?: ""
+                                if (newId.isNotEmpty()) {
+                                    val patchResult = AdminApi.patchClient(id = newId, exitNode = exitNode)
+                                    if (patchResult.ok) {
+                                        handleMutationResult(patchResult)
+                                    } else {
+                                        loadClients()
+                                        Toast.makeText(this@AdminActivity, R.string.admin_created_exit_failed, Toast.LENGTH_LONG).show()
+                                    }
+                                    return@launch
+                                }
+                            }
+                            handleMutationResult(result)
                         }
                     }
-                    handleMutationResult(result)
                 }
+                dialog.show()
             }
-            .setNegativeButton(getString(R.string.btn_cancel), null)
-            .show()
     }
 
     // ──────────── Edit ────────────
@@ -229,53 +224,38 @@ class AdminActivity : AppCompatActivity() {
     }
 
     private fun showEditDialogWithOptions(client: JSONObject, id: String, exitOptions: List<ExitNodeOption>) {
-        val dialogCtx = android.view.ContextThemeWrapper(this, R.style.Theme_AIVPN_Dialog)
-        val layout = LinearLayout(dialogCtx).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(24.dp, 16.dp, 24.dp, 0)
-        }
-        val nameInput = EditText(dialogCtx).apply {
-            hint = getString(R.string.admin_hint_name)
-            setText(client.optString("name", ""))
-            setSingleLine(true)
-        }
-        val enabledCheck = CheckBox(dialogCtx).apply {
-            text = getString(R.string.admin_enabled)
-            isChecked = client.optBoolean("enabled", true)
-        }
-        val oneTimeCheck = CheckBox(dialogCtx).apply {
-            text = getString(R.string.admin_one_time)
-            isChecked = client.optBoolean("one_time", false)
-        }
-        val expiryLabel = TextView(dialogCtx).apply {
-            text = getString(R.string.admin_hint_expiry)
-            textSize = 12f
-            setTextColor(getColor(R.color.text_secondary))
-            setPadding(0, 8.dp, 0, 2.dp)
-        }
+        val layout = dialogForm()
+        val nameInput = layout.addOutlinedField(
+            hint = getString(R.string.admin_hint_name),
+            value = client.optString("name", ""),
+        )
+        val enabledCheck = formCheck(
+            getString(R.string.admin_enabled),
+            client.optBoolean("enabled", true),
+        )
+        val oneTimeCheck = formCheck(
+            getString(R.string.admin_one_time),
+            client.optBoolean("one_time", false),
+        )
+        layout.addView(enabledCheck)
+        layout.addView(oneTimeCheck)
         // isNull guard: the server always serializes `expires_at` (null when
         // unset), and Android org.json's optString turns JSON null into the
         // literal string "null" — which would then round-trip into the PATCH
         // body and fail the server's DateTime parse (400 for the whole edit).
         val originalExpiry = if (client.isNull("expires_at")) "" else client.optString("expires_at", "")
-        val expiryInput = EditText(dialogCtx).apply {
-            hint = "2026-12-31T00:00:00Z"
-            setText(originalExpiry)
-            setSingleLine(true)
-            textSize = 13f
-        }
+        val expiryInput = layout.addOutlinedField(
+            hint = getString(R.string.admin_hint_expiry),
+            placeholder = "2026-12-31T00:00:00Z",
+            value = originalExpiry,
+        )
         // Empty = fall back to the server's global default (pool.exit_node).
         val originalExitNode = if (client.isNull("exit_node")) "" else client.optString("exit_node", "")
-        layout.addView(nameInput)
-        layout.addView(enabledCheck)
-        layout.addView(oneTimeCheck)
-        layout.addView(expiryLabel)
-        layout.addView(expiryInput)
-        val exitNodeInput = addExitNodePicker(dialogCtx, layout, exitOptions, originalExitNode)
+        val exitNodeInput = addExitNodePicker(this, layout, exitOptions, originalExitNode)
 
-        AlertDialog.Builder(this)
+        MaterialAlertDialogBuilder(this)
             .setTitle(getString(R.string.admin_dialog_edit_title))
-            .setView(layout)
+            .setView(scrollableForm(layout))
             .setPositiveButton(getString(R.string.btn_save)) { _, _ ->
                 val name = nameInput.text.toString().trim()
                 val expiry = expiryInput.text.toString().trim()
@@ -301,7 +281,10 @@ class AdminActivity : AppCompatActivity() {
                 }
             }
             .setNegativeButton(getString(R.string.btn_cancel), null)
-            .show()
+            .create().also { dialog ->
+                dialog.setOnShowListener { fitFormWindow(dialog) }
+                dialog.show()
+            }
     }
 
     // ──────────── Exit-node picker (Wave 3 G-B1) ────────────
@@ -359,24 +342,10 @@ class AdminActivity : AppCompatActivity() {
         options: List<ExitNodeOption>,
         originalExitNode: String,
     ): EditText {
-        val exitNodeLabel = TextView(dialogCtx).apply {
-            text = getString(R.string.admin_hint_exit_node)
-            textSize = 12f
-            setTextColor(getColor(R.color.text_secondary))
-            setPadding(0, 8.dp, 0, 2.dp)
-        }
-        val exitNodeCaption = TextView(dialogCtx).apply {
-            text = getString(R.string.admin_hint_exit_node_live)
-            textSize = 11f
-            setTextColor(getColor(R.color.text_secondary))
+        layout.addView(formCaption(getString(R.string.admin_hint_exit_node)))
+        layout.addView(formCaption(getString(R.string.admin_hint_exit_node_live)).apply {
             setPadding(0, 0, 0, 4.dp)
-        }
-        val exitNodeInput = EditText(dialogCtx).apply {
-            hint = "203.0.113.5:51820"
-            setText(originalExitNode)
-            setSingleLine(true)
-            textSize = 13f
-        }
+        })
 
         val labels = mutableListOf(getString(R.string.admin_exit_option_default))
         labels.addAll(options.map { "${it.nodeId} (${it.address})" })
@@ -389,48 +358,61 @@ class AdminActivity : AppCompatActivity() {
                 if (match >= 0) match + 1 else customIndex
             }
         }
-        // Pre-apply the state matching initialIndex before the listener is attached
-        // (belt-and-suspenders alongside the listener's own idempotent handling above).
-        when (initialIndex) {
-            0 -> { exitNodeInput.visibility = View.GONE; exitNodeInput.isEnabled = false }
-            customIndex -> { exitNodeInput.visibility = View.VISIBLE; exitNodeInput.isEnabled = true }
-            else -> { exitNodeInput.visibility = View.VISIBLE; exitNodeInput.isEnabled = false }
-        }
 
         val spinner = Spinner(dialogCtx).apply {
-            adapter = ArrayAdapter(dialogCtx, android.R.layout.simple_spinner_item, labels).apply {
-                setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
-            }
+            adapter = spinnerAdapter(dialogCtx, labels)
+            minimumHeight = 48.dp
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+            )
             setSelection(initialIndex)
         }
+        val exitNodeInput = layout.addOutlinedField(
+            hint = "203.0.113.5:51820",
+            value = originalExitNode,
+        )
+        // Состояние до слушателя: первый onItemSelected у Spinner не должен
+        // стереть уже введенный адрес на пункте "свой".
+        applyExitChoice(initialIndex, exitNodeInput, options, customIndex)
         spinner.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
             override fun onItemSelected(parent: AdapterView<*>?, view: View?, position: Int, id: Long) {
-                when (position) {
-                    0 -> {
-                        exitNodeInput.setText("")
-                        exitNodeInput.visibility = View.GONE
-                        exitNodeInput.isEnabled = false
-                    }
-                    customIndex -> {
-                        exitNodeInput.visibility = View.VISIBLE
-                        exitNodeInput.isEnabled = true
-                    }
-                    else -> {
-                        val opt = options[position - 1]
-                        exitNodeInput.setText(opt.address)
-                        exitNodeInput.visibility = View.VISIBLE
-                        exitNodeInput.isEnabled = false
-                    }
-                }
+                applyExitChoice(position, exitNodeInput, options, customIndex)
             }
             override fun onNothingSelected(parent: AdapterView<*>?) {}
         }
 
-        layout.addView(exitNodeLabel)
-        layout.addView(exitNodeCaption)
-        layout.addView(spinner)
-        layout.addView(exitNodeInput)
+        layout.addView(spinner, layout.indexOfChild(exitNodeInput.enclosingInput() ?: exitNodeInput))
         return exitNodeInput
+    }
+
+    /** Пункт 0 прячет поле, свой оставляет ввод, узел пула копирует адрес и блокирует правку. */
+    private fun applyExitChoice(
+        position: Int,
+        input: EditText,
+        options: List<ExitNodeOption>,
+        customIndex: Int,
+    ) {
+        val box = input.enclosingInput()
+        when (position) {
+            0 -> {
+                input.setText("")
+                input.isEnabled = false
+                box?.isEnabled = false
+                input.showField(false)
+            }
+            customIndex -> {
+                input.showField(true)
+                input.isEnabled = true
+                box?.isEnabled = true
+            }
+            else -> {
+                input.setText(options[position - 1].address)
+                input.showField(true)
+                input.isEnabled = false
+                box?.isEnabled = false
+            }
+        }
     }
 
     // ──────────── Connection key / QR ────────────
@@ -468,27 +450,26 @@ class AdminActivity : AppCompatActivity() {
                 }
             }
 
-            val dialogCtx = android.view.ContextThemeWrapper(this@AdminActivity, R.style.Theme_AIVPN_Dialog)
-            val layout = LinearLayout(dialogCtx).apply {
+            val layout = LinearLayout(this@AdminActivity).apply {
                 orientation = LinearLayout.VERTICAL
                 gravity = android.view.Gravity.CENTER_HORIZONTAL
                 setPadding(24.dp, 16.dp, 24.dp, 0)
             }
             if (bitmap != null) {
-                layout.addView(ImageView(dialogCtx).apply {
+                layout.addView(ImageView(this@AdminActivity).apply {
                     setImageBitmap(bitmap)
                     layoutParams = LinearLayout.LayoutParams(220.dp, 220.dp)
                 })
             }
-            layout.addView(TextView(dialogCtx).apply {
+            layout.addView(TextView(this@AdminActivity).apply {
                 text = key
-                textSize = 11f
-                setTextColor(getColor(R.color.text_secondary))
+                textSize = 14f
+                setTextColor(colorAttr(com.google.android.material.R.attr.colorOnSurfaceVariant, R.color.text_secondary))
                 setPadding(0, 12.dp, 0, 0)
                 setTextIsSelectable(true)
             })
 
-            AlertDialog.Builder(this@AdminActivity)
+            MaterialAlertDialogBuilder(this@AdminActivity)
                 .setTitle(name)
                 .setView(layout)
                 .setPositiveButton(getString(R.string.admin_share)) { _, _ ->
@@ -512,7 +493,7 @@ class AdminActivity : AppCompatActivity() {
 
     private fun confirmReset(id: String, name: String) {
         if (!canMutate) return
-        AlertDialog.Builder(this)
+        MaterialAlertDialogBuilder(this)
             .setTitle(getString(R.string.admin_reset_confirm_title))
             .setMessage(getString(R.string.admin_reset_confirm_msg, name))
             .setPositiveButton(getString(R.string.admin_action_reset)) { _, _ ->
@@ -529,7 +510,7 @@ class AdminActivity : AppCompatActivity() {
 
     private fun confirmRevoke(id: String, name: String) {
         if (!canMutate) return
-        AlertDialog.Builder(this)
+        MaterialAlertDialogBuilder(this)
             .setTitle(getString(R.string.admin_revoke_confirm_title))
             .setMessage(getString(R.string.admin_revoke_confirm_msg, name))
             .setPositiveButton(getString(R.string.admin_action_revoke)) { _, _ ->
@@ -558,6 +539,124 @@ class AdminActivity : AppCompatActivity() {
                 }
                 Toast.makeText(this, msg, Toast.LENGTH_LONG).show()
             }
+        }
+    }
+
+    private fun dialogForm(): LinearLayout = LinearLayout(this).apply {
+        orientation = LinearLayout.VERTICAL
+        setPadding(24.dp, 8.dp, 24.dp, 0)
+    }
+
+    private fun scrollableForm(content: View) = androidx.core.widget.NestedScrollView(this).apply {
+        addView(content)
+    }
+
+    private fun fitFormWindow(dialog: androidx.appcompat.app.AlertDialog) {
+        dialog.window?.setSoftInputMode(android.view.WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE)
+        val config = resources.configuration
+        if (config.screenWidthDp <= 360 || config.screenHeightDp <= 600 || config.fontScale > 1.2f) {
+            dialog.window?.setLayout(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
+        }
+    }
+
+    private fun formCheck(label: String, checked: Boolean): MaterialCheckBox =
+        MaterialCheckBox(this).apply {
+            text = label
+            isChecked = checked
+            textSize = 16f
+            minHeight = 48.dp
+            setTextColor(colorAttr(com.google.android.material.R.attr.colorOnSurface, R.color.text_primary))
+        }
+
+    private fun formCaption(label: String): TextView = TextView(this).apply {
+        text = label
+        textSize = 14f
+        setTextColor(colorAttr(com.google.android.material.R.attr.colorOnSurfaceVariant, R.color.text_secondary))
+        setPadding(0, 12.dp, 0, 2.dp)
+    }
+
+    private fun LinearLayout.addOutlinedField(
+        hint: String,
+        placeholder: String? = null,
+        value: String = "",
+    ): TextInputEditText {
+        val edit = TextInputEditText(this@AdminActivity).apply {
+            setText(value)
+            setSingleLine(true)
+            textSize = 16f
+            importantForAutofill = View.IMPORTANT_FOR_AUTOFILL_NO
+        }
+        val box = TextInputLayout(
+            this@AdminActivity,
+            null,
+            com.google.android.material.R.attr.textInputOutlinedStyle,
+        ).apply {
+            this.hint = hint
+            if (placeholder != null) placeholderText = placeholder
+            addView(
+                edit,
+                LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT,
+                ),
+            )
+        }
+        addView(
+            box,
+            LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+            ).apply { topMargin = 8.dp },
+        )
+        return edit
+    }
+
+    private fun spinnerAdapter(
+        context: android.content.Context,
+        labels: List<String>,
+    ): ArrayAdapter<String> {
+        return object : ArrayAdapter<String>(context, android.R.layout.simple_spinner_item, labels) {
+            override fun getView(position: Int, convertView: View?, parent: ViewGroup): View {
+                return styleSpinnerText(super.getView(position, convertView, parent))
+            }
+
+            override fun getDropDownView(position: Int, convertView: View?, parent: ViewGroup): View {
+                return styleSpinnerText(super.getDropDownView(position, convertView, parent))
+            }
+        }.also { it.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item) }
+    }
+
+    private fun styleSpinnerText(view: View): View {
+        (view as? TextView)?.apply {
+            textSize = 16f
+            minHeight = 48.dp
+            setTextColor(colorAttr(com.google.android.material.R.attr.colorOnSurface, R.color.text_primary))
+        }
+        return view
+    }
+
+    private fun View.enclosingInput(): TextInputLayout? {
+        var current = parent
+        while (current != null) {
+            if (current is TextInputLayout) return current
+            current = current.parent
+        }
+        return null
+    }
+
+    private fun View.showField(show: Boolean) {
+        val host: View = enclosingInput() ?: this
+        val state = if (show) View.VISIBLE else View.GONE
+        host.visibility = state
+        if (host !== this) visibility = state
+    }
+
+    private fun colorAttr(attr: Int, fallback: Int): Int {
+        val typed = android.util.TypedValue()
+        return if (theme.resolveAttribute(attr, typed, true)) {
+            if (typed.resourceId != 0) getColor(typed.resourceId) else typed.data
+        } else {
+            getColor(fallback)
         }
     }
 

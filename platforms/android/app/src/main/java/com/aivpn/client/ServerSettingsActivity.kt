@@ -2,11 +2,13 @@ package com.aivpn.client
 
 import android.os.Bundle
 import android.view.View
+import android.view.ViewGroup
 import android.widget.ArrayAdapter
 import android.widget.Button
 import android.widget.LinearLayout
 import android.widget.TextView
 import android.widget.Toast
+import com.google.android.material.textfield.TextInputLayout
 import androidx.appcompat.app.AppCompatActivity
 import androidx.lifecycle.lifecycleScope
 import androidx.core.widget.doAfterTextChanged
@@ -102,7 +104,9 @@ class ServerSettingsActivity : AppCompatActivity() {
         binding.btnConfirmMask.setOnClickListener { onConfirmMask() }
         binding.btnApplyExit.setOnClickListener { onApplyExit() }
         fun updateExitAction() {
-            binding.editExitNode.isEnabled = !binding.checkClearExitNode.isChecked
+            val fieldEnabled = !binding.checkClearExitNode.isChecked
+            binding.editExitNode.isEnabled = fieldEnabled
+            binding.editExitNode.enclosingInput()?.isEnabled = fieldEnabled
             binding.btnApplyExit.isEnabled = !exitBusy && (binding.checkClearExitNode.isChecked || binding.editExitNode.text.toString().trim().isNotEmpty())
         }
         binding.editExitNode.doAfterTextChanged { updateExitAction() }
@@ -172,29 +176,25 @@ class ServerSettingsActivity : AppCompatActivity() {
             } else {
                 binding.textMaskClientEmpty.visibility = View.GONE
                 binding.spinnerMaskClient.visibility = View.VISIBLE
-                binding.spinnerMaskClient.adapter = ArrayAdapter(
-                    this@ServerSettingsActivity,
-                    android.R.layout.simple_spinner_item,
+                binding.spinnerMaskClient.adapter = spinnerAdapter(
                     clients.map { if (it.name.isNotBlank() && it.name != it.id) "${it.name} (${it.id})" else it.id }
-                ).also { it.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item) }
+                )
             }
 
             val options = fetchMaskOptions()
             maskOptions = options
             if (options.isEmpty()) {
                 binding.spinnerMask.visibility = View.GONE
-                binding.editMaskCustom.visibility = View.VISIBLE
+                binding.editMaskCustom.showField(true)
                 binding.textMaskEmpty.visibility = View.VISIBLE
             } else {
                 binding.textMaskEmpty.visibility = View.GONE
-                binding.editMaskCustom.visibility = View.GONE
+                binding.editMaskCustom.showField(false)
                 binding.spinnerMask.visibility = View.VISIBLE
                 val labels = options.map {
                     if (it.generated) it.label + getString(R.string.mask_auto_marker) else it.label
                 }
-                binding.spinnerMask.adapter = ArrayAdapter(
-                    this@ServerSettingsActivity, android.R.layout.simple_spinner_item, labels
-                ).also { it.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item) }
+                binding.spinnerMask.adapter = spinnerAdapter(labels)
             }
         }
     }
@@ -485,6 +485,60 @@ class ServerSettingsActivity : AppCompatActivity() {
             timer = null
         }
     }
+
+    /** Обводка Material: прямой parent поля часто внутренний кадр, не сам TextInputLayout. */
+    private fun View.enclosingInput(): TextInputLayout? {
+        var current = parent
+        while (current != null) {
+            if (current is TextInputLayout) return current
+            current = current.parent
+        }
+        return null
+    }
+
+    /** Прячет и поле, и его Material-обводку, не меняя id самого ввода. */
+    private fun View.showField(show: Boolean) {
+        val host: View = enclosingInput() ?: this
+        val state = if (show) View.VISIBLE else View.GONE
+        host.visibility = state
+        if (host !== this) visibility = state
+    }
+
+    private fun spinnerAdapter(labels: List<String>): ArrayAdapter<String> {
+        return object : ArrayAdapter<String>(
+            this,
+            android.R.layout.simple_spinner_item,
+            labels
+        ) {
+            override fun getView(position: Int, convertView: View?, parent: ViewGroup): View {
+                return styleSpinnerText(super.getView(position, convertView, parent))
+            }
+
+            override fun getDropDownView(position: Int, convertView: View?, parent: ViewGroup): View {
+                return styleSpinnerText(super.getDropDownView(position, convertView, parent))
+            }
+        }.also { it.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item) }
+    }
+
+    private fun styleSpinnerText(view: View): View {
+        (view as? TextView)?.apply {
+            textSize = 16f
+            minHeight = 48.dp
+            setTextColor(colorAttr(com.google.android.material.R.attr.colorOnSurface, R.color.text_primary))
+        }
+        return view
+    }
+
+    private fun colorAttr(attr: Int, fallback: Int): Int {
+        val typed = android.util.TypedValue()
+        return if (theme.resolveAttribute(attr, typed, true)) {
+            if (typed.resourceId != 0) getColor(typed.resourceId) else typed.data
+        } else {
+            getColor(fallback)
+        }
+    }
+
+    private val Int.dp: Int get() = (this * resources.displayMetrics.density).toInt()
 
     companion object {
         private const val ROLE_ADMIN = 2

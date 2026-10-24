@@ -6,11 +6,12 @@
 //! ## Hash chain (tamper evidence)
 //!
 //! Every entry carries `prev_hash` (the previous entry's `hash`, hex) and
-//! `hash` (hex SHA-256 over this entry's own fields, canonically joined as
-//! `ts|actor|action|target|result|prev_hash`, EXCLUDING `hash` itself but
-//! INCLUDING `prev_hash`). The very first entry ever written by a given
-//! [`AuditLogger`] chains onto [`GENESIS_HASH`] (64 hex zero chars) rather
-//! than a prior entry's hash.
+//! `hash` (SHA-256 полей с длиной каждого поля перед его байтами).
+//! Версия 1 исключает неоднозначность разделителей; старые строки версии 0
+//! проверяются в исходном формате с разделителем `|`.
+//! Первая запись файла ссылается на
+//! [`GENESIS_HASH`] (64 нуля). Последующие записи используют хеш последней
+//! строки, включая записи других экземпляров журнала.
 //!
 //! This makes the log tamper-EVIDENT, not tamper-PROOF: a node with write
 //! access to the log file can always truncate it and start a fresh chain,
@@ -21,13 +22,8 @@
 //! external anchor (e.g. periodically publishing the tip hash somewhere the
 //! node itself can't rewrite), which is out of scope here.
 //!
-//! Old log lines written before this field existed deserialize fine
-//! (`#[serde(default)]` gives them `prev_hash == "" ` and `hash == ""`);
-//! [`AuditLogger::new`] treats such a line as if the file were empty when
-//! seeding the in-memory chain tip, so the FIRST post-upgrade entry chains
-//! onto [`GENESIS_HASH`] again rather than an empty string — i.e. upgrading
-//! a live log starts a fresh, independently-verifiable chain segment rather
-//! than silently linking onto un-hashed history.
+//! Старые строки без хеша читаются с пустыми `prev_hash` и `hash`.
+//! После такой строки новая цепочка начинается с [`GENESIS_HASH`].
 //!
 //! ## Pool note
 //!
@@ -40,7 +36,7 @@
 //! proves node A's own history wasn't silently edited, nothing about node
 //! B.
 
-use std::io::Write;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -96,6 +92,9 @@ pub struct AuditEntry {
     /// to `""` for the same backward-compat reason as `prev_hash`.
     #[serde(default)]
     pub hash: String,
+    /// Версия кодирования полей перед хешированием; 0 относится к старым строкам.
+    #[serde(default)]
+    pub hash_version: u8,
 }
 
 /// Canonical join of an entry's fields used as the hash-chain input.
@@ -119,7 +118,7 @@ fn canonical_join(
     )
 }
 
-fn compute_hash(
+fn compute_hash_legacy(
     ts: &str,
     actor: &AuditActor,
     action: &str,
@@ -129,6 +128,24 @@ fn compute_hash(
 ) -> String {
     let mut hasher = Sha256::new();
     hasher.update(canonical_join(ts, actor, action, target, result, prev_hash).as_bytes());
+    hex::encode(hasher.finalize())
+}
+
+// Длины полей входят в хеш: перенос разделителя между полями меняет подпись.
+fn compute_hash(
+    ts: &str,
+    actor: &AuditActor,
+    action: &str,
+    target: &str,
+    result: &str,
+    prev_hash: &str,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"aivpn-audit-v1\0");
+    for field in [ts, actor.as_str(), action, target, result, prev_hash] {
+        hasher.update((field.len() as u64).to_be_bytes());
+        hasher.update(field.as_bytes());
+    }
     hex::encode(hasher.finalize())
 }
 
@@ -155,7 +172,12 @@ pub fn verify_chain(entries: &[AuditEntry]) -> Result<(), usize> {
         if i > 0 && e.prev_hash != entries[i - 1].hash {
             return Err(i);
         }
-        let expected = compute_hash(
+        let hash_fn = match e.hash_version {
+            0 => compute_hash_legacy,
+            1 => compute_hash,
+            _ => return Err(i),
+        };
+        let expected = hash_fn(
             &e.ts,
             &e.actor,
             &e.action,
@@ -178,30 +200,67 @@ pub struct AuditLogger {
 
 struct AuditLoggerInner {
     path: PathBuf,
-    /// Hash of the last entry successfully written to `path`, or
-    /// [`GENESIS_HASH`] if none has been written yet (fresh/empty file, or
-    /// the existing last line predates the hash-chain field and so has no
-    /// usable hash — see the module doc's "upgrading a live log" note).
-    /// Cached here so `log()` never has to re-read the file to find the
-    /// chain tip.
-    last_hash: String,
 }
 
-/// Read the hash of the last JSON line in `path`, or [`GENESIS_HASH`] if
-/// the file doesn't exist, is empty, its last line fails to parse, or that
-/// line predates the hash-chain fields (empty `hash`). Called once, at
-/// [`AuditLogger::new`].
-fn read_last_hash(path: &Path) -> String {
-    if path == Path::new("/dev/null") {
-        return GENESIS_HASH.to_string();
-    }
-    let Ok(content) = std::fs::read_to_string(path) else {
-        return GENESIS_HASH.to_string();
-    };
-    let last_line = content.lines().rev().find(|l| !l.trim().is_empty());
-    match last_line.and_then(|l| serde_json::from_str::<AuditEntry>(l).ok()) {
-        Some(entry) if !entry.hash.is_empty() => entry.hash,
-        _ => GENESIS_HASH.to_string(),
+/// Читаем последнюю строку под той же блокировкой, что защищает добавление.
+/// Размер всего журнала не влияет на объем чтения при обычной длине записи.
+fn read_last_hash(file: &mut std::fs::File) -> std::io::Result<String> {
+    let length = file.metadata()?.len();
+    let mut budget = 8192u64;
+    loop {
+        let start = length.saturating_sub(budget);
+        file.seek(SeekFrom::Start(start))?;
+        let mut bytes = Vec::new();
+        file.take(length - start).read_to_end(&mut bytes)?;
+        let terminated = bytes.last() == Some(&b'\n');
+        let end = bytes
+            .iter()
+            .rposition(|byte| !byte.is_ascii_whitespace())
+            .map_or(0, |index| index + 1);
+        let bytes = &bytes[..end];
+        let line_start = bytes
+            .iter()
+            .rposition(|byte| *byte == b'\n')
+            .map(|index| index + 1);
+        if let Some(line_start) = line_start.or((start == 0).then_some(0)) {
+            let line = &bytes[line_start..];
+            if line.is_empty() {
+                return Ok(GENESIS_HASH.to_owned());
+            }
+            let entry: AuditEntry = match serde_json::from_slice(line) {
+                Ok(entry) => entry,
+                Err(_) if !terminated => {
+                    let valid_end = start + line_start as u64;
+                    file.set_len(valid_end)?;
+                    warn!(
+                        bytes = length - valid_end,
+                        "Удален оборванный хвост записи аудита"
+                    );
+                    return read_last_hash(file);
+                }
+                Err(_) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "Повреждена последняя запись аудита",
+                    ))
+                }
+            };
+            if !terminated {
+                file.write_all(b"\n")?;
+            }
+            return Ok(if entry.hash.is_empty() {
+                GENESIS_HASH.to_owned()
+            } else {
+                entry.hash
+            });
+        }
+        if budget >= 4 * 1024 * 1024 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Последняя запись аудита превышает лимит",
+            ));
+        }
+        budget *= 2;
     }
 }
 
@@ -228,11 +287,9 @@ impl AuditLogger {
                 let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
             }
         }
-        let last_hash = read_last_hash(path);
         Self {
             inner: Arc::new(Mutex::new(AuditLoggerInner {
                 path: path.to_path_buf(),
-                last_hash,
             })),
         }
     }
@@ -242,80 +299,53 @@ impl AuditLogger {
     }
 
     pub fn log(&self, actor: AuditActor, action: &str, target: &str, result: &str) {
-        let mut inner = self.inner.lock().unwrap();
-        let ts = Utc::now().to_rfc3339();
-        let prev_hash = inner.last_hash.clone();
-        let hash = compute_hash(&ts, &actor, action, target, result, &prev_hash);
-        let entry = AuditEntry {
-            ts,
-            actor,
-            action: action.to_string(),
-            target: target.to_string(),
-            result: result.to_string(),
-            prev_hash,
-            hash: hash.clone(),
-        };
-        let line = match serde_json::to_string(&entry) {
-            Ok(s) => s,
-            Err(e) => {
-                warn!("audit_log serialize: {}", e);
-                return;
+        let inner = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+        if inner.path == Path::new("/dev/null") {
+            return;
+        }
+        let write = (|| -> std::io::Result<()> {
+            let mut options = std::fs::OpenOptions::new();
+            options.create(true).read(true).append(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options
+                    .mode(0o600)
+                    .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
             }
-        };
-        match std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&inner.path)
-        {
-            Ok(mut f) => {
-                // MEDIUM (server-sec): audit entries can include admin
-                // actions and target identifiers; harden the file's
-                // permissions rather than inheriting the process umask
-                // (commonly world-readable under root). Cheap relative to
-                // admin-action call volume — set on every append rather
-                // than tracking "did we just create it" so an operator who
-                // manually loosens permissions gets them re-hardened on the
-                // next audit event too. NEVER touch `/dev/null` itself
-                // (the `disabled()` sentinel) — chmod-ing a shared system
-                // device node would be catastrophic for every other
-                // process/user on the host.
-                #[cfg(unix)]
-                if inner.path != Path::new("/dev/null") {
-                    use std::os::unix::fs::PermissionsExt;
-                    let _ = f.set_permissions(std::fs::Permissions::from_mode(0o600));
-                }
-                match writeln!(f, "{}", line) {
-                    Ok(()) => {
-                        // Only advance the in-memory chain tip once the
-                        // entry actually landed on disk — otherwise a
-                        // write failure here would desync `last_hash` from
-                        // what's really the last entry on disk, breaking
-                        // every subsequent `prev_hash` link.
-                        inner.last_hash = hash;
-                    }
-                    Err(e) => {
-                        warn!("audit_log write {:?}: {}", inner.path, e);
-                        eprintln!(
-                            "AUDIT LOG WRITE FAILED ({:?}): {} — entry lost: {}",
-                            inner.path, e, line
-                        );
-                    }
-                }
+            let mut file = options.open(&inner.path)?;
+            if !file.metadata()?.is_file() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "Журнал аудита должен быть обычным файлом",
+                ));
             }
-            Err(e) => {
-                // MEDIUM (server-sec): audit logging fails open by design
-                // (an admin action must not be blocked by a logging
-                // outage), but that must never be SILENT. `warn!` alone can
-                // be filtered out entirely by the tracing subscriber's
-                // level/module config, making a persistent audit-write
-                // failure invisible; eprintln! guarantees an operator
-                // watching stderr sees it regardless of log configuration.
-                warn!("audit_log write {:?}: {}", inner.path, e);
-                eprintln!(
-                    "AUDIT LOG WRITE FAILED ({:?}): {} — entry lost: {}",
-                    inner.path, e, line
-                );
+            file.lock()?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
             }
+            let ts = Utc::now().to_rfc3339();
+            let prev_hash = read_last_hash(&mut file)?;
+            let hash = compute_hash(&ts, &actor, action, target, result, &prev_hash);
+            let entry = AuditEntry {
+                ts,
+                actor,
+                action: action.to_owned(),
+                target: target.to_owned(),
+                result: result.to_owned(),
+                prev_hash,
+                hash,
+                hash_version: 1,
+            };
+            let mut line = serde_json::to_vec(&entry).map_err(std::io::Error::other)?;
+            line.push(b'\n');
+            file.write_all(&line)
+        })();
+        if let Err(error) = write {
+            warn!("audit_log write {:?}: {}", inner.path, error);
+            eprintln!("AUDIT LOG WRITE FAILED ({:?}): {}", inner.path, error);
         }
     }
 }
@@ -331,6 +361,119 @@ mod tests {
             .filter(|l| !l.trim().is_empty())
             .map(|l| serde_json::from_str(l).unwrap())
             .collect()
+    }
+
+    #[test]
+    fn incomplete_tail_recovers_without_stopping_future_audit_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let logger = AuditLogger::new(&path);
+        logger.log(AuditActor::Api, "update", "alice", "ok");
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"{\"ts\":")
+            .unwrap();
+        logger.log(AuditActor::Api, "update", "bob", "ok");
+        let entries = read_entries(&path);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(verify_chain(&entries), Ok(()));
+        let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        file.set_len(file.metadata().unwrap().len() - 1).unwrap();
+        logger.log(AuditActor::Api, "update", "carol", "ok");
+        assert_eq!(read_entries(&path).len(), 3);
+        assert_eq!(verify_chain(&read_entries(&path)), Ok(()));
+    }
+
+    #[test]
+    fn complete_corrupt_record_is_preserved_and_hashless_history_is_not_verified() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        std::fs::write(&path, b"{broken}\n").unwrap();
+        AuditLogger::new(&path).log(AuditActor::Api, "update", "alice", "ok");
+        assert_eq!(std::fs::read(&path).unwrap(), b"{broken}\n");
+        std::fs::write(
+            &path,
+            br#"{"ts":"old","actor":"api","action":"update","target":"alice","result":"ok"}
+"#,
+        )
+        .unwrap();
+        let logger = AuditLogger::new(&path);
+        logger.log(AuditActor::Api, "update", "bob", "ok");
+        assert_eq!(verify_chain(&read_entries(&path)), Err(0));
+        assert_eq!(verify_chain(&read_entries(&path)[1..]), Ok(()));
+    }
+
+    #[test]
+    fn field_delimiters_cannot_hide_a_changed_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        AuditLogger::new(&path).log(AuditActor::Api, "update", "alice|bob", "ok");
+        let mut entries = read_entries(&path);
+        entries[0].target = "alice".into();
+        entries[0].result = "bob|ok".into();
+        assert_eq!(verify_chain(&entries), Err(0));
+    }
+
+    #[test]
+    fn legacy_entries_can_be_followed_by_unambiguous_hashes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let logger = AuditLogger::new(&path);
+        logger.log(AuditActor::Api, "update", "alice", "ok");
+        let mut entries = read_entries(&path);
+        let entry = &mut entries[0];
+        entry.hash_version = 0;
+        entry.hash = compute_hash_legacy(
+            &entry.ts,
+            &entry.actor,
+            &entry.action,
+            &entry.target,
+            &entry.result,
+            &entry.prev_hash,
+        );
+        std::fs::write(
+            &path,
+            format!("{}\n", serde_json::to_string(entry).unwrap()),
+        )
+        .unwrap();
+        logger.log(AuditActor::Api, "update", "bob", "ok");
+        assert_eq!(verify_chain(&read_entries(&path)), Ok(()));
+    }
+
+    #[test]
+    fn reading_the_tip_does_not_load_the_entire_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let logger = AuditLogger::new(&path);
+        logger.log(AuditActor::Api, "first", "test", "ok");
+        let entry = std::fs::read(&path).unwrap();
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        file.set_len(128 * 1024 * 1024).unwrap();
+        file.seek(SeekFrom::End(0)).unwrap();
+        file.write_all(b"\n").unwrap();
+        file.write_all(&entry).unwrap();
+        let last: AuditEntry = serde_json::from_slice(&entry).unwrap();
+        assert_eq!(read_last_hash(&mut file).unwrap(), last.hash);
+    }
+
+    #[test]
+    fn independent_writers_share_the_current_chain_tip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let first = AuditLogger::new(&path);
+        let second = AuditLogger::new(&path);
+        first.log(AuditActor::Api, "ClientAdd", "alice", "ok");
+        second.log(AuditActor::Cli, "ClientAdd", "bob", "ok");
+        first.log(AuditActor::Api, "ClientRemove", "alice", "ok");
+        let entries = read_entries(&path);
+        assert_eq!(entries.len(), 3);
+        assert_eq!(verify_chain(&entries), Ok(()));
     }
 
     #[test]

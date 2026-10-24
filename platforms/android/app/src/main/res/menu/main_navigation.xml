@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<menu xmlns:android="http://schemas.android.com/apk/res/android">
+    <item android:id="@+id/nav_vpn" android:icon="@drawable/ic_vpn_shield" android:title="@string/nav_vpn" />
+    <item android:id="@+id/nav_profiles" android:icon="@drawable/ic_vpn_key" android:title="@string/nav_profiles" />
+    <item android:id="@+id/nav_settings" android:icon="@drawable/ic_vpn_settings" android:title="@string/nav_settings" />
+</menu>

@@ -28,7 +28,8 @@ import {
 import type { RegistrationResponseJSON, AuthenticationResponseJSON } from '@simplewebauthn/server'
 import { requireAuth, requireAdmin } from '../auth/middleware'
 import { writeAudit } from '../audit'
-import { checkRateLimit, isRateLimited, recordRateLimitEvent } from '../ratelimit'
+import { checkRateLimit, reserveRateLimit } from '../ratelimit'
+import { claimPasskeyCounter } from '../auth/passkey-counter'
 import { config } from '../config'
 import { getClientIp } from '../lib/client-ip'
 import type { UserRole } from '../db/schema'
@@ -125,127 +126,130 @@ auth.post('/login', zValidator('json', LoginSchema), async (c) => {
   // Brute-force protection is unchanged: the check runs before password
   // verification and every wrong password/TOTP still burns a slot.
   const loginRateKey = `login_user:${body.username}`
-  if (isRateLimited(loginRateKey, config.AUTH_RATE_MAX, config.AUTH_RATE_WINDOW_MS)) {
-    return c.json({ error: 'Too many requests. Please wait before retrying.' }, 429)
-  }
-  const recordLoginFailure = () => recordRateLimitEvent(loginRateKey, config.AUTH_RATE_MAX)
+  const attempt = reserveRateLimit(loginRateKey, config.AUTH_RATE_MAX, config.AUTH_RATE_WINDOW_MS)
+  if (!attempt) return c.json({ error: 'Too many requests. Please wait before retrying.' }, 429)
+  let failed = false
+  const recordLoginFailure = () => { failed = true }
+  try {
+    const db = await getDb()
+    const { users, sessions } = tables()
+    const ip = getClientIp(c)
+    const ua = getUA(c)
 
-  const db = await getDb()
-  const { users, sessions } = tables()
-  const ip = getClientIp(c)
-  const ua = getUA(c)
+    const d = db as any
 
-  const d = db as any
+    // Find user
+    const [user] = await d.select().from(users).where(eq(users.username, body.username)).limit(1)
 
-  // Find user
-  const [user] = await d.select().from(users).where(eq(users.username, body.username)).limit(1)
-
-  if (!user) {
-    // Burn the same Argon2id work as the real-user path (timing equalisation).
-    await verifyPassword(DUMMY_PASSWORD_HASH, body.password ?? '')
-    recordLoginFailure()
-    await writeAudit(db, null, 'login', body.username, 'fail', ip)
-    return c.json({ error: 'Invalid credentials' }, 401)
-  }
-
-  // Passkey-only users cannot use password login.
-  // Burn the same Argon2id work as every other failure path: a fast 401 here
-  // (and on the branches below) would reveal that the username exists —
-  // the same enumeration oracle DUMMY_PASSWORD_HASH exists to prevent.
-  if (user.passkey_only) {
-    await verifyPassword(DUMMY_PASSWORD_HASH, body.password ?? '')
-    recordLoginFailure()
-    await writeAudit(db, user.id, 'login', body.username, 'fail', ip)
-    return c.json({ error: 'Invalid credentials' }, 401)
-  }
-
-  if (!user.password_hash || !body.password) {
-    // Same timing equalisation (covers SSO shadow accounts and omitted password).
-    await verifyPassword(DUMMY_PASSWORD_HASH, body.password ?? '')
-    recordLoginFailure()
-    await writeAudit(db, user.id, 'login', body.username, 'fail', ip)
-    return c.json({ error: 'Invalid credentials' }, 401)
-  }
-
-  const passwordOk = await verifyPassword(user.password_hash, body.password)
-  if (!passwordOk) {
-    recordLoginFailure()
-    await writeAudit(db, user.id, 'login', body.username, 'fail', ip)
-    return c.json({ error: 'Invalid credentials' }, 401)
-  }
-
-  // TOTP 2FA check
-  if (user.totp_enabled) {
-    if (!body.totp_token) {
-      // Not an error: password was correct, a second factor is required.
-      // Return 200 so the client can read the flag (apiJson throws on non-2xx).
-      return c.json({ totp_required: true })
-    }
-    let loginDecryptedSecret: string
-    try {
-      loginDecryptedSecret = decryptTotpSecret(user.totp_secret!)
-    } catch {
-      return c.json({ error: 'TOTP not configured on this server' }, 503)
-    }
-    const acceptedStep = verifyTotpToken(loginDecryptedSecret, body.totp_token)
-    // One-time use (RFC 6238 §5.2): atomically claim the time step — the
-    // conditional update rejects a replayed code (step <= last accepted) and
-    // closes the race between two concurrent logins presenting the same code.
-    const claimed = acceptedStep === null ? [] : await d
-      .update(users)
-      .set({ totp_last_step: acceptedStep })
-      .where(and(
-        eq(users.id, user.id),
-        or(isNull(users.totp_last_step), lt(users.totp_last_step, acceptedStep)),
-      ))
-      .returning({ id: users.id })
-    if (acceptedStep === null || claimed.length === 0) {
-      // A wrong (or replayed) TOTP code is a failed attempt too — 6-digit
-      // codes are brute-forceable, so they must consume rate-limit slots.
+    if (!user) {
+      // Burn the same Argon2id work as the real-user path (timing equalisation).
+      await verifyPassword(DUMMY_PASSWORD_HASH, body.password ?? '')
       recordLoginFailure()
-      await writeAudit(db, user.id, 'login_totp', body.username, 'fail', ip)
-      return c.json({ error: 'Invalid TOTP token' }, 401)
+      await writeAudit(db, null, 'login', body.username, 'fail', ip)
+      return c.json({ error: 'Invalid credentials' }, 401)
     }
+
+    // Passkey-only users cannot use password login.
+    // Burn the same Argon2id work as every other failure path: a fast 401 here
+    // (and on the branches below) would reveal that the username exists —
+    // the same enumeration oracle DUMMY_PASSWORD_HASH exists to prevent.
+    if (user.passkey_only) {
+      await verifyPassword(DUMMY_PASSWORD_HASH, body.password ?? '')
+      recordLoginFailure()
+      await writeAudit(db, user.id, 'login', body.username, 'fail', ip)
+      return c.json({ error: 'Invalid credentials' }, 401)
+    }
+
+    if (!user.password_hash || !body.password) {
+      // Same timing equalisation (covers SSO shadow accounts and omitted password).
+      await verifyPassword(DUMMY_PASSWORD_HASH, body.password ?? '')
+      recordLoginFailure()
+      await writeAudit(db, user.id, 'login', body.username, 'fail', ip)
+      return c.json({ error: 'Invalid credentials' }, 401)
+    }
+
+    const passwordOk = await verifyPassword(user.password_hash, body.password)
+    if (!passwordOk) {
+      recordLoginFailure()
+      await writeAudit(db, user.id, 'login', body.username, 'fail', ip)
+      return c.json({ error: 'Invalid credentials' }, 401)
+    }
+
+    // TOTP 2FA check
+    if (user.totp_enabled) {
+      if (!body.totp_token) {
+        // Not an error: password was correct, a second factor is required.
+        // Return 200 so the client can read the flag (apiJson throws on non-2xx).
+        return c.json({ totp_required: true })
+      }
+      let loginDecryptedSecret: string
+      try {
+        loginDecryptedSecret = decryptTotpSecret(user.totp_secret!)
+      } catch {
+        return c.json({ error: 'TOTP not configured on this server' }, 503)
+      }
+      const acceptedStep = verifyTotpToken(loginDecryptedSecret, body.totp_token)
+      // One-time use (RFC 6238 §5.2): atomically claim the time step — the
+      // conditional update rejects a replayed code (step <= last accepted) and
+      // closes the race between two concurrent logins presenting the same code.
+      const claimed = acceptedStep === null ? [] : await d
+        .update(users)
+        .set({ totp_last_step: acceptedStep })
+        .where(and(
+          eq(users.id, user.id),
+          or(isNull(users.totp_last_step), lt(users.totp_last_step, acceptedStep)),
+        ))
+        .returning({ id: users.id })
+      if (acceptedStep === null || claimed.length === 0) {
+        // A wrong (or replayed) TOTP code is a failed attempt too — 6-digit
+        // codes are brute-forceable, so they must consume rate-limit slots.
+        recordLoginFailure()
+        await writeAudit(db, user.id, 'login_totp', body.username, 'fail', ip)
+        return c.json({ error: 'Invalid TOTP token' }, 401)
+      }
+    }
+
+    // Issue tokens
+    const sessionId = randomUUID()
+    const { raw, hash, expiresAt } = generateRefreshToken()
+
+    await d.insert(sessions).values({
+      id: sessionId,
+      user_id: user.id,
+      refresh_token_hash: hash,
+      session_version: user.session_version,
+      expires_at: expiresAt,
+      ip,
+      ua,
+    })
+
+    // Update last_login
+    await d.update(users).set({
+      last_login: new Date(),
+    }).where(eq(users.id, user.id))
+
+    const accessToken = await signAccessToken({
+      sub: String(user.id),
+      role: user.role as UserRole,
+      session_version: user.session_version,
+      session_id: sessionId,
+    })
+
+    await writeAudit(db, user.id, 'login', body.username, 'ok', ip)
+
+    c.header('Set-Cookie', buildRefreshCookieHeader(raw, expiresAt))
+    return c.json({
+      access_token: accessToken,
+      user: {
+        id: user.id,
+        username: user.username,
+        role: user.role,
+        totp_enabled: user.totp_enabled,
+      },
+    })
+  } finally {
+    attempt.finish(failed)
   }
-
-  // Issue tokens
-  const sessionId = randomUUID()
-  const { raw, hash, expiresAt } = generateRefreshToken()
-
-  await d.insert(sessions).values({
-    id: sessionId,
-    user_id: user.id,
-    refresh_token_hash: hash,
-    session_version: user.session_version,
-    expires_at: expiresAt,
-    ip,
-    ua,
-  })
-
-  // Update last_login
-  await d.update(users).set({
-    last_login: new Date(),
-  }).where(eq(users.id, user.id))
-
-  const accessToken = await signAccessToken({
-    sub: String(user.id),
-    role: user.role as UserRole,
-    session_version: user.session_version,
-    session_id: sessionId,
-  })
-
-  await writeAudit(db, user.id, 'login', body.username, 'ok', ip)
-
-  c.header('Set-Cookie', buildRefreshCookieHeader(raw, expiresAt))
-  return c.json({
-    access_token: accessToken,
-    user: {
-      id: user.id,
-      username: user.username,
-      role: user.role,
-      totp_enabled: user.totp_enabled,
-    },
-  })
 })
 
 // POST /web/auth/logout
@@ -766,11 +770,11 @@ auth.post('/passkey/authenticate', zValidator('json', PasskeyAuthSchema), async 
     return c.json({ error: err.message ?? 'Authentication failed' }, 401)
   }
 
-  // Update passkey counter and last_used_at
-  await d.update(passkeys).set({
-    counter: verification.authenticationInfo.newCounter,
-    last_used_at: new Date(),
-  }).where(eq(passkeys.id, pk.id))
+  // Счетчик заявляется атомарно: поздний ответ не возвращает старое значение.
+  if (!await claimPasskeyCounter(d, passkeys, pk.id, verification.authenticationInfo.newCounter)) {
+    await writeAudit(db, pk.user_id, 'passkey_auth', credentialId, 'fail', ip)
+    return c.json({ error: 'Passkey counter changed. Please retry.' }, 401)
+  }
 
   // Issue tokens
   const sessionId = randomUUID()

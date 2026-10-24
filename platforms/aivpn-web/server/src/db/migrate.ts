@@ -95,7 +95,7 @@ export async function runMigrations(): Promise<void> {
 
     // Add OIDC identity + TOTP replay-protection columns if they don't exist
     // yet (idempotent ALTER TABLE)
-    for (const col of ['oidc_iss TEXT', 'oidc_sub TEXT', 'totp_last_step INTEGER']) {
+    for (const col of ['oidc_iss TEXT', 'oidc_sub TEXT', 'totp_last_step INTEGER', 'session_version INTEGER NOT NULL DEFAULT 0']) {
       try { sqlite.exec(`ALTER TABLE users ADD COLUMN ${col}`) } catch { /* already exists */ }
     }
     // Refresh-rotation grace columns (cross-tab refresh race, routes/auth.ts)
@@ -181,6 +181,7 @@ export async function runMigrations(): Promise<void> {
       -- 0003: TOTP replay protection — last accepted RFC 6238 time step
       ALTER TABLE users ADD COLUMN IF NOT EXISTS totp_last_step INTEGER;
 
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS session_version INTEGER NOT NULL DEFAULT 0;
       ALTER TABLE sessions ADD COLUMN IF NOT EXISTS session_version INTEGER NOT NULL DEFAULT 0;
     `)
   } finally {

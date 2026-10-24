@@ -1,12 +1,23 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <color name="background">#FF160F2F</color>
-    <color name="surface">#FF211060</color>
-    <color name="accent">#FF7B61FF</color>
-    <color name="accent_lemon">#FFE8FF6B</color>
-    <color name="disconnect">#FFE74C3C</color>
-    <color name="text_primary">#FFFFFFFF</color>
-    <color name="text_secondary">#FFB0B0BF</color>
-    <color name="green">#FF2ECC71</color>
-    <color name="grey">#FF555566</color>
+    <color name="background">#FDF8FF</color>
+    <color name="surface">#F0EBF4</color>
+    <color name="surface_high">#E9E2EF</color>
+    <color name="accent">#68518F</color>
+    <color name="on_accent">#FFFFFF</color>
+    <color name="accent_container">#EADDFA</color>
+    <color name="on_accent_container">#322047</color>
+    <color name="accent_lemon">#75520D</color>
+    <color name="warning_container">#FFF0CF</color>
+    <color name="disconnect">#A12E29</color>
+    <color name="error_container">#FFDAD6</color>
+    <color name="on_error">#FFFFFF</color>
+    <color name="text_primary">#201B24</color>
+    <color name="text_secondary">#625B69</color>
+    <color name="green">#246335</color>
+    <color name="green_container">#DFEFDF</color>
+    <color name="grey">#807684</color>
+    <color name="outline_variant">#D7CEDF</color>
+    <color name="navigation_bar_legacy">#242128</color>
+    <bool name="light_system_bars">true</bool>
 </resources>

@@ -16,27 +16,19 @@
 /** Per-key log of allowed-request timestamps (ms), oldest first. */
 const rateLimitMap = new Map<string, number[]>()
 
-// Hard cap on distinct keys tracked at once. Several callers key this limiter
-// on unauthenticated, attacker-chosen input (e.g. routes/auth.ts's
-// `login_user:${username}` per-username brute-force guard) — without a cap,
-// flooding the login endpoint with a fresh random username on every request
-// grows this map without bound between periodic sweeps (memory-exhaustion
-// DoS). When full, evict the single least-recently-active entry to make room
-// (O(map size), but only paid once every MAX_RATE_LIMIT_KEYS insertions).
+// Храним ключи в порядке последнего записанного события. При переполнении
+// удаляем самый старый за O(1), без обхода всей таблицы на каждом новом ключе.
 const MAX_RATE_LIMIT_KEYS = 50_000
 
 function evictStalestIfFull(): void {
-  if (rateLimitMap.size < MAX_RATE_LIMIT_KEYS) return
-  let stalestKey: string | undefined
-  let stalestTs = Infinity
-  for (const [k, log] of rateLimitMap) {
-    const last = log.at(-1) ?? -Infinity
-    if (last < stalestTs) {
-      stalestTs = last
-      stalestKey = k
-    }
+  if (rateLimitMap.size >= MAX_RATE_LIMIT_KEYS) {
+    rateLimitMap.delete(rateLimitMap.keys().next().value!)
   }
-  if (stalestKey !== undefined) rateLimitMap.delete(stalestKey)
+}
+
+function touch(key: string, log: number[]): void {
+  rateLimitMap.delete(key)
+  rateLimitMap.set(key, log)
 }
 
 export function checkRateLimit(key: string, maxReqs: number, windowMs: number): boolean {
@@ -56,6 +48,7 @@ export function checkRateLimit(key: string, maxReqs: number, windowMs: number): 
 
   if (log.length >= maxReqs) return false
   log.push(now)
+  touch(key, log)
   return true
 }
 
@@ -100,6 +93,28 @@ export function recordRateLimitEvent(key: string, maxReqs: number): void {
     log.splice(0, log.length - maxReqs + 1)
   }
   log.push(Date.now())
+  touch(key, log)
+}
+
+// Незавершенные проверки занимают слот, но успешный вход его освобождает.
+// Активные ключи не вытесняются: иначе параллельные запросы обойдут лимит.
+const pendingAttempts = new Map<string, number>()
+
+export function reserveRateLimit(key: string, maxReqs: number, windowMs: number):
+  { finish: (failed: boolean) => void } | null {
+  const pending = pendingAttempts.get(key) ?? 0
+  if (isRateLimited(key, Math.max(0, maxReqs - pending), windowMs) || pending >= maxReqs) return null
+  if (!pendingAttempts.has(key) && pendingAttempts.size >= MAX_RATE_LIMIT_KEYS) return null
+  pendingAttempts.set(key, pending + 1)
+  let finished = false
+  return { finish(failed) {
+    if (finished) return
+    finished = true
+    if (failed) recordRateLimitEvent(key, maxReqs)
+    const remaining = (pendingAttempts.get(key) ?? 1) - 1
+    if (remaining === 0) pendingAttempts.delete(key)
+    else pendingAttempts.set(key, remaining)
+  } }
 }
 
 /**

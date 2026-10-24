@@ -199,6 +199,7 @@ impl super::Gateway {
             .map(|_| crate::batch_io::RecvSlot::new(MAX_PACKET_SIZE))
             .collect();
 
+        let mut rates = crate::source_rates::SourceRates::default();
         loop {
             let received = tokio::select! {
                 payload = socket.decoded() => {
@@ -216,21 +217,13 @@ impl super::Gateway {
                         let Some(client_addr) = slot.addr else {
                             continue;
                         };
-                        // Per-IP rate limiting (fast, stays in recv task)
-                        {
-                            let now = Instant::now();
-                            let mut entry = gateway
-                                .rate_limits
-                                .entry(client_addr.ip())
-                                .or_insert((0, now));
-                            if entry.1.elapsed() > Duration::from_secs(1) {
-                                entry.0 = 0;
-                                entry.1 = now;
-                            }
-                            entry.0 += 1;
-                            if entry.0 > gateway.config.per_ip_pps_limit {
-                                continue;
-                            }
+                        if !rates.allow(
+                            client_addr.ip(),
+                            Instant::now(),
+                            65_536,
+                            gateway.config.per_ip_pps_limit,
+                        ) {
+                            continue;
                         }
 
                         let packet_data = slot.packet().to_vec();
