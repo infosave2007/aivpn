@@ -26,7 +26,9 @@ final class NetworkAssignmentTests: XCTestCase {
             NetworkAssignment(clientIp: "10.0.0.2", serverVpnIp: "10.0.0.1", prefixLen: 0, mtu: 1346, ipv6Address: nil, ipv6PrefixLen: nil),
             NetworkAssignment(clientIp: "10.0.0.2", serverVpnIp: "10.0.0.1", prefixLen: 24, mtu: 1200, ipv6Address: "fd10::2", ipv6PrefixLen: 64),
             NetworkAssignment(clientIp: "10.0.0.999", serverVpnIp: "10.0.0.1", prefixLen: 24, mtu: 1346, ipv6Address: nil, ipv6PrefixLen: nil),
-            NetworkAssignment(clientIp: "10.0.0.2", serverVpnIp: "10.0.0.1", prefixLen: 24, mtu: 1346, ipv6Address: "fd10::2", ipv6PrefixLen: nil)
+            NetworkAssignment(clientIp: "10.0.0.2", serverVpnIp: "10.0.0.1", prefixLen: 24, mtu: 1346, ipv6Address: "fd10::2", ipv6PrefixLen: nil),
+            NetworkAssignment(clientIp: "10.0.0.2", serverVpnIp: "10.0.0.1", prefixLen: 24, mtu: 1346, ipv6Address: "fe80::2%en0", ipv6PrefixLen: 64),
+            NetworkAssignment(clientIp: "10.0.0.2", serverVpnIp: "10.0.0.1", prefixLen: 24, mtu: 1346, ipv6Address: "fd10::2\0ignored", ipv6PrefixLen: 64)
         ] { XCTAssertFalse(assignment.isValid) }
     }
 }
@@ -39,7 +41,7 @@ final class CIDRRouteTests: XCTestCase {
         XCTAssertEqual(CIDRRoute("2001:db8::/64")?.prefixLen, 64)
         XCTAssertTrue(CIDRRoute("::/0")?.isIPv6 ?? false)
         XCTAssertTrue(CIDRRoute("::1/128")?.isIPv6 ?? false)
-        for input in ["1..2.3.4/24", "256.1.1.1/8", "::/129", "192.0.2.1/33", "::/-1", "::/64/", "invalid/64", "fe80::1%en0/64"] {
+        for input in ["1..2.3.4/24", "256.1.1.1/8", "::/129", "192.0.2.1/33", "::/-1", "::/64/", "invalid/64", "fe80::1%en0/64", "::1\0ignored/64", "192.0.2.1\0ignored/24"] {
             XCTAssertNil(CIDRRoute(input), input)
         }
     }
@@ -50,7 +52,7 @@ final class VPNServerEndpointTests: XCTestCase {
         XCTAssertEqual(VPNServerEndpoint("[2001:db8::1]:443")?.host, "2001:db8::1")
         XCTAssertEqual(VPNServerEndpoint("[::1]:8443")?.host, "::1")
         XCTAssertEqual(VPNServerEndpoint("host.example:8443")?.port, 8443)
-        for invalid in ["2001:db8::1:443", "[::1]:0", "host:65536", ":443", "[broken]:443"] {
+        for invalid in ["2001:db8::1:443", "[::1]:0", "host:65536", ":443", "[broken]:443", "[fe80::1%en0]:443", "[::1\0ignored]:443"] {
             XCTAssertNil(VPNServerEndpoint(invalid))
         }
     }

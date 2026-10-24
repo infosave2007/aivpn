@@ -111,11 +111,9 @@ async fn lookup(
     kind: RecordType,
 ) -> Result<Vec<IpAddr>> {
     for _ in 0..8 {
-        let mut query = Message::new();
-        query
-            .set_id(rand::random())
-            .set_recursion_desired(true)
-            .add_query(Query::query(name.clone(), kind));
+        let mut query = Message::query();
+        query.metadata.recursion_desired = true;
+        query.add_query(Query::query(name.clone(), kind));
         let mut response = None;
         let mut last_error = None;
         for server in servers {
@@ -136,12 +134,8 @@ async fn lookup(
         let mut next = None;
         for _ in 0..8 {
             let mut ips = Vec::new();
-            for record in answer
-                .answers()
-                .iter()
-                .filter(|record| record.name() == &name)
-            {
-                match record.data() {
+            for record in answer.answers.iter().filter(|record| record.name == name) {
+                match &record.data {
                     RData::A(ip) if kind == RecordType::A => ips.push(IpAddr::V4(ip.0)),
                     RData::AAAA(ip) if kind == RecordType::AAAA => ips.push(IpAddr::V6(ip.0)),
                     RData::CNAME(alias) => next = Some(alias.0.clone()),
@@ -158,7 +152,7 @@ async fn lookup(
                 }
                 _ => break,
             }
-            if !answer.answers().iter().any(|record| record.name() == &name) {
+            if !answer.answers.iter().any(|record| record.name == name) {
                 break;
             }
         }
@@ -172,14 +166,14 @@ async fn lookup(
 fn validate(bytes: &[u8], query: &Message) -> Result<Message> {
     let answer =
         Message::from_vec(bytes).map_err(|_| Error::InvalidPacket("Неверный ответ DNS"))?;
-    if answer.id() != query.id()
-        || answer.message_type() != MessageType::Response
-        || answer.queries() != query.queries()
+    if answer.metadata.id != query.metadata.id
+        || answer.metadata.message_type != MessageType::Response
+        || answer.queries != query.queries
     {
         return Err(Error::InvalidPacket("Ответ DNS не соответствует запросу"));
     }
     if !matches!(
-        answer.response_code(),
+        answer.metadata.response_code,
         ResponseCode::NoError | ResponseCode::NXDomain
     ) {
         return Err(Error::InvalidPacket("Ошибка служебного DNS"));
@@ -213,7 +207,7 @@ async fn exchange(guard: &dyn SocketGuard, server: SocketAddr, query: &Message) 
     let mut bytes = vec![0; u16::MAX as usize];
     let size = udp.recv(&mut bytes).await?;
     let answer = validate(&bytes[..size], query)?;
-    if !answer.truncated() {
+    if !answer.metadata.truncation {
         return Ok(answer);
     }
     let socket = if server.is_ipv4() {
@@ -238,7 +232,7 @@ async fn exchange(guard: &dyn SocketGuard, server: SocketAddr, query: &Message) 
     bytes.resize(size, 0);
     tcp.read_exact(&mut bytes).await?;
     let answer = validate(&bytes, query)?;
-    if answer.truncated() {
+    if answer.metadata.truncation {
         return Err(Error::InvalidPacket("Обрезанный ответ DNS по TCP"));
     }
     Ok(answer)
@@ -271,9 +265,9 @@ mod tests {
     }
     fn answer(query: &Message) -> Message {
         let mut answer = query.clone();
-        answer.set_message_type(MessageType::Response);
-        if query.queries()[0].query_type() == RecordType::A {
-            let name = query.queries()[0].name().clone();
+        answer.metadata.message_type = MessageType::Response;
+        if query.queries[0].query_type() == RecordType::A {
+            let name = query.queries[0].name().clone();
             let alias = Name::from_ascii("edge.test.").unwrap();
             answer.add_answer(Record::from_rdata(
                 name,
@@ -299,9 +293,8 @@ mod tests {
             for _ in 0..2 {
                 let (size, peer) = udp.recv_from(&mut bytes).await.unwrap();
                 let mut truncated = Message::from_vec(&bytes[..size]).unwrap();
-                truncated
-                    .set_message_type(MessageType::Response)
-                    .set_truncated(true);
+                truncated.metadata.message_type = MessageType::Response;
+                truncated.metadata.truncation = true;
                 udp.send_to(&truncated.to_vec().unwrap(), peer)
                     .await
                     .unwrap();
@@ -332,15 +325,17 @@ mod tests {
 
     #[test]
     fn mismatched_dns_response_is_rejected() {
-        let mut query = Message::new();
-        query.set_id(17).add_query(Query::query(
+        let mut query = Message::query();
+        query.metadata.id = 17;
+        query.add_query(Query::query(
             Name::from_ascii("carrier.invalid").unwrap(),
             RecordType::A,
         ));
         let mut response = answer(&query);
-        response.set_id(18);
+        response.metadata.id = 18;
         assert!(validate(&response.to_vec().unwrap(), &query).is_err());
-        response.set_id(17).queries_mut().clear();
+        response.metadata.id = 17;
+        response.queries.clear();
         assert!(validate(&response.to_vec().unwrap(), &query).is_err());
     }
 

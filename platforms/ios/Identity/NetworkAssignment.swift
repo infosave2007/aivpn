@@ -47,6 +47,7 @@ struct NetworkAssignment: Codable, Equatable {
         guard ipv4Valid(clientIp), ipv4Valid(serverVpnIp), (1...30).contains(prefixLen),
               (576...1500).contains(mtu) else { return false }
         if let address = ipv6Address, let prefix = ipv6PrefixLen {
+            guard !address.contains("%"), !address.utf8.contains(0) else { return false }
             var binary = in6_addr()
             let parsed = address.withCString { inet_pton(AF_INET6, $0, &binary) }
             return parsed == 1 && address != "::" && address != "::1" &&
@@ -70,6 +71,7 @@ struct CIDRRoute {
         let parts = value.split(separator: "/", omittingEmptySubsequences: false)
         guard parts.count == 2, let prefix = Int(parts[1]), prefix >= 0 else { return nil }
         let host = String(parts[0])
+        guard !host.contains("%"), !host.utf8.contains(0) else { return nil }
         let ipv6 = host.contains(":")
         if ipv6 {
             var binary = in6_addr()
@@ -107,7 +109,8 @@ struct VPNServerEndpoint {
             guard !prefix.isEmpty, !prefix.contains(":"), !prefix.contains("["), !prefix.contains("]") else { return nil }
             host = prefix
         }
-        guard !host.contains(where: { $0.isWhitespace }) else { return nil }
+        guard !host.contains(where: { $0.isWhitespace }), !host.contains("%"),
+              !host.utf8.contains(0) else { return nil }
         self.host = host
         self.port = port
     }
