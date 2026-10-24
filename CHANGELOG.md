@@ -16,6 +16,7 @@
 
 ### Fixed
 
+- **Bootstrap cache after catalog upgrades** - the server restores the known profile requested in the authenticated initial exchange when a cached descriptor selects a different base from the expanded catalog. A matching STUN header no longer completes PFS with the wrong RTC profile and leaves the tunnel unable to carry data.
 - **Client configuration validation** - malformed local JSON and transport parameters now stop startup before network changes. Global runtime settings remain separate from connection profiles and survive reconnects.
 - **DNS address failover** - desktop and mobile direct UDP connections try other resolved addresses after unsuccessful attempts and prefer the last address confirmed by a PFS handshake. One unreachable A or AAAA record no longer traps reconnects on the same endpoint.
 - **Signed reverse profiles** - signing a mask signs nested reverse profiles first, so strict verification accepts each profile both inside its parent and when sent separately. Server security features also propagate to the embedded client and shared core.
@@ -118,6 +119,7 @@
 
 ### Исправлено
 
+- **Кеш bootstrap после обновления каталога** - сервер восстанавливает известный профиль, запрошенный в защищенном начальном обмене, если кешированный дескриптор выбирает другую базу из расширенного каталога. Совпадающий STUN-заголовок больше не приводит к завершению PFS с чужим RTC-профилем и остановке передачи данных.
 - **Проверка конфигурации клиента** - неверный локальный JSON и поврежденные параметры транспорта останавливают запуск до изменения сети. Общие настройки процесса отделены от профиля подключения и сохраняются при переподключении.
 - **Переключение DNS-адресов** - прямой UDP на desktop и мобильных устройствах перебирает адреса после неудачных попыток и предпочитает последний адрес, подтвержденный рукопожатием PFS. Недоступная запись A или AAAA больше не удерживает все реконнекты на одном адресе.
 - **Подпись обратных профилей** - при подписи маски сначала подписываются вложенные обратные профили. Строгая проверка принимает их внутри основного профиля и при отдельной передаче клиенту. Защитные возможности серверной сборки также передаются встроенному клиенту и общему ядру.

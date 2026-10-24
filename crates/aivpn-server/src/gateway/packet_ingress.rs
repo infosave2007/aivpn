@@ -5,6 +5,58 @@
 
 use super::*;
 
+fn hinted_bootstrap_mask(
+    descriptors: &[BootstrapDescriptor],
+    preshared_key: &[u8; 32],
+    requested_id: &str,
+) -> Option<MaskProfile> {
+    for descriptor in descriptors {
+        let Some(requested) =
+            requested_id.strip_prefix(&format!("bootstrap:{}:", descriptor.descriptor_id))
+        else {
+            continue;
+        };
+        let bases: Vec<_> = if !descriptor.embedded_masks.is_empty() {
+            descriptor.embedded_masks.clone()
+        } else if descriptor.base_mask_ids.is_empty() {
+            aivpn_common::mask::preset_masks::all()
+        } else {
+            descriptor
+                .base_mask_ids
+                .iter()
+                .filter_map(|id| aivpn_common::mask::preset_masks::by_id(id))
+                .collect()
+        };
+        for base in bases {
+            let Some(tail) = requested.strip_prefix(&format!("{}:", base.mask_id)) else {
+                continue;
+            };
+            let Some(slot) = tail
+                .split_once(':')
+                .and_then(|(slot, _)| slot.parse::<u8>().ok())
+            else {
+                continue;
+            };
+            if slot >= descriptor.candidate_count {
+                continue;
+            }
+            // Старый кеш может выбирать другую базу из того же epoch и соли.
+            // Восстанавливаем только известную базу; сам дескриптор не меняется.
+            let mut pinned = descriptor.clone();
+            pinned.base_mask_ids = vec![base.mask_id.clone()];
+            if !pinned.embedded_masks.is_empty() {
+                pinned.embedded_masks = vec![base];
+            }
+            let candidate =
+                aivpn_common::mask::derive_bootstrap_candidate(&pinned, Some(preshared_key), slot)?;
+            if candidate.mask_id == requested_id {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
 fn hinted_initial_mask(
     current: &MaskProfile,
     requested_id: &str,
@@ -33,6 +85,45 @@ fn hinted_initial_mask(
 #[cfg(test)]
 mod mask_hint_tests {
     use super::*;
+
+    #[test]
+    fn bootstrap_hint_stays_within_the_known_descriptor_and_base() {
+        let signing_key = derive_server_signing_key(&[7; 32]);
+        let base = aivpn_common::mask::preset_masks::webrtc_zoom_v3();
+        for embedded in [false, true] {
+            let descriptor = super::super::bootstrap::build_bootstrap_descriptor(
+                &[7; 32],
+                &signing_key,
+                1,
+                if embedded {
+                    std::slice::from_ref(&base)
+                } else {
+                    &[]
+                },
+            );
+            let unchanged = descriptor.signing_bytes();
+            let expected = derive_bootstrap_candidates(&descriptor, Some(&[9; 32]))[0].clone();
+            let descriptors = std::slice::from_ref(&descriptor);
+            let actual = hinted_bootstrap_mask(descriptors, &[9; 32], &expected.mask_id).unwrap();
+            assert_eq!(
+                actual.signing_message().unwrap(),
+                expected.signing_message().unwrap()
+            );
+            for invalid in [
+                expected.mask_id.replace("epoch-1:", "epoch-2:"),
+                format!("{}:extra", expected.mask_id),
+                format!("bootstrap:epoch-1:{}:255:0000", base.mask_id),
+                "bootstrap:epoch-1:unknown:0:0000".into(),
+                "bootstrap:epoch-1:webrtc_zoom_v3:0:zzzz".into(),
+            ] {
+                assert!(
+                    hinted_bootstrap_mask(descriptors, &[9; 32], &invalid).is_none(),
+                    "{invalid}"
+                );
+            }
+            assert_eq!(descriptor.signing_bytes(), unchanged);
+        }
+    }
 
     #[test]
     fn authenticated_builtin_hint_replaces_ambiguous_generated_bootstrap() {
@@ -1164,11 +1255,15 @@ impl super::Gateway {
                                 .as_ref()
                                 .and_then(|database| database.find_by_id(id))
                         }) {
-                            trusted.extend(self.bootstrap_descriptors.read().iter().flat_map(
-                                |descriptor| {
-                                    derive_bootstrap_candidates(descriptor, Some(&client.psk))
-                                },
-                            ));
+                            let descriptors = self.bootstrap_descriptors.read();
+                            trusted.extend(descriptors.iter().flat_map(|descriptor| {
+                                derive_bootstrap_candidates(descriptor, Some(&client.psk))
+                            }));
+                            if let Some(requested) =
+                                hinted_bootstrap_mask(&descriptors, &client.psk, &mask_id)
+                            {
+                                trusted.push(requested);
+                            }
                         }
                         let mut sess = session.lock();
                         if sess.initial_hello_sends == 0 {

@@ -675,8 +675,22 @@ async fn export_authenticated_dpi_training_captures() {
 
 async fn exercise_diagnostics_profile(
     carrier: bool,
+    mask: MaskProfile,
+    training_dir: Option<&std::path::Path>,
+) {
+    exercise_diagnostics_with_bootstrap(carrier, mask, training_dir, false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cached_bootstrap_catalog_upgrade_keeps_the_requested_rtc_profile() {
+    exercise_diagnostics_with_bootstrap(false, preset_masks::webrtc_zoom_v3(), None, true).await;
+}
+
+async fn exercise_diagnostics_with_bootstrap(
+    carrier: bool,
     mut mask: MaskProfile,
     training_dir: Option<&std::path::Path>,
+    catalog_upgrade: bool,
 ) {
     use aivpn_common::diagnostics;
     let mut tasks = Tasks::default();
@@ -709,6 +723,41 @@ async fn exercise_diagnostics_profile(
         ..Default::default()
     })
     .unwrap();
+    if catalog_upgrade {
+        let signing_key = derive_server_signing_key(&[73; 32]);
+        let mut descriptor = super::bootstrap::build_bootstrap_descriptor(
+            &[73; 32],
+            &signing_key,
+            bootstrap_epoch(current_unix_secs()),
+            &[],
+        );
+        descriptor.base_mask_ids = vec!["sber_salute_v1".into(), mask.mask_id.clone()];
+        let descriptor = (0..=255u8)
+            .find_map(|salt| {
+                descriptor.kdf_salt[0] = salt;
+                let candidate =
+                    aivpn_common::mask::derive_bootstrap_candidate(&descriptor, Some(&user.psk), 0)
+                        .unwrap();
+                (candidate.spoof_protocol == aivpn_common::mask::SpoofProtocol::WebRTC_STUN).then(
+                    || {
+                        super::bootstrap::sign_bootstrap_descriptor(
+                            descriptor.clone(),
+                            &signing_key,
+                        )
+                    },
+                )
+            })
+            .unwrap();
+        let mut cached = descriptor.clone();
+        cached.base_mask_ids = vec![mask.mask_id.clone()];
+        let cached = super::bootstrap::sign_bootstrap_descriptor(cached, &signing_key);
+        assert!(cached
+            .verify_signature(&signing_key.verifying_key().to_bytes())
+            .unwrap());
+        mask = aivpn_common::mask::derive_bootstrap_candidate(&cached, Some(&user.psk), 0).unwrap();
+        *gateway.bootstrap_descriptors.write() = vec![descriptor];
+    }
+    let expected_initial_mask = mask.mask_id.clone();
     let server = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
     let address = server.local_addr().unwrap();
     let training = training_dir.is_some();
@@ -828,6 +877,46 @@ async fn exercise_diagnostics_profile(
     })
     .await
     .unwrap();
+    if catalog_upgrade {
+        let session = gateway
+            .session_manager
+            .iter_sessions()
+            .next()
+            .unwrap()
+            .value()
+            .clone();
+        assert_eq!(
+            session.lock().mask.as_ref().unwrap().mask_id,
+            expected_initial_mask,
+            "Кеш прежнего каталога не должен подменять RTC-профиль похожей STUN-маской"
+        );
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !gateway
+                .udp_socket
+                .as_ref()
+                .unwrap()
+                .is_stateful(session.lock().client_addr)
+            {
+                assert!(!client_task.is_finished());
+                time_delay(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("RTC-профиль не согласован после обновления каталога");
+        for (path, body) in [
+            (diagnostics::PING, vec![7; 8]),
+            (diagnostics::UP, vec![9; diagnostics::BLOCK_BYTES]),
+            (diagnostics::DOWN, vec![11; 8]),
+        ] {
+            let expected = diagnostics::response(1, path, &body);
+            let actual = mgmt
+                .mgmt_call(&tx, 1, path, body, Duration::from_secs(2))
+                .await
+                .unwrap();
+            assert_eq!(actual, expected);
+        }
+        return;
+    }
     if let Some(directory) = training_dir {
         let seed = std::env::var("AIVPN_DPI_CAPTURE_SEED")
             .ok()
