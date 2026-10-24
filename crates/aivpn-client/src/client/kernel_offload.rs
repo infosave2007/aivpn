@@ -8,7 +8,8 @@
 use std::net::Ipv4Addr;
 
 use aivpn_common::kernel_accel::{
-    SessionPolicy, CLAIM_OK, POLICY_VERSION, POL_FALLBACK, POL_IPV6, ROLE_CLIENT,
+    SessionPolicy, CLAIM_OK, POLICY_VERSION, POL_FALLBACK, POL_IPV6, POL_RX_FALLBACK,
+    POL_TX_FALLBACK, ROLE_CLIENT,
 };
 use aivpn_common::mask::MaskProfile;
 
@@ -113,7 +114,12 @@ impl super::AivpnClient {
             return;
         };
         // Транспорт без UDP-дескриптора полностью остается в userspace.
-        if transport.raw_fd().is_none() {
+        let userspace_mask = transport.raw_fd().is_none()
+            || self
+                .mimicry_engine
+                .as_ref()
+                .is_some_and(|engine| aivpn_common::mask_io::requires_userspace(engine.mask()));
+        if userspace_mask && !self.kernel_replay_bound {
             return;
         }
         let Some(policy) = client_kernel_policy(self.kernel_session_id, &self.config.tun_config)
@@ -121,6 +127,7 @@ impl super::AivpnClient {
             warn!("kernel accel: нет адреса клиента, offload не включаем");
             return;
         };
+        let policy = mask_kernel_policy(policy, userspace_mask);
 
         if !self.kernel_tun_set {
             let tun_name = self.tunnel.name();
@@ -220,6 +227,12 @@ impl super::AivpnClient {
             self.kernel_installed = false;
             return;
         }
+        if userspace_mask {
+            // Replay остается в том же реестре. Удаление сессии здесь
+            // потеряло бы счетчики, принятые ядром до смены маски.
+            self.kernel_installed = false;
+            return;
+        }
         self.kernel_installed_mdh_len = mdh_len;
         self.kernel_installed_tag_offset = tag_offset;
         self.kernel_push_tags(true);
@@ -300,6 +313,8 @@ impl super::AivpnClient {
             .is_some_and(|k| k.session_key_s2c == self.kernel_epoch_key);
         if same_key {
             let words = snapshot.replay_words;
+            let (received, span) = aivpn_common::quality::replay_observation_counts(&words);
+            self.quality_tracker.record_window(received, span);
             for (word_index, word) in words.into_iter().enumerate() {
                 for bit in 0..64 {
                     let offset = (word_index * 64 + bit) as u64;
@@ -362,6 +377,13 @@ impl super::AivpnClient {
     }
 }
 
+fn mask_kernel_policy(mut policy: SessionPolicy, userspace: bool) -> SessionPolicy {
+    if userspace {
+        policy.flags |= POL_RX_FALLBACK | POL_TX_FALLBACK;
+    }
+    policy
+}
+
 #[cfg(test)]
 mod tests {
     use super::{claim_allows, client_kernel_policy, epoch_step, kernel_tag_offset};
@@ -377,6 +399,17 @@ mod tests {
         tun.tun_addr = addr.to_string();
         tun.ipv6 = None;
         tun
+    }
+
+    #[test]
+    fn stateful_mask_disarms_offload_without_dropping_replay_policy() {
+        let ordinary = client_kernel_policy([7; 16], &tun_v4("10.8.0.5")).unwrap();
+        let masked = super::mask_kernel_policy(ordinary, true);
+        assert_eq!(masked.session_id, [7; 16]);
+        assert_eq!({ masked.role }, ROLE_CLIENT);
+        assert_ne!(masked.flags & super::POL_RX_FALLBACK, 0);
+        assert_ne!(masked.flags & super::POL_TX_FALLBACK, 0);
+        assert_eq!(masked.flags & POL_FALLBACK, 0);
     }
 
     #[test]

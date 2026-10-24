@@ -1,5 +1,6 @@
 <script lang="ts">
   import { goto } from '$app/navigation';
+  import { onDestroy } from 'svelte';
   import { toStore } from 'svelte/store';
   import { createQuery, createMutation, useQueryClient } from '@tanstack/svelte-query';
   import { clients as clientsApi, type ClientRole } from '$lib/api';
@@ -77,6 +78,8 @@
   let qrData = $state('');
   let connKeyOpen = $state(false);
   let connKey = $state('');
+  let keyRequest = 0;
+  onDestroy(() => { keyRequest += 1; });
 
   /** Surface key-fetch failures (403 for viewer role, 404, daemon down) the
    *  same way this page reports mutation errors — swallowing them left the
@@ -86,19 +89,25 @@
   }
 
   async function handleViewKey(id: string) {
+    const request = ++keyRequest;
     try {
       const res = await clientsApi.connectionKey(id);
+      if (request !== keyRequest) return;
+      qrOpen = false;
       connKey = res.connection_key;
       connKeyOpen = true;
-    } catch (e) { keyError(e); }
+    } catch (e) { if (request === keyRequest) keyError(e); }
   }
 
   async function handleViewQr(id: string) {
+    const request = ++keyRequest;
     try {
       const res = await clientsApi.connectionKey(id);
+      if (request !== keyRequest) return;
+      connKeyOpen = false;
       qrData = res.connection_key;
       qrOpen = true;
-    } catch (e) { keyError(e); }
+    } catch (e) { if (request === keyRequest) keyError(e); }
   }
 
   function handleEdit(id: string) {

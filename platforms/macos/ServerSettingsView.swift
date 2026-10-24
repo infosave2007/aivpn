@@ -6,12 +6,7 @@ import SwiftUI
 // `crates/aivpn-server/src/management_api.rs::MaskInfo` exactly — field
 // names match the server's `#[derive(Serialize)]` output verbatim
 // (snake_case, no `#[serde(rename_all)]` override on either struct).
-// Reached here via `AdminApi.applyConfig(body:)`/`confirmConfig(token:)`/
-// `listMasks()` (thin wrappers around `AdminApi.mgmtRequest` — see that
-// file, including the doc comment on `listMasks()` for a known gap: the
-// masks catalog isn't in the tunnel's curated route allowlist yet), same
-// layering as the pool-topology/audit-log wire types in
-// PoolView.swift/AuditLogView.swift.
+// Каталог и настройки доступны через аутентифицированные запросы внутри VPN.
 
 /// Mirrors `management_api::MaskInfo` — one entry of the array
 /// `GET /api/v1/masks` returns. `modified` is `Option<DateTime<Utc>>`
@@ -126,10 +121,40 @@ final class ServerSettingsStore: ObservableObject {
     @Published var role: UInt8? = nil
     var isAdmin: Bool { role == AdminApi.roleAdmin }
 
+    func resetSession() {
+        role = nil
+        masks = []
+        masksLoading = false
+        masksUnavailable = false
+        clients = []
+        poolNodes = []
+        maskPending = nil
+        maskApplying = false
+        maskConfirming = false
+        maskRemainingSeconds = 0
+        maskErrorStatus = nil
+        maskReverted = false
+        maskTimer?.invalidate()
+        maskTimer = nil
+        exitPending = nil
+        exitApplying = false
+        exitConfirming = false
+        exitRemainingSeconds = 0
+        exitErrorStatus = nil
+        exitReverted = false
+        exitTimer?.invalidate()
+        exitTimer = nil
+    }
+
     private func run<T>(_ work: @escaping () -> T, completion: @escaping (T) -> Void) {
+        let binding = AdminApi.captureSession()
         DispatchQueue.global(qos: .userInitiated).async {
-            let result = work()
-            DispatchQueue.main.async { completion(result) }
+            guard AdminApi.isCurrent(binding) else { return }
+            let result = AdminApi.withSession(binding, work)
+            DispatchQueue.main.async {
+                guard AdminApi.isCurrent(binding) else { return }
+                completion(result)
+            }
         }
     }
 
@@ -143,14 +168,7 @@ final class ServerSettingsStore: ObservableObject {
 
     @Published var masks: [AdminMaskInfoView] = []
     @Published var masksLoading = false
-    /// True whenever the last refresh couldn't decode a `200` +
-    /// `[AdminMaskInfoView]` reply — currently ALWAYS true against a real
-    /// server, since `GET /api/v1/masks` isn't in the tunnel's curated
-    /// route allowlist yet (see `AdminApi.listMasks()`'s doc comment for
-    /// the full explanation and the server-side follow-up this is written
-    /// against). `ActiveMaskSection` below falls back to a free-text
-    /// mask-id field whenever this is true, so the Apply flow itself still
-    /// works even though the catalog dropdown can't populate.
+    /// Сервер не вернул пригодный каталог. Можно ввести идентификатор вручную.
     @Published var masksUnavailable = false
 
     func refreshMasks() {
@@ -475,6 +493,7 @@ struct ServerSettingsRootView: View {
         }
         .frame(minWidth: 420, minHeight: 480)
         .onAppear { refreshAll() }
+        .onReceive(NotificationCenter.default.publisher(for: .aivpnAdminSessionChanged)) { _ in store.resetSession() }
         .onReceive(NotificationCenter.default.publisher(for: .serverSettingsWindowDidShow)) { _ in
             refreshAll()
         }
@@ -707,7 +726,7 @@ private struct GlobalExitSection: View {
             Picker("", selection: $choice) {
                 Text(loc.t("server_settings_exit_unknown")).tag(ServerSettingsExitChoice.unknown)
                 Text(loc.t("server_settings_exit_none")).tag(ServerSettingsExitChoice.none)
-                ForEach(store.poolNodes.filter { $0.address != nil }) { node in
+                ForEach(availableExitNodes(store.poolNodes)) { node in
                     Text("\(node.node_id) (\(node.address!))").tag(ServerSettingsExitChoice.node(node.address!))
                 }
                 Text(loc.t("admin_exit_node_custom")).tag(ServerSettingsExitChoice.custom)

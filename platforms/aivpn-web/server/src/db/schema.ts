@@ -42,6 +42,7 @@ export const sqliteSessions = sqliteTable('sessions', {
     .notNull()
     .references(() => sqliteUsers.id, { onDelete: 'cascade' }),
   refresh_token_hash: text('refresh_token_hash').notNull(),
+  session_version: integer('session_version').notNull().default(0),
   expires_at: integer('expires_at', { mode: 'timestamp' }).notNull(),
   // Previous refresh-token hash, honoured for a short grace window after
   // rotation (cross-tab refresh race — see routes/auth.ts POST /refresh).
@@ -109,6 +110,7 @@ export const pgSessions = pgTable('sessions', {
     .notNull()
     .references(() => pgUsers.id, { onDelete: 'cascade' }),
   refresh_token_hash: varchar('refresh_token_hash', { length: 128 }).notNull(),
+  session_version: pgInteger('session_version').notNull().default(0),
   expires_at: timestamp('expires_at', { withTimezone: true }).notNull(),
   prev_token_hash: varchar('prev_token_hash', { length: 128 }),
   prev_expires_at: timestamp('prev_expires_at', { withTimezone: true }),

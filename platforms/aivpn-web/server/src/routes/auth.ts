@@ -1,7 +1,7 @@
 import { Hono } from 'hono'
 import { z } from 'zod'
 import { zValidator } from '@hono/zod-validator'
-import { eq, and, gt, ne, or, isNull, lt } from 'drizzle-orm'
+import { eq, and, gt, ne, or, isNull, lt, sql } from 'drizzle-orm'
 import { createHmac, randomUUID } from 'node:crypto'
 import { getDb, IS_SQLITE } from '../db'
 import {
@@ -216,6 +216,7 @@ auth.post('/login', zValidator('json', LoginSchema), async (c) => {
     id: sessionId,
     user_id: user.id,
     refresh_token_hash: hash,
+    session_version: user.session_version,
     expires_at: expiresAt,
     ip,
     ua,
@@ -345,7 +346,7 @@ auth.post('/refresh', async (c) => {
     }
 
     const [graceUser] = await d.select().from(users).where(eq(users.id, graceSession.user_id)).limit(1)
-    if (!graceUser) {
+    if (!graceUser || graceUser.session_version !== graceSession.session_version) {
       return c.json({ error: 'User not found' }, 401)
     }
 
@@ -363,7 +364,7 @@ auth.post('/refresh', async (c) => {
   }
 
   const [user] = await d.select().from(users).where(eq(users.id, session.user_id)).limit(1)
-  if (!user) {
+  if (!user || user.session_version !== session.session_version) {
     return c.json({ error: 'User not found' }, 401)
   }
 
@@ -488,7 +489,7 @@ auth.post('/change-password', requireAuth(), zValidator('json', ChangePasswordSc
   const newHash = await hashPassword(body.new_password)
   await d.update(users).set({
     password_hash: newHash,
-    session_version: user.session_version + 1,
+    session_version: sql`${users.session_version} + 1`,
   }).where(eq(users.id, u.id))
   // Revoke ALL refresh tokens so every device must re-authenticate
   await d.delete(sessions).where(eq(sessions.user_id, u.id))
@@ -520,7 +521,10 @@ auth.get('/totp/setup', requireAuth(), async (c) => {
   } catch {
     return c.json({ error: 'TOTP not configured on this server' }, 503)
   }
-  await d.update(users).set({ totp_secret: encryptedSecret }).where(eq(users.id, u.id))
+  const stored = await d.update(users).set({ totp_secret: encryptedSecret }).where(and(
+    eq(users.id, u.id), eq(users.totp_enabled, false), eq(users.session_version, u.session_version),
+  )).returning({ id: users.id })
+  if (!stored.length) return c.json({ error: 'Security settings changed; start setup again' }, 409)
 
   return c.json({
     secret: setup.secret,
@@ -555,12 +559,16 @@ auth.post('/totp/verify', requireAuth(), zValidator('json', TotpVerifySchema), a
     return c.json({ error: 'Invalid TOTP token' }, 401)
   }
 
-  await d.update(users).set({
+  const enabled = await d.update(users).set({
     totp_enabled: true,
     // Consume the setup code too, so it cannot be replayed as the first login code.
     totp_last_step: enableStep,
-    session_version: user.session_version + 1,
-  }).where(eq(users.id, u.id))
+    session_version: sql`${users.session_version} + 1`,
+  }).where(and(
+    eq(users.id, u.id), eq(users.totp_enabled, false),
+    eq(users.totp_secret, user.totp_secret), eq(users.session_version, u.session_version),
+  )).returning({ id: users.id })
+  if (!enabled.length) return c.json({ error: 'Security settings changed; start setup again' }, 409)
   await d.delete(sessions).where(eq(sessions.user_id, u.id))
 
   await writeAudit(db, u.id, 'totp_enable', null, 'ok', ip)
@@ -583,7 +591,7 @@ auth.delete('/totp', requireAuth(), async (c) => {
     totp_enabled: false,
     totp_secret: null,
     totp_last_step: null,
-    session_version: user.session_version + 1,
+    session_version: sql`${users.session_version} + 1`,
   }).where(eq(users.id, u.id))
   await d.delete(sessions).where(eq(sessions.user_id, u.id))
 
@@ -658,7 +666,7 @@ auth.post('/passkey/register', requireAuth(), zValidator('json', PasskeyRegister
   })
 
   const [user] = await d.select().from(users).where(eq(users.id, u.id)).limit(1)
-  await d.update(users).set({ session_version: user.session_version + 1 }).where(eq(users.id, u.id))
+  await d.update(users).set({ session_version: sql`${users.session_version} + 1` }).where(eq(users.id, u.id))
   await d.delete(sessions).where(eq(sessions.user_id, u.id))
 
   await writeAudit(db, u.id, 'passkey_register', cred.id, 'ok', ip)
@@ -734,6 +742,9 @@ auth.post('/passkey/authenticate', zValidator('json', PasskeyAuthSchema), async 
     return c.json({ error: 'Passkey not found' }, 401)
   }
 
+  const [user] = await d.select().from(users).where(eq(users.id, pk.user_id)).limit(1)
+  if (!user) return c.json({ error: 'User not found' }, 401)
+
   // Build challenge key server-side from the authenticated user in the DB record
   const serverUserKey = `user:${pk.user_id}`
 
@@ -761,9 +772,6 @@ auth.post('/passkey/authenticate', zValidator('json', PasskeyAuthSchema), async 
     last_used_at: new Date(),
   }).where(eq(passkeys.id, pk.id))
 
-  const [user] = await d.select().from(users).where(eq(users.id, pk.user_id)).limit(1)
-  if (!user) return c.json({ error: 'User not found' }, 401)
-
   // Issue tokens
   const sessionId = randomUUID()
   const { raw, hash, expiresAt } = generateRefreshToken()
@@ -772,6 +780,7 @@ auth.post('/passkey/authenticate', zValidator('json', PasskeyAuthSchema), async 
     id: sessionId,
     user_id: user.id,
     refresh_token_hash: hash,
+    session_version: user.session_version,
     expires_at: expiresAt,
     ip,
     ua,
@@ -835,10 +844,20 @@ auth.delete('/passkeys/:id', requireAuth(), async (c) => {
 
   if (!pk) return c.json({ error: 'Passkey not found' }, 404)
 
-  await d.delete(passkeys).where(and(eq(passkeys.id, passkeyId), eq(passkeys.user_id, u.id)))
-
   const [user] = await d.select().from(users).where(eq(users.id, u.id)).limit(1)
-  await d.update(users).set({ session_version: user.session_version + 1 }).where(eq(users.id, u.id))
+  if (!user || user.session_version !== u.session_version) return c.json({ error: 'Session changed' }, 409)
+  const remaining = await d.select({ id: passkeys.id }).from(passkeys)
+    .where(and(eq(passkeys.user_id, u.id), ne(passkeys.id, passkeyId))).limit(1)
+  const passwordAvailable = config.OIDC_MODE !== 'exclusive' && !user.passkey_only && !!user.password_hash
+  const ssoAvailable = config.OIDC_MODE !== 'disabled' && !!user.oidc_sub && user.oidc_iss === config.OIDC_ISSUER
+  if (!remaining.length && !passwordAvailable && !ssoAvailable) {
+    return c.json({ error: 'Cannot remove the last available sign-in method' }, 409)
+  }
+  // Один security update выигрывает гонку. Второй запрос должен заново войти.
+  const changed = await d.update(users).set({ session_version: sql`${users.session_version} + 1` })
+    .where(and(eq(users.id, u.id), eq(users.session_version, u.session_version))).returning({ id: users.id })
+  if (!changed.length) return c.json({ error: 'Session changed' }, 409)
+  await d.delete(passkeys).where(and(eq(passkeys.id, passkeyId), eq(passkeys.user_id, u.id)))
   await d.delete(sessions).where(eq(sessions.user_id, u.id))
 
   await writeAudit(db, u.id, 'passkey_remove', passkeyId, 'ok', ip)

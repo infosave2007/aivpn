@@ -1,0 +1,414 @@
+{
+  "schema": 2,
+  "threshold": 0.5,
+  "material_margin": 0.05,
+  "material_met": true,
+  "majority_class_tunnel": true,
+  "counts": {
+    "train": 120,
+    "train_tunnel": 80,
+    "val": 130,
+    "test": 120
+  },
+  "metrics": {
+    "val": {
+      "tp": 79,
+      "fp": 0,
+      "fn": 1,
+      "tn": 50,
+      "precision": 1.0,
+      "recall": 0.9875,
+      "f1": 0.9937106918238994,
+      "accuracy": 0.9923076923076923,
+      "n": 130,
+      "false_tunnel_rate": 0.0,
+      "missed_tunnel_rate": 0.0125
+    },
+    "test": {
+      "tp": 78,
+      "fp": 1,
+      "fn": 2,
+      "tn": 39,
+      "precision": 0.9873417721518988,
+      "recall": 0.975,
+      "f1": 0.9811320754716981,
+      "accuracy": 0.975,
+      "n": 120,
+      "false_tunnel_rate": 0.025,
+      "missed_tunnel_rate": 0.025
+    },
+    "val_majority": {
+      "tp": 80,
+      "fp": 50,
+      "fn": 0,
+      "tn": 0,
+      "precision": 0.6153846153846154,
+      "recall": 1.0,
+      "f1": 0.761904761904762,
+      "accuracy": 0.6153846153846154,
+      "n": 130,
+      "false_tunnel_rate": 1.0,
+      "missed_tunnel_rate": 0.0
+    },
+    "test_majority": {
+      "tp": 80,
+      "fp": 40,
+      "fn": 0,
+      "tn": 0,
+      "precision": 0.6666666666666666,
+      "recall": 1.0,
+      "f1": 0.8,
+      "accuracy": 0.6666666666666666,
+      "n": 120,
+      "false_tunnel_rate": 1.0,
+      "missed_tunnel_rate": 0.0
+    },
+    "train_insample": {
+      "tp": 80,
+      "fp": 0,
+      "fn": 0,
+      "tn": 40,
+      "precision": 1.0,
+      "recall": 1.0,
+      "f1": 1.0,
+      "accuracy": 1.0,
+      "n": 120,
+      "false_tunnel_rate": 0.0,
+      "missed_tunnel_rate": 0.0
+    },
+    "test_overlap": {
+      "tp": 157,
+      "fp": 2,
+      "fn": 3,
+      "tn": 118,
+      "precision": 0.9874213836477987,
+      "recall": 0.98125,
+      "f1": 0.9843260188087775,
+      "accuracy": 0.9821428571428571,
+      "n": 280,
+      "false_tunnel_rate": 0.016666666666666666,
+      "missed_tunnel_rate": 0.01875
+    },
+    "test_old": {
+      "tp": 71,
+      "fp": 31,
+      "fn": 9,
+      "tn": 9,
+      "precision": 0.696078431372549,
+      "recall": 0.8875,
+      "f1": 0.7802197802197801,
+      "accuracy": 0.6666666666666666,
+      "n": 120,
+      "false_tunnel_rate": 0.775,
+      "missed_tunnel_rate": 0.1125
+    }
+  },
+  "per_mask_val": [
+    {
+      "mask_id": "webrtc_zoom_v3",
+      "title": "Zoom",
+      "n_pos": 5,
+      "n_neg": 8,
+      "pos_mean_p": 0.023528636171249673,
+      "neg_mean_p": 0.9953477382659912,
+      "pos_flagged": 0.0,
+      "neg_flagged": 1.0
+    },
+    {
+      "mask_id": "quic_https_v2",
+      "title": "QUIC HTTPS",
+      "n_pos": 5,
+      "n_neg": 8,
+      "pos_mean_p": 0.0005459699488710612,
+      "neg_mean_p": 0.9989110752940178,
+      "pos_flagged": 0.0,
+      "neg_flagged": 1.0
+    },
+    {
+      "mask_id": "webrtc_yandex_telemost_v1",
+      "title": "Telemost",
+      "n_pos": 5,
+      "n_neg": 8,
+      "pos_mean_p": 0.04785743842367083,
+      "neg_mean_p": 0.9338828548789024,
+      "pos_flagged": 0.0,
+      "neg_flagged": 0.875
+    },
+    {
+      "mask_id": "webrtc_vk_teams_v1",
+      "title": "VK Teams",
+      "n_pos": 5,
+      "n_neg": 8,
+      "pos_mean_p": 0.00044936867780052123,
+      "neg_mean_p": 0.9997530803084373,
+      "pos_flagged": 0.0,
+      "neg_flagged": 1.0
+    },
+    {
+      "mask_id": "webrtc_sberjazz_v1",
+      "title": "Jazz",
+      "n_pos": 5,
+      "n_neg": 8,
+      "pos_mean_p": 0.0006764683523215354,
+      "neg_mean_p": 0.9996334537863731,
+      "pos_flagged": 0.0,
+      "neg_flagged": 1.0
+    },
+    {
+      "mask_id": "sber_salute_v1",
+      "title": "Salute",
+      "n_pos": 5,
+      "n_neg": 8,
+      "pos_mean_p": 0.003989887295756489,
+      "neg_mean_p": 0.9998350888490677,
+      "pos_flagged": 0.0,
+      "neg_flagged": 1.0
+    },
+    {
+      "mask_id": "whatsapp_voip_v1",
+      "title": "WhatsApp",
+      "n_pos": 5,
+      "n_neg": 8,
+      "pos_mean_p": 0.008761479565873743,
+      "neg_mean_p": 0.9505257532000542,
+      "pos_flagged": 0.0,
+      "neg_flagged": 1.0
+    },
+    {
+      "mask_id": "avito_api_v1",
+      "title": "Avito",
+      "n_pos": 5,
+      "n_neg": 8,
+      "pos_mean_p": 0.005179147102171555,
+      "neg_mean_p": 0.9993339478969574,
+      "pos_flagged": 0.0,
+      "neg_flagged": 1.0
+    },
+    {
+      "mask_id": "telegram_calls_v1",
+      "title": "Telegram",
+      "n_pos": 5,
+      "n_neg": 8,
+      "pos_mean_p": 0.022101011872291566,
+      "neg_mean_p": 0.9996778815984726,
+      "pos_flagged": 0.0,
+      "neg_flagged": 1.0
+    },
+    {
+      "mask_id": "vk_video_v1",
+      "title": "VK Video",
+      "n_pos": 5,
+      "n_neg": 8,
+      "pos_mean_p": 0.0005912054359214381,
+      "neg_mean_p": 0.9989042803645134,
+      "pos_flagged": 0.0,
+      "neg_flagged": 1.0
+    }
+  ],
+  "per_mask_test": [
+    {
+      "mask_id": "webrtc_zoom_v3",
+      "title": "Zoom",
+      "n_pos": 4,
+      "n_neg": 8,
+      "pos_mean_p": 0.00561218656366691,
+      "neg_mean_p": 0.886038233526051,
+      "pos_flagged": 0.0,
+      "neg_flagged": 0.875
+    },
+    {
+      "mask_id": "quic_https_v2",
+      "title": "QUIC HTTPS",
+      "n_pos": 4,
+      "n_neg": 8,
+      "pos_mean_p": 0.00046749500688747503,
+      "neg_mean_p": 0.9989216476678848,
+      "pos_flagged": 0.0,
+      "neg_flagged": 1.0
+    },
+    {
+      "mask_id": "webrtc_yandex_telemost_v1",
+      "title": "Telemost",
+      "n_pos": 4,
+      "n_neg": 8,
+      "pos_mean_p": 0.07101472726208158,
+      "neg_mean_p": 0.8840091601014137,
+      "pos_flagged": 0.0,
+      "neg_flagged": 1.0
+    },
+    {
+      "mask_id": "webrtc_vk_teams_v1",
+      "title": "VK Teams",
+      "n_pos": 4,
+      "n_neg": 8,
+      "pos_mean_p": 0.0003932651197828818,
+      "neg_mean_p": 0.9996998459100723,
+      "pos_flagged": 0.0,
+      "neg_flagged": 1.0
+    },
+    {
+      "mask_id": "webrtc_sberjazz_v1",
+      "title": "Jazz",
+      "n_pos": 4,
+      "n_neg": 8,
+      "pos_mean_p": 0.0006780925614293665,
+      "neg_mean_p": 0.9998102933168411,
+      "pos_flagged": 0.0,
+      "neg_flagged": 1.0
+    },
+    {
+      "mask_id": "sber_salute_v1",
+      "title": "Salute",
+      "n_pos": 4,
+      "n_neg": 8,
+      "pos_mean_p": 0.0012684531720879022,
+      "neg_mean_p": 0.9661601781845093,
+      "pos_flagged": 0.0,
+      "neg_flagged": 1.0
+    },
+    {
+      "mask_id": "whatsapp_voip_v1",
+      "title": "WhatsApp",
+      "n_pos": 4,
+      "n_neg": 8,
+      "pos_mean_p": 0.1236875329632312,
+      "neg_mean_p": 0.9663994610309601,
+      "pos_flagged": 0.0,
+      "neg_flagged": 1.0
+    },
+    {
+      "mask_id": "avito_api_v1",
+      "title": "Avito",
+      "n_pos": 4,
+      "n_neg": 8,
+      "pos_mean_p": 0.0005172037454030942,
+      "neg_mean_p": 0.9988203123211861,
+      "pos_flagged": 0.0,
+      "neg_flagged": 1.0
+    },
+    {
+      "mask_id": "telegram_calls_v1",
+      "title": "Telegram",
+      "n_pos": 4,
+      "n_neg": 8,
+      "pos_mean_p": 0.0007318674615817145,
+      "neg_mean_p": 0.9997444897890091,
+      "pos_flagged": 0.0,
+      "neg_flagged": 1.0
+    },
+    {
+      "mask_id": "vk_video_v1",
+      "title": "VK Video",
+      "n_pos": 4,
+      "n_neg": 8,
+      "pos_mean_p": 0.24694677676598076,
+      "neg_mean_p": 0.8750534981372766,
+      "pos_flagged": 0.25,
+      "neg_flagged": 0.875
+    }
+  ],
+  "importances": [
+    {
+      "name": "ent_first16",
+      "importance": 0.32195721929585885
+    },
+    {
+      "name": "byte0_mean",
+      "importance": 0.29864317908949645
+    },
+    {
+      "name": "quic_longform_frac",
+      "importance": 0.2798714984633332
+    },
+    {
+      "name": "byte0_msb_frac",
+      "importance": 0.021848049984701818
+    },
+    {
+      "name": "ent_full",
+      "importance": 0.017278261143691378
+    },
+    {
+      "name": "szfrac_600_1000",
+      "importance": 0.01286815435445717
+    },
+    {
+      "name": "stun_magic_frac",
+      "importance": 0.011363620239456336
+    },
+    {
+      "name": "szfrac_300_600",
+      "importance": 0.00783555626890787
+    },
+    {
+      "name": "stun_lenconsistent_frac",
+      "importance": 0.005772485531857968
+    },
+    {
+      "name": "sz_min",
+      "importance": 0.005143300176360465
+    },
+    {
+      "name": "szfrac_100_300",
+      "importance": 0.0051221934734255545
+    },
+    {
+      "name": "sz_mean",
+      "importance": 0.004436697015053502
+    },
+    {
+      "name": "sz_p10",
+      "importance": 0.003646331439387885
+    },
+    {
+      "name": "sz_med",
+      "importance": 0.003006363768777527
+    },
+    {
+      "name": "sz_p90",
+      "importance": 0.0004966380060460738
+    },
+    {
+      "name": "szfrac_1000_1400",
+      "importance": 0.00034279836781530155
+    },
+    {
+      "name": "sz_std",
+      "importance": 0.00034001396128717954
+    },
+    {
+      "name": "sz_max",
+      "importance": 2.4334940407299105e-05
+    },
+    {
+      "name": "szfrac_0_100",
+      "importance": 3.304479678117989e-06
+    },
+    {
+      "name": "n_pkts",
+      "importance": 0.0
+    },
+    {
+      "name": "szfrac_1400p",
+      "importance": 0.0
+    },
+    {
+      "name": "stun_type_frac",
+      "importance": 0.0
+    },
+    {
+      "name": "dns_looksdns_frac",
+      "importance": 0.0
+    }
+  ],
+  "sklearn_probability_gap": 8.161429210229443e-08,
+  "branch_mismatches": 0,
+  "second_fit_matched": true,
+  "uncertainty": {
+    "test_false_tunnel_wilson95": [
+      0.0044267174077949195,
+      0.1288165948800778
+    ],
+    "note": "one session per mask; interval is narrower than mask-level uncertainty"
+  }
+}

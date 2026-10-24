@@ -195,6 +195,9 @@ pub struct Session {
     pub ratcheted_expected_tags: HashMap<u64, [u8; TAG_SIZE]>,
     /// Whether session has completed PFS ratchet
     pub is_ratcheted: bool,
+    /// До PFS ответ ограничен по времени, частоте и общему числу отправок.
+    pub initial_hello_sends: u8,
+    pub initial_hello_last_sent: Option<Instant>,
     /// Assigned VPN IP (e.g. 10.0.0.2)
     pub vpn_ip: Option<Ipv4Addr>,
     /// Registered client ID (from client_db) for traffic accounting
@@ -276,6 +279,7 @@ pub struct Session {
 
     /// Допуск клиента к адресу после PFS и обязательных доказательств личности.
     pub client_admitted: bool,
+    pub diagnostic_budget: aivpn_common::diagnostics::DiagnosticBudget,
 
     /// Повтор запроса proof/cert ограничен одной отправкой в секунду.
     pub authentication_retry_at: Option<Instant>,
@@ -302,26 +306,16 @@ pub struct Session {
     /// Used to scale the rekey/ratchet grace window so high-latency links
     /// (e.g. satellite) don't silently drop in-flight packets at the key seam.
     pub client_srtt_ms: u32,
+    /// Последние потери и джиттер из отчета текущего клиента.
+    pub client_loss_ppm: u32,
+    pub client_jitter_ms: u16,
 
-    // --- FEC server-side recovery state (0.9.0+) ---
-    /// Data packets received in the current FEC group (reset on each FecRepair).
-    pub fec_recv_count: u8,
-    /// XOR accumulator for in-flight FEC group payloads.
-    pub fec_xor_buf: Vec<u8>,
-    /// Max payload length seen in the current FEC group.
-    pub fec_xor_len: usize,
-    /// Next expected FEC group_seq. Mismatches indicate a lost FecRepair
-    /// and mean the XOR buffer is stale — recovery must be skipped.
-    pub fec_pending_seq: u16,
-    /// Inner seq_num of the most recently processed FecRepair packet.
-    /// The client numbers all inner packets monotonically, so a Data packet
-    /// arriving after this repair with a seq NOT AHEAD of it belongs to an
-    /// already-closed group: it is either the just-FEC-recovered packet
-    /// arriving late (a duplicate) or a straggler whose group is gone —
-    /// either way it must not be delivered again nor pollute the new group's
-    /// XOR accumulator (a false `recv == group_size - 1` trigger recovers
-    /// garbage). None until the first FecRepair is seen.
-    pub fec_repair_seq_hi: Option<u16>,
+    /// Счетчик проверенных внешних STUN-кадров, независимо от AEAD и его ротации.
+    pub plain_wire_seen: u64,
+    /// Независимые группы FEC с проверенными позициями исходных IP-пакетов.
+    pub fec_rx: aivpn_common::fec::FecReceiver,
+    /// Завершенные поколения RTC сохраняются и при освобождении полного пула.
+    pub rtc_retired_offers: std::collections::VecDeque<[u8; 16]>,
     /// Highest mask-catalog version already pushed to this client. The gateway
     /// bumps a global catalog version whenever the mask set changes; when this
     /// lags behind, the next Keepalive triggers a fresh `MaskCatalog` push.
@@ -473,6 +467,34 @@ impl ReplayWindow {
 }
 
 impl Session {
+    pub(crate) fn retire_rtc_offer(&mut self, id: [u8; 16]) {
+        if !self.rtc_retired_offers.contains(&id) {
+            self.rtc_retired_offers.push_back(id);
+            while self.rtc_retired_offers.len() > 64 {
+                self.rtc_retired_offers.pop_front();
+            }
+        }
+    }
+
+    pub(crate) fn admit_initial_hello(&mut self, now: Instant) -> bool {
+        if self.is_ratcheted {
+            return true;
+        }
+        if self.initial_hello_sends >= 16
+            || now.saturating_duration_since(self.created_at)
+                >= aivpn_common::handshake_retry::HANDSHAKE_TIMEOUT
+            || (self.initial_hello_sends >= 2
+                && self.initial_hello_last_sent.is_some_and(|last| {
+                    now.saturating_duration_since(last) < Duration::from_millis(200)
+                }))
+        {
+            return false;
+        }
+        self.initial_hello_sends += 1;
+        self.initial_hello_last_sent = Some(now);
+        true
+    }
+
     pub(crate) fn is_removed(&self) -> bool {
         self.removed
     }
@@ -603,6 +625,8 @@ impl Session {
             ratcheted_keys: None,
             ratcheted_expected_tags: HashMap::new(),
             is_ratcheted: false,
+            initial_hello_sends: 0,
+            initial_hello_last_sent: None,
             vpn_ip: None,
             client_id: None,
             pre_ratchet_tags: HashMap::new(),
@@ -621,6 +645,7 @@ impl Session {
             last_partition_check: None,
             bootstrap_descriptors_sent: false,
             client_admitted: false,
+            diagnostic_budget: Default::default(),
             authentication_retry_at: None,
             pending_rekey_keypair: None,
             pending_rekey_attempts: 0,
@@ -629,11 +654,11 @@ impl Session {
             bytes_since_rekey: 0,
             client_quality: 100,
             client_srtt_ms: 0,
-            fec_recv_count: 0,
-            fec_xor_buf: Vec::new(),
-            fec_xor_len: 0,
-            fec_pending_seq: 0,
-            fec_repair_seq_hi: None,
+            client_loss_ppm: 0,
+            client_jitter_ms: 0,
+            plain_wire_seen: 0,
+            fec_rx: Default::default(),
+            rtc_retired_offers: Default::default(),
             mask_catalog_version_sent: 0,
             capabilities_sent: false,
             client_packet_features: None,
@@ -930,16 +955,15 @@ impl Session {
     pub fn update_fsm(&mut self) {
         if let Some(mask) = &self.mask {
             let duration_ms = self.fsm_state_start.elapsed().as_millis() as u64;
-            let (new_state, _size_override, _iat_override, _padding_override) =
-                mask.process_transition(self.fsm_state, self.fsm_packets, duration_ms);
-
-            if new_state != self.fsm_state {
-                self.fsm_state = new_state;
+            if let Some(transition) =
+                mask.matching_transition(self.fsm_state, self.fsm_packets, duration_ms)
+            {
+                self.fsm_state = transition.next_state;
                 self.fsm_packets = 0;
                 self.fsm_state_start = Instant::now();
             }
         }
-        self.fsm_packets += 1;
+        self.fsm_packets = self.fsm_packets.saturating_add(1);
     }
 
     /// Check if session is idle
@@ -1037,20 +1061,40 @@ impl Session {
         const MASK_GRACE_PERIOD: Duration = Duration::from_millis(500);
         if let Some((_, sent_at)) = &self.pending_mask {
             if sent_at.elapsed() >= MASK_GRACE_PERIOD {
-                let (new_mask, _) = self.pending_mask.take().unwrap();
-                info!("Committing deferred mask switch to '{}'", new_mask.mask_id);
-                self.mask = Some(new_mask);
-                // 1a: the old pool's headers belong to the mask we just left
-                // — rebuild before the next downlink packet picks one up.
-                self.rebuild_mdh_pool();
-                // Reset FSM state for the new mask
-                self.fsm_state = 0;
-                self.fsm_packets = 0;
-                self.fsm_state_start = Instant::now();
-                return true;
+                return self.activate_pending_mask();
             }
         }
         false
+    }
+
+    /// AEAD-пакет в новом внешнем протоколе подтверждает доставку MaskUpdate.
+    pub fn confirm_mask_protocol(&mut self, stateful: bool) -> bool {
+        let current = self
+            .mask
+            .as_ref()
+            .is_some_and(aivpn_common::mask_io::needs_state);
+        let pending = self
+            .pending_mask
+            .as_ref()
+            .map(|(mask, _)| aivpn_common::mask_io::needs_state(mask));
+        if current != stateful && pending == Some(stateful) {
+            self.activate_pending_mask()
+        } else {
+            false
+        }
+    }
+
+    fn activate_pending_mask(&mut self) -> bool {
+        let Some((new_mask, _)) = self.pending_mask.take() else {
+            return false;
+        };
+        info!("Committing deferred mask switch to '{}'", new_mask.mask_id);
+        self.mask = Some(new_mask);
+        self.rebuild_mdh_pool();
+        self.fsm_state = 0;
+        self.fsm_packets = 0;
+        self.fsm_state_start = Instant::now();
+        true
     }
 }
 
@@ -2188,8 +2232,6 @@ impl SessionManager {
         session: &Arc<Mutex<Session>>,
         new_mask: &MaskProfile,
     ) -> Result<Vec<u8>> {
-        use aivpn_common::crypto::{encrypt_session_payload, PacketDirection};
-
         // Serialize mask profile → mask_data (MessagePack to match client's rmp_serde::from_slice)
         let mask_data = rmp_serde::to_vec(new_mask)
             .map_err(|e| Error::Session(format!("Failed to serialize mask: {}", e)))?;
@@ -2204,9 +2246,50 @@ impl SessionManager {
         };
         let encoded = control.encode()?;
 
+        self.encrypt_mask_update_piece(&mut session.lock(), &encoded, InnerType::Control)
+    }
+
+    /// Подписывает обновление маски и разбивает его до шифрования.
+    pub fn build_mask_update_packets(
+        &self,
+        session: &Arc<Mutex<Session>>,
+        new_mask: &MaskProfile,
+    ) -> Result<(Vec<Vec<u8>>, bool)> {
+        let mask_data =
+            rmp_serde::to_vec(new_mask).map_err(|error| Error::Session(error.to_string()))?;
+        let signature = self.sign_mask(&mask_data);
+        let encoded = ControlPayload::MaskUpdate {
+            mask_data,
+            signature,
+        }
+        .encode()?;
+        let (kind, pieces) = if encoded.len() > aivpn_common::fragment::FRAGMENT_DATA_SIZE {
+            (
+                InnerType::Fragment,
+                aivpn_common::fragment::split(InnerType::Control, &encoded)?,
+            )
+        } else {
+            (InnerType::Control, vec![encoded])
+        };
         let mut sess = session.lock();
+        let stateful =
+            aivpn_common::mask_io::needs_state(sess.mask.as_ref().unwrap_or(&self.default_mask));
+        let packets = pieces
+            .iter()
+            .map(|piece| self.encrypt_mask_update_piece(&mut sess, piece, kind))
+            .collect::<Result<Vec<_>>>()?;
+        Ok((packets, stateful))
+    }
+
+    fn encrypt_mask_update_piece(
+        &self,
+        sess: &mut Session,
+        encoded: &[u8],
+        kind: InnerType,
+    ) -> Result<Vec<u8>> {
+        use aivpn_common::crypto::{encrypt_session_payload, PacketDirection};
         let inner_header = InnerHeader {
-            inner_type: InnerType::Control,
+            inner_type: kind,
             seq_num: sess.next_seq() as u16,
         };
         let mut inner_payload = inner_header.encode().to_vec();
@@ -2214,7 +2297,18 @@ impl SessionManager {
 
         // Encrypt (same logic as Gateway::build_packet)
         let (_, counter) = sess.next_send_nonce();
-        let pad_len = 16u16;
+        let transport_mask = sess.mask.as_ref().unwrap_or(&self.default_mask);
+        let mdh = if let Some(ref spec) = transport_mask.header_spec {
+            spec.generate(&mut rand::thread_rng())
+        } else {
+            transport_mask.header_template.clone()
+        };
+        let base = mdh.len()
+            + crypto::session_payload_overhead(&sess.keys)
+            + 2
+            + inner_payload.len()
+            + crypto::POLY1305_TAG_SIZE;
+        let pad_len = transport_mask.wire_padding(base, 16, 19)?;
         let mut padded = Vec::with_capacity(2 + inner_payload.len() + pad_len as usize);
         padded.extend_from_slice(&pad_len.to_le_bytes());
         padded.extend_from_slice(&inner_payload);
@@ -2240,19 +2334,10 @@ impl SessionManager {
 
         // Wrap MaskUpdate in the session's current mask. The switch to `new_mask`
         // happens only after the packet is successfully delivered.
-        let transport_mask = sess.mask.as_ref().unwrap_or(&self.default_mask);
-        let mdh = if let Some(ref spec) = transport_mask.header_spec {
-            let mut rng = rand::thread_rng();
-            spec.generate(&mut rng)
-        } else {
-            transport_mask.header_template.clone()
-        };
 
         // Assemble: TAG | MDH | ciphertext
         let mut packet = Vec::with_capacity(TAG_SIZE + mdh.len() + ciphertext.len());
-        packet.extend_from_slice(&tag);
-        packet.extend_from_slice(&mdh);
-        packet.extend_from_slice(&ciphertext);
+        transport_mask.assemble_packet_into(&mut packet, &mdh, &tag, &ciphertext)?;
 
         Ok(packet)
     }
@@ -2497,6 +2582,46 @@ mod tests {
             make_keys(1),
             [0u8; X25519_PUBLIC_KEY_SIZE],
         )
+    }
+
+    #[test]
+    fn fsm_self_transition_restarts_the_packet_budget() {
+        let mut session = make_session();
+        let mut mask = aivpn_common::mask::preset_masks::webrtc_zoom_v3();
+        mask.fsm_initial_state = 0;
+        mask.fsm_states = vec![aivpn_common::mask::FSMState {
+            state_id: 0,
+            transitions: vec![aivpn_common::mask::FSMTransition {
+                condition: aivpn_common::mask::TransitionCondition::AfterPackets(3),
+                next_state: 0,
+                size_override: None,
+                iat_override: None,
+                padding_override: None,
+            }],
+        }];
+        session.mask = Some(mask);
+        session.fsm_packets = 2;
+        session.update_fsm();
+        assert_eq!(session.fsm_packets, 3);
+        session.update_fsm();
+        assert_eq!(session.fsm_packets, 1);
+    }
+
+    #[test]
+    fn initial_hello_budget_bounds_bursts_total_and_lifetime() {
+        let mut session = make_session();
+        let start = session.created_at;
+        assert!(session.admit_initial_hello(start));
+        assert!(session.admit_initial_hello(start));
+        assert!(!session.admit_initial_hello(start + Duration::from_millis(199)));
+        for step in 1..=14 {
+            assert!(session.admit_initial_hello(start + Duration::from_millis(200 * step)));
+        }
+        assert!(!session.admit_initial_hello(start + Duration::from_secs(4)));
+        let mut expired = make_session();
+        assert!(!expired.admit_initial_hello(expired.created_at + Duration::from_secs(10)));
+        expired.is_ratcheted = true;
+        assert!(expired.admit_initial_hello(expired.created_at + Duration::from_secs(60)));
     }
 
     // ── RTT-scaled rekey grace (A5) ───────────────────────────────────────────
@@ -2826,7 +2951,13 @@ mod tests {
             .as_ref()
             .map(|spec| spec.min_length())
             .unwrap_or(transport_mask.header_template.len());
-        let tag: [u8; 8] = packet[..8].try_into().unwrap();
+        let prefix = transport_mask.effective_tag_prefix_len(mdh_len);
+        let tag_offset = if prefix == 0 {
+            transport_mask.tag_offset as usize
+        } else {
+            0
+        };
+        let tag: [u8; 8] = packet[tag_offset..tag_offset + 8].try_into().unwrap();
         let dh = client.compute_shared(&manager.server_public_key()).unwrap();
         let keys = crypto::derive_initial_session_keys(&dh, None, &client.public_key_bytes());
         let padded = crypto::decrypt_session_payload(
@@ -2834,7 +2965,7 @@ mod tests {
             crypto::PacketDirection::ServerToClient,
             0,
             &tag,
-            &packet[8 + mdh_len..],
+            &packet[prefix + mdh_len..],
         )
         .expect("до PFS MaskUpdate обязан использовать InitialV2");
         assert_eq!(

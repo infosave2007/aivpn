@@ -102,7 +102,24 @@ impl super::Gateway {
             self.config.listen_addr
         );
 
-        self.udp_socket = Some(Arc::new(socket));
+        let wire_observer = {
+            #[cfg(feature = "neural")]
+            {
+                let gate = self.dpi_gate.clone();
+                self.config.enable_neural.then(|| {
+                    Arc::new(move |session_id, wire: &[u8]| gate.record_wire(session_id, wire))
+                        as super::mask_socket::WireObserver
+                })
+            }
+            #[cfg(not(feature = "neural"))]
+            {
+                None
+            }
+        };
+        self.udp_socket = Some(MaskSocket::with_wire_observer(
+            Arc::new(socket),
+            wire_observer,
+        ));
 
         // Wire kernel accelerator to live TUN + UDP socket.
         KERNEL_DOWNLINK_ARMED.store(false, std::sync::atomic::Ordering::Relaxed);
@@ -556,22 +573,10 @@ impl super::Gateway {
                     // didn't exist before the change, so it's removed.
                     let mut rolled_back_any = false;
                     {
-                        // Keep the same transaction lock through the restore:
-                        // removing an expired entry and writing its prior value
-                        // must not interleave with a new apply to that path.
-                        let mutation_guard = pending_config_cleanup.lock_mutation();
-                        for entry in
-                            pending_config_cleanup.tick_locked(Instant::now(), &mutation_guard)
+                        for (entry, restore_result) in
+                            pending_config_cleanup.rollback_expired(Instant::now())
                         {
-                            let path = entry.target_path().to_path_buf();
-                            let restore_result = match entry.rollback_value() {
-                                Some(prior_bytes) => std::fs::write(&path, prior_bytes),
-                                None => match std::fs::remove_file(&path) {
-                                    Ok(()) => Ok(()),
-                                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                                    Err(e) => Err(e),
-                                },
-                            };
+                            let path = entry.target_path();
                             match restore_result {
                                 Ok(()) => {
                                     rolled_back_any = true;
@@ -823,17 +828,15 @@ impl super::Gateway {
 
     /// Background task: periodic neural resonance checks (Patent 1)
     ///
-    /// For each active session, computes reconstruction error between
-    /// observed traffic features and the assigned mask's signature vector.
-    /// If MSE exceeds threshold → mask is detected as compromised by DPI.
-    /// Triggers automatic mask rotation (Patent 3).
+    /// Сравнивает статистику с обученным эталоном или резервной проекцией.
+    /// Превышение порога запускает смену маски, но не доказывает обнаружение DPI.
     async fn resonance_check_loop(
         neural: Arc<parking_lot::Mutex<NeuralResonanceModule>>,
         sessions: Arc<SessionManager>,
         catalog: Arc<MaskCatalog>,
         metrics: Arc<MetricsCollector>,
         check_interval_secs: u64,
-        socket: Arc<UdpSocket>,
+        socket: Arc<MaskSocket>,
         #[cfg(feature = "neural")] dpi_gate: Arc<crate::dpi_gate::DpiGate>,
     ) {
         let interval = Duration::from_secs(check_interval_secs);
@@ -859,8 +862,12 @@ impl super::Gateway {
 
             // Collect mask update packets to send AFTER releasing the neural lock
             // (parking_lot::MutexGuard is !Send, cannot hold across .await)
-            let mut pending_sends: Vec<(Vec<u8>, std::net::SocketAddr, [u8; 16], MaskProfile)> =
-                Vec::new();
+            let mut pending_sends: Vec<(
+                (Vec<Vec<u8>>, bool),
+                std::net::SocketAddr,
+                [u8; 16],
+                MaskProfile,
+            )> = Vec::new();
 
             {
                 let mut neural_guard = neural.lock();
@@ -912,7 +919,7 @@ impl super::Gateway {
                                         if let Some(session) = sessions.get_session(session_id) {
                                             let client_addr = session.lock().client_addr;
                                             match sessions
-                                                .build_mask_update_packet(&session, &new_mask)
+                                                .build_mask_update_packets(&session, &new_mask)
                                             {
                                                 Ok(packet) => {
                                                     pending_sends.push((
@@ -1003,7 +1010,7 @@ impl super::Gateway {
                                 if let Some(session) = sessions.get_session(session_id) {
                                     let client_addr = session.lock().client_addr;
                                     if let Ok(packet) =
-                                        sessions.build_mask_update_packet(&session, &new_mask)
+                                        sessions.build_mask_update_packets(&session, &new_mask)
                                     {
                                         pending_sends.push((
                                             packet,
@@ -1024,7 +1031,7 @@ impl super::Gateway {
                     }
 
                     // Check anomaly detection (DPI blocking indicators)
-                    if neural_guard.is_mask_anomalous(mask_id) {
+                    if neural_guard.is_mask_anomalous(mask_id) && neural_guard.can_rotate(mask_id) {
                         warn!(
                             "Anomaly detected for mask '{}' (packet loss / RTT spike)",
                             mask_id
@@ -1033,11 +1040,13 @@ impl super::Gateway {
                         // H1: atomically check-then-mark so a single-mask
                         // catalog is never emptied.
                         if let Some(new_mask) = catalog.mark_compromised_with_fallback(mask_id) {
+                            neural_guard.record_rotation(mask_id);
+                            neural_guard.clear_mask_anomaly(mask_id);
                             info!("Anomaly-triggered rotation to mask '{}'", new_mask.mask_id);
                             if let Some(session) = sessions.get_session(session_id) {
                                 let client_addr = session.lock().client_addr;
                                 if let Ok(packet) =
-                                    sessions.build_mask_update_packet(&session, &new_mask)
+                                    sessions.build_mask_update_packets(&session, &new_mask)
                                 {
                                     pending_sends.push((
                                         packet,
@@ -1055,7 +1064,7 @@ impl super::Gateway {
 
             // Send collected MaskUpdate packets (async, safe now)
             for (packet, client_addr, session_id, new_mask) in pending_sends {
-                if let Err(e) = socket.send_to(&packet, client_addr).await {
+                if let Err(e) = socket.send_packets_to(&packet, client_addr).await {
                     warn!("Failed to send MaskUpdate to {}: {}", client_addr, e);
                 } else {
                     sessions.update_session_mask(&session_id, new_mask);

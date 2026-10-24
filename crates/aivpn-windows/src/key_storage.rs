@@ -108,6 +108,28 @@ pub(crate) fn protect_key(key: &str) -> Result<String, String> {
 ///
 /// `pub(crate)` — see `protect_key` above.
 pub(crate) fn unprotect_key(stored: &str) -> Result<String, String> {
+    unprotect_value(stored, |value| {
+        ConnectionKey::from_key_string("", value).is_some()
+    })
+}
+
+pub(crate) fn unprotect_bootstrap_token(stored: &str) -> Result<String, String> {
+    unprotect_value(stored, |value| {
+        value.split_once(':').is_some_and(|(id, token)| {
+            !id.is_empty()
+                && id.bytes().all(|byte| byte.is_ascii_digit())
+                && !token.is_empty()
+                && token
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b"_-".contains(&byte))
+        })
+    })
+}
+
+fn unprotect_value(
+    stored: &str,
+    valid_plaintext: impl FnOnce(&str) -> bool,
+) -> Result<String, String> {
     #[cfg(windows)]
     {
         if let Ok(blob) = base64::engine::general_purpose::STANDARD.decode(stored) {
@@ -123,7 +145,7 @@ pub(crate) fn unprotect_key(stored: &str) -> Result<String, String> {
     // connection key. A genuine DPAPI blob that failed decryption is binary
     // garbage under base64, not key JSON, so it stays Err here and the caller
     // drops it as before.
-    if ConnectionKey::from_key_string("", stored).is_some() {
+    if valid_plaintext(stored) {
         Ok(stored.to_string())
     } else {
         Err("unreadable stored key (corrupt or from a different user/machine)".to_string())
@@ -382,5 +404,19 @@ impl KeyStorage {
             .unwrap_or_else(|| PathBuf::from("."))
             .join("AIVPN")
             .join("keys.json")
+    }
+}
+
+#[cfg(test)]
+mod bootstrap_token_tests {
+    use super::*;
+    #[test]
+    fn keeps_legacy_plaintext_bot_token_without_accepting_a_ciphertext_as_plaintext() {
+        assert_eq!(
+            unprotect_bootstrap_token("123456:abc_DEF-012").unwrap(),
+            "123456:abc_DEF-012"
+        );
+        assert!(unprotect_bootstrap_token("corrupt-storage-blob").is_err());
+        assert!(unprotect_bootstrap_token("123:secret with spaces").is_err());
     }
 }

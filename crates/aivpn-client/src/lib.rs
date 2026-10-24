@@ -17,6 +17,7 @@ pub(crate) static TEST_HOME_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(
 extern crate self as aivpn_client;
 
 pub mod adaptive;
+mod admin_ipc;
 pub mod bench;
 pub mod bootstrap_cache;
 pub mod bootstrap_loader;

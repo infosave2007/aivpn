@@ -1197,23 +1197,9 @@ async fn export_backup(State(state): State<ApiState>) -> impl IntoResponse {
     let config_path = state.config_path.clone();
 
     let result = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<u8>> {
-        // server-sec HIGH5: a predictable /tmp path with default perms lets
-        // any local user race to read (or pre-create/symlink) the backup —
-        // which contains every client's plaintext PSK. Use an unpredictable
-        // name and create it 0600 up front (before `export_server` ever
-        // writes to it) rather than chmod-ing after the fact.
-        let mut suffix = [0u8; 16];
-        rand::rngs::OsRng.fill_bytes(&mut suffix);
-        let tmp = std::env::temp_dir().join(format!("aivpn-backup-{}.tar.gz", hex::encode(suffix)));
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(&tmp)?;
-        }
+        // Закрытый временный каталог удаляется и при ошибке экспорта или чтения.
+        let directory = tempfile::Builder::new().prefix("aivpn-backup-").tempdir()?;
+        let tmp = directory.path().join("backup.tar.gz");
         let opts = ExportOptions {
             include_clients: true,
             include_masks: true,
@@ -1224,7 +1210,6 @@ async fn export_backup(State(state): State<ApiState>) -> impl IntoResponse {
         };
         export_server(&opts, &tmp)?;
         let data = std::fs::read(&tmp)?;
-        let _ = std::fs::remove_file(&tmp);
         Ok(data)
     })
     .await;
@@ -1310,27 +1295,18 @@ async fn import_backup(
     let dry_run = q.dry_run;
     let result =
         tokio::task::spawn_blocking(move || -> anyhow::Result<crate::backup::ImportSummary> {
-            // server-sec HIGH5: unpredictable name + created 0600 up front (the
-            // uploaded archive contains plaintext PSKs until it is fully
-            // validated and either imported or discarded) instead of a
-            // predictable timestamp path with default perms.
-            let mut suffix = [0u8; 16];
-            rand::rngs::OsRng.fill_bytes(&mut suffix);
-            let tmp =
-                std::env::temp_dir().join(format!("aivpn-import-{}.tar.gz", hex::encode(suffix)));
+            let directory = tempfile::Builder::new().prefix("aivpn-import-").tempdir()?;
+            let tmp = directory.path().join("backup.tar.gz");
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true);
             #[cfg(unix)]
             {
                 use std::os::unix::fs::OpenOptionsExt;
-                std::fs::OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .mode(0o600)
-                    .open(&tmp)?;
+                options.mode(0o600);
             }
-            std::fs::write(&tmp, &body)?;
-            let r = import_server_with_options(&tmp, &opts, dry_run);
-            let _ = std::fs::remove_file(&tmp);
-            Ok(r?)
+            use std::io::Write;
+            options.open(&tmp)?.write_all(&body)?;
+            Ok(import_server_with_options(&tmp, &opts, dry_run)?)
         })
         .await;
 
@@ -1642,7 +1618,10 @@ mod control_regression_tests {
 
     fn signed_profile() -> aivpn_common::mask::MaskProfile {
         let mut profile = aivpn_common::mask::preset_masks::webrtc_zoom_v3();
-        profile.sign(&ed25519_dalek::SigningKey::from_bytes(&[42; 32]));
+        crate::test_masks::sign(
+            &mut profile,
+            &ed25519_dalek::SigningKey::from_bytes(&[42; 32]),
+        );
         profile
     }
 
@@ -1719,7 +1698,9 @@ mod control_regression_tests {
         let mut profile = signed_profile();
         profile.reverse_profile =
             Some(Box::new(aivpn_common::mask::preset_masks::webrtc_zoom_v3()));
-        profile.sign(&ed25519_dalek::SigningKey::from_bytes(&[42; 32]));
+        use ed25519_dalek::Signer;
+        let key = ed25519_dalek::SigningKey::from_bytes(&[42; 32]);
+        profile.signature = key.sign(&profile.signing_message().unwrap()).to_bytes();
         let path = format!("/api/v1/masks?name={}", profile.mask_id);
         assert_eq!(
             request(

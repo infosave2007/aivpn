@@ -9,6 +9,7 @@
 
 use std::sync::Arc;
 
+#[cfg(test)]
 use tokio::net::UdpSocket;
 use tracing::debug;
 
@@ -44,26 +45,43 @@ impl Gateway {
     }
 
     pub(crate) async fn send_control_message_via(
-        socket: &UdpSocket,
+        socket: &super::MaskSocket,
         mdh: &[u8],
         payload: &ControlPayload,
         session: &Arc<parking_lot::Mutex<Session>>,
     ) -> Result<()> {
-        let encoded = payload.encode()?;
-        let (kind, pieces) = if encoded.len() > aivpn_common::fragment::FRAGMENT_DATA_SIZE {
+        Self::send_inner_message_via(socket, mdh, InnerType::Control, &payload.encode()?, session)
+            .await
+            .map(|_| ())
+    }
+
+    pub(crate) fn build_inner_packets(
+        mdh: &[u8],
+        kind: InnerType,
+        payload: &[u8],
+        session: &Arc<parking_lot::Mutex<Session>>,
+    ) -> Result<(std::net::SocketAddr, bool, Vec<Vec<u8>>)> {
+        let (kind, pieces) = if payload.len() > aivpn_common::fragment::FRAGMENT_DATA_SIZE {
             (
                 InnerType::Fragment,
-                aivpn_common::fragment::split(InnerType::Control, &encoded)?,
+                aivpn_common::fragment::split(kind, payload)?,
             )
         } else {
-            (InnerType::Control, vec![encoded])
+            (kind, vec![payload.to_vec()])
         };
-        for (index, encoded) in pieces.into_iter().enumerate() {
-            // Даем приемнику разбирать большие ответы без переполнения UDP-буфера.
-            if index > 0 && index % 16 == 0 {
-                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-            }
-            let (mut inner_payload, _nonce, counter, keys, client_addr, mask) = {
+        let (address, stateful) = {
+            let session = session.lock();
+            (
+                session.client_addr,
+                session
+                    .mask
+                    .as_ref()
+                    .is_some_and(aivpn_common::mask_io::needs_state),
+            )
+        };
+        let mut packets = Vec::with_capacity(pieces.len());
+        for encoded in pieces {
+            let (mut inner_payload, _nonce, counter, keys, _client_addr, mask) = {
                 let mut sess = session.lock();
                 let inner_header = InnerHeader {
                     inner_type: kind,
@@ -83,7 +101,15 @@ impl Gateway {
                 )
             };
             inner_payload.extend_from_slice(&encoded);
-            let pad_len = 16u16;
+            let base = mdh.len()
+                + crypto::session_payload_overhead(&keys)
+                + 2
+                + inner_payload.len()
+                + crypto::POLY1305_TAG_SIZE;
+            let pad_len = match mask.as_ref() {
+                Some(mask) => mask.wire_padding(base, 16, 19)?,
+                None => 16,
+            };
             let mut padded = Vec::with_capacity(2 + inner_payload.len() + pad_len as usize);
             padded.extend_from_slice(&pad_len.to_le_bytes());
             padded.extend_from_slice(&inner_payload);
@@ -107,23 +133,34 @@ impl Gateway {
                 &padded,
             )?;
             let mut packet = Vec::with_capacity(TAG_SIZE + mdh.len() + ciphertext.len());
-            if let Some(mask) = mask
-                .as_ref()
-                .filter(|mask| mask.uses_embedded_layout(mdh.len()))
-            {
-                packet.extend_from_slice(mdh);
-                let offset = mask.tag_offset as usize;
-                packet[offset..offset + TAG_SIZE].copy_from_slice(&tag);
-                packet.extend_from_slice(&ciphertext);
-                mask.patch_stun_length(&mut packet);
+            if let Some(mask) = mask.as_ref() {
+                mask.assemble_packet_into(&mut packet, mdh, &tag, &ciphertext)?;
             } else {
                 packet.extend_from_slice(&tag);
                 packet.extend_from_slice(mdh);
                 packet.extend_from_slice(&ciphertext);
             }
-            socket.send_to(&packet, client_addr).await?;
+            packets.push(packet);
         }
-        Ok(())
+        Ok((address, stateful, packets))
+    }
+
+    pub(crate) async fn send_inner_message_via(
+        socket: &super::MaskSocket,
+        mdh: &[u8],
+        kind: InnerType,
+        payload: &[u8],
+        session: &Arc<parking_lot::Mutex<Session>>,
+    ) -> Result<usize> {
+        let (address, stateful, packets) = Self::build_inner_packets(mdh, kind, payload, session)?;
+        let mut sent = 0;
+        for (index, packet) in packets.into_iter().enumerate() {
+            if index > 0 && index % 16 == 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+            sent += socket.send_with_mask(&packet, address, stateful).await?;
+        }
+        Ok(sent)
     }
 
     pub(crate) async fn send_server_hello(
@@ -132,7 +169,10 @@ impl Gateway {
         client_addr: std::net::SocketAddr,
     ) -> Result<()> {
         let (server_eph_pub, signature, network_config) = {
-            let sess = session.lock();
+            let mut sess = session.lock();
+            if !sess.admit_initial_hello(std::time::Instant::now()) {
+                return Ok(());
+            }
             match (sess.server_eph_pub, sess.server_hello_signature) {
                 (Some(pub_key), Some(sig)) => {
                     let network_config = sess
@@ -161,7 +201,24 @@ impl Gateway {
             .udp_socket
             .as_ref()
             .ok_or_else(|| Error::Session("UDP socket не открыт".into()))?;
-        let sent = socket.send_to(&packet, client_addr).await?;
+        let stateful = session
+            .lock()
+            .mask
+            .as_ref()
+            .is_some_and(aivpn_common::mask_io::needs_state);
+        let rtc_bootstrap = session
+            .lock()
+            .mask
+            .as_ref()
+            .is_some_and(aivpn_common::mask_io::uses_rtc);
+        let sent = if rtc_bootstrap {
+            // Новый клиент за прежним NAT еще не знает ключей старого SRTP.
+            socket.raw().send_to(&packet, client_addr).await?
+        } else {
+            socket
+                .send_with_mask(&packet, client_addr, stateful)
+                .await?
+        };
         debug!("ServerHello sent: {} bytes to {}", sent, client_addr);
         Ok(())
     }
@@ -216,7 +273,20 @@ impl Gateway {
 
         // Build padded plaintext: pad_len(u16) || plaintext || random_padding
         // pad_len is inside encryption — invisible to DPI (CRIT-5 fix)
-        let pad_len = 16u16;
+        let current_mask = sess.mask.clone();
+        let mdh = current_mask
+            .as_ref()
+            .map(packet_mdh_bytes_for_mask)
+            .unwrap_or_else(|| self.mask_catalog.packet_mdh_bytes());
+        let base = mdh.len()
+            + crypto::session_payload_overhead(&sess.keys)
+            + 2
+            + plaintext.len()
+            + crypto::POLY1305_TAG_SIZE;
+        let pad_len = match current_mask.as_ref() {
+            Some(mask) => mask.wire_padding(base, 16, 19)?,
+            None => 16,
+        };
         let mut padded = Vec::with_capacity(2 + plaintext.len() + pad_len as usize);
         padded.extend_from_slice(&pad_len.to_le_bytes());
         padded.extend_from_slice(plaintext);
@@ -239,27 +309,15 @@ impl Gateway {
             &tag,
             &padded,
         )?;
-        let current_mask = sess.mask.clone();
         drop(sess);
 
         // Build MDH using the session's current packet mask so the peer can
         // decode bootstrap traffic before any runtime MaskUpdate arrives.
-        let mdh = current_mask
-            .as_ref()
-            .map(packet_mdh_bytes_for_mask)
-            .unwrap_or_else(|| self.mask_catalog.packet_mdh_bytes());
 
         // Assemble packet: TAG | MDH | ciphertext (no cleartext padding)
         let mut packet = Vec::with_capacity(TAG_SIZE + mdh.len() + ciphertext.len());
-        if let Some(mask) = current_mask
-            .as_ref()
-            .filter(|mask| mask.uses_embedded_layout(mdh.len()))
-        {
-            packet.extend_from_slice(&mdh);
-            let offset = mask.tag_offset as usize;
-            packet[offset..offset + TAG_SIZE].copy_from_slice(&tag);
-            packet.extend_from_slice(&ciphertext);
-            mask.patch_stun_length(&mut packet);
+        if let Some(mask) = current_mask.as_ref() {
+            mask.assemble_packet_into(&mut packet, &mdh, &tag, &ciphertext)?;
         } else {
             packet.extend_from_slice(&tag);
             packet.extend_from_slice(&mdh);
@@ -306,6 +364,7 @@ mod fragment_tests {
     async fn response_roundtrip(embedded: bool) {
         let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let sender = super::super::MaskSocket::new(Arc::new(sender));
         let keys = SessionKeys {
             packet_cipher: crypto::PacketCipher::Established,
             session_key: [1; 32],
@@ -371,5 +430,69 @@ mod fragment_tests {
             .await
             .unwrap();
         upload.await.unwrap().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod full_mtu_tests {
+    use super::*;
+    use aivpn_common::client_wire::{decode_packet_with_layout, RecvWindow};
+    use aivpn_common::fragment::Reassembler;
+    use aivpn_common::mask::preset_masks;
+    use std::time::Instant;
+
+    #[test]
+    fn full_mtu_downlink_reassembles_for_every_mask() {
+        let keys = crypto::derive_session_keys(&[1; 32], Some(&[2; 32]), &[3; 32]);
+        for mask in preset_masks::all() {
+            let mut session = Session::new(
+                [7; 16],
+                "127.0.0.1:9".parse().unwrap(),
+                keys.clone(),
+                [3; 32],
+            );
+            session.mask = Some(mask.clone());
+            let session = Arc::new(parking_lot::Mutex::new(session));
+            let mdh = packet_mdh_bytes_for_mask(&mask);
+            for length in [1280, 1346, 1500] {
+                let payload: Vec<_> = (0..length).map(|n| (n % 251) as u8).collect();
+                let (_, stateful, packets) =
+                    Gateway::build_inner_packets(&mdh, InnerType::Data, &payload, &session)
+                        .unwrap();
+                assert_eq!(stateful, aivpn_common::mask_io::needs_state(&mask));
+                let budget = if stateful {
+                    aivpn_common::mask_io::MAX_QUIC_INNER
+                } else {
+                    1380
+                };
+                let mut window = RecvWindow::new();
+                let mut fragments = Reassembler::default();
+                let mut received = None;
+                for packet in packets {
+                    assert!(
+                        packet.len() <= budget,
+                        "{}: {} > {budget}",
+                        mask.mask_id,
+                        packet.len()
+                    );
+                    let decoded = decode_packet_with_layout(
+                        &packet,
+                        &keys,
+                        &mut window,
+                        mdh.len(),
+                        mask.tag_offset,
+                    )
+                    .unwrap();
+                    assert_eq!(decoded.header.inner_type, InnerType::Fragment);
+                    if let Some((kind, bytes)) =
+                        fragments.accept(&decoded.payload, Instant::now()).unwrap()
+                    {
+                        assert_eq!(kind, InnerType::Data);
+                        received = Some(bytes);
+                    }
+                }
+                assert_eq!(received, Some(payload));
+            }
+        }
     }
 }

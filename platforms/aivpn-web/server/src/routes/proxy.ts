@@ -1,3 +1,5 @@
+import { once } from 'node:events'
+import { Readable } from 'node:stream'
 import { Hono } from 'hono'
 import http from 'node:http'
 import type { IncomingMessage } from 'node:http'
@@ -116,6 +118,7 @@ async function forwardToUnixSocket(
   requestHeaders: Record<string, string>,
   body: ReadableStream | null,
   maxBodyBytes: number,
+  signal: AbortSignal,
 ): Promise<{ status: number; headers: Record<string, string>; body: IncomingMessage }> {
   return new Promise((resolve, reject) => {
     const options: http.RequestOptions = {
@@ -128,7 +131,14 @@ async function forwardToUnixSocket(
       },
     }
 
+    let cancelBody: (() => void) | undefined
+    const abort = () => req.destroy(new Error('Request cancelled'))
     const req = http.request(options, (res) => {
+      clearTimeout(headersDeadline)
+      res.once('close', () => {
+        signal.removeEventListener('abort', abort)
+        cancelBody?.()
+      })
       const headers: Record<string, string> = {}
       for (const [k, v] of Object.entries(res.headers)) {
         if (v !== undefined) {
@@ -138,35 +148,37 @@ async function forwardToUnixSocket(
       resolve({ status: res.statusCode ?? 502, headers, body: res })
     })
 
-    req.on('error', reject)
+    const headersDeadline = setTimeout(() => req.destroy(new Error('Upstream headers timeout')), 120_000)
+    req.setTimeout(30_000, () => req.destroy(new Error('Upstream idle timeout')))
+    req.once('error', (error) => {
+      clearTimeout(headersDeadline)
+      signal.removeEventListener('abort', abort)
+      cancelBody?.()
+      reject(error)
+    })
+    signal.addEventListener('abort', abort, { once: true })
+    if (signal.aborted) { abort(); return }
 
     if (body) {
-      // Pipe request body to unix socket request, enforcing a hard byte
-      // ceiling. This guards the case where Content-Length is absent or lies
-      // (chunked / spoofed): as soon as the streamed size exceeds the cap we
-      // abort the upstream request and reject → mapped to 413 by the caller.
-      const reader = body.getReader()
-      let received = 0
-      const pump = () => {
-        reader.read().then(({ done, value }) => {
-          if (done) {
-            req.end()
-            return
-          }
-          if (value) {
+      const input = body.getReader()
+      cancelBody = () => { input.cancel().catch(() => {}) }
+      void (async () => {
+        let received = 0
+        try {
+          for (;;) {
+            const { done, value } = await input.read()
+            if (done) { req.end(); return }
             received += value.byteLength
-            if (received > maxBodyBytes) {
-              req.destroy()
-              reader.cancel().catch(() => {})
-              reject(new PayloadTooLargeError())
-              return
-            }
-            req.write(value)
+            if (received > maxBodyBytes) throw new PayloadTooLargeError()
+            if (!req.write(value)) await once(req, 'drain', { signal })
           }
-          pump()
-        }).catch(reject)
-      }
-      pump()
+        } catch (error) {
+          req.destroy(error instanceof Error ? error : new Error(String(error)))
+          await input.cancel().catch(() => {})
+        } finally {
+          input.releaseLock()
+        }
+      })()
     } else {
       req.end()
     }
@@ -258,14 +270,7 @@ proxy.all('/*', requireReadAccess(), async (c) => {
   const body = hasBody ? c.req.raw.body : null
 
   try {
-    const upstream = await forwardToUnixSocket(method, fullPath, forwardHeaders, body, maxBodyBytes)
-
-    // Determine if this is an SSE stream
-    const contentType = upstream.headers['content-type'] ?? ''
-    const isSSE = contentType.includes('text/event-stream')
-    const isBinary = contentType.includes('application/octet-stream')
-      || contentType.includes('application/gzip')
-      || apiPath.includes('/backup/export')
+    const upstream = await forwardToUnixSocket(method, fullPath, forwardHeaders, body, maxBodyBytes, c.req.raw.signal)
 
     // Build response headers (strip hop-by-hop)
     const responseHeaders = new Headers()
@@ -275,36 +280,8 @@ proxy.all('/*', requireReadAccess(), async (c) => {
       }
     }
 
-    if (isSSE) {
-      // Stream SSE directly — convert Node.js IncomingMessage to Web ReadableStream
-      const nodeStream = upstream.body
-      const webStream = new ReadableStream({
-        start(controller) {
-          nodeStream.on('data', (chunk: Buffer) => {
-            controller.enqueue(chunk)
-          })
-          nodeStream.on('end', () => controller.close())
-          nodeStream.on('error', (err) => controller.error(err))
-        },
-        cancel() {
-          nodeStream.destroy()
-        },
-      })
-
-      return new Response(webStream, {
-        status: upstream.status,
-        headers: responseHeaders,
-      })
-    }
-
-    // For all other responses, buffer the body
-    const chunks: Buffer[] = []
-    for await (const chunk of upstream.body) {
-      chunks.push(chunk as Buffer)
-    }
-    const buffer = Buffer.concat(chunks)
-
-    return new Response(buffer, {
+    // Readable.toWeb сохраняет backpressure и закрывает сокет при отмене чтения.
+    return new Response(Readable.toWeb(upstream.body) as ReadableStream<Uint8Array>, {
       status: upstream.status,
       headers: responseHeaders,
     })

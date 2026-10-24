@@ -19,7 +19,7 @@ path = "src/bin/aivpn-ip-helper.rs"
 default = []
 # Production secure mode: disables built-in bootstrap fallback
 # When enabled, client will fail to start if no valid descriptors are available
-production-secure = []
+production-secure = ["aivpn-common/production-secure"]
 # R2 Phase D — client-side inline ML-DPI "reads-as-tunnel" self-gate (OFF by
 # default). Samples the client's own outbound wire and requests a mask rotation
 # (via the existing MaskPreference path) when its flow reads as a tunnel.
@@ -80,6 +80,7 @@ winapi = { version = "0.3", features = [
 winres = "0.1"
 
 [dev-dependencies]
+async-trait.workspace = true
 # `test-util` is not part of the workspace `tokio` "full" feature set — needed
 # by client.rs tests that pause/advance virtual time (e.g. to deterministically
 # exercise the randomized MaskFeedback send-jitter without a real 0-3s sleep).

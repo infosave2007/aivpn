@@ -475,7 +475,7 @@ mod tests {
         let _ = std::fs::create_dir_all(&mask_dir);
         let mut mask = aivpn_common::mask::preset_masks::webrtc_zoom_v3();
         let signing_key = ed25519_dalek::SigningKey::from_bytes(&[72; 32]);
-        mask.sign(&signing_key);
+        crate::test_masks::sign(&mut mask, &signing_key);
         let json = serde_json::to_string_pretty(&mask).unwrap();
         std::fs::write(mask_dir.join(format!("{}.json", mask.mask_id)), &json).unwrap();
         std::fs::write(mask_dir.join(format!("{}.stats", mask.mask_id)), "{}").unwrap();

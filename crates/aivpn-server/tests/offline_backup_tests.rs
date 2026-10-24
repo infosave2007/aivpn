@@ -10,6 +10,10 @@ use aivpn_server::backup::{
 };
 use aivpn_server::ClientDatabase;
 
+// fork в соседнем тесте временно наследует flock-дескрипторы до exec.
+// Не совмещаем этот промежуток с проверкой освобождения последнего владельца.
+static PROCESS_TEST_GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn options(root: &Path) -> ImportOptions {
     ImportOptions {
         config_path: root.join("server.json"),
@@ -42,6 +46,7 @@ fn archive(root: &Path) -> PathBuf {
 
 #[test]
 fn restore_refuses_every_live_database_owner_until_last_drop() {
+    let _process_gate = PROCESS_TEST_GATE.lock().unwrap();
     let root = tempfile::tempdir().unwrap();
     let archive = archive(root.path());
     let opts = options(root.path());
@@ -131,6 +136,7 @@ fn offline_process_fixture() {
 
 #[test]
 fn cli_refuses_another_process_and_restores_corrupt_files_only_offline() {
+    let _process_gate = PROCESS_TEST_GATE.lock().unwrap();
     let root = tempfile::tempdir().unwrap();
     let archive = archive(root.path());
     let opts = options(root.path());
@@ -177,6 +183,7 @@ fn cli_refuses_another_process_and_restores_corrupt_files_only_offline() {
 
 #[test]
 fn exclusive_restore_lock_blocks_load_and_export_in_other_processes() {
+    let _process_gate = PROCESS_TEST_GATE.lock().unwrap();
     use std::os::fd::AsRawFd;
     for kind in ["live", "export"] {
         let root = tempfile::tempdir().unwrap();
@@ -207,6 +214,7 @@ fn lifetime_lock_refuses_symlinks_without_touching_victim() {
 
 #[test]
 fn cli_waits_for_restore_before_reading_config() {
+    let _process_gate = PROCESS_TEST_GATE.lock().unwrap();
     use std::os::fd::AsRawFd;
     let root = tempfile::tempdir().unwrap();
     let opts = options(root.path());

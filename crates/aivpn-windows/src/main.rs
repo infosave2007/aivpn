@@ -5,7 +5,7 @@ mod admin;
 mod admin_ops;
 #[cfg(windows)]
 mod app_update;
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 mod assets;
 mod install_wizard;
 mod key_storage;
@@ -300,6 +300,7 @@ struct AivpnApp {
 
     /// `host:port`, empty = clear the global default (`None`).
     admin_settings_exit_node: String,
+    admin_settings_exit_selected: bool,
     /// Same rationale as `admin_add_exit_custom_mode` — G-B1's picker
     /// convention reused here via `Self::draw_exit_node_picker`.
     admin_settings_exit_custom_mode: bool,
@@ -463,6 +464,7 @@ impl AivpnApp {
             admin_settings_mask_confirm_busy: false,
             admin_settings_mask_rolled_back: false,
             admin_settings_exit_node: String::new(),
+            admin_settings_exit_selected: false,
             admin_settings_exit_custom_mode: false,
             admin_settings_exit_busy: false,
             admin_settings_exit_error: None,
@@ -746,7 +748,9 @@ impl AivpnApp {
         }
         if let Some(at) = self.dirty_at {
             if at.elapsed().as_secs() >= 2 {
-                self.settings.save();
+                if let Err(error) = self.settings.save() {
+                    self.show_error(error);
+                }
                 self.dirty_at = None;
             }
         }
@@ -776,7 +780,9 @@ impl AivpnApp {
                     // Hand off entirely to the elevated instance — save
                     // settings first since this process is about to exit
                     // and never reach its normal on-exit save path.
-                    self.settings.save();
+                    if let Err(error) = self.settings.save() {
+                        self.show_error(error);
+                    }
                     std::process::exit(0);
                 }
                 Err(e) => {

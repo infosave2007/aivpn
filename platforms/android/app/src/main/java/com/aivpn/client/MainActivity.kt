@@ -29,10 +29,6 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
-import java.net.DatagramPacket
-import java.net.DatagramSocket
-import java.net.InetAddress
-import java.net.SocketTimeoutException
 import java.util.UUID
 
 /**
@@ -1275,8 +1271,6 @@ class MainActivity : AppCompatActivity() {
             Toast.makeText(this, getString(R.string.status_disconnected), Toast.LENGTH_SHORT).show()
             return
         }
-        val serverAddr = profiles.find { it.id == activeProfileId }
-            ?.key?.let { parseConnectionKey(it)?.server } ?: ""
         // Read the LIVE score straight from the native core, not the cached
         // currentQualityScore — that cache is only refreshed by the traffic
         // callback, so it can be a stale 0 captured right after connect (before
@@ -1296,9 +1290,23 @@ class MainActivity : AppCompatActivity() {
                 val runningToast = Toast.makeText(this, getString(R.string.bench_running), Toast.LENGTH_LONG)
                 runningToast.show()
                 lifecycleScope.launch {
-                    val stats = withContext(Dispatchers.IO) { runUDPBench(serverAddr) }
+                    val result = withContext(Dispatchers.IO) {
+                        runCatching {
+                            val bytes = AivpnJni.runBenchmark() ?: error("No diagnostic response")
+                            org.json.JSONObject(String(bytes, Charsets.UTF_8))
+                        }.getOrNull()
+                    }
                     runningToast.cancel()
-                    val msg = getString(R.string.bench_result, stats.p50, stats.p95, stats.lossPct.toFloat(), stats.quality)
+                    val msg = if (result == null || result.has("error")) {
+                        result?.optString("error") ?: getString(R.string.bench_failed)
+                    } else {
+                        getString(R.string.bench_result,
+                            result.optDouble("latency_p50_ms").toInt(),
+                            result.optDouble("latency_p95_ms").toInt(),
+                            result.optDouble("packet_loss_pct"), result.optInt("quality_score")) +
+                            "\n" + getString(R.string.bench_speed,
+                                result.optDouble("throughput_up_kbps"), result.optDouble("throughput_down_kbps"))
+                    }
                     AlertDialog.Builder(this@MainActivity)
                         .setTitle(getString(R.string.diagnostics))
                         .setMessage(msg)
@@ -1308,91 +1316,6 @@ class MainActivity : AppCompatActivity() {
             }
             .setNegativeButton(getString(R.string.btn_cancel), null)
             .show()
-    }
-
-    private data class BenchStats(val p50: Int, val p95: Int, val lossPct: Double, val quality: Int)
-
-    /** Parse host:port or [IPv6]:port. Returns null on invalid input. */
-    private fun parseHostPort(addr: String): Pair<String, Int>? {
-        if (addr.startsWith("[")) {
-            val bracket = addr.indexOf(']')
-            if (bracket < 1) return null
-            val host = addr.substring(1, bracket)
-            val port = if (bracket + 1 < addr.length && addr[bracket + 1] == ':')
-                addr.substring(bracket + 2).toIntOrNull()?.takeIf { it in 1..65535 }
-            else null
-            return Pair(host, port ?: 443)
-        }
-        val lastColon = addr.lastIndexOf(':')
-        if (lastColon < 0) return null
-        val port = addr.substring(lastColon + 1).toIntOrNull()?.takeIf { it in 1..65535 } ?: return null
-        return Pair(addr.substring(0, lastColon), port)
-    }
-
-    private fun runUDPBench(serverAddr: String): BenchStats {
-        if (serverAddr.isEmpty()) return BenchStats(0, 0, 100.0, 0)
-        val (host, port) = parseHostPort(serverAddr) ?: return BenchStats(0, 0, 100.0, 0)
-
-        return try {
-            val socket = DatagramSocket()
-            // Protect the socket so bench probes bypass the VPN tunnel and reach the
-            // server directly. If protection FAILS (service gone, fd limit), abort:
-            // an unprotected probe would loop through the tunnel (bogus RTTs) and,
-            // worse, leak a direct-to-server datagram association outside the mask.
-            val protectOk = AivpnService.instance?.protect(socket) == true
-            if (!protectOk) {
-                android.util.Log.w("MainActivity", "bench: socket not protected — aborting benchmark")
-                socket.close()
-                return BenchStats(0, 0, 100.0, 0)
-            }
-            socket.soTimeout = 500
-            // Random payload, NOT a plaintext marker: a fixed "aivpn-bench-probe-v1"
-            // string is a trivial DPI signature that links this client to the VPN
-            // server address. Random bytes are indistinguishable from the encrypted/
-            // masked traffic already flowing to the same endpoint. The server never
-            // parses the probe anyway (RTT is estimated via the timeout fallback).
-            val probe = ByteArray(20).also { java.security.SecureRandom().nextBytes(it) }
-            val addr = InetAddress.getByName(host)
-            val deadline = System.currentTimeMillis() + 5_000L
-            val rtts = mutableListOf<Double>()
-            var sent = 0
-            try {
-                while (System.currentTimeMillis() < deadline) {
-                    val t0 = System.currentTimeMillis()
-                    sent++
-                    socket.send(DatagramPacket(probe, probe.size, addr, port))
-                    try {
-                        val buf = ByteArray(256)
-                        socket.receive(DatagramPacket(buf, buf.size))
-                        rtts.add((System.currentTimeMillis() - t0).toDouble())
-                    } catch (_: SocketTimeoutException) {
-                        val elapsed = (System.currentTimeMillis() - t0).toDouble()
-                        if (elapsed < 490) rtts.add(elapsed * 2)
-                    }
-                    Thread.sleep(100)
-                }
-            } finally {
-                socket.close()
-            }
-            computeBenchStats(rtts, sent)
-        } catch (_: Exception) {
-            BenchStats(0, 0, 100.0, 0)
-        }
-    }
-
-    private fun computeBenchStats(rtts: List<Double>, sent: Int): BenchStats {
-        if (rtts.isEmpty()) return BenchStats(0, 0, 100.0, 0)
-        val sorted = rtts.sorted()
-        val p50 = sorted[(sorted.size * 0.50).toInt().coerceAtMost(sorted.size - 1)].toInt()
-        val p95 = sorted[(sorted.size * 0.95).toInt().coerceAtMost(sorted.size - 1)].toInt()
-        val lossPct = (maxOf(0, sent - rtts.size).toDouble() / sent * 100).coerceIn(0.0, 100.0)
-        val quality = when {
-            p50 < 50 && lossPct < 1.0  -> 95
-            p50 < 100 && lossPct < 3.0 -> 80
-            p50 < 200 && lossPct < 10.0 -> 60
-            else -> 30
-        }
-        return BenchStats(p50, p95, lossPct, quality)
     }
 
     override fun onDestroy() {

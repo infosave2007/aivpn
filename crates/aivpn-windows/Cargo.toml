@@ -42,3 +42,6 @@ winapi = { version = "0.3", features = [
 ] }
 winreg = "0.52"
 
+[dev-dependencies]
+png = "0.18"
+

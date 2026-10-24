@@ -21,7 +21,7 @@ use bytes::Bytes;
 use portable_atomic::AtomicU64;
 use std::collections::VecDeque;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -66,12 +66,7 @@ impl Drop for AbortOnDrop {
     }
 }
 
-/// A4: NAT-safe upper bound for the keepalive interval. Consumer CGNAT UDP
-/// mappings commonly expire after ~30 s of silence; capping at 25 s keeps the
-/// mapping warm with margin while staying battery-friendly on mobile.
-/// `AdaptiveLevel::Satellite` is exempt — satellite links have deliberately
-/// different timing (15 s default, possibly longer from the server) and the
-/// server-chosen interval is authoritative there.
+/// Интервал до 25 с оставляет запас до таймаута QUIC и обычного NAT.
 const KEEPALIVE_NAT_CAP: Duration = Duration::from_secs(25);
 
 /// A4: if nothing has been SENT for this long, the CGNAT mapping is close to
@@ -209,14 +204,9 @@ fn data_stall_confirmed(strikes: &mut u32, verdict: Option<&'static str>) -> Opt
 /// select arm, freezing the receive loop (watchdog, stop signal and all).
 const REKEY_ACK_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Apply the NAT-safe keepalive cap (A4) for every adaptive level except
-/// Satellite.
-fn keepalive_with_nat_cap(level: AdaptiveLevel, requested: Duration) -> Duration {
-    if level == AdaptiveLevel::Satellite {
-        requested
-    } else {
-        requested.min(KEEPALIVE_NAT_CAP)
-    }
+/// Оставляет запас до таймаута QUIC 30 с, включая спутниковый режим.
+fn keepalive_with_nat_cap(requested: Duration) -> Duration {
+    requested.min(KEEPALIVE_NAT_CAP)
 }
 
 /// K6: number of (tag, counter) entries pushed per kernel tag-window update.
@@ -382,6 +372,8 @@ pub struct AivpnClient {
     /// socket is exempted by routing, not by this guard.
     socket_guard: aivpn_common::transport::SharedGuard,
     mimicry_engine: Option<MimicryEngine>,
+    /// Профиль контрольного цикла остается доступен после передачи движка uploader.
+    control_mask: Option<MaskProfile>,
     pub control_tx: Option<mpsc::Sender<ControlPayload>>,
     /// Receiver half preset by `control_handle()`, consumed by `run()` in
     /// place of the receiver it would otherwise create itself. Lets an
@@ -503,6 +495,7 @@ pub struct AivpnClient {
     keepalive_interval: Duration,
     /// Shared keepalive interval in milliseconds with the upload task for dynamic updates.
     keepalive_interval_ms: Arc<AtomicU64>,
+    fec_group: Arc<AtomicU8>,
     /// Local UDP port used on last successful connect — reused on reconnect to
     /// preserve CGNAT inbound mapping (port-preserving carriers like MTS).
     last_local_port: Option<u16>,
@@ -648,10 +641,8 @@ impl AivpnClient {
             load_or_generate_static_keypair()?
         };
         let initial_adaptive_level = config.initial_adaptive_level;
-        let initial_keepalive = keepalive_with_nat_cap(
-            initial_adaptive_level,
-            Duration::from_secs(initial_adaptive_level.keepalive_secs()),
-        );
+        let initial_keepalive =
+            keepalive_with_nat_cap(Duration::from_secs(initial_adaptive_level.keepalive_secs()));
 
         Ok(Self {
             config,
@@ -661,6 +652,7 @@ impl AivpnClient {
             transport_registry: Arc::new(aivpn_common::transport::TransportRegistry::new()),
             socket_guard: aivpn_common::transport::no_socket_guard(),
             mimicry_engine: None,
+            control_mask: None,
             control_tx: None,
             preset_control_rx: None,
             pending_mask: Arc::new(Mutex::new(None)),
@@ -737,6 +729,7 @@ impl AivpnClient {
             static_keypair,
             quality_tracker: QualityTracker::new(),
             adaptive_level: initial_adaptive_level,
+            fec_group: Arc::new(AtomicU8::new(initial_adaptive_level.fec_n())),
             keepalive_sent_ms: Arc::new(AtomicU64::new(0)),
             last_tx_ms: Arc::new(AtomicU64::new(0)),
             feedback_log: MaskFeedbackLog::load_default(),
@@ -751,11 +744,9 @@ impl AivpnClient {
         })
     }
 
-    /// Set the keepalive interval, applying the NAT-safe cap (A4) for every
-    /// adaptive level except Satellite, and propagate it to the running
-    /// upload task via the shared `keepalive_interval_ms` atomic.
+    /// Ограничивает keepalive и передает интервал работающей задаче отправки.
     fn set_keepalive_interval(&mut self, requested: Duration) {
-        let effective = keepalive_with_nat_cap(self.adaptive_level, requested);
+        let effective = keepalive_with_nat_cap(requested);
         if effective < requested {
             debug!(
                 "Keepalive {}s capped to {}s (NAT-safe bound, level {:?})",
@@ -764,6 +755,8 @@ impl AivpnClient {
                 self.adaptive_level
             );
         }
+        self.fec_group
+            .store(self.adaptive_level.fec_n(), Ordering::Relaxed);
         self.keepalive_interval = effective;
         self.keepalive_interval_ms
             .store(effective.as_millis() as u64, Ordering::Relaxed);
@@ -845,37 +838,19 @@ impl AivpnClient {
 
         // Resolve the server address with a hard 10 s timeout so a hung DNS
         // server cannot stall the reconnect loop indefinitely.
-        let server_addr = tokio::time::timeout(
-            Duration::from_secs(10),
-            tokio::net::lookup_host(&self.config.server_addr),
-        )
-        .await
-        .map_err(|_| {
-            Error::Io(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                format!("DNS lookup timed out for {}", self.config.server_addr),
-            ))
-        })?
-        .map_err(Error::Io)?
-        .next()
-        .ok_or_else(|| {
-            Error::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!(
-                    "failed to resolve server address: {}",
-                    self.config.server_addr
-                ),
-            ))
-        })?;
-
-        // A configured transport replaces the direct UDP socket entirely. The
-        // protocol above this point is unchanged either way — it only ever sees
-        // `DatagramTransport`.
         if let Some(cfg) = self.config.transport.clone() {
             if self.config.proxy_listen.is_none() && !self.config.control_only {
-                self.tunnel
-                    .set_transport_mark(self.socket_guard.routing_mark())?;
+                self.tunnel.set_transport_guard(self.socket_guard.clone())?;
             }
+            let (host, port) = self
+                .config
+                .server_addr
+                .rsplit_once(':')
+                .ok_or_else(|| Error::InvalidPacket("В адресе сервера отсутствует порт"))?;
+            let port = port
+                .parse()
+                .map_err(|_| Error::InvalidPacket("Некорректный порт сервера"))?;
+            let server_addr = aivpn_common::transport::logical_peer_addr(host, port);
             let transport = self
                 .transport_registry
                 .open(&cfg, self.socket_guard.clone())
@@ -889,6 +864,32 @@ impl AivpnClient {
             return self.finish_connect(server_addr).await;
         }
 
+        let addresses = tokio::time::timeout(
+            Duration::from_secs(10),
+            tokio::net::lookup_host(&self.config.server_addr),
+        )
+        .await
+        .map_err(|_| {
+            Error::Io(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("DNS lookup timed out for {}", self.config.server_addr),
+            ))
+        })?
+        .map_err(Error::Io)?;
+        let server_addr = aivpn_common::dns_candidates::select(&self.config.server_addr, addresses)
+            .ok_or_else(|| {
+                Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "failed to resolve server address: {}",
+                        self.config.server_addr
+                    ),
+                ))
+            })?;
+
+        // A configured transport replaces the direct UDP socket entirely. The
+        // protocol above this point is unchanged either way — it only ever sees
+        // `DatagramTransport`.
         self.open_udp_socket(server_addr).await?;
         self.finish_connect(server_addr).await
     }
@@ -1000,6 +1001,23 @@ impl AivpnClient {
         self.recv_tag_offsets = vec![self.config.initial_mask.tag_offset];
         self.ever_connected.store(false, Ordering::Relaxed);
 
+        if let Some(raw) = self.transport.take() {
+            let name = self
+                .config
+                .server_addr
+                .rsplit_once(':')
+                .map(|(host, _)| host)
+                .unwrap_or(&self.config.server_addr)
+                .trim_matches(['[', ']'])
+                .to_string();
+            self.transport = Some(aivpn_common::mask_io::client(
+                raw,
+                &self.config.initial_mask,
+                server_addr,
+                name,
+            )?);
+        }
+
         // Auto-detect kernel acceleration (Linux only).
         #[cfg(target_os = "linux")]
         {
@@ -1064,7 +1082,9 @@ impl AivpnClient {
         }
 
         if self.config.proxy_listen.is_none() && !self.config.control_only {
-            self.tunnel.set_server_ip(server_addr.ip().to_string());
+            if self.config.transport.is_none() {
+                self.tunnel.set_server_ip(server_addr.ip().to_string());
+            }
             // Enable full tunnel only after the server UDP path is established.
             if self.config.tun_config.full_tunnel {
                 self.tunnel.enable_full_tunnel()?;
@@ -1081,6 +1101,7 @@ impl AivpnClient {
 
         // Initialize mimicry engine
         self.mimicry_engine = Some(MimicryEngine::new(self.config.initial_mask.clone()));
+        self.control_mask = Some(self.config.initial_mask.clone());
 
         // Начальные ключи нужны только до подтвержденного PFS обмена.
         let dh_result = self
@@ -1319,7 +1340,9 @@ impl AivpnClient {
             .ok_or(Error::Session("No mimicry engine".into()))?;
 
         // Build keepalive control as init payload
-        let keepalive = ControlPayload::Keepalive { send_ts: 0 };
+        let keepalive = ControlPayload::ClientHello {
+            mask_id: mimicry.mask().mask_id.clone(),
+        };
         let encoded = keepalive.encode()?;
         let seq_num = self.send_seq as u16;
         self.send_seq = self.send_seq.wrapping_add(1);
@@ -1393,8 +1416,15 @@ impl AivpnClient {
             .await
     }
 
+    /// Общий канал и корреляция запросов для встраивания диагностики в клиент.
+    pub fn management_handle(&mut self) -> (MgmtClient, mpsc::Sender<ControlPayload>) {
+        let tx = self.control_handle();
+        (self.mgmt.clone(), tx)
+    }
+
     /// Update mask profile
     pub fn update_mask(&mut self, new_mask: MaskProfile) {
+        self.control_mask = Some(new_mask.clone());
         if !self.recv_tag_offsets.contains(&new_mask.tag_offset) {
             self.recv_tag_offsets.push(new_mask.tag_offset);
         }
@@ -1409,6 +1439,11 @@ impl AivpnClient {
             "Updating mask to {} (mdh_len: {})",
             new_mask.mask_id, new_mdh_len
         );
+        #[cfg(target_os = "linux")]
+        let protocol_changed = self
+            .mimicry_engine
+            .as_ref()
+            .is_some_and(|engine| engine.mask().spoof_protocol != new_mask.spoof_protocol);
         if let Some(ref mut engine) = self.mimicry_engine {
             engine.update_mask(new_mask.clone());
         }
@@ -1419,6 +1454,7 @@ impl AivpnClient {
             let tag_offset = kernel_offload::kernel_tag_offset(&new_mask, new_mdh_len);
             if self.kernel_installed_mdh_len != new_mdh_len
                 || self.kernel_installed_tag_offset != tag_offset
+                || protocol_changed
             {
                 self.kernel_install_session();
             }
@@ -1709,6 +1745,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn alternative_transport_connects_without_resolving_vpn_server() {
+        struct Factory;
+        #[async_trait::async_trait]
+        impl aivpn_common::transport::TransportFactory for Factory {
+            fn name(&self) -> &str {
+                "test-carrier"
+            }
+            async fn open(
+                &self,
+                _: &aivpn_common::transport::TransportConfig,
+                _: aivpn_common::transport::SharedGuard,
+            ) -> Result<aivpn_common::transport::SharedTransport> {
+                let socket = UdpSocket::bind("127.0.0.1:0").await?;
+                socket.connect("127.0.0.1:9").await?;
+                Ok(aivpn_common::transport::udp_transport(Arc::new(socket)))
+            }
+        }
+        let mut config = make_test_config();
+        config.control_only = true;
+        config.server_addr = "unresolvable.invalid:443".into();
+        config.server_public_key = KeyPair::generate().public_key_bytes();
+        config.transport = Some(aivpn_common::transport::TransportConfig::new(
+            "test-carrier",
+            vec![],
+        ));
+        let mut registry = aivpn_common::transport::TransportRegistry::new();
+        registry.register(Arc::new(Factory));
+        let mut client = AivpnClient::new(config).unwrap();
+        client.set_transport_registry(
+            Arc::new(registry),
+            aivpn_common::transport::no_socket_guard(),
+        );
+        client.connect().await.unwrap();
+        assert_eq!(client.state, ClientState::Connected);
+        client.disconnect().await;
+    }
+
+    #[tokio::test]
     async fn reconnect_same_object_uses_fresh_ephemeral_and_empty_replay_state() {
         let mut config = make_test_config();
         config.control_only = true;
@@ -1846,6 +1920,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn authenticated_downlink_updates_loss_and_late_packets_repair_the_estimate() {
+        let mut config = make_test_config();
+        config.control_only = true;
+        let mut client = AivpnClient::new(config).unwrap();
+        let keys = crypto::derive_session_keys(&[7; 32], None, &[8; 32]);
+        client.session_keys = Some(keys.clone());
+        let control = ControlPayload::Capabilities {
+            role: 1,
+            features: 0,
+        }
+        .encode()
+        .unwrap();
+        for (mut counter, expected_loss) in [(100, 0), (103, 500_000), (101, 250_000), (102, 0)] {
+            let inner = build_inner_packet(InnerType::Control, counter as u16, &control);
+            let packet = initial_downlink_packet(&keys, &mut counter, &inner, client.recv_mdh_len);
+            client.receive_and_write_packet(&packet).await.unwrap();
+            assert_eq!(client.quality_tracker.loss_ppm(), expected_loss);
+        }
+    }
+
+    #[tokio::test]
     async fn capabilities_are_announced_after_confirmed_server_hello() {
         let mut config = make_test_config();
         config.control_only = true;
@@ -1913,6 +2008,45 @@ mod tests {
                     .map(|offset| line[offset..].trim().to_string())
             })
             .collect()
+    }
+
+    #[tokio::test]
+    async fn invalid_initial_hello_fails_but_invalid_repeat_cannot_change_established_session() {
+        use ed25519_dalek::Signer;
+        let signing = ed25519_dalek::SigningKey::from_bytes(&[42; 32]);
+        let mut config = make_test_config();
+        config.control_only = true;
+        config.server_public_key = KeyPair::generate().public_key_bytes();
+        config.server_signing_key = Some(signing.verifying_key().to_bytes());
+        let mut client = AivpnClient::new(config).unwrap();
+        client
+            .finish_connect("127.0.0.1:443".parse().unwrap())
+            .await
+            .unwrap();
+        let server_eph_pub = KeyPair::generate().public_key_bytes();
+        let mut message = server_eph_pub.to_vec();
+        message.extend_from_slice(&client.keypair.public_key_bytes());
+        let good = ControlPayload::ServerHello {
+            server_eph_pub,
+            signature: signing.sign(&message).to_bytes(),
+            network_config: None,
+        };
+        let mut forged_network = client.config.tun_config.client_network_config().unwrap();
+        forged_network.client_ip = "10.0.0.99".parse().unwrap();
+        let bad = ControlPayload::ServerHello {
+            server_eph_pub,
+            signature: [0; 64],
+            network_config: Some(forged_network),
+        };
+        assert!(client.handle_server_control(bad.clone()).await.is_err());
+        assert!(client.ratcheted_server_eph_pub.is_none());
+        client.handle_server_control(good).await.unwrap();
+        let before = client.session_keys.clone().unwrap();
+        let network = client.config.tun_config.tun_addr.clone();
+        client.handle_server_control(bad).await.unwrap();
+        assert_eq!(client.ratcheted_server_eph_pub, Some(server_eph_pub));
+        assert!(client.session_keys.as_ref().unwrap().session_key == before.session_key);
+        assert_eq!(client.config.tun_config.tun_addr, network);
     }
 
     #[tokio::test]
@@ -3798,5 +3932,22 @@ mod tests {
         assert_ne!(ClientState::Connecting, ClientState::Connected);
         assert_ne!(ClientState::Connected, ClientState::Reconnecting);
         assert_ne!(ClientState::Reconnecting, ClientState::Disconnected);
+    }
+}
+
+#[cfg(test)]
+mod keepalive_bound_tests {
+    use super::*;
+
+    #[test]
+    fn server_keepalive_stays_below_quic_idle_in_all_modes() {
+        assert_eq!(
+            keepalive_with_nat_cap(Duration::from_secs(255)),
+            Duration::from_secs(25)
+        );
+        assert_eq!(
+            keepalive_with_nat_cap(Duration::from_secs(15)),
+            Duration::from_secs(15)
+        );
     }
 }

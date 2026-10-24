@@ -140,29 +140,58 @@ pub(crate) fn mask_choices_from_catalog(lang: localization::Lang) -> Option<Vec<
     None
 }
 
-/// Decode a PNG into (rgba_bytes, width, height). Panics on decode failure
-/// — both callers pass a bundled, known-good asset, so a failure here means
-/// the build is broken, not a runtime condition to recover from.
-///
-/// `png`/`eframe` are `cfg(windows)`-only dependencies (see Cargo.toml), so
-/// this — and `app_icon` below — must stay gated the same way for the crate
-/// to remain host-buildable on Linux (`cargo test -p aivpn-windows`), same
-/// as every other egui-touching item in this file.
+/// Декодирует встроенный ресурс, проверенный при сборке.
 #[cfg(windows)]
 pub(crate) fn decode_png_rgba(bytes: &[u8]) -> (Vec<u8>, u32, u32) {
-    let decoder = png::Decoder::new(std::io::Cursor::new(bytes));
-    let mut reader = decoder.read_info().expect("bundled brand PNG must decode");
-    let mut rgba = vec![
-        0u8;
-        reader
-            .output_buffer_size()
-            .expect("bundled brand PNG must have a known buffer size")
-    ];
+    try_decode_png_rgba(bytes).expect("bundled brand PNG must decode")
+}
+
+/// Проверяет полученное изображение и приводит все поддержанные цвета к RGBA8.
+#[cfg(any(windows, test))]
+pub(crate) fn try_decode_png_rgba(bytes: &[u8]) -> Result<(Vec<u8>, u32, u32), String> {
+    let mut decoder = png::Decoder::new(std::io::Cursor::new(bytes));
+    decoder.set_limits(png::Limits {
+        bytes: 16 * 1024 * 1024,
+    });
+    decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
+    let mut reader = decoder.read_info().map_err(|error| error.to_string())?;
+    let size = reader
+        .output_buffer_size()
+        .filter(|size| *size <= 16 * 1024 * 1024)
+        .ok_or("PNG слишком большой")?;
+    let mut pixels = vec![0; size];
     let info = reader
-        .next_frame(&mut rgba)
-        .expect("bundled brand PNG must decode");
-    rgba.truncate(info.buffer_size());
-    (rgba, info.width, info.height)
+        .next_frame(&mut pixels)
+        .map_err(|error| error.to_string())?;
+    pixels.truncate(info.buffer_size());
+    let count = (info.width as usize)
+        .checked_mul(info.height as usize)
+        .filter(|count| *count <= 4 * 1024 * 1024)
+        .ok_or("PNG слишком большой")?;
+    let mut rgba = Vec::with_capacity(count * 4);
+    match info.color_type {
+        png::ColorType::Grayscale => {
+            for value in pixels {
+                rgba.extend_from_slice(&[value, value, value, 255]);
+            }
+        }
+        png::ColorType::GrayscaleAlpha => {
+            for pixel in pixels.chunks_exact(2) {
+                rgba.extend_from_slice(&[pixel[0], pixel[0], pixel[0], pixel[1]]);
+            }
+        }
+        png::ColorType::Rgb => {
+            for pixel in pixels.chunks_exact(3) {
+                rgba.extend_from_slice(&[pixel[0], pixel[1], pixel[2], 255]);
+            }
+        }
+        png::ColorType::Rgba => rgba = pixels,
+        _ => return Err("Неподдерживаемый цвет PNG".into()),
+    }
+    if rgba.len() != count * 4 {
+        return Err("Неверная длина PNG".into());
+    }
+    Ok((rgba, info.width, info.height))
 }
 
 #[cfg(windows)]
@@ -241,5 +270,47 @@ pub(crate) fn make_tray_icon(connected: bool) -> Option<tray_icon::Icon> {
             vpn_manager::gui_log(&format!("tray: failed to build icon: {e}"));
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn runtime_png_accepts_gray_rgb_and_alpha_without_panicking() {
+        for (color, pixels, expected) in [
+            (
+                png::ColorType::Grayscale,
+                vec![0, 255],
+                vec![0, 0, 0, 255, 255, 255, 255, 255],
+            ),
+            (
+                png::ColorType::GrayscaleAlpha,
+                vec![0, 17, 255, 19],
+                vec![0, 0, 0, 17, 255, 255, 255, 19],
+            ),
+            (
+                png::ColorType::Rgb,
+                vec![1, 2, 3, 4, 5, 6],
+                vec![1, 2, 3, 255, 4, 5, 6, 255],
+            ),
+        ] {
+            let mut encoded = Vec::new();
+            {
+                let mut encoder = png::Encoder::new(&mut encoded, 2, 1);
+                encoder.set_color(color);
+                encoder.set_depth(png::BitDepth::Eight);
+                encoder
+                    .write_header()
+                    .unwrap()
+                    .write_image_data(&pixels)
+                    .unwrap();
+            }
+            let (rgba, width, height) = try_decode_png_rgba(&encoded).unwrap();
+            assert_eq!((width, height), (2, 1));
+            assert_eq!(rgba, expected);
+        }
+        assert!(try_decode_png_rgba(b"invalid PNG").is_err());
     }
 }

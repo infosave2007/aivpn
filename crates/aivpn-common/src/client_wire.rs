@@ -128,6 +128,15 @@ impl RecvWindow {
         (self.highest >= 0).then_some(self.highest as u64)
     }
 
+    pub fn observation_counts(&self) -> (u64, u64) {
+        crate::quality::replay_observation_counts(&[
+            self.bitmap.lo as u64,
+            (self.bitmap.lo >> 64) as u64,
+            self.bitmap.hi as u64,
+            (self.bitmap.hi >> 64) as u64,
+        ])
+    }
+
     pub fn find_counter(&self, tag: &[u8; TAG_SIZE], keys: &SessionKeys) -> Option<u64> {
         let base_tw = compute_time_window(current_timestamp_ms(), DEFAULT_WINDOW_MS);
         let start = if self.highest < 0 {
@@ -322,7 +331,20 @@ fn build_mdh_packet_core(
     tag_offset: u16,
     header_mask: Option<&crate::mask::MaskProfile>,
 ) -> Result<Vec<u8>> {
-    let pad_len: u16 = 8 + rand::thread_rng().next_u32() as u16 % 16;
+    if header_mask.is_some_and(|mask| mask.uses_stun_attributes() && mdh_len < 24) {
+        return Err(Error::InvalidPacket("MDH не вмещает атрибут STUN"));
+    }
+    let requested = 8 + rand::thread_rng().next_u32() as u16 % 16;
+    let base = mdh_len
+        + if obfuscated_eph_pub.is_some() { 32 } else { 0 }
+        + crypto::session_payload_overhead(keys)
+        + 2
+        + inner.len()
+        + crypto::POLY1305_TAG_SIZE;
+    let pad_len = match header_mask {
+        Some(mask) => mask.wire_padding(base, requested, 26)?,
+        None => requested,
+    };
     let mut plaintext = Vec::with_capacity(2 + inner.len() + pad_len as usize);
     plaintext.extend_from_slice(&pad_len.to_le_bytes());
     plaintext.extend_from_slice(inner);
@@ -407,7 +429,7 @@ fn build_mdh_packet_core(
     // prefix and patching would corrupt the tag.
     if embed_tag_offset.is_some() {
         if let Some(mask) = header_mask {
-            mask.patch_stun_length(&mut packet);
+            mask.finalize_packet(&mut packet)?;
         }
     }
 
@@ -819,10 +841,13 @@ mod tag_layout_tests {
         let mask = crate::mask::preset_masks::bootstrap_default();
         let obf = obfuscate_client_eph_pub(&client, &server.public_key_bytes());
         let inner = build_inner_packet(InnerType::Control, 0, &[3; 8]);
-        let packet = build_shaped_mdh_packet(&keys, &mut 0, &inner, Some(&obf), 20, &mask).unwrap();
+        let mdh_len = mask.header_spec.as_ref().unwrap().min_length();
+        assert!(build_shaped_mdh_packet(&keys, &mut 0, &inner, Some(&obf), 20, &mask).is_err());
+        let packet =
+            build_shaped_mdh_packet(&keys, &mut 0, &inner, Some(&obf), mdh_len, &mask).unwrap();
         let prefix = if mask.tag_offset == u16::MAX { 8 } else { 0 };
-        assert_eq!(&packet[prefix + 20..prefix + 52], &obf);
-        assert!(packet.len() >= prefix + 20 + 32 + 24 + 16 + 2 + inner.len() + 8);
+        assert_eq!(&packet[prefix + mdh_len..prefix + mdh_len + 32], &obf);
+        assert!(packet.len() >= prefix + mdh_len + 32 + 24 + 16 + 2 + inner.len() + 8);
     }
 
     #[test]
@@ -1072,7 +1097,7 @@ mod tag_layout_tests {
         let mask = webrtc_zoom_v3();
         assert_eq!(mask.tag_offset, 8);
         let mdh_len = mask.header_spec.as_ref().unwrap().min_length();
-        assert_eq!(mdh_len, 20);
+        assert_eq!(mdh_len, 24);
 
         let inner = build_inner_packet(InnerType::Control, 0, b"handshake");
         let eph = [0xABu8; 32];
@@ -1081,7 +1106,8 @@ mod tag_layout_tests {
             .unwrap();
 
         // STUN Binding Request type at offset 0, magic cookie at offset 4.
-        assert_eq!(&pkt[0..2], &[0x00, 0x01], "STUN type at offset 0");
+        assert_eq!(&pkt[0..2], &[0x00, 0x11], "STUN type at offset 0");
+        crate::stun_wire::validate(&pkt).unwrap();
         assert_eq!(
             &pkt[4..8],
             &[0x21, 0x12, 0xA4, 0x42],

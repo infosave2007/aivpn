@@ -524,6 +524,11 @@ mod tests {
     #[cfg(feature = "production-secure")]
     #[test]
     fn production_secure_mask_trust_requires_signing_key_and_enforce() {
+        assert!(aivpn_common::mask::protected_build_requires_keys(false, false).is_err());
+        assert!(aivpn_common::mask::resolve_protected_mask_verify_mode(Some(
+            aivpn_common::mask::MaskVerifyMode::Off
+        ),)
+        .is_err());
         assert!(
             validate_mask_trust_config(None, Some("cHVibGlj"), None).is_err(),
             "pubkey alone does not replace the signing key"

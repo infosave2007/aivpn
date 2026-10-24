@@ -68,18 +68,20 @@ jobs:
         python3 deploy/ci/test-tc-loader.py
         python3 deploy/ci/test-build-packaging.py
         python3 deploy/ci/test-mikrotik-entrypoint.py
+        python3 deploy/ci/test-openwrt-init.py
+        python3 deploy/ci/test-macos-admin-ipc.py
 
     - name: Run tests
-      run: cargo test --locked --workspace --exclude aivpn-windows --features "aivpn-server/management-api,aivpn-server/metrics,aivpn-server/dns,aivpn-server/passive-distribution" --verbose
+      run: cargo test --locked --workspace --exclude aivpn-windows --features "aivpn-server/management-api,aivpn-server/metrics,aivpn-server/dns,aivpn-server/passive-distribution,aivpn-server/neural,aivpn-client/client-dpi-gate" --verbose
 
     - name: Protected build tests
-      run: cargo test --locked -p aivpn-server -p aivpn-client -p aivpn-common --features "aivpn-server/production-secure,aivpn-server/management-api,aivpn-server/passive-distribution,aivpn-client/production-secure,aivpn-common/production-secure" --lib
+      run: cargo test --locked -p aivpn-server -p aivpn-client -p aivpn-common --features "aivpn-server/production-secure,aivpn-server/management-api,aivpn-server/passive-distribution,aivpn-client/production-secure,aivpn-common/production-secure,aivpn-server/neural,aivpn-client/client-dpi-gate" --lib
 
     - name: Clippy correctness and suspicious checks
-      run: cargo clippy --locked --workspace --all-targets --exclude aivpn-windows -- -D clippy::correctness -D clippy::suspicious
+      run: cargo clippy --locked --workspace --all-targets --exclude aivpn-windows --features "aivpn-server/neural,aivpn-client/client-dpi-gate" -- -D clippy::correctness -D clippy::suspicious
 
     - name: Install DPI build dependencies
-      run: sudo apt-get update && sudo apt-get install -y autoconf automake libtool pkg-config libpcap-dev libjson-c-dev
+      run: sudo apt-get update && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y autoconf automake libtool pkg-config libpcap-dev libjson-c-dev tshark
 
     - name: Set DPI tool paths
       run: |
@@ -87,7 +89,9 @@ jobs:
         echo "NDPI_READER=$RUNNER_TEMP/aivpn-ndpi/example/ndpiReader" >> "$GITHUB_ENV"
 
     - name: DPI checkout recovery tests
-      run: python3 deploy/ci/test-dpi-checkout.py
+      run: |
+        python3 deploy/ci/test-dpi-checkout.py
+        python3 deploy/ci/test-mask-pcaps.py
 
     - name: Build pinned DPI classifier
       run: deploy/ci/build-dpi-tools.sh
@@ -97,7 +101,9 @@ jobs:
 
     # Проверяет границу публичного дерева и служебные файлы.
     - name: Public-tree vocabulary gate
-      run: make hygiene-gate
+      run: |
+        python3 deploy/ci/test-public-hygiene.py
+        make hygiene-gate
 
     - name: Release version consistency
       run: make version-gate

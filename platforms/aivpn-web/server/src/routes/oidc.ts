@@ -1,7 +1,9 @@
-import { Hono } from 'hono'
+import { Hono, type Context } from 'hono'
+import { getCookie } from 'hono/cookie'
 import { createHash, randomBytes, randomUUID } from 'node:crypto'
 import { eq, and } from 'drizzle-orm'
-import { createRemoteJWKSet, jwtVerify } from 'jose'
+import { createRemoteJWKSet } from 'jose'
+import { verifyIdToken } from '../auth/oidc-token'
 import { config } from '../config'
 import { getDb, IS_SQLITE } from '../db'
 import { sqliteUsers, sqliteSessions, pgUsers, pgSessions } from '../db/schema'
@@ -13,6 +15,7 @@ import { getClientIp } from '../lib/client-ip'
 import type { UserRole } from '../db/schema'
 
 const app = new Hono()
+const pkceCookieName = () => config.ORIGIN.startsWith('https:') ? '__Host-aivpn_oidc_pkce' : 'aivpn_oidc_pkce'
 
 // ─── OIDC discovery + JWKS cache ─────────────────────────────────────────────
 
@@ -22,7 +25,7 @@ let discoveryCache: { endpoint: string; data: Discovery } | null = null
 async function getDiscovery(): Promise<Discovery> {
   const issuer = config.OIDC_ISSUER!
   if (discoveryCache?.endpoint === issuer) return discoveryCache.data
-  const r = await fetch(issuer.replace(/\/$/, '') + '/.well-known/openid-configuration')
+  const r = await fetch(issuer.replace(/\/$/, '') + '/.well-known/openid-configuration', { signal: AbortSignal.timeout(10_000) })
   if (!r.ok) throw new Error(`OIDC discovery failed: ${r.status}`)
   const data = await r.json() as Discovery
   discoveryCache = { endpoint: issuer, data }
@@ -79,8 +82,8 @@ app.get('/start', async (c) => {
 
   const codeVerifier = b64url(randomBytes(32))
   const codeChallenge = b64url(createHash('sha256').update(codeVerifier).digest())
-  const state = b64url(randomBytes(16))
-  const nonce = b64url(randomBytes(16))
+  const state = b64url(randomBytes(32))
+  const nonce = b64url(randomBytes(32))
   const redirectUri = new URL('/web/auth/oidc/callback', config.ORIGIN).toString()
 
   const params = new URLSearchParams({
@@ -94,9 +97,9 @@ app.get('/start', async (c) => {
     code_challenge_method: 'S256',
   })
 
-  const cookieValue = Buffer.from(JSON.stringify({ codeVerifier, state, nonce })).toString('base64')
+  const cookieValue = Buffer.from(JSON.stringify({ codeVerifier, state, nonce, expiresAt: Date.now() + 600_000 })).toString('base64')
   const secure = config.ORIGIN.startsWith('https') ? '; Secure' : ''
-  c.header('Set-Cookie', `oidc_pkce=${cookieValue}; HttpOnly; SameSite=Lax; Path=/; Max-Age=600${secure}`)
+  c.header('Set-Cookie', `${pkceCookieName()}=${cookieValue}; HttpOnly; SameSite=Lax; Path=/; Max-Age=600${secure}`)
   return c.redirect(`${discovery.authorization_endpoint}?${params}`)
 })
 
@@ -108,24 +111,31 @@ app.get('/callback', async (c) => {
   }
 
   const { code, state, error: oidcError } = c.req.query()
-  if (oidcError) return c.html(errPage(`IdP error: ${String(oidcError).slice(0, 200)}`))
-  if (!code) return c.html(errPage('Missing code'))
+  if (oidcError) return oidcFailure(c, `IdP error: ${String(oidcError).slice(0, 200)}`)
+  if (!code) return oidcFailure(c, 'Missing code')
 
   // Validate PKCE cookie
-  const cookie = c.req.header('cookie') ?? ''
-  const pkceMatch = cookie.match(/oidc_pkce=([^;]+)/)
-  if (!pkceMatch) return c.html(errPage('Missing PKCE state cookie — try again'))
+  const pkceCookie = getCookie(c, pkceCookieName())
+  if (!pkceCookie) return oidcFailure(c, 'Missing PKCE state cookie - try again')
   let pkceData: { codeVerifier: string; state: string; nonce: string }
-  try { pkceData = JSON.parse(Buffer.from(pkceMatch[1]!, 'base64').toString()) }
-  catch { return c.html(errPage('Invalid PKCE cookie')) }
-  if (pkceData.state !== state) return c.html(errPage('State mismatch — possible CSRF'))
+  try {
+    const parsed = JSON.parse(Buffer.from(pkceCookie, 'base64').toString())
+    if (!parsed || !['codeVerifier', 'state', 'nonce'].every((key) =>
+      typeof parsed[key] === 'string' && /^[A-Za-z0-9_-]{43,128}$/.test(parsed[key])) ||
+      !Number.isSafeInteger(parsed.expiresAt) || parsed.expiresAt <= Date.now() || parsed.expiresAt > Date.now() + 600_000) {
+      return oidcFailure(c, 'Invalid PKCE cookie')
+    }
+    pkceData = parsed
+  }
+  catch { return oidcFailure(c, 'Invalid PKCE cookie') }
+  if (pkceData.state !== state) return oidcFailure(c, 'State mismatch — possible CSRF')
 
   const secure = config.ORIGIN.startsWith('https') ? '; Secure' : ''
-  c.header('Set-Cookie', `oidc_pkce=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0${secure}`)
+  c.header('Set-Cookie', `${pkceCookieName()}=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0${secure}`)
 
   // Fetch discovery + exchange code for tokens
   let discovery: Discovery
-  try { discovery = await getDiscovery() } catch (e) { return c.html(errPage(`Discovery error: ${e}`)) }
+  try { discovery = await getDiscovery() } catch (e) { return oidcFailure(c, `Discovery error: ${e}`) }
 
   const redirectUri = new URL('/web/auth/oidc/callback', config.ORIGIN).toString()
   const body = new URLSearchParams({
@@ -141,32 +151,25 @@ app.get('/callback', async (c) => {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body: body.toString(),
+    signal: AbortSignal.timeout(10_000),
   })
   if (!tokenRes.ok) {
     // Avoid leaking full IdP error body (may contain sensitive info); log it server-side only
     const errBody = await tokenRes.text()
     console.error('[oidc] token exchange failed:', tokenRes.status, errBody.slice(0, 500))
-    return c.html(errPage(`Token exchange failed (HTTP ${tokenRes.status})`))
+    return oidcFailure(c, `Token exchange failed (HTTP ${tokenRes.status})`)
   }
   const tokens = await tokenRes.json() as { id_token?: string }
-  if (!tokens.id_token) return c.html(errPage('No id_token in response'))
+  if (!tokens.id_token) return oidcFailure(c, 'No id_token in response')
 
   // ── Verify ID token: signature (JWKS) + iss + aud + exp + nonce ─────────────
   let claims: Record<string, unknown> & { sub: string; preferred_username?: string; email?: string }
   try {
     const jwks = getJwks(discovery.jwks_uri)
-    const { payload } = await jwtVerify(tokens.id_token, jwks, {
-      issuer: config.OIDC_ISSUER,
-      audience: config.OIDC_CLIENT_ID,
-    })
-    // jwtVerify already checks exp; verify nonce to prevent replay
-    if (payload['nonce'] !== pkceData.nonce) {
-      return c.html(errPage('Nonce mismatch — possible replay attack'))
-    }
-    claims = payload as typeof claims
+    claims = await verifyIdToken(tokens.id_token, jwks, config.OIDC_ISSUER, config.OIDC_CLIENT_ID, pkceData.nonce)
   } catch (e) {
     console.error('[oidc] ID token verification failed:', e)
-    return c.html(errPage('ID token verification failed'))
+    return oidcFailure(c, 'ID token verification failed')
   }
 
   const iss = config.OIDC_ISSUER
@@ -186,17 +189,14 @@ app.get('/callback', async (c) => {
     // Namespace username to prevent collision with local accounts
     const baseUsername = `sso:${sub.slice(0, 48)}`
     let username = baseUsername
-    let suffix = 0
-    while (true) {
-      const [existing] = await d.select({ id: users.id }).from(users).where(eq(users.username, username)).limit(1)
-      if (!existing) break
-      suffix++
-      username = `${baseUsername}_${suffix}`
+    for (let attempt = 0; attempt < 3 && !user; attempt++) {
+      await d.insert(users).values({ username, password_hash: null, role, oidc_iss: iss, oidc_sub: sub }).onConflictDoNothing()
+      ;[user] = await d.select().from(users).where(
+        and(eq(users.oidc_iss, iss), eq(users.oidc_sub, sub))
+      ).limit(1)
+      username = `${baseUsername}_${randomBytes(4).toString('hex')}`
     }
-    await d.insert(users).values({ username, password_hash: null, role, oidc_iss: iss, oidc_sub: sub })
-    ;[user] = await d.select().from(users).where(
-      and(eq(users.oidc_iss, iss), eq(users.oidc_sub, sub))
-    ).limit(1)
+    if (!user) return c.html(errPage('Could not provision SSO user'), 503)
   }
   // Subsequent logins use the DB role (admin can override in panel)
 
@@ -210,6 +210,7 @@ app.get('/callback', async (c) => {
     id: sessionId,
     user_id: user.id,
     refresh_token_hash: refreshHash,
+    session_version: user.session_version,
     expires_at: expiresAt,
     ip,
     ua,
@@ -227,6 +228,10 @@ app.get('/callback', async (c) => {
 // client (never in localStorage, where any XSS payload could read it). The
 // SPA re-mints it via POST /web/auth/refresh from the httpOnly refresh
 // cookie set above, then loads the user via /web/auth/me.
+function oidcFailure(c: Context, message: string) {
+  return c.html(errPage(message), 400)
+}
+
 function ssoLandingPage(): string {
   return `<!doctype html><html><head><meta charset="utf-8"><title>Signing in…</title></head><body>
 <script>

@@ -102,6 +102,9 @@ pub(crate) fn build_connection_server_addr(args: &ServerArgs, server_ip: &str) -
         .map(|addr| addr.port())
         .unwrap_or(443);
 
+    if let Ok(ip) = server_ip.parse::<std::net::IpAddr>() {
+        return SocketAddr::new(ip, port).to_string();
+    }
     format!("{}:{}", server_ip, port)
 }
 

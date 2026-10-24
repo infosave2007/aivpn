@@ -110,10 +110,14 @@ fn admin_token_path_at(addr: SocketAddrV4) -> std::path::PathBuf {
     }
 }
 
-pub async fn bind_admin(addr: SocketAddrV4) -> std::io::Result<(tokio::net::UdpSocket, String)> {
+pub async fn bind_admin(
+    addr: SocketAddrV4,
+) -> std::io::Result<(tokio::net::UdpSocket, tokio::net::TcpListener, String)> {
     parse_admin_addr(&addr.to_string())
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
-    bind_admin_at(addr, &admin_token_path_at(addr)).await
+    let tcp = tokio::net::TcpListener::bind(addr).await?;
+    let (udp, token) = bind_admin_at(addr, &admin_token_path_at(addr)).await?;
+    Ok((udp, tcp, token))
 }
 
 async fn bind_admin_at(
@@ -443,6 +447,7 @@ pub enum AdminCommand {
     RecordStart(String),
     RecordStop,
     RecordStatus,
+    Bench(u64),
     /// Report `AivpnClient::cached_role()`.
     Role,
     /// Generate a QR PNG for the given (UTF-8) text.
@@ -493,6 +498,12 @@ pub fn parse_admin_command(rest: &str) -> Option<AdminCommand> {
     }
     if rest == "record_status" {
         return Some(AdminCommand::RecordStatus);
+    }
+    if let Some(duration) = rest.strip_prefix("bench:") {
+        let duration: u64 = duration.parse().ok()?;
+        return (3..=30)
+            .contains(&duration)
+            .then_some(AdminCommand::Bench(duration));
     }
     if rest == "role" {
         return Some(AdminCommand::Role);

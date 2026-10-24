@@ -10,6 +10,8 @@
 
 use aivpn_common::error::{Error, Result};
 
+#[cfg(any(target_os = "macos", test))]
+mod macos_pf;
 #[cfg(target_os = "windows")]
 mod windows;
 #[cfg(not(target_os = "windows"))]
@@ -34,6 +36,8 @@ pub struct KillSwitch {
     /// socket guard stamps, so exactly the sockets that were deliberately kept
     /// out of the tunnel are the ones allowed out here — nothing broader.
     mark: Option<u32>,
+    #[cfg(any(target_os = "macos", windows))]
+    guard: Option<aivpn_common::transport::SharedGuard>,
     active: bool,
     /// Даже прерванная настройка может оставить защитные правила до явного выхода.
     cleanup_needed: bool,
@@ -45,9 +49,32 @@ impl KillSwitch {
             tun_name,
             server_ip,
             mark: None,
+            #[cfg(any(target_os = "macos", windows))]
+            guard: None,
             active: false,
             cleanup_needed: false,
         }
+    }
+
+    /// Подключить исключения транспорта и к защите, оставшейся после перезапуска.
+    #[cfg(any(target_os = "macos", windows))]
+    pub(crate) fn prepare_transport_guard(
+        guard: &aivpn_common::transport::SharedGuard,
+    ) -> Result<()> {
+        #[cfg(windows)]
+        guard.set_firewall_peer_handler(Some(std::sync::Arc::new(|peer| {
+            windows::allow_transport_peer(peer).map_err(Error::Io)
+        })))?;
+        #[cfg(target_os = "macos")]
+        {
+            let rules = std::process::Command::new("/sbin/pfctl")
+                .args(["-a", "aivpn_ks", "-s", "rules"])
+                .output()?;
+            if rules.status.success() && !rules.stdout.is_empty() {
+                guard.set_firewall(true)?;
+            }
+        }
+        Ok(())
     }
 
     /// Also let out traffic carrying `mark` (see the field's documentation).
@@ -55,6 +82,12 @@ impl KillSwitch {
     /// until the next activation.
     pub fn with_mark(mut self, mark: u32) -> Self {
         self.mark = Some(mark);
+        self
+    }
+
+    #[cfg(any(target_os = "macos", windows))]
+    pub fn with_guard(mut self, guard: aivpn_common::transport::SharedGuard) -> Self {
+        self.guard = Some(guard);
         self
     }
 
@@ -400,11 +433,18 @@ impl KillSwitch {
         use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
         use std::process::Command;
 
-        let rules = format!(
+        let mut rules = format!(
             "block out all\npass out on lo0 all\npass out on {tun} all\npass out proto {{tcp,udp}} from any to {sip}\n",
             tun = self.tun_name,
             sip = self.server_ip,
         );
+        if self
+            .guard
+            .as_ref()
+            .is_some_and(|guard| guard.uses_firewall_table())
+        {
+            rules = format!("table <aivpn_transport> persist\n{rules}pass out proto {{tcp,udp}} from any to <aivpn_transport>\n");
+        }
 
         // Write anchor rules to a root-only directory, not world-writable /tmp.
         // O_NOFOLLOW ensures we fail if the path is a symlink (symlink attack prevention).
@@ -451,21 +491,29 @@ impl KillSwitch {
             )));
         }
 
-        // Enable pf if not already running (best-effort)
+        // Уже включенный PF может вернуть ошибку на повторный -e.
         let _ = Command::new("pfctl").args(["-e"]).status();
+        let status = Command::new("pfctl").args(["-s", "info"]).output()?;
+        if !status.status.success()
+            || !String::from_utf8_lossy(&status.stdout)
+                .lines()
+                .any(|line| line.starts_with("Status: Enabled"))
+        {
+            return Err(io::Error::other("kill-switch: PF не включен").into());
+        }
 
         // Inject anchor reference into running pf config if not present
-        let already = Command::new("sh")
-            .args(["-c", "pfctl -s all 2>/dev/null | grep -q aivpn_ks"])
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
+        let root_rules = Command::new("pfctl").args(["-s", "rules"]).output()?;
+        if !root_rules.status.success() {
+            return Err(io::Error::other("kill-switch: правила PF недоступны").into());
+        }
+        let already = macos_pf::anchor_is_first(&String::from_utf8_lossy(&root_rules.stdout));
         if !already {
-            let existing = std::fs::read_to_string("/etc/pf.conf").unwrap_or_default();
-            let with_anchor = format!("{}\nanchor \"aivpn_ks\"\n", existing);
+            let existing = std::fs::read_to_string("/etc/pf.conf")?;
+            let with_anchor = macos_pf::with_first_anchor(&existing);
             let ref_file = "/var/run/aivpn/aivpn_ks_ref.conf";
             let _ = std::fs::remove_file(ref_file);
-            let wrote = std::fs::OpenOptions::new()
+            std::fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
                 .mode(0o600)
@@ -474,18 +522,29 @@ impl KillSwitch {
                 .and_then(|mut f| {
                     use std::io::Write;
                     f.write_all(with_anchor.as_bytes())
-                })
-                .is_ok();
-            if wrote {
-                let _ = Command::new("pfctl").args(["-f", ref_file]).status();
+                })?;
+            if !Command::new("pfctl")
+                .args(["-f", ref_file])
+                .status()?
+                .success()
+            {
+                return Err(
+                    io::Error::other("kill-switch: не удалось подключить anchor PF").into(),
+                );
             }
         }
 
+        if let Some(guard) = &self.guard {
+            guard.set_firewall(true)?;
+        }
         Ok(())
     }
 
     #[cfg(target_os = "macos")]
     fn deactivate_impl(&self) {
+        if let Some(guard) = &self.guard {
+            let _ = guard.set_firewall(false);
+        }
         use std::process::Command;
         let _ = Command::new("pfctl")
             .args(["-a", "aivpn_ks", "-F", "rules"])
@@ -508,11 +567,20 @@ impl KillSwitch {
 
     #[cfg(target_os = "windows")]
     fn activate_impl(&self) -> Result<()> {
-        windows::activate(&self.tun_name, &self.server_ip).map_err(Error::Io)
+        windows::activate(&self.tun_name, &self.server_ip).map_err(Error::Io)?;
+        if let Some(guard) = &self.guard {
+            guard.set_firewall_peer_handler(Some(std::sync::Arc::new(|peer| {
+                windows::allow_transport_peer(peer).map_err(Error::Io)
+            })))?;
+        }
+        Ok(())
     }
 
     #[cfg(target_os = "windows")]
     fn deactivate_impl(&self) {
+        if let Some(guard) = &self.guard {
+            let _ = guard.set_firewall_peer_handler(None);
+        }
         if let Err(error) = windows::clear() {
             warn!("kill-switch cleanup failed: {error}");
         }

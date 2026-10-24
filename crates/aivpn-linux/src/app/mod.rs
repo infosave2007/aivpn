@@ -550,8 +550,14 @@ fn exit_node_choices(lang: &str, pool_nodes: &[PoolNode]) -> Vec<ExitNodeChoice>
         selection: ExitNodeSelection::Default,
         display: t(lang, "(default)").to_string(),
     }];
-    for n in pool_nodes {
+    for n in pool_nodes.iter().filter(|n| !n.revoked) {
         if let Some(addr) = n.address.as_ref().filter(|a| !a.trim().is_empty()) {
+            if choices
+                .iter()
+                .any(|choice| choice.selection == ExitNodeSelection::Node(addr.clone()))
+            {
+                continue;
+            }
             choices.push(ExitNodeChoice {
                 selection: ExitNodeSelection::Node(addr.clone()),
                 display: addr.clone(),
@@ -801,6 +807,7 @@ pub struct App {
     /// Server-assigned role cached by the daemon (0=User,1=Viewer,2=Admin),
     /// fetched fresh on every new Connected transition. `None` until loaded.
     admin_role: Option<u8>,
+    admin_generation: u64,
     admin_clients: Vec<ClientRecord>,
     admin_clients_loading: bool,
     admin_error: Option<String>,
@@ -866,6 +873,7 @@ pub struct App {
     /// per-client override elsewhere in this panel, applying this only
     /// takes effect after the server process restarts.
     server_settings_exit_node: String,
+    server_settings_exit_selected: bool,
     /// Set while an apply/confirm call is in flight — disables both Apply
     /// buttons and the Confirm button rather than allowing a second
     /// concurrent request.
@@ -1004,6 +1012,7 @@ impl App {
                 bootstrap_fallback: false,
                 admin_open: false,
                 admin_role: None,
+                admin_generation: 0,
                 admin_clients: Vec::new(),
                 admin_clients_loading: false,
                 admin_error: None,
@@ -1035,6 +1044,7 @@ impl App {
                 server_settings_mask_client: None,
                 server_settings_mask_id: None,
                 server_settings_exit_node: String::new(),
+                server_settings_exit_selected: false,
                 server_settings_busy: false,
                 server_settings_pending: None,
                 server_settings_countdown: 0,
@@ -1074,7 +1084,9 @@ impl App {
             // reconnect. `role` only needs the running daemon's local admin
             // socket — no connection key — so fetch it right away.
             if adopted_client.is_some() {
-                Task::perform(admin::get_role(), Message::AdminRoleLoaded)
+                session_task(admin::get_role(), |role| {
+                    Message::SessionReply(0, Box::new(Message::AdminRoleLoaded(role)))
+                })
             } else {
                 Task::none()
             },
@@ -1144,7 +1156,62 @@ impl App {
     }
 
     pub fn update(&mut self, msg: Message) -> Task<Message> {
+        let msg = match msg {
+            Message::SessionReply(generation, reply) => {
+                if generation != self.admin_generation {
+                    return Task::none();
+                }
+                *reply
+            }
+            other => other,
+        };
+        let task = self.update_inner(msg);
+        let generation = self.admin_generation;
+        task.map(move |reply| {
+            if reply.belongs_to_session() {
+                Message::SessionReply(generation, Box::new(reply))
+            } else {
+                reply
+            }
+        })
+    }
+
+    fn invalidate_session_views(&mut self) {
+        self.admin_generation = self.admin_generation.wrapping_add(1);
+        self.admin_role = None;
+        self.admin_open = false;
+        self.admin_clients.clear();
+        self.admin_clients_loading = false;
+        self.admin_error = None;
+        self.admin_busy_id = None;
+        self.admin_key_view = None;
+        self.admin_qr = None;
+        self.admin_qr_loading = None;
+        self.admin_pending_revoke = None;
+        self.admin_edit_id = None;
+        self.pool_nodes.clear();
+        self.pool_health = None;
+        self.pool_loading = false;
+        self.pool_error = None;
+        self.audit_entries.clear();
+        self.audit_verified = None;
+        self.audit_broken_at = None;
+        self.audit_loading = false;
+        self.audit_error = None;
+        self.server_settings_exit_selected = false;
+        self.server_settings_exit_node.clear();
+        self.server_settings_open = false;
+        self.server_settings_busy = false;
+        self.server_settings_pending = None;
+        self.server_settings_countdown = 0;
+        self.server_settings_error = None;
+        self.bench_running = false;
+        self.bench_result = None;
+    }
+
+    fn update_inner(&mut self, msg: Message) -> Task<Message> {
         match msg {
+            Message::SessionReply(..) => return Task::none(),
             Message::Connect => {
                 // 3c: a new connection attempt starts clean — any fallback
                 // badge from a previous session must not persist into this
@@ -1152,6 +1219,7 @@ impl App {
                 self.bootstrap_fallback = false;
                 if let Some(k) = self.storage.selected_key() {
                     let key = k.key.clone();
+                    self.invalidate_session_views();
                     // Kill any existing child before starting a new connection to
                     // avoid leaking a zombie VPN process when the user reconnects.
                     let mut guard = match self.child_handle.lock() {
@@ -1167,7 +1235,7 @@ impl App {
                         // reconnect path below.
                         self.pending_connect = true;
                         self.connection_key = None;
-                        return Task::perform(terminate_adopted_wait(pid, starttime), |_| {
+                        return session_task(terminate_adopted_wait(pid, starttime), |_| {
                             Message::OldClientReaped
                         });
                     }
@@ -1182,7 +1250,7 @@ impl App {
                         // Task — the UI thread is never blocked.
                         self.pending_connect = true;
                         self.connection_key = None;
-                        return Task::perform(
+                        return session_task(
                             terminate_child_wait(child, self.launched_kill_switch, true),
                             |_| Message::OldClientReaped,
                         );
@@ -1217,6 +1285,7 @@ impl App {
                 }
             }
             Message::Disconnect => {
+                self.invalidate_session_views();
                 self.pending_connect = false;
                 self.connection_key = None;
                 let reap_task = if let Some((pid, starttime)) = self.adopted_client.take() {
@@ -1226,7 +1295,7 @@ impl App {
                     // old client's late route restore / kill-switch clear
                     // would tear down the new session.
                     self.adopted_reap_in_flight = true;
-                    Task::perform(terminate_adopted_wait(pid, starttime), |_| {
+                    session_task(terminate_adopted_wait(pid, starttime), |_| {
                         Message::OldClientReaped
                     })
                 } else {
@@ -1249,6 +1318,11 @@ impl App {
                 return reap_task;
             }
             Message::StatusReceived(s) => {
+                if matches!(s, VpnStatus::Disconnected)
+                    && matches!(self.status, VpnStatus::Error(_))
+                {
+                    return Task::none();
+                }
                 // While a reconnect waits for the old client's reap, the old
                 // (cancelled) worker stream may still deliver stale statuses —
                 // including a stale Connected. Drop them ALL so a dead session
@@ -1304,6 +1378,7 @@ impl App {
                     }
                 }
                 if became_disconnected {
+                    self.invalidate_session_views();
                     self.admin_role = None;
                     self.admin_open = false;
                     self.admin_clients.clear();
@@ -1328,7 +1403,7 @@ impl App {
                     self.admin_clients.clear();
                     self.admin_clients_loading = false;
                     self.admin_error = None;
-                    return Task::perform(admin::get_role(), Message::AdminRoleLoaded);
+                    return session_task(admin::get_role(), Message::AdminRoleLoaded);
                 }
             }
             Message::BootstrapFallbackDetected => {
@@ -1344,7 +1419,7 @@ impl App {
                 self.logs_open = !self.logs_open;
             }
             Message::SaveLog => {
-                return Task::perform(
+                return session_task(
                     async {
                         rfd::AsyncFileDialog::new()
                             .set_file_name("aivpn-debug.log")
@@ -1364,6 +1439,7 @@ impl App {
             Message::SelectProfile(idx) => {
                 if idx < self.storage.keys.len() {
                     self.storage.selected = Some(idx);
+                    self.storage.save();
                 }
             }
             Message::ShowAddDialog => {
@@ -1663,7 +1739,7 @@ impl App {
                 };
                 self.recording_state = RecordingState::Active(svc.clone());
                 let binary = find_client_binary().ok();
-                return Task::perform(
+                return session_task(
                     async move {
                         if let Some(bin) = binary {
                             let _ = tokio::process::Command::new(&bin)
@@ -1679,7 +1755,7 @@ impl App {
             Message::StopRecording => {
                 self.recording_state = RecordingState::Stopping;
                 let binary = find_client_binary().ok();
-                return Task::perform(
+                return session_task(
                     async move {
                         if let Some(bin) = binary {
                             let _ = tokio::process::Command::new(&bin)
@@ -1742,7 +1818,7 @@ impl App {
                     .map(|k| k.key.clone())
                     .unwrap_or_default();
                 let binary = find_client_binary().ok();
-                return Task::perform(
+                return session_task(
                     async move {
                         let bin = binary?;
                         if key.is_empty() {
@@ -1756,6 +1832,9 @@ impl App {
                         // scrubs it from its own env right after parsing.
                         let out = tokio::process::Command::new(&bin)
                             .env("AIVPN_CONNECTION_KEY", &key)
+                            .env("AIVPN_ADMIN_TOKEN", admin::pinned_token()?)
+                            .env_remove("AIVPN_ADMIN_LISTEN")
+                            .kill_on_drop(true)
                             .args(["bench", "--duration", "5", "--json"])
                             .output()
                             .await
@@ -1766,11 +1845,13 @@ impl App {
                             let srv =
                                 extract_server_addr(&key).unwrap_or_else(|| "unknown".to_string());
                             Some(format!(
-                                "{srv}  P50: {:.0}ms  P95: {:.0}ms  Loss: {:.1}%  Q: {}%",
+                                "{srv}  P50: {:.0}ms  P95: {:.0}ms  Loss: {:.1}%  Q: {}%  ↑ {:.0} ↓ {:.0} kbps",
                                 v["latency_p50_ms"].as_f64().unwrap_or(0.0),
                                 v["latency_p95_ms"].as_f64().unwrap_or(0.0),
                                 v["packet_loss_pct"].as_f64().unwrap_or(0.0),
                                 v["quality_score"].as_u64().unwrap_or(0),
+                                v["throughput_up_kbps"].as_f64().unwrap_or(0.0),
+                                v["throughput_down_kbps"].as_f64().unwrap_or(0.0),
                             ))
                         } else {
                             let stderr = String::from_utf8_lossy(&out.stderr).to_string();
@@ -1804,7 +1885,7 @@ impl App {
                 {
                     self.admin_clients_loading = true;
                     self.admin_error = None;
-                    tasks.push(Task::perform(
+                    tasks.push(session_task(
                         admin::list_clients(),
                         Message::AdminClientsLoaded,
                     ));
@@ -1822,7 +1903,7 @@ impl App {
                     && !self.pool_loading
                 {
                     self.pool_loading = true;
-                    tasks.push(Task::perform(admin::pool_nodes(), Message::PoolNodesLoaded));
+                    tasks.push(session_task(admin::pool_nodes(), Message::PoolNodesLoaded));
                 }
                 return Task::batch(tasks);
             }
@@ -1836,7 +1917,7 @@ impl App {
                         && !self.admin_clients_loading
                     {
                         self.admin_clients_loading = true;
-                        tasks.push(Task::perform(
+                        tasks.push(session_task(
                             admin::list_clients(),
                             Message::AdminClientsLoaded,
                         ));
@@ -1851,7 +1932,7 @@ impl App {
                         && !self.pool_loading
                     {
                         self.pool_loading = true;
-                        tasks.push(Task::perform(admin::pool_nodes(), Message::PoolNodesLoaded));
+                        tasks.push(session_task(admin::pool_nodes(), Message::PoolNodesLoaded));
                     }
                     return Task::batch(tasks);
                 }
@@ -1870,7 +1951,7 @@ impl App {
             Message::AdminRefreshClients => {
                 self.admin_clients_loading = true;
                 self.admin_error = None;
-                return Task::perform(admin::list_clients(), Message::AdminClientsLoaded);
+                return session_task(admin::list_clients(), Message::AdminClientsLoaded);
             }
             Message::AdminClientsLoaded(result) => {
                 self.admin_clients_loading = false;
@@ -1904,18 +1985,19 @@ impl App {
                     expires_at: self.admin_new_expires.trim().to_string(),
                     exit_node: self.admin_new_exit_node.trim().to_string(),
                 };
-                return Task::perform(admin::add_client(args), Message::AdminAddClientResult);
+                return session_task(admin::add_client(args), Message::AdminAddClientResult);
             }
             Message::AdminAddClientResult(result) => {
                 self.admin_busy_id = None;
                 match result {
-                    Ok(client) => {
+                    Ok(outcome) => {
+                        let client = outcome.client;
                         self.admin_clients.push(client);
                         self.admin_new_name.clear();
                         self.admin_new_one_time = false;
                         self.admin_new_expires.clear();
                         self.admin_new_exit_node.clear();
-                        self.admin_error = None;
+                        self.admin_error = outcome.warning;
                     }
                     Err(e) => self.admin_error = Some(e),
                 }
@@ -1929,7 +2011,7 @@ impl App {
                     enabled: Some(enabled),
                     ..Default::default()
                 };
-                return Task::perform(
+                return session_task(
                     async move { admin::update_client(&id, args).await },
                     Message::AdminToggleEnabledResult,
                 );
@@ -1991,7 +2073,7 @@ impl App {
                             Some(exit_node)
                         }),
                     };
-                    return Task::perform(
+                    return session_task(
                         async move { admin::update_client(&id, args).await },
                         Message::AdminEditResult,
                     );
@@ -2019,7 +2101,7 @@ impl App {
                     return Task::none();
                 }
                 self.admin_busy_id = Some(id.clone());
-                return Task::perform(
+                return session_task(
                     async move {
                         let r = admin::reset_device(&id).await;
                         (id, r)
@@ -2034,7 +2116,7 @@ impl App {
                         self.admin_error = None;
                         self.push_log(format!("[admin] Device binding reset for {id}"));
                         self.admin_clients_loading = true;
-                        return Task::perform(admin::list_clients(), Message::AdminClientsLoaded);
+                        return session_task(admin::list_clients(), Message::AdminClientsLoaded);
                     }
                     Err(e) => self.admin_error = Some(e),
                 }
@@ -2051,7 +2133,7 @@ impl App {
                     return Task::none();
                 }
                 self.admin_busy_id = Some(id.clone());
-                return Task::perform(
+                return session_task(
                     async move {
                         let r = admin::revoke_client(&id).await;
                         (id, r)
@@ -2079,7 +2161,7 @@ impl App {
                     return Task::none();
                 }
                 self.admin_busy_id = Some(id.clone());
-                return Task::perform(
+                return session_task(
                     async move {
                         let r = admin::connection_key(&id).await;
                         (id, r)
@@ -2106,7 +2188,7 @@ impl App {
                 return iced::clipboard::write(text);
             }
             Message::AdminSaveKeyToFile => {
-                return Task::perform(
+                return session_task(
                     async {
                         rfd::AsyncFileDialog::new()
                             .set_file_name("aivpn-connection-key.txt")
@@ -2134,7 +2216,7 @@ impl App {
                     return Task::none();
                 };
                 self.admin_qr_loading = Some(id.clone());
-                return Task::perform(
+                return session_task(
                     async move {
                         let r = admin::qr_png(text).await;
                         (id, r)
@@ -2153,7 +2235,7 @@ impl App {
                 }
             }
             Message::AdminSaveQrToFile => {
-                return Task::perform(
+                return session_task(
                     async {
                         rfd::AsyncFileDialog::new()
                             .set_file_name("aivpn-connection-qr.png")
@@ -2179,8 +2261,8 @@ impl App {
                     self.pool_loading = true;
                     self.pool_error = None;
                     return Task::batch([
-                        Task::perform(admin::pool_nodes(), Message::PoolNodesLoaded),
-                        Task::perform(admin::pool_health(), Message::PoolHealthLoaded),
+                        session_task(admin::pool_nodes(), Message::PoolNodesLoaded),
+                        session_task(admin::pool_health(), Message::PoolHealthLoaded),
                     ]);
                 }
             }
@@ -2188,8 +2270,8 @@ impl App {
                 self.pool_loading = true;
                 self.pool_error = None;
                 return Task::batch([
-                    Task::perform(admin::pool_nodes(), Message::PoolNodesLoaded),
-                    Task::perform(admin::pool_health(), Message::PoolHealthLoaded),
+                    session_task(admin::pool_nodes(), Message::PoolNodesLoaded),
+                    session_task(admin::pool_health(), Message::PoolHealthLoaded),
                 ]);
             }
             Message::PoolNodesLoaded(result) => {
@@ -2216,13 +2298,13 @@ impl App {
                 if self.audit_open && self.audit_entries.is_empty() && !self.audit_loading {
                     self.audit_loading = true;
                     self.audit_error = None;
-                    return Task::perform(admin::audit_log(), Message::AuditLogLoaded);
+                    return session_task(admin::audit_log(), Message::AuditLogLoaded);
                 }
             }
             Message::AuditRefresh => {
                 self.audit_loading = true;
                 self.audit_error = None;
-                return Task::perform(admin::audit_log(), Message::AuditLogLoaded);
+                return session_task(admin::audit_log(), Message::AuditLogLoaded);
             }
             Message::AuditLogLoaded(result) => {
                 self.audit_loading = false;
@@ -2250,14 +2332,14 @@ impl App {
                     if self.admin_clients.is_empty() && !self.admin_clients_loading {
                         self.admin_clients_loading = true;
                         self.admin_error = None;
-                        tasks.push(Task::perform(
+                        tasks.push(session_task(
                             admin::list_clients(),
                             Message::AdminClientsLoaded,
                         ));
                     }
                     if self.pool_nodes.is_empty() && !self.pool_loading {
                         self.pool_loading = true;
-                        tasks.push(Task::perform(admin::pool_nodes(), Message::PoolNodesLoaded));
+                        tasks.push(session_task(admin::pool_nodes(), Message::PoolNodesLoaded));
                     }
                 }
                 return Task::batch(tasks);
@@ -2277,7 +2359,7 @@ impl App {
                         self.server_settings_busy = true;
                         self.server_settings_error = None;
                         self.server_settings_rolled_back = false;
-                        return Task::perform(
+                        return session_task(
                             admin::apply_config(ConfigSetting::ActiveMask { client, mask }),
                             |result| {
                                 Message::ServerSettingsApplyResult(
@@ -2289,13 +2371,25 @@ impl App {
                     }
                 }
             }
-            Message::ServerSettingsExitNodeChanged(s) => self.server_settings_exit_node = s,
-            Message::ServerSettingsExitNodePicked(choice) => match choice.selection {
-                ExitNodeSelection::Default => self.server_settings_exit_node.clear(),
-                ExitNodeSelection::Node(addr) => self.server_settings_exit_node = addr,
-                ExitNodeSelection::Custom => {}
-            },
+            Message::ServerSettingsExitNodeChanged(s) => {
+                self.server_settings_exit_selected = !s.trim().is_empty();
+                self.server_settings_exit_node = s;
+            }
+            Message::ServerSettingsExitNodePicked(choice) => {
+                self.server_settings_exit_selected = true;
+                match choice.selection {
+                    ExitNodeSelection::Default => self.server_settings_exit_node.clear(),
+                    ExitNodeSelection::Node(addr) => self.server_settings_exit_node = addr,
+                    ExitNodeSelection::Custom => {
+                        self.server_settings_exit_selected =
+                            !self.server_settings_exit_node.trim().is_empty()
+                    }
+                }
+            }
             Message::ServerSettingsApplyExitNode => {
+                if !self.server_settings_exit_selected {
+                    return Task::none();
+                }
                 if !self.server_settings_busy && self.server_settings_pending.is_none() {
                     self.server_settings_busy = true;
                     self.server_settings_error = None;
@@ -2306,7 +2400,7 @@ impl App {
                     } else {
                         Some(trimmed.to_string())
                     };
-                    return Task::perform(
+                    return session_task(
                         admin::apply_config(ConfigSetting::ExitNode(addr)),
                         |result| {
                             Message::ServerSettingsApplyResult(
@@ -2343,7 +2437,7 @@ impl App {
                     if let Some((token, _)) = self.server_settings_pending.clone() {
                         self.server_settings_busy = true;
                         self.server_settings_error = None;
-                        return Task::perform(
+                        return session_task(
                             admin::confirm_config(token),
                             Message::ServerSettingsConfirmResult,
                         );
@@ -2419,7 +2513,7 @@ impl App {
             Message::InstallBinaryUrlChanged(s) => self.install_binary_url = s,
             Message::InstallBinaryFileChanged(s) => self.install_binary_file = s,
             Message::InstallBinaryFileBrowse => {
-                return Task::perform(
+                return session_task(
                     async {
                         rfd::AsyncFileDialog::new()
                             .pick_file()
@@ -2441,7 +2535,7 @@ impl App {
             Message::InstallShowScript => {
                 self.install_script_open = true;
                 if self.install_script.is_none() {
-                    return Task::perform(
+                    return session_task(
                         install_wizard::fetch_script(),
                         Message::InstallScriptLoaded,
                     );
@@ -2470,7 +2564,7 @@ impl App {
                 };
                 self.install_probing = true;
                 self.install_error = None;
-                return Task::perform(
+                return session_task(
                     install_wizard::probe(host, port, user),
                     Message::InstallProbeResult,
                 );
@@ -2609,14 +2703,9 @@ impl App {
                         line.push_str(&format!(": {m}"));
                     }
                     self.install_log.push(line);
-                    if let Some(ck) = connection_key {
-                        self.install_connection_key = Some(ck.clone());
-                        // G-C1: auto-import — "install → immediately
-                        // connected as admin", no mandatory manual click.
-                        // Guarded so a re-delivered/duplicate marker line
-                        // can never add the same profile twice.
-                        if self.install_profile_imported.is_none() {
-                            self.import_installed_key(ck);
+                    if status == "ok" && matches!(step.as_str(), "done" | "client_done") {
+                        if let Some(ck) = connection_key {
+                            self.install_connection_key = Some(ck);
                         }
                     }
                 }
@@ -2625,6 +2714,11 @@ impl App {
                 self.install_running = false;
                 self.install_exit_code = Some(code);
                 self.install_target = None;
+                if code == 0 && self.install_profile_imported.is_none() {
+                    if let Some(key) = self.install_connection_key.clone() {
+                        self.import_installed_key(key);
+                    }
+                }
             }
             Message::InstallWizardSpawnError(e) => {
                 self.install_running = false;
@@ -3062,4 +3156,11 @@ impl App {
             self.log_lines.drain(0..excess);
         }
     }
+}
+
+fn session_task<A: Send + 'static>(
+    future: impl std::future::Future<Output = A> + Send + 'static,
+    mapper: impl FnOnce(A) -> Message + Send + 'static,
+) -> Task<Message> {
+    Task::perform(admin::pin_session(future), mapper)
 }

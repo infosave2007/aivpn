@@ -1664,7 +1664,8 @@ fn test_gateway_creation_with_neural() {
     let mask_dir = temp.path().join("masks");
     let _ = std::fs::create_dir_all(&mask_dir);
     let mut mask = webrtc_zoom_v3();
-    mask.sign(&ed25519_dalek::SigningKey::from_bytes(&[79; 32]));
+    mask.sign(&ed25519_dalek::SigningKey::from_bytes(&[79; 32]))
+        .unwrap();
     let json = serde_json::to_string_pretty(&mask).unwrap();
     std::fs::write(mask_dir.join(format!("{}.json", mask.mask_id)), &json).unwrap();
     std::fs::write(mask_dir.join(format!("{}.stats", mask.mask_id)), "{}").unwrap();

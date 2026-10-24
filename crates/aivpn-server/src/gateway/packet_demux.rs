@@ -163,10 +163,18 @@ impl super::Gateway {
             let gw = gateway.clone();
             tokio::spawn(async move {
                 while let Some(packet) = rx.recv().await {
-                    if let Err(e) = gw
-                        .handle_packet(&packet.packet_data, packet.client_addr)
+                    let result = if packet.masked {
+                        gw.handle_unmasked_packet(
+                            &packet.packet_data,
+                            packet.client_addr,
+                            packet.quic_inner,
+                        )
                         .await
-                    {
+                    } else {
+                        gw.handle_packet(&packet.packet_data, packet.client_addr)
+                            .await
+                    };
+                    if let Err(e) = result {
                         debug!(
                             "Worker {} packet error from {}: {}",
                             worker_id,
@@ -182,13 +190,23 @@ impl super::Gateway {
         // A2: pull datagrams in batches (recvmmsg on Linux) — one syscall per
         // up-to-64 packets instead of one per packet. Buffers are reused
         // across iterations; only the per-worker handoff copies.
-        let batch_io = crate::batch_io::BatchIo::new(socket.clone());
+        let batch_io = crate::batch_io::BatchIo::new(socket.raw());
         let mut slots: Vec<crate::batch_io::RecvSlot> = (0..crate::batch_io::MAX_BATCH)
             .map(|_| crate::batch_io::RecvSlot::new(MAX_PACKET_SIZE))
             .collect();
 
         loop {
-            match batch_io.recv_batch(&mut slots).await {
+            let received = tokio::select! {
+                payload = socket.decoded() => {
+                    if let Some((packet, peer, quic)) = payload {
+                        let index = gateway.worker_index_for_packet(&packet, peer, worker_count);
+                        let _ = worker_txs[index].try_send(QueuedPacket { packet_data: packet, client_addr: peer, masked: true, quic_inner: quic });
+                    }
+                    continue;
+                }
+                received = batch_io.recv_batch(&mut slots) => received,
+            };
+            match received {
                 Ok(filled) => {
                     for slot in &slots[..filled] {
                         let Some(client_addr) = slot.addr else {
@@ -220,6 +238,8 @@ impl super::Gateway {
                         let packet = QueuedPacket {
                             packet_data,
                             client_addr,
+                            masked: false,
+                            quic_inner: false,
                         };
 
                         // try_send, not send().await: awaiting a FULL worker

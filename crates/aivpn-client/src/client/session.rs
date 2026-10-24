@@ -5,7 +5,57 @@ mod initial_upload_tests {
     use super::*;
 
     #[tokio::test]
-    async fn max_mtu_data_before_hello_is_dropped_without_stopping_upload() {
+    async fn initial_retry_carries_ephemeral_and_advances_crypto() {
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        client.connect(server.local_addr().unwrap()).await.unwrap();
+        let keys = crypto::derive_initial_session_keys(&[7; 32], None, &[8; 32]);
+        let state = Arc::new(Mutex::new(UploadCryptoState {
+            keys: keys.clone(),
+            counter: 0,
+            seq: 0,
+            rekey_ack: VecDeque::new(),
+        }));
+        let mask = aivpn_common::mask::preset_masks::webrtc_zoom_v3();
+        let (_data_tx, data_rx) = mpsc::channel(8);
+        let (_control_tx, control_rx) = mpsc::channel(8);
+        let task = tokio::spawn(AivpnClient::spawn_upload(
+            data_rx,
+            control_rx,
+            aivpn_common::transport::udp_transport(client),
+            MimicryEngine::new(mask.clone()),
+            state.clone(),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(Mutex::new(None)),
+            Duration::from_secs(8),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU8::new(0)),
+            Arc::new(AtomicU64::new(8000)),
+            Arc::new(AtomicU64::new(0)),
+            Some([42; 32]),
+        ));
+        let mut nonces = Vec::new();
+        for _ in 0..3 {
+            let mut buf = [0; 2048];
+            let n = tokio::time::timeout(Duration::from_millis(1500), server.recv(&mut buf))
+                .await
+                .expect("Повтор init не должен ждать keepalive")
+                .unwrap();
+            let eph_offset = mask.eph_pub_offset as usize;
+            assert_eq!(&buf[eph_offset..eph_offset + 32], &[42; 32]);
+            let nonce_offset = eph_offset + 32;
+            assert!(n >= nonce_offset + 24);
+            let nonce = buf[nonce_offset..nonce_offset + 24].to_vec();
+            assert!(!nonces.contains(&nonce), "Nonce повторился");
+            nonces.push(nonce);
+        }
+        assert!(state.lock().unwrap().counter >= 3);
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn max_mtu_data_waits_for_hello_and_reassembles_with_fec() {
         let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let client = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         client.connect(server.local_addr().unwrap()).await.unwrap();
@@ -36,11 +86,12 @@ mod initial_upload_tests {
             Arc::new(Mutex::new(None)),
             Duration::from_secs(60),
             Arc::new(AtomicU64::new(0)),
-            2,
+            Arc::new(AtomicU8::new(2)),
             Arc::new(AtomicU64::new(60000)),
             Arc::new(AtomicU64::new(0)),
+            None,
         ));
-        // Оба начальных пакета - keepalive. Очередь DATA уже прочитана перед вторым.
+        // До Hello идут только управляющие сообщения, DATA остается в очереди.
         for _ in 0..2 {
             let kind = tokio::select! {
                 result = &mut task => panic!("Uploader остановился до Hello: {result:?}"),
@@ -57,25 +108,71 @@ mod initial_upload_tests {
         }
         data_tx.send(vec![0x45; 1280]).await.unwrap();
         data_tx.send(vec![0x45; 1280]).await.unwrap();
+        data_tx.send(vec![0x46; 1000]).await.unwrap();
+        data_tx.send(vec![0x46; 1000]).await.unwrap();
+        let mut reassembler = aivpn_common::fragment::Reassembler::default();
+        let mut restored = Vec::new();
+        let mut repairs = 0;
+        while restored.len() < 5 || repairs < 2 {
+            let (kind, payload) = recv_inner(&server, &established, &mask).await;
+            match kind {
+                InnerType::Fragment => {
+                    if let Some((kind, packet)) = reassembler
+                        .accept(&payload, std::time::Instant::now())
+                        .unwrap()
+                    {
+                        match kind {
+                            InnerType::Data => restored.push(packet),
+                            InnerType::FecRepair => {
+                                let repair = aivpn_common::fec::FecRepair::decode(&packet).unwrap();
+                                assert_eq!(repair.group_size, 2);
+                                let (left, right) = if repairs == 0 {
+                                    (vec![0x45; 1500], vec![0x45; 1280])
+                                } else {
+                                    (vec![0x45; 1280], vec![0x46; 1000])
+                                };
+                                assert_eq!(repair.recover(&left), {
+                                    let mut padded = right;
+                                    padded.resize(left.len(), 0);
+                                    padded
+                                });
+                                repairs += 1;
+                            }
+                            other => panic!("Unexpected fragmented type: {other:?}"),
+                        }
+                    }
+                }
+                InnerType::Data => restored.push(payload),
+                InnerType::FecRepair => repairs += 1,
+                InnerType::Control => {}
+                other => panic!("Неожиданный тип после Hello: {other:?}"),
+            }
+        }
         assert_eq!(
-            recv_kind(&server, &established, &mask).await,
-            InnerType::Data
+            restored,
+            vec![
+                vec![0x45; 1500],
+                vec![0x45; 1280],
+                vec![0x45; 1280],
+                vec![0x46; 1000],
+                vec![0x46; 1000]
+            ]
         );
-        assert_eq!(
-            recv_kind(&server, &established, &mask).await,
-            InnerType::Data
-        );
-        assert_eq!(
-            recv_kind(&server, &established, &mask).await,
-            InnerType::FecRepair
-        );
-        assert_eq!(sent.load(Ordering::Relaxed), 2560);
+        assert_eq!(sent.load(Ordering::Relaxed), 6060);
         assert!(!task.is_finished());
         task.abort();
         assert!(task.await.unwrap_err().is_cancelled());
     }
 
     async fn recv_kind(server: &UdpSocket, keys: &SessionKeys, mask: &MaskProfile) -> InnerType {
+        recv_inner(server, keys, mask).await.0
+    }
+
+    async fn recv_inner(
+        server: &UdpSocket,
+        keys: &SessionKeys,
+        mask: &MaskProfile,
+    ) -> (InnerType, Vec<u8>) {
         let mut buf = [0; 65536];
         let n = tokio::time::timeout(Duration::from_secs(2), server.recv(&mut buf))
             .await
@@ -102,9 +199,9 @@ mod initial_upload_tests {
             &buf[mask.mdh_len()..n],
         )
         .unwrap();
-        aivpn_common::protocol::InnerHeader::decode(&plain[2..])
-            .unwrap()
-            .inner_type
+        let padding = u16::from_le_bytes(plain[..2].try_into().unwrap()) as usize;
+        let header = aivpn_common::protocol::InnerHeader::decode(&plain[2..]).unwrap();
+        (header.inner_type, plain[6..plain.len() - padding].to_vec())
     }
 }
 
@@ -158,151 +255,16 @@ impl super::AivpnClient {
         // mTLS ClientCert is sent inside the ServerHello handler, after the PFS
         // ratchet completes, so it is protected by the ratcheted session keys.
 
-        // Spawn local IPC listener for CLI commands. Stored in AbortOnDrop so the task
-        // (and its bound UDP socket) is cancelled when run() returns. Without this,
-        // the orphaned task keeps 127.0.0.1:44301 bound across reconnect iterations,
-        // causing the next run() call to fail with "Address already in use".
-        // P2.3-desktop: the admin socket now also bridges in-tunnel `mgmt`
-        // calls (`AdminCommand::Mgmt`/`Role`/`Qr`) for the Windows egui /
-        // Linux iced GUIs, which shell out to this binary rather than
-        // embedding the crate — they drive the running daemon's tunnel over
-        // this same loopback socket via `aivpn-client mgmt`/`role`.
-        //
-        // `mgmt_call` is `&self` on `AivpnClient` and needs only two pieces
-        // of state, both cheaply `Clone`: `self.mgmt` (`MgmtClient`, an
-        // `Arc`-wrapped correlation table shared with `run()`'s inbound
-        // `MgmtResponse`/`Capabilities` handling) and the outbound
-        // `control_tx` sender already constructed above. Cloning those two
-        // into the admin task — rather than threading a full
-        // `Arc<AivpnClient>` through — avoids taking `&mut self` away from
-        // `run()`'s exclusive session loop for the task's lifetime.
-        let admin_mgmt = self.mgmt.clone();
-        let admin_control_tx = control_tx.clone();
-        let mut admin_task = if let Some((socket, admin_token)) = admin_binding {
-            AbortOnDrop(tokio::spawn(async move {
-                let mut replies = tokio::task::JoinSet::<(std::net::SocketAddr, String)>::new();
-                let mut buf = [0u8; 65536];
-                loop {
-                    let received = tokio::select! {
-                        result = socket.recv_from(&mut buf) => result,
-                        Some(Ok((addr, reply))) = replies.join_next(), if !replies.is_empty() => {
-                            let _ = socket.send_to(reply.as_bytes(), addr).await;
-                            continue;
-                        },
-                    };
-                    let (len, addr) = match received {
-                        Ok(value) => value,
-                        Err(error) => {
-                            warn!("Admin socket receive failed: {error}");
-                            break;
-                        }
-                    };
-                    if let Ok(raw) = std::str::from_utf8(&buf[..len]) {
-                        match raw.split_once(':').and_then(|(tok, rest)| {
-                            crate::record_cmd::tokens_match(tok, &admin_token)
-                                .then(|| rest.to_string())
-                        }) {
-                            Some(rest) => {
-                                match crate::record_cmd::parse_admin_command(&rest) {
-                                    Some(
-                                        cmd @ (crate::record_cmd::AdminCommand::RecordStart(_)
-                                        | crate::record_cmd::AdminCommand::RecordStop
-                                        | crate::record_cmd::AdminCommand::RecordStatus),
-                                    ) => {
-                                        // Preserve pre-existing behavior exactly:
-                                        // forward the raw command string to the main
-                                        // select loop (`admin_rx`), which owns the
-                                        // recording session state and its own
-                                        // fire-and-forget (no socket reply) handling.
-                                        let forwarded = match cmd {
-                                            crate::record_cmd::AdminCommand::RecordStart(
-                                                service,
-                                            ) => {
-                                                format!("record_start:{service}")
-                                            }
-                                            crate::record_cmd::AdminCommand::RecordStop => {
-                                                "record_stop".to_string()
-                                            }
-                                            crate::record_cmd::AdminCommand::RecordStatus => {
-                                                "record_status".to_string()
-                                            }
-                                            _ => unreachable!(),
-                                        };
-                                        let _ = admin_tx.send(forwarded).await;
-                                    }
-                                    Some(crate::record_cmd::AdminCommand::Role) => {
-                                        let reply = admin_mgmt.cached_role().to_string();
-                                        let _ = socket.send_to(reply.as_bytes(), addr).await;
-                                    }
-                                    Some(crate::record_cmd::AdminCommand::Qr(text)) => {
-                                        match crate::qr::png_for(&text) {
-                                            Ok(png) => {
-                                                let reply =
-                                                    crate::record_cmd::encode_body_b64(&png);
-                                                let _ =
-                                                    socket.send_to(reply.as_bytes(), addr).await;
-                                            }
-                                            Err(e) => {
-                                                warn!("admin qr command failed: {e}");
-                                            }
-                                        }
-                                    }
-                                    Some(crate::record_cmd::AdminCommand::Mgmt {
-                                        method,
-                                        path,
-                                        body,
-                                    }) => {
-                                        // Spawned so a slow/timed-out mgmt call (up to
-                                        // 10s, see `MgmtClient::mgmt_call`) never blocks
-                                        // this loop from servicing other admin-socket
-                                        // commands (record_*, other mgmt calls) meanwhile.
-                                        let mgmt = admin_mgmt.clone();
-                                        let control_tx = admin_control_tx.clone();
-                                        replies.spawn(async move {
-                                            let reply = match mgmt
-                                                .mgmt_call(
-                                                    &control_tx,
-                                                    method,
-                                                    &path,
-                                                    body,
-                                                    Duration::from_secs(10),
-                                                )
-                                                .await
-                                            {
-                                                Ok((status, resp_body)) => {
-                                                    crate::record_cmd::format_mgmt_reply(
-                                                        status, &resp_body,
-                                                    )
-                                                }
-                                                Err(e) => {
-                                                    warn!("admin mgmt command failed: {e}");
-                                                    // Status 0 is a synthetic sentinel (no
-                                                    // real HTTP-style status is ever < 100)
-                                                    // meaning the call itself failed locally
-                                                    // — control_tx closed, or no
-                                                    // `MgmtResponse` within the 10s
-                                                    // `mgmt_call` timeout — as opposed to a
-                                                    // real server-returned status. The CLI
-                                                    // (`aivpn-client mgmt`) treats 0 as a
-                                                    // hard failure (non-zero exit).
-                                                    crate::record_cmd::format_mgmt_reply(0, &[])
-                                                }
-                                            };
-                                            (addr, reply)
-                                        });
-                                    }
-                                    None => {
-                                        warn!("Rejected admin command: unparseable command");
-                                    }
-                                }
-                            }
-                            None => {
-                                warn!("Rejected admin command: missing or invalid auth token");
-                            }
-                        }
-                    }
-                }
-            }))
+        // Обе локальные службы завершаются вместе с текущей VPN-сессией.
+        let mut admin_task = if let Some((udp, tcp, token)) = admin_binding {
+            AbortOnDrop(tokio::spawn(crate::admin_ipc::serve(
+                udp,
+                tcp,
+                token,
+                self.mgmt.clone(),
+                control_tx.clone(),
+                admin_tx,
+            )))
         } else {
             AbortOnDrop(tokio::spawn(std::future::pending::<()>()))
         };
@@ -543,9 +505,13 @@ impl super::AivpnClient {
             upload_pending_mask,
             self.keepalive_interval,
             self.keepalive_sent_ms.clone(),
-            self.adaptive_level.fec_n(),
+            self.fec_group.clone(),
             self.keepalive_interval_ms.clone(),
             self.last_tx_ms.clone(),
+            Some(obfuscate_client_eph_pub(
+                &self.keypair,
+                &self.config.server_public_key,
+            )),
         ));
 
         // Main loop: download + shutdown + upload health
@@ -609,6 +575,7 @@ impl super::AivpnClient {
                         stats_task.abort();
                         break Ok(());
                     }
+                    if let Err(error) = self.send_mask_state_offer().await { break Err(error); }
                 }
 
                 // 3b: native OS network-change listener (see net_change.rs).
@@ -856,7 +823,7 @@ impl super::AivpnClient {
                     // ~20 s (keepalive stalled by doze/backpressure, or the
                     // server pushed a long interval), refresh the NAT mapping
                     // BEFORE it expires instead of reconnecting after. Satellite
-                    // is exempt, mirroring the keepalive cap exemption.
+                    // keeps its separate warmup policy.
                     if self.adaptive_level != AdaptiveLevel::Satellite
                         && tx_gap_ms >= NAT_WARMUP_AFTER.as_millis() as u64
                         && last_warmup.elapsed() >= KEEPALIVE_NAT_CAP
@@ -984,9 +951,10 @@ impl super::AivpnClient {
         pending_mask: Arc<Mutex<Option<aivpn_common::mask::MaskProfile>>>,
         keepalive_interval: Duration,
         keepalive_sent_ms: Arc<AtomicU64>,
-        fec_n: u8,
+        fec_group: Arc<AtomicU8>,
         keepalive_interval_ms: Arc<AtomicU64>,
         last_tx_ms: Arc<AtomicU64>,
+        initial_eph_pub: Option<[u8; 32]>,
     ) -> Result<()> {
         /// Wraps MimicryEngine to implement the shared PacketEncryptor trait.
         struct MimicryEncryptor {
@@ -998,11 +966,27 @@ impl super::AivpnClient {
             /// A4: shared with the RX watchdog — every encrypted outbound
             /// packet stamps this so silence detection knows the uplink is live.
             last_tx_ms: Arc<AtomicU64>,
-            fec_encoder: Option<aivpn_common::fec::FecEncoder>,
-            pending_fec: Option<Vec<u8>>,
+            fec: aivpn_common::fec::FecSender,
+            fec_group: Arc<AtomicU8>,
+            initial_eph_pub: Option<[u8; 32]>,
         }
 
         impl MimicryEncryptor {
+            fn queue_fec(&mut self, payload: &[u8]) {
+                let limit = self.engine.data_payload_limit(usize::MAX);
+                let mut state = self
+                    .upload_state
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                let keys = state.keys.clone();
+                self.fec.feed(payload, limit, |kind, payload| {
+                    let inner = build_inner_packet(kind, state.seq, payload);
+                    state.seq = state.seq.wrapping_add(1);
+                    self.engine
+                        .build_packet(&inner, &keys, &mut state.counter, None)
+                });
+            }
+
             fn check_mask(&mut self) {
                 if let Some(mask) = self
                     .pending_mask
@@ -1011,11 +995,46 @@ impl super::AivpnClient {
                     .take()
                 {
                     self.engine.update_mask(mask);
+                    self.fec.discard_pending();
                 }
             }
         }
 
         impl PacketEncryptor for MimicryEncryptor {
+            fn fec_metadata(&self, len: usize) -> Option<aivpn_common::fec::FecMetadata> {
+                self.fec.metadata_for(len)
+            }
+            fn feed_fragmented_data(&mut self, payload: &[u8]) {
+                self.queue_fec(payload);
+            }
+
+            fn max_data_payload(&mut self, datagram_limit: usize) -> usize {
+                self.fec.set_group(self.fec_group.load(Ordering::Relaxed));
+                self.check_mask();
+                self.engine.data_payload_limit(datagram_limit)
+            }
+            fn data_send_delay(&mut self) -> Duration {
+                self.check_mask();
+                self.engine.prepare_data_delay()
+            }
+            fn encrypt_mask_bootstrap(&mut self) -> Result<Vec<u8>> {
+                let mut state = self
+                    .upload_state
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                let payload = ControlPayload::Keepalive {
+                    send_ts: epoch_ms(),
+                }
+                .encode()?;
+                let inner = build_inner_packet(InnerType::Control, state.seq, &payload);
+                state.seq = state.seq.wrapping_add(1);
+                let keys = state.keys.clone();
+                self.engine
+                    .build_packet(&inner, &keys, &mut state.counter, None)
+            }
+            fn active_mask(&self) -> Option<&aivpn_common::mask::MaskProfile> {
+                Some(self.engine.mask())
+            }
             fn data_ready(&self) -> bool {
                 !self
                     .upload_state
@@ -1027,6 +1046,7 @@ impl super::AivpnClient {
             }
 
             fn encrypt_data(&mut self, payload: &[u8]) -> Result<Vec<u8>> {
+                self.fec.set_group(self.fec_group.load(Ordering::Relaxed));
                 self.check_mask();
                 self.last_tx_ms.store(epoch_ms(), Ordering::Relaxed);
                 let mut state = self.upload_state.lock().unwrap_or_else(|e| e.into_inner());
@@ -1038,27 +1058,12 @@ impl super::AivpnClient {
                     .build_packet(&inner, &keys, &mut state.counter, None)?;
                 self.engine.update_fsm();
 
-                // FEC: feed payload; if group complete, pre-encrypt repair datagram
-                if let Some(fec) = self.fec_encoder.as_mut() {
-                    if let Some(repair) = fec.feed(payload) {
-                        let repair_payload = repair.encode();
-                        let repair_inner =
-                            build_inner_packet(InnerType::FecRepair, state.seq, &repair_payload);
-                        state.seq = state.seq.wrapping_add(1);
-                        if let Ok(enc_repair) =
-                            self.engine
-                                .build_packet(&repair_inner, &keys, &mut state.counter, None)
-                        {
-                            self.pending_fec = Some(enc_repair);
-                        }
-                    }
-                }
-
+                drop(state);
                 Ok(pkt)
             }
 
             fn take_fec_repair(&mut self) -> Option<Vec<u8>> {
-                self.pending_fec.take()
+                self.fec.take_packet()
             }
 
             fn encrypt_fragment(&mut self, payload: &[u8]) -> Result<Vec<u8>> {
@@ -1104,12 +1109,23 @@ impl super::AivpnClient {
                 self.keepalive_sent_ms.store(now_ms, Ordering::Relaxed);
                 self.last_tx_ms.store(now_ms, Ordering::Relaxed);
                 let mut state = self.upload_state.lock().unwrap_or_else(|e| e.into_inner());
-                let keepalive = ControlPayload::Keepalive { send_ts: now_ms }.encode()?;
+                let keepalive = if state.keys.packet_cipher.is_initial() {
+                    ControlPayload::ClientHello {
+                        mask_id: self.engine.mask().mask_id.clone(),
+                    }
+                } else {
+                    ControlPayload::Keepalive { send_ts: now_ms }
+                }
+                .encode()?;
                 let inner = build_inner_packet(InnerType::Control, state.seq, &keepalive);
                 state.seq = state.seq.wrapping_add(1);
                 let keys = state.keys.clone();
+                let eph = self
+                    .initial_eph_pub
+                    .as_ref()
+                    .filter(|_| keys.packet_cipher.is_initial());
                 self.engine
-                    .build_packet(&inner, &keys, &mut state.counter, None)
+                    .build_packet(&inner, &keys, &mut state.counter, eph)
             }
 
             fn on_data_sent(&mut self, payload_len: usize) {
@@ -1132,17 +1148,13 @@ impl super::AivpnClient {
             pending_mask,
             keepalive_sent_ms,
             last_tx_ms,
-            fec_encoder: if fec_n > 0 {
-                // 1500 == MAX_PACKET_SIZE. TunnelConfig::from_network_config
-                // and Tunnel::apply_network_config both clamp the (possibly
-                // server-pushed) MTU to this same bound before it's ever
-                // applied to the TUN device, so no payload fed here can
-                // legitimately exceed it — see the comments there.
-                Some(aivpn_common::fec::FecEncoder::new(fec_n, MAX_PACKET_SIZE))
-            } else {
-                None
+            fec: {
+                let mut fec = aivpn_common::fec::FecSender::default();
+                fec.set_group(fec_group.load(Ordering::Relaxed));
+                fec
             },
-            pending_fec: None,
+            fec_group,
+            initial_eph_pub,
         };
         let config = UploadConfig {
             keepalive_interval,
@@ -1263,6 +1275,8 @@ impl super::AivpnClient {
                 return Err(primary_err);
             }
         };
+        let (received, span) = self.recv_window.observation_counts();
+        self.quality_tracker.record_window(received, span);
         self.process_decoded(decoded).await
     }
 

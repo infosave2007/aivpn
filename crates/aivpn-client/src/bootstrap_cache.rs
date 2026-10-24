@@ -7,9 +7,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 
 use aivpn_common::error::{Error, Result};
-use aivpn_common::mask::{
-    current_unix_secs, derive_bootstrap_candidates, BootstrapDescriptor, MaskProfile,
-};
+use aivpn_common::mask::{current_unix_secs, BootstrapDescriptor, MaskProfile};
 
 /// Sticky last-known-good mask (client). Set on the first real DATA RX of a
 /// session and reused in AUTO mode across reconnects instead of re-deriving from
@@ -24,6 +22,7 @@ pub static LAST_GOOD_MASK: Mutex<Option<MaskProfile>> = Mutex::new(None);
 /// mask that keeps getting throttled is abandoned (LAST_GOOD_MASK cleared) and
 /// AUTO explores a different one, instead of looping on it forever.
 static DATA_STALL_STREAK: AtomicU32 = AtomicU32::new(0);
+static DATA_EXPLORATION_ROUND: AtomicU32 = AtomicU32::new(0);
 /// A session that stayed up at least this long is a working mask; a later stall
 /// is a transient hiccup, so the streak resets and the mask stays sticky.
 const HEALTHY_SESSION_MIN: Duration = Duration::from_secs(45);
@@ -42,6 +41,7 @@ pub fn note_data_stall_and_maybe_explore(established: Instant) {
     if n >= DATA_STALL_EXPLORE_THRESHOLD {
         *LAST_GOOD_MASK.lock().unwrap_or_else(|e| e.into_inner()) = None;
         DATA_STALL_STREAK.store(0, Ordering::Relaxed);
+        DATA_EXPLORATION_ROUND.fetch_add(1, Ordering::Relaxed);
         tracing::warn!(
             "sticky mask produced {n} short data-stall sessions — clearing it so auto-mask can try a different mask"
         );
@@ -50,40 +50,6 @@ pub fn note_data_stall_and_maybe_explore(established: Instant) {
 
 const CACHE_FILE_NAME: &str = "bootstrap_descriptors.json";
 const MAX_CACHED_DESCRIPTORS: usize = 8;
-
-/// Bootstrap descriptor ids excluded from `select_initial_mask` for the
-/// lifetime of this process. `production-secure` builds must never fall back
-/// to an unsigned builtin mask, but without any resilience net a cached
-/// descriptor whose signer rotated its key (or an epoch the server no longer
-/// retains) wedges the client on the same dead handshake forever — selection
-/// is otherwise a deterministic newest-`created_at`-first pick. Excluding a
-/// proven-unmatchable descriptor id (without deleting it from disk — a
-/// multi-epoch server may still accept it later) lets selection advance to
-/// the next-newest still-valid SIGNED descriptor instead. See main.rs's
-/// `#[cfg(feature = "production-secure")]` handshake-fallback block.
-static EXCLUDED_DESCRIPTOR_IDS: Mutex<Vec<String>> = Mutex::new(Vec::new());
-
-/// Mark a descriptor id as unmatchable for this run's `select_initial_mask`.
-/// Idempotent. Returns `true` if this was a new exclusion.
-pub fn exclude_descriptor(descriptor_id: &str) -> bool {
-    let mut ids = EXCLUDED_DESCRIPTOR_IDS
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    if ids.iter().any(|id| id == descriptor_id) {
-        false
-    } else {
-        ids.push(descriptor_id.to_string());
-        true
-    }
-}
-
-fn is_excluded(descriptor_id: &str) -> bool {
-    EXCLUDED_DESCRIPTOR_IDS
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .iter()
-        .any(|id| id == descriptor_id)
-}
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct BootstrapCacheFile {
@@ -117,23 +83,42 @@ pub fn load_descriptors() -> Vec<BootstrapDescriptor> {
     descriptors
 }
 
-pub fn select_initial_mask(preshared_key: Option<&[u8; 32]>) -> Option<MaskProfile> {
-    let now = current_unix_secs();
-    for descriptor in load_descriptors() {
-        if is_excluded(&descriptor.descriptor_id) {
-            continue;
-        }
-        if !descriptor.is_valid_at(now) {
-            continue;
-        }
-        if let Some(mask) = derive_bootstrap_candidates(&descriptor, preshared_key)
-            .into_iter()
-            .next()
-        {
-            return Some(mask);
-        }
+pub fn select_initial_mask_for_attempt(
+    preshared_key: Option<&[u8; 32]>,
+    fail_streak: u32,
+    trusted_key: Option<&[u8; 32]>,
+) -> Option<MaskProfile> {
+    select_cached_candidate(
+        &load_descriptors(),
+        preshared_key,
+        fail_streak,
+        trusted_key,
+        DATA_EXPLORATION_ROUND.load(Ordering::Relaxed),
+    )
+}
+
+fn select_cached_candidate(
+    descriptors: &[BootstrapDescriptor],
+    preshared_key: Option<&[u8; 32]>,
+    fail_streak: u32,
+    trusted_key: Option<&[u8; 32]>,
+    exploration_round: u32,
+) -> Option<MaskProfile> {
+    #[cfg(feature = "production-secure")]
+    if trusted_key.is_none() {
+        return None;
     }
-    None
+    // Общий файл может содержать профили разных серверов. Проверка при
+    // записи не заменяет проверку при чтении с ключом текущего подключения.
+    let trusted: Vec<_> = descriptors
+        .iter()
+        .filter(|descriptor| validate_descriptor_signature(descriptor, trusted_key).is_ok())
+        .cloned()
+        .collect();
+    let attempt = fail_streak.saturating_add(
+        exploration_round.saturating_mul(aivpn_common::mask::HANDSHAKE_FALLBACK_THRESHOLD),
+    );
+    aivpn_common::mask::bootstrap_candidate_for_attempt(&trusted, preshared_key, attempt)
 }
 
 /// Advisory file lock guarding `store_descriptor`'s read-modify-write of the
@@ -346,6 +331,84 @@ mod tests {
             kdf_salt: [0u8; 32],
             signature: [0u8; 64],
         }
+    }
+
+    #[test]
+    fn repeated_short_data_stalls_advance_the_signed_candidate() {
+        use ed25519_dalek::Signer;
+        let previous_round = DATA_EXPLORATION_ROUND.swap(0, Ordering::Relaxed);
+        let previous_streak = DATA_STALL_STREAK.swap(0, Ordering::Relaxed);
+        let previous_sticky = LAST_GOOD_MASK.lock().unwrap().take();
+        let signing = ed25519_dalek::SigningKey::from_bytes(&[43; 32]);
+        let key = signing.verifying_key().to_bytes();
+        let mut descriptor = make_desc();
+        descriptor.base_mask_ids = vec!["webrtc_zoom_v3".into()];
+        descriptor.candidate_count = 4;
+        descriptor.signature = signing.sign(&descriptor.signing_bytes()).to_bytes();
+        let descriptors = [descriptor];
+        let first = select_cached_candidate(&descriptors, None, 0, Some(&key), 0).unwrap();
+        *LAST_GOOD_MASK.lock().unwrap() = Some(first.clone());
+        for _ in 0..DATA_STALL_EXPLORE_THRESHOLD {
+            note_data_stall_and_maybe_explore(Instant::now() - Duration::from_secs(5));
+        }
+        let next = select_cached_candidate(
+            &descriptors,
+            None,
+            0,
+            Some(&key),
+            DATA_EXPLORATION_ROUND.load(Ordering::Relaxed),
+        )
+        .unwrap();
+        assert_ne!(first.mask_id, next.mask_id);
+        assert!(LAST_GOOD_MASK.lock().unwrap().is_none());
+        DATA_EXPLORATION_ROUND.store(previous_round, Ordering::Relaxed);
+        DATA_STALL_STREAK.store(previous_streak, Ordering::Relaxed);
+        *LAST_GOOD_MASK.lock().unwrap() = previous_sticky;
+    }
+
+    #[test]
+    fn cached_selection_rechecks_the_current_server_key() {
+        use ed25519_dalek::Signer;
+        let first_key = ed25519_dalek::SigningKey::from_bytes(&[41; 32]);
+        let second_key = ed25519_dalek::SigningKey::from_bytes(&[42; 32]);
+        let mut first = make_desc();
+        first.descriptor_id = "server-first".into();
+        first.base_mask_ids = vec!["webrtc_zoom_v3".into()];
+        first.signature = first_key.sign(&first.signing_bytes()).to_bytes();
+        let mut second = first.clone();
+        second.descriptor_id = "server-second".into();
+        second.signature = second_key.sign(&second.signing_bytes()).to_bytes();
+        let descriptors = vec![second, first];
+        let candidate = select_cached_candidate(
+            &descriptors,
+            None,
+            0,
+            Some(&first_key.verifying_key().to_bytes()),
+            0,
+        )
+        .unwrap();
+        assert!(candidate.mask_id.starts_with("bootstrap:server-first:"));
+        let candidate = select_cached_candidate(
+            &descriptors,
+            None,
+            999,
+            Some(&second_key.verifying_key().to_bytes()),
+            0,
+        )
+        .unwrap();
+        assert!(candidate.mask_id.starts_with("bootstrap:server-second:"));
+        let mut forged = descriptors[0].clone();
+        forged.signature[0] ^= 1;
+        assert!(select_cached_candidate(
+            &[forged],
+            None,
+            0,
+            Some(&second_key.verifying_key().to_bytes()),
+            0
+        )
+        .is_none());
+        #[cfg(feature = "production-secure")]
+        assert!(select_cached_candidate(&descriptors, None, 0, None, 0).is_none());
     }
 
     #[test]

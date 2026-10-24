@@ -1,6 +1,7 @@
 #![cfg(unix)]
 
-use std::net::UdpSocket;
+use std::io::{Read, Write};
+use std::net::{TcpListener, UdpSocket};
 use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
@@ -24,7 +25,8 @@ fn cli_selects_token_and_recording_status_for_each_instance() {
     std::fs::create_dir_all(&private).unwrap();
     let mut daemons = Vec::new();
     for role in [1, 2] {
-        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let tcp = TcpListener::bind("127.0.0.1:0").unwrap();
+        let socket = UdpSocket::bind(tcp.local_addr().unwrap()).unwrap();
         socket
             .set_read_timeout(Some(Duration::from_secs(10)))
             .unwrap();
@@ -33,32 +35,39 @@ fn cli_selects_token_and_recording_status_for_each_instance() {
         std::fs::write(private.join(format!("admin-{}.token", addr.port())), &token).unwrap();
         let status = private.join(format!("admin-{}.recording.status", addr.port()));
         let task = std::thread::spawn(move || {
-            let mut buf = [0u8; 2048];
-            for expected in ["role", "record_status"] {
-                let (len, peer) = socket.recv_from(&mut buf).unwrap();
-                assert_eq!(&buf[..len], format!("{token}:{expected}").as_bytes());
-                if expected == "role" {
-                    // Ответ с другого порта не должен подменить ответ выбранного демона.
-                    let stranger = UdpSocket::bind("127.0.0.1:0").unwrap();
-                    stranger.send_to(b"99", peer).unwrap();
-                    std::thread::sleep(Duration::from_millis(20));
-                    socket.send_to(role.to_string().as_bytes(), peer).unwrap();
-                } else {
-                    let snapshot = serde_json::json!({
-                        "can_record": true,
-                        "state": "recording",
-                        "service": format!("instance-{role}"),
-                        "message": null,
-                        "mask_id": null,
-                        "confidence": null,
-                        "updated_at_ms": 1
-                    });
-                    assert!(aivpn_client::secure_write::write_status_best_effort(
-                        &status,
-                        snapshot.to_string().as_bytes()
-                    ));
-                }
-            }
+            let (mut stream, _) = tcp.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            let mut header = [0; 4];
+            stream.read_exact(&mut header).unwrap();
+            let size = u32::from_be_bytes(header) as usize;
+            assert!(size < 2048);
+            let mut raw = vec![0; size];
+            stream.read_exact(&mut raw).unwrap();
+            assert_eq!(raw, format!("{token}:role").as_bytes());
+            let reply = role.to_string();
+            stream
+                .write_all(&(reply.len() as u32).to_be_bytes())
+                .unwrap();
+            stream.write_all(reply.as_bytes()).unwrap();
+            drop(stream);
+            let mut buf = [0; 2048];
+            let (len, _) = socket.recv_from(&mut buf).unwrap();
+            assert_eq!(&buf[..len], format!("{token}:record_status").as_bytes());
+            let snapshot = serde_json::json!({
+                "can_record": true,
+                "state": "recording",
+                "service": format!("instance-{role}"),
+                "message": null,
+                "mask_id": null,
+                "confidence": null,
+                "updated_at_ms": 1
+            });
+            assert!(aivpn_client::secure_write::write_status_best_effort(
+                &status,
+                snapshot.to_string().as_bytes()
+            ));
         });
         daemons.push((role, addr.to_string(), task));
     }

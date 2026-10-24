@@ -6,6 +6,9 @@
 extern "C" {
 #endif
 
+// Диагностика активной сессии. Вызывать в фоне с буфером от 4096 байт.
+intptr_t aivpn_run_benchmark(uint8_t *out_buf, size_t out_cap);
+
 /// Callback invoked from Rust when the VPN tunnel is ready (handshake complete).
 /// @param host  NUL-terminated server hostname (valid only for the duration of the callback).
 /// @param ctx   Opaque pointer passed back from aivpn_run_tunnel.

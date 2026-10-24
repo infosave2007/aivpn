@@ -16,8 +16,9 @@ use crate::crypto::{
     self, encrypt_session_payload, PacketDirection, SessionKeys, POLY1305_TAG_SIZE, TAG_SIZE,
 };
 use crate::error::Result;
-use crate::fec::FecEncoder;
+use crate::fec::FecSender;
 use crate::mask::{IATDistribution, MaskProfile, PaddingStrategy, SizeDistribution, SpoofProtocol};
+#[cfg(test)]
 use crate::mimic_protocol::MimicProtocol;
 use crate::protocol::{ControlPayload, InnerType, MAX_PACKET_SIZE};
 use crate::upload_pipeline::PacketEncryptor;
@@ -45,6 +46,21 @@ pub struct MimicryEngine {
     mask: MaskProfile,
     state: MimicryState,
     rng: StdRng,
+    prepared_data: Option<(u16, Duration)>,
+}
+
+pub fn data_payload_limit(mask: &MaskProfile, datagram_limit: usize) -> usize {
+    let mdh_len = mask.mdh_len();
+    let budget = if crate::mask_io::needs_state(mask) {
+        crate::mask_io::MAX_QUIC_INNER
+    } else if crate::mask_io::uses_rtc(mask) {
+        crate::mask_io::rtc_inner_budget(mask)
+    } else {
+        SAFE_OUTER_PACKET_BUDGET.min(MAX_PACKET_SIZE)
+    };
+    budget.min(datagram_limit).saturating_sub(
+        mask.packet_framing(mdh_len).prefix_len() + mdh_len + 2 + 4 + POLY1305_TAG_SIZE + 6,
+    )
 }
 
 impl MimicryEngine {
@@ -62,6 +78,7 @@ impl MimicryEngine {
                 pending_joint_iat: None,
             },
             rng: StdRng::from_entropy(),
+            prepared_data: None,
         }
     }
 
@@ -69,9 +86,15 @@ impl MimicryEngine {
         &self.mask
     }
 
+    /// Учитывает заголовки, AEAD и выравнивание, включая три байта FEC repair.
+    pub fn data_payload_limit(&self, datagram_limit: usize) -> usize {
+        data_payload_limit(&self.mask, datagram_limit)
+    }
+
     pub fn update_mask(&mut self, new_mask: MaskProfile) {
         debug!("Updating mask to {}", new_mask.mask_id);
         self.mask = new_mask;
+        self.prepared_data = None;
         self.state = MimicryState {
             current_state: self.mask.initial_state(),
             packets_in_state: 0,
@@ -84,15 +107,16 @@ impl MimicryEngine {
     }
 
     pub fn sample_packet_size(&mut self) -> u16 {
-        // R3: a joint size↔IAT model (present only when the recording showed
-        // material correlation) supersedes the independent marginals AND the FSM
-        // per-state override — draw (size, iat) together and stash the IAT for
-        // the paired sample_iat call so their correlation survives on the wire.
-        if let Some(ref joint) = self.mask.size_iat_joint {
-            let (size, iat) = joint.sample(&mut self.rng);
-            self.state.pending_joint_iat = Some(iat);
-            return size;
+        // Общая joint-модель действует вне состояний с явными overrides.
+        // Иначе параметры активного состояния никогда не попадут на провод.
+        if self.state.size_override.is_none() && self.state.iat_override.is_none() {
+            if let Some(ref joint) = self.mask.size_iat_joint {
+                let (size, iat) = joint.sample(&mut self.rng);
+                self.state.pending_joint_iat = Some(iat);
+                return size;
+            }
         }
+        self.state.pending_joint_iat = None;
         if let Some(ref d) = self.state.size_override {
             d.sample(&mut self.rng)
         } else {
@@ -112,6 +136,29 @@ impl MimicryEngine {
         }
     }
 
+    /// Размер и IAT выбираются одной парой до отправки данных.
+    /// Управляющий пакет не должен израсходовать подготовленный размер.
+    pub fn prepare_data_delay(&mut self) -> Duration {
+        if let Some((_, delay)) = self.prepared_data {
+            return delay;
+        }
+        let target = self.sample_packet_size();
+        let milliseconds = self.sample_iat();
+        let delay = if milliseconds.is_finite() {
+            Duration::from_secs_f64(milliseconds.clamp(0.0, 1000.0) / 1000.0)
+        } else {
+            Duration::from_millis(20)
+        };
+        self.prepared_data = Some((target, delay));
+        delay
+    }
+
+    /// Сервер использует ту же выборку, не меняя заголовок и ключи сессии.
+    pub fn take_data_shape(&mut self) -> (u16, Duration) {
+        self.prepare_data_delay();
+        self.prepared_data.take().unwrap()
+    }
+
     pub fn calc_padding(&mut self, payload_size: usize, target_size: u16) -> u16 {
         let strategy = self
             .state
@@ -119,6 +166,10 @@ impl MimicryEngine {
             .as_ref()
             .unwrap_or(&self.mask.padding_strategy);
         strategy.calc_padding(payload_size, target_size, &mut self.rng)
+    }
+
+    pub fn padding_override(&self) -> Option<&PaddingStrategy> {
+        self.state.padding_override.as_ref()
     }
 
     pub async fn apply_timing(&mut self) {
@@ -130,25 +181,24 @@ impl MimicryEngine {
 
     pub fn update_fsm(&mut self) {
         let duration_ms = self.state.state_start.elapsed().as_millis() as u64;
-        let (new_state, size_override, iat_override, padding_override) =
-            self.mask.process_transition(
-                self.state.current_state,
-                self.state.packets_in_state,
-                duration_ms,
-            );
-        if new_state != self.state.current_state {
+        if let Some(transition) = self.mask.matching_transition(
+            self.state.current_state,
+            self.state.packets_in_state,
+            duration_ms,
+        ) {
             debug!(
                 "FSM transition: {} -> {}",
-                self.state.current_state, new_state
+                self.state.current_state, transition.next_state
             );
-            self.state.current_state = new_state;
+            self.state.current_state = transition.next_state;
             self.state.packets_in_state = 0;
             self.state.state_start = Instant::now();
-            self.state.size_override = size_override;
-            self.state.iat_override = iat_override;
-            self.state.padding_override = padding_override;
+            self.state.size_override = transition.size_override.clone();
+            self.state.iat_override = transition.iat_override.clone();
+            self.state.padding_override = transition.padding_override.clone();
+            self.state.pending_joint_iat = None;
         }
-        self.state.packets_in_state += 1;
+        self.state.packets_in_state = self.state.packets_in_state.saturating_add(1);
     }
 
     pub fn build_mdh(&mut self, eph_pub: Option<&[u8; 32]>) -> Vec<u8> {
@@ -215,7 +265,12 @@ impl MimicryEngine {
             TAG_SIZE
         };
 
-        let target_size = self.sample_packet_size();
+        let target_size = if plaintext.first() == Some(&(InnerType::Data as u8)) {
+            self.prepared_data.take().map(|(target, _)| target)
+        } else {
+            None
+        }
+        .unwrap_or_else(|| self.sample_packet_size());
         let envelope_overhead = crypto::session_payload_overhead(keys);
         let base_overhead = tag_prefix_len
             + mdh.len()
@@ -223,63 +278,33 @@ impl MimicryEngine {
             + 2
             + plaintext.len()
             + POLY1305_TAG_SIZE;
-        let requested_pad_len = self.calc_padding(base_overhead, target_size);
-        let packet_budget = SAFE_OUTER_PACKET_BUDGET.min(MAX_PACKET_SIZE);
-
-        let proto = MimicProtocol::for_spoof(self.mask.spoof_protocol);
-        // The constructed (QUIC) layout hard-codes the resonance tag at DCID
-        // offset 6 (`quic_initial::QUIC_TAG_OFFSET`) — and so does the
-        // server's `parse_quic_initial`, while its tag LOOKUP honours the
-        // mask's own `tag_offset`. Deciding on `spoof_protocol` alone let an
-        // operator QUIC mask with `tag_offset != 6` shape the handshake by one
-        // layout and the data by another — a silent break. Only masks that
-        // explicitly declare the DCID tag offset take the constructed path;
-        // anything else falls back to the embedded/legacy `[mdh][ciphertext]`
-        // layout, which both wire ends derive from the SAME MaskProfile
-        // methods (`uses_embedded_layout` / `effective_tag_prefix_len`).
-        let constructed_ok = proto.is_constructed()
-            && self.mask.embedded_tag_offset() == Some(crate::quic_initial::QUIC_TAG_OFFSET);
-        if proto.is_constructed() && !constructed_ok {
-            debug!(
-                "mask {} is QUIC-constructed but declares tag_offset {:?} (!= {}) — \
-                 falling back to the embedded/legacy layout",
-                self.mask.mask_id,
-                self.mask.embedded_tag_offset(),
-                crate::quic_initial::QUIC_TAG_OFFSET,
-            );
-        }
-
-        // Budget correction for *constructed* (QUIC) masks. A QUIC DATA packet
-        // (`eph_pub` is None → the `proto.emit()` path below is taken) is NOT
-        // emitted as `[mdh][ciphertext]`: `emit()` discards the mdh and wraps the
-        // ciphertext in a whole RFC 9001 Initial, adding `quic_initial_overhead()`
-        // (~92 B: long header + CRYPTO(ClientHello) frame + AEAD tag) ON TOP.
-        // `base_overhead` (sized for `[mdh][ciphertext]`) never reserved those
-        // bytes, so a near-MTU QUIC packet could pad up to `packet_budget` and
-        // then overflow it by the Initial overhead after `emit()` → fragmentation
-        // (and a DPI anomaly, since real QUIC does PMTUD). Reserve the Initial
-        // overhead here so the FINAL emitted datagram — not the pre-wrap packet —
-        // stays within `packet_budget`. The final QUIC datagram size (before the
-        // 1200-byte QUIC floor) is `quic_overhead + ciphertext_len`, where
-        // `ciphertext_len = 2 + plaintext.len() + pad_len + POLY1305_TAG_SIZE`;
-        // solving `<= packet_budget` for `pad_len` gives this reserved overhead.
-        let emits_quic = eph_pub.is_none() && constructed_ok;
-        let budget_overhead = if emits_quic {
-            crate::quic_initial::quic_initial_overhead()
-                + envelope_overhead
-                + 2
-                + plaintext.len()
-                + POLY1305_TAG_SIZE
+        let carrier_overhead = crate::mask_io::carrier_overhead(&self.mask);
+        let requested_pad_len = self.calc_padding(base_overhead + carrier_overhead, target_size);
+        // Внешний QUIC собирает движок состояния маски. Здесь остается
+        // внутренний пакет и резерв для его DATAGRAM-кадра и AEAD QUIC.
+        let packet_budget = if crate::mask_io::needs_state(&self.mask) {
+            if keys.packet_cipher.is_initial()
+                || plaintext.first() == Some(&(InnerType::Control as u8))
+            {
+                512
+            } else {
+                crate::mask_io::MAX_QUIC_INNER
+            }
+        } else if crate::mask_io::uses_rtc(&self.mask) {
+            crate::mask_io::rtc_inner_budget(&self.mask)
         } else {
-            base_overhead
+            SAFE_OUTER_PACKET_BUDGET.min(MAX_PACKET_SIZE)
         };
-        if keys.packet_cipher.is_initial() && budget_overhead > packet_budget {
+        let budget_overhead = base_overhead;
+        if budget_overhead > packet_budget {
             return Err(crate::error::Error::InvalidPacket(
-                "InitialV2 packet exceeds outer budget",
+                "Packet exceeds mask budget",
             ));
         }
         let max_pad_len = packet_budget.saturating_sub(budget_overhead) as u16;
-        let pad_len = requested_pad_len.min(max_pad_len);
+        let pad_len = self
+            .mask
+            .wire_padding(budget_overhead, requested_pad_len, max_pad_len)?;
 
         let mut padded = Vec::with_capacity(2 + plaintext.len() + pad_len as usize);
         padded.extend_from_slice(&pad_len.to_le_bytes());
@@ -305,23 +330,6 @@ impl MimicryEngine {
             &padded,
         )?;
 
-        // Constructed protocols (QUIC) build the WHOLE datagram from the tag +
-        // ciphertext (a crypto-built decoy header coalesced with aivpn's real
-        // ciphertext), bypassing the `[mdh][ciphertext]` + finalize layout. The
-        // resonance tag rides inside the decoy header (QUIC: the DCID), so the
-        // server extracts it there and skips the decoy to reach the ciphertext.
-        //
-        // Only DATA packets take this path: a handshake packet (`eph_pub` set)
-        // must carry the obfuscated ephemeral key inside the MDH for the server
-        // to establish the session, so it keeps the standard layout. The flow
-        // still classifies as QUIC because steady-state data packets are valid
-        // RFC 9001 Initials (nDPI's `may_be_initial_pkt` runs per packet).
-        if eph_pub.is_none() && constructed_ok {
-            if let Some(datagram) = proto.emit(&tag, &ciphertext) {
-                return Ok(datagram);
-            }
-        }
-
         let mut packet = Vec::with_capacity(tag_prefix_len + mdh.len() + ciphertext.len());
         if let Some(off) = embed_tag_offset {
             // New layout: real protocol header at offset 0 with the tag embedded
@@ -335,7 +343,7 @@ impl MimicryEngine {
             // patches the Length field to `packet_len - 20` (nDPI's `is_stun()`
             // demands the exact `msg_len + 20 == udp_payload_len`); other
             // protocols are a no-op for now. Mirrors the tag embed just above.
-            proto.finalize(&mut packet, &self.mask);
+            self.mask.finalize_packet(&mut packet)?;
         } else {
             // Legacy layout: tag ++ mdh ++ ciphertext (byte-identical to before).
             packet.extend_from_slice(&tag);
@@ -364,8 +372,7 @@ pub struct MimicryEncryptor {
     seq: u16,
     /// Written by the control-message handler; consumed on next encrypt call.
     pub pending_mask: Arc<Mutex<Option<MaskProfile>>>,
-    fec_encoder: Option<FecEncoder>,
-    pending_fec: Option<Vec<u8>>,
+    fec: FecSender,
 }
 
 impl MimicryEncryptor {
@@ -382,8 +389,7 @@ impl MimicryEncryptor {
             counter,
             seq,
             pending_mask,
-            fec_encoder: None,
-            pending_fec: None,
+            fec: FecSender::default(),
         }
     }
 
@@ -409,11 +415,7 @@ impl MimicryEncryptor {
     }
 
     pub fn set_fec_group(&mut self, group_size: u8) {
-        self.fec_encoder = if group_size > 0 {
-            Some(FecEncoder::new(group_size, 1500))
-        } else {
-            None
-        };
+        self.fec.set_group(group_size);
     }
 
     fn check_mask(&mut self) {
@@ -424,11 +426,52 @@ impl MimicryEncryptor {
             .take()
         {
             self.engine.update_mask(mask);
+            self.fec.discard_pending();
         }
     }
 }
 
+impl MimicryEncryptor {
+    fn queue_fec(&mut self, payload: &[u8]) {
+        let limit = self.engine.data_payload_limit(usize::MAX);
+        self.fec.feed(payload, limit, |kind, payload| {
+            let inner = build_inner_packet(kind, self.seq, payload);
+            self.seq = self.seq.wrapping_add(1);
+            self.engine
+                .build_packet(&inner, &self.keys, &mut self.counter, None)
+        });
+    }
+}
+
 impl PacketEncryptor for MimicryEncryptor {
+    fn fec_metadata(&self, payload_len: usize) -> Option<crate::fec::FecMetadata> {
+        self.fec.metadata_for(payload_len)
+    }
+    fn feed_fragmented_data(&mut self, payload: &[u8]) {
+        self.queue_fec(payload);
+    }
+
+    fn max_data_payload(&mut self, datagram_limit: usize) -> usize {
+        self.check_mask();
+        self.engine.data_payload_limit(datagram_limit)
+    }
+    fn data_send_delay(&mut self) -> Duration {
+        self.check_mask();
+        self.engine.prepare_data_delay()
+    }
+    fn encrypt_mask_bootstrap(&mut self) -> Result<Vec<u8>> {
+        let payload = ControlPayload::Keepalive {
+            send_ts: crypto::current_timestamp_ms(),
+        }
+        .encode()?;
+        let inner = build_inner_packet(InnerType::Control, self.seq, &payload);
+        self.seq = self.seq.wrapping_add(1);
+        self.engine
+            .build_packet(&inner, &self.keys, &mut self.counter, None)
+    }
+    fn active_mask(&self) -> Option<&MaskProfile> {
+        Some(self.engine.mask())
+    }
     fn data_ready(&self) -> bool {
         !self.keys.packet_cipher.is_initial()
     }
@@ -441,19 +484,6 @@ impl PacketEncryptor for MimicryEncryptor {
             .engine
             .build_packet(&inner, &self.keys, &mut self.counter, None)?;
         self.engine.update_fsm();
-        if let Some(fec) = self.fec_encoder.as_mut() {
-            if let Some(repair) = fec.feed(payload) {
-                let repair_inner =
-                    build_inner_packet(InnerType::FecRepair, self.seq, &repair.encode());
-                self.seq = self.seq.wrapping_add(1);
-                if let Ok(enc) =
-                    self.engine
-                        .build_packet(&repair_inner, &self.keys, &mut self.counter, None)
-                {
-                    self.pending_fec = Some(enc);
-                }
-            }
-        }
         Ok(pkt)
     }
 
@@ -481,6 +511,7 @@ impl PacketEncryptor for MimicryEncryptor {
     }
 
     fn encrypt_keepalive_ts(&mut self, send_ts: u64) -> Result<Vec<u8>> {
+        self.check_mask();
         let payload = ControlPayload::Keepalive { send_ts };
         let bytes = payload.encode()?;
         let inner = build_inner_packet(InnerType::Control, self.seq, &bytes);
@@ -492,7 +523,7 @@ impl PacketEncryptor for MimicryEncryptor {
     fn on_data_sent(&mut self, _payload_len: usize) {}
 
     fn take_fec_repair(&mut self) -> Option<Vec<u8>> {
-        self.pending_fec.take()
+        self.fec.take_packet()
     }
 }
 
@@ -505,18 +536,7 @@ pub fn decode_mask_update(mask_data: &[u8]) -> Option<MaskProfile> {
 /// Derive the bootstrap mask from PSK so iOS/Android start with mimicry active
 /// before the server sends a MaskUpdate.
 pub fn bootstrap_mask_for_psk(psk: Option<&[u8; 32]>) -> MaskProfile {
-    let presets = crate::mask::preset_masks::all();
-    debug_assert!(!presets.is_empty(), "preset_masks::all() must not be empty");
-    if presets.is_empty() {
-        return crate::mask::preset_masks::bootstrap_default();
-    }
-    if let Some(key) = psk {
-        let hash = blake3::derive_key("aivpn-bootstrap-mask-v1", key);
-        let idx = hash[0] as usize % presets.len();
-        presets[idx].clone()
-    } else {
-        presets[0].clone()
-    }
+    crate::mask::preset_masks::bootstrap_for_psk(psk)
 }
 
 #[cfg(test)]
@@ -524,6 +544,230 @@ mod tests {
     use super::*;
     use crate::client_wire::{decode_packet_with_layout, decode_packet_with_mdh_len, RecvWindow};
     use crate::mask::preset_masks::webrtc_zoom_v3;
+
+    #[test]
+    fn fec_group_survives_a_mask_change_before_the_repair_is_built() {
+        let mut keys = crypto::derive_session_keys(&[7; 32], None, &[8; 32]);
+        keys.session_key_s2c = keys.session_key;
+        let before = webrtc_zoom_v3();
+        let after = crate::mask::preset_masks::quic_https_v2();
+        let update = Arc::new(Mutex::new(None));
+        let mut sender = MimicryEncryptor::new(keys.clone(), 0, 0, before.clone(), update.clone());
+        sender.set_fec_group(4);
+        let mut wire = Vec::new();
+        for index in 0..4 {
+            if index == 2 {
+                *update.lock().unwrap() = Some(after.clone());
+            }
+            let profile = if index < 2 { &before } else { &after };
+            let length = if index < 2 { 1000 } else { 1500 };
+            let packets = sender
+                .encrypt_data_packets(
+                    &vec![index as u8 + 1; length],
+                    crate::mask_io::MAX_QUIC_INNER,
+                )
+                .unwrap();
+            if index != 0 {
+                wire.extend(packets.into_iter().map(|packet| (profile.clone(), packet)));
+            }
+        }
+        while let Some(packet) = sender.take_fec_repair() {
+            wire.push((after.clone(), packet));
+        }
+        let mut window = RecvWindow::new();
+        let mut reassembler = crate::fragment::Reassembler::default();
+        let mut xor = vec![0; 1500];
+        let mut recovered = None;
+        for (profile, packet) in wire {
+            let decoded = decode_packet_with_layout(
+                &packet,
+                &keys,
+                &mut window,
+                profile.mdh_len(),
+                profile.tag_offset,
+            )
+            .unwrap();
+            let (kind, bytes) = if decoded.header.inner_type == InnerType::Fragment {
+                let Some((kind, bytes)) = reassembler
+                    .accept(&decoded.payload, Instant::now())
+                    .unwrap()
+                else {
+                    continue;
+                };
+                (kind, bytes)
+            } else {
+                (decoded.header.inner_type, decoded.payload)
+            };
+            match kind {
+                InnerType::Data => {
+                    for (sum, byte) in xor.iter_mut().zip(&bytes) {
+                        *sum ^= byte;
+                    }
+                }
+                InnerType::FecRepair => {
+                    let repair = crate::fec::FecRepair::decode(&bytes).unwrap();
+                    assert_eq!(repair.group_size, 4);
+                    assert_eq!(repair.group_seq, 0);
+                    recovered = Some(repair.recover(&xor));
+                }
+                other => panic!("Unexpected data type: {other:?}"),
+            }
+        }
+        let mut expected = vec![1; 1000];
+        expected.resize(1500, 0);
+        assert_eq!(recovered, Some(expected));
+    }
+
+    #[test]
+    fn large_ip_and_fragmented_fec_recover_loss_in_both_mask_directions() {
+        let mut keys = crypto::derive_session_keys(&[7; 32], None, &[8; 32]);
+        keys.session_key_s2c = keys.session_key;
+        for mask in crate::mask::preset_masks::all() {
+            for reverse in [false, true] {
+                let profile = if reverse {
+                    mask.reverse_profile.as_deref().unwrap_or(&mask)
+                } else {
+                    &mask
+                };
+                let budget = if crate::mask_io::needs_state(profile) {
+                    crate::mask_io::MAX_QUIC_INNER
+                } else if crate::mask_io::uses_rtc(profile) {
+                    crate::mask_io::rtc_inner_budget(profile)
+                } else {
+                    SAFE_OUTER_PACKET_BUDGET
+                };
+                let mut sender = MimicryEncryptor::new(
+                    keys.clone(),
+                    0,
+                    0,
+                    profile.clone(),
+                    Arc::new(Mutex::new(None)),
+                );
+                sender.set_fec_group(4);
+                let payloads: Vec<_> = [
+                    crate::network_config::DEFAULT_VPN_MTU as usize,
+                    1500,
+                    1000,
+                    1346,
+                ]
+                .into_iter()
+                .enumerate()
+                .map(|(index, len)| vec![0x45 + index as u8; len])
+                .collect();
+                let mut delivered = Vec::new();
+                for (index, payload) in payloads.iter().enumerate() {
+                    let packets = sender.encrypt_data_packets(payload, budget).unwrap();
+                    assert!(packets.iter().all(|packet| packet.len() <= budget));
+                    if index != 1 {
+                        delivered.extend(packets);
+                    }
+                }
+                let mut parity_packets = 0;
+                while let Some(packet) = sender.take_fec_repair() {
+                    assert!(packet.len() <= budget);
+                    delivered.push(packet);
+                    parity_packets += 1;
+                }
+                assert!(
+                    parity_packets > 0,
+                    "{} reverse={reverse}: нет FEC",
+                    profile.mask_id
+                );
+                let mut window = RecvWindow::new();
+                let mut reassembler = crate::fragment::Reassembler::default();
+                let mut xor = Vec::<u8>::new();
+                let mut received = 0;
+                let mut recovered = None;
+                for packet in delivered {
+                    let decoded = decode_packet_with_layout(
+                        &packet,
+                        &keys,
+                        &mut window,
+                        profile.mdh_len(),
+                        profile.tag_offset,
+                    )
+                    .unwrap();
+                    let (kind, bytes) = if decoded.header.inner_type == InnerType::Fragment {
+                        let Some(message) = reassembler
+                            .accept_detailed(&decoded.payload, Instant::now())
+                            .unwrap()
+                        else {
+                            continue;
+                        };
+                        if message.kind == InnerType::Data {
+                            assert!(message.fec.is_some());
+                        }
+                        (message.kind, message.payload)
+                    } else {
+                        (decoded.header.inner_type, decoded.payload)
+                    };
+                    match kind {
+                        InnerType::Data => {
+                            xor.resize(xor.len().max(bytes.len()), 0);
+                            for (sum, byte) in xor.iter_mut().zip(&bytes) {
+                                *sum ^= byte;
+                            }
+                            received += 1;
+                        }
+                        InnerType::FecRepair => {
+                            let repair = crate::fec::FecRepair::decode(&bytes).unwrap();
+                            assert_eq!(repair.group_size, 4);
+                            assert_eq!(received, 3);
+                            recovered = Some(repair.recover(&xor));
+                        }
+                        other => panic!("Unexpected data type: {other:?}"),
+                    }
+                }
+                assert_eq!(
+                    recovered.as_ref(),
+                    Some(&payloads[1]),
+                    "{} reverse={reverse}",
+                    profile.mask_id
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn stun_initial_and_established_packets_have_valid_attributes() {
+        for mask in crate::mask::preset_masks::all()
+            .into_iter()
+            .filter(|mask| mask.spoof_protocol.is_stun())
+        {
+            for initial in [true, false] {
+                let keys = if initial {
+                    crypto::derive_initial_session_keys(&[7; 32], None, &[8; 32])
+                } else {
+                    crypto::derive_session_keys(&[7; 32], None, &[8; 32])
+                };
+                let mut engine = MimicryEngine::new(mask.clone());
+                let mut counter = 0;
+                for length in [0, 1, 2, 3, 4, 7, 17, 1100, 1280] {
+                    let payload = vec![0x45; length];
+                    let built = engine.build_packet(
+                        &payload,
+                        &keys,
+                        &mut counter,
+                        initial.then_some(&[42; 32]),
+                    );
+                    if initial && crate::mask_io::uses_rtc(&mask) && length == 1280 {
+                        assert!(
+                            built.is_err(),
+                            "Eph и InitialV2 должны помещаться в бюджет маски"
+                        );
+                        continue;
+                    }
+                    let packet = built.unwrap();
+                    crate::stun_wire::validate(&packet).unwrap_or_else(|error| {
+                        panic!(
+                            "{} initial={initial}, length={length}: {error}",
+                            mask.mask_id
+                        )
+                    });
+                }
+            }
+        }
+    }
 
     #[test]
     fn maximum_management_request_roundtrips_through_encrypted_fragments() {
@@ -582,6 +826,65 @@ mod tests {
     }
 
     #[test]
+    fn full_mtu_data_roundtrips_for_every_mask_within_wire_budget() {
+        use crate::fragment::Reassembler;
+        let mut keys = crate::crypto::derive_session_keys(&[1; 32], Some(&[2; 32]), &[3; 32]);
+        keys.session_key_s2c = keys.session_key;
+        for mask in crate::mask::preset_masks::all() {
+            for length in [1280, 1346, 1500] {
+                let payload: Vec<_> = (0..length).map(|n| (n % 251) as u8).collect();
+                let budget = if crate::mask_io::needs_state(&mask) {
+                    crate::mask_io::MAX_QUIC_INNER
+                } else if crate::mask_io::uses_rtc(&mask) {
+                    crate::mask_io::rtc_inner_budget(&mask)
+                } else {
+                    SAFE_OUTER_PACKET_BUDGET
+                };
+                let mut sender = MimicryEncryptor::new(
+                    keys.clone(),
+                    0,
+                    0,
+                    mask.clone(),
+                    Arc::new(Mutex::new(None)),
+                );
+                sender.set_fec_group(4);
+                let packets = sender.encrypt_data_packets(&payload, budget).unwrap();
+                let mut window = RecvWindow::new();
+                let mut fragments = Reassembler::default();
+                let mut result = None;
+                for packet in packets {
+                    assert!(
+                        packet.len() <= budget,
+                        "{} {length}: {} > {budget}",
+                        mask.mask_id,
+                        packet.len()
+                    );
+                    let decoded = decode_packet_with_layout(
+                        &packet,
+                        &keys,
+                        &mut window,
+                        mask.mdh_len(),
+                        mask.tag_offset,
+                    )
+                    .unwrap();
+                    if decoded.header.inner_type == InnerType::Fragment {
+                        if let Some((kind, bytes)) =
+                            fragments.accept(&decoded.payload, Instant::now()).unwrap()
+                        {
+                            assert_eq!(kind, InnerType::Data);
+                            result = Some(bytes);
+                        }
+                    } else {
+                        assert_eq!(decoded.header.inner_type, InnerType::Data);
+                        result = Some(decoded.payload);
+                    }
+                }
+                assert_eq!(result, Some(payload), "{} {length}", mask.mask_id);
+            }
+        }
+    }
+
+    #[test]
     fn test_mimicry_engine_builds_packet() {
         let mask = webrtc_zoom_v3();
         let mut engine = MimicryEngine::new(mask);
@@ -637,18 +940,53 @@ mod tests {
         let keys = crypto::derive_initial_session_keys(&[1; 32], None, &[3; 32]);
         for mut mask in [webrtc_zoom_v3(), crate::mask::preset_masks::quic_https_v2()] {
             mask.padding_strategy = PaddingStrategy::Fixed { size: u16::MAX };
+            let budget = if crate::mask_io::needs_state(&mask) {
+                512
+            } else if crate::mask_io::uses_rtc(&mask) {
+                crate::mask_io::rtc_inner_budget(&mask)
+            } else {
+                SAFE_OUTER_PACKET_BUDGET
+            };
             let mut engine = MimicryEngine::new(mask);
             let mut counter = 0;
             let packet = engine
-                .build_packet(&vec![0x55; 1100], &keys, &mut counter, None)
+                .build_packet(&vec![0x55; budget - 100], &keys, &mut counter, None)
                 .unwrap();
             assert!(
-                packet.len() <= SAFE_OUTER_PACKET_BUDGET,
+                packet.len() <= budget,
                 "outer packet {} exceeds {}",
                 packet.len(),
-                SAFE_OUTER_PACKET_BUDGET
+                budget
             );
         }
+    }
+
+    #[test]
+    fn rtc_padding_reserves_srtp_overhead_and_matches_outer_target() {
+        let keys = crypto::derive_session_keys(&[1; 32], None, &[3; 32]);
+        let mut mask = webrtc_zoom_v3();
+        mask.size_iat_joint = None;
+        mask.size_distribution = crate::mask::SizeDistribution {
+            dist_type: crate::mask::SizeDistType::Histogram,
+            bins: vec![(400, 400, 1.0)],
+            parametric_type: None,
+            parametric_params: None,
+        };
+        mask.padding_strategy = PaddingStrategy::MatchDistribution;
+        let mut engine = MimicryEngine::new(mask.clone());
+        let packet = engine
+            .build_packet(&vec![0x55; 100], &keys, &mut 0, None)
+            .unwrap();
+        assert_eq!(
+            packet.len() + crate::mask_io::carrier_overhead(engine.mask()),
+            400
+        );
+        mask.padding_strategy = PaddingStrategy::Fixed { size: u16::MAX };
+        let mut engine = MimicryEngine::new(mask);
+        let packet = engine
+            .build_packet(&vec![0x55; 1280], &keys, &mut 0, None)
+            .unwrap();
+        assert!(packet.len() <= crate::rtc_mask::MAX_INNER);
     }
 
     #[test]
@@ -712,7 +1050,7 @@ mod tests {
         let tag_offset = mask.tag_offset;
         assert_eq!(tag_offset, 8);
         let mdh_len = mask.header_spec.as_ref().unwrap().min_length();
-        assert_eq!(mdh_len, 20);
+        assert_eq!(mdh_len, 24);
 
         let mut engine = MimicryEngine::new(mask);
         let keys = SessionKeys {
@@ -731,7 +1069,8 @@ mod tests {
         // (b) Real STUN discriminator: magic cookie 0x2112A442 at packet offset 4.
         assert_eq!(&pkt[4..8], &[0x21, 0x12, 0xA4, 0x42]);
         // Message type is STUN Binding Request at offset 0.
-        assert_eq!(&pkt[0..2], &[0x00, 0x01]);
+        assert_eq!(&pkt[0..2], &[0x00, 0x11]);
+        crate::stun_wire::validate(&pkt).unwrap();
 
         // (c) Tag embedded at packet offset tag_offset (inside the transaction id).
         let tw = compute_time_window(current_timestamp_ms(), DEFAULT_WINDOW_MS);
@@ -750,7 +1089,7 @@ mod tests {
     }
 
     #[test]
-    fn embedded_quic_packet_roundtrips_and_shows_long_header() {
+    fn quic_inner_packet_roundtrips_before_stateful_masking() {
         use crate::mask::preset_masks::quic_https_v2;
         use crate::protocol::InnerType;
 
@@ -758,6 +1097,7 @@ mod tests {
         let tag_offset = mask.tag_offset;
         assert_eq!(tag_offset, 6);
 
+        let mdh_len = mask.mdh_len();
         let mut engine = MimicryEngine::new(mask);
         let keys = SessionKeys {
             packet_cipher: crate::crypto::PacketCipher::Established,
@@ -772,30 +1112,15 @@ mod tests {
             .build_packet(&inner, &keys, &mut counter, None)
             .unwrap();
 
-        // (b) QUIC v1 long-header discriminator: long-header Initial form in the
-        // high nibble (0xC = header-form + fixed-bit + Initial type), and
-        // version 0x00000001. Only the high nibble is asserted: RFC 9001 §5.4.1
-        // header protection masks the 4 LOW bits of the first byte (reserved +
-        // packet-number length), so they vary per packet — asserting the full
-        // 0xC0 byte was nondeterministic.
+        // Это внутренняя раскладка, не пакет для отправки прямо в UDP.
         assert_eq!(pkt[0] & 0xf0, 0xc0);
         assert_eq!(&pkt[1..5], &[0x00, 0x00, 0x00, 0x01]);
         // DCID length byte.
         assert_eq!(pkt[5], 8);
 
-        // Round-trip: a QUIC data packet is a coalesced RFC 9001 Initial with
-        // aivpn's ciphertext appended after it, so decode via the Initial parser
-        // (as the server does) to locate the trailing payload, then decrypt it.
-        // The resonance tag sits in the DCID at `tag_offset`.
-        let layout = crate::quic_initial::parse_quic_initial(&pkt).expect("valid QUIC Initial");
-        assert_eq!(
-            &layout.tag[..],
-            &pkt[tag_offset as usize..tag_offset as usize + 8]
-        );
         let mut win = RecvWindow::new();
         let decoded =
-            decode_packet_with_layout(&pkt, &keys, &mut win, layout.payload_offset, tag_offset)
-                .unwrap();
+            decode_packet_with_layout(&pkt, &keys, &mut win, mdh_len, tag_offset).unwrap();
         assert_eq!(decoded.payload, b"quic-inner");
     }
 
@@ -876,7 +1201,7 @@ mod tests {
         let tw = compute_time_window(current_timestamp_ms(), DEFAULT_WINDOW_MS);
         let expected = generate_resonance_tag(&keys.tag_secret, 0, tw);
         assert_eq!(&pkt[0..TAG_SIZE], &expected);
-        assert_eq!(&pkt[TAG_SIZE..TAG_SIZE + 2], &[0x00, 0x01]);
+        assert_eq!(&pkt[TAG_SIZE..TAG_SIZE + 2], &[0x00, 0x11]);
 
         let mut win = RecvWindow::new();
         let decoded = decode_packet_with_mdh_len(&pkt, &keys, &mut win, mdh_len).unwrap();
@@ -923,7 +1248,7 @@ mod tests {
         // (STUN header is 20 bytes). Assert the built webrtc_zoom_v3 packet's
         // message-length field (bytes[2..4], big-endian) satisfies that for a
         // range of packet sizes, and that the magic cookie / type stay correct.
-        let mask = webrtc_zoom_v3();
+        let mask = crate::mask::preset_masks::webrtc_vk_teams_v1();
         assert_eq!(mask.stun_length_field_offset(), Some(2));
         let mut engine = MimicryEngine::new(mask);
         let keys = SessionKeys {
@@ -942,7 +1267,8 @@ mod tests {
                 .build_packet(&inner, &keys, &mut counter, None)
                 .unwrap();
             // STUN header must sit at offset 0: type + magic cookie intact.
-            assert_eq!(&pkt[0..2], &[0x00, 0x01], "STUN type at offset 0");
+            assert_eq!(&pkt[0..2], &[0x00, 0x11], "STUN type at offset 0");
+            crate::stun_wire::validate(&pkt).unwrap();
             assert_eq!(
                 &pkt[4..8],
                 &[0x21, 0x12, 0xA4, 0x42],
@@ -989,13 +1315,7 @@ mod tests {
 
     #[test]
     fn quic_data_packet_stays_within_wan_budget() {
-        // FIX 1: a QUIC DATA packet is re-wrapped by emit() into a full RFC 9001
-        // Initial (adding ~92 B on top of the ciphertext). The mimicry engine
-        // must reserve that overhead so the FINAL emitted datagram never exceeds
-        // the WAN-safe budget — even when padding tries to fill toward the
-        // sampled target size. Loop many times per size because the padding is
-        // randomized (without the reservation, some iterations pad the pre-emit
-        // packet up to ~1380 and then overflow to ~1472 after emit()).
+        // Внутренний пакет обязан оставить место для DATAGRAM и AEAD QUIC.
         use crate::mask::preset_masks::quic_https_v2;
         let mask = quic_https_v2();
         assert_eq!(
@@ -1011,18 +1331,24 @@ mod tests {
             prng_seed: [0u8; 32],
         };
         let mut counter = 0u64;
-        // Payloads that leave padding headroom (<= ~1266 so a zero-pad Initial
-        // still fits the SAFE budget). The fix guarantees padding never pushes
-        // the final datagram past the budget for these.
-        for payload_len in [1usize, 64, 256, 700, 1000, 1200, 1264] {
+        // Проверяем внутренний бюджет, оставляющий место внешнему QUIC.
+        for payload_len in [1usize, 64, 256, 700, 1000, 1200, 1264, 1280] {
             for _ in 0..40 {
                 let inner = build_inner_packet(InnerType::Data, 0, &vec![0x42u8; payload_len]);
-                let pkt = engine
-                    .build_packet(&inner, &keys, &mut counter, None)
-                    .unwrap();
+                let before = counter;
+                let result = engine.build_packet(&inner, &keys, &mut counter, None);
+                if payload_len > 1104 {
+                    assert!(
+                        result.is_err(),
+                        "Большой payload должен пройти фрагментацию"
+                    );
+                    assert_eq!(counter, before);
+                    continue;
+                }
+                let pkt = result.unwrap();
                 engine.update_fsm();
-                // Confirm the QUIC emit() path actually ran (long-header Initial).
-                assert_eq!(pkt[0] & 0xf0, 0xc0, "expected a QUIC Initial datagram");
+                // Здесь еще внутренний заголовок, не внешний QUIC Initial.
+                assert_eq!(pkt[0] & 0xf0, 0xc0);
                 assert!(
                     pkt.len() <= MAX_PACKET_SIZE,
                     "QUIC datagram {} exceeds MAX_PACKET_SIZE for payload {}",
@@ -1030,7 +1356,7 @@ mod tests {
                     payload_len
                 );
                 assert!(
-                    pkt.len() <= SAFE_OUTER_PACKET_BUDGET,
+                    pkt.len() <= crate::mask_io::MAX_QUIC_INNER,
                     "QUIC datagram {} exceeds SAFE_OUTER_PACKET_BUDGET for payload {}",
                     pkt.len(),
                     payload_len
@@ -1052,5 +1378,257 @@ mod tests {
         let pending = Arc::new(Mutex::new(None));
         let mut enc = MimicryEncryptor::new(keys, 0, 0, mask, pending);
         assert!(enc.encrypt_data(b"test payload").is_ok());
+    }
+
+    #[test]
+    fn every_builtin_size_profile_controls_small_data_wire_length() {
+        for mut mask in crate::mask::preset_masks::all() {
+            let id = mask.mask_id.clone();
+            let carrier_overhead = crate::mask_io::carrier_overhead(&mask);
+            // Внутренний STUN выровнен на 4. Выбираем достижимый размер
+            // фикстуры с учетом 10-байтного SRTP auth tag без лишнего RTP padding.
+            let target = 512 + carrier_overhead % 4;
+            mask.size_iat_joint = None;
+            mask.fsm_states.clear();
+            mask.size_distribution = SizeDistribution {
+                dist_type: crate::mask::SizeDistType::Histogram,
+                bins: vec![(target as u16, target as u16, 1.0)],
+                parametric_type: None,
+                parametric_params: None,
+            };
+            let keys = SessionKeys {
+                packet_cipher: crypto::PacketCipher::Established,
+                session_key: [1; 32],
+                session_key_s2c: [1; 32],
+                tag_secret: [2; 32],
+                prng_seed: [3; 32],
+            };
+            let mut engine = MimicryEngine::new(mask);
+            let mut counter = 0;
+            let packet = engine
+                .build_packet(
+                    &build_inner_packet(InnerType::Data, 0, &[42; 64]),
+                    &keys,
+                    &mut counter,
+                    None,
+                )
+                .unwrap();
+            assert_eq!(
+                packet.len() + carrier_overhead,
+                target,
+                "{id}: распределение размеров не применяется"
+            );
+        }
+    }
+
+    #[test]
+    fn control_does_not_steal_joint_data_size_and_iat_pair() {
+        let mut mask = crate::mask::preset_masks::webrtc_zoom_v3();
+        mask.size_iat_joint = Some(crate::mask::SizeIatGmm2d {
+            params: vec![
+                2.0, 0.5, 512.0, 20.0, 0.0, 0.0, 0.0, 0.5, 1024.0, 40.0, 0.0, 0.0, 0.0,
+            ],
+        });
+        let keys = SessionKeys {
+            packet_cipher: crypto::PacketCipher::Established,
+            session_key: [1; 32],
+            session_key_s2c: [1; 32],
+            tag_secret: [2; 32],
+            prng_seed: [3; 32],
+        };
+        let mut engine = MimicryEngine::new(mask);
+        let mut counter = 0;
+        for _ in 0..128 {
+            let delay = engine.prepare_data_delay();
+            let control = build_inner_packet(
+                InnerType::Control,
+                0,
+                &ControlPayload::Keepalive { send_ts: 1 }.encode().unwrap(),
+            );
+            engine
+                .build_packet(&control, &keys, &mut counter, None)
+                .unwrap();
+            let packet = engine
+                .build_packet(
+                    &build_inner_packet(InnerType::Data, 1, &[42; 32]),
+                    &keys,
+                    &mut counter,
+                    None,
+                )
+                .unwrap();
+            assert_eq!(
+                packet.len() + crate::mask_io::carrier_overhead(engine.mask()),
+                if delay == Duration::from_millis(20) {
+                    512
+                } else {
+                    1024
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn different_profiles_do_not_share_one_hidden_cadence() {
+        let mean = |mask| {
+            let mut engine = MimicryEngine::new(mask);
+            engine.rng = StdRng::seed_from_u64(73);
+            (0..4096)
+                .map(|_| engine.take_data_shape().1.as_secs_f64())
+                .sum::<f64>()
+                / 4096.0
+        };
+        let profile = |milliseconds| {
+            let mut mask = crate::mask::preset_masks::webrtc_zoom_v3();
+            mask.size_iat_joint = None;
+            mask.iat_distribution = IATDistribution {
+                dist_type: crate::mask::IATDistType::Empirical,
+                params: vec![milliseconds],
+                jitter_range_ms: (0.0, 0.0),
+            };
+            mask
+        };
+        let slow = mean(profile(50.0));
+        let fast = mean(profile(10.0));
+        assert!(
+            slow > fast * 1.5,
+            "Разные профили перекрыты общей cadence: {slow}/{fast}"
+        );
+    }
+
+    #[test]
+    fn fsm_overrides_are_not_shadowed_by_global_joint_model() {
+        let mut engine = MimicryEngine::new(crate::mask::preset_masks::quic_https_v2());
+        engine.mask.size_iat_joint = Some(crate::mask::SizeIatGmm2d {
+            params: vec![1.0, 1.0, 1200.0, 5.0, 0.0, 0.0, 0.0],
+        });
+        assert!(engine.mask.size_iat_joint.is_some());
+        engine.state.size_override = Some(SizeDistribution {
+            dist_type: crate::mask::SizeDistType::Histogram,
+            bins: vec![(512, 512, 1.0)],
+            parametric_type: None,
+            parametric_params: None,
+        });
+        engine.state.iat_override = Some(IATDistribution {
+            dist_type: crate::mask::IATDistType::Empirical,
+            params: vec![50.0],
+            jitter_range_ms: (0.0, 0.0),
+        });
+        assert_eq!(engine.take_data_shape(), (512, Duration::from_millis(50)));
+    }
+
+    #[test]
+    fn self_transition_applies_its_size_and_iat_overrides() {
+        let mut mask = crate::mask::preset_masks::webrtc_zoom_v3();
+        mask.size_iat_joint = None;
+        mask.iat_distribution = IATDistribution {
+            dist_type: crate::mask::IATDistType::Empirical,
+            params: vec![8.0],
+            jitter_range_ms: (0.0, 0.0),
+        };
+        let size = SizeDistribution {
+            dist_type: crate::mask::SizeDistType::Histogram,
+            bins: vec![(512, 512, 1.0)],
+            parametric_type: None,
+            parametric_params: None,
+        };
+        mask.fsm_initial_state = 0;
+        mask.fsm_states = vec![crate::mask::FSMState {
+            state_id: 0,
+            transitions: vec![crate::mask::FSMTransition {
+                condition: crate::mask::TransitionCondition::AfterPackets(0),
+                next_state: 0,
+                size_override: Some(size),
+                iat_override: Some(IATDistribution {
+                    dist_type: crate::mask::IATDistType::Empirical,
+                    params: vec![50.0],
+                    jitter_range_ms: (0.0, 0.0),
+                }),
+                padding_override: None,
+            }],
+        }];
+        let mut engine = MimicryEngine::new(mask);
+        engine.update_fsm();
+        assert_eq!(engine.take_data_shape(), (512, Duration::from_millis(50)));
+    }
+
+    #[test]
+    fn recorded_video_models_keep_the_large_packet_mode() {
+        for id in ["webrtc_yandex_telemost_v1", "webrtc_sberjazz_v1"] {
+            let mut engine = MimicryEngine::new(crate::mask::preset_masks::by_id(id).unwrap());
+            engine.rng = StdRng::seed_from_u64(73);
+            let large = (0..4096)
+                .filter(|_| engine.sample_packet_size() >= 1000)
+                .count();
+            assert!(
+                large > 0,
+                "{id}: большая мода из реального видеопотока потеряна"
+            );
+        }
+    }
+
+    #[test]
+    fn recorded_zoom_audio_model_does_not_use_a_uniform_fallback() {
+        let mut engine = MimicryEngine::new(crate::mask::preset_masks::webrtc_zoom_v3());
+        engine.rng = StdRng::seed_from_u64(73);
+        assert!((0..4096).all(|_| engine.sample_packet_size() <= 350));
+    }
+
+    #[test]
+    fn telegram_call_profile_does_not_emit_a_quic_initial() {
+        let mask = crate::mask::preset_masks::by_id("telegram_calls_v1")
+            .expect("Профиль UDP-звонков должен быть доступен клиентам");
+        let mut engine = MimicryEngine::new(mask);
+        let mut counter = 0;
+        let keys = SessionKeys {
+            packet_cipher: crate::crypto::PacketCipher::Established,
+            session_key: [7; 32],
+            session_key_s2c: [8; 32],
+            tag_secret: [9; 32],
+            prng_seed: [10; 32],
+        };
+        let packet = engine
+            .build_packet(
+                &build_inner_packet(InnerType::Data, 0, b"call"),
+                &keys,
+                &mut counter,
+                None,
+            )
+            .unwrap();
+        crate::stun_wire::validate(&packet).unwrap();
+        assert!(crate::quic_mask::QuicMask::bootstrap(&packet).is_none());
+    }
+
+    #[test]
+    fn self_transition_without_overrides_restores_base_profile() {
+        let mut mask = crate::mask::preset_masks::webrtc_zoom_v3();
+        mask.size_iat_joint = None;
+        mask.iat_distribution = IATDistribution {
+            dist_type: crate::mask::IATDistType::Empirical,
+            params: vec![8.0],
+            jitter_range_ms: (0.0, 0.0),
+        };
+        mask.fsm_initial_state = 0;
+        mask.fsm_states = vec![crate::mask::FSMState {
+            state_id: 0,
+            transitions: vec![crate::mask::FSMTransition {
+                condition: crate::mask::TransitionCondition::AfterPackets(3),
+                next_state: 0,
+                size_override: None,
+                iat_override: None,
+                padding_override: None,
+            }],
+        }];
+        let mut engine = MimicryEngine::new(mask);
+        engine.state.iat_override = Some(IATDistribution {
+            dist_type: crate::mask::IATDistType::Empirical,
+            params: vec![50.0],
+            jitter_range_ms: (0.0, 0.0),
+        });
+        engine.state.packets_in_state = 2;
+        engine.update_fsm();
+        assert_eq!(engine.sample_iat(), 50.0);
+        engine.update_fsm();
+        assert_eq!(engine.sample_iat(), 8.0);
+        assert_eq!(engine.state.packets_in_state, 1);
     }
 }

@@ -25,7 +25,9 @@ impl eframe::App for super::AivpnApp {
             self.tray_thread_shutdown.store(true, Relaxed);
             self.tray = None;
             self.vpn.disconnect();
-            self.settings.save();
+            if let Err(error) = self.settings.save() {
+                self.show_error(error);
+            }
             self.quitting = true;
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             return;
@@ -334,7 +336,12 @@ impl eframe::App for super::AivpnApp {
                                         let selected = self.keys.selected == Some(i);
                                         let resp = ui.selectable_label(selected, &name);
                                         if resp.clicked() {
+                                            let previous = self.keys.selected;
                                             self.keys.selected = Some(i);
+                                            if let Err(error) = self.keys.save() {
+                                                self.keys.selected = previous;
+                                                self.error_msg = Some(error);
+                                            }
                                         }
                                         resp.context_menu(|ui| {
                                             if ui.button(t(lang, "edit")).clicked() {
@@ -506,7 +513,9 @@ impl eframe::App for super::AivpnApp {
                                 }
                             });
                         }
+                    }
 
+                    if is_connected {
                         // ── Diagnostics / Benchmark ───────────────────────────────
                         ui.horizontal(|ui| {
                             let bench_lbl = if self.bench_running {
@@ -518,7 +527,7 @@ impl eframe::App for super::AivpnApp {
                                 .add_enabled(!self.bench_running, egui::Button::new(bench_lbl))
                                 .clicked()
                             {
-                                let binary = self.vpn.client_binary.clone();
+                                let token = crate::admin::read_admin_token();
                                 let server = self.vpn.server_addr().unwrap_or("").to_string();
                                 if server.is_empty() {
                                     self.show_error(
@@ -531,7 +540,7 @@ impl eframe::App for super::AivpnApp {
                                     self.bench_rx = Some(rx);
                                     std::thread::spawn(move || {
                                         let result =
-                                            VpnManager::run_bench_blocking(&binary, &server);
+                                            VpnManager::run_bench_blocking(token);
                                         let _ = tx.send(result);
                                     });
                                 }
@@ -546,12 +555,14 @@ impl eframe::App for super::AivpnApp {
                                 };
                                 ui.label(
                                     egui::RichText::new(format!(
-                                        "P50/P95/P99: {:.0}/{:.0}/{:.0}ms  Loss: {:.1}%  Q:{}/100",
+                                        "P50/P95/P99: {:.0}/{:.0}/{:.0}ms  Loss: {:.1}%  Q:{}/100  ↑ {:.0} ↓ {:.0} kbps",
                                         r.latency_p50_ms,
                                         r.latency_p95_ms,
                                         r.latency_p99_ms,
                                         r.packet_loss_pct,
-                                        r.quality_score
+                                        r.quality_score,
+                                        r.throughput_up_kbps,
+                                        r.throughput_down_kbps
                                     ))
                                     .color(qc)
                                     .size(12.0),
@@ -809,7 +820,7 @@ impl eframe::App for super::AivpnApp {
                         self.settings.connect_on_startup = startup;
                         set_autostart(startup);
                         // Save immediately — registry and settings.json must stay in sync
-                        self.settings.save();
+                        if let Err(error) = self.settings.save() { self.show_error(error); }
                         self.dirty_at = None;
                     }
                     // ── Error / warning ────────────────────────────────────────────
@@ -1047,7 +1058,9 @@ impl eframe::App for super::AivpnApp {
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         if !self.quitting {
             self.vpn.disconnect();
-            let _ = self.settings.save();
+            if let Err(error) = self.settings.save() {
+                crate::vpn_manager::gui_log(&error);
+            }
         }
     }
 }

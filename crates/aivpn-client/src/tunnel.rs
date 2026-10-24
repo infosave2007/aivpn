@@ -13,8 +13,8 @@ use aivpn_common::network_config::{ClientNetworkConfig, VpnNetworkConfig, LEGACY
 
 // Real worst-case outer overhead per packet:
 //   TAG(8) + MDH(varies, default 20) + pad_len(2) + inner_hdr(4) + random_padding(≤24) + Poly1305(16) ≈ 74 bytes.
-// Masks with MDH > ~40 bytes require a lower negotiated client MTU via ServerHello network_config.
-const WAN_SAFE_TUN_MTU: u16 = 1346;
+// Вмещает DATA и FEC во все встроенные носители при переключении масок.
+const WAN_SAFE_TUN_MTU: u16 = aivpn_common::network_config::DEFAULT_VPN_MTU;
 
 /// Whether the current process has an elevated (Administrator) token.
 /// Creating a Wintun adapter always requires this on Windows — there is no
@@ -104,21 +104,11 @@ impl TunnelConfig {
         network_config: ClientNetworkConfig,
         full_tunnel: bool,
     ) -> Self {
-        // Clamp to MAX_PACKET_SIZE (1500): client.rs's FecEncoder is
-        // hardcoded to a 1500-byte parity buffer
-        // (`FecEncoder::new(fec_n, 1500)`), and `FecEncoder::feed()` silently
-        // truncates anything longer — bytes beyond 1500 never get XORed into
-        // repair parity, so any lost packet in a group containing an
-        // oversized member gets "recovered" corrupted/truncated instead of
-        // failing loudly. `network_config.mtu` is server-controlled (pushed
-        // in `apply_server_network_override`) as well as
-        // config-file/bootstrap-controlled here at startup, up to u16::MAX —
-        // this is the single choke point both paths route through before a
-        // `TunnelConfig` (and the MTU actually applied to the TUN device) is
-        // produced.
+        // Назначение сервера и ключ подключения не могут увеличить MTU
+        // сверх бюджета носителя. Это также меньше буфера FEC на 1500 байт.
         let mtu = network_config
             .mtu
-            .min(aivpn_common::protocol::MAX_PACKET_SIZE as u16);
+            .min(aivpn_common::network_config::MAX_MASK_TUN_MTU);
         Self {
             tun_name,
             tun_addr: network_config.client_ip.to_string(),
@@ -214,6 +204,8 @@ pub struct Tunnel {
     ipv6_routes_added: bool,
     ipv6_server_bypass: Option<(String, String)>,
     transport_mark: Option<u32>,
+    #[cfg(any(target_os = "macos", windows))]
+    transport_guard: Option<aivpn_common::transport::SharedGuard>,
     #[cfg(target_os = "linux")]
     transport_routes: Option<crate::transport_routes::TransportRoutes>,
     ipv6_address_applied: Option<(std::net::Ipv6Addr, u8)>,
@@ -261,7 +253,10 @@ fn kill_orphaned_pkexec_child() {
 }
 
 impl Tunnel {
-    pub fn new(config: TunnelConfig) -> Self {
+    pub fn new(mut config: TunnelConfig) -> Self {
+        config.mtu = config
+            .mtu
+            .min(aivpn_common::network_config::MAX_MASK_TUN_MTU);
         Self {
             config,
             reader: None,
@@ -279,6 +274,8 @@ impl Tunnel {
             ipv6_routes_added: false,
             ipv6_server_bypass: None,
             transport_mark: None,
+            #[cfg(any(target_os = "macos", windows))]
+            transport_guard: None,
             #[cfg(target_os = "linux")]
             transport_routes: None,
             ipv6_address_applied: None,
@@ -532,15 +529,10 @@ impl Tunnel {
         mut network_config: ClientNetworkConfig,
     ) -> Result<()> {
         network_config.validate()?;
-        // Clamp to MAX_PACKET_SIZE — see the matching comment in
-        // `TunnelConfig::from_network_config`. This is the live path that
-        // sets the TUN device's actual MTU on a server-pushed
-        // (ServerHello/mid-session) network-config override, so it must be
-        // clamped independently of that other choke point, not just rely on
-        // it.
+        // Live override соблюдает тот же бюджет, что и начальный TUN.
         network_config.mtu = network_config
             .mtu
-            .min(aivpn_common::protocol::MAX_PACKET_SIZE as u16);
+            .min(aivpn_common::network_config::MAX_MASK_TUN_MTU);
         // Remember the address the device carried BEFORE this override: on
         // Linux `ip addr replace <new>` with a different IP ADDS it as a
         // secondary address, the old one stays primary and keeps winning
@@ -911,6 +903,15 @@ impl Tunnel {
             _ => {}
         }
         match args {
+            ["-6", "addr", action @ ("replace" | "del"), cidr, "dev", iface] => {
+                Some(format!("{name}\taddr6_{action}\t{cidr}\t{iface}"))
+            }
+            ["-6", "route", action @ ("replace" | "del" | "add"), cidr, "dev", iface] => {
+                Some(format!("{name}\troute6_{action}\t{cidr}\t{iface}"))
+            }
+            ["-6", "route", "add", cidr, "dev", iface, "via", gateway] => Some(format!(
+                "{name}\troute6_add_via\t{cidr}\t{iface}\t{gateway}"
+            )),
             ["route", "replace", "0.0.0.0/1", "dev", iface] => {
                 Some(format!("{name}\troute_replace_fulltunnel_lower\t{iface}"))
             }
@@ -1322,6 +1323,22 @@ impl Tunnel {
     }
 
     /// Настроить обход до открытия сокетов альтернативного транспорта.
+    pub fn set_transport_guard(
+        &mut self,
+        guard: aivpn_common::transport::SharedGuard,
+    ) -> Result<()> {
+        self.set_transport_mark(guard.routing_mark())?;
+        #[cfg(any(target_os = "macos", windows))]
+        {
+            if self.config.kill_switch {
+                KillSwitch::prepare_transport_guard(&guard)?;
+            }
+            self.transport_guard = Some(guard);
+        }
+        Ok(())
+    }
+
+    /// Настроить отдельную таблицу маршрутов для помеченных сокетов.
     pub fn set_transport_mark(&mut self, mark: Option<u32>) -> Result<()> {
         #[cfg(target_os = "linux")]
         {
@@ -1398,7 +1415,9 @@ impl Tunnel {
             if status.success() {
                 info!("Added bypass route: {} via {}", server_ip, gw);
             } else {
-                error!("Failed to add bypass route for {}", server_ip);
+                return Err(Error::Io(io::Error::other(format!(
+                    "Не удалось добавить обходной маршрут для {server_ip}"
+                ))));
             }
         }
 
@@ -2151,6 +2170,10 @@ impl Tunnel {
         if let Some(mark) = self.transport_mark {
             ks = ks.with_mark(mark);
         }
+        #[cfg(any(target_os = "macos", windows))]
+        if let Some(guard) = &self.transport_guard {
+            ks = ks.with_guard(guard.clone());
+        }
         let result = ks.activate();
         // Ошибка не снимает DROP guard. Владелец нужен и для его явной очистки.
         self.kill_switch_state = Some(ks);
@@ -2619,6 +2642,21 @@ mod tests {
         assert_eq!(config.tun_addr, "10.0.0.2");
         assert_eq!(config.server_vpn_ip, "10.0.0.1");
         assert_eq!(config.mtu, WAN_SAFE_TUN_MTU);
+    }
+
+    #[tokio::test]
+    async fn explicit_and_live_tun_mtu_leave_room_for_all_mask_carriers() {
+        let network = aivpn_common::network_config::VpnNetworkConfig {
+            mtu: 1500,
+            ..Default::default()
+        };
+        let mut assigned = network.client_config("10.0.0.2".parse().unwrap()).unwrap();
+        assigned.mtu = 1500;
+        let config = TunnelConfig::from_network_config("tun-test".into(), assigned.clone(), false);
+        assert_eq!(config.mtu, 1500);
+        let mut tunnel = Tunnel::new(config);
+        tunnel.apply_network_config(assigned).await.unwrap();
+        assert_eq!(tunnel.config.mtu, 1500);
     }
 
     #[cfg(target_os = "linux")]

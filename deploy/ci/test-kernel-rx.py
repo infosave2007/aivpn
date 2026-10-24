@@ -26,9 +26,10 @@ struct aivpn_kern_session {
 };
 static int aivpn_peer_is_other(__u32 ip, void *ctx) { (void)ip; (void)ctx; return 0; }
 static u64 ktime_get_ns(void) { return 1000000000; }
+static int accounting_result = AIVPN_VERDICT_ACCEPT;
 static int aivpn_session_account(struct aivpn_kern_session *s, int dir,
                                 unsigned int bytes, u64 now)
-{ (void)s; (void)dir; (void)bytes; (void)now; return AIVPN_VERDICT_ACCEPT; }
+{ (void)s; (void)dir; (void)bytes; (void)now; return accounting_result; }
 ''' + functions + r'''
 int main(void) {
     struct aivpn_kern_session s = {0};
@@ -51,6 +52,18 @@ int main(void) {
         return 1;
     }
     puts("RX смена эпохи между prepare/finish: PASS");
+    accounting_result = AIVPN_VERDICT_FALLBACK;
+    after = aivpn_session_rx_finish(&s, 2, 9, ip, sizeof(ip), 64, &dup);
+    if (after != AIVPN_VERDICT_FALLBACK || s.replay.hi != 0 || s.rx_packets != 0) return 3;
+    accounting_result = AIVPN_VERDICT_ACCEPT;
+    after = aivpn_session_rx_finish(&s, 2, 9, ip, sizeof(ip), 64, &dup);
+    if (after != AIVPN_VERDICT_ACCEPT || s.replay.hi != 9 || s.rx_packets != 1) return 4;
+    after = aivpn_session_rx_finish(&s, 2, 9, ip, sizeof(ip), 64, &dup);
+    if (after != AIVPN_VERDICT_DROP || !dup || s.rx_packets != 1) return 5;
+    accounting_result = AIVPN_VERDICT_DROP;
+    after = aivpn_session_rx_finish(&s, 2, 10, ip, sizeof(ip), 64, &dup);
+    if (after != AIVPN_VERDICT_DROP || s.replay.hi != 10 || s.rx_packets != 1) return 6;
+    puts("RX отсутствие QoS: fallback без claim, quota drop с claim: PASS");
     return 0;
 }
 '''

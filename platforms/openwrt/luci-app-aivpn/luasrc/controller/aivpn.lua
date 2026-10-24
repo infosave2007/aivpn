@@ -14,10 +14,10 @@ function index()
           cbi("aivpn"), "Configuration", 20).leaf = true
 
     entry({"admin", "services", "aivpn", "start"},
-          call("action_start"), nil).leaf = true
+          post("action_start"), nil).leaf = true
 
     entry({"admin", "services", "aivpn", "stop"},
-          call("action_stop"), nil).leaf = true
+          post("action_stop"), nil).leaf = true
 end
 
 function action_start()

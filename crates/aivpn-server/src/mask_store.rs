@@ -620,7 +620,7 @@ mod tests {
 
         let mut signed = preset_masks::all()[0].clone();
         signed.mask_id = "signed_m".into();
-        signed.sign(sk);
+        signed.sign(sk).unwrap();
         write_profile(dir, &signed);
 
         let mut unsigned = preset_masks::all()[0].clone();
@@ -639,7 +639,10 @@ mod tests {
         reverse.mask_id = "reverse_broken_m_rev".into();
         reverse.signature = [0u8; 64];
         reverse_broken.reverse_profile = Some(Box::new(reverse));
-        reverse_broken.sign(sk);
+        use ed25519_dalek::Signer;
+        reverse_broken.signature = sk
+            .sign(&reverse_broken.signing_message().unwrap())
+            .to_bytes();
         write_profile(dir, &reverse_broken);
     }
 
@@ -781,7 +784,7 @@ mod tests {
 
         let mut signed = preset_masks::quic_https_v2();
         signed.mask_id = "add_signed".into();
-        signed.sign(&sk);
+        signed.sign(&sk).unwrap();
         store
             .add_mask(sample_entry("add_signed", signed))
             .expect("signed mask must be stored");

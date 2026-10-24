@@ -263,38 +263,22 @@ final class InstallServerStore: ObservableObject {
                 self.logLines.append(line)
                 if let marker = SshInstaller.parseMarkerLine(line) {
                     self.lastMarker = marker
-                    if marker.step == "client_done", let key = marker.connection_key {
+                    if marker.status == "ok", ["done", "client_done"].contains(marker.step), let key = marker.connection_key {
                         self.connectionKey = key
-                        // G-C1: import the profile the moment the key
-                        // arrives — no mandatory manual "Import Profile"
-                        // click. Same `VPNManager.addKey` path the old
-                        // button used (adds to KeychainStorage + selects
-                        // it), just called here instead of gated behind a
-                        // tap. `onLine` (SshInstaller.runInstall's doc
-                        // comment) always dispatches on the main thread, so
-                        // touching `@Published` state and `VPNManager.shared`
-                        // here is safe. Guarded by `didImport` so a
-                        // (theoretical) duplicate `client_done` line can't
-                        // double-import.
-                        if !self.didImport {
-                            let profileName = self.host
-                            if VPNManager.shared.addKey(name: profileName, keyValue: key) {
-                                self.didImport = true
-                                self.importFailed = false
-                                self.importedProfileName = profileName
-                                self.importedKeyId = VPNManager.shared.selectedKeyId
-                            } else {
-                                // Duplicate key value (KeychainStorage.addKey
-                                // returns nil) — surfaced in resultView via
-                                // `install_import_failed`; the key text
-                                // itself stays visible/copyable regardless.
-                                self.importFailed = true
-                            }
-                        }
                     }
                 }
             }
             await MainActor.run {
+                if code == 0, !self.didImport, let key = self.connectionKey {
+                    if VPNManager.shared.addKey(name: self.host, keyValue: key) {
+                        self.didImport = true
+                        self.importFailed = false
+                        self.importedProfileName = self.host
+                        self.importedKeyId = VPNManager.shared.selectedKeyId
+                    } else {
+                        self.importFailed = true
+                    }
+                }
                 self.exitCode = code
                 self.isRunning = false
                 self.isFinished = true

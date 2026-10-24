@@ -8,7 +8,7 @@
 //! этом крейте: она поставляет собственный бинарь, вызывающий [`run`].
 
 use aivpn_client::adaptive::{AdaptiveConfig, AdaptiveMonitor};
-use aivpn_client::bench::run_bench;
+use aivpn_client::bench::run_bench_with_token;
 use aivpn_client::bootstrap_cache;
 use aivpn_client::bootstrap_loader::{self, BootstrapConfig};
 use aivpn_client::client::{base_mask_family, handshake_reject_message, ClientConfig};
@@ -58,6 +58,14 @@ async fn wait_reconnect_backoff(backoff: Duration, shutdown: &AtomicBool) {
 }
 
 /// AIVPN Client - Censorship-resistant VPN client
+fn parse_preset_mask(value: &str) -> std::result::Result<String, String> {
+    if aivpn_common::mask::preset_masks::ids().any(|id| id == value) {
+        Ok(value.to_owned())
+    } else {
+        Err(format!("Неизвестная встроенная маска '{value}'"))
+    }
+}
+
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 pub struct ClientArgs {
@@ -72,6 +80,10 @@ pub struct ClientArgs {
     /// Server public key (base64, 32 bytes)
     #[arg(long)]
     pub server_key: Option<String>,
+
+    /// Предварительный ключ клиента (base64, 32 байта).
+    #[arg(long, env = "AIVPN_PRESHARED_KEY")]
+    pub preshared_key: Option<String>,
 
     /// Server signing public key (base64, 32 bytes)
     #[arg(long)]
@@ -195,15 +207,15 @@ pub struct ClientArgs {
 
     /// Preferred mask profile name (e.g. webrtc_zoom_v3, quic_https_v2).
     /// When set, overrides the bootstrap-selected mask with the named built-in preset.
-    /// Has no effect if the name is not a known preset.
-    #[arg(long, value_name = "NAME")]
+    /// Неизвестное имя отклоняется до подключения.
+    #[arg(long, value_name = "NAME", value_parser = parse_preset_mask)]
     pub preferred_mask: Option<String>,
 
     /// Request a polymorphic (per-session perturbed) variant of the named base mask
     /// (e.g. webrtc_zoom_v3). The server derives the variant deterministically from
     /// the session's PRNG seed and pushes it back via the normal MaskUpdate channel.
-    /// Has no effect if the name is not a known preset.
-    #[arg(long, value_name = "MASK_ID")]
+    /// Неизвестное имя отклоняется до подключения.
+    #[arg(long, value_name = "MASK_ID", value_parser = parse_preset_mask)]
     pub polymorphic_base: Option<String>,
 
     /// Opt in to sharing crowdsourced mask-blocking feedback with the server
@@ -246,6 +258,8 @@ pub enum ClientCommand {
         /// Output as JSON instead of human-readable text
         #[arg(long)]
         json: bool,
+        #[arg(long, env = "AIVPN_ADMIN_TOKEN", hide_env_values = true)]
+        token: Option<String>,
     },
     /// P2.3-desktop: issue an in-tunnel management API call against the
     /// running client daemon, bridged over its local admin socket. This is
@@ -268,7 +282,7 @@ pub enum ClientCommand {
         /// Admin-socket auth token. Defaults to reading the token the
         /// running daemon wrote for this OS user (same file `record`
         /// commands use).
-        #[arg(long)]
+        #[arg(long, env = "AIVPN_ADMIN_TOKEN", hide_env_values = true)]
         token: Option<String>,
         /// Admin-socket address of the running client daemon.
         #[arg(long, value_parser = aivpn_client::record_cmd::parse_admin_addr)]
@@ -278,7 +292,7 @@ pub enum ClientCommand {
     /// 2=Admin) cached by the running client daemon.
     Role {
         /// Admin-socket auth token (see `mgmt --token`).
-        #[arg(long)]
+        #[arg(long, env = "AIVPN_ADMIN_TOKEN", hide_env_values = true)]
         token: Option<String>,
         /// Admin-socket address of the running client daemon.
         #[arg(long, value_parser = aivpn_client::record_cmd::parse_admin_addr)]
@@ -323,21 +337,9 @@ impl MgmtMethod {
     }
 }
 
-/// Send a `"{token}:{command}"` datagram to the running daemon's admin
-/// socket and wait (bounded) for a reply datagram. Shared by the `mgmt` and
-/// `role` CLI subcommands, which — unlike the pre-existing `record`
-/// subcommand (fire-and-forget, polls a status file) — need the daemon's
-/// direct reply.
+/// Выполняет один локальный запрос без повторной отправки при ошибке.
 fn send_admin_request(socket_addr: std::net::SocketAddrV4, line: &str) -> Option<String> {
-    let socket = std::net::UdpSocket::bind("127.0.0.1:0").ok()?;
-    socket
-        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
-        .ok()?;
-    socket.connect(socket_addr).ok()?;
-    socket.send(line.as_bytes()).ok()?;
-    let mut buf = [0u8; 65536];
-    let len = socket.recv(&mut buf).ok()?;
-    std::str::from_utf8(&buf[..len]).ok().map(|s| s.to_string())
+    aivpn_common::local_admin::request(socket_addr, line, std::time::Duration::from_secs(12)).ok()
 }
 
 #[derive(clap::Subcommand, Debug)]
@@ -364,6 +366,8 @@ static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug, Clone, Default, Deserialize)]
 struct ClientFileConfig {
+    #[serde(flatten)]
+    runtime: aivpn_common::transport::RuntimeConfig,
     server_addr: Option<String>,
     server_public_key: Option<String>,
     server_signing_public_key: Option<String>,
@@ -381,11 +385,11 @@ struct ClientFileConfig {
     kill_switch: Option<bool>,
 }
 
-fn load_client_file_config(path: Option<&str>) -> Option<ClientFileConfig> {
-    let resolved = path?;
-    std::fs::read_to_string(resolved)
-        .ok()
-        .and_then(|json| serde_json::from_str::<ClientFileConfig>(&json).ok())
+fn load_client_file_config(path: Option<&str>) -> Result<Option<ClientFileConfig>, String> {
+    path.map(|path| {
+        aivpn_common::transport::read_local_config(path).map_err(|error| error.to_string())
+    })
+    .transpose()
 }
 
 fn decode_base64_key(label: &str, encoded: &str) -> [u8; 32] {
@@ -546,11 +550,13 @@ pub async fn run(
                     if redact_next {
                         redact_next = false;
                         out.push("<redacted>".to_string());
-                    } else if a == "--connection-key" || a == "-k" {
+                    } else if a == "--connection-key" || a == "-k" || a == "--preshared-key" {
                         redact_next = true;
                         out.push(a.clone());
                     } else if a.starts_with("--connection-key=") {
                         out.push("--connection-key=<redacted>".to_string());
+                    } else if a.starts_with("--preshared-key=") {
+                        out.push("--preshared-key=<redacted>".to_string());
                     } else if a.contains("aivpn://") {
                         out.push("<redacted>".to_string());
                     } else {
@@ -679,6 +685,7 @@ pub async fn run(
         }
     }
     std::env::remove_var("AIVPN_CONNECTION_KEY");
+    std::env::remove_var("AIVPN_ADMIN_TOKEN");
 
     // Handle subcommands
     if let Some(command) = args.command {
@@ -693,30 +700,23 @@ pub async fn run(
                     return;
                 }
             },
-            ClientCommand::Bench { duration, json } => {
-                let server_addr = args
-                    .server
-                    .clone()
-                    .or_else(|| {
-                        args.connection_key.as_deref().and_then(|ck| {
-                            let payload = ck.trim().strip_prefix("aivpn://").unwrap_or(ck.trim());
-                            base64::engine::general_purpose::URL_SAFE_NO_PAD
-                                .decode(payload)
-                                .ok()
-                                .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
-                                .and_then(|v| v["s"].as_str().map(|s| s.to_string()))
-                        })
-                    })
-                    .unwrap_or_else(|| {
-                        error!("--server or --connection-key required for bench");
-                        std::process::exit(1);
-                    });
-
-                let addr = server_addr.parse().unwrap_or_else(|e| {
-                    error!("Invalid server address '{}': {}", server_addr, e);
+            ClientCommand::Bench {
+                duration,
+                json,
+                token,
+            } => {
+                let result = run_bench_with_token(
+                    args.admin_listen,
+                    Duration::from_secs(duration),
+                    token.or_else(|| {
+                        aivpn_client::record_cmd::read_admin_token_at(args.admin_listen)
+                    }),
+                )
+                .await
+                .unwrap_or_else(|e| {
+                    error!("Benchmark failed: {e}");
                     std::process::exit(1);
                 });
-                let result = run_bench(addr, Duration::from_secs(duration)).await;
                 if json {
                     println!(
                         "{}",
@@ -724,13 +724,14 @@ pub async fn run(
                     );
                 } else {
                     println!("═══ AIVPN Diagnostics ═══");
-                    println!("Server:      {}", server_addr);
+                    println!("Session:     {}", args.admin_listen);
                     println!("Samples:     {}", result.samples);
                     println!("Latency P50: {:.1} ms", result.latency_p50_ms);
                     println!("Latency P95: {:.1} ms", result.latency_p95_ms);
                     println!("Latency P99: {:.1} ms", result.latency_p99_ms);
                     println!("Packet loss: {:.1}%", result.packet_loss_pct);
-                    println!("Throughput:  {:.0} kbps est.", result.throughput_up_kbps);
+                    println!("Upload:      {:.0} kbps", result.throughput_up_kbps);
+                    println!("Download:    {:.0} kbps", result.throughput_down_kbps);
                     println!(
                         "Quality:     {} ({})",
                         result.quality_score, result.quality_label
@@ -746,10 +747,28 @@ pub async fn run(
                 socket,
             } => {
                 let body = match body_file {
-                    Some(f) => std::fs::read(&f).unwrap_or_else(|e| {
-                        eprintln!("Failed to read --body-file {}: {e}", f.display());
-                        std::process::exit(1);
-                    }),
+                    Some(path) => {
+                        use std::io::Read;
+                        let reader: Box<dyn Read> = if path.as_os_str() == "-" {
+                            Box::new(std::io::stdin())
+                        } else {
+                            Box::new(std::fs::File::open(&path).unwrap_or_else(|e| {
+                                eprintln!("Cannot read request body: {e}");
+                                std::process::exit(1);
+                            }))
+                        };
+                        let mut bytes = Vec::new();
+                        if let Err(error) = reader.take(4 * 1024 * 1024 + 1).read_to_end(&mut bytes)
+                        {
+                            eprintln!("Cannot read request body: {error}");
+                            std::process::exit(1);
+                        }
+                        if bytes.len() > 4 * 1024 * 1024 {
+                            eprintln!("Request body exceeds 4 MiB");
+                            std::process::exit(1);
+                        }
+                        bytes
+                    }
                     None => Vec::new(),
                 };
                 let socket = socket.unwrap_or(args.admin_listen);
@@ -872,7 +891,31 @@ pub async fn run(
         }
     }
 
-    let file_config = load_client_file_config(args.config.as_deref());
+    let file_config = match load_client_file_config(args.config.as_deref()) {
+        Ok(config) => config,
+        Err(error) => {
+            error!("локальная конфигурация: {error}");
+            std::process::exit(1);
+        }
+    };
+    let runtime = match file_config
+        .as_ref()
+        .map(|config| Ok(config.runtime.clone()))
+        .unwrap_or_else(|| runtime_policy(None))
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            error!("локальная конфигурация: {error}");
+            std::process::exit(1);
+        }
+    };
+    let local_transport = match transport_config(runtime) {
+        Ok(config) => config,
+        Err(error) => {
+            error!("локальная конфигурация: {error}");
+            std::process::exit(1);
+        }
+    };
 
     // Parse connection key or individual args
     let (
@@ -982,10 +1025,15 @@ pub async fn run(
                 error!("Either --connection-key or --server + --server-key required");
                 std::process::exit(1);
             });
-        let psk = file_config
+        let psk = args
+            .preshared_key
             .as_ref()
-            .and_then(|config| config.preshared_key.as_ref())
-            .and_then(|value| base64::engine::general_purpose::STANDARD.decode(value).ok());
+            .or_else(|| {
+                file_config
+                    .as_ref()
+                    .and_then(|config| config.preshared_key.as_ref())
+            })
+            .map(|value| decode_base64_key("preshared key", value).to_vec());
         let network_config = file_config
             .as_ref()
             .and_then(|config| config.network_config.clone())
@@ -1386,9 +1434,32 @@ pub async fn run(
             format!("tun{:04x}", rand::thread_rng().gen::<u16>())
         });
 
+        if handshake_fail_streak >= HANDSHAKE_FALLBACK_THRESHOLD {
+            bootstrap_cache::LAST_GOOD_MASK
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .take();
+        }
+
         // Select initial mask from cached descriptors
         // In production secure mode (no_fallback), fail if no valid descriptors are available
-        let initial_mask = bootstrap_cache::select_initial_mask(preshared_key.as_ref());
+        let mut initial_mask = bootstrap_cache::select_initial_mask_for_attempt(
+            preshared_key.as_ref(),
+            0,
+            server_signing_key.as_ref(),
+        );
+        if initial_mask.is_none() && !bootstrap_descriptor_urls.is_empty() {
+            bootstrap_cache::refresh_from_urls(
+                &bootstrap_descriptor_urls,
+                server_signing_key.as_ref(),
+            )
+            .await;
+            initial_mask = bootstrap_cache::select_initial_mask_for_attempt(
+                preshared_key.as_ref(),
+                0,
+                server_signing_key.as_ref(),
+            );
+        }
 
         // FIX (Jul 15): sticky last-known-good mask. In AUTO mode (no explicit
         // --preferred-mask / --polymorphic-base), once a mask has carried real
@@ -1488,46 +1559,25 @@ pub async fn run(
             initial_mask
         };
 
-        // production-secure companion to the fallback above: never drop to an
-        // unsigned builtin mask, but still recover from a cached descriptor the
-        // server can no longer match (rotated signing/session key, expired
-        // epoch) — otherwise `select_initial_mask()` deterministically re-picks
-        // the same newest-`created_at` descriptor every reconnect and the
-        // client is stuck until the descriptor's own (possibly hours/days-long)
-        // `expires_at` passes. Exclude the specific failing descriptor id from
-        // this run's selection (not delete it from disk) so selection advances
-        // to the next-newest still-valid SIGNED descriptor, and kick an
-        // immediate re-fetch in case the operator has since published a fresh
-        // one. Resets the fail streak so the newly-selected descriptor gets its
-        // own full threshold before being excluded in turn.
+        // Ошибка связи не исключает доверенный дескриптор навсегда.
         #[cfg(feature = "production-secure")]
         let initial_mask = if handshake_fail_streak >= HANDSHAKE_FALLBACK_THRESHOLD {
-            let descriptor_id = initial_mask
-                .mask_id
-                .strip_prefix("bootstrap:")
-                .and_then(|rest| rest.split(':').next())
-                .map(|s| s.to_string());
-            if let Some(id) = &descriptor_id {
-                warn!(
-                    "{} consecutive handshakes never connected on descriptor '{}' — excluding it \
-                     from selection and forcing a bootstrap re-fetch (production-secure: no unsigned fallback)",
-                    handshake_fail_streak, id
-                );
-                bootstrap_cache::exclude_descriptor(id);
-                handshake_fail_streak = 0;
+            if handshake_fail_streak % HANDSHAKE_FALLBACK_THRESHOLD == 0 {
+                let refetched = bootstrap_cache::refresh_from_urls(
+                    &bootstrap_descriptor_urls,
+                    server_signing_key.as_ref(),
+                )
+                .await;
+                if refetched > 0 {
+                    info!("Обновлено bootstrap-дескрипторов: {refetched}");
+                }
             }
-            let refetched = bootstrap_cache::refresh_from_urls(
-                &bootstrap_descriptor_urls,
+            bootstrap_cache::select_initial_mask_for_attempt(
+                preshared_key.as_ref(),
+                handshake_fail_streak,
                 server_signing_key.as_ref(),
             )
-            .await;
-            if refetched > 0 {
-                info!(
-                    "Re-fetched {} bootstrap descriptor(s) after a stuck descriptor",
-                    refetched
-                );
-            }
-            bootstrap_cache::select_initial_mask(preshared_key.as_ref()).unwrap_or(initial_mask)
+            .unwrap_or(initial_mask)
         } else {
             initial_mask
         };
@@ -1737,7 +1787,7 @@ pub async fn run(
             pool_node_id: None,
             remote_verified_node: None,
             remote_enroll_hook: None,
-            transport: transport_config(),
+            transport: local_transport.clone(),
         };
 
         match AivpnClient::new(config) {
@@ -1933,18 +1983,47 @@ fn fallback_network_config(tun_addr: &str) -> ClientNetworkConfig {
 ///
 /// `None` - the case in a build that registers nothing - is the direct UDP
 /// socket the client has always used.
-fn transport_config() -> Option<aivpn_common::transport::TransportConfig> {
-    let name = std::env::var("AIVPN_TRANSPORT")
-        .ok()
-        .filter(|s| !s.trim().is_empty())?;
-    let params = std::env::var("AIVPN_TRANSPORT_PARAMS")
-        .ok()
-        .and_then(|s| base64::engine::general_purpose::STANDARD.decode(s).ok())
-        .unwrap_or_default();
-    Some(aivpn_common::transport::TransportConfig::new(
-        name.trim(),
-        params,
+fn transport_config(
+    runtime: aivpn_common::transport::RuntimeConfig,
+) -> Result<Option<aivpn_common::transport::TransportConfig>, String> {
+    let name = match std::env::var("AIVPN_TRANSPORT") {
+        Ok(value) => value,
+        Err(std::env::VarError::NotPresent) => return Ok(None),
+        Err(_) => return Err("AIVPN_TRANSPORT должен быть UTF-8".into()),
+    };
+    let name = name.trim();
+    if name.is_empty() {
+        return Ok(None);
+    }
+    let params = match std::env::var("AIVPN_TRANSPORT_PARAMS") {
+        Ok(value) => decode_transport_params(&value)?,
+        Err(std::env::VarError::NotPresent) => Vec::new(),
+        Err(_) => return Err("AIVPN_TRANSPORT_PARAMS должен быть UTF-8".into()),
+    };
+    Ok(Some(
+        aivpn_common::transport::TransportConfig::new(name, params).with_runtime_config(runtime),
     ))
+}
+
+fn decode_transport_params(value: &str) -> Result<Vec<u8>, String> {
+    base64::engine::general_purpose::STANDARD
+        .decode(value)
+        .map_err(|_| "неверный AIVPN_TRANSPORT_PARAMS".into())
+}
+
+/// Политика из того же `--config`, что и остальные поля клиента, либо из
+/// стандартного общего файла. Отсутствующий файл оставляет значение по
+/// умолчанию. Существующий неверный файл не подменяет `false` на `true`.
+fn runtime_policy(
+    config_path: Option<&str>,
+) -> Result<aivpn_common::transport::RuntimeConfig, String> {
+    match config_path {
+        Some(path) => aivpn_common::transport::RuntimeConfig::load_file(path),
+        None => aivpn_common::transport::RuntimeConfig::load_default_file(
+            aivpn_common::transport::default_config_path(),
+        ),
+    }
+    .map_err(|error| error.to_string())
 }
 
 /// The transports this binary can open.
@@ -1967,6 +2046,62 @@ fn transport_registry(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn malformed_transport_parameters_are_not_an_empty_profile() {
+        assert!(decode_transport_params("private-invalid-%").is_err());
+        assert_eq!(decode_transport_params("").unwrap(), Vec::<u8>::new());
+        assert_eq!(decode_transport_params("e30=").unwrap(), b"{}");
+        assert!(!decode_transport_params("private-invalid-%")
+            .unwrap_err()
+            .contains("private-invalid"));
+    }
+
+    #[test]
+    fn local_policy_remains_separate_from_connection_key_and_room() {
+        let path = std::env::temp_dir().join(format!(
+            "aivpn-cli-policy-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::write(
+            &path,
+            r#"{"server_addr":"198.51.100.8:443","traffic_adaptation":false}"#,
+        )
+        .unwrap();
+        let key = make_conn_key(r#"{"s":"198.51.100.9:443","k":"abc"}"#);
+        let parsed = parse_connection_key(&key).unwrap();
+        assert_eq!(parsed["s"].as_str(), Some("198.51.100.9:443"));
+        let policy = load_client_file_config(Some(path.to_str().unwrap()))
+            .unwrap()
+            .unwrap()
+            .runtime;
+        let params = br#"{"room":"north","traffic_adaptation":true}"#.to_vec();
+        let cfg = aivpn_common::transport::TransportConfig::new("local", params)
+            .with_runtime_config(policy);
+        let _ = std::fs::remove_file(&path);
+        assert!(!cfg.runtime_config().traffic_adaptation);
+        assert_eq!(
+            cfg.params(),
+            br#"{"room":"north","traffic_adaptation":true}"#
+        );
+    }
+
+    #[test]
+    fn explicit_missing_policy_file_is_an_error() {
+        let path = std::env::temp_dir().join(format!(
+            "aivpn-cli-missing-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&path);
+        assert!(runtime_policy(Some(path.to_str().unwrap())).is_err());
+    }
 
     #[tokio::test(start_paused = true)]
     async fn shutdown_interrupts_reconnect_backoff() {
@@ -2027,6 +2162,26 @@ mod tests {
         assert!(
             matches!(args.command, Some(ClientCommand::Role { socket: Some(addr), .. }) if addr.port() == 44303)
         );
+    }
+
+    #[test]
+    fn disabled_alice_cannot_be_selected_as_a_builtin_mask() {
+        for argument in ["--preferred-mask", "--polymorphic-base"] {
+            assert!(
+                ClientArgs::try_parse_from(["aivpn-client", argument, "yandex_alice_v1"]).is_err(),
+                "Отключенный профиль не должен запускать подключение"
+            );
+        }
+    }
+
+    #[test]
+    fn mask_arguments_accept_all_assets_and_reject_unknown_names() {
+        for argument in ["--preferred-mask", "--polymorphic-base"] {
+            for id in aivpn_common::mask::preset_masks::ids() {
+                assert!(ClientArgs::try_parse_from(["aivpn-client", argument, id]).is_ok());
+            }
+            assert!(ClientArgs::try_parse_from(["aivpn-client", argument, "typo_mask"]).is_err());
+        }
     }
 
     #[test]

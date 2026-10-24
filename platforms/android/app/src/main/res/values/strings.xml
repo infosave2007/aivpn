@@ -85,7 +85,8 @@
     <string name="split_tunnel_hint_combined">%1$s via VPN, %2$s bypass VPN</string>
     <string name="split_tunnel_add_domain">Enter domain…</string>
     <string name="split_tunnel_domain_hint">Traffic to these domains will bypass VPN</string>
-    <string name="split_tunnel_domain_note">IPs are resolved at connect time. Requires Android 13+. CDN addresses may change.</string>
+    <string name="split_tunnel_domain_note">IPs are resolved at connect time. CDN addresses may change. Up to 64 addresses per IP family are excluded; remaining addresses stay inside the VPN.</string>
+    <string name="split_tunnel_domain_limit">Up to 64 domains can be excluded.</string>
     <string name="split_tunnel_apps_unavailable">App list unavailable — QUERY_ALL_PACKAGES permission denied</string>
     <string name="split_tunnel_domain_invalid">Invalid domain format</string>
     <string name="split_tunnel_domain_exists">Domain already added</string>
@@ -290,7 +291,8 @@
     <string name="server_settings_mask_none_loaded">No mask list available yet — connect to the VPN and reopen this screen, or enter a mask id manually.</string>
     <string name="server_settings_exit_title">Global default exit (pool)</string>
     <string name="server_settings_exit_caption">Applies after a server RESTART — not live. This is the fallback used by any client without its own per-client exit-node override.</string>
-    <string name="server_settings_exit_hint">host:port — empty = none</string>
+    <string name="server_settings_exit_hint">host:port</string>
+    <string name="server_settings_clear_exit">Disable global exit node</string>
     <string name="server_settings_apply">Apply</string>
     <string name="server_settings_confirm">Confirm</string>
     <string name="server_settings_pending_banner">Confirm within %ds or this change reverts automatically</string>
@@ -381,4 +383,6 @@
     <string name="install_marker_docker_missing">Docker is not installed on the target</string>
     <string name="install_marker_compose_missing">docker compose is not available on the target</string>
     <string name="install_marker_container_not_running">aivpn-server container did not report as running</string>
+    <string name="bench_speed">Upload: %1$.0f kbps  Download: %2$.0f kbps</string>
+    <string name="bench_failed">Active-session benchmark failed</string>
 </resources>

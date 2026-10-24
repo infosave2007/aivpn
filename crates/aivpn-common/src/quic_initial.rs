@@ -1,6 +1,10 @@
-//! RFC 9001 QUIC v1 Initial packet construction for the `Quic` mimic protocol.
+//! Генератор прежней синтетической заготовки QUIC Initial для тестов.
 //!
-//! aivpn's QUIC mask emits a **coalesced datagram**:
+//! Не реализует соединение, ACK или TLS handshake и не используется
+//! в сетевом пути клиента и сервера. Внешний QUIC формирует `quic_mask`
+//! с состоянием обеих сторон. Разбор этой заготовки не заменяет живой DPI-gate.
+//!
+//! Старый генератор создает составную дейтаграмму:
 //!
 //! ```text
 //! [ real RFC 9001 v1 QUIC Initial (header-protected, AEAD-encrypted) ]
@@ -16,8 +20,8 @@
 //!
 //! The 8-byte aivpn resonance tag rides inside the DCID (offset 6), so the
 //! per-packet key material is per-packet — the QUIC crypto is recomputed for
-//! every packet. The aivpn server extracts the tag from the DCID and skips
-//! the Initial (using its Length field) to reach the real ciphertext.
+//! every packet. Прежний декодер извлекал тег из DCID и пропускал Initial.
+//! В текущем gateway этот путь удален.
 //!
 //! Crypto (RFC 9001 §5.2, all SHA-256 / AES-128-GCM):
 //! - `initial_secret        = HKDF-Extract(initial_salt, DCID)`

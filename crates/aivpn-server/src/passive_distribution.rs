@@ -426,10 +426,7 @@ fn signing_key_from_material(material: &[u8; 64]) -> SigningKey {
 
 fn sign_envelope(mask: &MaskProfile, key: &SigningKey) -> Result<Vec<u8>> {
     let mut mask = mask.clone();
-    if let Some(reverse) = mask.reverse_profile.as_mut() {
-        reverse.sign(key);
-    }
-    mask.sign(key);
+    mask.sign(key)?;
     let raw = rmp_serde::to_vec(&mask)?;
     if raw.len() > MAX_PLAINTEXT {
         return Err(Error::Session("mask plaintext exceeds limit".into()));
@@ -1230,7 +1227,7 @@ mod tests {
     fn sample() -> MaskProfile {
         let (_, _, signing) = keys();
         let mut mask = aivpn_common::mask::preset_masks::webrtc_zoom_v3();
-        mask.sign(&signing);
+        mask.sign(&signing).unwrap();
         mask
     }
 

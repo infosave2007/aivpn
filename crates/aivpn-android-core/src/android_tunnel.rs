@@ -74,6 +74,55 @@ impl VpnProtectGuard {
 }
 
 impl aivpn_common::transport::SocketGuard for VpnProtectGuard {
+    fn resolve<'a>(
+        &'a self,
+        host: &'a str,
+        port: u16,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Vec<std::net::SocketAddr>>> + Send + 'a>,
+    > {
+        let this = self.clone();
+        let host = host.to_owned();
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || {
+                let mut env = this
+                    .vm
+                    .attach_current_thread()
+                    .map_err(|error| Error::Session(format!("JNI attach: {error}")))?;
+                let result = (|| -> jni::errors::Result<Vec<std::net::SocketAddr>> {
+                    let name = env.new_string(host)?;
+                    let addresses = env
+                        .call_method(
+                            &this.vpn_service,
+                            "resolveTransportHost",
+                            "(Ljava/lang/String;)[Ljava/lang/String;",
+                            &[jni::objects::JValue::Object(name.as_ref())],
+                        )?
+                        .l()?;
+                    let addresses = jni::objects::JObjectArray::from(addresses);
+                    let mut out = Vec::new();
+                    for index in 0..env.get_array_length(&addresses)? {
+                        let item = jni::objects::JString::from(
+                            env.get_object_array_element(&addresses, index)?,
+                        );
+                        let text: String = env.get_string(&item)?.into();
+                        if let Ok(ip) = text.split('%').next().unwrap_or(&text).parse() {
+                            out.push(std::net::SocketAddr::new(ip, port));
+                        }
+                        env.delete_local_ref(item)?;
+                    }
+                    Ok(out)
+                })();
+                if env.exception_check().unwrap_or(false) {
+                    let _ = env.exception_clear();
+                }
+                result.map_err(|error| Error::Session(format!("DNS физической сети: {error}")))
+            })
+            .await
+            .map_err(|error| Error::Session(format!("DNS: {error}")))?
+        })
+    }
+
     fn protect(&self, fd: RawFd) -> Result<()> {
         vpn_protect(&self.vm, &self.vpn_service, fd)
     }
@@ -271,10 +320,42 @@ async fn build_alt_transport(
     let mut registry = aivpn_common::transport::TransportRegistry::new();
     registry.register(factory);
     let params = transport_params_json.unwrap_or_default().into_bytes();
-    let cfg = aivpn_common::transport::TransportConfig::new(name, params);
+    // Общий файл приложения: filesDir/config.json. Каталог берется у сервиса,
+    // стандартный путь рабочего стола на Android не используется.
+    let policy_path = files_dir_config(vm, vpn_service)?;
+    let runtime = aivpn_common::transport::RuntimeConfig::load_default_file(&policy_path)
+        .map_err(|error| Error::Session(format!("локальная конфигурация: {error}")))?;
+    let cfg =
+        aivpn_common::transport::TransportConfig::new(name, params).with_runtime_config(runtime);
     let transport = registry
         .open(&cfg, guard)
         .await
         .map_err(|e| Error::Session(format!("open alt transport: {e}")))?;
     Ok(Some(transport))
+}
+
+/// `Context.getFilesDir().getAbsolutePath()` плюс имя общего файла.
+fn files_dir_config(vm: &JavaVM, vpn_service: &GlobalRef) -> Result<std::path::PathBuf> {
+    let mut env = vm
+        .attach_current_thread()
+        .map_err(|error| Error::Session(format!("JNI attach: {error}")))?;
+    let outcome: jni::errors::Result<String> = env.with_local_frame(8, |env| {
+        let file = env
+            .call_method(vpn_service, "getFilesDir", "()Ljava/io/File;", &[])?
+            .l()?;
+        let path = env
+            .call_method(&file, "getAbsolutePath", "()Ljava/lang/String;", &[])?
+            .l()?;
+        let path = jni::objects::JString::from(path);
+        let text = env.get_string(&path)?.into();
+        Ok(text)
+    });
+    if matches!(env.exception_check(), Ok(true)) {
+        let _ = env.exception_clear();
+    }
+    let directory = outcome.map_err(|error| Error::Session(format!("filesDir: {error}")))?;
+    if directory.is_empty() {
+        return Err(Error::Session("filesDir пуст".into()));
+    }
+    Ok(std::path::PathBuf::from(directory).join("config.json"))
 }

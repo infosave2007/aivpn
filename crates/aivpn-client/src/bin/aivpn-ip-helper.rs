@@ -62,6 +62,12 @@ const MAX_STDIN_BYTES: usize = 64 * 1024;
 /// / `run_ip_privileged` in `crates/aivpn-client/src/tunnel.rs`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Verb {
+    Addr6ReplaceDev,
+    Addr6DelDev,
+    Route6ReplaceDev,
+    Route6DelDev,
+    Route6AddDev,
+    Route6AddViaDev,
     SplitAdd,
     SplitDel,
     /// `ip addr replace <CIDR> dev <IFACE>`
@@ -106,6 +112,12 @@ enum Verb {
 impl Verb {
     fn parse(s: &str) -> Option<Verb> {
         Some(match s {
+            "addr6_replace" => Verb::Addr6ReplaceDev,
+            "addr6_del" => Verb::Addr6DelDev,
+            "route6_replace" => Verb::Route6ReplaceDev,
+            "route6_del" => Verb::Route6DelDev,
+            "route6_add" => Verb::Route6AddDev,
+            "route6_add_via" => Verb::Route6AddViaDev,
             "split_add" => Verb::SplitAdd,
             "split_del" => Verb::SplitDel,
             "addr_replace" => Verb::AddrReplaceDev,
@@ -131,6 +143,12 @@ impl Verb {
     /// shape requires — enforced exactly, no optional/variadic fields.
     fn field_count(self) -> usize {
         match self {
+            Verb::Addr6ReplaceDev
+            | Verb::Addr6DelDev
+            | Verb::Route6ReplaceDev
+            | Verb::Route6DelDev
+            | Verb::Route6AddDev => 2,
+            Verb::Route6AddViaDev => 3,
             Verb::SplitAdd | Verb::SplitDel => 3,
             Verb::AddrReplaceDev => 2,                   // CIDR, IFACE
             Verb::AddrDelDev => 2,                       // CIDR, IFACE
@@ -250,6 +268,40 @@ fn parse_line(line: &str, line_no: usize) -> Result<ParsedCommand, String> {
     }
 
     let argv = match verb {
+        Verb::Addr6ReplaceDev
+        | Verb::Addr6DelDev
+        | Verb::Route6ReplaceDev
+        | Verb::Route6DelDev
+        | Verb::Route6AddDev
+        | Verb::Route6AddViaDev => {
+            let (cidr, interface) = (rest[0], rest[1]);
+            let (address, prefix) = cidr.split_once('/').ok_or("нужен IPv6 CIDR")?;
+            if address.parse::<std::net::Ipv6Addr>().is_err()
+                || prefix.parse::<u8>().map_or(true, |value| value > 128)
+                || !is_valid_iface(interface)
+            {
+                return Err("неверный адрес или интерфейс IPv6".into());
+            }
+            let (object, action) = match verb {
+                Verb::Addr6ReplaceDev => ("addr", "replace"),
+                Verb::Addr6DelDev => ("addr", "del"),
+                Verb::Route6ReplaceDev => ("route", "replace"),
+                Verb::Route6DelDev => ("route", "del"),
+                _ => ("route", "add"),
+            };
+            let mut args: Vec<String> = ["-6", object, action, cidr, "dev", interface]
+                .into_iter()
+                .map(str::to_owned)
+                .collect();
+            if verb == Verb::Route6AddViaDev {
+                if rest[2].parse::<std::net::Ipv6Addr>().is_err() {
+                    return Err("неверный шлюз IPv6".into());
+                }
+                args.extend(["via", rest[2]].into_iter().map(str::to_owned));
+            }
+            args
+        }
+
         Verb::SplitAdd | Verb::SplitDel => {
             let (cidr, device, gateway) = (rest[0], rest[1], rest[2]);
             let (address, prefix) = cidr.split_once('/').ok_or("split route requires CIDR")?;
@@ -1039,5 +1091,55 @@ mod tests {
         .join("\n");
         let parsed = parse_batch(&input).unwrap();
         assert_eq!(parsed.len(), 8);
+    }
+}
+
+#[cfg(test)]
+mod ipv6_tests {
+    use super::*;
+
+    #[test]
+    fn accepts_ipv6_routes_and_addresses_without_shell() {
+        for (wire, expected) in [
+            (
+                "v6\taddr6_replace\tfd00::2/64\ttun0",
+                vec!["-6", "addr", "replace", "fd00::2/64", "dev", "tun0"],
+            ),
+            (
+                "v6\troute6_replace\t::/1\ttun0",
+                vec!["-6", "route", "replace", "::/1", "dev", "tun0"],
+            ),
+            (
+                "v6\troute6_del\t8000::/1\ttun0",
+                vec!["-6", "route", "del", "8000::/1", "dev", "tun0"],
+            ),
+            (
+                "v6\troute6_add_via\t2001:db8::1/128\teth0\tfe80::1",
+                vec![
+                    "-6",
+                    "route",
+                    "add",
+                    "2001:db8::1/128",
+                    "dev",
+                    "eth0",
+                    "via",
+                    "fe80::1",
+                ],
+            ),
+        ] {
+            assert_eq!(parse_line(wire, 1).unwrap().argv, expected);
+        }
+    }
+
+    #[test]
+    fn rejects_ipv6_field_injection_and_wrong_family() {
+        for wire in [
+            "v6\taddr6_replace\t10.0.0.1/24\ttun0",
+            "v6\troute6_replace\t::/129\ttun0",
+            "v6\troute6_del\t::/1\t--all",
+            "v6\troute6_add_via\t::/1\ttun0\t1.1.1.1",
+        ] {
+            assert!(parse_line(wire, 1).is_err());
+        }
     }
 }

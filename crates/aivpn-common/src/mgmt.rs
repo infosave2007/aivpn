@@ -133,6 +133,13 @@ impl MgmtClient {
         body: Vec<u8>,
         timeout: Duration,
     ) -> Result<(u16, Vec<u8>)> {
+        if path.len() > crate::protocol::MAX_MGMT_PATH_SIZE
+            || body.len() > crate::protocol::MAX_MGMT_BODY_SIZE
+        {
+            return Err(Error::InvalidPacket(
+                "Management request exceeds protocol limits",
+            ));
+        }
         let req_id = self.req_seq.fetch_add(1, Ordering::Relaxed);
         let (resp_tx, resp_rx) = oneshot::channel();
         self.pending

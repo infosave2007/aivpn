@@ -136,7 +136,8 @@ async fn main() {
     let effective_tun_mtu: u16 = match file_config.as_ref().and_then(|c| c.tun_mtu.as_ref()) {
         Some(MtuSetting::Fixed(v)) => *v,
         Some(MtuSetting::Auto) | None => detect_mtu(),
-    };
+    }
+    .min(aivpn_common::network_config::MAX_MASK_TUN_MTU);
     let network_config =
         config_resolve::resolve_network_config(file_config.as_ref(), effective_tun_mtu)
             .unwrap_or_else(|e| {
@@ -367,6 +368,19 @@ mod tests {
         assert_eq!(
             cli::client::build_connection_server_addr(&args, "203.0.113.10"),
             "203.0.113.10:443"
+        );
+    }
+
+    #[test]
+    fn build_connection_server_addr_brackets_bare_ipv6() {
+        let args = test_args("[::]:8443");
+        assert_eq!(
+            cli::client::build_connection_server_addr(&args, "2001:db8::1"),
+            "[2001:db8::1]:8443"
+        );
+        assert_eq!(
+            cli::client::build_connection_server_addr(&args, "[::1]:443"),
+            "[::1]:443"
         );
     }
 
@@ -738,7 +752,7 @@ mod tests {
         std::fs::write(&key_path, seed).unwrap();
         let signing = ed25519_dalek::SigningKey::from_bytes(&seed);
         let mut mask = aivpn_common::mask::preset_masks::webrtc_zoom_v3();
-        mask.sign(&signing);
+        mask.sign(&signing).unwrap();
         std::fs::File::create(&mask_path)
             .unwrap()
             .write_all(serde_json::to_string(&mask).unwrap().as_bytes())

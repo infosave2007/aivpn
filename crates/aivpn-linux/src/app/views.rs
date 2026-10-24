@@ -1456,8 +1456,17 @@ impl super::App {
         // ── Global exit node (pool default, restart required) ───────────
         body = body.push(rule::horizontal(1));
         body = body.push(text(t(lang, "Global exit node (pool default)")).size(13));
-        let exit_choices = exit_node_choices(lang, &self.pool_nodes);
-        let exit_selected = exit_node_selected(&self.server_settings_exit_node, &exit_choices);
+        let mut exit_choices = exit_node_choices(lang, &self.pool_nodes);
+        exit_choices[0].display = if lang == "ru" {
+            "Отключить"
+        } else {
+            "Disable"
+        }
+        .into();
+        let exit_selected = self
+            .server_settings_exit_selected
+            .then(|| exit_node_selected(&self.server_settings_exit_node, &exit_choices))
+            .flatten();
         body = body.push(
             row![
                 pick_list(
@@ -1470,7 +1479,9 @@ impl super::App {
                     .on_input(Message::ServerSettingsExitNodeChanged)
                     .width(Length::FillPortion(2)),
                 button(t(lang, "Apply")).on_press_maybe(
-                    (!self.server_settings_busy && !pending_active)
+                    (self.server_settings_exit_selected
+                        && !self.server_settings_busy
+                        && !pending_active)
                         .then_some(Message::ServerSettingsApplyExitNode)
                 ),
             ]

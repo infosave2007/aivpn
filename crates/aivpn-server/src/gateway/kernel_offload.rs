@@ -159,6 +159,11 @@ pub(crate) fn make_kernel_downlink(sess: &mut crate::session::Session) -> Option
         return None;
     }
     let mask = sess.mask.as_ref()?;
+    // ABI ядра пока не заполняет длину атрибута и padding STUN.
+    // Прием остается ускоренным, отправку оставляем общему сборщику.
+    if mask.uses_stun_attributes() || aivpn_common::mask_io::requires_userspace(mask) {
+        return None;
+    }
     let mdh = packet_mdh_bytes_for_mask(mask);
     if mdh.is_empty() || mdh.len() > DL_MDH_MAX {
         return None;
@@ -512,13 +517,24 @@ pub(crate) fn kernel_input_from_session(
         .client_id
         .as_deref()
         .and_then(|id| db.and_then(|db| db.find_by_id(id)));
-    kernel_limits_for(
+    let mut input = kernel_limits_for(
         sess,
         client.as_ref(),
         network,
         allow_peer_routing,
         global_exit,
-    )
+    );
+    input.userspace_tx |= sess
+        .mask
+        .as_ref()
+        .is_some_and(|mask| mask.uses_stun_attributes());
+    let stateful_mask = sess
+        .mask
+        .as_ref()
+        .is_some_and(aivpn_common::mask_io::requires_userspace);
+    input.userspace_rx |= stateful_mask;
+    input.userspace_tx |= stateful_mask;
+    input
 }
 
 fn stored_policy_sig(fingerprint: u64) -> u64 {

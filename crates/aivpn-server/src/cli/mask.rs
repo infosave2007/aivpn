@@ -107,10 +107,10 @@ pub(crate) fn handle_sign_mask_dir(dir: &str, args: &ServerArgs) {
                 continue;
             }
         };
-        if let Some(rev) = profile.reverse_profile.as_deref_mut() {
-            rev.sign(&key);
+        if let Err(error) = profile.sign(&key) {
+            eprintln!("  skip {}: ошибка подписи: {error}", path.display());
+            continue;
         }
-        profile.sign(&key);
         match serde_json::to_string_pretty(&profile) {
             Ok(out) => match std::fs::write(&path, out) {
                 Ok(()) => {
