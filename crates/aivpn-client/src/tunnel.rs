@@ -185,10 +185,6 @@ pub struct Tunnel {
     /// Saved default gateway for full-tunnel restore
     saved_default_gw: Option<String>,
     full_tunnel_routes_active: bool,
-    /// Saved default device for full-tunnel restore on Linux (e.g. "eth0").
-    /// Stored alongside saved_default_gw; used in disable_full_tunnel().
-    #[cfg(target_os = "linux")]
-    saved_default_dev: Option<String>,
     /// Server IP for bypass route cleanup
     server_ip: Option<String>,
     /// Windows: wintun adapter interface index for explicit route binding.
@@ -263,8 +259,6 @@ impl Tunnel {
             writer: None,
             saved_default_gw: None,
             full_tunnel_routes_active: false,
-            #[cfg(target_os = "linux")]
-            saved_default_dev: None,
             server_ip: None,
             wintun_if_index: None,
             #[cfg(not(target_os = "linux"))]
@@ -1623,7 +1617,6 @@ impl Tunnel {
         );
         self.saved_default_gw = (!gw.is_empty()).then(|| gw.clone());
         self.full_tunnel_routes_active = true;
-        self.saved_default_dev = (!default_dev.is_empty()).then(|| default_dev.clone());
 
         // 2 & 3. Bypass route for the VPN server IP + the 0/1+128/1
         // full-tunnel trick, all issued as ONE privileged batch (at most one
@@ -1904,14 +1897,8 @@ impl Tunnel {
         if let Some(server_ip) = self.server_ip.as_ref().filter(|ip| !ip.contains(':')) {
             batch.push(("del_bypass", vec!["route", "del", server_ip.as_str()]));
         }
-        // Restore default gateway
-        if let Some(ref gw) = self.saved_default_gw {
-            let mut args = vec!["route", "add", "default", "via", gw.as_str()];
-            if let Some(ref dev) = self.saved_default_dev {
-                args.extend_from_slice(&["dev", dev.as_str()]);
-            }
-            batch.push(("restore_default", args));
-        }
+        // Исходный default не удалялся. Повторное добавление теряет его metric
+        // и оставляет лишний маршрут после отключения или смены сети.
         let named_args: Vec<(&str, &[&str])> = batch
             .iter()
             .map(|(name, args)| (*name, args.as_slice()))
@@ -2660,6 +2647,83 @@ impl Drop for Tunnel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn full_tunnel_disconnect_preserves_dhcp_default_route() {
+        use std::process::Command;
+        const CHILD: &str = "AIVPN_DEFAULT_ROUTE_TEST_PARENT";
+        let namespace = std::fs::read_link("/proc/self/ns/net").unwrap();
+        if let Ok(parent) = std::env::var(CHILD) {
+            assert_ne!(namespace.to_string_lossy(), parent);
+            let ip = |args: &[&str]| {
+                let output = Command::new("ip").args(args).output().unwrap();
+                assert!(
+                    output.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                String::from_utf8(output.stdout).unwrap()
+            };
+            ip(&["link", "add", "wan0", "type", "dummy"]);
+            ip(&["link", "set", "wan0", "up"]);
+            ip(&["addr", "add", "192.0.2.2/24", "dev", "wan0"]);
+            ip(&[
+                "route",
+                "add",
+                "default",
+                "via",
+                "192.0.2.1",
+                "dev",
+                "wan0",
+                "proto",
+                "dhcp",
+                "metric",
+                "600",
+            ]);
+            let before = ip(&["-j", "route", "show", "default"]);
+            let runtime = tokio::runtime::Runtime::new().unwrap();
+            for _ in 0..2 {
+                let mut tunnel = Tunnel::new(TunnelConfig {
+                    tun_name: "audit0".into(),
+                    full_tunnel: true,
+                    ..TunnelConfig::default()
+                });
+                runtime.block_on(tunnel.create()).unwrap();
+                tunnel.set_server_ip("203.0.113.7".into());
+                tunnel.enable_full_tunnel().unwrap();
+                assert!(ip(&["route", "get", "1.1.1.1"]).contains("dev audit0"));
+                drop(tunnel);
+                assert_eq!(ip(&["-j", "route", "show", "default"]), before);
+            }
+            return;
+        }
+        let output = Command::new("unshare")
+            .args(["-Urn"])
+            .arg(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tunnel::tests::full_tunnel_disconnect_preserves_dhcp_default_route",
+                "--nocapture",
+            ])
+            .env(CHILD, namespace)
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if !output.status.success()
+            && stderr.starts_with("unshare:")
+            && stderr.contains("Operation not permitted")
+        {
+            eprintln!("Пространства имен запрещены: проверка маршрутов не выполнена");
+            return;
+        }
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            stderr
+        );
+    }
 
     #[cfg(target_os = "linux")]
     #[test]

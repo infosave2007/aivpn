@@ -17,6 +17,7 @@
 
 ### Fixed
 
+- **Responsive paced traffic** - bounded per-flow queues in both directions keep DNS and new connections from waiting behind a bulk transfer while preserving mask timing and packet order within each flow. Linux full-tunnel teardown preserves the original default route and its metric instead of adding a duplicate.
 - **Android profiles and system windows** - refresh imported profiles before saving the main screen, keep a granted VPN request across Activity recreation and asynchronous key loading, and retain the installation wizard during night mode changes. Empty client names keep the administration form open; a failed exit assignment reports that the client was already created.
 - **Android storage compatibility** - classify Keystore failures without linking to an exception type published in API 33, keeping recovery usable on older supported Android versions without deleting profiles after transient errors.
 - **Bounded server workloads** - limit pending DNS queries, unauthenticated source tracking and webhook queues. Slow upstream services no longer allow unbounded background work or source tables; webhook HTTP errors are reported without logging credential-bearing URLs.
@@ -134,6 +135,7 @@
 
 ### Исправлено
 
+- **Отзывчивость при маскировке трафика** - ограниченная очередь по потокам не оставляет DNS и новые соединения за большой фоновой передачей. Интервалы маски и порядок пакетов внутри потока сохраняются. При отключении полного туннеля Linux сохраняет исходный маршрут по умолчанию и его метрику, не добавляя дубликат.
 - **Профили Android и системные окна** - главный экран перечитывает импортированные профили перед сохранением. Согласие на VPN сохраняется при пересоздании Activity и отложенной загрузке ключей, а смена ночной темы не уничтожает мастер установки. Пустое имя не закрывает форму клиента; при неудачном назначении выхода явно сообщается, что клиент уже создан.
 - **Совместимость хранилища Android** - ошибки Keystore распознаются без прямой ссылки на класс, опубликованный в API 33. Восстановление работает на старых поддерживаемых Android и не удаляет профили после временных сбоев.
 - **Ограничение серверной нагрузки** - ограничены незавершенные DNS-запросы, таблицы непроверенных источников и очередь webhook. Медленные внешние службы больше не вызывают неограниченного роста фоновой работы; ошибки HTTP webhook видны без вывода URL с реквизитами.

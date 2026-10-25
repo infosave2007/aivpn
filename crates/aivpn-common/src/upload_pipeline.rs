@@ -408,6 +408,7 @@ pub async fn run_upload_loop(
     let handshake_start = time::Instant::now();
     let mut handshake_retry = crate::handshake_retry::HandshakeRetry::default();
     let mut pending_data: Option<(Vec<u8>, time::Instant)> = None;
+    let mut data_queue = crate::flow_queue::FlowQueue::new(512);
     let mut last_data_sent: Option<time::Instant> = None;
     let mut readiness_poll = time::interval(Duration::from_millis(20));
     readiness_poll.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
@@ -471,7 +472,7 @@ pub async fn run_upload_loop(
             // Пакеты данных обрабатываются ограниченными сериями.
             _ = readiness_poll.tick(), if !enc.data_ready() || !transport.mask_data_ready() => {}
 
-            maybe_pkt = rx.recv(), if pending_data.is_none() && enc.data_ready() && transport.mask_data_ready() => {
+            maybe_pkt = data_queue.next(rx), if pending_data.is_none() && enc.data_ready() && transport.mask_data_ready() => {
                 let pkt_data = match maybe_pkt {
                     Some(p) => p,
                     None => return Err(Error::Channel("TUN->UDP channel closed".into())),
@@ -518,7 +519,7 @@ pub async fn run_upload_loop(
                 for _ in 0..config.burst_size {
                     drain_pending_control(&mut control_rx, transport, enc).await?;
                     if !enc.data_ready() || !transport.mask_data_ready() { break; }
-                    match rx.try_recv() {
+                    match data_queue.try_next(rx) {
                         Ok(pkt) => {
                             if !enc.data_ready() || !transport.mask_data_ready() {
                                 pending_data = Some((pkt, time::Instant::now()));
@@ -593,6 +594,85 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use tokio::net::UdpSocket;
+
+    #[tokio::test(start_paused = true)]
+    async fn fresh_dns_flow_is_not_starved_by_paced_bulk_backlog() {
+        struct PlainPackets;
+        impl PacketEncryptor for PlainPackets {
+            fn data_send_delay(&mut self) -> Duration {
+                Duration::from_millis(30)
+            }
+            fn encrypt_data(&mut self, packet: &[u8]) -> Result<Vec<u8>> {
+                Ok(packet.to_vec())
+            }
+            fn encrypt_control(&mut self, _: &ControlPayload) -> Result<Vec<u8>> {
+                Ok(vec![0])
+            }
+            fn encrypt_keepalive(&mut self) -> Result<Vec<u8>> {
+                Ok(vec![0])
+            }
+            fn on_data_sent(&mut self, _: usize) {}
+        }
+        struct Recorder(std::sync::Mutex<Vec<u16>>);
+        #[async_trait::async_trait]
+        impl DatagramTransport for Recorder {
+            async fn send(&self, wire: &[u8]) -> std::io::Result<usize> {
+                if wire.len() == 28 {
+                    let mut ports = self.0.lock().unwrap();
+                    ports.push(u16::from_be_bytes([wire[22], wire[23]]));
+                    if ports.len() == 6 {
+                        return Err(std::io::ErrorKind::BrokenPipe.into());
+                    }
+                }
+                Ok(wire.len())
+            }
+            async fn recv(&self, _: &mut [u8]) -> std::io::Result<usize> {
+                std::future::pending().await
+            }
+            fn kind(&self) -> crate::transport::TransportKind {
+                crate::transport::TransportKind::Udp
+            }
+            fn max_datagram(&self) -> usize {
+                65507
+            }
+        }
+        let packet = |port: u16| {
+            let mut bytes = vec![0; 28];
+            bytes[0] = 0x45;
+            bytes[3] = 28;
+            bytes[9] = 17;
+            bytes[12..16].copy_from_slice(&[10, 0, 0, 2]);
+            bytes[16..20].copy_from_slice(&[1, 1, 1, 1]);
+            bytes[20..22].copy_from_slice(&5000u16.to_be_bytes());
+            bytes[22..24].copy_from_slice(&port.to_be_bytes());
+            bytes
+        };
+        let (tx, mut rx) = mpsc::channel(128);
+        for _ in 0..100 {
+            tx.send(packet(443)).await.unwrap();
+        }
+        tx.send(packet(53)).await.unwrap();
+        let recorder = Arc::new(Recorder(Default::default()));
+        let transport: Arc<dyn DatagramTransport> = recorder.clone();
+        let result = run_upload_loop(
+            &mut rx,
+            None,
+            &transport,
+            &mut PlainPackets,
+            &UploadConfig::default(),
+            None,
+        )
+        .await;
+        assert!(result.is_err());
+        let ports = recorder.0.lock().unwrap();
+        assert!(
+            ports
+                .iter()
+                .position(|port| *port == 53)
+                .is_some_and(|index| index < 4),
+            "DNS остался за фоновой очередью: {ports:?}"
+        );
+    }
 
     struct ShapedWire {
         ready: std::sync::atomic::AtomicBool,

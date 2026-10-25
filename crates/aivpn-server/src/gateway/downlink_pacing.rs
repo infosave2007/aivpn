@@ -1,12 +1,13 @@
 //! Планировщик нисходящих RAW IP пакетов до QoS, шифрования, nonce и учета.
 //!
 //! У каждой сессии одна активная голова в общем индексе сроков. Остальные
-//! пакеты этой сессии лежат в FIFO и не задерживают чужие сессии. После паузы
+//! пакеты этой сессии чередуются по IP-потокам. После паузы
 //! следующий срок ставится от текущего момента, без догоняющей серии.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap};
 use std::time::Duration;
 
+use aivpn_common::flow_queue::FairQueue;
 use aivpn_common::mask::{MaskProfile, PaddingStrategy};
 use aivpn_common::mimicry::MimicryEngine;
 use aivpn_common::protocol::MAX_PACKET_SIZE;
@@ -93,8 +94,8 @@ struct Head {
 struct Stream {
     engine: MimicryEngine,
     profile_key: ProfileKey,
-    /// Пакеты позади головы. Голова в этот список не входит.
-    fifo: VecDeque<Pending>,
+    /// Пакеты позади головы с сохранением порядка каждого IP-потока.
+    fifo: FairQueue<Pending>,
     head: Option<Head>,
     last_sent: Option<Instant>,
     last_use: Instant,
@@ -105,7 +106,7 @@ impl Stream {
         Self {
             engine: MimicryEngine::new(profile),
             profile_key: key,
-            fifo: VecDeque::new(),
+            fifo: FairQueue::new(MAX_PACKETS_PER_SESSION - 1),
             head: None,
             last_sent: None,
             last_use: now,
@@ -128,7 +129,9 @@ enum Placement {
         padding_override: Option<PaddingStrategy>,
         deadline: Instant,
     },
-    Queued,
+    Queued {
+        replaced: bool,
+    },
 }
 
 /// Планировщик отдельных сессий. В индексе сроков одна голова на сессию.
@@ -211,7 +214,7 @@ impl DownlinkPacer {
                 .get(&session_id)
                 .map(Stream::len_packets)
                 .unwrap_or(0);
-            if occupied >= MAX_PACKETS_PER_SESSION || self.total >= MAX_PACKETS_TOTAL {
+            if self.total >= MAX_PACKETS_TOTAL && occupied < MAX_PACKETS_PER_SESSION {
                 return false;
             }
         } else if self.total >= MAX_PACKETS_TOTAL || !self.make_room_for_new_stream() {
@@ -223,8 +226,7 @@ impl DownlinkPacer {
             );
         }
 
-        self.push_packet(session_id, packet, now, mode);
-        true
+        self.push_packet(session_id, packet, now, mode)
     }
 
     /// Неготовая маска сохраняет голову FIFO и не задерживает чужие сессии.
@@ -266,7 +268,7 @@ impl DownlinkPacer {
             if let Some(head) = stream.head.take() {
                 stream.last_sent = Some(now);
                 stream.last_use = now;
-                let next_deadline = if let Some(pending) = stream.fifo.pop_front() {
+                let next_deadline = if let Some(pending) = stream.fifo.pop() {
                     let (target_size, delay, padding_override) =
                         sample_shape(&mut stream.engine, pending.mode);
                     // Срок следующего пакета считается от now, а не от старого срока.
@@ -371,7 +373,7 @@ impl DownlinkPacer {
         packet: Vec<u8>,
         now: Instant,
         mode: DelayMode,
-    ) {
+    ) -> bool {
         let placement = {
             let stream = self
                 .streams
@@ -389,10 +391,18 @@ impl DownlinkPacer {
                     deadline,
                 }
             } else {
-                stream.fifo.push_back(Pending { packet, mode });
-                Placement::Queued
+                match stream
+                    .fifo
+                    .push(Pending { packet, mode }, |pending| &pending.packet)
+                {
+                    Ok(evicted) => Placement::Queued {
+                        replaced: evicted.is_some(),
+                    },
+                    Err(_) => return false,
+                }
             }
         };
+        let replaced = matches!(placement, Placement::Queued { replaced: true });
         if let Placement::Head {
             packet,
             target_size,
@@ -412,8 +422,11 @@ impl DownlinkPacer {
             });
             self.ready.insert((deadline, session_id), ());
         }
-        self.total += 1;
+        if !replaced {
+            self.total += 1;
+        }
         self.debug_check();
+        true
     }
 
     fn debug_check(&self) {
@@ -550,6 +563,36 @@ mod tests {
             tag_offset: u16::MAX,
             generated: false,
         }
+    }
+
+    #[test]
+    fn fresh_dns_reply_does_not_wait_for_a_bulk_flow_backlog() {
+        let packet = |port: u16| {
+            let mut p = vec![0; 28];
+            p[0] = 0x45;
+            p[3] = 28;
+            p[9] = 17;
+            p[12..16].copy_from_slice(&[1, 1, 1, 1]);
+            p[16..20].copy_from_slice(&[10, 0, 0, 2]);
+            p[20..22].copy_from_slice(&port.to_be_bytes());
+            p[22..24].copy_from_slice(&5000u16.to_be_bytes());
+            p
+        };
+        let now = Instant::now();
+        let mask = profile("fairness", 1, 1, 400, 30.0);
+        let mut queue = DownlinkPacer::new();
+        for _ in 0..MAX_PACKETS_PER_SESSION {
+            assert!(queue.enqueue(sid_at(1), &mask, packet(443), now, false));
+        }
+        assert!(queue.enqueue(sid_at(1), &mask, packet(53), now, false));
+        let mut seen_dns = false;
+        for step in 1..=4 {
+            let p = queue
+                .pop_ready(now + Duration::from_millis(step * 30))
+                .unwrap();
+            seen_dns |= p.packet[20..22] == 53u16.to_be_bytes();
+        }
+        assert!(seen_dns, "DNS-ответ остался за фоновой очередью");
     }
 
     #[test]
