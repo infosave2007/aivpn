@@ -86,6 +86,7 @@ pub use protocol::*;
 pub use recording::*;
 
 pub mod ip_packet;
+pub mod pacing;
 
 #[cfg(feature = "client-upload")]
 pub mod flow_queue;

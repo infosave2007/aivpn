@@ -15,33 +15,17 @@ use crate::client_db::ClientDatabase;
 use crate::neural::NeuralConfig;
 use crate::qos::QosEnforcer;
 
-/// Covertness↔throughput tradeoff for server→client (downlink) padding
-/// (1c). Sourced from the `"downlink_shaping"` key in server.json (accepts
-/// either the legacy bool or one of `"off"`/`"light"`/`"full"`) or
-/// `--shaping-level` / `AIVPN_SHAPING_LEVEL` on the CLI.
-///
-/// * **`Full`** (default, `true`) — pad every downlink DATA packet to the
-///   session mask's own size distribution, exactly the historical (only)
-///   behavior. Maximizes traffic-shape covertness: uplink and downlink share
-///   one size signature on the 5-tuple. Costs the most per packet — a
-///   size-distribution sample, a padding-strategy calculation, and the
-///   padding bytes themselves go out on the wire.
-/// * **`Light`** — still pads (so downlink packets are not trivially
-///   distinguishable from uplink by "always exactly the unpadded IP-payload
-///   size"), but caps the padding budget far below `Full`'s target, trading
-///   most of the covertness for most of the throughput back.
-/// * **`Off`** (`false`) — no downlink padding at all, the historical
-///   `downlink_shaping: false`. Maximum throughput; downlink packet sizes
-///   leak the exact payload size.
+/// Локальная политика нисходящих данных: server.json или --shaping-level.
+/// Adaptive сохраняет padding профиля и регулирует IAT по ожиданию в очереди.
+/// Full оставляет исходные интервалы; Light ограничивает IAT и padding.
+/// Off отключает оба механизма. Старые bool true/false означают Full/Off.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ShapingLevel {
-    /// No downlink padding — maximum throughput, least covert.
     Off,
-    /// Capped padding budget — partial covertness, most of the throughput.
     Light,
-    /// Full mask size-distribution padding (default; matches historical `true`).
-    #[default]
     Full,
+    #[default]
+    Adaptive,
 }
 
 impl std::str::FromStr for ShapingLevel {
@@ -49,10 +33,11 @@ impl std::str::FromStr for ShapingLevel {
     fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
         match s.to_ascii_lowercase().as_str() {
             "off" | "false" => Ok(ShapingLevel::Off),
+            "adaptive" => Ok(ShapingLevel::Adaptive),
             "light" => Ok(ShapingLevel::Light),
             "full" | "true" => Ok(ShapingLevel::Full),
             other => Err(format!(
-                "invalid shaping level {:?}: expected \"off\", \"light\", or \"full\"",
+                "invalid shaping level {:?}: expected \"adaptive\", \"off\", \"light\", or \"full\"",
                 other
             )),
         }
@@ -60,9 +45,7 @@ impl std::str::FromStr for ShapingLevel {
 }
 
 impl<'de> Deserialize<'de> for ShapingLevel {
-    /// Accepts the historical bool (`true`→`Full`, `false`→`Off`) for
-    /// backward compatibility with existing `server.json` files, as well as
-    /// the new `"off"`/`"light"`/`"full"` strings (case-insensitive).
+    /// Bool сохраняет прежнее значение; строки дополнительно принимают adaptive.
     fn deserialize<D: Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
         use serde::de::Error as _;
         let v = serde_json::Value::deserialize(d)?;
@@ -71,7 +54,7 @@ impl<'de> Deserialize<'de> for ShapingLevel {
             serde_json::Value::Bool(false) => Ok(ShapingLevel::Off),
             serde_json::Value::String(ref s) => s.parse().map_err(D::Error::custom),
             other => Err(D::Error::custom(format!(
-                "downlink_shaping must be a bool or one of \"off\"/\"light\"/\"full\", got: {}",
+                "downlink_shaping must be a bool or one of \"adaptive\"/\"off\"/\"light\"/\"full\", got: {}",
                 other
             ))),
         }
@@ -155,18 +138,7 @@ pub struct GatewayConfig {
     /// would use if it deferred to the active mask instead of an explicit
     /// `base_mask_id`.
     pub polymorphic_base_mask: Option<String>,
-    /// A7/1c downlink shaping level: the covertness↔throughput tradeoff for
-    /// server→client DATA padding. `Full` (default) pads to a size sampled
-    /// from the session mask's own size distribution — the same distribution
-    /// the client uses for uplink — so uplink and downlink packets share one
-    /// size signature on a 5-tuple instead of downlink being systematically
-    /// smaller (pad_len=0). `Light` still pads but at a capped budget;
-    /// `Off` disables downlink padding entirely (max throughput). Padding is
-    /// written into the existing `pad_len` field, which every client already
-    /// strips (`parse_downlink_inner`), so every level is wire- and
-    /// decode-compatible with all client versions. Sourced from the optional
-    /// `"downlink_shaping"` key in server.json (bool or string) or
-    /// `--shaping-level`. See [`ShapingLevel`] for the full tradeoff writeup.
+    /// Политика пауз и padding. При отсутствии настройки используется adaptive.
     pub downlink_shaping: ShapingLevel,
     /// R2 Phase B: operator Ed25519 mask-signing key SEED (32 bytes). When
     /// `Some`, freshly generated masks are signed after the KS self-test
@@ -273,7 +245,7 @@ impl Default for GatewayConfig {
             feedback_report_interval_secs: DEFAULT_FEEDBACK_REPORT_INTERVAL_SECS,
             polymorphic_all_sessions: false,
             polymorphic_base_mask: None,
-            downlink_shaping: ShapingLevel::Full,
+            downlink_shaping: ShapingLevel::default(),
             mask_signing_key: None,
             mask_operator_pubkey: None,
             mask_verify_mode: aivpn_common::mask::MaskVerifyMode::default(),
@@ -284,5 +256,29 @@ impl Default for GatewayConfig {
             server_config_path: None,
             pool_configured: false,
         }
+    }
+}
+
+#[cfg(test)]
+mod shaping_tests {
+    use super::ShapingLevel;
+
+    #[test]
+    fn adaptive_default_does_not_reinterpret_explicit_legacy_settings() {
+        assert_eq!(ShapingLevel::default(), ShapingLevel::Adaptive);
+        for (json, expected) in [
+            ("true", ShapingLevel::Full),
+            ("false", ShapingLevel::Off),
+            ("\"full\"", ShapingLevel::Full),
+            ("\"off\"", ShapingLevel::Off),
+            ("\"light\"", ShapingLevel::Light),
+            ("\"adaptive\"", ShapingLevel::Adaptive),
+        ] {
+            assert_eq!(
+                serde_json::from_str::<ShapingLevel>(json).unwrap(),
+                expected
+            );
+        }
+        assert!(serde_json::from_str::<ShapingLevel>("\"unknown\"").is_err());
     }
 }

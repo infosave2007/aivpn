@@ -180,6 +180,7 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
     // path byte-for-byte unchanged.
     alt_transport: Option<Arc<dyn crate::transport::DatagramTransport>>,
 ) -> Result<()> {
+    let upload_shaping = platform.upload_shaping()?;
     if let Err(msg) = crate::mask::protected_build_requires_keys(
         server_signing_key.is_some(),
         mask_operator_pubkey.is_some(),
@@ -1151,6 +1152,7 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
         };
         enc.inner.set_fec_group(level.fec_n());
         let config = UploadConfig {
+            pacing: upload_shaping,
             keepalive_interval,
             keepalive_ms: Some(keepalive_ms_upload),
             ..Default::default()

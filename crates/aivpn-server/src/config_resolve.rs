@@ -135,8 +135,7 @@ pub(crate) fn resolve_mask_verify_mode(
     }
 }
 
-/// Resolve the downlink shaping level (1c): CLI/env → server.json → default
-/// (`Full`, matching the historical `downlink_shaping: true`/absent behavior).
+/// Приоритет политики: CLI/env, server.json, затем adaptive.
 pub(crate) fn resolve_shaping_level(
     args: &ServerArgs,
     file_config: Option<&ServerFileConfig>,

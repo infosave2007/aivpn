@@ -15,6 +15,25 @@ use crate::transport::DatagramTransport;
 use tokio::sync::mpsc;
 use tokio::time;
 
+fn paced_delay(
+    enc: &mut impl PacketEncryptor,
+    pacer: &mut crate::pacing::AdaptivePacer,
+    generation: &mut Option<(String, u16, [u8; 64])>,
+    queue_wait: Duration,
+) -> Duration {
+    let profile_delay = enc.data_send_delay();
+    if let Some(mask) = enc.active_mask() {
+        let changed = generation.as_ref().is_none_or(|(id, version, signature)| {
+            id != &mask.mask_id || *version != mask.version || signature != &mask.signature
+        });
+        if changed {
+            pacer.reset();
+            *generation = Some((mask.mask_id.clone(), mask.version, mask.signature));
+        }
+    }
+    pacer.delay(profile_delay, queue_wait, time::Instant::now().into_std())
+}
+
 // ──────────── Configuration ────────────
 
 /// Tuneable knobs for the upload pipeline shared by all clients.
@@ -22,6 +41,8 @@ pub struct UploadConfig {
     /// Maximum additional packets to drain from the channel after the first
     /// recv without yielding back to the async executor.
     pub burst_size: usize,
+    /// Режим пауз перед данными. Padding и управляющий обмен сохраняются.
+    pub pacing: crate::pacing::PacingMode,
     /// How often a keepalive is sent when there is no data traffic.
     pub keepalive_interval: Duration,
     /// Shared keepalive interval in milliseconds; updated dynamically by the client.
@@ -34,6 +55,7 @@ impl Default for UploadConfig {
     fn default() -> Self {
         Self {
             burst_size: 63,
+            pacing: crate::pacing::PacingMode::default(),
             keepalive_interval: Duration::from_secs(25),
             keepalive_ms: None,
         }
@@ -397,6 +419,7 @@ pub async fn run_upload_loop(
         }
         Ok(())
     }
+    tracing::info!(mode = ?config.pacing, "Политика пауз исходящих данных");
     let mut current_ka_ms = config.keepalive_interval.as_millis() as u64;
     let mut ka_interval = time::interval_at(tokio::time::Instant::now(), config.keepalive_interval);
     let mut data_packet_count: u64 = 0;
@@ -409,6 +432,8 @@ pub async fn run_upload_loop(
     let mut handshake_retry = crate::handshake_retry::HandshakeRetry::default();
     let mut pending_data: Option<(Vec<u8>, time::Instant)> = None;
     let mut data_queue = crate::flow_queue::FlowQueue::new(512);
+    let mut pacer = crate::pacing::AdaptivePacer::new(config.pacing);
+    let mut pacing_profile: Option<(String, u16, [u8; 64])> = None;
     let mut last_data_sent: Option<time::Instant> = None;
     let mut readiness_poll = time::interval(Duration::from_millis(20));
     readiness_poll.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
@@ -483,7 +508,7 @@ pub async fn run_upload_loop(
                     drain_pending_control(&mut control_rx, transport, enc).await?;
                     continue;
                 }
-                let delay = enc.data_send_delay();
+                let delay = paced_delay(enc, &mut pacer, &mut pacing_profile, data_queue.queue_wait());
                 let deadline = last_data_sent.unwrap_or_else(time::Instant::now) + delay;
                 pending_data = Some((pkt_data, deadline));
             }
@@ -525,7 +550,7 @@ pub async fn run_upload_loop(
                                 pending_data = Some((pkt, time::Instant::now()));
                                 break;
                             }
-                            let delay = enc.data_send_delay();
+                            let delay = paced_delay(enc, &mut pacer, &mut pacing_profile, data_queue.queue_wait());
                             if !delay.is_zero() {
                                 pending_data = Some((pkt, last_data_sent.unwrap() + delay));
                                 break;
@@ -594,6 +619,83 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use tokio::net::UdpSocket;
+
+    #[tokio::test(start_paused = true)]
+    async fn adaptive_upload_drains_backlog_without_an_unpaced_burst() {
+        struct Plain;
+        impl PacketEncryptor for Plain {
+            fn data_send_delay(&mut self) -> Duration {
+                Duration::from_millis(30)
+            }
+            fn encrypt_data(&mut self, _: &[u8]) -> Result<Vec<u8>> {
+                Ok(vec![1])
+            }
+            fn encrypt_control(&mut self, _: &ControlPayload) -> Result<Vec<u8>> {
+                Ok(vec![0])
+            }
+            fn encrypt_keepalive(&mut self) -> Result<Vec<u8>> {
+                Ok(vec![0])
+            }
+            fn on_data_sent(&mut self, _: usize) {}
+        }
+        struct Recorder(std::sync::Mutex<Vec<time::Instant>>);
+        #[async_trait::async_trait]
+        impl DatagramTransport for Recorder {
+            async fn send(&self, wire: &[u8]) -> std::io::Result<usize> {
+                if wire == [1] {
+                    let mut sent = self.0.lock().unwrap();
+                    sent.push(time::Instant::now());
+                    if sent.len() == 64 {
+                        return Err(std::io::ErrorKind::BrokenPipe.into());
+                    }
+                }
+                Ok(wire.len())
+            }
+            async fn recv(&self, _: &mut [u8]) -> std::io::Result<usize> {
+                std::future::pending().await
+            }
+            fn kind(&self) -> crate::transport::TransportKind {
+                crate::transport::TransportKind::Udp
+            }
+            fn max_datagram(&self) -> usize {
+                65507
+            }
+        }
+        let mut durations = Vec::new();
+        for mode in [
+            crate::pacing::PacingMode::Full,
+            crate::pacing::PacingMode::Adaptive,
+            crate::pacing::PacingMode::Off,
+        ] {
+            let (tx, mut rx) = mpsc::channel(128);
+            for _ in 0..100 {
+                tx.try_send(vec![1]).unwrap();
+            }
+            let recorder = Arc::new(Recorder(Default::default()));
+            let transport: Arc<dyn DatagramTransport> = recorder.clone();
+            let start = time::Instant::now();
+            let config = UploadConfig {
+                pacing: mode,
+                ..Default::default()
+            };
+            assert!(
+                run_upload_loop(&mut rx, None, &transport, &mut Plain, &config, None)
+                    .await
+                    .is_err()
+            );
+            let sent = recorder.0.lock().unwrap();
+            assert_eq!(sent.len(), 64);
+            durations.push(sent[63] - start);
+            if mode != crate::pacing::PacingMode::Off {
+                assert_eq!(sent[0] - start, Duration::from_millis(30));
+                assert!(sent
+                    .windows(2)
+                    .all(|pair| pair[1] - pair[0] >= Duration::from_millis(1)));
+            }
+        }
+        assert!(durations[1] < durations[0]);
+        assert_eq!(durations[2], Duration::ZERO);
+    }
 
     #[tokio::test(start_paused = true)]
     async fn fresh_dns_flow_is_not_starved_by_paced_bulk_backlog() {
@@ -759,6 +861,7 @@ mod tests {
             burst_size: 63,
             keepalive_interval: Duration::from_secs(8),
             keepalive_ms: None,
+            pacing: crate::pacing::PacingMode::Full,
         };
         let (control_sender, mut control_receiver) = mpsc::channel(8);
         let scheduled_control = control_sender.clone();
@@ -917,6 +1020,7 @@ mod tests {
             burst_size: 3,
             keepalive_interval: Duration::from_millis(25),
             keepalive_ms: None,
+            pacing: crate::pacing::PacingMode::Full,
         };
         let mut encryptor = MarkerEncryptor { next_seq: 0 };
         assert!(run_upload_loop(

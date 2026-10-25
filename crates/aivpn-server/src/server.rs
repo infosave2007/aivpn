@@ -282,11 +282,8 @@ pub struct ServerArgs {
     #[arg(long, value_name = "PATH")]
     pub bootstrap_output: Option<String>,
 
-    /// Downlink padding covertness↔throughput tradeoff: off | light | full
-    /// (default full). `full` pads every server→client DATA packet to the
-    /// session mask's size distribution (max covertness); `light` pads with a
-    /// small capped budget; `off` disables downlink padding (max throughput).
-    /// Overrides server.json "downlink_shaping".
+    /// Паузы и padding нисходящих данных: adaptive | full | light | off.
+    /// По умолчанию adaptive. Переопределяет downlink_shaping из server.json.
     #[arg(long, value_name = "LEVEL", env = "AIVPN_SHAPING_LEVEL")]
     pub shaping_level: Option<String>,
 }

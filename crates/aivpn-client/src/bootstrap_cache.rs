@@ -152,6 +152,18 @@ struct CacheFileLock {
 }
 
 #[cfg(unix)]
+impl Drop for CacheFileLock {
+    fn drop(&mut self) {
+        use std::os::unix::io::AsRawFd;
+        // Одного close недостаточно: fd мог попасть в параллельно созданного
+        // ребенка до его exec. Снимаем lock независимо от оставшихся копий fd.
+        unsafe {
+            libc::flock(self._file.as_raw_fd(), libc::LOCK_UN);
+        }
+    }
+}
+
+#[cfg(unix)]
 impl CacheFileLock {
     fn acquire(dir: &Path) -> Result<Self> {
         use std::os::unix::{
@@ -378,6 +390,43 @@ pub async fn refresh_from_urls(urls: &[String], signing_key: Option<&[u8; 32]>) 
 mod tests {
     use super::*;
     use aivpn_common::mask::BootstrapDescriptor;
+
+    #[cfg(unix)]
+    #[test]
+    fn cache_lock_is_released_even_if_a_child_inherited_its_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "aivpn-bootstrap-fork-{:032x}",
+            rand::random::<u128>()
+        ));
+        fs::create_dir(&dir).unwrap();
+        let held = CacheFileLock::acquire(&dir).unwrap();
+        let mut pipe = [-1; 2];
+        assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0);
+        if pid == 0 {
+            // После fork в дочернем процессе вызываются только системные функции.
+            unsafe {
+                libc::close(pipe[1]);
+                let mut byte = 0u8;
+                libc::read(pipe[0], (&mut byte as *mut u8).cast(), 1);
+                libc::_exit(0);
+            }
+        }
+        unsafe {
+            libc::close(pipe[0]);
+        }
+        drop(held);
+        let reacquired = CacheFileLock::acquire(&dir);
+        // Сначала освобождаем ребенка, даже если повторный захват не удался.
+        unsafe {
+            libc::close(pipe[1]);
+            libc::waitpid(pid, std::ptr::null_mut(), 0);
+        }
+        let held = reacquired.expect("Унаследованный fd не должен удерживать снятый lock");
+        drop(held);
+        fs::remove_dir_all(dir).unwrap();
+    }
 
     fn make_desc() -> BootstrapDescriptor {
         BootstrapDescriptor {

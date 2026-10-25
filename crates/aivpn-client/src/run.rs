@@ -909,6 +909,7 @@ pub async fn run(
             std::process::exit(1);
         }
     };
+    let upload_shaping = runtime.upload_shaping;
     let local_transport = match transport_config(runtime) {
         Ok(config) => config,
         Err(error) => {
@@ -1792,6 +1793,7 @@ pub async fn run(
 
         match AivpnClient::new(config) {
             Ok(mut client) => {
+                client.set_upload_shaping(upload_shaping);
                 client.set_dns_proxy_gate(dns_proxy_gate.clone());
                 client.set_transport_registry(registry.clone(), guard.clone());
                 info!("Client initialized successfully (TUN: {})", tun_name);

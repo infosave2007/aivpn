@@ -379,12 +379,12 @@ impl super::Gateway {
                                     tokio::time::Instant::now(),
                                 )
                             } else {
-                                pacer.enqueue(
+                                pacer.enqueue_shaped(
                                     session.session_id,
                                     active,
                                     packet_vec,
                                     tokio::time::Instant::now(),
-                                    downlink_shaping == ShapingLevel::Light,
+                                    downlink_shaping,
                                 )
                             };
                             if !queued {
@@ -395,12 +395,12 @@ impl super::Gateway {
                     }
                     if planned.is_none() && downlink_shaping != ShapingLevel::Off {
                         session.commit_pending_mask();
-                        if !pacer.enqueue(
+                        if !pacer.enqueue_shaped(
                             session.session_id,
                             session.mask.as_ref().unwrap_or(&mask),
                             packet_vec,
                             tokio::time::Instant::now(),
-                            downlink_shaping == ShapingLevel::Light,
+                            downlink_shaping,
                         ) {
                             debug!("Downlink: очередь шейпинга заполнена, пакет отброшен");
                         }
@@ -554,7 +554,7 @@ impl super::Gateway {
                     // entirely.
                     let pad_len: u16 = match downlink_shaping {
                         ShapingLevel::Off => 0,
-                        ShapingLevel::Full | ShapingLevel::Light => {
+                        ShapingLevel::Adaptive | ShapingLevel::Full | ShapingLevel::Light => {
                             {
                                 let profile = sess.mask.as_ref().unwrap_or(&mask);
                                 let m = profile.reverse_profile.as_deref().unwrap_or(profile);

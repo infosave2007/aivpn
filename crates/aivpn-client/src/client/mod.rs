@@ -493,6 +493,7 @@ pub struct AivpnClient {
     recording_status: crate::record_cmd::RecordingStatusStore,
     active_recording_session: Option<[u8; 16]>,
     keepalive_interval: Duration,
+    upload_shaping: aivpn_common::pacing::PacingMode,
     /// Shared keepalive interval in milliseconds with the upload task for dynamic updates.
     keepalive_interval_ms: Arc<AtomicU64>,
     fec_group: Arc<AtomicU8>,
@@ -619,6 +620,11 @@ pub struct AivpnClient {
 }
 
 impl AivpnClient {
+    /// Устанавливает локальную политику перед запуском сессии.
+    pub fn set_upload_shaping(&mut self, mode: aivpn_common::pacing::PacingMode) {
+        self.upload_shaping = mode;
+    }
+
     pub fn set_admin_listen(&mut self, addr: std::net::SocketAddrV4) {
         self.admin_listen = addr;
         self.recording_status = crate::record_cmd::RecordingStatusStore::for_endpoint(addr);
@@ -640,6 +646,11 @@ impl AivpnClient {
         } else {
             load_or_generate_static_keypair()?
         };
+        let upload_shaping = config
+            .transport
+            .as_ref()
+            .map(|transport| transport.runtime_config().upload_shaping)
+            .unwrap_or_default();
         let initial_adaptive_level = config.initial_adaptive_level;
         let initial_keepalive =
             keepalive_with_nat_cap(Duration::from_secs(initial_adaptive_level.keepalive_secs()));
@@ -724,6 +735,7 @@ impl AivpnClient {
             ),
             active_recording_session: None,
             keepalive_interval: initial_keepalive,
+            upload_shaping,
             keepalive_interval_ms: Arc::new(AtomicU64::new(initial_keepalive.as_millis() as u64)),
             last_local_port: None,
             static_keypair,

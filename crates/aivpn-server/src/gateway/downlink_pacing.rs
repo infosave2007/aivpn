@@ -7,9 +7,11 @@
 use std::collections::{BTreeMap, HashMap};
 use std::time::Duration;
 
+use super::config::ShapingLevel;
 use aivpn_common::flow_queue::FairQueue;
 use aivpn_common::mask::{MaskProfile, PaddingStrategy};
 use aivpn_common::mimicry::MimicryEngine;
+use aivpn_common::pacing::{AdaptivePacer, PacingMode};
 use aivpn_common::protocol::MAX_PACKET_SIZE;
 use tokio::time::Instant;
 
@@ -74,6 +76,7 @@ impl ProfileKey {
 
 #[derive(Clone, Copy)]
 enum DelayMode {
+    Adaptive,
     Profile,
     Light,
     Immediate,
@@ -81,6 +84,7 @@ enum DelayMode {
 
 struct Pending {
     packet: Vec<u8>,
+    queued_at: Instant,
     mode: DelayMode,
 }
 
@@ -93,6 +97,7 @@ struct Head {
 
 struct Stream {
     engine: MimicryEngine,
+    pacer: AdaptivePacer,
     profile_key: ProfileKey,
     /// Пакеты позади головы с сохранением порядка каждого IP-потока.
     fifo: FairQueue<Pending>,
@@ -105,6 +110,7 @@ impl Stream {
     fn new(profile: MaskProfile, key: ProfileKey, now: Instant) -> Self {
         Self {
             engine: MimicryEngine::new(profile),
+            pacer: AdaptivePacer::new(PacingMode::Adaptive),
             profile_key: key,
             fifo: FairQueue::new(MAX_PACKETS_PER_SESSION - 1),
             head: None,
@@ -162,6 +168,7 @@ impl DownlinkPacer {
 
     /// Кладет сырой пакет. `false`, если пакет длиннее лимита, сессия или общий
     /// буфер уже полны, либо для новой сессии нет места в кэше.
+    #[cfg(test)]
     pub fn enqueue(
         &mut self,
         session_id: [u8; 16],
@@ -181,6 +188,24 @@ impl DownlinkPacer {
                 DelayMode::Profile
             },
         )
+    }
+
+    /// Производственный путь с явно выбранной локальной политикой.
+    pub fn enqueue_shaped(
+        &mut self,
+        session_id: [u8; 16],
+        mask: &MaskProfile,
+        packet: Vec<u8>,
+        now: Instant,
+        level: ShapingLevel,
+    ) -> bool {
+        let mode = match level {
+            ShapingLevel::Adaptive => DelayMode::Adaptive,
+            ShapingLevel::Full => DelayMode::Profile,
+            ShapingLevel::Light => DelayMode::Light,
+            ShapingLevel::Off => DelayMode::Immediate,
+        };
+        self.enqueue_mode(session_id, mask, packet, now, mode)
     }
 
     pub fn enqueue_unpaced(
@@ -268,9 +293,19 @@ impl DownlinkPacer {
             if let Some(head) = stream.head.take() {
                 stream.last_sent = Some(now);
                 stream.last_use = now;
+                let queue_wait = stream
+                    .fifo
+                    .oldest(|pending| pending.queued_at)
+                    .map(|at| now.saturating_duration_since(at))
+                    .unwrap_or_default();
                 let next_deadline = if let Some(pending) = stream.fifo.pop() {
-                    let (target_size, delay, padding_override) =
-                        sample_shape(&mut stream.engine, pending.mode);
+                    let (target_size, delay, padding_override) = sample_shape(
+                        &mut stream.engine,
+                        &mut stream.pacer,
+                        pending.mode,
+                        queue_wait,
+                        now,
+                    );
                     // Срок следующего пакета считается от now, а не от старого срока.
                     let next_deadline = saturate_add(now, delay);
                     stream.head = Some(Head {
@@ -328,6 +363,8 @@ impl DownlinkPacer {
         if let Some(stream) = self.streams.get_mut(&session_id) {
             let source = mask.reverse_profile.as_deref().unwrap_or(mask);
             stream.engine = MimicryEngine::new(source.clone());
+            stream.pacer.reset();
+            stream.last_sent = None;
             stream.profile_key = ProfileKey::new(mask);
         }
     }
@@ -381,7 +418,13 @@ impl DownlinkPacer {
                 .expect("stream exists before push");
             stream.last_use = now;
             if stream.head.is_none() {
-                let (target_size, delay, padding_override) = sample_shape(&mut stream.engine, mode);
+                let (target_size, delay, padding_override) = sample_shape(
+                    &mut stream.engine,
+                    &mut stream.pacer,
+                    mode,
+                    Duration::ZERO,
+                    now,
+                );
                 let anchor = stream.last_sent.unwrap_or(now);
                 let deadline = max_instant(now, saturate_add(anchor, delay));
                 Placement::Head {
@@ -391,10 +434,14 @@ impl DownlinkPacer {
                     deadline,
                 }
             } else {
-                match stream
-                    .fifo
-                    .push(Pending { packet, mode }, |pending| &pending.packet)
-                {
+                match stream.fifo.push(
+                    Pending {
+                        packet,
+                        mode,
+                        queued_at: now,
+                    },
+                    |pending| &pending.packet,
+                ) {
                     Ok(evicted) => Placement::Queued {
                         replaced: evicted.is_some(),
                     },
@@ -457,12 +504,16 @@ impl Default for DownlinkPacer {
 
 fn sample_shape(
     engine: &mut MimicryEngine,
+    pacer: &mut AdaptivePacer,
     mode: DelayMode,
+    queue_wait: Duration,
+    now: Instant,
 ) -> (u16, Duration, Option<PaddingStrategy>) {
     let (size, delay) = engine.take_data_shape();
     let padding_override = engine.padding_override().cloned();
     engine.update_fsm();
     let delay = match mode {
+        DelayMode::Adaptive => pacer.delay(delay, queue_wait, now.into_std()),
         DelayMode::Profile => delay,
         DelayMode::Light => delay.min(LIGHT_MAX_DELAY),
         DelayMode::Immediate => Duration::ZERO,
@@ -563,6 +614,62 @@ mod tests {
             tag_offset: u16::MAX,
             generated: false,
         }
+    }
+
+    #[test]
+    fn adaptive_downlink_preserves_quiet_profile_and_accelerates_backlog() {
+        let start = Instant::now();
+        let mask = profile("adaptive", 1, 1, 400, 30.0);
+        let mut elapsed = Vec::new();
+        for level in [ShapingLevel::Full, ShapingLevel::Adaptive] {
+            let mut pacer = DownlinkPacer::new();
+            for n in 0..MAX_PACKETS_PER_SESSION {
+                assert!(pacer.enqueue_shaped(sid_at(1), &mask, vec![n as u8], start, level));
+            }
+            assert_eq!(pacer.next_deadline(), Some(start + sampled_delay(30.0)));
+            let mut previous = start;
+            for n in 0..MAX_PACKETS_PER_SESSION {
+                let due = pacer.next_deadline().unwrap();
+                assert!(due - previous >= Duration::from_millis(1));
+                assert!(pacer.pop_ready(due - Duration::from_nanos(1)).is_none());
+                let packet = pacer.pop_ready(due).unwrap();
+                assert_eq!(packet.packet, vec![n as u8]);
+                assert_eq!(packet.target_size, 400);
+                previous = due;
+            }
+            elapsed.push(previous - start);
+            assert!(pacer.is_empty());
+            // После простоя нет кредита для догоняющей серии пакетов.
+            let idle = previous + Duration::from_secs(10);
+            assert!(pacer.enqueue_shaped(sid_at(1), &mask, vec![1], idle, level));
+            assert!(pacer.enqueue_shaped(sid_at(1), &mask, vec![2], idle, level));
+            assert!(pacer.pop_ready(idle).is_some());
+            assert_eq!(pacer.next_deadline(), Some(idle + sampled_delay(30.0)));
+            assert!(pacer.pop_ready(idle).is_none());
+        }
+        assert!(elapsed[1] < elapsed[0]);
+    }
+
+    #[test]
+    fn changing_profile_resets_adaptive_rate_and_old_deadline() {
+        let start = Instant::now();
+        let mask = profile("old", 1, 1, 400, 30.0);
+        let mut pacer = DownlinkPacer::new();
+        for _ in 0..MAX_PACKETS_PER_SESSION {
+            assert!(pacer.enqueue_shaped(sid_at(1), &mask, vec![1], start, ShapingLevel::Adaptive));
+        }
+        let mut now = start;
+        for _ in 0..40 {
+            now = pacer.next_deadline().unwrap();
+            pacer.pop_ready(now).unwrap();
+        }
+        let next = profile("new", 2, 2, 600, 40.0);
+        assert!(pacer.enqueue_shaped(sid_at(1), &next, vec![2], now, ShapingLevel::Adaptive));
+        assert_eq!(pacer.next_deadline(), Some(now + sampled_delay(40.0)));
+        let sent = pacer.pop_ready(now + sampled_delay(40.0)).unwrap();
+        assert_eq!(sent.packet, vec![2]);
+        assert_eq!(sent.target_size, 600);
+        assert!(pacer.is_empty());
     }
 
     #[test]

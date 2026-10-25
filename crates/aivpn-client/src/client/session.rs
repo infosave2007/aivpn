@@ -28,6 +28,7 @@ mod initial_upload_tests {
             Arc::new(AtomicU64::new(0)),
             Arc::new(Mutex::new(None)),
             Duration::from_secs(8),
+            aivpn_common::pacing::PacingMode::Full,
             Arc::new(AtomicU64::new(0)),
             Arc::new(AtomicU8::new(0)),
             Arc::new(AtomicU64::new(8000)),
@@ -85,6 +86,7 @@ mod initial_upload_tests {
             sent.clone(),
             Arc::new(Mutex::new(None)),
             Duration::from_secs(60),
+            aivpn_common::pacing::PacingMode::Full,
             Arc::new(AtomicU64::new(0)),
             Arc::new(AtomicU8::new(2)),
             Arc::new(AtomicU64::new(60000)),
@@ -504,6 +506,7 @@ impl super::AivpnClient {
             upload_bytes_sent,
             upload_pending_mask,
             self.keepalive_interval,
+            self.upload_shaping,
             self.keepalive_sent_ms.clone(),
             self.fec_group.clone(),
             self.keepalive_interval_ms.clone(),
@@ -950,6 +953,7 @@ impl super::AivpnClient {
         bytes_sent: Arc<AtomicU64>,
         pending_mask: Arc<Mutex<Option<aivpn_common::mask::MaskProfile>>>,
         keepalive_interval: Duration,
+        pacing: aivpn_common::pacing::PacingMode,
         keepalive_sent_ms: Arc<AtomicU64>,
         fec_group: Arc<AtomicU8>,
         keepalive_interval_ms: Arc<AtomicU64>,
@@ -1157,6 +1161,7 @@ impl super::AivpnClient {
             initial_eph_pub,
         };
         let config = UploadConfig {
+            pacing,
             keepalive_interval,
             keepalive_ms: Some(keepalive_interval_ms),
             ..Default::default()

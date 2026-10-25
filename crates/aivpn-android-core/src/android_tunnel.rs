@@ -41,6 +41,7 @@ pub fn take_recording_feedback_json() -> String {
 /// Android's [`PlatformIo`]: JNI socket protection, the `onTunnelReady`
 /// callback, and the take-once recording-feedback static polled from Kotlin.
 struct AndroidPlatform {
+    upload_shaping: aivpn_common::pacing::PacingMode,
     vm: std::sync::Arc<JavaVM>,
     vpn_service: GlobalRef,
 }
@@ -156,6 +157,10 @@ fn vpn_protect(vm: &JavaVM, vpn_service: &GlobalRef, fd: RawFd) -> Result<()> {
 }
 
 impl PlatformIo for AndroidPlatform {
+    fn upload_shaping(&self) -> Result<aivpn_common::pacing::PacingMode> {
+        Ok(self.upload_shaping)
+    }
+
     fn configure_tunnel(
         &self,
         network: Option<&aivpn_common::network_config::ClientNetworkConfig>,
@@ -290,13 +295,27 @@ pub async fn run_tunnel_android(
         .lock()
         .unwrap_or_else(|e| e.into_inner()) = None;
 
+    // Общая политика применяется также к прямому UDP.
+    let policy_path = files_dir_config(&vm, &vpn_service)?;
+    let runtime = aivpn_common::transport::RuntimeConfig::load_default_file(&policy_path)
+        .map_err(|error| Error::Session(format!("локальная конфигурация: {error}")))?;
+    let upload_shaping = runtime.upload_shaping;
+
     // Open the alternative transport if one was configured. A build that
     // installed no factory has none to open and stays on direct UDP.
     let alt_transport: Option<std::sync::Arc<dyn aivpn_common::transport::DatagramTransport>> =
-        build_alt_transport(&vm, &vpn_service, transport_name, transport_params_json).await?;
+        build_alt_transport(
+            &vm,
+            &vpn_service,
+            transport_name,
+            transport_params_json,
+            runtime,
+        )
+        .await?;
 
     run_tunnel_generic(
         AndroidPlatform {
+            upload_shaping,
             vm: std::sync::Arc::new(vm),
             vpn_service,
         },
@@ -337,6 +356,7 @@ async fn build_alt_transport(
     vpn_service: &GlobalRef,
     transport_name: Option<String>,
     transport_params_json: Option<String>,
+    runtime: aivpn_common::transport::RuntimeConfig,
 ) -> Result<Option<std::sync::Arc<dyn aivpn_common::transport::DatagramTransport>>> {
     use std::sync::Arc;
 
@@ -367,11 +387,6 @@ async fn build_alt_transport(
     let mut registry = aivpn_common::transport::TransportRegistry::new();
     registry.register(factory);
     let params = transport_params_json.unwrap_or_default().into_bytes();
-    // Общий файл приложения: filesDir/config.json. Каталог берется у сервиса,
-    // стандартный путь рабочего стола на Android не используется.
-    let policy_path = files_dir_config(vm, vpn_service)?;
-    let runtime = aivpn_common::transport::RuntimeConfig::load_default_file(&policy_path)
-        .map_err(|error| Error::Session(format!("локальная конфигурация: {error}")))?;
     let cfg =
         aivpn_common::transport::TransportConfig::new(name, params).with_runtime_config(runtime);
     let transport = registry

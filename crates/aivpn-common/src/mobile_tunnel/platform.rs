@@ -15,6 +15,11 @@ use crate::error::Result;
 // force iOS to promise its raw Swift context pointer is safe to alias across
 // threads, which nothing synchronises.
 pub trait PlatformIo: Send + 'static {
+    /// Локальная политика пауз для текущей попытки соединения.
+    fn upload_shaping(&self) -> Result<crate::pacing::PacingMode> {
+        Ok(crate::pacing::PacingMode::default())
+    }
+
     /// Применяет проверенное назначение сервера до запуска передачи через TUN.
     /// Возвращенный fd принадлежит ядру; None сохраняет переданный при запуске TUN.
     fn configure_tunnel(

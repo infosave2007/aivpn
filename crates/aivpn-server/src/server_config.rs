@@ -159,11 +159,8 @@ pub struct ServerFileConfig {
     pub dns: Option<serde_json::Value>,
     #[serde(default)]
     pub allow_peer_routing: Option<bool>,
-    /// A7/1c downlink shaping level: covertness↔throughput tradeoff for
-    /// server→client DATA padding. Absent = `Full` (pad to the session
-    /// mask's own size distribution, the historical behavior). Accepts
-    /// either the legacy bool (`true`→`Full`, `false`→`Off`) or one of the
-    /// strings `"off"` | `"light"` | `"full"` — see [`crate::gateway::ShapingLevel`].
+    /// Паузы и padding: adaptive (по умолчанию), full, light или off.
+    /// Старые bool true/false сохраняют значения full/off.
     #[serde(default)]
     pub downlink_shaping: Option<ShapingLevel>,
     /// 3a: optional numeric GID to chown the management-API Unix socket's

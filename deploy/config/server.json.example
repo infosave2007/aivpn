@@ -24,7 +24,7 @@
   "allow_peer_routing": false,
 
   "neural_enabled": true,
-  "downlink_shaping": "full",
+  "downlink_shaping": "adaptive",
 
   "mask_verify_mode": "warn",
   "mask_signing_key": null,

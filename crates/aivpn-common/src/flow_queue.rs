@@ -2,7 +2,9 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::net::IpAddr;
+use std::time::Duration;
 use tokio::sync::mpsc;
+use tokio::time::Instant;
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 struct Flow {
@@ -95,6 +97,15 @@ impl<T> FairQueue<T> {
         self.len += 1;
         Ok(evicted)
     }
+    /// Возраст старейшего пакета среди голов IP-потоков.
+    pub fn oldest(&self, timestamp: impl Fn(&T) -> Instant) -> Option<Instant> {
+        self.lanes
+            .values()
+            .filter_map(|lane| lane.front())
+            .map(timestamp)
+            .min()
+    }
+
     pub fn pop(&mut self) -> Option<T> {
         let key = self.active.pop_front()?;
         let lane = self.lanes.get_mut(&key).unwrap();
@@ -109,16 +120,26 @@ impl<T> FairQueue<T> {
     }
 }
 
-pub(crate) struct FlowQueue(FairQueue<Vec<u8>>);
+pub(crate) struct FlowQueue(FairQueue<(Vec<u8>, Instant)>, Duration);
 impl FlowQueue {
     pub fn new(capacity: usize) -> Self {
-        Self(FairQueue::new(capacity))
+        Self(FairQueue::new(capacity), Duration::ZERO)
     }
     fn push(&mut self, packet: Vec<u8>) {
-        let _ = self.0.push(packet, Vec::as_slice);
+        let _ = self.0.push((packet, Instant::now()), |item| &item.0);
     }
     fn pop(&mut self) -> Option<Vec<u8>> {
-        self.0.pop()
+        let now = Instant::now();
+        self.1 = self
+            .0
+            .oldest(|item| item.1)
+            .map(|at| now.saturating_duration_since(at))
+            .unwrap_or_default();
+        self.0.pop().map(|item| item.0)
+    }
+
+    pub fn queue_wait(&self) -> Duration {
+        self.1
     }
 
     pub fn try_next(
@@ -165,6 +186,19 @@ mod tests {
         p[28] = sequence;
         p
     }
+    #[tokio::test(start_paused = true)]
+    async fn fresh_flow_does_not_hide_the_age_of_a_persistent_backlog() {
+        let mut queue = FlowQueue::new(8);
+        queue.push(packet(443, 0));
+        queue.push(packet(443, 1));
+        tokio::time::advance(Duration::from_millis(75)).await;
+        queue.push(packet(53, 2));
+        assert_eq!(queue.pop(), Some(packet(443, 0)));
+        assert_eq!(queue.queue_wait(), Duration::from_millis(75));
+        assert_eq!(queue.pop(), Some(packet(53, 2)));
+        assert_eq!(queue.queue_wait(), Duration::from_millis(75));
+    }
+
     #[test]
     fn full_bulk_queue_admits_new_flow_and_preserves_surviving_order() {
         let mut queue = FlowQueue::new(4);

@@ -21,12 +21,16 @@ fn traffic_adaptation_default() -> bool {
 pub struct RuntimeConfig {
     #[serde(default = "traffic_adaptation_default")]
     pub traffic_adaptation: bool,
+    /// Паузы отправки данных; настройка локальная, из ключа подключения не берется.
+    #[serde(default)]
+    pub upload_shaping: crate::pacing::PacingMode,
 }
 
 impl Default for RuntimeConfig {
     fn default() -> Self {
         Self {
             traffic_adaptation: true,
+            upload_shaping: crate::pacing::PacingMode::default(),
         }
     }
 }
@@ -138,7 +142,7 @@ pub fn default_config_path() -> PathBuf {
             std::env::var_os("APPDATA").as_deref(),
         )
     }
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     {
         path_for(
             HostKind::Macos,
@@ -147,7 +151,7 @@ pub fn default_config_path() -> PathBuf {
             None,
         )
     }
-    #[cfg(all(unix, not(target_os = "macos")))]
+    #[cfg(all(unix, not(any(target_os = "macos", target_os = "ios"))))]
     {
         path_for(
             HostKind::Linux,
@@ -173,6 +177,31 @@ mod tests {
         ));
         std::fs::write(&path, bytes).unwrap();
         path
+    }
+
+    #[test]
+    fn upload_shaping_is_local_explicit_and_validated() {
+        use crate::pacing::PacingMode;
+        assert_eq!(
+            serde_json::from_str::<RuntimeConfig>("{}")
+                .unwrap()
+                .upload_shaping,
+            PacingMode::Adaptive
+        );
+        for (value, expected) in [
+            ("adaptive", PacingMode::Adaptive),
+            ("full", PacingMode::Full),
+            ("off", PacingMode::Off),
+        ] {
+            let json = format!(r#"{{"upload_shaping":"{value}"}}"#);
+            assert_eq!(
+                serde_json::from_str::<RuntimeConfig>(&json)
+                    .unwrap()
+                    .upload_shaping,
+                expected
+            );
+        }
+        assert!(serde_json::from_str::<RuntimeConfig>(r#"{"upload_shaping":"invalid"}"#).is_err());
     }
 
     #[test]
@@ -247,6 +276,7 @@ mod tests {
     fn room_params_do_not_override_runtime_false() {
         let runtime = RuntimeConfig {
             traffic_adaptation: false,
+            ..Default::default()
         };
         let params = br#"{"room":"alpha","traffic_adaptation":true}"#.to_vec();
         let cfg = crate::transport::TransportConfig::new("local", params.clone())

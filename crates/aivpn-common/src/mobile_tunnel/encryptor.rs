@@ -5,6 +5,7 @@
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use tokio::sync::oneshot;
 
@@ -73,6 +74,9 @@ impl MobileEncryptor {
 }
 
 impl PacketEncryptor for MobileEncryptor {
+    fn data_send_delay(&mut self) -> Duration {
+        self.inner.data_send_delay()
+    }
     fn fec_metadata(&self, payload_len: usize) -> Option<crate::fec::FecMetadata> {
         self.inner.fec_metadata(payload_len)
     }
@@ -186,6 +190,25 @@ impl PacketEncryptor for MobileEncryptor {
 mod tests {
     use super::*;
     use crate::crypto::{derive_session_keys, KeyPair};
+
+    #[test]
+    fn mobile_upload_uses_the_active_profile_interval() {
+        let mut encryptor = make_encryptor(
+            make_keys(11),
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(VecDeque::new())),
+        );
+        let mut mask = crate::mask::preset_masks::webrtc_vk_teams_v1();
+        mask.fsm_states.clear();
+        mask.size_iat_joint = None;
+        mask.iat_distribution = crate::mask::IATDistribution {
+            dist_type: crate::mask::IATDistType::Empirical,
+            params: vec![30.0],
+            jitter_range_ms: (0.0, 0.0),
+        };
+        *encryptor.inner.pending_mask.lock().unwrap() = Some(mask);
+        assert_eq!(encryptor.data_send_delay(), Duration::from_millis(30));
+    }
 
     #[test]
     fn active_uploader_applies_fec_changes_without_reconnect() {
