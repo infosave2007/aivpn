@@ -36,7 +36,7 @@ crates/aivpn-client/     — cross-platform VPN client (Linux / macOS / Windows)
 crates/aivpn-android-core/ — JNI bridge for Android (Rust → Kotlin via C FFI)
 crates/aivpn-ios-core/   — iOS Rust staticlib (C FFI), linked by PacketTunnelProvider
 crates/aivpn-windows/    — Windows GUI (egui/eframe 0.31, manages aivpn-client.exe subprocess)
-crates/aivpn-linux/      — Linux GUI (iced 0.13, wraps aivpn-client subprocess)
+crates/aivpn-linux/      - Linux GUI (Iced 0.14, wraps aivpn-client subprocess)
 platforms/android/       — Android Kotlin app (MVVM: MainViewModel + RecyclerView)
 platforms/ios/           — iOS SwiftUI app + NetworkExtension PacketTunnelProvider
 platforms/macos/         — macOS SwiftUI menu bar app + privileged helper daemon
@@ -313,6 +313,8 @@ sudo ./aivpn-client -k "aivpn://..."
 # Full tunnel (route all traffic through VPN)
 sudo ./aivpn-client -k "aivpn://..." --full-tunnel
 ```
+
+В Linux GUI доступны две компоновки: Material и KDE / Breeze. Выбор находится в разделе «Настройки» и сохраняется между запусками. Цветовая тема выбирается отдельно: светлая, темная или системная. Смена оформления сохраняет VPN-сеанс и ввод в формах. Профили, маршруты, маски и служебные инструменты используют общую логику в обеих компоновках. Для смены профиля и сетевых параметров сначала отключите VPN.
 
 ### Client — macOS
 

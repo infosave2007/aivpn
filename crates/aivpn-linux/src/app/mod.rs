@@ -1,14 +1,15 @@
+mod appearance;
 mod i18n;
 mod messages;
+mod modal;
 mod notification;
 mod privilege;
+mod shell;
 mod views;
 
 use i18n::t;
 use iced::futures::SinkExt;
-use iced::widget::{
-    button, checkbox, container, image, pick_list, rule, scrollable, text, text_input, Space,
-};
+use iced::widget::{button, checkbox, container, image, pick_list, rule, scrollable, text, Space};
 use iced::{Alignment, Background, Border, Color, Element, Length, Subscription, Task, Theme};
 pub use messages::Message;
 use std::sync::{Arc, Mutex};
@@ -22,11 +23,20 @@ use crate::install_wizard::{
     self, BinarySourceOpt, InstallAuth, InstallLine, InstallModeOpt, InstallTarget,
 };
 use crate::key_storage::{ConnectionKey, KeyStorage};
-use crate::settings::{remove_autostart_entry, write_autostart_entry, AppSettings};
+use crate::settings::{
+    remove_autostart_entry, write_autostart_entry, AppSettings, ColorScheme, UiLayout,
+};
 use crate::vpn_manager::{
     self, extract_server_addr, find_client_binary, format_bytes, read_recording_status,
     read_traffic_stats, RecordingSnapshot, TrafficStats, VpnStatus,
 };
+fn text_input<'a>(placeholder: &str, value: &str) -> iced::widget::TextInput<'a, Message> {
+    iced::widget::text_input(placeholder, value)
+        .size(14)
+        .padding([8, 10])
+        .style(appearance::input_style)
+}
+
 const MAX_LOG_LINES: usize = 200;
 
 /// G-A3: client-side estimate of the server's `PENDING_CONFIG_TIMEOUT`
@@ -747,7 +757,22 @@ enum DialogMode {
     Edit(usize),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum UiPage {
+    #[default]
+    Overview,
+    Profiles,
+    Routes,
+    Masks,
+    Settings,
+    Service,
+}
+
 pub struct App {
+    page: UiPage,
+    system_theme: iced::theme::Mode,
+    dlg_key_visible: bool,
+    pending_remove: Option<usize>,
     storage: KeyStorage,
     settings: AppSettings,
     status: VpnStatus,
@@ -959,11 +984,22 @@ impl App {
     pub fn new() -> (Self, Task<Message>) {
         let settings = AppSettings::load();
         let storage = KeyStorage::load();
+        let (app, task) = Self::from_state(settings, storage, recover_orphaned_client());
+        (
+            app,
+            Task::batch([task, iced::system::theme().map(Message::SystemThemeChanged)]),
+        )
+    }
+
+    fn from_state(
+        settings: AppSettings,
+        storage: KeyStorage,
+        adopted_client: Option<(u32, u64)>,
+    ) -> (Self, Task<Message>) {
         // Startup recovery: a previous GUI run that crashed (or was
         // SIGKILLed) leaves its aivpn-client running with the tunnel up.
         // Adopt it instead of showing Disconnected over a live tunnel and
         // spawning a second client on the next Connect.
-        let adopted_client = recover_orphaned_client();
         let mut log_lines = Vec::new();
         let status = if let Some((pid, _)) = adopted_client {
             log_lines.push(format!(
@@ -977,6 +1013,10 @@ impl App {
         };
         (
             Self {
+                page: UiPage::Overview,
+                system_theme: iced::theme::Mode::None,
+                dlg_key_visible: false,
+                pending_remove: None,
                 storage,
                 settings,
                 status,
@@ -1211,7 +1251,111 @@ impl App {
     }
 
     fn update_inner(&mut self, msg: Message) -> Task<Message> {
+        if self.profiles_locked()
+            && matches!(
+                msg,
+                Message::SelectProfile(_)
+                    | Message::ShowAddDialog
+                    | Message::ShowEditDialog(_)
+                    | Message::RemoveProfile(_)
+                    | Message::ConfirmRemoveProfile
+                    | Message::DlgSave
+                    | Message::BrowseMtlsCert
+                    | Message::MtlsCertChosen(_)
+                    | Message::ToggleKillSwitch(_)
+                    | Message::AdaptiveLevelChanged(_)
+                    | Message::DnsProxyChanged(_)
+                    | Message::ExcludeRoutesChanged(_)
+                    | Message::IncludeRoutesChanged(_)
+                    | Message::ToggleSocks5(_)
+                    | Message::Socks5AddrChanged(_)
+                    | Message::MaskOptionChanged(_)
+                    | Message::TogglePolymorphicMask(_)
+                    | Message::ToggleShareMaskFeedback(_)
+                    | Message::ToggleReceiveMaskHints(_)
+                    | Message::CountryCodeChanged(_)
+                    | Message::BootstrapCdnUrlChanged(_)
+                    | Message::BootstrapTelegramTokenChanged(_)
+                    | Message::BootstrapTelegramChatChanged(_)
+                    | Message::BootstrapGithubChanged(_)
+                    | Message::ServerSigningKeyChanged(_)
+                    | Message::ExtApply
+                    | Message::ExtToggleChanged(..)
+                    | Message::ExtTextChanged(..)
+                    | Message::ExtSelectChanged(..)
+            )
+        {
+            return Task::none();
+        }
         match msg {
+            Message::PageSelected(page) => self.page = page,
+            Message::LayoutChanged(layout) => {
+                self.set_layout(layout);
+                self.settings.save();
+            }
+            Message::ColorSchemeChanged(scheme) => {
+                self.settings.color_scheme = Some(scheme);
+                if scheme != ColorScheme::System {
+                    self.settings.dark_mode = scheme == ColorScheme::Dark;
+                }
+                self.settings.save();
+            }
+            Message::SystemThemeChanged(mode) => self.system_theme = mode,
+            Message::ToggleKeyVisibility => self.dlg_key_visible = !self.dlg_key_visible,
+            Message::CancelRemoveProfile => self.pending_remove = None,
+            Message::ConfirmRemoveProfile => {
+                if let Some(idx) = self.pending_remove.take() {
+                    self.storage.remove(idx);
+                }
+            }
+            Message::BrowseMtlsCert => {
+                return Task::perform(
+                    async {
+                        rfd::AsyncFileDialog::new()
+                            .pick_file()
+                            .await
+                            .map(|f| f.path().to_path_buf())
+                    },
+                    Message::MtlsCertChosen,
+                )
+            }
+            Message::MtlsCertChosen(path) => {
+                if self.dialog != DialogMode::None {
+                    if let Some(path) = path {
+                        self.dlg_mtls_cert = path.to_string_lossy().into_owned();
+                    }
+                }
+            }
+            Message::Keyboard(key, modifiers) => {
+                use iced::keyboard::{key::Named, Key};
+                if key == Key::Named(Named::Escape) {
+                    self.pending_remove = None;
+                    return self.update_inner(Message::DlgCancel);
+                }
+                if key == Key::Named(Named::Tab) {
+                    return if modifiers.shift() {
+                        iced::widget::operation::focus_previous()
+                    } else {
+                        iced::widget::operation::focus_next()
+                    };
+                }
+                if self.dialog != DialogMode::None || self.pending_remove.is_some() {
+                    return Task::none();
+                }
+                if modifiers.control() {
+                    if let Key::Character(ch) = key {
+                        match ch.as_str() {
+                            "n" | "N" => return self.update_inner(Message::ShowAddDialog),
+                            "," => self.page = UiPage::Settings,
+                            "l" | "L" => {
+                                self.page = UiPage::Service;
+                                self.logs_open = true;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
             Message::SessionReply(..) => return Task::none(),
             Message::Connect => {
                 // 3c: a new connection attempt starts clean — any fallback
@@ -1439,11 +1583,13 @@ impl App {
             }
             Message::ShowAddDialog => {
                 self.dialog = DialogMode::Add;
+                self.dlg_key_visible = false;
                 self.dlg_name.clear();
                 self.dlg_key.clear();
                 self.dlg_mtls_cert.clear();
                 self.dlg_full_tunnel = false;
                 self.dlg_error = None;
+                return iced::widget::operation::focus("profile-name");
             }
             Message::ShowEditDialog(idx) => {
                 if let Some(k) = self.storage.keys.get(idx) {
@@ -1452,7 +1598,9 @@ impl App {
                     self.dlg_mtls_cert = k.mtls_cert.clone().unwrap_or_default();
                     self.dlg_full_tunnel = k.full_tunnel;
                     self.dialog = DialogMode::Edit(idx);
+                    self.dlg_key_visible = false;
                     self.dlg_error = None;
+                    return iced::widget::operation::focus("profile-name");
                 }
             }
             Message::DlgNameChanged(s) => {
@@ -1468,8 +1616,22 @@ impl App {
                 self.dlg_full_tunnel = v;
             }
             Message::DlgSave => {
+                if self.dialog == DialogMode::None {
+                    return Task::none();
+                }
                 let name = self.dlg_name.trim().to_string();
                 let key_str = self.dlg_key.trim().to_string();
+                if name.is_empty() {
+                    self.dlg_error = Some(
+                        if self.settings.lang == "ru" {
+                            "Укажите название профиля"
+                        } else {
+                            "Enter a profile name"
+                        }
+                        .into(),
+                    );
+                    return Task::none();
+                }
                 match ConnectionKey::from_key_string(&name, &key_str) {
                     Ok(mut conn_key) => {
                         let mtls = self.dlg_mtls_cert.trim().to_string();
@@ -1484,6 +1646,10 @@ impl App {
                             }
                             DialogMode::Edit(idx) => {
                                 let idx = *idx;
+                                if let Some(previous) = self.storage.keys.get(idx) {
+                                    conn_key.exclude_routes = previous.exclude_routes.clone();
+                                    conn_key.proxy_listen = previous.proxy_listen.clone();
+                                }
                                 self.storage.update(idx, conn_key);
                             }
                             DialogMode::None => {}
@@ -1500,11 +1666,9 @@ impl App {
                 self.dlg_error = None;
             }
             Message::RemoveProfile(idx) => {
-                self.storage.remove(idx);
-            }
-            Message::ToggleTheme => {
-                self.settings.dark_mode = !self.settings.dark_mode;
-                self.settings.save();
+                if idx < self.storage.keys.len() {
+                    self.pending_remove = Some(idx);
+                }
             }
             Message::ToggleLang => {
                 self.settings.lang = if self.settings.lang == "ru" {
@@ -3097,6 +3261,28 @@ impl App {
         };
 
         Subscription::batch(vec![
+            iced::system::theme_changes().map(Message::SystemThemeChanged),
+            iced::event::listen_with(|event, status, _| {
+                if let iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
+                    key,
+                    modifiers,
+                    ..
+                }) = event
+                {
+                    if status == iced::event::Status::Ignored
+                        || matches!(
+                            key,
+                            iced::keyboard::Key::Named(
+                                iced::keyboard::key::Named::Escape
+                                    | iced::keyboard::key::Named::Tab
+                            )
+                        )
+                    {
+                        return Some(Message::Keyboard(key, modifiers));
+                    }
+                }
+                None
+            }),
             worker_sub,
             stats_sub,
             tray_sub,
@@ -3137,11 +3323,7 @@ impl App {
     }
 
     pub fn theme(&self) -> Theme {
-        if self.settings.dark_mode {
-            Theme::Dark
-        } else {
-            Theme::Light
-        }
+        self.appearance_theme()
     }
 
     fn push_log(&mut self, line: String) {

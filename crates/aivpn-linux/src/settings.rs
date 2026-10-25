@@ -1,9 +1,41 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UiLayout {
+    Material,
+    #[default]
+    #[serde(other)]
+    Breeze,
+}
+
+impl std::fmt::Display for UiLayout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Material => "Material",
+            Self::Breeze => "KDE / Breeze",
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ColorScheme {
+    Light,
+    Dark,
+    #[serde(other)]
+    System,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppSettings {
     pub dark_mode: bool,
+    #[serde(default)]
+    pub ui_layout: UiLayout,
+    // Отсутствие поля сохраняет прежнее предпочтение dark_mode.
+    #[serde(default)]
+    pub color_scheme: Option<ColorScheme>,
     pub kill_switch: bool,
     pub adaptive_level: u8,
     pub dns_proxy: String,
@@ -80,6 +112,8 @@ impl Default for AppSettings {
     fn default() -> Self {
         AppSettings {
             dark_mode: true,
+            ui_layout: UiLayout::Breeze,
+            color_scheme: Some(ColorScheme::System),
             kill_switch: false,
             adaptive_level: 0,
             dns_proxy: String::new(),
@@ -244,5 +278,51 @@ mod tests {
         );
         assert_eq!(desktop_exec_argument("a\\b\"$`"), r#""a\\\\b\\"\\$\\`""#);
         assert!(!desktop_exec_argument("a\nb").contains('\n'));
+    }
+}
+
+#[cfg(test)]
+mod appearance_tests {
+    use super::*;
+
+    #[test]
+    fn appearance_defaults_are_serialized() {
+        let value = serde_json::to_value(AppSettings::default()).unwrap();
+        assert_eq!(value["ui_layout"], "breeze");
+        assert_eq!(value["color_scheme"], "system");
+    }
+
+    #[test]
+    fn legacy_settings_keep_network_and_color_preferences() {
+        let old = r#"{"dark_mode":false,"kill_switch":true,"adaptive_level":2,"dns_proxy":"127.0.0.1:5300","include_routes":"10.0.0.0/8","preferred_mask":"youtube"}"#;
+        let restored: AppSettings = serde_json::from_str(old).unwrap();
+        let value = serde_json::to_value(restored).unwrap();
+        assert_eq!(value["ui_layout"], "breeze");
+        assert!(value["color_scheme"].is_null());
+        assert_eq!(value["dark_mode"], false);
+        assert_eq!(value["kill_switch"], true);
+        assert_eq!(value["include_routes"], "10.0.0.0/8");
+        assert_eq!(value["preferred_mask"], "youtube");
+    }
+
+    #[test]
+    fn appearance_selection_survives_restart() {
+        let value = serde_json::json!({"dark_mode":true,"kill_switch":false,"adaptive_level":0,"dns_proxy":"","ui_layout":"material","color_scheme":"light"});
+        let settings: AppSettings = serde_json::from_value(value).unwrap();
+        let saved = serde_json::to_value(settings).unwrap();
+        assert_eq!(saved["ui_layout"], "material");
+        assert_eq!(saved["color_scheme"], "light");
+    }
+}
+
+#[cfg(test)]
+mod forward_compatibility_tests {
+    use super::*;
+    #[test]
+    fn unknown_appearance_does_not_reset_connection_preferences() {
+        let settings: AppSettings = serde_json::from_str(r#"{"dark_mode":false,"kill_switch":true,"adaptive_level":3,"dns_proxy":"127.0.0.1:5353","ui_layout":"future_layout","color_scheme":"future_scheme"}"#).unwrap();
+        assert!(settings.kill_switch);
+        assert_eq!(settings.adaptive_level, 3);
+        assert_eq!(settings.dns_proxy, "127.0.0.1:5353");
     }
 }
