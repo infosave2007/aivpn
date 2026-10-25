@@ -3,6 +3,7 @@
 //! App settings (language + theme) are persisted together in
 //! %LOCALAPPDATA%\AIVPN\settings.json. Legacy lang.txt is migrated on first load.
 
+use crate::appearance::{ColorScheme, UiLayout};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -19,6 +20,10 @@ pub struct AppSettings {
     pub lang: Lang,
     #[serde(default = "default_dark")]
     pub dark_mode: bool,
+    #[serde(default)]
+    pub ui_layout: UiLayout,
+    #[serde(default)]
+    pub color_scheme: Option<ColorScheme>,
     #[serde(default)]
     pub kill_switch: bool,
     #[serde(default)]
@@ -72,6 +77,14 @@ fn settings_path() -> PathBuf {
 }
 
 impl AppSettings {
+    pub fn effective_color_scheme(&self) -> ColorScheme {
+        self.color_scheme.unwrap_or(if self.dark_mode {
+            ColorScheme::Dark
+        } else {
+            ColorScheme::Light
+        })
+    }
+
     pub fn load() -> Self {
         let path = settings_path();
         if path.exists() {
@@ -134,6 +147,8 @@ impl AppSettings {
         AppSettings {
             lang,
             dark_mode: true,
+            ui_layout: UiLayout::FluentDesktop,
+            color_scheme: Some(ColorScheme::System),
             kill_switch: false,
             adaptive_level: 0,
             dns_proxy: String::new(),
@@ -658,5 +673,48 @@ pub fn t(lang: Lang, key: &str) -> &'static str {
 
         // Default fallback
         (_, _) => "???",
+    }
+}
+
+#[cfg(test)]
+mod appearance_settings_tests {
+    use super::*;
+    use crate::appearance::{ColorScheme, UiLayout};
+
+    #[test]
+    fn legacy_theme_and_network_preferences_survive_layout_migration() {
+        let settings: AppSettings = serde_json::from_str(r#"{"lang":"ru","dark_mode":false,"kill_switch":true,"dns_proxy":"127.0.0.1:5353","connect_on_startup":true,"preferred_mask":"quic_https_v2"}"#).unwrap();
+        assert_eq!(settings.ui_layout, UiLayout::FluentDesktop);
+        assert_eq!(settings.effective_color_scheme(), ColorScheme::Light);
+        assert!(settings.kill_switch && settings.connect_on_startup);
+        assert_eq!(settings.dns_proxy, "127.0.0.1:5353");
+        assert_eq!(settings.preferred_mask, "quic_https_v2");
+    }
+
+    #[test]
+    fn unknown_appearance_does_not_discard_saved_network_settings() {
+        let settings: AppSettings = serde_json::from_str(r#"{"ui_layout":"future","color_scheme":"future","lang":"ru","adaptive_level":3,"dns_proxy":"127.0.0.1:5353"}"#).unwrap();
+        assert_eq!(settings.ui_layout, UiLayout::FluentDesktop);
+        assert_eq!(settings.effective_color_scheme(), ColorScheme::System);
+        assert_eq!(settings.adaptive_level, 3);
+        assert_eq!(settings.dns_proxy, "127.0.0.1:5353");
+        assert_eq!(settings.lang, Lang::Ru);
+    }
+
+    #[test]
+    fn appearance_roundtrip_preserves_all_other_preferences() {
+        let mut settings: AppSettings = serde_json::from_str(r#"{"lang":"ru","kill_switch":true,"adaptive_level":2,"dns_proxy":"127.0.0.1:5353","preferred_mask":"quic_https_v2","connect_on_startup":true,"bootstrap_cdn_url":"https://example.invalid/bootstrap","country_code":"RU"}"#).unwrap();
+        let before = serde_json::to_value(&settings).unwrap();
+        settings.ui_layout = UiLayout::Compact;
+        settings.color_scheme = Some(ColorScheme::Dark);
+        let bytes = serde_json::to_vec(&settings).unwrap();
+        let loaded: AppSettings = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(loaded.ui_layout, UiLayout::Compact);
+        assert_eq!(loaded.effective_color_scheme(), ColorScheme::Dark);
+        let mut after = serde_json::to_value(loaded).unwrap();
+        for field in ["ui_layout", "color_scheme"] {
+            after[field] = before[field].clone();
+        }
+        assert_eq!(after, before);
     }
 }

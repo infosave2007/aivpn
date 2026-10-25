@@ -4,20 +4,138 @@ use crate::vpn_manager;
 // ── Theme / visuals ────────────────────────────────────────────────────────
 
 #[cfg(windows)]
-pub(crate) fn apply_theme_to_ctx(ctx: &eframe::egui::Context, dark: bool) {
-    use eframe::egui::{self, FontFamily, FontId, TextStyle};
-
-    if dark {
-        ctx.set_visuals(egui::Visuals::dark());
-    } else {
-        ctx.set_visuals(egui::Visuals::light());
+pub(crate) fn install_fonts(ctx: &eframe::egui::Context) {
+    use eframe::egui;
+    let mut fonts = egui::FontDefinitions::default();
+    fonts.font_data.insert(
+        "Inter".into(),
+        egui::FontData::from_static(include_bytes!("../assets/Inter-Regular.ttf")).into(),
+    );
+    let mut names = vec!["Inter".to_owned()];
+    if let Some(dir) = std::env::var_os("WINDIR") {
+        for name in ["SegoeUI-VF.ttf", "segoeui.ttf"] {
+            if let Ok(bytes) = std::fs::read(std::path::Path::new(&dir).join("Fonts").join(name)) {
+                fonts
+                    .font_data
+                    .insert("Segoe UI".into(), egui::FontData::from_owned(bytes).into());
+                names.insert(0, "Segoe UI".into());
+                break;
+            }
+        }
     }
+    fonts
+        .families
+        .entry(egui::FontFamily::Proportional)
+        .or_default()
+        .splice(0..0, names);
+    ctx.set_fonts(fonts);
+}
 
+#[cfg(windows)]
+pub(crate) struct FluentColors {
+    pub background: eframe::egui::Color32,
+    pub surface: eframe::egui::Color32,
+    pub border: eframe::egui::Color32,
+    pub accent: eframe::egui::Color32,
+    pub on_accent: eframe::egui::Color32,
+    pub success: eframe::egui::Color32,
+}
+
+#[cfg(windows)]
+pub(crate) fn fluent_colors(dark: bool) -> FluentColors {
+    use eframe::egui::Color32 as C;
+    if dark {
+        FluentColors {
+            background: C::from_rgb(32, 32, 32),
+            surface: C::from_rgb(45, 45, 45),
+            border: C::from_rgb(69, 69, 69),
+            accent: C::from_rgb(96, 205, 255),
+            on_accent: C::from_rgb(0, 51, 77),
+            success: C::from_rgb(108, 203, 154),
+        }
+    } else {
+        FluentColors {
+            background: C::from_rgb(243, 243, 243),
+            surface: C::WHITE,
+            border: C::from_rgb(222, 222, 222),
+            accent: C::from_rgb(0, 103, 192),
+            on_accent: C::WHITE,
+            success: C::from_rgb(15, 108, 54),
+        }
+    }
+}
+
+#[cfg(windows)]
+pub(crate) fn apply_theme_to_ctx(ctx: &eframe::egui::Context, dark: bool) {
+    use eframe::egui::{self, Color32 as C, FontFamily, FontId, TextStyle};
+    let colors = fluent_colors(dark);
+    let mut visuals = if dark {
+        egui::Visuals::dark()
+    } else {
+        egui::Visuals::light()
+    };
+    let ink = if dark {
+        C::from_rgb(245, 245, 245)
+    } else {
+        C::from_rgb(26, 26, 26)
+    };
+    let selection = if dark {
+        C::from_rgb(38, 59, 72)
+    } else {
+        C::from_rgb(232, 240, 247)
+    };
+    visuals.panel_fill = if dark {
+        C::from_rgb(39, 39, 39)
+    } else {
+        C::from_rgb(250, 250, 250)
+    };
+    visuals.window_fill = colors.surface;
+    visuals.extreme_bg_color = colors.surface;
+    visuals.faint_bg_color = selection;
+    visuals.override_text_color = Some(ink);
+    visuals.hyperlink_color = colors.accent;
+    visuals.selection.bg_fill = selection;
+    visuals.selection.stroke = egui::Stroke::new(1.0_f32, colors.accent);
+    visuals.warn_fg_color = if dark {
+        C::from_rgb(249, 211, 125)
+    } else {
+        C::from_rgb(128, 89, 0)
+    };
+    visuals.error_fg_color = if dark {
+        C::from_rgb(255, 180, 171)
+    } else {
+        C::from_rgb(179, 35, 37)
+    };
+    for widget in [
+        &mut visuals.widgets.noninteractive,
+        &mut visuals.widgets.inactive,
+        &mut visuals.widgets.hovered,
+        &mut visuals.widgets.active,
+        &mut visuals.widgets.open,
+    ] {
+        widget.corner_radius = egui::CornerRadius::same(4);
+        widget.fg_stroke.color = ink;
+        widget.bg_stroke = egui::Stroke::new(1.0_f32, colors.border);
+    }
+    // egui смешивает слабый текст с этой поверхностью пополам.
+    visuals.widgets.noninteractive.weak_bg_fill = if dark {
+        C::from_rgb(147, 147, 147)
+    } else {
+        C::from_rgb(160, 160, 160)
+    };
+    visuals.widgets.inactive.bg_fill = colors.surface;
+    visuals.widgets.inactive.weak_bg_fill = colors.surface;
+    visuals.widgets.hovered.bg_fill = selection;
+    visuals.widgets.hovered.weak_bg_fill = selection;
+    visuals.widgets.active.bg_fill = selection;
+    visuals.widgets.active.weak_bg_fill = selection;
+    visuals.window_corner_radius = egui::CornerRadius::same(8);
+    ctx.set_visuals(visuals);
     let mut style = (*ctx.style()).clone();
     style.text_styles = [
         (
             TextStyle::Heading,
-            FontId::new(16.0, FontFamily::Proportional),
+            FontId::new(18.0, FontFamily::Proportional),
         ),
         (TextStyle::Body, FontId::new(14.0, FontFamily::Proportional)),
         (
@@ -34,26 +152,9 @@ pub(crate) fn apply_theme_to_ctx(ctx: &eframe::egui::Context, dark: bool) {
         ),
     ]
     .into();
-    style.spacing.button_padding = egui::vec2(10.0, 6.0);
-    style.spacing.item_spacing = egui::vec2(8.0, 6.0);
-    style.visuals.window_corner_radius = egui::CornerRadius::same(6);
-    style.visuals.widgets.noninteractive.corner_radius = egui::CornerRadius::same(4);
-    style.visuals.widgets.inactive.corner_radius = egui::CornerRadius::same(4);
-    style.visuals.widgets.hovered.corner_radius = egui::CornerRadius::same(4);
-    style.visuals.widgets.active.corner_radius = egui::CornerRadius::same(4);
-
-    if dark {
-        style.visuals.panel_fill = egui::Color32::from_rgb(0x1E, 0x1E, 0x1E);
-        style.visuals.window_fill = egui::Color32::from_rgb(0x25, 0x25, 0x25);
-        style.visuals.widgets.inactive.bg_fill = egui::Color32::from_rgb(0x2D, 0x2D, 0x2D);
-        style.visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(0x3A, 0x3A, 0x3A);
-        style.visuals.extreme_bg_color = egui::Color32::from_rgb(0x15, 0x15, 0x15);
-    } else {
-        style.visuals.panel_fill = egui::Color32::from_rgb(0xF5, 0xF5, 0xF5);
-        style.visuals.window_fill = egui::Color32::WHITE;
-        style.visuals.widgets.inactive.bg_fill = egui::Color32::from_rgb(0xE8, 0xE8, 0xE8);
-        style.visuals.extreme_bg_color = egui::Color32::WHITE;
-    }
+    style.spacing.button_padding = egui::vec2(13.0, 8.0);
+    style.spacing.interact_size = egui::vec2(34.0, 34.0);
+    style.spacing.item_spacing = egui::vec2(8.0, 10.0);
     ctx.set_style(style);
 }
 

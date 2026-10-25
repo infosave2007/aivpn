@@ -329,6 +329,8 @@ sudo ./aivpn-client -k "aivpn://..."
 
 ### Client — Windows
 
+В Windows GUI доступны Fluent Desktop и компактная компоновка Fluent. По умолчанию используется Desktop; переключатель находится в разделе «Настройки». Компоновка и цветовая тема сохраняются отдельно от параметров подключения. Смена оформления сохраняет VPN-сеанс, счетчики, время и ввод в формах. Для ручного изменения профиля или сетевых настроек сначала отключите VPN. Include/exclude и SOCKS5 относятся к выбранному профилю, DNS-прокси остается общим параметром клиента.
+
 **Installer (recommended):** download `aivpn-windows-installer.exe`, run as Administrator, launch **AIVPN** from the Start Menu.
 
 **Portable:** extract `aivpn-windows-package.zip` (contains `aivpn.exe`, `aivpn-client.exe`, `wintun.dll`). Run `aivpn.exe` as Administrator.

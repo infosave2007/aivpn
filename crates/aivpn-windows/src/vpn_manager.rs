@@ -268,6 +268,10 @@ impl VpnManager {
         self.state
     }
 
+    pub fn kill_switch_enabled(&self) -> bool {
+        self.kill_switch_active
+    }
+
     pub fn stats(&self) -> &TrafficStats {
         &self.stats
     }
@@ -1509,5 +1513,25 @@ mod firewall_cleanup_tests {
         .unwrap();
         assert_eq!(std::fs::read_to_string(&marker).unwrap(), "new-session");
         std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(all(test, windows))]
+impl VpnManager {
+    pub(crate) fn connected_ui_fixture() -> Self {
+        let mut manager = Self::new();
+        manager.kill_switch_active = false;
+        manager.state = ConnectionState::Connected;
+        manager.session_since_ms = Some(1_000_000);
+        manager.stats.bytes_received = 12_345_678;
+        manager.stats.bytes_sent = 2_345_678;
+        manager
+    }
+}
+
+#[cfg(all(test, windows))]
+impl VpnManager {
+    pub(crate) fn set_ui_test_kill_switch(&mut self, active: bool) {
+        self.kill_switch_active = active;
     }
 }

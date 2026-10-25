@@ -224,3 +224,65 @@ pub(crate) fn set_autostart(enable: bool) {
 
 #[cfg(not(windows))]
 pub(crate) fn set_autostart(_enable: bool) {}
+
+pub(crate) fn choose_mtls_file(lang: crate::localization::Lang) -> Option<String> {
+    use winapi::um::commdlg::{
+        GetOpenFileNameW, OFN_EXPLORER, OFN_FILEMUSTEXIST, OFN_NOCHANGEDIR, OFN_PATHMUSTEXIST,
+        OPENFILENAMEW,
+    };
+    let title: Vec<u16> =
+        crate::appearance::text(lang, "Выбрать сертификат mTLS", "Select mTLS certificate")
+            .encode_utf16()
+            .chain(Some(0))
+            .collect();
+    let filter: Vec<u16> = "PEM / CRT\0*.pem;*.crt;*.cer\0All files\0*.*\0\0"
+        .encode_utf16()
+        .collect();
+    let mut path = vec![0u16; 32768];
+    let mut dialog: OPENFILENAMEW = unsafe { std::mem::zeroed() };
+    dialog.lStructSize = std::mem::size_of::<OPENFILENAMEW>() as u32;
+    dialog.hwndOwner = find_own_aivpn_hwnd();
+    dialog.lpstrTitle = title.as_ptr();
+    dialog.lpstrFilter = filter.as_ptr();
+    dialog.lpstrFile = path.as_mut_ptr();
+    dialog.nMaxFile = path.len() as u32;
+    dialog.Flags = OFN_EXPLORER | OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+    if unsafe { GetOpenFileNameW(&mut dialog) } == 0 {
+        return None;
+    }
+    let end = path.iter().position(|c| *c == 0)?;
+    Some(String::from_utf16_lossy(&path[..end]))
+}
+
+pub(crate) fn choose_log_path(lang: crate::localization::Lang) -> Option<std::path::PathBuf> {
+    use winapi::um::commdlg::{
+        GetSaveFileNameW, OFN_EXPLORER, OFN_NOCHANGEDIR, OFN_OVERWRITEPROMPT, OFN_PATHMUSTEXIST,
+        OPENFILENAMEW,
+    };
+    let title: Vec<u16> = crate::appearance::text(lang, "Сохранить журнал", "Save log")
+        .encode_utf16()
+        .chain(Some(0))
+        .collect();
+    let filter: Vec<u16> = "Text (*.txt)\0*.txt\0All files\0*.*\0\0"
+        .encode_utf16()
+        .collect();
+    let mut path = vec![0u16; 32768];
+    for (i, c) in "aivpn-log.txt".encode_utf16().enumerate() {
+        path[i] = c;
+    }
+    let mut dialog: OPENFILENAMEW = unsafe { std::mem::zeroed() };
+    dialog.lStructSize = std::mem::size_of::<OPENFILENAMEW>() as u32;
+    dialog.hwndOwner = find_own_aivpn_hwnd();
+    dialog.lpstrTitle = title.as_ptr();
+    dialog.lpstrFilter = filter.as_ptr();
+    dialog.lpstrFile = path.as_mut_ptr();
+    dialog.nMaxFile = path.len() as u32;
+    dialog.Flags = OFN_EXPLORER | OFN_NOCHANGEDIR | OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST;
+    if unsafe { GetSaveFileNameW(&mut dialog) } == 0 {
+        return None;
+    }
+    let end = path.iter().position(|c| *c == 0)?;
+    Some(std::path::PathBuf::from(String::from_utf16_lossy(
+        &path[..end],
+    )))
+}
