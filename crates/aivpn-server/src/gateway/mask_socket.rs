@@ -1,12 +1,12 @@
 //! Протокольное состояние маски поверх общего UDP-сокета.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::{collections::VecDeque, io, net::SocketAddr, sync::Arc, time::Instant};
 
 use aivpn_common::{
     error::Result,
     mask_state::MaskState,
-    quic_mask::{QuicMask, QuicMaskOutput},
+    quic_mask::{QuicMask, QuicMaskOutput, QuicRouting},
     rtc_carrier::{RtcCarrier as RtcMask, RtcKind},
     Error,
 };
@@ -18,13 +18,18 @@ use tokio::{
 
 const PEERS: usize = 1024;
 const QUEUE: usize = 64;
+const QUIC_QUEUE: usize = 4 * crate::batch_io::MAX_BATCH;
+const PENDING_QUIC: usize = 128;
+const PENDING_PER_PEER: usize = 2;
+const PENDING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+static QUIC_RECEIVE_DROPS: AtomicU64 = AtomicU64::new(0);
 pub(crate) type WireObserver = Arc<dyn Fn([u8; 16], &[u8]) + Send + Sync>;
 type SessionOwner = std::sync::Weak<parking_lot::Mutex<crate::session::Session>>;
 
 #[derive(Clone)]
 struct Peer {
     ready: Arc<AtomicBool>,
-    bootstrap: Vec<u8>,
+    quic: Option<QuicPeer>,
     rtc: Option<Arc<RtcAdmission>>,
     incoming: mpsc::Sender<Vec<u8>>,
     outgoing: mpsc::Sender<(Vec<u8>, bool)>,
@@ -94,20 +99,188 @@ impl MaskEngine {
     }
 }
 
-struct Admission {
-    generation: Arc<()>,
-    authenticated: bool,
-    replies: VecDeque<Vec<u8>>,
-    first: Vec<u8>,
-    engine: Option<QuicMask>,
-    permit: OwnedSemaphorePermit,
-    owner: Option<SessionOwner>,
+#[derive(Clone)]
+struct QuicPeer {
+    routing: QuicRouting,
+    context: QuicContext,
 }
 
-pub(crate) struct InitialGuard {
-    socket: Arc<MaskSocket>,
-    peer: SocketAddr,
+fn try_queue<T>(
+    sender: &mpsc::Sender<T>,
+    limit: usize,
+    make_packet: impl FnOnce() -> T,
+) -> std::result::Result<(), mpsc::error::TrySendError<()>> {
+    let permit = sender.try_reserve()?;
+    // Резерв учитывается в capacity до проверки. Параллельные producers
+    // не могут одновременно занять последний логический pending-слот.
+    if sender.max_capacity() - sender.capacity() > limit {
+        return Err(mpsc::error::TrySendError::Full(()));
+    }
+    permit.send(make_packet());
+    Ok(())
+}
+
+#[cfg(test)]
+pub(super) type BeforeCommitHook = Arc<dyn Fn() + Send + Sync>;
+
+/// Поколение проверенного TLS transport. Само по себе не дает VPN admission.
+#[derive(Clone)]
+pub(crate) struct QuicContext {
     generation: Arc<()>,
+    pub local: Option<crate::udp_source::LocalEndpoint>,
+    admission: Arc<parking_lot::Mutex<QuicAdmission>>,
+    commit_gate: Arc<parking_lot::Mutex<()>>,
+    retired: Arc<AtomicBool>,
+    active: Arc<AtomicBool>,
+    work_budget: Arc<parking_lot::Mutex<super::preauth::PreauthBudget>>,
+    #[cfg(test)]
+    pub(super) before_commit: Arc<parking_lot::Mutex<Option<BeforeCommitHook>>>,
+    #[cfg(test)]
+    before_ingress_owner: Arc<parking_lot::Mutex<Option<BeforeCommitHook>>>,
+    #[cfg(test)]
+    work_attempts: Arc<std::sync::atomic::AtomicUsize>,
+    #[cfg(test)]
+    work_calls: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+struct QuicAdmission {
+    owner: Option<SessionOwner>,
+    pending_permit: Option<OwnedSemaphorePermit>,
+}
+
+pub(crate) struct DecodedPacket {
+    pub payload: Vec<u8>,
+    pub peer: SocketAddr,
+    pub quic: bool,
+    pub context: Option<QuicContext>,
+}
+
+impl QuicContext {
+    fn same_generation(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.generation, &other.generation)
+    }
+
+    fn owner(&self) -> Option<SessionOwner> {
+        self.admission.lock().owner.clone()
+    }
+
+    fn queue_limit(&self, peer: SocketAddr) -> usize {
+        if !self.active.load(Ordering::Acquire) || self.retired.load(Ordering::Acquire) {
+            return QUEUE;
+        }
+        let Some(owner) = self.owner().and_then(|owner| owner.upgrade()) else {
+            return QUEUE;
+        };
+        let admitted = {
+            let owner = owner.lock();
+            owner.client_admitted
+                && owner.is_ratcheted
+                && !owner.is_removed()
+                && owner.client_addr == peer
+        };
+        if admitted && self.active.load(Ordering::Acquire) && !self.retired.load(Ordering::Acquire)
+        {
+            QUIC_QUEUE
+        } else {
+            QUEUE
+        }
+    }
+
+    fn protocol_work<T>(&self, operation: impl FnOnce() -> Result<T>) -> Result<Option<T>> {
+        #[cfg(test)]
+        self.work_attempts.fetch_add(1, Ordering::SeqCst);
+        if self.retired.load(Ordering::Acquire) {
+            return Err(Error::InvalidPacket("Поколение QUIC уже закрыто"));
+        }
+        let _lease = if self.active.load(Ordering::Acquire) {
+            None
+        } else {
+            match super::preauth::PreauthLease::acquire(self.work_budget.clone()) {
+                Some(lease) => Some(lease),
+                None => return Ok(None),
+            }
+        };
+        #[cfg(test)]
+        self.work_calls.fetch_add(1, Ordering::SeqCst);
+        operation().map(Some)
+    }
+
+    fn pending(&self) -> bool {
+        !self.active.load(Ordering::Acquire) && !self.retired.load(Ordering::Acquire)
+    }
+
+    fn retire_locked(&self) {
+        self.retired.store(true, Ordering::Release);
+        self.admission.lock().pending_permit.take();
+    }
+
+    fn retire(&self) {
+        let _guard = self.commit_gate.lock();
+        self.retire_locked();
+    }
+}
+
+pub(super) struct QuicCommitGuard<'a> {
+    socket: &'a MaskSocket,
+    peer: SocketAddr,
+    context: &'a QuicContext,
+    current: Peer,
+    _guard: parking_lot::MutexGuard<'a, ()>,
+}
+
+impl QuicCommitGuard<'_> {
+    pub fn authenticate(&mut self, session: &Arc<parking_lot::Mutex<crate::session::Session>>) {
+        if self.context.active.load(Ordering::Acquire) {
+            return;
+        }
+        {
+            let mut admission = self.context.admission.lock();
+            admission.owner = Some(Arc::downgrade(session));
+            admission.pending_permit.take();
+        }
+        self.context.active.store(true, Ordering::Release);
+        let previous = self.socket.peers.insert(self.peer, self.current.clone());
+        if let Some(previous) = previous.and_then(|previous| previous.quic) {
+            if !previous.context.same_generation(self.context) {
+                previous.context.retire_locked();
+                remove_quic_route(&self.socket.quic_transports, self.peer, &previous.context);
+            }
+        }
+    }
+}
+
+fn remove_quic_route(
+    transports: &DashMap<SocketAddr, Vec<Peer>>,
+    peer: SocketAddr,
+    context: &QuicContext,
+) {
+    if let Entry::Occupied(mut entry) = transports.entry(peer) {
+        entry.get_mut().retain(|current| {
+            !current
+                .quic
+                .as_ref()
+                .is_some_and(|quic| quic.context.same_generation(context))
+        });
+        if entry.get().is_empty() {
+            entry.remove();
+        }
+    }
+}
+
+fn retire_quic_generation(
+    peers: &DashMap<SocketAddr, Peer>,
+    transports: &DashMap<SocketAddr, Vec<Peer>>,
+    peer: SocketAddr,
+    context: &QuicContext,
+) {
+    context.retire();
+    peers.remove_if(&peer, |_, current| {
+        current
+            .quic
+            .as_ref()
+            .is_some_and(|quic| quic.context.same_generation(context))
+    });
+    remove_quic_route(transports, peer, context);
 }
 
 #[cfg(test)]
@@ -251,7 +424,7 @@ mod tests {
             peer,
             Peer {
                 ready: Arc::new(AtomicBool::new(false)),
-                bootstrap: vec![],
+                quic: None,
                 rtc: None,
                 incoming: new.clone(),
                 outgoing,
@@ -406,6 +579,11 @@ mod tests {
         )));
         owner.lock().mask = Some(mask);
         let answer = server.accept_rtc_offer(&offer, &owner, peer).unwrap();
+        {
+            let rtc = server.peers.get(&peer).unwrap();
+            assert_eq!(rtc.incoming.max_capacity(), 64);
+            assert_eq!(rtc.outgoing.max_capacity(), 64);
+        }
         // Потерянный ответ: повтор должен вернуть те же ключи и не занять слот.
         assert_eq!(
             server.accept_rtc_offer(&offer, &owner, peer).unwrap(),
@@ -432,14 +610,13 @@ mod tests {
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             }
         });
-        let (payload, source, quic) =
-            tokio::time::timeout(std::time::Duration::from_secs(5), server.decoded())
-                .await
-                .unwrap()
-                .unwrap();
-        assert_eq!(source, peer);
-        assert!(!quic);
-        assert_eq!(payload, vec![0x11; packet_length]);
+        let decoded = tokio::time::timeout(std::time::Duration::from_secs(5), server.decoded())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(decoded.peer, peer);
+        assert!(!decoded.quic);
+        assert_eq!(decoded.payload, vec![0x11; packet_length]);
         send.abort();
         if id == "webrtc_zoom_v3" {
             let changed =
@@ -480,31 +657,892 @@ mod tests {
         dispatch.abort();
     }
 
+    fn cold_initial(peer: SocketAddr) -> Vec<u8> {
+        let now = Instant::now();
+        QuicMask::client(b"inner-bootstrap", peer, "localhost", now)
+            .unwrap()
+            .poll(now)
+            .unwrap()
+            .wire
+            .remove(0)
+    }
+
     #[tokio::test]
-    async fn cancelled_admission_releases_slot_and_never_answers() {
+    async fn pending_quic_is_bounded_per_peer_and_expires_without_vpn_admission() {
         let raw = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         let socket = MaskSocket::new(raw);
-        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let address = peer.local_addr().unwrap();
-        let guard = socket.begin_initial(address, &[0; 1200]).unwrap();
-        assert_eq!(socket.permits.available_permits(), PEERS - 1);
-        assert!(socket.begin_initial(address, &[0; 1200]).is_none());
+        let peer = "127.0.0.1:30000".parse().unwrap();
+        for _ in 0..PENDING_PER_PEER {
+            socket.start_initial(peer, &cold_initial(peer)).unwrap();
+        }
+        assert!(socket.start_initial(peer, &cold_initial(peer)).is_err());
+        assert_eq!(
+            socket.quic_transports.get(&peer).unwrap().len(),
+            PENDING_PER_PEER
+        );
+        assert!(!socket.is_stateful(peer));
+        assert_eq!(
+            socket.pending_permits.available_permits(),
+            PENDING_QUIC - PENDING_PER_PEER
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(12), async {
+            while !socket.quic_transports.is_empty() {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(socket.pending_permits.available_permits(), PENDING_QUIC);
+        assert_eq!(socket.permits.available_permits(), PEERS);
+        assert_eq!(socket.decoded.capacity(), 4096);
+    }
+
+    #[tokio::test]
+    async fn unauthenticated_nat_restart_cannot_replace_active_generation() {
+        let raw = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let socket = MaskSocket::new(raw);
+        let peer = "127.0.0.1:30001".parse().unwrap();
+        let initial = cold_initial(peer);
+        socket.start_initial(peer, &initial).unwrap();
+        let old = socket.quic_transports.get(&peer).unwrap()[0]
+            .quic
+            .as_ref()
+            .unwrap()
+            .context
+            .clone();
+        let session = Arc::new(parking_lot::Mutex::new(crate::session::Session::new(
+            [7; 16],
+            peer,
+            aivpn_common::crypto::derive_session_keys(&[8; 32], None, &[9; 32]),
+            [9; 32],
+        )));
+        socket.authenticate(peer, &old, &session).unwrap();
+        let restart = cold_initial(peer);
+        socket.start_initial(peer, &restart).unwrap();
+        let pending = socket
+            .quic_transports
+            .get(&peer)
+            .unwrap()
+            .iter()
+            .find(|current| current.quic.as_ref().unwrap().context.owner().is_none())
+            .unwrap()
+            .quic
+            .as_ref()
+            .unwrap()
+            .context
+            .clone();
+        assert!(socket
+            .peers
+            .get(&peer)
+            .unwrap()
+            .quic
+            .as_ref()
+            .unwrap()
+            .context
+            .same_generation(&old));
+        assert!(socket.context_valid(peer, &old));
+        assert!(socket.context_valid(peer, &pending));
+        // Только gate после AEAD+replay может вызвать authenticate с этим context.
+        socket.authenticate(peer, &pending, &session).unwrap();
+        assert!(!socket.context_valid(peer, &old));
+        assert!(socket.context_valid(peer, &pending));
+        assert!(socket.authenticate(peer, &old, &session).is_err());
+        assert_eq!(socket.quic_transports.get(&peer).unwrap().len(), 1);
+        assert!(socket.route_incoming(&restart, peer));
+        assert!(!socket.route_incoming(&initial, peer));
+        socket.use_plain_mask(peer);
+    }
+
+    #[tokio::test]
+    async fn authenticated_ingress_requires_the_live_admitted_quic_generation_and_owner() {
+        let raw = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let socket = MaskSocket::new(raw);
+        let peer = "127.0.0.1:30004".parse().unwrap();
+        let initial = cold_initial(peer);
+        socket.start_initial(peer, &initial).unwrap();
+        assert!(!socket.authenticated_quic_ingress(&initial, peer));
+        let context = socket.quic_transports.get(&peer).unwrap()[0]
+            .quic
+            .as_ref()
+            .unwrap()
+            .context
+            .clone();
+        let session = Arc::new(parking_lot::Mutex::new(crate::session::Session::new(
+            [7; 16],
+            peer,
+            aivpn_common::crypto::derive_session_keys(&[8; 32], None, &[9; 32]),
+            [9; 32],
+        )));
+        socket.authenticate(peer, &context, &session).unwrap();
+        assert!(!socket.authenticated_quic_ingress(&initial, peer));
+        session.lock().client_admitted = true;
+        assert!(!socket.authenticated_quic_ingress(&initial, peer));
+        session.lock().is_ratcheted = true;
+        assert!(socket.authenticated_quic_ingress(&initial, peer));
+        let mut rates = crate::source_rates::UdpIngressRates::default();
+        let now = Instant::now();
+        for _ in 0..5001 {
+            assert!(rates.allow(
+                peer.ip(),
+                now,
+                16,
+                [5000, 100_000],
+                socket.authenticated_quic_ingress(&initial, peer)
+            ));
+        }
+        let unknown_cid = cold_initial(peer);
+        assert!(!socket.authenticated_quic_ingress(&unknown_cid, peer));
+        assert!(!socket.authenticated_quic_ingress(&initial, "127.0.0.1:30005".parse().unwrap()));
+        assert!(!socket.authenticated_quic_ingress(b"plain-or-rtc", peer));
+        let pending_initial = cold_initial(peer);
+        socket.start_initial(peer, &pending_initial).unwrap();
+        assert!(!socket.authenticated_quic_ingress(&pending_initial, peer));
+        assert!(socket.authenticated_quic_ingress(&initial, peer));
+        session.lock().client_admitted = false;
+        assert!(!socket.authenticated_quic_ingress(&initial, peer));
+        session.lock().client_admitted = true;
+        session.lock().client_addr = "127.0.0.2:30004".parse().unwrap();
+        assert!(!socket.authenticated_quic_ingress(&initial, peer));
+        session.lock().client_addr = peer;
+        context.retired.store(true, Ordering::Release);
+        assert!(!socket.authenticated_quic_ingress(&initial, peer));
+        context.retired.store(false, Ordering::Release);
+        let pending = socket
+            .quic_transports
+            .get(&peer)
+            .unwrap()
+            .iter()
+            .find_map(|p| {
+                p.quic
+                    .as_ref()
+                    .filter(|q| q.context.pending())
+                    .map(|q| q.context.clone())
+            })
+            .unwrap();
+        socket.authenticate(peer, &pending, &session).unwrap();
+        assert!(!socket.authenticated_quic_ingress(&initial, peer));
+        assert!(socket.authenticated_quic_ingress(&pending_initial, peer));
+        drop(session);
+        assert!(!socket.authenticated_quic_ingress(&pending_initial, peer));
+        socket.use_plain_mask(peer);
+    }
+
+    #[tokio::test]
+    async fn ingress_owner_contention_does_not_fall_back_or_hold_route_maps() {
+        let raw = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let socket = MaskSocket::new(raw);
+        let peer = "127.0.0.1:30006".parse().unwrap();
+        let initial = cold_initial(peer);
+        socket.start_initial(peer, &initial).unwrap();
+        let context = socket.quic_transports.get(&peer).unwrap()[0]
+            .quic
+            .as_ref()
+            .unwrap()
+            .context
+            .clone();
+        let session = Arc::new(parking_lot::Mutex::new(crate::session::Session::new(
+            [7; 16],
+            peer,
+            aivpn_common::crypto::derive_session_keys(&[8; 32], None, &[9; 32]),
+            [9; 32],
+        )));
+        session.lock().client_admitted = true;
+        session.lock().is_ratcheted = true;
+        socket.authenticate(peer, &context, &session).unwrap();
+        let ready = Arc::new(std::sync::Barrier::new(2));
+        let thread_ready = ready.clone();
+        *context.before_ingress_owner.lock() = Some(Arc::new(move || {
+            thread_ready.wait();
+        }));
+        let held = session.lock();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let classifier = socket.clone();
+        let thread = std::thread::spawn(move || {
+            tx.send(classifier.authenticated_quic_ingress(&initial, peer))
+                .unwrap();
+        });
+        ready.wait();
+        assert!(matches!(
+            socket.quic_transports.try_get_mut(&peer),
+            dashmap::try_result::TryResult::Present(_)
+        ));
+        assert!(matches!(
+            socket.peers.try_get_mut(&peer),
+            dashmap::try_result::TryResult::Present(_)
+        ));
+        assert!(matches!(
+            rx.recv_timeout(std::time::Duration::from_millis(25)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        drop(held);
+        assert!(rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap());
+        thread.join().unwrap();
+        *context.before_ingress_owner.lock() = None;
+        socket.use_plain_mask(peer);
+    }
+
+    #[tokio::test]
+    async fn removed_owner_loses_authenticated_ingress_before_actor_cleanup() {
+        let raw = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let socket = MaskSocket::new(raw);
+        let peer = "127.0.0.1:30007".parse().unwrap();
+        let initial = cold_initial(peer);
+        socket.start_initial(peer, &initial).unwrap();
+        let context = socket.quic_transports.get(&peer).unwrap()[0]
+            .quic
+            .as_ref()
+            .unwrap()
+            .context
+            .clone();
+        let manager = crate::session::SessionManager::new(
+            aivpn_common::crypto::KeyPair::generate(),
+            ed25519_dalek::SigningKey::from_bytes(&[71; 32]),
+            aivpn_common::mask::preset_masks::quic_https_v2(),
+        );
+        let session = manager.create_session(peer, [7; 32], None, None).unwrap();
+        session.lock().client_admitted = true;
+        session.lock().is_ratcheted = true;
+        socket.authenticate(peer, &context, &session).unwrap();
+        assert!(socket.authenticated_quic_ingress(&initial, peer));
+        let sid = session.lock().session_id;
+        manager.remove_session(&sid);
+        assert!(context.active.load(Ordering::Acquire));
+        assert!(!socket.authenticated_quic_ingress(&initial, peer));
+        socket.use_plain_mask(peer);
+    }
+
+    #[tokio::test]
+    async fn admitted_quic_keeps_two_receive_batches_and_has_a_finite_burst_queue() {
+        let raw = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let socket = MaskSocket::new(raw);
+        let peer = "127.0.0.1:30100".parse().unwrap();
+        let initial = cold_initial(peer);
+        socket.start_initial(peer, &initial).unwrap();
+        let current = socket.quic_transports.get(&peer).unwrap()[0].clone();
+        let session = Arc::new(parking_lot::Mutex::new(crate::session::Session::new(
+            [7; 16],
+            peer,
+            aivpn_common::crypto::derive_session_keys(&[8; 32], None, &[9; 32]),
+            [9; 32],
+        )));
+        session.lock().client_admitted = true;
+        session.lock().is_ratcheted = true;
         socket
-            .send_with_mask(b"queued, not public", address, false)
+            .authenticate(peer, &current.quic.as_ref().unwrap().context, &session)
+            .unwrap();
+        for _ in 0..2 * crate::batch_io::MAX_BATCH {
+            assert!(socket.route_incoming(&initial, peer));
+        }
+        assert_eq!(
+            current.incoming.max_capacity() - current.incoming.capacity(),
+            128
+        );
+        for _ in 0..256 {
+            assert!(socket.route_incoming(&initial, peer));
+        }
+        assert_eq!(current.incoming.max_capacity(), 256);
+        assert_eq!(current.incoming.capacity(), 0);
+        socket.use_plain_mask(peer);
+    }
+
+    #[tokio::test]
+    async fn pending_quic_flood_keeps_64_slots_across_route_and_initial_retry_paths() {
+        let raw = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let socket = MaskSocket::new(raw);
+        let peer = "127.0.0.1:30101".parse().unwrap();
+        let initial = cold_initial(peer);
+        assert!(!socket.route_incoming(&initial, peer));
+        socket.start_initial(peer, &initial).unwrap();
+        let current = socket.quic_transports.get(&peer).unwrap()[0].clone();
+        for _ in 0..256 {
+            assert!(socket.route_incoming(&initial, peer));
+            socket.start_initial(peer, &initial).unwrap();
+        }
+        assert_eq!(
+            current.incoming.max_capacity() - current.incoming.capacity(),
+            64
+        );
+        assert_eq!(
+            current.outgoing.max_capacity() - current.outgoing.capacity(),
+            0
+        );
+        assert!(socket
+            .send_data_with_mask(b"anonymous", peer, true)
+            .await
+            .is_err_and(|error| error.kind() == io::ErrorKind::WouldBlock));
+        assert_eq!(socket.pending_permits.available_permits(), PENDING_QUIC - 1);
+        assert_eq!(socket.permits.available_permits(), PEERS - 1);
+    }
+
+    #[tokio::test]
+    async fn attached_quic_without_vpn_admission_keeps_64_rx_and_tx_slots() {
+        let raw = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let socket = MaskSocket::new(raw);
+        let peer = "127.0.0.1:30103".parse().unwrap();
+        let initial = cold_initial(peer);
+        socket.start_initial(peer, &initial).unwrap();
+        let current = socket.quic_transports.get(&peer).unwrap()[0].clone();
+        let session = Arc::new(parking_lot::Mutex::new(crate::session::Session::new(
+            [7; 16],
+            peer,
+            aivpn_common::crypto::derive_session_keys(&[8; 32], None, &[9; 32]),
+            [9; 32],
+        )));
+        socket
+            .authenticate(peer, &current.quic.as_ref().unwrap().context, &session)
+            .unwrap();
+        for _ in 0..128 {
+            assert!(socket.route_incoming(&initial, peer));
+        }
+        assert_eq!(
+            current.incoming.max_capacity() - current.incoming.capacity(),
+            64
+        );
+        for _ in 0..64 {
+            socket
+                .send_with_mask(b"handshake", peer, true)
+                .await
+                .unwrap();
+        }
+        assert!(socket
+            .send_with_mask(b"too many", peer, true)
+            .await
+            .is_err_and(|error| error.kind() == io::ErrorKind::WouldBlock));
+        socket.use_plain_mask(peer);
+    }
+
+    #[test]
+    fn concurrent_pending_reservations_never_commit_more_than_64_payloads() {
+        let (sender, receiver) = mpsc::channel(256);
+        let barrier = Arc::new(std::sync::Barrier::new(8));
+        let mut threads = Vec::new();
+        for _ in 0..8 {
+            let sender = sender.clone();
+            let barrier = barrier.clone();
+            threads.push(std::thread::spawn(move || {
+                barrier.wait();
+                for _ in 0..128 {
+                    let _ = try_queue(&sender, 64, || vec![0u8; 1380]);
+                }
+            }));
+        }
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        assert_eq!(receiver.len(), 64);
+        assert_eq!(sender.capacity(), 256 - 64);
+    }
+
+    #[tokio::test]
+    async fn admitted_quic_tx_burst_is_bounded_at_256() {
+        let raw = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let socket = MaskSocket::new(raw);
+        let peer = "127.0.0.1:30102".parse().unwrap();
+        let initial = cold_initial(peer);
+        socket.start_initial(peer, &initial).unwrap();
+        let current = socket.quic_transports.get(&peer).unwrap()[0].clone();
+        let session = Arc::new(parking_lot::Mutex::new(crate::session::Session::new(
+            [7; 16],
+            peer,
+            aivpn_common::crypto::derive_session_keys(&[8; 32], None, &[9; 32]),
+            [9; 32],
+        )));
+        session.lock().client_admitted = true;
+        session.lock().is_ratcheted = true;
+        socket
+            .authenticate(peer, &current.quic.as_ref().unwrap().context, &session)
+            .unwrap();
+        for _ in 0..256 {
+            socket
+                .send_data_with_mask(b"bounded", peer, true)
+                .await
+                .unwrap();
+        }
+        assert_eq!(current.outgoing.max_capacity(), 256);
+        assert_eq!(current.outgoing.capacity(), 0);
+        assert!(socket
+            .send_data_with_mask(b"one too many", peer, true)
+            .await
+            .is_err_and(|error| error.kind() == io::ErrorKind::WouldBlock));
+        socket.use_plain_mask(peer);
+    }
+
+    #[tokio::test]
+    async fn global_pending_quic_budget_stops_a_multi_peer_flood() {
+        let raw = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let socket = MaskSocket::new(raw);
+        let hold = socket
+            .pending_permits
+            .clone()
+            .acquire_many_owned((PENDING_QUIC - 1) as u32)
             .await
             .unwrap();
-        assert!(peer.try_recv_from(&mut [0; 128]).is_err());
-        drop(guard);
-        assert!(socket.admissions.is_empty());
-        assert_eq!(socket.permits.available_permits(), PEERS);
-        assert!(socket.begin_initial(address, &[0; 1200]).is_some());
+        let peer = "127.0.0.1:30002".parse().unwrap();
+        socket.start_initial(peer, &cold_initial(peer)).unwrap();
+        let other = "127.0.0.1:30003".parse().unwrap();
+        assert!(socket.start_initial(other, &cold_initial(other)).is_err());
+        assert!(!socket.is_stateful(peer));
+        assert!(!socket.is_stateful(other));
+        drop(hold);
     }
-}
-impl Drop for InitialGuard {
-    fn drop(&mut self) {
-        self.socket.admissions.remove_if(&self.peer, |_, pending| {
-            Arc::ptr_eq(&pending.generation, &self.generation)
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn pending_quic_replies_from_the_initial_destination_without_vpn_binding() {
+        let raw = Arc::new(UdpSocket::bind("0.0.0.0:0").await.unwrap());
+        crate::udp_source::enable(&raw).unwrap();
+        let destination = SocketAddr::from(([127, 0, 0, 2], raw.local_addr().unwrap().port()));
+        let socket = MaskSocket::new(raw.clone());
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        client.connect(destination).await.unwrap();
+        client.send(&cold_initial(destination)).await.unwrap();
+        let mut buffer = [0; 2048];
+        let (length, peer, local) = crate::udp_source::recv_from(&raw, &mut buffer)
+            .await
+            .unwrap();
+        assert_eq!(local.unwrap().ip, destination.ip());
+        socket
+            .start_initial_with_source(peer, &buffer[..length], local)
+            .unwrap();
+        let length =
+            tokio::time::timeout(std::time::Duration::from_secs(1), client.recv(&mut buffer))
+                .await
+                .unwrap()
+                .unwrap();
+        assert!(length > 0);
+        assert!(!socket.is_stateful(peer));
+        assert!(socket.reply_sources.get(peer).is_none());
+        assert_eq!(socket.decoded.capacity(), 4096);
+    }
+
+    async fn receive_tls_bootstrap(
+        socket: &Arc<MaskSocket>,
+        client: &UdpSocket,
+        bootstrap: &[u8],
+    ) -> DecodedPacket {
+        let mut server = socket.raw.local_addr().unwrap();
+        if server.ip().is_unspecified() {
+            server.set_ip("127.0.0.2".parse().unwrap());
+        }
+        receive_tls_bootstrap_at(socket, client, bootstrap, server).await
+    }
+
+    async fn receive_tls_bootstrap_at(
+        socket: &Arc<MaskSocket>,
+        client: &UdpSocket,
+        bootstrap: &[u8],
+        server: SocketAddr,
+    ) -> DecodedPacket {
+        receive_tls_bootstrap_at_with_probe(socket, client, bootstrap, server)
+            .await
+            .0
+    }
+
+    async fn receive_tls_bootstrap_at_with_probe(
+        socket: &Arc<MaskSocket>,
+        client: &UdpSocket,
+        bootstrap: &[u8],
+        server: SocketAddr,
+    ) -> (DecodedPacket, Vec<u8>) {
+        let mut engine = QuicMask::client(bootstrap, server, "localhost", Instant::now()).unwrap();
+        let mut probe = Vec::new();
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            let mut server_buffer = [0; 2048];
+            let mut client_buffer = [0; 2048];
+            loop {
+                for packet in engine.poll(Instant::now()).unwrap().wire {
+                    if probe.is_empty() { probe = packet.clone(); }
+                    client.send_to(&packet, server).await.unwrap();
+                }
+                let deadline = engine.deadline();
+                tokio::select! {
+                    packet = socket.decoded() => break (packet.unwrap(), probe),
+                    received = crate::udp_source::recv_from(&socket.raw, &mut server_buffer) => {
+                        let (length, peer, local) = received.unwrap();
+                        let packet = &server_buffer[..length];
+                        if !socket.route_incoming(packet, peer) && QuicMask::initial_token(packet).is_some() {
+                            socket.start_initial_with_source(peer, packet, local).unwrap();
+                        }
+                    }
+                    received = client.recv_from(&mut client_buffer) => {
+                        let (length, peer) = received.unwrap();
+                        engine.receive(&client_buffer[..length], peer, Instant::now()).unwrap();
+                    }
+                    _ = async {
+                        if let Some(deadline) = deadline {
+                            tokio::time::sleep_until(deadline.into()).await;
+                        } else { std::future::pending::<()>().await; }
+                    } => {}
+                }
+            }
+        })
+        .await
+        .expect("TLS/CONNECT-UDP не доставил внутренний bootstrap")
+    }
+
+    #[tokio::test]
+    async fn quic_admission_preserves_source_for_plain_reply_after_switch() {
+        let fixture = authenticated_quic_fixture(true).await;
+        let peer = fixture.client.local_addr().unwrap();
+        let local = fixture
+            .socket
+            .reply_sources
+            .get(peer)
+            .expect("После admission нет ReplySources binding");
+        assert_eq!(local.ip, "127.0.0.2".parse::<std::net::IpAddr>().unwrap());
+        fixture.socket.use_plain_mask(peer);
+        fixture
+            .socket
+            .send_with_mask(b"plain-after-quic", peer, false)
+            .await
+            .unwrap();
+        let mut buffer = [0; 2048];
+        let source = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                let (length, source) = fixture.client.recv_from(&mut buffer).await.unwrap();
+                if &buffer[..length] == b"plain-after-quic" {
+                    break source;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(source.ip(), local.ip);
+    }
+
+    #[tokio::test]
+    async fn stale_quic_cleanup_before_commit_cannot_consume_a_valid_nonce() {
+        use aivpn_common::client_wire::{build_inner_packet, build_shaped_mdh_packet};
+        use aivpn_common::protocol::InnerType;
+        let fixture = authenticated_quic_fixture(false).await;
+        let peer = fixture.client.local_addr().unwrap();
+        let next_keys = aivpn_common::crypto::derive_session_keys(&[17; 32], None, &[18; 32]);
+        let sid = fixture.session.lock().session_id;
+        {
+            let mut state = fixture.session.lock();
+            state.is_ratcheted = false;
+            state.ratcheted_keys = Some(next_keys.clone());
+            state.update_ratcheted_tag_window();
+        }
+        fixture.gateway.session_manager.refresh_session_tags(&sid);
+        let inner = build_inner_packet(InnerType::Ack, 0, &[]);
+        let packet = build_shaped_mdh_packet(
+            &next_keys,
+            &mut 7,
+            &inner,
+            None,
+            fixture.mask.mdh_len(),
+            &fixture.mask,
+        )
+        .unwrap();
+        let decoded = receive_tls_bootstrap(&fixture.socket, &fixture.client, &packet).await;
+        let context = decoded.context.clone().unwrap();
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let hook_barrier = barrier.clone();
+        *context.before_commit.lock() = Some(Arc::new(move || {
+            hook_barrier.wait();
+            hook_barrier.wait();
+        }));
+        let socket = fixture.socket.clone();
+        let stale = context.clone();
+        let cleanup = std::thread::spawn(move || {
+            barrier.wait();
+            retire_quic_generation(&socket.peers, &socket.quic_transports, peer, &stale);
+            barrier.wait();
         });
+        let source_before = fixture.socket.reply_sources.get(peer);
+        let before = {
+            let state = fixture.session.lock();
+            (
+                state.keys.session_key,
+                state.counter,
+                state.send_counter,
+                state.received_bitmap,
+                state.client_addr,
+                state.is_ratcheted,
+                state.ratcheted_keys.as_ref().map(|keys| keys.session_key),
+            )
+        };
+        let _ = fixture.gateway.handle_decoded_packet(decoded).await;
+        cleanup.join().unwrap();
+        let after = {
+            let state = fixture.session.lock();
+            (
+                state.keys.session_key,
+                state.counter,
+                state.send_counter,
+                state.received_bitmap,
+                state.client_addr,
+                state.is_ratcheted,
+                state.ratcheted_keys.as_ref().map(|keys| keys.session_key),
+            )
+        };
+        assert_eq!(
+            after, before,
+            "Stale generation списало nonce или изменило VPN"
+        );
+        assert_eq!(fixture.socket.reply_sources.get(peer), source_before);
+        assert!(fixture.socket.context_valid(peer, &fixture.active));
+        fixture
+            .gateway
+            .handle_decoded_packet(DecodedPacket {
+                payload: packet,
+                peer,
+                quic: true,
+                context: Some(fixture.active.clone()),
+            })
+            .await
+            .unwrap();
+        assert_eq!(fixture.session.lock().counter, 7);
+        assert!(fixture.session.lock().is_ratcheted);
+        assert_eq!(
+            fixture.session.lock().keys.session_key,
+            next_keys.session_key
+        );
+    }
+
+    #[tokio::test]
+    async fn exhausted_pending_cpu_budget_skips_protocol_work_but_keeps_active_running() {
+        let raw = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let socket = MaskSocket::new(raw);
+        let peer = "127.0.0.1:30005".parse().unwrap();
+        let initial = cold_initial(peer);
+        socket.start_initial(peer, &initial).unwrap();
+        let context = socket.quic_transports.get(&peer).unwrap()[0]
+            .quic
+            .as_ref()
+            .unwrap()
+            .context
+            .clone();
+        assert!(context.work_budget.lock().try_begin(Instant::now()));
+        for _ in 0..64 {
+            assert!(socket.route_incoming(&initial, peer));
+        }
+        while context.work_attempts.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            context.work_calls.load(Ordering::SeqCst),
+            0,
+            "Pending выполнил crypto/H3 без бюджета"
+        );
+        let session = Arc::new(parking_lot::Mutex::new(crate::session::Session::new(
+            [7; 16],
+            peer,
+            aivpn_common::crypto::derive_session_keys(&[8; 32], None, &[9; 32]),
+            [9; 32],
+        )));
+        socket.authenticate(peer, &context, &session).unwrap();
+        assert!(socket.route_incoming(&initial, peer));
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while context.work_calls.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        socket.use_plain_mask(peer);
+    }
+
+    struct QuicFixture {
+        _directory: tempfile::TempDir,
+        gateway: super::super::Gateway,
+        socket: Arc<MaskSocket>,
+        client: UdpSocket,
+        session: Arc<parking_lot::Mutex<crate::session::Session>>,
+        keys: aivpn_common::crypto::SessionKeys,
+        mask: aivpn_common::mask::MaskProfile,
+        active: QuicContext,
+        wire_probe: Vec<u8>,
+    }
+
+    async fn authenticated_quic_fixture(wildcard: bool) -> QuicFixture {
+        use aivpn_common::client_wire::{build_inner_packet, build_shaped_mdh_packet};
+        use aivpn_common::protocol::InnerType;
+        let directory = tempfile::tempdir().unwrap();
+        let mask_dir = directory.path().join("masks");
+        std::fs::create_dir(&mask_dir).unwrap();
+        let mut mask = aivpn_common::mask::preset_masks::quic_https_v2();
+        crate::test_masks::sign(&mut mask, &ed25519_dalek::SigningKey::from_bytes(&[71; 32]));
+        std::fs::write(
+            mask_dir.join(format!("{}.json", mask.mask_id)),
+            serde_json::to_vec(&mask).unwrap(),
+        )
+        .unwrap();
+        let database = Arc::new(
+            crate::client_db::ClientDatabase::load(
+                &directory.path().join("clients.json"),
+                aivpn_common::network_config::VpnNetworkConfig::default(),
+            )
+            .unwrap(),
+        );
+        let mut gateway = super::super::Gateway::new(super::super::GatewayConfig {
+            mask_dir,
+            client_db: Some(database),
+            mask_signing_key: Some([71; 32]),
+            enable_nat: false,
+            enable_neural: false,
+            ..Default::default()
+        })
+        .unwrap();
+        let raw = Arc::new(
+            UdpSocket::bind(if wildcard { "0.0.0.0:0" } else { "127.0.0.1:0" })
+                .await
+                .unwrap(),
+        );
+        crate::udp_source::enable(&raw).unwrap();
+        let socket = MaskSocket::new(raw);
+        gateway.udp_socket = Some(socket.clone());
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer = client.local_addr().unwrap();
+        let session = gateway
+            .session_manager
+            .create_session(peer, [7; 32], None, None)
+            .unwrap();
+        let keys = aivpn_common::crypto::derive_session_keys(&[8; 32], None, &[9; 32]);
+        let sid = session.lock().session_id;
+        {
+            let mut state = session.lock();
+            state.keys = keys.clone();
+            state.mask = Some(mask.clone());
+            state.is_ratcheted = true;
+            state.client_admitted = true;
+            state.update_tag_window();
+        }
+        gateway.session_manager.refresh_session_tags(&sid);
+        let inner = build_inner_packet(InnerType::Ack, 0, &[]);
+        let initial =
+            build_shaped_mdh_packet(&keys, &mut 6, &inner, None, mask.mdh_len(), &mask).unwrap();
+        let mut destination = socket.raw.local_addr().unwrap();
+        if destination.ip().is_unspecified() {
+            destination.set_ip("127.0.0.2".parse().unwrap());
+        }
+        let (decoded, wire_probe) =
+            receive_tls_bootstrap_at_with_probe(&socket, &client, &initial, destination).await;
+        let active = decoded.context.clone().unwrap();
+        gateway.handle_decoded_packet(decoded).await.unwrap();
+        assert!(socket.context_valid(peer, &active));
+        QuicFixture {
+            _directory: directory,
+            gateway,
+            socket,
+            client,
+            session,
+            keys,
+            mask,
+            active,
+            wire_probe,
+        }
+    }
+
+    #[tokio::test]
+    async fn tls_admitted_generation_exceeds_5000_but_known_cid_still_has_a_finite_ceiling() {
+        let fixture = authenticated_quic_fixture(false).await;
+        let peer = fixture.client.local_addr().unwrap();
+        let mut rates = crate::source_rates::UdpIngressRates::default();
+        let now = Instant::now();
+        for _ in 0..5001 {
+            assert!(rates.allow(
+                peer.ip(),
+                now,
+                16,
+                [5000, 100_000],
+                fixture
+                    .socket
+                    .authenticated_quic_ingress(&fixture.wire_probe, peer)
+            ));
+        }
+        let mut forged = fixture.wire_probe.clone();
+        *forged.last_mut().unwrap() ^= 1;
+        // CID выбирает квоту, но не подтверждает пакет. Quinn AEAD проверяется дальше.
+        assert!(fixture.socket.authenticated_quic_ingress(&forged, peer));
+        for _ in 5001..100_000 {
+            assert!(rates.allow(peer.ip(), now, 16, [5000, 100_000], true));
+        }
+        assert!(!rates.allow(
+            peer.ip(),
+            now,
+            16,
+            [5000, 100_000],
+            fixture.socket.authenticated_quic_ingress(&forged, peer)
+        ));
+        fixture.socket.use_plain_mask(peer);
+    }
+
+    #[tokio::test]
+    async fn forged_and_replayed_inner_packets_cannot_attach_a_pending_nat_generation() {
+        use aivpn_common::client_wire::{build_inner_packet, build_shaped_mdh_packet};
+        use aivpn_common::protocol::InnerType;
+        let QuicFixture {
+            _directory,
+            gateway,
+            socket,
+            client,
+            session,
+            keys,
+            mask,
+            active,
+            wire_probe: _,
+        } = authenticated_quic_fixture(true).await;
+        let peer = client.local_addr().unwrap();
+        let inner = build_inner_packet(InnerType::Ack, 0, &[]);
+        let snapshot = || {
+            let state = session.lock();
+            (
+                state.keys.session_key,
+                state.keys.tag_secret,
+                state.counter,
+                state.send_counter,
+                state.received_bitmap,
+                state.client_addr,
+                state.last_seen,
+            )
+        };
+        let source_before = socket.reply_sources.get(peer);
+        let mut adversarial_destination = socket.raw.local_addr().unwrap();
+        adversarial_destination.set_ip("127.0.0.3".parse().unwrap());
+        let before = snapshot();
+        assert_eq!(snapshot(), before);
+        let packet =
+            build_shaped_mdh_packet(&keys, &mut 7, &inner, None, mask.mdh_len(), &mask).unwrap();
+        let mut forged = packet.clone();
+        *forged.last_mut().unwrap() ^= 1;
+        let (decoded, forged_wire) =
+            receive_tls_bootstrap_at_with_probe(&socket, &client, &forged, adversarial_destination)
+                .await;
+        let pending = decoded.context.clone().unwrap();
+        assert!(gateway.handle_decoded_packet(decoded).await.is_err());
+        assert_eq!(snapshot(), before);
+        assert_eq!(socket.reply_sources.get(peer), source_before);
+        assert!(socket.context_valid(peer, &active));
+        assert!(pending.owner().is_none());
+        assert!(!socket.authenticated_quic_ingress(&forged_wire, peer));
+        // Подделка не сожгла nonce: настоящий пакет по active принимается.
+        gateway
+            .handle_decoded_packet(DecodedPacket {
+                payload: packet.clone(),
+                peer,
+                quic: true,
+                context: Some(active.clone()),
+            })
+            .await
+            .unwrap();
+        let accepted = snapshot();
+        assert_ne!(accepted.4, before.4);
+        adversarial_destination.set_ip("127.0.0.4".parse().unwrap());
+        let (replayed, replay_wire) =
+            receive_tls_bootstrap_at_with_probe(&socket, &client, &packet, adversarial_destination)
+                .await;
+        let replay_context = replayed.context.clone().unwrap();
+        let _ = gateway.handle_decoded_packet(replayed).await;
+        assert_eq!(snapshot(), accepted);
+        assert_eq!(socket.reply_sources.get(peer), source_before);
+        assert!(socket.context_valid(peer, &active));
+        assert!(pending.owner().is_none());
+        assert!(replay_context.owner().is_none());
+        assert!(!socket.authenticated_quic_ingress(&replay_wire, peer));
+        assert_eq!(gateway.session_manager.session_count(), 1);
+        socket.use_plain_mask(peer);
     }
 }
 
@@ -512,9 +1550,12 @@ pub(crate) struct MaskSocket {
     raw: Arc<UdpSocket>,
     reply_sources: Arc<crate::udp_source::ReplySources>,
     peers: Arc<DashMap<SocketAddr, Peer>>,
-    admissions: DashMap<SocketAddr, Admission>,
-    decoded: mpsc::Sender<(Vec<u8>, SocketAddr, bool)>,
-    received: Mutex<mpsc::Receiver<(Vec<u8>, SocketAddr, bool)>>,
+    quic_transports: Arc<DashMap<SocketAddr, Vec<Peer>>>,
+    pending_permits: Arc<Semaphore>,
+    #[cfg(test)]
+    preauth_work: Arc<parking_lot::Mutex<super::preauth::PreauthBudget>>,
+    decoded: mpsc::Sender<DecodedPacket>,
+    received: Mutex<mpsc::Receiver<DecodedPacket>>,
     permits: Arc<Semaphore>,
     wire_observer: Option<WireObserver>,
 }
@@ -630,7 +1671,7 @@ impl MaskSocket {
         let ready = Arc::new(AtomicBool::new(false));
         let created = Peer {
             ready: ready.clone(),
-            bootstrap: vec![],
+            quic: None,
             incoming,
             outgoing,
             rtc: Some(Arc::new(RtcAdmission {
@@ -640,26 +1681,75 @@ impl MaskSocket {
                 inner_budget,
             })),
         };
-        match self.peers.entry(peer) {
-            Entry::Occupied(mut entry) => {
-                if let Some(answer) = existing(entry.get())? {
-                    return Ok(answer);
-                }
-                if let Some(previous) = entry
-                    .get()
-                    .rtc
-                    .as_ref()
-                    .filter(|previous| previous.session_id == session_id)
-                {
-                    session_guard.retire_rtc_offer(previous.offer.offer_id);
-                }
-                entry.insert(created);
-            }
-            Entry::Vacant(entry) => {
-                entry.insert(created);
-            }
-        }
+        // Session и DashMap guard не удерживаются при ожидании lifecycle gate.
         drop(session_guard);
+        let mut created = Some(created);
+        loop {
+            let previous_quic = self
+                .peers
+                .get(&peer)
+                .and_then(|current| current.quic.clone());
+            let generation_guard = previous_quic
+                .as_ref()
+                .map(|quic| quic.context.commit_gate.lock());
+            let mut latest_session = session.lock();
+            if latest_session.is_removed()
+                || latest_session.rtc_retired_offers.contains(&offer.offer_id)
+                || !latest_session.mask.as_ref().is_some_and(|mask| {
+                    aivpn_common::mask_io::uses_rtc(mask)
+                        && mask.mask_id == offer.mask_id
+                        && mask.version == offer.mask_version
+                })
+            {
+                return Err(Error::InvalidPacket(
+                    "Сессия или предложение RTC уже изменились",
+                ));
+            }
+            let previous = match self.peers.entry(peer) {
+                Entry::Occupied(mut entry) => {
+                    if entry.get().quic.as_ref().is_some_and(|current| {
+                        previous_quic.as_ref().is_none_or(|previous| {
+                            !Arc::ptr_eq(
+                                &previous.context.commit_gate,
+                                &current.context.commit_gate,
+                            )
+                        })
+                    }) {
+                        // Пока брали gate, другое допустимое поколение могло
+                        // завершить attach. Повторяем без блокировки DashMap.
+                        drop(entry);
+                        drop(latest_session);
+                        drop(generation_guard);
+                        continue;
+                    }
+                    if let Some(answer) = existing(entry.get())? {
+                        return Ok(answer);
+                    }
+                    Some(entry.insert(created.take().unwrap()))
+                }
+                Entry::Vacant(entry) => {
+                    entry.insert(created.take().unwrap());
+                    None
+                }
+            };
+            if let Some(previous) = previous
+                .as_ref()
+                .and_then(|previous| previous.rtc.as_ref())
+                .filter(|previous| previous.session_id == session_id)
+            {
+                latest_session.retire_rtc_offer(previous.offer.offer_id);
+            }
+            drop(latest_session);
+            if let Some(previous) = previous
+                .as_ref()
+                .and_then(|previous| previous.quic.as_ref())
+            {
+                previous.context.retire_locked();
+                remove_quic_route(&self.quic_transports, peer, &previous.context);
+            }
+            drop(generation_guard);
+            break;
+        }
         let raw = self.raw.clone();
         let reply_sources = self.reply_sources.clone();
         let peers = self.peers.clone();
@@ -679,6 +1769,7 @@ impl MaskSocket {
                 Some(owner),
                 ready,
                 observer,
+                None,
             )
             .await
             {
@@ -713,7 +1804,12 @@ impl MaskSocket {
             raw,
             reply_sources: Arc::new(crate::udp_source::ReplySources::default()),
             peers: Arc::new(DashMap::new()),
-            admissions: DashMap::new(),
+            quic_transports: Arc::new(DashMap::new()),
+            pending_permits: Arc::new(Semaphore::new(PENDING_QUIC)),
+            #[cfg(test)]
+            preauth_work: Arc::new(parking_lot::Mutex::new(super::preauth::PreauthBudget::new(
+                Instant::now(),
+            ))),
             decoded,
             received: Mutex::new(received),
             permits: Arc::new(Semaphore::new(PEERS)),
@@ -752,23 +1848,87 @@ impl MaskSocket {
         }
     }
 
-    pub async fn decoded(&self) -> Option<(Vec<u8>, SocketAddr, bool)> {
+    pub async fn decoded(&self) -> Option<DecodedPacket> {
         self.received.lock().await.recv().await
     }
 
+    /// Выбирает только конечную внешнюю квоту. Проверка Quinn AEAD остается обязательной.
+    pub(super) fn authenticated_quic_ingress(&self, packet: &[u8], peer: SocketAddr) -> bool {
+        if packet.len() > 1380 {
+            return false;
+        }
+        let Some(current) = self.quic_transports.get(&peer).and_then(|transports| {
+            transports
+                .iter()
+                .find(|current| {
+                    current
+                        .quic
+                        .as_ref()
+                        .is_some_and(|quic| quic.routing.matches(packet))
+                })
+                .cloned()
+        }) else {
+            return false;
+        };
+        let Some(quic) = current.quic.as_ref() else {
+            return false;
+        };
+        let context = &quic.context;
+        if !context.active.load(Ordering::Acquire)
+            || context.retired.load(Ordering::Acquire)
+            || current.incoming.is_closed()
+        {
+            return false;
+        }
+        let Some(owner) = context.owner().and_then(|owner| owner.upgrade()) else {
+            return false;
+        };
+        #[cfg(test)]
+        {
+            let hook = context.before_ingress_owner.lock().clone();
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
+        // Нельзя ждать Session с удержанным guard карты: worker обновляет
+        // transport mapping, пока работает с этой же сессией.
+        let admitted = {
+            let owner = owner.lock();
+            owner.client_admitted
+                && owner.is_ratcheted
+                && !owner.is_removed()
+                && owner.client_addr == peer
+        };
+        admitted
+            && self.peers.get(&peer).is_some_and(|active| {
+                active
+                    .quic
+                    .as_ref()
+                    .is_some_and(|active| active.context.same_generation(context))
+            })
+            && context.active.load(Ordering::Acquire)
+            && !context.retired.load(Ordering::Acquire)
+            && !current.incoming.is_closed()
+    }
+
     pub fn route_incoming(&self, packet: &[u8], peer: SocketAddr) -> bool {
-        // STUN оставляем обычному декодеру: смена протокола допускается только
-        // после проверки внутреннего AEAD, не по внешнему заголовку.
+        let quic = self.quic_transports.get(&peer).and_then(|transports| {
+            transports
+                .iter()
+                .find(|sender| {
+                    sender
+                        .quic
+                        .as_ref()
+                        .is_some_and(|quic| quic.routing.matches(packet))
+                })
+                .cloned()
+        });
+        if let Some(sender) = quic {
+            self.queue_quic_rx(&sender, packet, peer);
+            return true;
+        }
         if let Some(sender) = self.peers.get(&peer) {
-            if sender.rtc.is_some() {
-                if !aivpn_common::rtc_mask::is_wire_packet(packet) {
-                    return false;
-                }
-            } else if packet.first().is_none_or(|first| first & 0x40 == 0) {
-                return false;
-            } else if QuicMask::bootstrap(packet).is_some_and(|token| token != sender.bootstrap) {
-                // Новая попытка за тем же NAT проходит AEAD и replay заново.
-                // Старое состояние меняется только после ее аутентификации.
+            if sender.rtc.is_none() || !aivpn_common::rtc_mask::is_wire_packet(packet) {
                 return false;
             }
             if sender.incoming.is_closed() {
@@ -785,63 +1945,311 @@ impl MaskSocket {
         false
     }
 
+    fn queue_quic_rx(&self, sender: &Peer, packet: &[u8], peer: SocketAddr) {
+        let Some(quic) = &sender.quic else {
+            return;
+        };
+        if packet.len() > 1380 || quic.context.retired.load(Ordering::Acquire) {
+            return;
+        }
+        if matches!(
+            try_queue(&sender.incoming, quic.context.queue_limit(peer), || packet
+                .to_vec()),
+            Err(mpsc::error::TrySendError::Full(_))
+        ) {
+            let dropped = QUIC_RECEIVE_DROPS
+                .fetch_add(1, Ordering::Relaxed)
+                .wrapping_add(1);
+            if dropped.is_power_of_two() {
+                tracing::debug!(dropped, "Переполнена входная очередь QUIC");
+            }
+        }
+    }
+
     fn retire_closed_peer(&self, peer: SocketAddr, previous: &mpsc::Sender<Vec<u8>>) {
         self.peers.remove_if(&peer, |_, current| {
             current.incoming.same_channel(previous) && current.incoming.is_closed()
         });
     }
 
-    pub fn begin_initial(self: &Arc<Self>, peer: SocketAddr, first: &[u8]) -> Option<InitialGuard> {
-        if first.len() > 1380 {
-            return None;
-        }
-        let permit = self.permits.clone().try_acquire_owned().ok()?;
-        match self.admissions.entry(peer) {
-            Entry::Vacant(entry) => {
-                let generation = Arc::new(());
-                entry.insert(Admission {
-                    generation: generation.clone(),
-                    authenticated: false,
-                    replies: VecDeque::new(),
-                    first: first.to_vec(),
-                    engine: None,
-                    permit,
-                    owner: None,
-                });
-                Some(InitialGuard {
-                    socket: self.clone(),
-                    peer,
-                    generation,
-                })
-            }
-            Entry::Occupied(_) => None,
-        }
+    /// До VPN admission принимается только ограниченный стандартный QUIC transport.
+    #[cfg(test)]
+    pub fn start_initial(self: &Arc<Self>, peer: SocketAddr, first: &[u8]) -> Result<()> {
+        self.start_initial_with_source(peer, first, None)
     }
 
-    /// AEAD уже проверен, replay еще не захвачен. Битый внешний пакет
-    /// не должен сжечь nonce настоящего клиентского Initial.
-    pub fn prepare_authenticated_initial(&self, peer: SocketAddr) -> Result<()> {
-        if let Some(mut pending) = self.admissions.get_mut(&peer) {
-            if pending.engine.is_none() {
-                pending.engine = Some(QuicMask::server(&pending.first, peer, Instant::now())?);
+    #[cfg(test)]
+    pub fn start_initial_with_source(
+        self: &Arc<Self>,
+        peer: SocketAddr,
+        first: &[u8],
+        local: Option<crate::udp_source::LocalEndpoint>,
+    ) -> Result<()> {
+        self.start_initial_with_budget(peer, first, local, self.preauth_work.clone())
+    }
+
+    pub(super) fn start_initial_with_budget(
+        self: &Arc<Self>,
+        peer: SocketAddr,
+        first: &[u8],
+        local: Option<crate::udp_source::LocalEndpoint>,
+        work_budget: Arc<parking_lot::Mutex<super::preauth::PreauthBudget>>,
+    ) -> Result<()> {
+        if first.len() > 1380 || QuicMask::initial_token(first).is_none() {
+            return Err(Error::InvalidPacket("Некорректный QUIC Initial"));
+        }
+        let current = self.quic_transports.get(&peer).and_then(|transports| {
+            transports
+                .iter()
+                .find(|current| {
+                    current
+                        .quic
+                        .as_ref()
+                        .is_some_and(|quic| quic.routing.matches(first))
+                })
+                .cloned()
+        });
+        if let Some(current) = current {
+            self.queue_quic_rx(&current, first, peer);
+            return Ok(());
+        }
+        if let Some(transports) = self.quic_transports.get(&peer) {
+            if transports
+                .iter()
+                .filter(|current| {
+                    current
+                        .quic
+                        .as_ref()
+                        .is_some_and(|quic| quic.context.pending())
+                })
+                .count()
+                >= PENDING_PER_PEER
+            {
+                return Err(Error::Io(io::ErrorKind::WouldBlock.into()));
             }
         }
+        let permit = self
+            .permits
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| Error::Io(io::ErrorKind::WouldBlock.into()))?;
+        let pending_permit = self
+            .pending_permits
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| Error::Io(io::ErrorKind::WouldBlock.into()))?;
+        let engine = QuicMask::server(first, peer, Instant::now())?;
+        let routing = engine.routing().expect("Сервер QUIC имеет маршрут");
+        // Entry сериализует создание поколений одного peer; неизвестный CID
+        // не заменяет действующее состояние и не занимает более двух pending.
+        let mut transports = self.quic_transports.entry(peer).or_default();
+        if let Some(current) = transports
+            .iter()
+            .find(|current| {
+                current
+                    .quic
+                    .as_ref()
+                    .is_some_and(|quic| quic.routing.matches(first))
+            })
+            .cloned()
+        {
+            drop(transports);
+            self.queue_quic_rx(&current, first, peer);
+            return Ok(());
+        }
+        if transports
+            .iter()
+            .filter(|current| {
+                current
+                    .quic
+                    .as_ref()
+                    .is_some_and(|quic| quic.context.pending())
+            })
+            .count()
+            >= PENDING_PER_PEER
+        {
+            return Err(Error::Io(io::ErrorKind::WouldBlock.into()));
+        }
+        let context = QuicContext {
+            generation: Arc::new(()),
+            local,
+            admission: Arc::new(parking_lot::Mutex::new(QuicAdmission {
+                owner: None,
+                pending_permit: Some(pending_permit),
+            })),
+            work_budget,
+            commit_gate: transports
+                .first()
+                .and_then(|current| current.quic.as_ref())
+                .map(|quic| quic.context.commit_gate.clone())
+                .unwrap_or_default(),
+            retired: Arc::new(AtomicBool::new(false)),
+            active: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            before_commit: Default::default(),
+            #[cfg(test)]
+            before_ingress_owner: Default::default(),
+            #[cfg(test)]
+            work_attempts: Default::default(),
+            #[cfg(test)]
+            work_calls: Default::default(),
+        };
+        let (incoming, receiver) = mpsc::channel(QUIC_QUEUE);
+        let (outgoing, outgoing_rx) = mpsc::channel(QUIC_QUEUE);
+        let ready = Arc::new(AtomicBool::new(false));
+        transports.push(Peer {
+            ready: ready.clone(),
+            quic: Some(QuicPeer {
+                routing,
+                context: context.clone(),
+            }),
+            rtc: None,
+            incoming,
+            outgoing,
+        });
+        drop(transports);
+        let raw = self.raw.clone();
+        let reply_sources = self.reply_sources.clone();
+        let peers = self.peers.clone();
+        let transports = self.quic_transports.clone();
+        let decoded = self.decoded.clone();
+        let observer = self.wire_observer.clone();
+        tokio::spawn(async move {
+            let _permit = permit;
+            if let Err(error) = drive(
+                MaskEngine::Quic(engine),
+                raw,
+                reply_sources,
+                receiver,
+                outgoing_rx,
+                decoded,
+                peer,
+                VecDeque::new(),
+                None,
+                ready,
+                observer,
+                Some(context.clone()),
+            )
+            .await
+            {
+                tracing::debug!("Движок QUIC завершен: {}", error);
+            }
+            retire_quic_generation(&peers, &transports, peer, &context);
+        });
         Ok(())
     }
 
+    pub fn context_valid(&self, peer: SocketAddr, context: &QuicContext) -> bool {
+        let exists = self.quic_transports.get(&peer).is_some_and(|transports| {
+            transports.iter().any(|current| {
+                current
+                    .quic
+                    .as_ref()
+                    .is_some_and(|quic| quic.context.same_generation(context))
+            })
+        });
+        exists
+            && !context.retired.load(Ordering::Acquire)
+            && (!context.active.load(Ordering::Acquire)
+                || self.peers.get(&peer).is_some_and(|current| {
+                    current
+                        .quic
+                        .as_ref()
+                        .is_some_and(|quic| quic.context.same_generation(context))
+                }))
+    }
+
+    /// Lifecycle guard защищает ratchet, replay и attach от cleanup поколения.
+    /// Вызывающий код освобождает guard до первого await.
+    pub(super) fn begin_quic_commit<'a>(
+        &'a self,
+        peer: SocketAddr,
+        context: &'a QuicContext,
+        session: &Arc<parking_lot::Mutex<crate::session::Session>>,
+    ) -> Result<QuicCommitGuard<'a>> {
+        let current = self
+            .quic_transports
+            .get(&peer)
+            .and_then(|transports| {
+                transports
+                    .iter()
+                    .find(|current| {
+                        current
+                            .quic
+                            .as_ref()
+                            .is_some_and(|quic| quic.context.same_generation(context))
+                    })
+                    .cloned()
+            })
+            .ok_or(Error::InvalidPacket("Поколение QUIC уже закрыто"))?;
+        #[cfg(test)]
+        {
+            let hook = context.before_commit.lock().clone();
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
+        let guard = context.commit_gate.lock();
+        if context.retired.load(Ordering::Acquire) || current.incoming.is_closed() {
+            return Err(Error::InvalidPacket("Поколение QUIC уже закрыто"));
+        }
+        if let Some(owner) = context.owner() {
+            if !owner.ptr_eq(&Arc::downgrade(session))
+                || !self.peers.get(&peer).is_some_and(|current| {
+                    current
+                        .quic
+                        .as_ref()
+                        .is_some_and(|quic| quic.context.same_generation(context))
+                })
+            {
+                return Err(Error::InvalidPacket("Поколение QUIC больше не активно"));
+            }
+        }
+        if session.lock().is_removed() {
+            return Err(Error::InvalidPacket("Сессия QUIC уже удалена"));
+        }
+        Ok(QuicCommitGuard {
+            socket: self,
+            peer,
+            context,
+            current,
+            _guard: guard,
+        })
+    }
+
+    #[cfg(test)]
     pub fn authenticate(
         &self,
         peer: SocketAddr,
+        context: &QuicContext,
         session: &Arc<parking_lot::Mutex<crate::session::Session>>,
-    ) {
-        if let Some(mut pending) = self.admissions.get_mut(&peer) {
-            pending.authenticated = true;
-            pending.owner = Some(Arc::downgrade(session));
-        }
+    ) -> Result<()> {
+        self.begin_quic_commit(peer, context, session)?
+            .authenticate(session);
+        Ok(())
     }
 
     pub fn use_plain_mask(&self, peer: SocketAddr) {
-        self.peers.remove(&peer);
+        let previous = self.peers.get(&peer).map(|current| current.clone());
+        if let Some(previous) = previous {
+            if let Some(quic) = &previous.quic {
+                let _guard = quic.context.commit_gate.lock();
+                if self
+                    .peers
+                    .remove_if(&peer, |_, current| {
+                        current.incoming.same_channel(&previous.incoming)
+                    })
+                    .is_some()
+                {
+                    quic.context.retire_locked();
+                    remove_quic_route(&self.quic_transports, peer, &quic.context);
+                }
+            } else {
+                self.peers.remove_if(&peer, |_, current| {
+                    current.incoming.same_channel(&previous.incoming)
+                });
+            }
+        }
     }
 
     pub fn retire_other_rtc_session(&self, peer: SocketAddr, session_id: [u8; 16]) {
@@ -878,13 +2286,6 @@ impl MaskSocket {
         stateful: bool,
         data: bool,
     ) -> io::Result<usize> {
-        if let Some(mut pending) = self.admissions.get_mut(&peer) {
-            if data || pending.replies.len() >= QUEUE {
-                return Err(io::ErrorKind::WouldBlock.into());
-            }
-            pending.replies.push_back(packet.to_vec());
-            return Ok(packet.len());
-        }
         let sender = self.peers.get(&peer).map(|entry| entry.clone());
         if let Some(sender) = sender {
             let maximum = if let Some(rtc) = &sender.rtc {
@@ -895,10 +2296,20 @@ impl MaskSocket {
             if packet.len() > maximum {
                 return Err(io::ErrorKind::InvalidInput.into());
             }
-            sender
-                .outgoing
-                .try_send((packet.to_vec(), data))
+            if let Some(quic) = &sender.quic {
+                if quic.context.retired.load(Ordering::Acquire) {
+                    return Err(io::ErrorKind::WouldBlock.into());
+                }
+                try_queue(&sender.outgoing, quic.context.queue_limit(peer), || {
+                    (packet.to_vec(), data)
+                })
                 .map_err(|_| io::Error::from(io::ErrorKind::WouldBlock))?;
+            } else {
+                sender
+                    .outgoing
+                    .try_send((packet.to_vec(), data))
+                    .map_err(|_| io::Error::from(io::ErrorKind::WouldBlock))?;
+            }
             return Ok(packet.len());
         }
         if stateful {
@@ -924,68 +2335,6 @@ impl MaskSocket {
         Ok(sent)
     }
 
-    pub fn finish_initial(&self, peer: SocketAddr) -> Result<()> {
-        let Entry::Occupied(mut entry) = self.admissions.entry(peer) else {
-            return Ok(());
-        };
-        if !entry.get().authenticated {
-            entry.remove();
-            return Ok(());
-        }
-        let Some(engine) = entry.get_mut().engine.take() else {
-            return Ok(());
-        };
-        let (sender, receiver) = mpsc::channel(QUEUE);
-        let (outgoing, outgoing_rx) = mpsc::channel(QUEUE);
-        // Один слот является верхней границей памяти и числа таймеров.
-        let generation = outgoing.downgrade();
-        let ready = Arc::new(AtomicBool::new(false));
-        self.peers.insert(
-            peer,
-            Peer {
-                ready: ready.clone(),
-                rtc: None,
-                bootstrap: QuicMask::bootstrap(&entry.get().first)
-                    .expect("Initial уже проверен")
-                    .to_vec(),
-                incoming: sender,
-                outgoing,
-            },
-        );
-        let admission = entry.remove();
-        let raw = self.raw.clone();
-        let reply_sources = self.reply_sources.clone();
-        let peers = self.peers.clone();
-        let decoded = self.decoded.clone();
-        let observer = self.wire_observer.clone();
-        tokio::spawn(async move {
-            let _permit = admission.permit;
-            if let Err(error) = drive(
-                MaskEngine::Quic(engine),
-                raw,
-                reply_sources,
-                receiver,
-                outgoing_rx,
-                decoded,
-                peer,
-                admission.replies,
-                admission.owner,
-                ready,
-                observer,
-            )
-            .await
-            {
-                tracing::debug!("Движок маски завершен: {}", error);
-            }
-            peers.remove_if(&peer, |_, current| {
-                generation
-                    .upgrade()
-                    .is_some_and(|old| current.outgoing.same_channel(&old))
-            });
-        });
-        Ok(())
-    }
-
     pub fn is_stateful(&self, peer: SocketAddr) -> bool {
         self.peers.contains_key(&peer)
     }
@@ -1004,14 +2353,17 @@ async fn drive(
     reply_sources: Arc<crate::udp_source::ReplySources>,
     mut incoming: mpsc::Receiver<Vec<u8>>,
     mut outgoing: mpsc::Receiver<(Vec<u8>, bool)>,
-    decoded: mpsc::Sender<(Vec<u8>, SocketAddr, bool)>,
+    decoded: mpsc::Sender<DecodedPacket>,
     peer: SocketAddr,
     replies: VecDeque<Vec<u8>>,
     owner: Option<SessionOwner>,
     ready: Arc<AtomicBool>,
     observer: Option<WireObserver>,
+    context: Option<QuicContext>,
 ) -> Result<()> {
     let quic = matches!(engine, MaskEngine::Quic(_));
+    let pending_deadline = Instant::now() + PENDING_TIMEOUT;
+    let mut preauth_payloads = 0usize;
     if observer.is_some() {
         engine.observe_verified_wire();
     }
@@ -1023,7 +2375,28 @@ async fn drive(
     let mut lease_check = tokio::time::interval(std::time::Duration::from_secs(1));
     lease_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
-        let output = engine.poll(Instant::now())?;
+        let now = Instant::now();
+        let owner = context
+            .as_ref()
+            .and_then(QuicContext::owner)
+            .or_else(|| owner.clone());
+        if context
+            .as_ref()
+            .is_some_and(|context| context.retired.load(Ordering::Acquire))
+            || (context.is_some() && owner.is_none() && now >= pending_deadline)
+        {
+            break;
+        }
+        let output = match &context {
+            Some(context) => context.protocol_work(|| engine.poll(now))?,
+            None => Some(engine.poll(now)?),
+        };
+        let budget_blocked = output.is_none();
+        let output = output.unwrap_or_else(|| QuicMaskOutput {
+            wire: Vec::new(),
+            payloads: Vec::new(),
+            connected: ready.load(Ordering::Acquire),
+        });
         let verified = engine.take_verified_wire();
         if !verified.is_empty() {
             if let (Some(observer), Some(owner)) =
@@ -1039,8 +2412,16 @@ async fn drive(
         }
         ready.store(output.connected, Ordering::Release);
         for packet in output.wire {
-            if let Err(error) =
-                crate::udp_source::send_to(&raw, &reply_sources, &packet, peer).await
+            if let Err(error) = crate::udp_source::send_from(
+                &raw,
+                &packet,
+                peer,
+                context
+                    .as_ref()
+                    .and_then(|context| context.local)
+                    .or_else(|| reply_sources.get(peer)),
+            )
+            .await
             {
                 if quic && aivpn_common::quic_mask::mtu_probe_error(&error, packet.len()) {
                     continue;
@@ -1062,13 +2443,35 @@ async fn drive(
             }
         }
         for payload in output.payloads {
-            if decoded.try_send((payload, peer, quic)).is_err() && decoded.is_closed() {
+            if context.is_some() && owner.is_none() {
+                if preauth_payloads >= 8 {
+                    continue;
+                }
+                preauth_payloads += 1;
+            }
+            if decoded
+                .try_send(DecodedPacket {
+                    payload,
+                    peer,
+                    quic,
+                    context: context.clone(),
+                })
+                .is_err()
+                && decoded.is_closed()
+            {
                 return Ok(());
             }
         }
-        let deadline = engine.deadline();
+        let deadline = if budget_blocked {
+            Some(now + std::time::Duration::from_millis(10))
+        } else {
+            engine.deadline()
+        }
+        .into_iter()
+        .chain((context.is_some() && owner.is_none()).then_some(pending_deadline))
+        .min();
         tokio::select! {
-            _ = lease_check.tick(), if owner.is_some() => {
+            _ = lease_check.tick(), if owner.is_some() || context.is_some() => {
                 if owner.as_ref().is_some_and(|owner| owner.upgrade().is_none_or(|session| session.lock().is_removed())) {
                     break;
                 }
@@ -1077,7 +2480,11 @@ async fn drive(
                 Some(packet) => {
                     // Отдельные очереди RX и TX необходимы: входящий пакет
                     // никогда не должен трактоваться как исходящий payload.
-                    engine.receive(&packet, peer, Instant::now())?;
+                    if let Some(context) = &context {
+                        context.protocol_work(|| engine.receive(&packet, peer, Instant::now()))?;
+                    } else {
+                        engine.receive(&packet, peer, Instant::now())?;
+                    }
                 }
                 None => break,
             },
@@ -1099,8 +2506,24 @@ async fn drive(
             } => {}
         }
     }
-    for packet in engine.close(Instant::now())? {
-        let _ = crate::udp_source::send_to(&raw, &reply_sources, &packet, peer).await;
+    let closing = match &context {
+        Some(context) if context.retired.load(Ordering::Acquire) => Vec::new(),
+        Some(context) => context
+            .protocol_work(|| engine.close(Instant::now()))?
+            .unwrap_or_default(),
+        None => engine.close(Instant::now())?,
+    };
+    for packet in closing {
+        let _ = crate::udp_source::send_from(
+            &raw,
+            &packet,
+            peer,
+            context
+                .as_ref()
+                .and_then(|context| context.local)
+                .or_else(|| reply_sources.get(peer)),
+        )
+        .await;
     }
     Ok(())
 }

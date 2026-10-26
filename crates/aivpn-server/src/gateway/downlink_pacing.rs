@@ -77,6 +77,7 @@ impl ProfileKey {
 #[derive(Clone, Copy)]
 enum DelayMode {
     Adaptive,
+    Native,
     Profile,
     Light,
     Immediate,
@@ -200,6 +201,7 @@ impl DownlinkPacer {
         level: ShapingLevel,
     ) -> bool {
         let mode = match level {
+            ShapingLevel::Adaptive if aivpn_common::mask_io::needs_state(mask) => DelayMode::Native,
             ShapingLevel::Adaptive => DelayMode::Adaptive,
             ShapingLevel::Full => DelayMode::Profile,
             ShapingLevel::Light => DelayMode::Light,
@@ -293,21 +295,21 @@ impl DownlinkPacer {
             if let Some(head) = stream.head.take() {
                 stream.last_sent = Some(now);
                 stream.last_use = now;
+                stream.pacer.sent(now.into_std());
                 let queue_wait = stream
                     .fifo
                     .oldest(|pending| pending.queued_at)
                     .map(|at| now.saturating_duration_since(at))
                     .unwrap_or_default();
                 let next_deadline = if let Some(pending) = stream.fifo.pop() {
-                    let (target_size, delay, padding_override) = sample_shape(
+                    let (target_size, next_deadline, padding_override) = sample_shape(
                         &mut stream.engine,
                         &mut stream.pacer,
                         pending.mode,
                         queue_wait,
                         now,
+                        Some(now),
                     );
-                    // Срок следующего пакета считается от now, а не от старого срока.
-                    let next_deadline = saturate_add(now, delay);
                     stream.head = Some(Head {
                         packet: pending.packet,
                         target_size,
@@ -418,15 +420,14 @@ impl DownlinkPacer {
                 .expect("stream exists before push");
             stream.last_use = now;
             if stream.head.is_none() {
-                let (target_size, delay, padding_override) = sample_shape(
+                let (target_size, deadline, padding_override) = sample_shape(
                     &mut stream.engine,
                     &mut stream.pacer,
                     mode,
                     Duration::ZERO,
                     now,
+                    stream.last_sent,
                 );
-                let anchor = stream.last_sent.unwrap_or(now);
-                let deadline = max_instant(now, saturate_add(anchor, delay));
                 Placement::Head {
                     packet,
                     target_size,
@@ -508,17 +509,30 @@ fn sample_shape(
     mode: DelayMode,
     queue_wait: Duration,
     now: Instant,
-) -> (u16, Duration, Option<PaddingStrategy>) {
+    last_sent: Option<Instant>,
+) -> (u16, Instant, Option<PaddingStrategy>) {
     let (size, delay) = engine.take_data_shape();
     let padding_override = engine.padding_override().cloned();
     engine.update_fsm();
-    let delay = match mode {
-        DelayMode::Adaptive => pacer.delay(delay, queue_wait, now.into_std()),
-        DelayMode::Profile => delay,
-        DelayMode::Light => delay.min(LIGHT_MAX_DELAY),
-        DelayMode::Immediate => Duration::ZERO,
+    let anchor = last_sent.unwrap_or(now);
+    if !matches!(mode, DelayMode::Adaptive) {
+        pacer.reset();
+    }
+    let deadline = match mode {
+        DelayMode::Adaptive => pacer
+            .schedule(
+                delay,
+                queue_wait,
+                now.into_std(),
+                last_sent.map(Instant::into_std),
+            )
+            .into(),
+        DelayMode::Profile => max_instant(now, saturate_add(anchor, delay)),
+        DelayMode::Light => max_instant(now, saturate_add(anchor, delay.min(LIGHT_MAX_DELAY))),
+        DelayMode::Immediate => now,
+        DelayMode::Native => now,
     };
-    (size, delay, padding_override)
+    (size, deadline, padding_override)
 }
 
 fn saturate_add(base: Instant, delay: Duration) -> Instant {
@@ -728,6 +742,86 @@ mod tests {
             Some(PaddingStrategy::Fixed { size: 17 })
         );
         assert!(second.matches_profile(&mask));
+    }
+
+    #[test]
+    fn adaptive_downlink_groups_fast_packets_on_a_millisecond_clock() {
+        let start = Instant::now();
+        let mask = profile("bulk", 1, 1, 1200, 30.0);
+        let session = sid_at(9);
+        let mut pacer = DownlinkPacer::new();
+        for sequence in 0..MAX_PACKETS_PER_SESSION {
+            assert!(pacer.enqueue_shaped(
+                session,
+                &mask,
+                vec![sequence as u8],
+                start,
+                ShapingLevel::Adaptive
+            ));
+        }
+        let mut sent = Vec::new();
+        let mut batch_at = start;
+        let mut batch_size = 0;
+        for sequence in 0..2048 {
+            let deadline = pacer.next_deadline().unwrap();
+            let elapsed = deadline.saturating_duration_since(start);
+            let ticks = elapsed.as_nanos().div_ceil(1_000_000) as u64;
+            let now = start + Duration::from_millis(ticks);
+            let packet = pacer.pop_ready(now).unwrap();
+            assert_eq!(packet.packet, vec![sequence as u8]);
+            if now != batch_at {
+                batch_at = now;
+                batch_size = 0;
+            }
+            batch_size += 1;
+            assert!(batch_size <= 64, "Отправлено {batch_size} пакетов за квант");
+            sent.push(now);
+            assert!(pacer.enqueue_shaped(
+                session,
+                &mask,
+                vec![(sequence + MAX_PACKETS_PER_SESSION) as u8],
+                now,
+                ShapingLevel::Adaptive
+            ));
+        }
+        assert!(
+            sent[2047] - sent[1792] < Duration::from_millis(50),
+            "Отправка по одному пакету за тик ограничивает пропускную способность"
+        );
+    }
+
+    #[test]
+    fn adaptive_quic_does_not_add_an_ip_timer_before_native_pacing() {
+        let now = Instant::now();
+        let mut mask = profile("native", 1, 1, 1200, 50.0);
+        mask.spoof_protocol = SpoofProtocol::QUIC;
+        let mut adaptive = DownlinkPacer::new();
+        let mut strict = DownlinkPacer::new();
+        for sequence in 0..MAX_PACKETS_PER_SESSION {
+            assert!(adaptive.enqueue_shaped(
+                sid_at(1),
+                &mask,
+                vec![sequence as u8],
+                now,
+                ShapingLevel::Adaptive
+            ));
+            assert!(strict.enqueue_shaped(
+                sid_at(1),
+                &mask,
+                vec![sequence as u8],
+                now,
+                ShapingLevel::Full
+            ));
+        }
+        assert_eq!(strict.next_deadline(), Some(now + sampled_delay(50.0)));
+        for sequence in 0..MAX_PACKETS_PER_SESSION {
+            assert_eq!(
+                adaptive.pop_ready(now).unwrap().packet,
+                vec![sequence as u8]
+            );
+        }
+        assert!(adaptive.is_empty());
+        assert!(strict.pop_ready(now).is_none());
     }
 
     #[test]

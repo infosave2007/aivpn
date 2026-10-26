@@ -25,7 +25,6 @@ use aivpn_server::qos::QosEnforcer;
 use aivpn_server::server_config::ServerFileConfig;
 use aivpn_server::site_sync::SiteToSiteConfig;
 use aivpn_server::{AivpnServer, ClientDatabase, ServerArgs};
-use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tracing::{error, info};
@@ -144,13 +143,7 @@ pub async fn run_server(
     client_db: Arc<ClientDatabase>,
 ) {
     // Initialize logging (only for server mode)
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("aivpn_server=debug".parse().unwrap())
-                .add_directive("aivpn_common=debug".parse().unwrap()),
-        )
-        .init();
+    aivpn_server::server::init_logging_with_level(args.log_level.as_deref());
 
     info!("AIVPN Server v{}", env!("CARGO_PKG_VERSION"));
     info!("Starting server...");
@@ -241,16 +234,9 @@ pub async fn run_server(
     // `GatewayConfig::audit_log_path` further down, which feed the in-tunnel
     // `MgmtRequest` dispatch path (`mgmt_service` is unconditional — only
     // the Unix-socket REST `management_api` is behind the feature gate).
-    let mgmt_server_addr = args.server_ip.as_ref().map(|ip| {
-        if ip.parse::<SocketAddr>().is_ok() {
-            ip.clone()
-        } else {
-            let port = listen_addr
-                .parse::<SocketAddr>()
-                .map(|a| a.port())
-                .unwrap_or(443);
-            format!("{}:{}", ip, port)
-        }
+    let mgmt_server_addr = args.server_ip.as_ref().map(|endpoint| {
+        aivpn_server::server_config::normalize_public_endpoint(endpoint, &listen_addr)
+            .expect("server_ip проверен при загрузке конфигурации")
     });
     #[cfg(all(feature = "management-api", unix))]
     let mgmt_config_path = config_path.as_ref().map(std::path::PathBuf::from);
@@ -279,7 +265,13 @@ pub async fn run_server(
 
     // Build structured event bus (stdout JSONL sink + optional webhook forwarder,
     // the latter from `AIVPN_EVENT_WEBHOOK` — see `install_webhook_forwarder`).
-    let event_bus = EventBus::new(EventSinkConfig::from_env());
+    let event_bus = EventBus::new(EventSinkConfig {
+        stdout: file_config
+            .as_ref()
+            .and_then(|c| c.event_stdout)
+            .unwrap_or(true),
+        webhook_url: file_config.as_ref().and_then(|c| c.event_webhook.clone()),
+    });
     install_webhook_forwarder(&event_bus);
 
     // Audit logger
@@ -312,19 +304,8 @@ pub async fn run_server(
     // Pool sync — start listener + outbound tasks if pool is configured.
     // An EXPLICITLY passed --pool-config must hard-fail on read/parse errors:
     // silently falling back used to disable pool sync on a simple typo.
-    let pool_sync_config: Option<PoolSyncConfig> = match args.pool_config.as_deref() {
-        Some(p) => {
-            let content = std::fs::read_to_string(p).unwrap_or_else(|e| {
-                eprintln!("Failed to read pool config '{}': {}", p, e);
-                std::process::exit(1);
-            });
-            Some(serde_json::from_str(&content).unwrap_or_else(|e| {
-                eprintln!("Failed to parse pool config '{}': {}", p, e);
-                std::process::exit(1);
-            }))
-        }
-        None => file_config.as_ref().and_then(|c| c.pool.clone()),
-    };
+    let pool_sync_config: Option<PoolSyncConfig> =
+        file_config.as_ref().and_then(|c| c.pool.clone());
 
     // Wave B-IP: confine this node to a hard, disjoint VPN-IP partition so
     // independent adds on different pool nodes can never collide (see
@@ -402,13 +383,21 @@ pub async fn run_server(
     let config = GatewayConfig {
         listen_addr,
         per_ip_pps_limit: args.per_ip_pps_limit,
+        per_ip_authenticated_pps_limit: args.per_ip_authenticated_pps_limit,
         tun_name,
         tun_addr: network_config.server_ip_string(),
         tun_netmask: network_config.netmask_string(),
         network_config,
         server_private_key,
         signing_key: [0u8; 64],
-        enable_nat: true,
+        enable_nat: file_config
+            .as_ref()
+            .and_then(|c| c.enable_nat)
+            .unwrap_or(true),
+        kernel_downlink: file_config
+            .as_ref()
+            .and_then(|c| c.kernel_downlink)
+            .unwrap_or(false),
         // Neural Resonance (+ inline ML-DPI gate) on unless server.json
         // explicitly sets "neural_enabled": false.
         enable_neural: file_config
@@ -429,15 +418,11 @@ pub async fn run_server(
         event_bus: event_bus.clone(),
         qos_enforcer,
         mtls: file_config.as_ref().and_then(|c| c.mtls.clone()),
-        exit_node_enabled: file_config
+        exit_node_enabled: pool_sync_config
             .as_ref()
-            .and_then(|c| c.pool.as_ref())
             .is_some_and(|p| p.exit_node_enabled.unwrap_or(false)),
         audit_log: audit_logger, // H-S-8: wire audit logger into gateway
-        allow_peer_routing: file_config
-            .as_ref()
-            .and_then(|c| c.allow_peer_routing)
-            .unwrap_or(args.allow_peer_routing),
+        allow_peer_routing: args.allow_peer_routing,
         feedback_report_failure_threshold: file_config
             .as_ref()
             .and_then(|c| c.feedback.as_ref())

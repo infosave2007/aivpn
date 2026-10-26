@@ -68,6 +68,7 @@ jobs:
         python3 deploy/ci/test-tc-loader.py
         python3 deploy/ci/test-build-packaging.py
         python3 deploy/ci/test-mikrotik-entrypoint.py
+        python3 deploy/ci/test-server-entrypoint.py
         python3 deploy/ci/test-openwrt-init.py
         python3 deploy/ci/test-macos-admin-ipc.py
 

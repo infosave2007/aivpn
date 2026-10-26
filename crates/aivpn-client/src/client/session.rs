@@ -1,6 +1,265 @@
 use super::*;
 
 #[cfg(test)]
+mod rekey_counter_tests {
+    use super::*;
+
+    fn client() -> AivpnClient {
+        AivpnClient::new(ClientConfig {
+            server_addr: "127.0.0.1:443".into(),
+            server_public_key: [0; 32],
+            server_signing_key: None,
+            preshared_key: None,
+            initial_mask: aivpn_common::mask::preset_masks::bootstrap_default(),
+            tun_config: TunnelConfig::default(),
+            proxy_listen: None,
+            proxy_dns: Vec::new(),
+            mtls_cert: None,
+            initial_adaptive_level: AdaptiveLevel::Off,
+            polymorphic_base: None,
+            share_mask_feedback: false,
+            receive_mask_hints: false,
+            country_code: None,
+            mask_operator_pubkey: None,
+            mask_verify_mode: Default::default(),
+            network_change_notify: None,
+            is_bootstrap_fallback: false,
+            control_only: true,
+            inbound_control_tap: None,
+            node_identity: None,
+            pool_node_id: None,
+            remote_verified_node: None,
+            remote_enroll_hook: None,
+            transport: None,
+        })
+        .unwrap()
+    }
+
+    fn packet(keys: &SessionKeys, mut counter: u64, mdh_len: usize) -> Vec<u8> {
+        let mut downlink = keys.clone();
+        downlink.session_key = keys.session_key_s2c;
+        aivpn_common::client_wire::build_random_mdh_packet(
+            &downlink,
+            &mut counter,
+            &build_inner_packet(InnerType::Data, 0, &[0x45; 20]),
+            None,
+            mdh_len,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn authenticated_data_cache_write_waits_for_cache_test_guard() {
+        use crate::bootstrap_cache::{LAST_GOOD_MASK, STICKY_MASK_TEST_LOCK};
+        use std::sync::mpsc as sync_mpsc;
+
+        let guard = STICKY_MASK_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let previous = LAST_GOOD_MASK.lock().unwrap().take();
+        let (ready_tx, ready_rx) = sync_mpsc::channel();
+        let (done_tx, done_rx) = sync_mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            let mut client = client();
+            let keys = crypto::derive_session_keys(&[27; 32], None, &[28; 32]);
+            client.session_keys = Some(keys.clone());
+            let data = packet(&keys, 0, client.recv_mdh_len);
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            ready_tx.send(()).unwrap();
+            runtime
+                .block_on(client.receive_and_write_packet(&data))
+                .unwrap();
+            done_tx.send(client.data_plane_proven).unwrap();
+        });
+        ready_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let early = done_rx.recv_timeout(Duration::from_millis(100));
+        drop(guard);
+        let isolated = matches!(early, Err(sync_mpsc::RecvTimeoutError::Timeout));
+        let proven =
+            early.unwrap_or_else(|_| done_rx.recv_timeout(Duration::from_secs(2)).unwrap());
+        writer.join().unwrap();
+        let _guard = STICKY_MASK_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        *LAST_GOOD_MASK.lock().unwrap() = previous;
+        assert!(proven, "Проверяется настоящий аутентифицированный DATA");
+        assert!(
+            isolated,
+            "DATA другой fixture не должен менять кеш во время проверки stall"
+        );
+    }
+
+    async fn staged_rekey() -> (AivpnClient, SessionKeys) {
+        let mut client = client();
+        let old_keys = crypto::derive_session_keys(&[7; 32], None, &[8; 32]);
+        client.session_keys = Some(old_keys.clone());
+        client
+            .receive_and_write_packet(&packet(&old_keys, 1000, client.recv_mdh_len))
+            .await
+            .unwrap();
+        let (tx, mut rx) = mpsc::channel(4);
+        client.control_tx = Some(tx);
+        let upload = Arc::new(Mutex::new(UploadCryptoState {
+            keys: old_keys.clone(),
+            counter: 1001,
+            seq: 0,
+            rekey_ack: VecDeque::new(),
+        }));
+        client.upload_state = Some(upload.clone());
+        let sender = tokio::spawn(async move {
+            assert!(matches!(
+                rx.recv().await,
+                Some(ControlPayload::KeyRotate { .. })
+            ));
+            upload
+                .lock()
+                .unwrap()
+                .rekey_ack
+                .pop_front()
+                .unwrap()
+                .send(())
+                .unwrap();
+        });
+        client
+            .handle_server_control(ControlPayload::KeyRotate {
+                new_eph_pub: KeyPair::generate().public_key_bytes(),
+            })
+            .await
+            .unwrap();
+        sender.await.unwrap();
+        assert!(client.pending_upload_keys.is_some());
+        (client, old_keys)
+    }
+
+    #[tokio::test]
+    async fn inline_rekey_tracks_more_than_512_authenticated_old_packets() {
+        let (mut client, old_keys) = staged_rekey().await;
+        for counter in 1001..=1700 {
+            client
+                .receive_and_write_packet(&packet(&old_keys, counter, client.recv_mdh_len))
+                .await
+                .unwrap();
+        }
+        assert_eq!(client.transition_recv_window.highest(), Some(1700));
+        assert_eq!(client.recv_window.highest(), Some(1000));
+        let keys = client.session_keys.clone().unwrap();
+        client
+            .receive_and_write_packet(&packet(&keys, 1701, client.recv_mdh_len))
+            .await
+            .expect("Новая эпоха должна видеть общий счетчик после старой очереди");
+        assert_eq!(client.recv_window.highest(), Some(1701));
+        assert!(client.pending_upload_keys.is_none());
+    }
+
+    fn can_find(client: &AivpnClient, counter: u64) -> bool {
+        let keys = client.session_keys.as_ref().unwrap();
+        let tag = crypto::generate_resonance_tag(
+            &keys.tag_secret,
+            counter,
+            crypto::compute_time_window(crypto::current_timestamp_ms(), crypto::DEFAULT_WINDOW_MS),
+        );
+        client.recv_window.find_counter(&tag, keys) == Some(counter)
+    }
+
+    #[tokio::test]
+    async fn inline_rekey_tamper_foreign_epoch_and_old_replay_do_not_advance_search() {
+        let (mut client, old_keys) = staged_rekey().await;
+        let foreign = crypto::derive_session_keys(&[17; 32], None, &[18; 32]);
+        assert!(client
+            .receive_and_write_packet(&packet(&foreign, 1200, client.recv_mdh_len))
+            .await
+            .is_err());
+        let valid = packet(&old_keys, 1200, client.recv_mdh_len);
+        let mut corrupt = valid.clone();
+        *corrupt.last_mut().unwrap() ^= 1;
+        assert!(client.receive_and_write_packet(&corrupt).await.is_err());
+        assert!(!can_find(&client, 1600));
+        assert_eq!(client.recv_window.highest(), Some(1000));
+        assert_eq!(client.transition_recv_window.highest(), Some(1000));
+
+        client.receive_and_write_packet(&valid).await.unwrap();
+        assert!(can_find(&client, 1600));
+        assert_eq!(client.recv_window.highest(), Some(1000));
+        assert!(client.receive_and_write_packet(&valid).await.is_err());
+        assert!(client.pending_upload_keys.is_some());
+        let keys = client.session_keys.clone().unwrap();
+        // Hint старой эпохи не расходует тот же counter у нового ключа.
+        let committed = packet(&keys, 1200, client.recv_mdh_len);
+        client.receive_and_write_packet(&committed).await.unwrap();
+        assert!(client.receive_and_write_packet(&committed).await.is_err());
+        assert!(client.receive_and_write_packet(&valid).await.is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn inline_rekey_kernel_rejection_does_not_advance_search() {
+        let (mut client, old_keys) = staged_rekey().await;
+        // Привязанное окно без доступного claim закрывает пакет тем же
+        // условием, что и отказ replay_claim. Модуль ядра тест не загружает.
+        client.kernel_replay_bound = true;
+        client.kernel_prev_epoch = 1;
+        client.kernel_accel = None;
+        let rejected = packet(&old_keys, 1200, client.recv_mdh_len);
+        client.receive_and_write_packet(&rejected).await.unwrap();
+        assert_eq!(client.transition_recv_window.highest(), Some(1200));
+        assert_eq!(client.recv_window.highest(), Some(1000));
+        assert!(!can_find(&client, 1600));
+        assert!(client.pending_upload_keys.is_some());
+        // Отказ ядра не разрешает повтор уже проверенного старого пакета.
+        client.kernel_replay_bound = false;
+        assert!(client.receive_and_write_packet(&rejected).await.is_err());
+        assert!(!can_find(&client, 1600));
+    }
+
+    #[tokio::test]
+    async fn initial_pfs_transition_does_not_lend_its_old_counter() {
+        let mut client = client();
+        let old_keys = crypto::derive_session_keys(&[7; 32], None, &[8; 32]);
+        client.session_keys = Some(crypto::derive_session_keys(&[9; 32], None, &[10; 32]));
+        client.transition_recv_keys = Some(old_keys.clone());
+        client.transition_recv_deadline = Some(Instant::now() + Duration::from_secs(2));
+        client.transition_recv_window.mark(1000);
+        assert!(client.pending_upload_keys.is_none());
+        client
+            .receive_and_write_packet(&packet(&old_keys, 1001, client.recv_mdh_len))
+            .await
+            .unwrap();
+        assert_eq!(client.recv_window.highest(), None);
+        assert!(!can_find(&client, 1513));
+        let keys = client.session_keys.clone().unwrap();
+        client
+            .receive_and_write_packet(&packet(&keys, 0, client.recv_mdh_len))
+            .await
+            .unwrap();
+        assert_eq!(client.recv_window.highest(), Some(0));
+    }
+
+    #[tokio::test]
+    async fn inline_rekey_expiry_preserves_authenticated_search_cursor() {
+        let (mut client, old_keys) = staged_rekey().await;
+        for counter in 1001..=1700 {
+            client
+                .receive_and_write_packet(&packet(&old_keys, counter, client.recv_mdh_len))
+                .await
+                .unwrap();
+        }
+        assert_eq!(client.recv_window.highest(), Some(1000));
+        client.transition_recv_deadline = Some(Instant::now() - Duration::from_secs(1));
+        let keys = client.session_keys.clone().unwrap();
+        client
+            .receive_and_write_packet(&packet(&keys, 1701, client.recv_mdh_len))
+            .await
+            .expect("Истечение fallback не должно терять подтвержденный счетчик");
+        assert_eq!(client.recv_window.highest(), Some(1701));
+        assert!(client.pending_upload_keys.is_none());
+        assert!(client.transition_recv_keys.is_none());
+    }
+}
+
+#[cfg(test)]
 mod initial_upload_tests {
     use super::*;
 
@@ -573,6 +832,7 @@ impl super::AivpnClient {
             tokio::select! {
                 // Allow fast shutdown.
                 _ = shutdown_tick.tick() => {
+                    self.refresh_tx_fec_at(Instant::now());
                     if shutdown.load(Ordering::SeqCst) {
                         info!("Shutdown requested");
                         stats_task.abort();
@@ -1202,13 +1462,21 @@ impl super::AivpnClient {
         if let (Some(upload_state), Some(new_keys)) =
             (&self.upload_state, self.pending_upload_keys.take())
         {
-            upload_state.lock().unwrap_or_else(|e| e.into_inner()).keys = new_keys;
-            info!("Inline rekey confirmed — upload switched to the committed new keys");
+            let next_counter = {
+                let mut state = upload_state.lock().unwrap_or_else(|e| e.into_inner());
+                state.keys = new_keys;
+                state.counter
+            };
+            info!(
+                "Inline rekey confirmed - upload switched to the committed new keys, next_counter={}",
+                next_counter
+            );
         }
     }
 
     /// Receive packet from server and write to TUN (using pre-computed mdh_len)
     pub(super) async fn receive_and_write_packet(&mut self, packet: &[u8]) -> Result<()> {
+        self.refresh_tx_fec_at(Instant::now());
         if self
             .transition_recv_deadline
             .is_some_and(|deadline| Instant::now() >= deadline)
@@ -1228,6 +1496,7 @@ impl super::AivpnClient {
             .session_keys
             .as_ref()
             .ok_or(Error::Session("No session keys".into()))?;
+        let peer_feedback_allowed = !keys.packet_cipher.is_initial();
 
         // Try every MDH length this session has used, with the current session
         // keys first. The server frames different downlink packets with
@@ -1267,6 +1536,7 @@ impl super::AivpnClient {
                         &mut self.recv_mdh_candidates,
                         &self.recv_tag_offsets,
                     ) {
+                        let peer_feedback_allowed = !fallback_keys.packet_cipher.is_initial();
                         // Старая эпоха есть в ядре только после смены ключа.
                         #[cfg(target_os = "linux")]
                         if self.kernel_replay_bound
@@ -1274,7 +1544,11 @@ impl super::AivpnClient {
                         {
                             return Ok(());
                         }
-                        return self.process_decoded(decoded).await;
+                        if self.pending_upload_keys.is_some() {
+                            self.recv_window
+                                .observe_authenticated_counter(decoded.counter);
+                        }
+                        return self.process_decoded(decoded, peer_feedback_allowed).await;
                     }
                 }
                 return Err(primary_err);
@@ -1282,11 +1556,16 @@ impl super::AivpnClient {
         };
         let (received, span) = self.recv_window.observation_counts();
         self.quality_tracker.record_window(received, span);
-        self.process_decoded(decoded).await
+        self.process_decoded(decoded, peer_feedback_allowed).await
     }
 
     /// Process a successfully decoded packet (shared by primary and fallback paths)
-    async fn process_decoded(&mut self, decoded: DecodedPacket) -> Result<()> {
+    async fn process_decoded(
+        &mut self,
+        decoded: DecodedPacket,
+        peer_feedback_allowed: bool,
+    ) -> Result<()> {
+        let received_counter = decoded.counter;
         // K6: every user-space-validated packet is a fresh observation of the
         // downlink counter (kernel-consumed packets never reach here), so use
         // it to opportunistically re-base the kernel tag window. No-op unless
@@ -1348,6 +1627,10 @@ impl super::AivpnClient {
                     // FIX (Jul 15): remember the mask that just carried real DATA so
                     // AUTO-mode reconnects reuse it instead of re-deriving (and
                     // hopping) from the churning descriptor set.
+                    #[cfg(test)]
+                    let _cache_guard = crate::bootstrap_cache::STICKY_MASK_TEST_LOCK
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner());
                     *crate::bootstrap_cache::LAST_GOOD_MASK
                         .lock()
                         .unwrap_or_else(|e| e.into_inner()) =
@@ -1361,7 +1644,12 @@ impl super::AivpnClient {
             }
             InnerType::Control => {
                 let control = ControlPayload::decode(&ip_payload)?;
-                self.handle_server_control(control).await?;
+                if peer_feedback_allowed {
+                    self.handle_server_control_with_counter(control, received_counter)
+                        .await?;
+                } else {
+                    self.handle_server_control(control).await?;
+                }
             }
             _ => {
                 debug!(

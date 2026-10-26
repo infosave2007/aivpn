@@ -275,6 +275,14 @@ pub fn derive_bootstrap_candidate(
     preshared_key: Option<&[u8; 32]>,
     slot: u8,
 ) -> Option<MaskProfile> {
+    derive_bootstrap_candidate_with_base(descriptor, preshared_key, slot).map(|(_, mask)| mask)
+}
+
+fn derive_bootstrap_candidate_with_base(
+    descriptor: &BootstrapDescriptor,
+    preshared_key: Option<&[u8; 32]>,
+    slot: u8,
+) -> Option<(String, MaskProfile)> {
     let embedded_masks = &descriptor.embedded_masks;
     let base_ids = if descriptor.base_mask_ids.is_empty() && embedded_masks.is_empty() {
         preset_masks::all()
@@ -295,6 +303,11 @@ pub fn derive_bootstrap_candidate(
         base_ids.len()
     };
     let base_index = (seed[0] as usize) % selector_len;
+    let base_id = if !embedded_masks.is_empty() {
+        embedded_masks[base_index].mask_id.clone()
+    } else {
+        base_ids[base_index].clone()
+    };
     let mut mask = if !embedded_masks.is_empty() {
         embedded_masks[base_index].clone()
     } else {
@@ -329,7 +342,7 @@ pub fn derive_bootstrap_candidate(
         seed[0],
         seed[1]
     );
-    Some(mask)
+    Some((base_id, mask))
 }
 
 pub fn derive_bootstrap_candidates(
@@ -465,6 +478,43 @@ pub fn base_mask_family(mask_id: &str) -> String {
     }
 }
 
+/// Сверяет известную базу и протокол уже принятой маски. Подпись проверяет вызывающий код.
+pub fn mask_matches_preferred_base(mask: &MaskProfile, base_id: &str) -> bool {
+    let Some(base) = preset_masks::by_id(base_id) else {
+        return false;
+    };
+    if mask.spoof_protocol != base.spoof_protocol {
+        return false;
+    }
+    if mask.mask_id == base_id {
+        return true;
+    }
+    if let Some(rest) = mask.mask_id.strip_prefix("polymorphic:") {
+        return rest
+            .strip_prefix(base_id)
+            .is_some_and(|tail| tail.starts_with(':') && tail.len() > 1);
+    }
+    mask.mask_id
+        .strip_prefix("bootstrap:")
+        .is_some_and(|rest| rest.rsplitn(4, ':').nth(2) == Some(base_id))
+}
+
+/// При отсутствии подходящего opening просим сервер выбрать базу после PFS.
+pub fn post_pfs_mask_preference(
+    preferred: Option<&str>,
+    polymorphic_base: Option<&str>,
+    opening: &MaskProfile,
+) -> Option<String> {
+    if let Some(base) = polymorphic_base {
+        return Some(base.to_string());
+    }
+    let preferred = preferred
+        .map(str::trim)
+        .filter(|name| !name.is_empty() && *name != "auto")?;
+    preset_masks::by_id(preferred)?;
+    (!mask_matches_preferred_base(opening, preferred)).then(|| preferred.to_string())
+}
+
 pub fn resolve_handshake_mask(
     preferred: Option<&str>,
     descriptors: &[BootstrapDescriptor],
@@ -473,6 +523,13 @@ pub fn resolve_handshake_mask(
     let pref = preferred
         .map(str::trim)
         .filter(|s| !s.is_empty() && *s != "auto");
+
+    #[cfg(feature = "production-secure")]
+    if let Some(candidate) = pref.and_then(|name| {
+        preferred_bootstrap_candidate_for_attempt(descriptors, preshared_key, name, 0)
+    }) {
+        return candidate;
+    }
 
     // 1. Explicit named preset (user's deliberate mask-picker selection).
     //    production-secure не подменяет уже имеющийся дескриптор неподписанным
@@ -573,6 +630,38 @@ pub fn bootstrap_candidate_for_attempt(
         .or_else(|| derive_bootstrap_candidate(descriptor, preshared_key, first_slot))
 }
 
+/// Выбирает только исходные slots нужной базы из уже проверенного каталога.
+pub fn preferred_bootstrap_candidate_for_attempt(
+    descriptors: &[BootstrapDescriptor],
+    preshared_key: Option<&[u8; 32]>,
+    preferred_base: &str,
+    fail_streak: u32,
+) -> Option<MaskProfile> {
+    let preferred_base = preferred_base.trim();
+    let protocol = preset_masks::by_id(preferred_base)?.spoof_protocol;
+    let now = current_unix_secs();
+    let groups: Vec<Vec<MaskProfile>> = descriptors
+        .iter()
+        .filter(|descriptor| descriptor.is_valid_at(now))
+        .map(|descriptor| {
+            (0..descriptor.candidate_count)
+                .filter_map(|slot| {
+                    derive_bootstrap_candidate_with_base(descriptor, preshared_key, slot)
+                })
+                .filter(|(base, mask)| base == preferred_base && mask.spoof_protocol == protocol)
+                .map(|(_, mask)| mask)
+                .collect::<Vec<_>>()
+        })
+        .filter(|candidates| !candidates.is_empty())
+        .collect();
+    if groups.is_empty() {
+        return None;
+    }
+    let round = (fail_streak / HANDSHAKE_FALLBACK_THRESHOLD) as usize;
+    let candidates = &groups[round % groups.len()];
+    Some(candidates[(round / groups.len()) % candidates.len()].clone())
+}
+
 /// После неудач защищенная сборка меняет доверенный кандидат, обычная допускает пресет.
 pub fn resolve_handshake_mask_resilient(
     preferred: Option<&str>,
@@ -584,6 +673,11 @@ pub fn resolve_handshake_mask_resilient(
     // серии неудачных рукопожатий. Доступность здесь не важнее подписи.
     #[cfg(feature = "production-secure")]
     {
+        if let Some(candidate) = preferred.and_then(|name| {
+            preferred_bootstrap_candidate_for_attempt(descriptors, preshared_key, name, fail_streak)
+        }) {
+            return candidate;
+        }
         if fail_streak >= HANDSHAKE_FALLBACK_THRESHOLD {
             if let Some(candidate) =
                 bootstrap_candidate_for_attempt(descriptors, preshared_key, fail_streak)
@@ -3585,5 +3679,205 @@ mod signed_candidate_rotation_tests {
             .unwrap()
             .mask_id
             .starts_with("bootstrap:old:"));
+    }
+}
+
+#[cfg(all(test, feature = "production-secure"))]
+mod preferred_reconnect_tests {
+    use super::*;
+    use ed25519_dalek::Signer;
+
+    fn descriptor(embedded: bool) -> (BootstrapDescriptor, [u8; 32]) {
+        let psk = [61; 32];
+        let now = current_unix_secs();
+        let mut quic = preset_masks::quic_https_v2();
+        quic.iat_distribution.params = vec![777.0];
+        let mut descriptor = BootstrapDescriptor {
+            descriptor_id: "preferred-test".into(),
+            version: 1,
+            created_at: now - 1,
+            expires_at: now + 3600,
+            base_mask_ids: if embedded {
+                vec![]
+            } else {
+                vec!["webrtc_zoom_v3".into(), "quic_https_v2".into()]
+            },
+            embedded_masks: if embedded {
+                vec![preset_masks::webrtc_zoom_v3(), quic]
+            } else {
+                vec![]
+            },
+            candidate_count: 4,
+            kdf_salt: [0; 32],
+            signature: [0; 64],
+        };
+        let found = (0..=255u8).any(|seed| {
+            descriptor.kdf_salt = [seed; 32];
+            let candidates = derive_bootstrap_candidates(&descriptor, Some(&psk));
+            candidates[0].spoof_protocol != SpoofProtocol::QUIC
+                && candidates
+                    .iter()
+                    .any(|mask| mask.spoof_protocol == SpoofProtocol::QUIC)
+        });
+        assert!(
+            found,
+            "Fixture должна содержать RTC slot0 и другой QUIC slot"
+        );
+        let signing = ed25519_dalek::SigningKey::from_bytes(&[62; 32]);
+        descriptor.signature = signing.sign(&descriptor.signing_bytes()).to_bytes();
+        assert!(descriptor
+            .verify_signature(&signing.verifying_key().to_bytes())
+            .unwrap());
+        (descriptor, psk)
+    }
+
+    #[test]
+    fn preferred_reconnect_uses_exact_signed_quic_slots_in_every_round() {
+        for embedded in [false, true] {
+            let (descriptor, psk) = descriptor(embedded);
+            let unchanged = descriptor.signing_bytes();
+            let candidates = derive_bootstrap_candidates(&descriptor, Some(&psk));
+            for attempt in [
+                0,
+                HANDSHAKE_FALLBACK_THRESHOLD - 1,
+                HANDSHAKE_FALLBACK_THRESHOLD,
+                HANDSHAKE_FALLBACK_THRESHOLD * 2,
+                u32::MAX,
+            ] {
+                let selected = resolve_handshake_mask_resilient(
+                    Some("quic_https_v2"),
+                    std::slice::from_ref(&descriptor),
+                    Some(&psk),
+                    attempt,
+                );
+                assert_eq!(
+                    selected.spoof_protocol,
+                    SpoofProtocol::QUIC,
+                    "Preferred теряется: embedded={embedded}, attempt={attempt}"
+                );
+                let selected_bytes = rmp_serde::to_vec(&selected).unwrap();
+                assert!(
+                    candidates
+                        .iter()
+                        .any(|mask| rmp_serde::to_vec(mask).unwrap() == selected_bytes),
+                    "Выбор обязан быть точным исходным signed slot"
+                );
+                assert_eq!(descriptor.signing_bytes(), unchanged);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod preferred_bootstrap_policy_tests {
+    use super::*;
+
+    fn descriptor(mask: MaskProfile) -> BootstrapDescriptor {
+        let now = current_unix_secs();
+        BootstrapDescriptor {
+            descriptor_id: "policy-test".into(),
+            version: 1,
+            created_at: now - 1,
+            expires_at: now + 3600,
+            base_mask_ids: vec!["quic_https_v2".into()],
+            embedded_masks: vec![mask],
+            candidate_count: 4,
+            kdf_salt: [69; 32],
+            signature: [0; 64],
+        }
+    }
+
+    #[test]
+    fn preferred_reconnect_requires_authoritative_base_and_actual_protocol() {
+        let mut mislabeled = preset_masks::webrtc_zoom_v3();
+        mislabeled.mask_id = "quic_https_v2".into();
+        let wrong_protocol = descriptor(mislabeled);
+        assert!(preferred_bootstrap_candidate_for_attempt(
+            &[wrong_protocol],
+            None,
+            "quic_https_v2",
+            0
+        )
+        .is_none());
+        let mut other_base = preset_masks::quic_https_v2();
+        other_base.mask_id = "server-custom-quic".into();
+        assert!(preferred_bootstrap_candidate_for_attempt(
+            &[descriptor(other_base)],
+            None,
+            "quic_https_v2",
+            0
+        )
+        .is_none());
+        let valid = descriptor(preset_masks::quic_https_v2());
+        let selected = preferred_bootstrap_candidate_for_attempt(
+            std::slice::from_ref(&valid),
+            None,
+            " quic_https_v2 ",
+            u32::MAX,
+        )
+        .unwrap();
+        assert!(derive_bootstrap_candidates(&valid, None)
+            .iter()
+            .any(|mask| rmp_serde::to_vec(mask).unwrap() == rmp_serde::to_vec(&selected).unwrap()));
+        for count in [0, 1, 255] {
+            let mut bounded = valid.clone();
+            bounded.candidate_count = count;
+            assert_eq!(
+                preferred_bootstrap_candidate_for_attempt(&[bounded], None, "quic_https_v2", 0)
+                    .is_some(),
+                count > 0
+            );
+        }
+        let mut expired = valid.clone();
+        expired.expires_at = current_unix_secs() - 1;
+        assert!(
+            preferred_bootstrap_candidate_for_attempt(&[expired], None, "quic_https_v2", 0)
+                .is_none()
+        );
+        let mut future = valid;
+        future.created_at = current_unix_secs() + 3600;
+        assert!(
+            preferred_bootstrap_candidate_for_attempt(&[future], None, "quic_https_v2", 0)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn preferred_reconnect_requests_missing_base_only_after_trusted_opening() {
+        let rtc = preset_masks::webrtc_zoom_v3();
+        let quic = preset_masks::quic_https_v2();
+        assert_eq!(
+            post_pfs_mask_preference(Some("quic_https_v2"), None, &rtc).as_deref(),
+            Some("quic_https_v2")
+        );
+        assert!(post_pfs_mask_preference(Some("quic_https_v2"), None, &quic).is_none());
+        let derived = derive_bootstrap_candidates(&descriptor(quic), None).remove(0);
+        assert!(post_pfs_mask_preference(Some("quic_https_v2"), None, &derived).is_none());
+        assert_eq!(
+            post_pfs_mask_preference(Some("quic_https_v2"), Some("webrtc_zoom_v3"), &derived)
+                .as_deref(),
+            Some("webrtc_zoom_v3")
+        );
+        for automatic in [None, Some(""), Some("auto"), Some("unknown-base")] {
+            assert!(post_pfs_mask_preference(automatic, None, &rtc).is_none());
+        }
+        let mut wrong = preset_masks::quic_https_v2().to_polymorphic(&[70; 32]);
+        assert!(mask_matches_preferred_base(&wrong, "quic_https_v2"));
+        wrong.mask_id = "polymorphic:quic_https_v2-other:aa".into();
+        assert!(!mask_matches_preferred_base(&wrong, "quic_https_v2"));
+    }
+
+    #[cfg(not(feature = "production-secure"))]
+    #[test]
+    fn preferred_reconnect_keeps_mobile_development_preset_policy() {
+        let descriptors = [descriptor(preset_masks::webrtc_zoom_v3())];
+        let selected = resolve_handshake_mask_resilient(
+            Some("quic_https_v2"),
+            &descriptors,
+            None,
+            HANDSHAKE_FALLBACK_THRESHOLD,
+        );
+        assert_eq!(selected.mask_id, "quic_https_v2");
+        assert!(post_pfs_mask_preference(Some("quic_https_v2"), None, &selected).is_none());
     }
 }

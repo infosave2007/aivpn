@@ -1,8 +1,25 @@
 use super::*;
 
 impl super::AivpnClient {
+    pub(super) async fn handle_server_control_with_counter(
+        &mut self,
+        control: ControlPayload,
+        counter: u64,
+    ) -> Result<()> {
+        self.handle_server_control_observed(control, Some(counter))
+            .await
+    }
+
     /// Handle control messages from server
     pub(super) async fn handle_server_control(&mut self, control: ControlPayload) -> Result<()> {
+        self.handle_server_control_observed(control, None).await
+    }
+
+    async fn handle_server_control_observed(
+        &mut self,
+        control: ControlPayload,
+        received_counter: Option<u64>,
+    ) -> Result<()> {
         match control {
             ControlPayload::MaskState(state) => {
                 if self.ratcheted_server_eph_pub.is_none() {
@@ -92,9 +109,13 @@ impl super::AivpnClient {
                                 );
                             }
                         }
-                        // §3 F: once a polymorphic variant lands, signal the
-                        // MaskPreference retry task to stop resending.
-                        if new_mask.mask_id.starts_with("polymorphic:") {
+                        // Запрос подтверждает только подписанный ответ нужной базы и протокола.
+                        if transport_verified
+                            && new_mask.mask_id.starts_with("polymorphic:")
+                            && self.config.polymorphic_base.as_deref().is_some_and(|base| {
+                                aivpn_common::mask::mask_matches_preferred_base(&new_mask, base)
+                            })
+                        {
                             self.polymorphic_confirmed.store(true, Ordering::Relaxed);
                         }
                         self.update_mask(new_mask);
@@ -399,6 +420,7 @@ impl super::AivpnClient {
                 // REKEY_TRANSITION_HARD_CAP).
                 self.transition_grace_hard = Some(Instant::now() + REKEY_TRANSITION_HARD_CAP);
                 self.transition_recv_window = self.recv_window.clone();
+                self.recv_window.begin_counter_recovery_epoch();
                 self.session_keys = Some(new_keys);
                 self.ratcheted_rekey_eph_pub = Some(new_eph_pub);
                 self.rekey_response_eph = Some(client_rekey_kp.public_key_bytes());
@@ -547,6 +569,8 @@ impl super::AivpnClient {
                     self.pending_upload_keys = None;
                     self.counter = 0;
                     self.recv_window.reset();
+                    self.tx_fec_feedback.reset();
+                    self.refresh_tx_fec_at(Instant::now());
                     if let Some(upload_state) = &self.upload_state {
                         let mut state = upload_state.lock().unwrap_or_else(|e| e.into_inner());
                         if let Some(ref keys) = self.session_keys {
@@ -888,6 +912,17 @@ impl super::AivpnClient {
             ControlPayload::CertRejected {} => {
                 warn!("mTLS: server rejected the certificate — re-provision your mTLS cert");
             }
+            ControlPayload::QualityReport { loss_ppm, .. } => {
+                let now = Instant::now();
+                if self.ratcheted_server_eph_pub.is_some() {
+                    if let Some(counter) = received_counter {
+                        if self.tx_fec_feedback.record(counter, loss_ppm, now) {
+                            debug!(target: "aivpn::receiver_feedback", counter, loss_ppm = loss_ppm.min(1_000_000), fec_group = self.tx_fec_feedback.fec_group(self.adaptive_level, now), "Принят отчет приемника");
+                        }
+                    }
+                }
+                self.refresh_tx_fec_at(now);
+            }
             ControlPayload::KeepaliveAck { echo_ts } => {
                 // Ядро принимает Data без userspace. Его окно включает и эти пакеты.
                 #[cfg(target_os = "linux")]
@@ -936,6 +971,7 @@ impl super::AivpnClient {
                         })
                         .await;
                 }
+                self.refresh_tx_fec_at(Instant::now());
             }
             ControlPayload::AdaptiveHint { level } => {
                 let new_level = AdaptiveLevel::from_u8(level);
@@ -944,6 +980,7 @@ impl super::AivpnClient {
                     self.set_keepalive_interval(Duration::from_secs(new_level.keepalive_secs()));
                     info!("Server adaptive hint → {:?}", new_level);
                 }
+                self.refresh_tx_fec_at(Instant::now());
             }
             ControlPayload::RegionalMaskHints {
                 country_code,
@@ -1110,7 +1147,6 @@ impl super::AivpnClient {
             | ControlPayload::RecordingStatusRequest
             | ControlPayload::ClientCert { .. }
             | ControlPayload::DeviceEnrollment { .. }
-            | ControlPayload::QualityReport { .. }
             | ControlPayload::MaskPreference { .. } => {
                 // Intentionally ignored on the desktop client: these are
                 // messages THIS client only ever SENDS (to the server, or to
@@ -1145,5 +1181,347 @@ impl super::AivpnClient {
             self.send_control(&ControlPayload::MaskState(state)).await?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod preferred_reconnect_tests {
+    use super::*;
+    use aivpn_common::mask::{preset_masks, MaskVerifyMode, SpoofProtocol};
+    use ed25519_dalek::Signer;
+
+    fn client(
+        signing: &ed25519_dalek::SigningKey,
+    ) -> (AivpnClient, mpsc::Receiver<ControlPayload>) {
+        let mut client = AivpnClient::new(ClientConfig {
+            server_addr: "127.0.0.1:443".into(),
+            server_public_key: [0; 32],
+            server_signing_key: Some(signing.verifying_key().to_bytes()),
+            preshared_key: None,
+            initial_mask: preset_masks::webrtc_zoom_v3(),
+            tun_config: TunnelConfig::default(),
+            proxy_listen: None,
+            proxy_dns: vec![],
+            mtls_cert: None,
+            initial_adaptive_level: AdaptiveLevel::Off,
+            polymorphic_base: Some("quic_https_v2".into()),
+            share_mask_feedback: false,
+            receive_mask_hints: false,
+            country_code: None,
+            mask_operator_pubkey: None,
+            mask_verify_mode: MaskVerifyMode::Enforce,
+            network_change_notify: None,
+            is_bootstrap_fallback: false,
+            control_only: true,
+            inbound_control_tap: None,
+            node_identity: None,
+            pool_node_id: None,
+            remote_verified_node: None,
+            remote_enroll_hook: None,
+            transport: None,
+        })
+        .unwrap();
+        let (tx, rx) = mpsc::channel(16);
+        client.control_tx = Some(tx);
+        client.ratcheted_server_eph_pub = Some([66; 32]);
+        (client, rx)
+    }
+
+    fn update(mask: &MaskProfile, signing: &ed25519_dalek::SigningKey) -> ControlPayload {
+        let mask_data = rmp_serde::to_vec(mask).unwrap();
+        let signature = signing.sign(&mask_data).to_bytes();
+        ControlPayload::MaskUpdate {
+            mask_data,
+            signature,
+        }
+    }
+
+    #[tokio::test]
+    async fn preferred_reconnect_confirmation_requires_requested_base_and_protocol() {
+        let signing = ed25519_dalek::SigningKey::from_bytes(&[67; 32]);
+        for wrong_protocol in [false, true] {
+            let (mut client, _rx) = client(&signing);
+            let mut wrong = if wrong_protocol {
+                preset_masks::quic_https_v2().to_polymorphic(&[68; 32])
+            } else {
+                preset_masks::webrtc_zoom_v3().to_polymorphic(&[68; 32])
+            };
+            if wrong_protocol {
+                wrong.spoof_protocol = SpoofProtocol::WebRTC_STUN;
+            }
+            client
+                .handle_server_control(update(&wrong, &signing))
+                .await
+                .unwrap();
+            assert_eq!(
+                client.control_mask.as_ref().unwrap().mask_id,
+                wrong.mask_id,
+                "Поздняя signed ML rotation остается разрешенной"
+            );
+            assert!(
+                !client.polymorphic_confirmed.load(Ordering::Relaxed),
+                "Чужой base/protocol не подтверждает запрошенный QUIC"
+            );
+            let desired = preset_masks::quic_https_v2().to_polymorphic(&[68; 32]);
+            let mut tampered = update(&desired, &signing);
+            if let ControlPayload::MaskUpdate { signature, .. } = &mut tampered {
+                signature[0] ^= 1;
+            }
+            client.handle_server_control(tampered).await.unwrap();
+            assert!(!client.polymorphic_confirmed.load(Ordering::Relaxed));
+            client
+                .handle_server_control(update(&desired, &signing))
+                .await
+                .unwrap();
+            assert!(client.polymorphic_confirmed.load(Ordering::Relaxed));
+            client
+                .handle_server_control(update(&wrong, &signing))
+                .await
+                .unwrap();
+            assert_eq!(client.control_mask.as_ref().unwrap().mask_id, wrong.mask_id);
+            assert!(
+                client.polymorphic_confirmed.load(Ordering::Relaxed),
+                "Поздняя ML rotation не запускает preference заново"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod fec_receiver_feedback_tests {
+    use super::*;
+    use aivpn_common::client_wire::build_random_mdh_packet;
+    use aivpn_common::mask::preset_masks;
+
+    fn client() -> (AivpnClient, mpsc::Receiver<ControlPayload>) {
+        let mut client = AivpnClient::new(ClientConfig {
+            server_addr: "127.0.0.1:443".into(),
+            server_public_key: [0; 32],
+            server_signing_key: None,
+            preshared_key: None,
+            initial_mask: preset_masks::bootstrap_default(),
+            tun_config: TunnelConfig::default(),
+            proxy_listen: None,
+            proxy_dns: vec![],
+            mtls_cert: None,
+            initial_adaptive_level: AdaptiveLevel::Light,
+            polymorphic_base: None,
+            share_mask_feedback: false,
+            receive_mask_hints: false,
+            country_code: None,
+            mask_operator_pubkey: None,
+            mask_verify_mode: Default::default(),
+            network_change_notify: None,
+            is_bootstrap_fallback: false,
+            control_only: true,
+            inbound_control_tap: None,
+            node_identity: None,
+            pool_node_id: None,
+            remote_verified_node: None,
+            remote_enroll_hook: None,
+            transport: None,
+        })
+        .unwrap();
+        let (tx, rx) = mpsc::channel(16);
+        client.control_tx = Some(tx);
+        (client, rx)
+    }
+
+    fn report(loss_ppm: u32) -> ControlPayload {
+        ControlPayload::QualityReport {
+            quality: 0,
+            rtt_ms: u16::MAX,
+            loss_ppm,
+            jitter_ms: u16::MAX,
+        }
+    }
+
+    fn packet(keys: &SessionKeys, mut counter: u64, mdh_len: usize, loss: u32) -> Vec<u8> {
+        let mut downlink = keys.clone();
+        downlink.session_key = keys.session_key_s2c;
+        let inner = build_inner_packet(InnerType::Control, 0, &report(loss).encode().unwrap());
+        build_random_mdh_packet(&downlink, &mut counter, &inner, None, mdh_len).unwrap()
+    }
+
+    #[tokio::test]
+    async fn fec_receiver_client_wire_report_changes_only_tx_and_never_echoes() {
+        let (mut client, mut outgoing) = client();
+        let keys = crypto::derive_session_keys(&[77; 32], None, &[78; 32]);
+        client.session_keys = Some(keys.clone());
+        client.ratcheted_server_eph_pub = Some([79; 32]);
+        client.quality_tracker.record_rtt(15_000);
+        let before = (
+            client.quality_tracker.score(),
+            client.quality_tracker.rtt_ms(),
+            client.quality_tracker.jitter_ms(),
+            client.quality_tracker.loss_ppm(),
+            client.keepalive_interval,
+        );
+        let positive = packet(&keys, 100, client.recv_mdh_len, 25_000);
+        client.receive_and_write_packet(&positive).await.unwrap();
+        assert_eq!(
+            client.fec_group.load(Ordering::Relaxed),
+            8,
+            "Receiver UL loss должен управлять TX FEC"
+        );
+        assert!(client.receive_and_write_packet(&positive).await.is_err());
+        let mut tampered = packet(&keys, 101, client.recv_mdh_len, 0);
+        *tampered.last_mut().unwrap() ^= 1;
+        assert!(client.receive_and_write_packet(&tampered).await.is_err());
+        assert_eq!(client.fec_group.load(Ordering::Relaxed), 8);
+        client
+            .receive_and_write_packet(&packet(&keys, 99, client.recv_mdh_len, 0))
+            .await
+            .unwrap();
+        assert_eq!(
+            client.fec_group.load(Ordering::Relaxed),
+            8,
+            "Поздний clean QR не стирает новый positive"
+        );
+        #[cfg(not(target_os = "linux"))]
+        let clean_counter = 101;
+        #[cfg(target_os = "linux")]
+        let clean_counter = {
+            client.kernel_replay_bound = true;
+            client.kernel_epoch = 1;
+            client.kernel_accel = None;
+            client
+                .receive_and_write_packet(&packet(&keys, 101, client.recv_mdh_len, 0))
+                .await
+                .unwrap();
+            assert_eq!(
+                client.fec_group.load(Ordering::Relaxed),
+                8,
+                "Отказ kernel claim не обновляет peer feedback"
+            );
+            client.kernel_replay_bound = false;
+            client.kernel_epoch = 0;
+            102
+        };
+        client
+            .receive_and_write_packet(&packet(&keys, clean_counter, client.recv_mdh_len, 0))
+            .await
+            .unwrap();
+        assert_eq!(client.fec_group.load(Ordering::Relaxed), 0);
+        client
+            .handle_server_control(ControlPayload::AdaptiveHint {
+                level: AdaptiveLevel::Light as u8,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            client.fec_group.load(Ordering::Relaxed),
+            0,
+            "Тот же level не отменяет свежий receiver report"
+        );
+        assert_eq!(
+            (
+                client.quality_tracker.score(),
+                client.quality_tracker.rtt_ms(),
+                client.quality_tracker.jitter_ms(),
+                client.quality_tracker.loss_ppm(),
+                client.keepalive_interval
+            ),
+            before
+        );
+        client.refresh_tx_fec_at(Instant::now() + Duration::from_secs(31));
+        assert_eq!(
+            client.fec_group.load(Ordering::Relaxed),
+            16,
+            "Expiry пересчитывает actual group без смены level"
+        );
+        assert!(
+            outgoing.try_recv().is_err(),
+            "Incoming QR не порождает ответ или echo"
+        );
+    }
+
+    #[tokio::test]
+    async fn fec_receiver_data_only_rx_expires_clean_feedback_and_restores_repair() {
+        use aivpn_common::upload_pipeline::{PacketEncryptor, ZeroMdhEncryptor};
+
+        let (mut client, mut outgoing) = client();
+        let keys = crypto::derive_session_keys(&[83; 32], None, &[84; 32]);
+        client.session_keys = Some(keys.clone());
+        client.ratcheted_server_eph_pub = Some([85; 32]);
+        client.data_plane_proven = true;
+        client
+            .tx_fec_feedback
+            .record(100, 0, Instant::now() - Duration::from_secs(31));
+        client.fec_group.store(0, Ordering::Relaxed);
+        let before = (client.adaptive_level, client.keepalive_interval);
+
+        let mut ip = vec![0; 1000];
+        ip[0] = 0x45;
+        ip[2..4].copy_from_slice(&1000u16.to_be_bytes());
+        let mut downlink = keys.clone();
+        downlink.session_key = keys.session_key_s2c;
+        let inner = build_inner_packet(InnerType::Data, 0, &ip);
+        let data = build_random_mdh_packet(&downlink, &mut 101, &inner, None, client.recv_mdh_len)
+            .unwrap();
+
+        client.receive_and_write_packet(&data).await.unwrap();
+        assert_eq!(
+            client.fec_group.load(Ordering::Relaxed),
+            16,
+            "DATA-only RX должен снять просроченный clean feedback без control"
+        );
+        assert_eq!(client.bytes_received.load(Ordering::Relaxed), 1000);
+        assert_eq!((client.adaptive_level, client.keepalive_interval), before);
+        assert!(outgoing.try_recv().is_err());
+
+        let mut encoder = ZeroMdhEncryptor::new(keys, 0, 0);
+        encoder.set_fec_group(client.fec_group.load(Ordering::Relaxed));
+        for _ in 0..16 {
+            assert_eq!(encoder.encrypt_data_packets(&ip, 1140).unwrap().len(), 2);
+        }
+        assert!(
+            encoder.take_fec_repair().is_some(),
+            "После expiry фактический FecSender снова выдает repair"
+        );
+    }
+
+    #[tokio::test]
+    async fn fec_receiver_reconnect_resets_feedback_before_failed_network_setup() {
+        let (mut client, _outgoing) = client();
+        client.ratcheted_server_eph_pub = Some([81; 32]);
+        client
+            .handle_server_control_with_counter(report(0), 100)
+            .await
+            .unwrap();
+        assert_eq!(client.fec_group.load(Ordering::Relaxed), 0);
+        client.config.server_addr = "missing-port".into();
+        assert!(client.connect().await.is_err());
+        assert_eq!(
+            client.fec_group.load(Ordering::Relaxed),
+            AdaptiveLevel::Light.fec_n()
+        );
+    }
+
+    #[tokio::test]
+    async fn fec_receiver_initial_or_counterless_reports_are_not_authoritative() {
+        let (mut client, mut outgoing) = client();
+        client
+            .handle_server_control_with_counter(report(0), 20)
+            .await
+            .unwrap();
+        assert_eq!(
+            client.fec_group.load(Ordering::Relaxed),
+            16,
+            "До PFS feedback неизвестен"
+        );
+        client.ratcheted_server_eph_pub = Some([80; 32]);
+        client
+            .handle_server_control_with_counter(report(25_000), 30)
+            .await
+            .unwrap();
+        assert_eq!(client.fec_group.load(Ordering::Relaxed), 8);
+        client.handle_server_control(report(0)).await.unwrap();
+        assert_eq!(
+            client.fec_group.load(Ordering::Relaxed),
+            8,
+            "Без authenticated counter старый initial QR не источник feedback"
+        );
+        assert!(outgoing.try_recv().is_err());
     }
 }

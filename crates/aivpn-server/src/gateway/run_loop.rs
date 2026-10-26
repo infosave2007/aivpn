@@ -29,8 +29,8 @@ impl super::Gateway {
     pub async fn run(mut self) -> Result<()> {
         info!("Starting AIVPN Gateway on {}", self.config.listen_addr);
         info!(
-            "Per-IP UDP rate limit: {} pps",
-            self.config.per_ip_pps_limit
+            "Лимиты UDP на IP: до admission {} pps, активный QUIC {} pps",
+            self.config.per_ip_pps_limit, self.config.per_ip_authenticated_pps_limit
         );
 
         // Start eBPF observer (no-op when xdp_prog.o is absent)
@@ -152,14 +152,8 @@ impl super::Gateway {
                     self.kernel_accel = None;
                 }
 
-                // Kernel downlink (server->client) encryption is OPT-IN and OFF by
-                // default: it is a new, live-unproven fast path. Enable it only when
-                // AIVPN_KERNEL_DOWNLINK=1 is set in the environment. With it off, the
-                // egress hook is never registered and the user-space downlink path
-                // (downlink_worker) runs exactly as before.
-                let downlink_enabled = std::env::var("AIVPN_KERNEL_DOWNLINK")
-                    .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-                    .unwrap_or(false);
+                // Новый путь ядра включается только явной настройкой оператора.
+                let downlink_enabled = self.config.kernel_downlink;
                 if downlink_enabled && self.kernel_accel.is_some() {
                     if tun_ifindex == 0 {
                         warn!(

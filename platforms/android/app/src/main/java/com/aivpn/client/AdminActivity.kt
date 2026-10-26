@@ -51,6 +51,7 @@ class AdminActivity : AppCompatActivity() {
     private lateinit var binding: ActivityAdminBinding
     private lateinit var adapter: ClientAdapter
     private val clients = mutableListOf<JSONObject>()
+    private val loader = ScreenLoader()
 
     /** Role == 2 (Admin): full read/write, all mutating actions enabled. */
     private var canMutate = false
@@ -94,8 +95,6 @@ class AdminActivity : AppCompatActivity() {
         }
         binding.fabAdd.visibility = if (canMutate) View.VISIBLE else View.GONE
         binding.fabAdd.setOnClickListener { showAddDialog() }
-
-        loadClients()
     }
 
     override fun onResume() {
@@ -107,34 +106,29 @@ class AdminActivity : AppCompatActivity() {
 
     private fun loadClients() {
         lifecycleScope.launch {
-            val result = AdminApi.listClients()
-            if (result.notConnected) {
-                binding.textNotConnected.visibility = View.VISIBLE
-                binding.textEmpty.visibility = View.GONE
-                clients.clear()
-                adapter.notifyDataSetChanged()
-                return@launch
-            }
-            binding.textNotConnected.visibility = View.GONE
-
-            if (!result.ok) {
-                Toast.makeText(
-                    this@AdminActivity,
-                    getString(R.string.admin_error_generic, result.status),
-                    Toast.LENGTH_SHORT
-                ).show()
-                return@launch
-            }
-
-            val arr = result.bodyArray()
-            clients.clear()
-            if (arr != null) {
-                for (i in 0 until arr.length()) {
-                    clients.add(arr.optJSONObject(i) ?: continue)
+            loader.load { isCurrent ->
+                binding.btnRefresh.isEnabled = false
+                try {
+                    val result = AdminApi.listClients()
+                    if (!isCurrent()) return@load
+                    val arr = if (result.ok) result.bodyArray() else null
+                    clients.clear()
+                    if (arr == null) {
+                        binding.textNotConnected.text = managementErrorMessage(result)
+                        binding.textNotConnected.visibility = View.VISIBLE
+                        binding.textEmpty.visibility = View.GONE
+                    } else {
+                        binding.textNotConnected.visibility = View.GONE
+                        for (i in 0 until arr.length()) {
+                            clients.add(arr.optJSONObject(i) ?: continue)
+                        }
+                        binding.textEmpty.visibility = if (clients.isEmpty()) View.VISIBLE else View.GONE
+                    }
+                    adapter.notifyDataSetChanged()
+                } finally {
+                    binding.btnRefresh.isEnabled = true
                 }
             }
-            binding.textEmpty.visibility = if (clients.isEmpty()) View.VISIBLE else View.GONE
-            adapter.notifyDataSetChanged()
         }
     }
 
@@ -197,7 +191,11 @@ class AdminActivity : AppCompatActivity() {
                                         handleMutationResult(patchResult)
                                     } else {
                                         loadClients()
-                                        Toast.makeText(this@AdminActivity, R.string.admin_created_exit_failed, Toast.LENGTH_LONG).show()
+                                        Toast.makeText(
+                                            this@AdminActivity,
+                                            getString(R.string.admin_created_exit_failed) + "\n" + managementErrorMessage(patchResult),
+                                            Toast.LENGTH_LONG,
+                                        ).show()
                                     }
                                     return@launch
                                 }
@@ -304,8 +302,11 @@ class AdminActivity : AppCompatActivity() {
      */
     private suspend fun fetchExitNodeOptions(): List<ExitNodeOption> {
         val result = AdminApi.poolNodes()
-        if (!result.ok) return emptyList()
-        val arr = result.bodyArray() ?: return emptyList()
+        val arr = if (result.ok) result.bodyArray() else null
+        if (arr == null) {
+            Toast.makeText(this, managementErrorMessage(result), Toast.LENGTH_LONG).show()
+            return emptyList()
+        }
         val out = mutableListOf<ExitNodeOption>()
         for (i in 0 until arr.length()) {
             val n = arr.optJSONObject(i) ?: continue
@@ -420,21 +421,17 @@ class AdminActivity : AppCompatActivity() {
     private fun showKeyDialog(id: String, name: String) {
         lifecycleScope.launch {
             val result = AdminApi.connectionKey(id)
-            if (result.notConnected) {
-                Toast.makeText(this@AdminActivity, getString(R.string.admin_not_connected), Toast.LENGTH_SHORT).show()
-                return@launch
-            }
             if (!result.ok) {
                 Toast.makeText(
                     this@AdminActivity,
-                    getString(R.string.admin_error_generic, result.status),
-                    Toast.LENGTH_SHORT
+                    managementErrorMessage(result),
+                    Toast.LENGTH_LONG
                 ).show()
                 return@launch
             }
             val key = result.bodyObject()?.optString("connection_key", "") ?: ""
             if (key.isEmpty()) {
-                Toast.makeText(this@AdminActivity, getString(R.string.admin_error_generic, result.status), Toast.LENGTH_SHORT).show()
+                Toast.makeText(this@AdminActivity, managementErrorMessage(result), Toast.LENGTH_LONG).show()
                 return@launch
             }
 
@@ -445,7 +442,7 @@ class AdminActivity : AppCompatActivity() {
                     if (png == null || png.isEmpty()) null
                     else BitmapFactory.decodeByteArray(png, 0, png.size)
                 } catch (t: Throwable) {
-                    android.util.Log.e("AdminActivity", "qrPng failed", t)
+                    android.util.Log.e("AdminActivity", "qrPng failed (${t.javaClass.simpleName})")
                     null
                 }
             }
@@ -526,20 +523,8 @@ class AdminActivity : AppCompatActivity() {
     // ──────────── Shared mutation result handling ────────────
 
     private fun handleMutationResult(result: MgmtResult) {
-        when {
-            result.notConnected -> Toast.makeText(this, getString(R.string.admin_not_connected), Toast.LENGTH_SHORT).show()
-            result.ok -> loadClients()
-            else -> {
-                val reason = result.bodyObject()?.optString("reason")
-                    ?: result.bodyObject()?.optString("error")
-                val msg = if (!reason.isNullOrBlank()) {
-                    getString(R.string.admin_error_with_reason, result.status, reason)
-                } else {
-                    getString(R.string.admin_error_generic, result.status)
-                }
-                Toast.makeText(this, msg, Toast.LENGTH_LONG).show()
-            }
-        }
+        if (result.ok) loadClients()
+        else Toast.makeText(this, managementErrorMessage(result), Toast.LENGTH_LONG).show()
     }
 
     private fun dialogForm(): LinearLayout = LinearLayout(this).apply {

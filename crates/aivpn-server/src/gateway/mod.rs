@@ -139,6 +139,7 @@ struct QueuedPacket {
     client_addr: SocketAddr,
     masked: bool,
     quic_inner: bool,
+    quic_context: Option<mask_socket::QuicContext>,
 }
 
 /// Hash a socket address for privacy-preserving logging (MED-4)
@@ -415,25 +416,11 @@ pub struct Gateway {
     pending_config: Arc<crate::pending_config::PendingConfigManager>,
 }
 
-/// Global cap (packets/sec, shared across ALL source IPs) on how often the
-/// expensive "scan every session and recompute its tag window" fallback
-/// (`refresh_and_find_by_tag` / `recover_session_by_tag`) may run.
-///
-/// Every packet whose 8-byte resonance tag misses the O(1) `tag_map` lookup
-/// — including arbitrary garbage UDP payloads from an unauthenticated sender,
-/// no PSK/session required — falls through to this fallback, which iterates
-/// every active session (`MAX_SESSIONS` = 500) and recomputes its ~256-512
-/// wide tag window (one keyed BLAKE3 hash per counter slot). Measured cost is
-/// ~69ns/hash, so one full scan over 500 sessions costs roughly 20ms of CPU.
-/// The per-IP packet-rate limiter (`per_ip_pps_limit`, default 1000/s) alone
-/// is not sufficient: it is keyed by source IP, which UDP senders can vary or
-/// spoof per packet, so a distributed/spoofed sender could otherwise force
-/// unbounded full-table rescans. This budget is independent of source IP and
-/// bounds the worst-case aggregate cost regardless of how many distinct
-/// (possibly spoofed) source addresses are used. It is intentionally generous
-/// relative to legitimate reconnection/time-window-drift recovery traffic,
-/// which is rare compared to steady-state data packets that hit the fast
-/// `tag_map` path directly.
+/// Общая квота дорогого поиска сессий, независимо от исходного IP.
+/// После промаха по tag_map fallback пересчитывает окна тегов, поэтому
+/// одной квоты per_ip_pps_limit недостаточно: источник UDP можно подменять.
+/// Общий предел сдерживает число обходов таблицы при распределенном потоке
+/// мусора. Обычный трафик действующих сессий идет через быстрый tag_map.
 const MAX_FALLBACK_SCANS_PER_SEC: u64 = 20;
 /// Global cap on the per-client × per-mask handshake candidate scan (the most
 /// expensive pre-auth path: DH + key derivation + tag-window build per
@@ -2951,6 +2938,72 @@ mod tests {
         assert!(authorize(ClientRole::Admin.as_u8(), 1, "/api/v1/clients"));
     }
 
+    #[tokio::test]
+    async fn enrollment_database_error_is_transient_and_real_binding_mismatch_stays_terminal() {
+        use aivpn_common::client_wire::{decode_downlink_any_mdh_len, RecvWindow};
+        use aivpn_common::crypto;
+        use aivpn_common::protocol::ControlPayload;
+        for broken_database in [true, false] {
+            let (gateway, session, device) = mtls_fixture().await;
+            let receiver = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let addr = receiver.local_addr().unwrap();
+            session.lock().client_addr = addr;
+            let cid = session.lock().client_id.clone().unwrap();
+            if broken_database {
+                std::fs::write(gateway.config.mask_dir.join("clients.json"), "{").unwrap();
+            } else {
+                let db = gateway.client_db.as_ref().unwrap();
+                db.enroll_device(&cid, &[88; 32]).unwrap();
+                db.update_client(
+                    &cid,
+                    crate::client_db::UpdateClientParams {
+                        one_time: Some(true),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            }
+            let (server_eph, client_eph, keys) = {
+                let s = session.lock();
+                (s.server_eph_pub.unwrap(), s.eph_pub, s.keys.clone())
+            };
+            let dh = device
+                .compute_shared(&gateway.session_manager.server_public_key())
+                .unwrap();
+            let enrollment = ControlPayload::DeviceEnrollment {
+                static_pub: device.public_key_bytes(),
+                dh_proof: crypto::device_enrollment_proof(&dh, &server_eph, &client_eph),
+            }
+            .encode()
+            .unwrap();
+            gateway
+                .handle_control_message(&enrollment, &session, addr)
+                .await
+                .unwrap();
+            let mut bytes = [0u8; 4096];
+            let size = tokio::time::timeout(Duration::from_secs(1), receiver.recv(&mut bytes))
+                .await
+                .unwrap()
+                .unwrap();
+            let packet = decode_downlink_any_mdh_len(
+                &bytes[..size],
+                &keys,
+                &mut RecvWindow::default(),
+                &mut vec![gateway.mask_catalog.packet_mdh_bytes().len()],
+            )
+            .unwrap();
+            let response = ControlPayload::decode(&packet.payload).unwrap();
+            assert_eq!(
+                response,
+                if broken_database {
+                    ControlPayload::Shutdown { reason: 5 }
+                } else {
+                    ControlPayload::HandshakeReject { reason: 1 }
+                }
+            );
+        }
+    }
+
     async fn mtls_fixture() -> (
         Gateway,
         Arc<parking_lot::Mutex<Session>>,
@@ -3503,6 +3556,9 @@ mod tests {
                 .unwrap();
                 let addr = session.lock().client_addr;
                 for _ in 0..10 {
+                    // Моделируем допустимый интервал; квота проверяется отдельно.
+                    session.lock().quality_report_received_at =
+                        Some(std::time::Instant::now() - Duration::from_secs(2));
                     gateway
                         .handle_control_message(&report, session, addr)
                         .await

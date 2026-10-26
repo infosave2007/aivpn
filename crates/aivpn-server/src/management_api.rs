@@ -273,19 +273,6 @@ impl ApiState {
     }
 }
 
-/// Map a `MgmtError` from `add_client`/`connection_key`-style operations
-/// where the pre-refactor handler had exactly two outcomes: a specific
-/// `BadRequest` (400, name validation) and everything else as `Conflict`
-/// (409). Kept as a named helper (rather than inlined per handler) since
-/// two handlers (`add_client`) share this exact mapping.
-fn conflict_or_bad_request(e: &MgmtError) -> StatusCode {
-    match e {
-        MgmtError::BadRequest(_) => StatusCode::BAD_REQUEST,
-        MgmtError::NotFound => StatusCode::NOT_FOUND,
-        _ => StatusCode::CONFLICT,
-    }
-}
-
 // ── Wire types ───────────────────────────────────────────────────────────────
 //
 // `ClientResponse` is a type alias for `mgmt_service::ClientView` (the
@@ -451,7 +438,7 @@ async fn add_client(
             .await;
     match result {
         Ok(Ok(c)) => (StatusCode::CREATED, Json(c)).into_response(),
-        Ok(Err(e)) => (conflict_or_bad_request(&e), err(e)).into_response(),
+        Ok(Err(e)) => mgmt_error_response(&e),
         Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, err("internal error")).into_response(),
     }
 }
@@ -563,7 +550,7 @@ async fn remove_client(State(state): State<ApiState>, Path(id): Path<String>) ->
             .await;
     match result {
         Ok(Ok(())) => StatusCode::NO_CONTENT.into_response(),
-        Ok(Err(e)) => (StatusCode::NOT_FOUND, err(e)).into_response(),
+        Ok(Err(e)) => mgmt_error_response(&e),
         Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, err("internal error")).into_response(),
     }
 }
@@ -574,7 +561,7 @@ async fn reset_device(State(state): State<ApiState>, Path(id): Path<String>) -> 
             .await;
     match result {
         Ok(Ok(())) => Json(serde_json::json!({ "ok": true })).into_response(),
-        Ok(Err(e)) => (StatusCode::NOT_FOUND, err(e)).into_response(),
+        Ok(Err(e)) => mgmt_error_response(&e),
         Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, err("internal error")).into_response(),
     }
 }
@@ -600,7 +587,7 @@ async fn revoke_client(State(state): State<ApiState>, Path(id): Path<String>) ->
         tokio::task::spawn_blocking(move || mgmt_service::revoke(&state.mgmt_ctx(), &id)).await;
     match result {
         Ok(Ok(())) => StatusCode::NO_CONTENT.into_response(),
-        Ok(Err(e)) => (StatusCode::NOT_FOUND, err(e)).into_response(),
+        Ok(Err(e)) => mgmt_error_response(&e),
         Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, err("internal error")).into_response(),
     }
 }
@@ -619,15 +606,7 @@ async fn get_connection_key(
 ) -> impl IntoResponse {
     match mgmt_service::connection_key(&state.mgmt_ctx(), &id) {
         Ok(key) => Json(serde_json::json!({ "connection_key": key })).into_response(),
-        Err(MgmtError::Unavailable(msg)) => {
-            (StatusCode::SERVICE_UNAVAILABLE, err(msg)).into_response()
-        }
-        Err(MgmtError::NotFound) => (
-            StatusCode::NOT_FOUND,
-            err(format!("Client '{}' not found", id)),
-        )
-            .into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, err(e)).into_response(),
+        Err(e) => mgmt_error_response(&e),
     }
 }
 
@@ -706,18 +685,20 @@ async fn put_config(
     // failure). The allowlist is back (`CONFIG_KNOWN_KEYS`, checked above),
     // but guarded by a test that catches drift against the shipped example.
     let parsed_cfg =
-        match serde_json::from_value::<crate::server_config::ServerFileConfig>(body.clone()) {
+        match serde_path_to_error::deserialize::<_, crate::server_config::ServerFileConfig>(
+            body.clone(),
+        ) {
             Ok(cfg) => cfg,
             Err(e) => {
                 audit(
                     &state,
                     "ConfigPut",
                     &path.display().to_string(),
-                    &format!("rejected: {}", e),
+                    &format!("rejected: {}", e.path()),
                 );
                 return (
                     StatusCode::BAD_REQUEST,
-                    err(format!("invalid config: {}", e)),
+                    err(format!("{}: неверный тип или значение настройки", e.path())),
                 )
                     .into_response();
             }
@@ -725,7 +706,7 @@ async fn put_config(
     // Полная замена файла: в production-secure тело без mask_signing_key или с
     // режимом off/warn не должно сохраниться. Обычная сборка по-прежнему
     // принимает warn без ключа.
-    if let Err(e) = parsed_cfg.validate_mask_trust() {
+    if let Err(e) = parsed_cfg.validate_runtime() {
         audit(
             &state,
             "ConfigPut",
@@ -1177,15 +1158,13 @@ async fn confirm_config(
 /// `Forbidden`/`Unavailable`/`Internal`, which `apply_heavy`/
 /// `confirm_config` can both return).
 fn mgmt_error_response(e: &MgmtError) -> axum::response::Response {
-    let status = match e {
-        MgmtError::NotFound => StatusCode::NOT_FOUND,
-        MgmtError::Conflict(_) => StatusCode::CONFLICT,
-        MgmtError::BadRequest(_) => StatusCode::BAD_REQUEST,
-        MgmtError::Forbidden => StatusCode::FORBIDDEN,
-        MgmtError::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
-        MgmtError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
-    };
-    (status, err(e.to_string())).into_response()
+    let status =
+        StatusCode::from_u16(e.response_status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    let error = e.response_error();
+    // Поле error оставлено для существующей веб-панели.
+    let payload =
+        serde_json::json!({ "code": error.code, "message": error.message, "error": error.message });
+    (status, Json(payload)).into_response()
 }
 
 // ── Backup ───────────────────────────────────────────────────────────────────
@@ -1366,7 +1345,7 @@ async fn get_audit_log(
         .await;
         return match result {
             Ok(Ok(view)) => Json(view).into_response(),
-            Ok(Err(e)) => (StatusCode::NOT_FOUND, err(e)).into_response(),
+            Ok(Err(e)) => mgmt_error_response(&e),
             Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, err("internal error")).into_response(),
         };
     }
@@ -1377,7 +1356,7 @@ async fn get_audit_log(
 
     match result {
         Ok(Ok(entries)) => Json(entries).into_response(),
-        Ok(Err(e)) => (StatusCode::NOT_FOUND, err(e)).into_response(),
+        Ok(Err(e)) => mgmt_error_response(&e),
         Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, err("internal error")).into_response(),
     }
 }
@@ -1518,6 +1497,42 @@ async fn sse_events(State(state): State<ApiState>) -> impl IntoResponse {
 
 // ── Router ───────────────────────────────────────────────────────────────────
 
+/// Дополняет старые HTTP-ошибки и отказы JSON extractor общей формой ответа.
+async fn normalize_error_response(response: axum::response::Response) -> axum::response::Response {
+    let status = response.status();
+    if !status.is_client_error() && !status.is_server_error() {
+        return response;
+    }
+    let (mut parts, body) = response.into_parts();
+    let bytes = axum::body::to_bytes(body, 65536).await.unwrap_or_default();
+    let parsed = serde_json::from_slice::<serde_json::Value>(&bytes).ok();
+    let mut error = aivpn_common::mgmt_error::ManagementError::for_status(status.as_u16());
+    if let Some(value) = &parsed {
+        if let Ok(structured) =
+            serde_json::from_value::<aivpn_common::mgmt_error::ManagementError>(value.clone())
+        {
+            error = structured;
+        } else if status.is_client_error() {
+            if let Some(reason) = value
+                .get("error")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+            {
+                error.message = reason.chars().take(512).collect();
+            }
+        }
+    }
+    let mut payload = serde_json::to_value(&error).unwrap_or_default();
+    payload["error"] = serde_json::Value::String(error.message);
+    let body = serde_json::to_vec(&payload).unwrap_or_default();
+    parts.headers.remove(axum::http::header::CONTENT_LENGTH);
+    parts.headers.insert(
+        axum::http::header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static("application/json"),
+    );
+    axum::response::Response::from_parts(parts, axum::body::Body::from(body))
+}
+
 fn router(state: ApiState) -> Router {
     Router::new()
         .route("/api/v1/status", get(get_status))
@@ -1556,6 +1571,7 @@ fn router(state: ApiState) -> Router {
         .route("/api/v1/pool/nodes", get(get_pool_nodes))
         .route("/api/v1/pool/health", get(get_pool_health))
         .route("/api/v1/pool/links", get(get_pool_links))
+        .layer(axum::middleware::map_response(normalize_error_response))
         .with_state(state)
 }
 
@@ -1565,6 +1581,87 @@ mod control_regression_tests {
     use crate::pending_config::PendingConfig;
     use axum::body::Body;
     use axum::http::Request;
+
+    #[tokio::test]
+    async fn rest_structured_errors_cover_keys_and_json_rejections() {
+        let root = tempfile::tempdir().unwrap();
+        let app = router(state(root.path()));
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/clients/example/connection-key")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = axum::body::to_bytes(response.into_body(), 65536)
+            .await
+            .unwrap();
+        let error: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(error["code"], "public_endpoint_not_configured");
+        assert_eq!(error["error"], error["message"]);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/clients")
+                    .header("content-type", "application/json")
+                    .body(Body::from("not-json-sensitive-value"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(response.status().is_client_error());
+        let body = axum::body::to_bytes(response.into_body(), 65536)
+            .await
+            .unwrap();
+        let error: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(error["code"], "invalid_request");
+        assert!(!String::from_utf8_lossy(&body).contains("sensitive-value"));
+    }
+
+    #[tokio::test]
+    async fn config_api_rejects_settings_that_would_break_the_next_start() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let path = state.config_path.clone().unwrap();
+        let original = b"{\"listen_addr\":\"127.0.0.1:443\"}";
+        std::fs::write(&path, original).unwrap();
+        let app = router(state);
+        for (field, value) in [
+            ("server_ip", "bad/path"),
+            ("log_level", "["),
+            ("mask_verify_mode", "private-token"),
+            ("session_timeout_secs", "sensitive-value"),
+        ] {
+            let mut payload =
+                serde_json::json!({"mask_signing_key":"/test/key", "mask_verify_mode":"enforce"});
+            payload[field] = serde_json::Value::String(value.into());
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("PUT")
+                        .uri("/api/v1/config")
+                        .header("content-type", "application/json")
+                        .body(Body::from(serde_json::to_vec(&payload).unwrap()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{field}");
+            let body = axum::body::to_bytes(response.into_body(), 65536)
+                .await
+                .unwrap();
+            assert!(!String::from_utf8_lossy(&body).contains("private-token"));
+            assert!(!String::from_utf8_lossy(&body).contains("sensitive-value"));
+            assert_eq!(std::fs::read(&path).unwrap(), original);
+        }
+    }
 
     fn state(root: &std::path::Path) -> ApiState {
         let db_path = root.join("clients.json");

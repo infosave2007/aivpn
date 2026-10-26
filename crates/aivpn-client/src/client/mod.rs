@@ -42,7 +42,7 @@ use aivpn_common::network_config::ClientNetworkConfig;
 use aivpn_common::protocol::{
     ControlPayload, InnerType, MaskOutcome, MAX_PACKET_SIZE, UDP_RECV_BUF_SIZE,
 };
-use aivpn_common::quality::{AdaptiveLevel, QualityTracker};
+use aivpn_common::quality::{AdaptiveLevel, PeerReceiverFeedback, QualityTracker};
 use aivpn_common::transport::DatagramTransport;
 use aivpn_common::upload_pipeline::{self, PacketEncryptor, UploadConfig};
 
@@ -504,6 +504,7 @@ pub struct AivpnClient {
     static_keypair: Option<KeyPair>,
     /// Connection quality tracker — RTT, jitter, loss → 0–100 score (0.9.0+).
     quality_tracker: QualityTracker,
+    tx_fec_feedback: PeerReceiverFeedback,
     /// Current adaptive mode level — adjusted from quality score (0.9.0+).
     adaptive_level: AdaptiveLevel,
     /// Epoch-ms timestamp of last outbound keepalive — shared with upload task for RTT.
@@ -740,6 +741,7 @@ impl AivpnClient {
             last_local_port: None,
             static_keypair,
             quality_tracker: QualityTracker::new(),
+            tx_fec_feedback: PeerReceiverFeedback::default(),
             adaptive_level: initial_adaptive_level,
             fec_group: Arc::new(AtomicU8::new(initial_adaptive_level.fec_n())),
             keepalive_sent_ms: Arc::new(AtomicU64::new(0)),
@@ -767,11 +769,19 @@ impl AivpnClient {
                 self.adaptive_level
             );
         }
-        self.fec_group
-            .store(self.adaptive_level.fec_n(), Ordering::Relaxed);
+        self.refresh_tx_fec_at(Instant::now());
         self.keepalive_interval = effective;
         self.keepalive_interval_ms
             .store(effective.as_millis() as u64, Ordering::Relaxed);
+    }
+
+    fn refresh_tx_fec_at(&mut self, now: Instant) {
+        let group = self.tx_fec_feedback.fec_group(self.adaptive_level, now);
+        let previous = self.fec_group.load(Ordering::Relaxed);
+        if previous != group {
+            self.fec_group.store(group, Ordering::Relaxed);
+            info!(target: "aivpn::receiver_feedback", previous, fec_group = group, "Изменена группа TX FEC");
+        }
     }
 
     /// Fire-and-forget CGNAT warmup burst: 4 keepalives 100 ms apart, sent via
@@ -839,6 +849,10 @@ impl AivpnClient {
 
     /// Connect to server
     pub async fn connect(&mut self) -> Result<()> {
+        // Старые права и ожидающие команды не переходят в новую попытку подключения.
+        self.mgmt.reset();
+        self.tx_fec_feedback.reset();
+        self.refresh_tx_fec_at(Instant::now());
         info!("Connecting to AIVPN server...");
         self.state = ClientState::Connecting;
 
@@ -1250,6 +1264,8 @@ impl AivpnClient {
 
     /// Disconnect from server
     pub async fn disconnect(&mut self) {
+        // Отменяем управление до сетевых await, в том числе при медленном close.
+        self.mgmt.reset();
         info!("Disconnecting...");
 
         // Send shutdown message if connected
@@ -1732,6 +1748,8 @@ fn dirs_home() -> Option<std::path::PathBuf> {
 mod tests {
     use super::*;
     use aivpn_common::mask::preset_masks;
+
+    mod management_lifecycle_tests;
 
     fn make_test_config() -> ClientConfig {
         let mask = preset_masks::bootstrap_default();

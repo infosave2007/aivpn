@@ -1,11 +1,4 @@
-//! Config resolution: turns CLI args + optional `server.json` into effective
-//! values (config path, network config, listen addr, mask dir, mask
-//! signing/verify settings, downlink shaping level).
-//!
-//! Pure extract-module move from `main.rs` (ÉTAPE 1 decomposition, step 2)
-//! — bodies are byte-for-byte the former top-level `main.rs` functions of
-//! the same name; only visibility (`pub(crate)`) changed so `main.rs`,
-//! `bootstrap.rs`, and the `cli::*` submodules can call them.
+//! Постоянные настройки: явный CLI, затем env, server.json и defaults.
 
 use aivpn_common::network_config::{netmask_to_prefix_len, VpnNetworkConfig};
 use aivpn_server::server_config::{MtuSetting, ServerFileConfig};
@@ -15,7 +8,9 @@ use std::path::PathBuf;
 
 const DEFAULT_SERVER_CONFIG_PATH: &str = "/etc/aivpn/server.json";
 const LOCAL_SERVER_CONFIG_PATH: &str = "deploy/config/server.json";
-const DEFAULT_LISTEN_ADDR: &str = "0.0.0.0:443";
+
+mod runtime;
+pub(crate) use runtime::{collect_environment, resolve_with_env};
 
 // ─── R2 Phase B: operator mask-signing key handling ──────────────────────────
 
@@ -151,27 +146,17 @@ pub(crate) fn resolve_shaping_level(
         .unwrap_or_default()
 }
 
-/// Loads and parses `server.json` at startup. Deliberately LENIENT about
-/// unknown top-level keys: a config that survived one or more upgrades
-/// commonly carries a field a past release removed (e.g. `max_sessions`,
-/// `default_mask`), and refusing to boot over that is a deployment-breaking
-/// regression, not a useful guard — unlike `PUT /api/v1/config`'s validator
-/// in `management_api.rs`, which stays strict because a body submitted there
-/// is a live, operator-authored write where a stray key is almost certainly a
-/// typo. See `server_config.rs`'s module doc for the full rationale.
-///
-/// Known fields are still fully type-checked (a wrong-typed value is still a
-/// hard parse error, same as before) — only *unrecognized keys* are
-/// tolerated, and only after warning about them so the operator can clean up
-/// the file.
-pub(crate) fn load_server_file_config(path: Option<&str>) -> Option<ServerFileConfig> {
-    let path = path?;
+/// При запуске устаревшие поля файла допустимы, известные поля проверяет resolver.
+pub(crate) fn load_server_config_value(path: Option<&str>) -> serde_json::Value {
+    let Some(path) = path else {
+        return serde_json::json!({});
+    };
     let content = std::fs::read_to_string(path).unwrap_or_else(|e| {
         eprintln!("Failed to read config file '{}': {}", path, e);
         std::process::exit(1);
     });
-    let value: serde_json::Value = serde_json::from_str(&content).unwrap_or_else(|e| {
-        eprintln!("Failed to parse config file '{}': {}", path, e);
+    let value: serde_json::Value = serde_json::from_str(&content).unwrap_or_else(|_| {
+        eprintln!("config: неверный JSON в файле");
         std::process::exit(1);
     });
     let unknown = aivpn_server::server_config::unknown_top_level_keys(&value);
@@ -186,15 +171,16 @@ pub(crate) fn load_server_file_config(path: Option<&str>) -> Option<ServerFileCo
             unknown.join(", ")
         );
     }
-    Some(serde_json::from_value(value).unwrap_or_else(|e| {
-        eprintln!("Failed to parse config file '{}': {}", path, e);
-        std::process::exit(1);
-    }))
+    value
 }
 
 pub(crate) fn resolve_config_path(args: &ServerArgs) -> Option<String> {
     if let Some(path) = &args.config {
         return Some(path.clone());
+    }
+    if let Ok(path) = std::env::var("AIVPN_CONFIG").or_else(|_| std::env::var("AIVPN_CONFIG_PATH"))
+    {
+        return Some(path);
     }
 
     // Only auto-select a config file that can actually be opened; an existing
@@ -204,6 +190,135 @@ pub(crate) fn resolve_config_path(args: &ServerArgs) -> Option<String> {
         .iter()
         .find(|path| std::fs::File::open(path).is_ok())
         .map(|path| path.to_string())
+}
+
+/// Восстановление не читает файл, который само должно заменить.
+pub(crate) fn apply_restore_env(args: &mut ServerArgs, matches: &clap::ArgMatches) {
+    use clap::parser::ValueSource;
+    let text = |key: &str, nullable: bool| {
+        let raw = match std::env::var(key) {
+            Ok(raw) => raw,
+            Err(std::env::VarError::NotPresent) => return None,
+            Err(std::env::VarError::NotUnicode(_)) => {
+                eprintln!("{key}: значение должно быть UTF-8");
+                std::process::exit(1);
+            }
+        };
+        match serde_json::from_str::<serde_json::Value>(&raw) {
+            Ok(serde_json::Value::Null) if nullable => None,
+            Ok(serde_json::Value::String(value)) => Some(value),
+            _ => Some(raw),
+        }
+    };
+    if matches.value_source("config") != Some(ValueSource::CommandLine) {
+        args.config = text("AIVPN_CONFIG", false).or_else(|| text("AIVPN_CONFIG_PATH", false));
+    }
+    if matches.value_source("clients_db") != Some(ValueSource::CommandLine) {
+        if let Some(path) = text("AIVPN_CLIENTS_DB", true) {
+            args.clients_db = path;
+        }
+    }
+    if matches.value_source("mask_dir") != Some(ValueSource::CommandLine) {
+        args.mask_dir = text("AIVPN_MASK_DIR", true);
+    }
+}
+
+/// Выбирает только пути назначения recovery. Остальные настройки, ключи и DB
+/// могут быть повреждены и не нужны для восстановления из проверенного архива.
+pub(crate) fn resolve_import_paths(
+    args: &mut ServerArgs,
+    matches: &clap::ArgMatches,
+) -> Result<(), String> {
+    use clap::parser::ValueSource;
+    fn environment(name: &str) -> Result<Option<Option<String>>, String> {
+        let raw = match std::env::var(name) {
+            Ok(raw) => raw,
+            Err(std::env::VarError::NotPresent) => return Ok(None),
+            Err(_) => return Err(format!("{name}: значение должно быть UTF-8")),
+        };
+        Ok(Some(
+            match serde_json::from_str::<serde_json::Value>(&raw) {
+                Ok(serde_json::Value::Null) => None,
+                Ok(serde_json::Value::String(value)) => Some(value),
+                _ => Some(raw),
+            },
+        ))
+    }
+    fn target(
+        field: &str,
+        override_value: Option<Option<String>>,
+        file: Option<&serde_json::Map<String, serde_json::Value>>,
+        default: Option<String>,
+    ) -> Result<Option<String>, String> {
+        let value = match override_value {
+            Some(value) => value.or(default),
+            None => match file.and_then(|file| file.get(field)) {
+                None | Some(serde_json::Value::Null) => default,
+                Some(serde_json::Value::String(value)) => Some(value.clone()),
+                _ => return Err(format!("{field}: нужен путь назначения восстановления")),
+            },
+        };
+        if value.as_ref().is_some_and(|value| value.trim().is_empty()) {
+            return Err(format!("{field}: пустой путь назначения восстановления"));
+        }
+        Ok(value)
+    }
+    let default_database = args.clients_db.clone();
+    let default_masks = args.mask_dir.clone();
+    let database_override = if matches.value_source("clients_db") == Some(ValueSource::CommandLine)
+    {
+        Some(Some(args.clients_db.clone()))
+    } else {
+        environment("AIVPN_CLIENTS_DB")?
+    };
+    let masks_override = if matches.value_source("mask_dir") == Some(ValueSource::CommandLine) {
+        Some(args.mask_dir.clone())
+    } else {
+        environment("AIVPN_MASK_DIR")?
+    };
+    apply_restore_env(args, matches);
+    // Для recovery существующий, но нечитаемый файл тоже является источником,
+    // который нельзя молча заменить defaults. Обычный startup выбирает иначе.
+    let config_path = args.config.clone().unwrap_or_else(|| {
+        [DEFAULT_SERVER_CONFIG_PATH, LOCAL_SERVER_CONFIG_PATH]
+            .into_iter()
+            .find(|path| {
+                !matches!(std::fs::symlink_metadata(path), Err(error)
+                    if error.kind() == std::io::ErrorKind::NotFound)
+            })
+            .unwrap_or(DEFAULT_SERVER_CONFIG_PATH)
+            .to_string()
+    });
+    let absent = matches!(std::fs::symlink_metadata(&config_path), Err(error)
+        if error.kind() == std::io::ErrorKind::NotFound);
+    let file = if absent {
+        Some(serde_json::json!({}))
+    } else {
+        std::fs::read(&config_path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+            .filter(serde_json::Value::is_object)
+    };
+    let explicit_path = |value: &Option<Option<String>>| {
+        value
+            .as_ref()
+            .and_then(Option::as_ref)
+            .is_some_and(|value| !value.trim().is_empty())
+    };
+    if file.is_none() && !(explicit_path(&database_override) && explicit_path(&masks_override)) {
+        return Err("config: пути восстановления неизвестны; задайте явно --clients-db и --mask-dir или AIVPN_CLIENTS_DB и AIVPN_MASK_DIR".to_string());
+    }
+    let object = file.as_ref().and_then(serde_json::Value::as_object);
+    args.clients_db = target(
+        "clients_db",
+        database_override,
+        object,
+        Some(default_database),
+    )?
+    .expect("Для DB всегда задан встроенный путь");
+    args.mask_dir = target("mask_dir", masks_override, object, default_masks)?;
+    args.config = Some(config_path);
+    Ok(())
 }
 
 pub(crate) fn resolve_network_config(
@@ -259,15 +374,9 @@ pub(crate) fn resolve_network_config(
 
 pub(crate) fn resolve_listen_addr(
     args: &ServerArgs,
-    file_config: Option<&ServerFileConfig>,
+    _file_config: Option<&ServerFileConfig>,
 ) -> String {
-    if args.listen == DEFAULT_LISTEN_ADDR {
-        file_config
-            .and_then(|config| config.listen_addr.clone())
-            .unwrap_or_else(|| args.listen.clone())
-    } else {
-        args.listen.clone()
-    }
+    args.listen.clone()
 }
 
 /// Resolve mask directory: CLI --mask-dir / env AIVPN_MASK_DIR → server.json "mask_dir" → default

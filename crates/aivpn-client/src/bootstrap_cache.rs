@@ -17,6 +17,10 @@ use aivpn_common::mask::{current_unix_secs, BootstrapDescriptor, MaskProfile};
 /// mobile cores' `LAST_GOOD_MASK`.
 pub static LAST_GOOD_MASK: Mutex<Option<MaskProfile>> = Mutex::new(None);
 
+#[cfg(test)]
+// Проверка stall держит guard целиком, настоящий DATA writer - только при записи.
+pub(crate) static STICKY_MASK_TEST_LOCK: Mutex<()> = Mutex::new(());
+
 /// Liveness half of the sticky-mask fix (client). Counts consecutive SHORT
 /// sessions that ended on the data watchdog while a sticky mask was in use, so a
 /// mask that keeps getting throttled is abandoned (LAST_GOOD_MASK cleared) and
@@ -113,12 +117,46 @@ pub fn select_initial_mask_for_attempt(
     )
 }
 
+pub fn select_initial_mask_with_preference(
+    preshared_key: Option<&[u8; 32]>,
+    fail_streak: u32,
+    trusted_key: Option<&[u8; 32]>,
+    preferred: Option<&str>,
+) -> Option<MaskProfile> {
+    select_cached_candidate_with_preference(
+        &load_descriptors(),
+        preshared_key,
+        fail_streak,
+        trusted_key,
+        DATA_EXPLORATION_ROUND.load(Ordering::Relaxed),
+        preferred,
+    )
+}
+
 fn select_cached_candidate(
     descriptors: &[BootstrapDescriptor],
     preshared_key: Option<&[u8; 32]>,
     fail_streak: u32,
     trusted_key: Option<&[u8; 32]>,
     exploration_round: u32,
+) -> Option<MaskProfile> {
+    select_cached_candidate_with_preference(
+        descriptors,
+        preshared_key,
+        fail_streak,
+        trusted_key,
+        exploration_round,
+        None,
+    )
+}
+
+fn select_cached_candidate_with_preference(
+    descriptors: &[BootstrapDescriptor],
+    preshared_key: Option<&[u8; 32]>,
+    fail_streak: u32,
+    trusted_key: Option<&[u8; 32]>,
+    exploration_round: u32,
+    preferred: Option<&str>,
 ) -> Option<MaskProfile> {
     #[cfg(feature = "production-secure")]
     if trusted_key.is_none() {
@@ -134,6 +172,16 @@ fn select_cached_candidate(
     let attempt = fail_streak.saturating_add(
         exploration_round.saturating_mul(aivpn_common::mask::HANDSHAKE_FALLBACK_THRESHOLD),
     );
+    if let Some(candidate) = preferred.and_then(|name| {
+        aivpn_common::mask::preferred_bootstrap_candidate_for_attempt(
+            &trusted,
+            preshared_key,
+            name,
+            attempt,
+        )
+    }) {
+        return Some(candidate);
+    }
     aivpn_common::mask::bootstrap_candidate_for_attempt(&trusted, preshared_key, attempt)
 }
 
@@ -470,6 +518,9 @@ mod tests {
     #[test]
     fn repeated_short_data_stalls_advance_the_signed_candidate() {
         use ed25519_dalek::Signer;
+        let _cache_guard = STICKY_MASK_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let previous_round = DATA_EXPLORATION_ROUND.swap(0, Ordering::Relaxed);
         let previous_streak = DATA_STALL_STREAK.swap(0, Ordering::Relaxed);
         let previous_sticky = LAST_GOOD_MASK.lock().unwrap().take();
@@ -572,5 +623,87 @@ mod tests {
         let desc = make_desc();
         let err = store_verified_descriptor(desc, None).unwrap_err();
         assert!(err.to_string().contains("production-secure"), "{err}");
+    }
+}
+
+#[cfg(test)]
+mod preferred_reconnect_tests {
+    use super::*;
+    use aivpn_common::mask::{preset_masks, SpoofProtocol};
+    use ed25519_dalek::Signer;
+
+    #[test]
+    fn preferred_reconnect_cache_rechecks_signatures_and_preserves_exact_slots() {
+        let now = current_unix_secs();
+        let owner = ed25519_dalek::SigningKey::from_bytes(&[71; 32]);
+        let foreign = ed25519_dalek::SigningKey::from_bytes(&[72; 32]);
+        let make = |id: &str, base: &str, signing: &ed25519_dalek::SigningKey| {
+            let mut descriptor = BootstrapDescriptor {
+                descriptor_id: id.into(),
+                version: 1,
+                created_at: now - 1,
+                expires_at: now + 3600,
+                base_mask_ids: vec![],
+                embedded_masks: vec![preset_masks::by_id(base).unwrap()],
+                candidate_count: 2,
+                kdf_salt: [73; 32],
+                signature: [0; 64],
+            };
+            descriptor.signature = signing.sign(&descriptor.signing_bytes()).to_bytes();
+            descriptor
+        };
+        let other = make("foreign-quic", "quic_https_v2", &foreign);
+        let rtc = make("owner-rtc", "webrtc_zoom_v3", &owner);
+        let quic = make("owner-quic", "quic_https_v2", &owner);
+        let descriptors = [other.clone(), rtc.clone(), quic.clone()];
+        let original: Vec<_> = descriptors
+            .iter()
+            .map(BootstrapDescriptor::signing_bytes)
+            .collect();
+        let psk = [74; 32];
+        let key = owner.verifying_key().to_bytes();
+        let pool = aivpn_common::mask::derive_bootstrap_candidates(&quic, Some(&psk));
+        for attempt in [0, 3, 6, u32::MAX] {
+            let mask = select_cached_candidate_with_preference(
+                &descriptors,
+                Some(&psk),
+                attempt,
+                Some(&key),
+                2,
+                Some("quic_https_v2"),
+            )
+            .unwrap();
+            assert_eq!(mask.spoof_protocol, SpoofProtocol::QUIC);
+            assert!(mask.mask_id.starts_with("bootstrap:owner-quic:"));
+            assert!(pool
+                .iter()
+                .any(|candidate| rmp_serde::to_vec(candidate).unwrap()
+                    == rmp_serde::to_vec(&mask).unwrap()));
+        }
+        assert_eq!(
+            descriptors
+                .iter()
+                .map(BootstrapDescriptor::signing_bytes)
+                .collect::<Vec<_>>(),
+            original
+        );
+        let mut tampered = quic;
+        tampered.kdf_salt[0] ^= 1;
+        let untrusted = [other, rtc, tampered];
+        let opening = select_cached_candidate_with_preference(
+            &untrusted,
+            Some(&psk),
+            0,
+            Some(&key),
+            0,
+            Some("quic_https_v2"),
+        )
+        .unwrap();
+        assert!(opening.mask_id.starts_with("bootstrap:owner-rtc:"));
+        assert_eq!(
+            aivpn_common::mask::post_pfs_mask_preference(Some("quic_https_v2"), None, &opening)
+                .as_deref(),
+            Some("quic_https_v2")
+        );
     }
 }

@@ -69,6 +69,13 @@ enum Verb {
     Route6DelDev,
     Route6AddDev,
     Route6AddViaDev,
+    // Только собственные /1 и обход сервера /128 с фиксированными proto/metric.
+    Route6OwnedBlockAdd,
+    Route6OwnedBlockDel,
+    Route6OwnedTunAdd,
+    Route6OwnedTunDel,
+    Route6OwnedBypassAdd,
+    Route6OwnedBypassDel,
     SplitAdd,
     SplitDel,
     /// `ip addr replace <CIDR> dev <IFACE>`
@@ -120,6 +127,12 @@ impl Verb {
             "route6_del" => Verb::Route6DelDev,
             "route6_add" => Verb::Route6AddDev,
             "route6_add_via" => Verb::Route6AddViaDev,
+            "route6_owned_block_add" => Verb::Route6OwnedBlockAdd,
+            "route6_owned_block_del" => Verb::Route6OwnedBlockDel,
+            "route6_owned_tun_add" => Verb::Route6OwnedTunAdd,
+            "route6_owned_tun_del" => Verb::Route6OwnedTunDel,
+            "route6_owned_bypass_add" => Verb::Route6OwnedBypassAdd,
+            "route6_owned_bypass_del" => Verb::Route6OwnedBypassDel,
             "split_add" => Verb::SplitAdd,
             "split_del" => Verb::SplitDel,
             "addr_replace" => Verb::AddrReplaceDev,
@@ -152,6 +165,9 @@ impl Verb {
             | Verb::Route6DelDev
             | Verb::Route6AddDev => 2,
             Verb::Route6AddViaDev => 3,
+            Verb::Route6OwnedBlockAdd | Verb::Route6OwnedBlockDel => 1,
+            Verb::Route6OwnedTunAdd | Verb::Route6OwnedTunDel => 2,
+            Verb::Route6OwnedBypassAdd | Verb::Route6OwnedBypassDel => 3,
             Verb::SplitAdd | Verb::SplitDel => 3,
             Verb::AddrReplaceDev => 2,                   // CIDR, IFACE
             Verb::AddrDelDev => 2,                       // CIDR, IFACE
@@ -320,6 +336,67 @@ fn parse_line(line: &str, line_no: usize) -> Result<ParsedCommand, String> {
             args
         }
 
+        Verb::Route6OwnedBlockAdd
+        | Verb::Route6OwnedBlockDel
+        | Verb::Route6OwnedTunAdd
+        | Verb::Route6OwnedTunDel
+        | Verb::Route6OwnedBypassAdd
+        | Verb::Route6OwnedBypassDel => {
+            let block = matches!(verb, Verb::Route6OwnedBlockAdd | Verb::Route6OwnedBlockDel);
+            let bypass = matches!(
+                verb,
+                Verb::Route6OwnedBypassAdd | Verb::Route6OwnedBypassDel
+            );
+            let prefix = rest[0];
+            if if bypass {
+                !prefix
+                    .strip_suffix("/128")
+                    .is_some_and(|address| address.parse::<std::net::Ipv6Addr>().is_ok())
+            } else {
+                !matches!(prefix, "::/1" | "8000::/1")
+            } {
+                return Err("Недопустимый префикс собственного маршрута IPv6".into());
+            }
+            let action = if matches!(
+                verb,
+                Verb::Route6OwnedBlockDel | Verb::Route6OwnedTunDel | Verb::Route6OwnedBypassDel
+            ) {
+                "del"
+            } else {
+                "add"
+            };
+            let mut args: Vec<String> = ["-6", "route", action]
+                .into_iter()
+                .map(str::to_owned)
+                .collect();
+            if block {
+                args.push("blackhole".into());
+            }
+            args.push(prefix.into());
+            if !block {
+                if !is_valid_iface(rest[1]) {
+                    return Err("Неверный интерфейс собственного маршрута IPv6".into());
+                }
+                args.extend(["dev", rest[1]].into_iter().map(str::to_owned));
+            }
+            if bypass && rest[2] != "-" {
+                if rest[2].parse::<std::net::Ipv6Addr>().is_err() {
+                    return Err("Неверный шлюз собственного обхода IPv6".into());
+                }
+                args.extend(["via", rest[2]].into_iter().map(str::to_owned));
+            }
+            args.extend(
+                [
+                    "proto",
+                    "242",
+                    "metric",
+                    if block || bypass { "1" } else { "2" },
+                ]
+                .into_iter()
+                .map(str::to_owned),
+            );
+            args
+        }
         Verb::SplitAdd | Verb::SplitDel => {
             let (cidr, device, gateway) = (rest[0], rest[1], rest[2]);
             let (address, prefix) = cidr.split_once('/').ok_or("split route requires CIDR")?;
@@ -622,6 +699,95 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn owned_ipv6_routes_preserve_exact_selectors() {
+        for action in ["add", "del"] {
+            for prefix in ["::/1", "8000::/1"] {
+                let block =
+                    parse_line(&format!("v6\troute6_owned_block_{action}\t{prefix}"), 1).unwrap();
+                assert_eq!(
+                    block.argv,
+                    [
+                        "-6",
+                        "route",
+                        action,
+                        "blackhole",
+                        prefix,
+                        "proto",
+                        "242",
+                        "metric",
+                        "1"
+                    ]
+                );
+                let tun = parse_line(&format!("v6\troute6_owned_tun_{action}\t{prefix}\ttun0"), 1)
+                    .unwrap();
+                assert_eq!(
+                    tun.argv,
+                    ["-6", "route", action, prefix, "dev", "tun0", "proto", "242", "metric", "2"]
+                );
+            }
+            let direct = parse_line(
+                &format!("v6\troute6_owned_bypass_{action}\t2001:db8::7/128\teth0\t-"),
+                1,
+            )
+            .unwrap();
+            assert_eq!(
+                direct.argv,
+                [
+                    "-6",
+                    "route",
+                    action,
+                    "2001:db8::7/128",
+                    "dev",
+                    "eth0",
+                    "proto",
+                    "242",
+                    "metric",
+                    "1"
+                ]
+            );
+            let via = parse_line(
+                &format!("v6\troute6_owned_bypass_{action}\t2001:db8::7/128\teth0\tfe80::1"),
+                1,
+            )
+            .unwrap();
+            assert_eq!(
+                via.argv,
+                [
+                    "-6",
+                    "route",
+                    action,
+                    "2001:db8::7/128",
+                    "dev",
+                    "eth0",
+                    "via",
+                    "fe80::1",
+                    "proto",
+                    "242",
+                    "metric",
+                    "1"
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn owned_ipv6_verbs_reject_broader_routes_and_extra_arguments() {
+        for line in [
+            "v6\troute6_owned_block_add\t::/0",
+            "v6\troute6_owned_block_del\t::/1\t99",
+            "v6\troute6_owned_tun_add\t2001:db8::/64\ttun0",
+            "v6\troute6_owned_tun_del\t::/1\t--help",
+            "v6\troute6_owned_bypass_add\t2001:db8::/64\teth0\t-",
+            "v6\troute6_owned_bypass_del\t192.0.2.7/128\teth0\t-",
+            "v6\troute6_owned_bypass_add\t2001:db8::7/128\teth0\t192.0.2.1",
+            "v6\troute6_owned_bypass_del\t2001:db8::7/128\teth0;id\t-",
+            "v6\troute6_owned_bypass_add\t2001:db8::7/128\teth0\t-\t254",
+        ] {
+            assert!(parse_line(line, 1).is_err(), "{line}");
+        }
+    }
 
     #[test]
     fn mtu_command_is_validated_before_execution() {

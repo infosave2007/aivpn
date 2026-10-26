@@ -39,11 +39,11 @@ import org.json.JSONArray
 class ServerSettingsActivity : AppCompatActivity() {
 
     private lateinit var binding: ActivityServerSettingsBinding
+    private val loader = ScreenLoader()
 
     /** One `mask_id` per fetched option — see [fetchMaskOptions]. */
     private data class MaskOption(val id: String, val label: String, val generated: Boolean)
-
-    private var maskOptions: List<MaskOption> = emptyList()
+    private data class MaskOptionsResult(val options: List<MaskOption>, val error: MgmtResult? = null)
 
     /**
      * One row per client from `GET /api/v1/clients`, for the mask section's
@@ -54,7 +54,8 @@ class ServerSettingsActivity : AppCompatActivity() {
      */
     private data class ClientOption(val id: String, val name: String)
 
-    private var clientOptions: List<ClientOption> = emptyList()
+    private data class SettingsOptions(val clients: List<ClientOption>, val masks: List<MaskOption>)
+    private val optionsSnapshot = ScreenSnapshot<SettingsOptions>()
 
     private lateinit var maskSection: PendingSection
     private lateinit var exitSection: PendingSection
@@ -107,7 +108,7 @@ class ServerSettingsActivity : AppCompatActivity() {
             val fieldEnabled = !binding.checkClearExitNode.isChecked
             binding.editExitNode.isEnabled = fieldEnabled
             binding.editExitNode.enclosingInput()?.isEnabled = fieldEnabled
-            binding.btnApplyExit.isEnabled = !exitBusy && (binding.checkClearExitNode.isChecked || binding.editExitNode.text.toString().trim().isNotEmpty())
+            updateActionButtons()
         }
         binding.editExitNode.doAfterTextChanged { updateExitAction() }
         binding.checkClearExitNode.setOnCheckedChangeListener { _, _ -> updateExitAction() }
@@ -129,8 +130,11 @@ class ServerSettingsActivity : AppCompatActivity() {
                 if (remaining > 0) exitSection.resume(tok, remaining)
             }
         }
+    }
 
-        loadOptions()
+    override fun onResume() {
+        super.onResume()
+        if (::binding.isInitialized) loadOptions()
     }
 
     override fun onSaveInstanceState(outState: Bundle) {
@@ -164,50 +168,100 @@ class ServerSettingsActivity : AppCompatActivity() {
     // ──────────── Mask options (spinner data source) ────────────
 
     private fun loadOptions() {
+        invalidateOptions()
         lifecycleScope.launch {
-            val statusResult = AdminApi.status()
-            binding.textNotConnected.visibility = if (statusResult.notConnected) View.VISIBLE else View.GONE
-
-            val clients = fetchClientOptions()
-            clientOptions = clients
-            if (clients.isEmpty()) {
-                binding.spinnerMaskClient.visibility = View.GONE
-                binding.textMaskClientEmpty.visibility = View.VISIBLE
-            } else {
-                binding.textMaskClientEmpty.visibility = View.GONE
-                binding.spinnerMaskClient.visibility = View.VISIBLE
-                binding.spinnerMaskClient.adapter = spinnerAdapter(
-                    clients.map { if (it.name.isNotBlank() && it.name != it.id) "${it.name} (${it.id})" else it.id }
-                )
-            }
-
-            val options = fetchMaskOptions()
-            maskOptions = options
-            if (options.isEmpty()) {
-                binding.spinnerMask.visibility = View.GONE
-                binding.editMaskCustom.showField(true)
-                binding.textMaskEmpty.visibility = View.VISIBLE
-            } else {
-                binding.textMaskEmpty.visibility = View.GONE
-                binding.editMaskCustom.showField(false)
-                binding.spinnerMask.visibility = View.VISIBLE
-                val labels = options.map {
-                    if (it.generated) it.label + getString(R.string.mask_auto_marker) else it.label
+            loader.load currentLoad@{ isCurrent ->
+                binding.btnRefresh.isEnabled = false
+                try {
+                    val statusResult = AdminApi.status()
+                    if (!isCurrent()) return@currentLoad
+                    if (!statusResult.ok) {
+                        showLoadError(statusResult)
+                        return@currentLoad
+                    }
+                    val clientsResult = AdminApi.listClients()
+                    if (!isCurrent()) return@currentLoad
+                    if (!clientsResult.ok || clientsResult.bodyArray() == null) {
+                        showLoadError(clientsResult)
+                        return@currentLoad
+                    }
+                    val clients = parseClientOptions(clientsResult)
+                    val masks = fetchMaskOptions()
+                    if (!isCurrent()) return@currentLoad
+                    if (masks.error != null) {
+                        showLoadError(masks.error)
+                        return@currentLoad
+                    }
+                    if (!optionsSnapshot.publish(SettingsOptions(clients, masks.options), isCurrent)) {
+                        return@currentLoad
+                    }
+                    binding.spinnerMaskClient.isEnabled = true
+                    binding.spinnerMask.isEnabled = true
+                    if (clients.isEmpty()) {
+                        binding.spinnerMaskClient.visibility = View.GONE
+                        binding.textMaskClientEmpty.visibility = View.VISIBLE
+                    } else {
+                        binding.textMaskClientEmpty.visibility = View.GONE
+                        binding.spinnerMaskClient.visibility = View.VISIBLE
+                        binding.spinnerMaskClient.adapter = spinnerAdapter(
+                            clients.map { if (it.name.isNotBlank() && it.name != it.id) "${it.name} (${it.id})" else it.id }
+                        )
+                    }
+                    val options = masks.options
+                    if (options.isEmpty()) {
+                        binding.spinnerMask.visibility = View.GONE
+                        binding.editMaskCustom.showField(true)
+                        binding.textMaskEmpty.visibility = View.VISIBLE
+                    } else {
+                        binding.textMaskEmpty.visibility = View.GONE
+                        binding.editMaskCustom.showField(false)
+                        binding.spinnerMask.visibility = View.VISIBLE
+                        val labels = options.map {
+                            if (it.generated) it.label + getString(R.string.mask_auto_marker) else it.label
+                        }
+                        binding.spinnerMask.adapter = spinnerAdapter(labels)
+                    }
+                    binding.textNotConnected.visibility = View.GONE
+                    updateActionButtons()
+                } finally {
+                    binding.btnRefresh.isEnabled = true
                 }
-                binding.spinnerMask.adapter = spinnerAdapter(labels)
             }
         }
     }
 
-    /**
-     * Client rows for the mask section's client picker, from
-     * `GET /api/v1/clients` (same route [AdminActivity] lists). Returns an
-     * empty list (never throws) on any failure — the caller then hides the
-     * picker and [onApplyMask] refuses to send (an apply without a client is
-     * guaranteed to 400 server-side, see [ClientOption]).
-     */
-    private suspend fun fetchClientOptions(): List<ClientOption> {
-        val result = AdminApi.listClients()
+    private fun showLoadError(result: MgmtResult) {
+        invalidateOptions()
+        binding.textNotConnected.text = managementErrorMessage(result)
+        binding.textNotConnected.visibility = View.VISIBLE
+    }
+
+    private fun invalidateOptions() {
+        optionsSnapshot.invalidate()
+        binding.spinnerMaskClient.adapter = null
+        binding.spinnerMask.adapter = null
+        binding.spinnerMaskClient.isEnabled = false
+        binding.spinnerMask.isEnabled = false
+        binding.spinnerMaskClient.visibility = View.GONE
+        binding.spinnerMask.visibility = View.GONE
+        binding.textMaskClientEmpty.visibility = View.GONE
+        binding.textMaskEmpty.visibility = View.GONE
+        updateActionButtons()
+    }
+
+    private fun updateActionButtons() {
+        if (!::maskSection.isInitialized || !::exitSection.isInitialized) return
+        val options = optionsSnapshot.value
+        binding.btnApplyMask.isEnabled = options != null && options.clients.isNotEmpty() &&
+            !maskBusy && maskSection.token == null
+        binding.btnConfirmMask.isEnabled = options != null && !maskBusy && maskSection.token != null
+        binding.btnApplyExit.isEnabled = options != null && !exitBusy && exitSection.token == null &&
+            (binding.checkClearExitNode.isChecked || binding.editExitNode.text.toString().trim().isNotEmpty())
+        binding.btnConfirmExit.isEnabled = options != null && !exitBusy && exitSection.token != null
+    }
+
+    /** Разбирает загруженный список клиентов для выбора маски. */
+    private fun parseClientOptions(result: MgmtResult): List<ClientOption> {
         if (!result.ok) return emptyList()
         val arr = result.bodyArray() ?: return emptyList()
         val out = mutableListOf<ClientOption>()
@@ -221,25 +275,13 @@ class ServerSettingsActivity : AppCompatActivity() {
     }
 
     /**
-     * Two sources, tried in order:
-     *
-     * 1. `GET /api/v1/masks` via [AdminApi.listMasks] — the documented contract
-     *    (`id`/`file`/`size_bytes`/`modified`/`generated`). As of this wave this
-     *    route is NOT in the tunnel's curated allowlist (verified against
-     *    `mgmt_service.rs::classify_route`), so it currently always 404s — kept
-     *    first so this screen starts working with zero Android changes the day
-     *    that route is added server-side.
-     * 2. [AivpnJni.getMaskCatalogJson] — the `MaskCatalog` control message the
-     *    server already pushes to every connected session (`mask_id`/`label`/
-     *    `generated`), the SAME source [MainActivity]'s connect-time mask picker
-     *    reads. This is what actually populates the spinner today.
-     *
-     * Returns an empty list (never throws) if both sources are empty/unavailable
-     * — the caller then falls back to a free-text mask-id field, same
-     * graceful-degradation convention [AdminActivity.fetchExitNodeOptions] uses.
+     * При недоступном API использует каталог текущей туннельной сессии.
+     * Старые серверы возвращают 404 для этого маршрута даже при доступном
+     * каталоге сессии. Другие ошибки остаются видны вместе с запасным каталогом.
      */
-    private suspend fun fetchMaskOptions(): List<MaskOption> {
+    private suspend fun fetchMaskOptions(): MaskOptionsResult {
         val restResult = AdminApi.listMasks()
+        val error = if (!restResult.ok || restResult.bodyArray() == null) restResult else null
         if (restResult.ok) {
             val arr = restResult.bodyArray()
             if (arr != null && arr.length() > 0) {
@@ -250,7 +292,7 @@ class ServerSettingsActivity : AppCompatActivity() {
                     if (id.isEmpty()) continue
                     out.add(MaskOption(id = id, label = id, generated = o.optBoolean("generated", false)))
                 }
-                if (out.isNotEmpty()) return out
+                if (out.isNotEmpty()) return MaskOptionsResult(out)
             }
         }
 
@@ -265,18 +307,21 @@ class ServerSettingsActivity : AppCompatActivity() {
                     if (id.isEmpty() || id == "auto") continue
                     out.add(MaskOption(id = id, label = o.optString("label", id), generated = o.optBoolean("generated", false)))
                 }
-                if (out.isNotEmpty()) return out
+                if (out.isNotEmpty()) return MaskOptionsResult(out, error?.takeUnless { it.status == 404 })
             } catch (_: Throwable) {
-                // Malformed catalog JSON — fall through to the empty-list caller fallback.
+                // При некорректном каталоге остается ручной ввод маски.
             }
         }
-        return emptyList()
+        return MaskOptionsResult(emptyList(), error)
     }
 
     // ──────────── Active mask apply/confirm ────────────
 
     private fun onApplyMask() {
-        if (maskBusy) return
+        if (maskBusy || maskSection.token != null) return
+        val options = optionsSnapshot.value ?: return
+        val clientOptions = options.clients
+        val maskOptions = options.masks
         val clientPos = binding.spinnerMaskClient.selectedItemPosition
         val clientId = if (clientPos in clientOptions.indices) clientOptions[clientPos].id else ""
         if (clientId.isEmpty()) {
@@ -296,24 +341,24 @@ class ServerSettingsActivity : AppCompatActivity() {
             return
         }
         maskBusy = true
-        binding.btnApplyMask.isEnabled = false
+        updateActionButtons()
         lifecycleScope.launch {
             val result = AdminApi.applyActiveMask(clientId, maskId)
             maskBusy = false
-            binding.btnApplyMask.isEnabled = true
+            updateActionButtons()
             handleApplyResult(result, maskSection)
         }
     }
 
     private fun onConfirmMask() {
-        if (maskBusy) return
+        if (maskBusy || optionsSnapshot.value == null) return
         val token = maskSection.token ?: return
         maskBusy = true
-        binding.btnConfirmMask.isEnabled = false
+        updateActionButtons()
         lifecycleScope.launch {
             val result = AdminApi.confirmConfig(token)
             maskBusy = false
-            binding.btnConfirmMask.isEnabled = true
+            updateActionButtons()
             handleConfirmResult(result, maskSection, token)
         }
     }
@@ -321,28 +366,28 @@ class ServerSettingsActivity : AppCompatActivity() {
     // ──────────── Global default exit apply/confirm ────────────
 
     private fun onApplyExit() {
-        if (exitBusy) return
+        if (exitBusy || exitSection.token != null || optionsSnapshot.value == null) return
         val addr = binding.editExitNode.text.toString().trim()
         if (!binding.checkClearExitNode.isChecked && addr.isEmpty()) return
         exitBusy = true
-        binding.btnApplyExit.isEnabled = false
+        updateActionButtons()
         lifecycleScope.launch {
             val result = AdminApi.applyGlobalExitNode(if (binding.checkClearExitNode.isChecked) null else addr)
             exitBusy = false
-            binding.btnApplyExit.isEnabled = binding.checkClearExitNode.isChecked || binding.editExitNode.text.toString().trim().isNotEmpty()
+            updateActionButtons()
             handleApplyResult(result, exitSection)
         }
     }
 
     private fun onConfirmExit() {
-        if (exitBusy) return
+        if (exitBusy || optionsSnapshot.value == null) return
         val token = exitSection.token ?: return
         exitBusy = true
-        binding.btnConfirmExit.isEnabled = false
+        updateActionButtons()
         lifecycleScope.launch {
             val result = AdminApi.confirmConfig(token)
             exitBusy = false
-            binding.btnConfirmExit.isEnabled = true
+            updateActionButtons()
             handleConfirmResult(result, exitSection, token)
         }
     }
@@ -351,46 +396,31 @@ class ServerSettingsActivity : AppCompatActivity() {
 
     private fun handleApplyResult(result: MgmtResult, section: PendingSection) {
         when {
-            result.notConnected -> Toast.makeText(this, getString(R.string.admin_not_connected), Toast.LENGTH_SHORT).show()
             result.ok -> {
                 val token = result.bodyObject()?.optString("token", "") ?: ""
                 if (token.isEmpty()) {
-                    Toast.makeText(this, getString(R.string.admin_error_generic, result.status), Toast.LENGTH_SHORT).show()
+                    Toast.makeText(this, managementErrorMessage(result), Toast.LENGTH_LONG).show()
                 } else {
                     section.start(token)
                 }
             }
-            else -> Toast.makeText(this, describeError(result), Toast.LENGTH_LONG).show()
+            else -> Toast.makeText(this, managementErrorMessage(result), Toast.LENGTH_LONG).show()
         }
     }
 
     private fun handleConfirmResult(result: MgmtResult, section: PendingSection, expectedToken: String) {
-        // The section may already have moved on to a NEWER token (a fresh Apply
-        // that fired while this Confirm was in flight, or the countdown already
-        // hit zero and self-reverted) — only touch it if it still matches.
+        // Ответ старого подтверждения не должен менять состояние нового токена.
         if (section.token != expectedToken) return
         when {
-            result.notConnected -> Toast.makeText(this, getString(R.string.admin_not_connected), Toast.LENGTH_SHORT).show()
             result.ok -> {
                 section.confirmed()
                 Toast.makeText(this, getString(R.string.server_settings_confirmed), Toast.LENGTH_SHORT).show()
             }
-            else -> {
-                // 404/409 here means the confirm window already closed and the
-                // server auto-rolled back before this request even landed.
+            result.status == 404 || result.status == 409 -> {
                 section.revert(showToast = false)
-                Toast.makeText(this, getString(R.string.server_settings_reverted), Toast.LENGTH_LONG).show()
+                Toast.makeText(this, managementErrorMessage(result), Toast.LENGTH_LONG).show()
             }
-        }
-    }
-
-    private fun describeError(result: MgmtResult): String {
-        val reason = result.bodyObject()?.optString("reason")
-            ?: result.bodyObject()?.optString("error")
-        return if (!reason.isNullOrBlank()) {
-            getString(R.string.admin_error_with_reason, result.status, reason)
-        } else {
-            getString(R.string.admin_error_generic, result.status)
+            else -> Toast.makeText(this, managementErrorMessage(result), Toast.LENGTH_LONG).show()
         }
     }
 
@@ -441,7 +471,7 @@ class ServerSettingsActivity : AppCompatActivity() {
             remainingMs = durationMs
             bannerRow.visibility = View.VISIBLE
             applyBtn.isEnabled = false
-            confirmBtn.isEnabled = true
+            confirmBtn.isEnabled = optionsSnapshot.value != null
             renderBanner(durationMs)
             timer = object : android.os.CountDownTimer(durationMs, 1000L) {
                 override fun onTick(millisUntilFinished: Long) {
@@ -465,7 +495,7 @@ class ServerSettingsActivity : AppCompatActivity() {
             token = null
             remainingMs = 0L
             bannerRow.visibility = View.GONE
-            applyBtn.isEnabled = true
+            updateActionButtons()
         }
 
         /** Timed out (or the server already reported it as gone) — clear pending state. */
@@ -474,7 +504,7 @@ class ServerSettingsActivity : AppCompatActivity() {
             token = null
             remainingMs = 0L
             bannerRow.visibility = View.GONE
-            applyBtn.isEnabled = true
+            updateActionButtons()
             if (showToast) {
                 Toast.makeText(this@ServerSettingsActivity, getString(R.string.server_settings_reverted), Toast.LENGTH_LONG).show()
             }

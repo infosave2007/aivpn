@@ -266,8 +266,19 @@ pub(crate) async fn send_to(
     packet: &[u8],
     peer: SocketAddr,
 ) -> io::Result<usize> {
+    send_from(socket, packet, peer, sources.get(peer)).await
+}
+
+/// Ответ transport использует только локальный destination принятого Initial.
+/// Глобальная привязка VPN меняется отдельно после AEAD и replay.
+pub(crate) async fn send_from(
+    socket: &UdpSocket,
+    packet: &[u8],
+    peer: SocketAddr,
+    source: Option<LocalEndpoint>,
+) -> io::Result<usize> {
     #[cfg(target_os = "linux")]
-    if let Some(source) = sources.get(peer) {
+    if let Some(source) = source {
         use std::os::fd::AsRawFd;
         loop {
             socket.writable().await?;
@@ -300,7 +311,7 @@ pub(crate) async fn send_to(
         }
     }
     #[cfg(not(target_os = "linux"))]
-    let _ = sources;
+    let _ = source;
     socket.send_to(packet, peer).await
 }
 

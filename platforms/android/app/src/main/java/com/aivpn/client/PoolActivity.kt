@@ -32,6 +32,7 @@ import java.util.TimeZone
 class PoolActivity : AppCompatActivity() {
 
     private lateinit var binding: ActivityPoolBinding
+    private val loader = ScreenLoader()
 
     private val dateFormat = SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.US).apply {
         timeZone = TimeZone.getTimeZone("UTC")
@@ -44,8 +45,6 @@ class PoolActivity : AppCompatActivity() {
 
         binding.btnBack.setOnClickListener { finish() }
         binding.btnRefresh.setOnClickListener { load() }
-
-        load()
     }
 
     override fun onResume() {
@@ -55,37 +54,36 @@ class PoolActivity : AppCompatActivity() {
 
     private fun load() {
         lifecycleScope.launch {
-            val nodesResult = AdminApi.poolNodes()
-            if (nodesResult.notConnected) {
-                binding.textNotConnected.visibility = View.VISIBLE
-                binding.cardHealth.visibility = View.GONE
-                binding.textWarning.visibility = View.GONE
-                binding.textEmpty.visibility = View.GONE
-                binding.containerNodes.removeAllViews()
-                return@launch
+            loader.load currentLoad@{ isCurrent ->
+                binding.btnRefresh.isEnabled = false
+                try {
+                    val snapshot = loadPoolSnapshot(AdminApi::poolNodes, AdminApi::poolHealth, isCurrent)
+                    if (!isCurrent()) return@currentLoad
+                    val nodes = if (snapshot.nodes.ok) snapshot.nodes.bodyArray() else null
+                    if (nodes == null) {
+                        binding.textNotConnected.text = managementErrorMessage(snapshot.nodes)
+                        binding.textNotConnected.visibility = View.VISIBLE
+                        binding.cardHealth.visibility = View.GONE
+                        binding.textWarning.visibility = View.GONE
+                        binding.textEmpty.visibility = View.GONE
+                        binding.containerNodes.removeAllViews()
+                        return@currentLoad
+                    }
+                    binding.textNotConnected.visibility = View.GONE
+                    renderNodes(nodes)
+                    snapshot.health?.let { renderHealth(it) }
+                } finally {
+                    binding.btnRefresh.isEnabled = true
+                }
             }
-            binding.textNotConnected.visibility = View.GONE
-
-            val healthResult = AdminApi.poolHealth()
-
-            if (!nodesResult.ok) {
-                android.widget.Toast.makeText(
-                    this@PoolActivity,
-                    getString(R.string.admin_error_generic, nodesResult.status),
-                    android.widget.Toast.LENGTH_SHORT
-                ).show()
-                return@launch
-            }
-
-            renderHealth(healthResult)
-            renderNodes(nodesResult.bodyArray())
         }
     }
 
     private fun renderHealth(healthResult: MgmtResult) {
         val health = if (healthResult.ok) healthResult.bodyObject() else null
         if (health == null) {
-            binding.cardHealth.visibility = View.GONE
+            binding.cardHealth.visibility = View.VISIBLE
+            binding.textHealth.text = getString(R.string.pool_health_error, managementErrorMessage(healthResult))
             binding.textWarning.visibility = View.GONE
             return
         }

@@ -1,53 +1,52 @@
-//! In-tunnel management-API client: `MgmtRequest`/`MgmtResponse` correlation
-//! and the cached server-assigned role, shared by every client implementation
-//! (desktop `aivpn-client`, `aivpn-ios-core`, `aivpn-android-core`).
+//! Общий клиент управления внутри туннеля для desktop, iOS и Android.
+//! Сопоставляет `MgmtRequest` с `MgmtResponse` и запоминает роль от сервера.
 //!
-//! Originally landed only in `aivpn-client` (P2.1); hoisted here (P2.R) so the
-//! mobile cores — which depend on `aivpn-common` but NOT on `aivpn-client` —
-//! can reach the same correlation logic instead of re-implementing it.
-//!
-//! [`MgmtClient`] owns just the correlation state (pending requests, the
-//! `req_id` allocator, the cached role). It does not own a control channel:
-//! callers pass their own `tokio::sync::mpsc::Sender<ControlPayload>` into
-//! [`MgmtClient::mgmt_call`] so each embedder can wire it to whatever
-//! transport it already has (the desktop client's `control_tx`, a mobile
-//! core's equivalent channel, ...).
+//! [`MgmtClient`] хранит общую очередь отправки, ожидающие ответы, счетчик
+//! `req_id` и роль сервера. Канал управления принадлежит вызывающему коду:
+//! [`MgmtClient::mgmt_call`] получает `tokio::sync::mpsc::Sender<ControlPayload>`
+//! существующего транспорта, общего с остальными управляющими сообщениями.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch, Semaphore};
+use tokio::time::Instant;
 
 use crate::error::{Error, Result};
 use crate::protocol::ControlPayload;
 
-/// In-tunnel management-API client state: in-flight `MgmtRequest`s awaiting
-/// their correlated `MgmtResponse`, the `req_id` allocator, and the cached
-/// server-assigned role from the last `Capabilities` control message.
-///
-/// Cheaply cloneable (all fields are `Arc`-wrapped) so it can be shared
-/// between the session loop (which feeds it inbound `Capabilities` /
-/// `MgmtResponse` control messages) and embedders calling `mgmt_call`
-/// concurrently (FFI, admin-socket bridge) while only holding a shared
-/// reference.
+// Сервер допускает запрос раз в 200 мс; запас учитывает округление его часов.
+const REQUEST_INTERVAL: Duration = Duration::from_millis(210);
+const MAX_GET_RETRIES: usize = 2;
+const MAX_ACTIVE_REQUESTS: usize = 64;
+
+type PendingRequests = Arc<Mutex<HashMap<u32, oneshot::Sender<(u16, Vec<u8>)>>>>;
+
+/// Очередь управления, ожидающие ответы и роль из последнего `Capabilities`.
+/// Все клоны разделяют состояние: цикл сессии передает сюда входящие ответы,
+/// а FFI и локальный API могут одновременно вызывать `mgmt_call`.
 #[derive(Clone)]
 pub struct MgmtClient {
-    /// In-flight `MgmtRequest`s awaiting their correlated `MgmtResponse`,
-    /// keyed by `req_id`. `mgmt_call` registers a oneshot here before
-    /// enqueuing the request; `on_mgmt_response` resolves it when the
-    /// matching `MgmtResponse` arrives. An unmatched `req_id` (already timed
-    /// out / unknown) is silently dropped. `std::sync::Mutex` is fine here —
-    /// the critical section is a single HashMap insert/remove, never held
-    /// across an `.await`.
-    pending: Arc<Mutex<HashMap<u32, oneshot::Sender<(u16, Vec<u8>)>>>>,
+    /// Ответы по `req_id`. Запись создается перед фактической отправкой.
+    /// Mutex также не дает reset вклиниться между проверкой поколения
+    /// и передачей запроса в канал; во время await он не удерживается.
+    pending: PendingRequests,
     /// Monotonically increasing `req_id` allocator for `mgmt_call`.
     req_seq: Arc<AtomicU32>,
     /// Cached server-assigned role (0=User,1=Viewer,2=Admin) from the last
     /// `Capabilities` control message, defaulting to User (0) until one
     /// arrives.
     cached_role: Arc<AtomicU8>,
+    /// FIFO-очередь сериализует только отправку, ответы могут приходить параллельно.
+    send_queue: Arc<tokio::sync::Mutex<Option<Instant>>>,
+    /// Лимит административных запросов, общий для отправленных и ожидающих.
+    request_slots: Arc<Semaphore>,
+    /// Окно диагностики не занимает места в административной очереди.
+    diagnostic_slots: Arc<Semaphore>,
+    /// Смена поколения прерывает ожидание очереди, канала, ответа и повтора.
+    session_epoch: watch::Sender<u64>,
 }
 
 impl Default for MgmtClient {
@@ -62,20 +61,22 @@ impl MgmtClient {
             pending: Arc::new(Mutex::new(HashMap::new())),
             req_seq: Arc::new(AtomicU32::new(1)),
             cached_role: Arc::new(AtomicU8::new(0)),
+            send_queue: Arc::new(tokio::sync::Mutex::new(None)),
+            request_slots: Arc::new(Semaphore::new(MAX_ACTIVE_REQUESTS)),
+            diagnostic_slots: Arc::new(Semaphore::new(MAX_ACTIVE_REQUESTS)),
+            session_epoch: watch::channel(0).0,
         }
     }
 
-    /// Clear all in-flight correlation state and reset the cached role to
-    /// User (0). Intended for a session restart (reconnect): any pending
-    /// `mgmt_call` from the previous session is no longer resolvable (its
-    /// `req_id` space and the server-side session it referred to are both
-    /// gone), and the role must be re-learned from a fresh `Capabilities`
-    /// push rather than carrying a stale value across sessions.
+    /// Отменить отправленные и ожидающие запросы старой сессии, сбросить роль
+    /// в User (0). После переподключения роль определяется новым `Capabilities`.
+    /// Счетчик `req_id` сохраняется, чтобы поздние ответы не совпали с новыми.
     pub fn reset(&self) {
-        self.pending
-            .lock()
-            .expect("mgmt pending mutex poisoned")
-            .clear();
+        let mut pending = self.pending.lock().expect("mgmt pending mutex poisoned");
+        // Тот же mutex защищает проверку поколения перед передачей в канал.
+        self.session_epoch
+            .send_modify(|epoch| *epoch = epoch.wrapping_add(1));
+        pending.clear();
         self.cached_role.store(0, Ordering::Relaxed);
     }
 
@@ -111,20 +112,19 @@ impl MgmtClient {
         }
     }
 
-    /// Issue an in-tunnel management API call and await the correlated
-    /// `MgmtResponse`. `method`: 0=GET, 1=POST, 2=PATCH, 3=DELETE, 4=PUT (see
-    /// `ControlPayload::MgmtRequest`). `path` is a curated REST-shaped path
-    /// (e.g. "/api/v1/clients"); `body` is an optional JSON payload.
-    /// `control_tx` is the caller's outbound control channel — the same one
-    /// used for every other outbound control payload (keepalives,
-    /// MaskFeedback, ...), so `MgmtRequest` rides the identical encrypted
-    /// path. `timeout` bounds how long to wait for the response.
+    /// Отправить запрос внутри туннеля и дождаться соответствующего ответа.
+    /// `method`: 0=GET, 1=POST, 2=PATCH, 3=DELETE, 4=PUT. `path` содержит путь
+    /// API (например, "/api/v1/clients"), `body` - необязательное тело JSON.
+    /// Запрос идет через переданный канал существующего транспорта.
+    /// Таймаут включает общую очередь, отправку, ответ и повторы.
+    /// GET повторяется не более двух раз и только после явного статуса 429.
+    /// Остальные методы, таймауты и ошибки канала не повторяются.
+    /// Три маршрута диагностики используют отдельный бюджет сервера:
+    /// они не ждут административный интервал и не повторяются.
     ///
-    /// Resolves to `(status, body)` on a timely response. Returns an error
-    /// if the channel is closed or no response arrives within `timeout` — on
-    /// timeout the pending entry is removed so a very late/duplicate
-    /// response is dropped by `on_mgmt_response` instead of being
-    /// misdelivered.
+    /// Возвращает `(status, body)` либо ошибку канала, таймаута, сброса сессии
+    /// или переполнения очереди. Отмена и таймаут удаляют запись из pending,
+    /// поэтому поздние и повторные ответы отбрасываются.
     pub async fn mgmt_call(
         &self,
         control_tx: &mpsc::Sender<ControlPayload>,
@@ -140,21 +140,24 @@ impl MgmtClient {
                 "Management request exceeds protocol limits",
             ));
         }
-        let req_id = self.req_seq.fetch_add(1, Ordering::Relaxed);
-        let (resp_tx, resp_rx) = oneshot::channel();
-        self.pending
-            .lock()
-            .expect("mgmt pending mutex poisoned")
-            .insert(req_id, resp_tx);
-        // Cancellation-safe cleanup: this future can be dropped at any
-        // `.await` below (embedder-side `select!`/FFI timeout). Without a
-        // Drop-guard the `pending` entry registered above would leak until
-        // `reset()` — every error/cancel path funnels through this guard
-        // instead of hand-removing in each branch. On the success path
-        // `on_mgmt_response` has already removed the entry, so the guard's
-        // extra remove is a harmless no-op.
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .ok_or_else(|| Error::Session("mgmt_call: timeout exceeds clock limits".into()))?;
+        let mut session = self.session_epoch.subscribe();
+        let epoch = *session.borrow_and_update();
+        let diagnostic = crate::diagnostics::is_diagnostic(path);
+        let slots = if diagnostic {
+            &self.diagnostic_slots
+        } else {
+            &self.request_slots
+        };
+        let _slot = slots
+            .try_acquire()
+            .map_err(|_| Error::Session("mgmt_call: management request queue is full".into()))?;
+
+        // При отмене future запись удаляется, даже если внешний select прервал ожидание.
         struct PendingCleanup {
-            pending: Arc<Mutex<HashMap<u32, oneshot::Sender<(u16, Vec<u8>)>>>>,
+            pending: PendingRequests,
             req_id: u32,
         }
         impl Drop for PendingCleanup {
@@ -164,36 +167,101 @@ impl MgmtClient {
                 }
             }
         }
-        let _cleanup = PendingCleanup {
-            pending: self.pending.clone(),
-            req_id,
-        };
-
-        let payload = ControlPayload::MgmtRequest {
-            req_id,
-            method,
-            path: path.to_string(),
-            body,
-        };
-        // Один таймаут ограничивает и очередь отправки, и ожидание ответа.
+        let timeout_error =
+            || Error::Session("mgmt_call: timed out awaiting request queue or MgmtResponse".into());
+        let mut body = body;
         let request = async {
-            control_tx
-                .send(payload)
-                .await
-                .map_err(|e| Error::Channel(e.to_string()))?;
-            resp_rx.await.map_err(|_| {
-                Error::Session("mgmt_call: response channel closed unexpectedly".into())
-            })
+            for attempt in 0..=MAX_GET_RETRIES {
+                let mut pacing = if diagnostic {
+                    None
+                } else {
+                    Some(self.send_queue.lock().await)
+                };
+                if let Some(last_sent) = pacing.as_deref().copied().flatten() {
+                    tokio::time::sleep_until(last_sent + REQUEST_INTERVAL).await;
+                }
+                // Резервирование не кладет команду в заполненный канал после ее отмены.
+                let permit = control_tx
+                    .reserve()
+                    .await
+                    .map_err(|e| Error::Channel(e.to_string()))?;
+                let (resp_tx, resp_rx) = oneshot::channel();
+                let req_id = {
+                    let mut pending = self.pending.lock().expect("mgmt pending mutex poisoned");
+                    if *self.session_epoch.borrow() != epoch {
+                        return Err(Error::Session("mgmt_call: session reset".into()));
+                    }
+                    // timeout_at сначала опрашивает future: просроченную мутацию
+                    // нельзя отправлять даже при готовом разрешении канала.
+                    if Instant::now() >= deadline {
+                        return Err(timeout_error());
+                    }
+                    let mut req_id = self.req_seq.fetch_add(1, Ordering::Relaxed);
+                    while pending.contains_key(&req_id) {
+                        req_id = self.req_seq.fetch_add(1, Ordering::Relaxed);
+                    }
+                    pending.insert(req_id, resp_tx);
+                    permit.send(ControlPayload::MgmtRequest {
+                        req_id,
+                        method,
+                        path: path.to_string(),
+                        body: if method == 0 {
+                            body.clone()
+                        } else {
+                            std::mem::take(&mut body)
+                        },
+                    });
+                    if let Some(last_sent) = pacing.as_deref_mut() {
+                        *last_sent = Some(Instant::now());
+                    }
+                    req_id
+                };
+                let cleanup = PendingCleanup {
+                    pending: self.pending.clone(),
+                    req_id,
+                };
+                drop(pacing);
+
+                let response = resp_rx.await.map_err(|_| {
+                    Error::Session("mgmt_call: response channel closed unexpectedly".into())
+                })?;
+                drop(cleanup);
+                if Instant::now() >= deadline {
+                    return Err(timeout_error());
+                }
+                if diagnostic || method != 0 || response.0 != 429 || attempt == MAX_GET_RETRIES {
+                    return Ok(response);
+                }
+
+                #[derive(serde::Deserialize)]
+                struct RetryAfter {
+                    retry_after_ms: Option<u64>,
+                }
+                let delay = serde_json::from_slice::<RetryAfter>(&response.1)
+                    .ok()
+                    .and_then(|error| error.retry_after_ms)
+                    .map(Duration::from_millis)
+                    .unwrap_or(REQUEST_INTERVAL);
+                let retry_at = Instant::now()
+                    .checked_add(delay)
+                    .unwrap_or(deadline)
+                    .min(deadline);
+                tokio::time::sleep_until(retry_at).await;
+            }
+            unreachable!("Ограниченный цикл всегда возвращает последний ответ")
         };
-        match tokio::time::timeout(timeout, request).await {
-            Ok(result) => result,
-            Err(_) => Err(Error::Session(format!(
-                "mgmt_call: timed out awaiting MgmtResponse for req_id={}",
-                req_id
-            ))),
+        tokio::select! {
+            biased;
+            _ = session.changed() => Err(Error::Session("mgmt_call: session reset".into())),
+            result = tokio::time::timeout_at(deadline, request) => {
+                result.unwrap_or_else(|_| Err(timeout_error()))
+            }
         }
     }
 }
+
+#[cfg(test)]
+mod scheduling_tests;
 
 #[cfg(test)]
 mod tests {

@@ -9,7 +9,7 @@
     <string name="status_error">Error: %s</string>
     <string name="status_native_lib_unavailable">Error: native library unavailable — reinstall the app</string>
     <string name="status_cert_rejected">Server rejected the certificate — re-provisioning required</string>
-    <string name="status_handshake_reject_one_time_used">This one-time key has already been used</string>
+    <string name="status_handshake_reject_one_time_used">This connection key is bound to another device</string>
     <string name="status_handshake_reject_expired">This client key has expired</string>
     <string name="status_handshake_reject_disabled">This client has been disabled by the server</string>
     <string name="status_handshake_reject_unspecified">Server refused the connection</string>
@@ -254,6 +254,22 @@
     <string name="admin_reject_reason_prefix">Rejected: %s</string>
     <string name="admin_error_generic">Request failed (%d)</string>
     <string name="admin_error_with_reason">Request failed (%1$d): %2$s</string>
+    <string name="admin_error_public_endpoint">The server has no public address configured. Its administrator must configure the address used in connection keys.</string>
+    <string name="admin_error_server_key">The server key is not configured. Its administrator must check the server key settings.</string>
+    <string name="admin_error_invalid_request">The server rejected the request parameters. Check the entered values.</string>
+    <string name="admin_error_forbidden">Your server role does not permit this action.</string>
+    <string name="admin_error_not_found">The requested object or action was not found. Refresh the data and check the server version.</string>
+    <string name="admin_error_conflict">The request conflicts with the current server state. Refresh the data and try again.</string>
+    <string name="admin_error_rate_limited">Too many requests. Wait and try again.</string>
+    <string name="admin_error_internal">The server could not complete the request because of an internal error. Try again later.</string>
+    <string name="admin_error_unavailable">The server management service is temporarily unavailable. Try again later.</string>
+    <string name="admin_error_client_database">The server client database is temporarily unavailable. Try again later.</string>
+    <string name="admin_error_unreachable">The server did not respond. Check the VPN connection and try again; the request may have timed out.</string>
+    <string name="admin_error_timeout">The server response timed out. Try again.</string>
+    <string name="admin_error_invalid_response">The server returned an invalid response. Check that the client and server versions are compatible.</string>
+    <string name="admin_error_retry_after">Try again in %d seconds.</string>
+    <string name="admin_error_retry_message">%1$s %2$s</string>
+    <string name="pool_health_error">Could not load pool health: %s</string>
     <string name="admin_hint_exit_node">Exit node (optional, host:port — empty = global default)</string>
     <string name="admin_hint_exit_node_live">Per-client exit applies live, without reconnecting. The global default only applies after a server restart.</string>
     <string name="admin_exit_option_default">(default)</string>

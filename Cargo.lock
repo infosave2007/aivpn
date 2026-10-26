@@ -203,6 +203,7 @@ dependencies = [
  "time",
  "tokio",
  "tracing",
+ "web-time",
  "webrtc-srtp",
  "windows-sys 0.61.2",
  "x25519-dalek",
@@ -272,7 +273,9 @@ dependencies = [
  "reqwest",
  "rmp-serde",
  "serde",
+ "serde_ignored",
  "serde_json",
+ "serde_path_to_error",
  "sha2 0.10.9",
  "socket2 0.5.10",
  "subtle",
@@ -6882,6 +6885,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "serde_ignored"
+version = "0.1.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "115dffd5f3853e06e746965a20dcbae6ee747ae30b543d91b0e089668bb07798"
+dependencies = [
+ "serde",
+ "serde_core",
+]
+
+[[package]]
 name = "serde_json"
 version = "1.0.151"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7773,9 +7786,9 @@ checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
 
 [[package]]
 name = "tokio"
-version = "1.53.1"
+version = "1.53.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "202caea871b69668250d242070849eb495be178ed697a3e98aebce5bc81a0bed"
+checksum = "ce3335fa71841cda333a58d7615b03901380ecf09d59b3296d21f8bbac0dde4e"
 dependencies = [
  "bytes",
  "libc",

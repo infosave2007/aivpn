@@ -283,9 +283,9 @@ impl MimicryEngine {
         // Внешний QUIC собирает движок состояния маски. Здесь остается
         // внутренний пакет и резерв для его DATAGRAM-кадра и AEAD QUIC.
         let packet_budget = if crate::mask_io::needs_state(&self.mask) {
-            if keys.packet_cipher.is_initial()
-                || plaintext.first() == Some(&(InnerType::Control as u8))
-            {
+            // Initial сохраняет малый bootstrap-бюджет. После PFS управление
+            // идет внутри TLS/H3 DATAGRAM с тем же пределом, что DATA/Fragment.
+            if keys.packet_cipher.is_initial() {
                 512
             } else {
                 crate::mask_io::MAX_QUIC_INNER
@@ -544,6 +544,185 @@ mod tests {
     use super::*;
     use crate::client_wire::{decode_packet_with_layout, decode_packet_with_mdh_len, RecvWindow};
     use crate::mask::preset_masks::webrtc_zoom_v3;
+
+    #[test]
+    fn quic_established_control_crosses_old_token_budget_before_fragmentation() {
+        let mut keys = crypto::derive_session_keys(&[7; 32], None, &[8; 32]);
+        keys.session_key_s2c = keys.session_key;
+        for mask in crate::mask::preset_masks::all()
+            .into_iter()
+            .filter(crate::mask_io::needs_state)
+        {
+            let mut sender =
+                MimicryEncryptor::new(keys.clone(), 0, 0, mask.clone(), Arc::new(Mutex::new(None)));
+            let mut window = RecvWindow::new();
+            let mut fragments = crate::fragment::Reassembler::default();
+            let request = ControlPayload::MgmtRequest {
+                req_id: 6,
+                method: 1,
+                path: "/api/v1/neural/models".into(),
+                body: vec![0x42; 768],
+            };
+            let mut controls = vec![request];
+            for encoded_len in [511, 512, 513, 768, 899, 900, 901, 1800] {
+                let response = ControlPayload::MgmtResponse {
+                    req_id: encoded_len as u32,
+                    status: 200,
+                    body: vec![0x55; encoded_len - 11],
+                };
+                assert_eq!(response.encode().unwrap().len(), encoded_len);
+                controls.push(response);
+            }
+            let mut expected_counter = 0;
+            for control in controls {
+                let bytes = control.encode().unwrap();
+                let packets = sender
+                    .encrypt_control_packets(&control)
+                    .unwrap_or_else(|error| {
+                        panic!("{} control {}: {error}", mask.mask_id, bytes.len())
+                    });
+                assert_eq!(packets.len(), bytes.len().div_ceil(900));
+                let mut restored = None;
+                for packet in packets {
+                    assert!(packet.len() <= crate::mask_io::MAX_QUIC_INNER);
+                    let before = window.highest();
+                    let mut corrupt = packet.clone();
+                    *corrupt.last_mut().unwrap() ^= 1;
+                    assert!(decode_packet_with_layout(
+                        &corrupt,
+                        &keys,
+                        &mut window,
+                        mask.mdh_len(),
+                        mask.tag_offset,
+                    )
+                    .is_err());
+                    assert_eq!(window.highest(), before);
+                    let decoded = decode_packet_with_layout(
+                        &packet,
+                        &keys,
+                        &mut window,
+                        mask.mdh_len(),
+                        mask.tag_offset,
+                    )
+                    .unwrap();
+                    assert_eq!(decoded.counter, expected_counter);
+                    expected_counter += 1;
+                    assert!(decode_packet_with_layout(
+                        &packet,
+                        &keys,
+                        &mut window,
+                        mask.mdh_len(),
+                        mask.tag_offset,
+                    )
+                    .is_err());
+                    match decoded.header.inner_type {
+                        InnerType::Control => restored = Some(decoded.payload),
+                        InnerType::Fragment => {
+                            if let Some((kind, payload)) =
+                                fragments.accept(&decoded.payload, Instant::now()).unwrap()
+                            {
+                                assert_eq!(kind, InnerType::Control);
+                                restored = Some(payload);
+                            }
+                        }
+                        other => panic!("Control потерял тип: {other:?}"),
+                    }
+                }
+                assert_eq!(restored.unwrap(), bytes);
+            }
+        }
+    }
+
+    #[test]
+    fn quic_control_budget_keeps_initial_512_and_established_1140_boundaries() {
+        for mut mask in crate::mask::preset_masks::all()
+            .into_iter()
+            .filter(crate::mask_io::needs_state)
+        {
+            mask.padding_strategy = PaddingStrategy::Fixed { size: u16::MAX };
+            for initial in [true, false] {
+                let keys = if initial {
+                    crypto::derive_initial_session_keys(&[7; 32], None, &[8; 32])
+                } else {
+                    crypto::derive_session_keys(&[7; 32], None, &[8; 32])
+                };
+                for eph in [None, Some(&[42; 32])] {
+                    let mdh_len = if eph.is_some() {
+                        mask.mdh_len()
+                            .max(mask.eph_pub_offset as usize + mask.eph_pub_length as usize)
+                    } else {
+                        mask.mdh_len()
+                    };
+                    let prefix = mask.packet_framing(mdh_len).prefix_len();
+                    let budget = if initial {
+                        512
+                    } else {
+                        crate::mask_io::MAX_QUIC_INNER
+                    };
+                    let control_limit = budget
+                        - prefix
+                        - mdh_len
+                        - crypto::session_payload_overhead(&keys)
+                        - 2
+                        - 4
+                        - POLY1305_TAG_SIZE;
+                    let control = |encoded_len| {
+                        ControlPayload::MgmtResponse {
+                            req_id: 6,
+                            status: 200,
+                            body: vec![0x55; encoded_len - 11],
+                        }
+                        .encode()
+                        .unwrap()
+                    };
+                    let mut engine = MimicryEngine::new(mask.clone());
+                    let mut counter = 0;
+                    let bytes = control(control_limit);
+                    let inner = build_inner_packet(InnerType::Control, 7, &bytes);
+                    let packet = engine
+                        .build_packet(&inner, &keys, &mut counter, eph)
+                        .unwrap();
+                    assert_eq!(packet.len(), budget);
+                    assert_eq!(counter, 1);
+                    let tag_at = if prefix == 0 {
+                        mask.tag_offset as usize
+                    } else {
+                        0
+                    };
+                    let tag = packet[tag_at..tag_at + TAG_SIZE].try_into().unwrap();
+                    let ciphertext = &packet[prefix + mdh_len..];
+                    let plain = crypto::decrypt_session_payload(
+                        &keys,
+                        PacketDirection::ClientToServer,
+                        0,
+                        &tag,
+                        ciphertext,
+                    )
+                    .unwrap();
+                    assert_eq!(&plain[2..], &inner);
+                    let mut corrupt = ciphertext.to_vec();
+                    corrupt[0] ^= 1;
+                    assert!(crypto::decrypt_session_payload(
+                        &keys,
+                        PacketDirection::ClientToServer,
+                        0,
+                        &tag,
+                        &corrupt,
+                    )
+                    .is_err());
+                    assert!(engine
+                        .build_packet(
+                            &build_inner_packet(InnerType::Control, 8, &control(control_limit + 1)),
+                            &keys,
+                            &mut counter,
+                            eph,
+                        )
+                        .is_err());
+                    assert_eq!(counter, 1, "Отказ бюджета не должен расходовать nonce");
+                }
+            }
+        }
+    }
 
     #[test]
     fn fec_group_survives_a_mask_change_before_the_repair_is_built() {
@@ -1595,7 +1774,7 @@ mod tests {
             )
             .unwrap();
         crate::stun_wire::validate(&packet).unwrap();
-        assert!(crate::quic_mask::QuicMask::bootstrap(&packet).is_none());
+        assert!(crate::quic_mask::QuicMask::initial_token(&packet).is_none());
     }
 
     #[test]

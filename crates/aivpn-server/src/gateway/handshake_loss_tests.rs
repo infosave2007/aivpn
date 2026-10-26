@@ -218,8 +218,8 @@ async fn exercise_with_switch(
         loop {
             let (length, address) = tokio::select! {
                 decoded = receiver_gateway.udp_socket.as_ref().unwrap().decoded() => {
-                    if let Some((packet, address, quic)) = decoded {
-                        let _ = receiver_gateway.handle_unmasked_packet(&packet, address, quic).await;
+                    if let Some(packet) = decoded {
+                        let _ = receiver_gateway.handle_decoded_packet(packet).await;
                     }
                     continue;
                 }
@@ -680,7 +680,13 @@ async fn export_authenticated_dpi_training_captures() {
         std::env::var_os("AIVPN_DPI_CAPTURE_DIR").expect("Нужен AIVPN_DPI_CAPTURE_DIR"),
     );
     std::fs::create_dir_all(&directory).unwrap();
-    for mask in preset_masks::all() {
+    let selected = std::env::var("AIVPN_DPI_CAPTURE_MASK").ok();
+    let masks: Vec<_> = preset_masks::all()
+        .into_iter()
+        .filter(|mask| selected.as_ref().is_none_or(|id| id == &mask.mask_id))
+        .collect();
+    assert!(!masks.is_empty(), "Неизвестная маска обучающего захвата");
+    for mask in masks {
         exercise_diagnostics_profile(false, mask, Some(&directory)).await;
     }
 }
@@ -798,8 +804,10 @@ async fn exercise_diagnostics_with_bootstrap(
         loop {
             let (length, peer) = tokio::select! {
                 decoded = receive_gateway.udp_socket.as_ref().unwrap().decoded() => {
-                    if let Some((packet, peer, stateful)) = decoded {
-                        let _ = receive_gateway.handle_unmasked_packet(&packet, peer, stateful).await;
+                    if let Some(packet) = decoded {
+                        if let Err(error) = receive_gateway.handle_decoded_packet(packet).await {
+                            if training { eprintln!("dpi-training decoded: {error}"); }
+                        }
                     }
                     continue;
                 }
@@ -813,7 +821,11 @@ async fn exercise_diagnostics_with_bootstrap(
                     .packets
                     .push((elapsed, true, buffer[..length].to_vec()));
             }
-            let _ = receive_gateway.handle_packet(&buffer[..length], peer).await;
+            if let Err(error) = receive_gateway.handle_packet(&buffer[..length], peer).await {
+                if training {
+                    eprintln!("dpi-training wire: {error}");
+                }
+            }
         }
     });
     tasks.track(&server_task);

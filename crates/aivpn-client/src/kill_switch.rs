@@ -149,6 +149,14 @@ impl KillSwitch {
         Ok(())
     }
 
+    /// Явное восстановление сети оператором после аварийного завершения.
+    pub fn clear_for_operator() -> Result<()> {
+        Self::clear_stale()?;
+        #[cfg(target_os = "linux")]
+        crate::tunnel::Tunnel::clear_crashed_ipv6_guards()?;
+        Ok(())
+    }
+
     // ──────────────────── Linux ────────────────────
 
     #[cfg(target_os = "linux")]
@@ -629,6 +637,191 @@ mod tests {
     }
 
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "вспомогательный процесс запускается только из отдельного net namespace"]
+    fn crash_ipv6_guard_fixture() {
+        use std::io::Write;
+        let parent = std::env::var("AIVPN_CRASH_CLEAR_PARENT").unwrap();
+        assert_ne!(
+            std::fs::read_link("/proc/self/ns/net")
+                .unwrap()
+                .to_string_lossy(),
+            parent
+        );
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let mut tunnel = crate::tunnel::Tunnel::new(crate::tunnel::TunnelConfig {
+            tun_name: "crash6".into(),
+            mtu: 1000,
+            full_tunnel: true,
+            ..Default::default()
+        });
+        runtime.block_on(tunnel.create()).unwrap();
+        tunnel.set_server_ip("203.0.113.7".into());
+        tunnel.enable_full_tunnel().unwrap();
+        println!("CRASH_GUARD_READY");
+        std::io::stdout().flush().unwrap();
+        loop {
+            std::thread::park();
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn explicit_clear_recovers_ipv6_after_sigkill_and_preserves_foreign_routes() {
+        use std::io::BufRead;
+        use std::process::{Command, Stdio};
+        struct ChildGuard(Option<std::process::Child>);
+        impl Drop for ChildGuard {
+            fn drop(&mut self) {
+                if let Some(mut child) = self.0.take() {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+            }
+        }
+        const CHILD: &str = "AIVPN_CRASH_CLEAR_PARENT";
+        let namespace = std::fs::read_link("/proc/self/ns/net").unwrap();
+        if let Ok(parent) = std::env::var(CHILD) {
+            assert_ne!(namespace.to_string_lossy(), parent);
+            let ip = |args: &[&str]| {
+                let output = Command::new("ip").args(args).output().unwrap();
+                assert!(
+                    output.status.success(),
+                    "ip {args:?}: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                String::from_utf8(output.stdout).unwrap()
+            };
+            let ipv6_works = || {
+                Command::new("ip")
+                    .args(["-6", "route", "get", "2001:4860:4860::8888"])
+                    .output()
+                    .unwrap()
+                    .status
+                    .success()
+            };
+            ip(&["link", "add", "wan0", "type", "dummy"]);
+            ip(&["link", "set", "wan0", "up"]);
+            ip(&["addr", "add", "192.0.2.2/24", "dev", "wan0"]);
+            ip(&["route", "add", "default", "via", "192.0.2.1", "dev", "wan0"]);
+            ip(&[
+                "-6",
+                "addr",
+                "add",
+                "2001:db8:1::2/64",
+                "dev",
+                "wan0",
+                "nodad",
+            ]);
+            ip(&[
+                "-6", "route", "add", "default", "dev", "wan0", "proto", "99", "metric", "600",
+            ]);
+            let default = ip(&["-j", "-6", "route", "show", "default"]);
+            assert!(ipv6_works());
+            let mut child = ChildGuard(Some(
+                Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "kill_switch::tests::crash_ipv6_guard_fixture",
+                        "--ignored",
+                        "--nocapture",
+                    ])
+                    .stdout(Stdio::piped())
+                    .spawn()
+                    .unwrap(),
+            ));
+            let mut stdout =
+                std::io::BufReader::new(child.0.as_mut().unwrap().stdout.take().unwrap());
+            let mut line = String::new();
+            loop {
+                assert_ne!(
+                    stdout.read_line(&mut line).unwrap(),
+                    0,
+                    "Дочерний процесс не установил guard"
+                );
+                if line.contains("CRASH_GUARD_READY") {
+                    break;
+                }
+                line.clear();
+            }
+            let live_guard = ip(&["-j", "-6", "route", "show", "proto", "242"]);
+            KillSwitch::clear_stale().unwrap();
+            assert!(child.0.as_mut().unwrap().try_wait().unwrap().is_none());
+            assert_eq!(
+                ip(&["-j", "-6", "route", "show", "proto", "242"]),
+                live_guard
+            );
+            child.0.as_mut().unwrap().kill().unwrap();
+            use std::os::unix::process::ExitStatusExt;
+            let status = child.0.as_mut().unwrap().wait().unwrap();
+            child.0.take();
+            assert_eq!(status.signal(), Some(libc::SIGKILL));
+            assert!(!Command::new("ip")
+                .args(["link", "show", "crash6"])
+                .output()
+                .unwrap()
+                .status
+                .success());
+            assert!(!ipv6_works());
+            let guarded = ip(&["-j", "-6", "route", "show", "proto", "242"]);
+            KillSwitch::clear_stale().unwrap();
+            assert_eq!(
+                ip(&["-j", "-6", "route", "show", "proto", "242"]),
+                guarded,
+                "Автоматическая очистка не снимает guard живого соседа"
+            );
+            KillSwitch::clear_for_operator().unwrap();
+            assert!(
+                ipv6_works(),
+                "Обычный IPv6 без заданного source не восстановлен"
+            );
+            assert_eq!(ip(&["-j", "-6", "route", "show", "default"]), default);
+            ip(&[
+                "-6",
+                "route",
+                "add",
+                "blackhole",
+                "::/1",
+                "proto",
+                "99",
+                "metric",
+                "1",
+            ]);
+            ip(&[
+                "-6", "route", "add", "prohibit", "8000::/1", "proto", "242", "metric", "1",
+            ]);
+            ip(&[
+                "-6",
+                "route",
+                "add",
+                "blackhole",
+                "8000::/1",
+                "proto",
+                "242",
+                "metric",
+                "77",
+            ]);
+            ip(&[
+                "-6", "route", "add", "::/1", "dev", "wan0", "proto", "242", "metric", "2",
+            ]);
+            let foreign = ip(&["-j", "-6", "route", "show"]);
+            KillSwitch::clear_for_operator().unwrap();
+            assert_eq!(ip(&["-j", "-6", "route", "show"]), foreign);
+            return;
+        }
+        let output = Command::new("unshare").args(["-Urn"])
+            .arg(std::env::current_exe().unwrap())
+            .args(["--exact", "kill_switch::tests::explicit_clear_recovers_ipv6_after_sigkill_and_preserves_foreign_routes", "--nocapture"])
+            .env(CHILD, namespace).output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 
     #[cfg(target_os = "linux")]
     #[test]

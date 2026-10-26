@@ -39,6 +39,10 @@ pub struct GbdtNode {
 /// window has accumulated.
 pub const WINDOW: usize = 24;
 
+/// Вторая схема не использует spin и защищенные биты первого байта QUIC 1-RTT.
+pub const FEATURE_SCHEMA_VERSION: u32 = 2;
+const _: () = assert!(FEATURE_SCHEMA_VERSION == model::FEATURE_SCHEMA_VERSION);
+
 /// Size histogram bins `[lo, hi)`, identical to `features.py::SIZE_BINS`.
 const SIZE_BINS: [(u32, u32); 6] = [
     (0, 100),
@@ -82,7 +86,12 @@ impl PacketMeta {
     /// header bytes at the wire offsets checked below.
     pub fn from_wire(p: &[u8]) -> Self {
         let len = p.len();
-        let byte0 = p.first().copied().unwrap_or(0);
+        let raw_byte0 = p.first().copied().unwrap_or(0);
+        let byte0 = if raw_byte0 & 0xc0 == 0x40 {
+            0x40
+        } else {
+            raw_byte0
+        };
 
         let stun_type = len >= 2
             && (p[0] & 0xC0) == 0
@@ -113,15 +122,14 @@ impl PacketMeta {
             magic_ok,
             stun_lenok,
             dns_ok,
-            ent16: shannon_entropy(&p[..n16]) as f32,
-            ent_full: shannon_entropy(p) as f32,
+            ent16: shannon_entropy(&p[..n16], byte0) as f32,
+            ent_full: shannon_entropy(p, byte0) as f32,
         }
     }
 }
 
-/// Shannon entropy in bits/byte over `data`. Identical to `features.py::_entropy`
-/// and `gateway::compute_entropy`.
-fn shannon_entropy(data: &[u8]) -> f64 {
+/// Энтропия признака с каноническим первым байтом, без копирования wire payload.
+fn shannon_entropy(data: &[u8], first: u8) -> f64 {
     if data.is_empty() {
         return 0.0;
     }
@@ -129,6 +137,8 @@ fn shannon_entropy(data: &[u8]) -> f64 {
     for &b in data {
         counts[b as usize] += 1;
     }
+    counts[data[0] as usize] -= 1;
+    counts[first as usize] += 1;
     let len = data.len() as f64;
     let mut h = 0.0;
     for &c in &counts {
@@ -618,6 +628,28 @@ mod tests {
         assert!(!junk.stun_type && !junk.magic_ok);
     }
 
+    #[test]
+    fn short_header_spin_and_protected_bits_do_not_change_features() {
+        let mut packet = rnd_pkt(1200, 71);
+        packet[0] = 0x40;
+        let expected = extract_features(&[PacketMeta::from_wire(&packet); WINDOW]);
+        for byte0 in 0x40..0x80 {
+            packet[0] = byte0;
+            assert_eq!(
+                extract_features(&[PacketMeta::from_wire(&packet); WINDOW]),
+                expected,
+                "{byte0}"
+            );
+        }
+        packet[0] = 0x80;
+        let other = extract_features(&[PacketMeta::from_wire(&packet); WINDOW]);
+        packet[0] = 0x81;
+        assert_ne!(
+            extract_features(&[PacketMeta::from_wire(&packet); WINDOW]),
+            other
+        );
+    }
+
     fn feature_row(value: &serde_json::Value) -> [f32; model::N_FEATURES] {
         let items = value.as_array().expect("feature vector");
         assert_eq!(items.len(), model::N_FEATURES);
@@ -626,6 +658,43 @@ mod tests {
             out[index] = item.as_f64().expect("feature") as f32;
         }
         out
+    }
+
+    #[test]
+    fn published_feature_schema_matches_python_packet_fixtures() {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../../../assets/dpi/parity_fixtures.json")).unwrap();
+        assert_eq!(fixture["feature_schema_version"], FEATURE_SCHEMA_VERSION);
+        for window in fixture["windows"].as_array().unwrap() {
+            let mut packets = Vec::new();
+            for spec in window["packets"].as_array().unwrap() {
+                let total = spec["total"].as_u64().unwrap() as usize;
+                let repeat = spec["repeat"].as_u64().unwrap_or(1);
+                for _ in 0..repeat {
+                    let packet = match spec["op"].as_str().unwrap() {
+                        "stun" => stun_pkt(spec["msg_len"].as_u64().unwrap() as usize, total),
+                        "rnd" => rnd_pkt(total, spec["seed"].as_u64().unwrap() as usize),
+                        "quic_short" => {
+                            let mut packet =
+                                rnd_pkt(total, spec["seed"].as_u64().unwrap() as usize);
+                            packet[0] = spec["byte0"].as_u64().unwrap() as u8;
+                            packet
+                        }
+                        _ => panic!("Неизвестный генератор parity fixture"),
+                    };
+                    packets.push(PacketMeta::from_wire(&packet));
+                }
+            }
+            let actual = extract_features(&packets);
+            let expected = feature_row(&window["x"]);
+            for (index, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+                assert!(
+                    (*actual - expected).abs() <= 1e-5 * expected.abs().max(1.0),
+                    "{}: признак {index}: {actual} != {expected}",
+                    window["name"]
+                );
+            }
+        }
     }
 
     fn windows() -> Vec<serde_json::Value> {
@@ -643,6 +712,7 @@ mod tests {
             "../../../assets/dpi/external_vpn_fixtures.json"
         ))
         .unwrap();
+        assert_eq!(evidence["feature_schema_version"], FEATURE_SCHEMA_VERSION);
         assert_eq!(evidence["training_use"], false);
         assert_eq!(evidence["training_overlap_checked"], true);
         assert_eq!(
@@ -673,6 +743,68 @@ mod tests {
         }
         assert_eq!(windows, 15);
         assert_eq!(evidence["detected"], windows);
+    }
+
+    fn validation_balanced_accuracy(tp: usize, fp: usize, missed: usize, tn: usize) -> Option<f64> {
+        let positive = tp + missed;
+        let negative = fp + tn;
+        (positive > 0 && negative > 0)
+            .then(|| 0.5 * (tp as f64 / positive as f64 + tn as f64 / negative as f64))
+    }
+
+    fn validation_beats_constant(
+        tp: usize,
+        fp: usize,
+        missed: usize,
+        tn: usize,
+        majority_tunnel: bool,
+    ) -> bool {
+        let constant = if majority_tunnel {
+            validation_balanced_accuracy(tp + missed, fp + tn, 0, 0)
+        } else {
+            validation_balanced_accuracy(0, 0, tp + missed, fp + tn)
+        };
+        match (validation_balanced_accuracy(tp, fp, missed, tn), constant) {
+            (Some(score), Some(constant)) => score > constant + 0.05,
+            _ => false,
+        }
+    }
+
+    #[test]
+    fn validation_accepts_perfect_models_for_both_majorities_and_rejects_constants() {
+        for (tp, tn) in [(1, 3), (3, 1)] {
+            for majority in [false, true] {
+                assert!(validation_beats_constant(tp, 0, 0, tn, majority));
+                assert!(!validation_beats_constant(0, 0, tp, tn, majority));
+                assert!(!validation_beats_constant(tp, tn, 0, 0, majority));
+            }
+        }
+        assert!(!validation_beats_constant(0, 0, 0, 3, false));
+    }
+
+    #[test]
+    fn validation_metrics_match_python_fixtures() {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../../../assets/dpi/parity_fixtures.json")).unwrap();
+        for case in fixture["validation_cases"]
+            .as_array()
+            .expect("validation cases")
+        {
+            let count = |key: &str| case[key].as_u64().unwrap() as usize;
+            let balanced =
+                validation_balanced_accuracy(count("tp"), count("fp"), count("fn"), count("tn"));
+            assert_eq!(balanced, case["balanced_accuracy"].as_f64());
+            assert_eq!(
+                validation_beats_constant(
+                    count("tp"),
+                    count("fp"),
+                    count("fn"),
+                    count("tn"),
+                    case["majority_tunnel"].as_bool().unwrap()
+                ),
+                case["material_met"].as_bool().unwrap()
+            );
+        }
     }
 
     /// Shipped session-holdout windows keep the reported probability and class.
@@ -710,7 +842,7 @@ mod tests {
             .collect();
         assert_eq!(test_rows.len(), shipped.len());
         let mut masks = std::collections::BTreeSet::new();
-        let mut correct = 0usize;
+        let mut true_tunnel = 0usize;
         let mut benign = 0usize;
         let mut false_tunnel = 0usize;
         let mut tunnel_rows = 0usize;
@@ -718,7 +850,7 @@ mod tests {
             assert_eq!(row["stride"].as_u64(), Some(24));
             masks.insert(row["mask_id"].as_str().unwrap().to_string());
             let matched = shipped.iter().find(|item| {
-                item["mask_id"] == row["mask_id"]
+                item["capture_id"] == row["capture_id"]
                     && item["role"] == row["role"]
                     && item["variant"] == row["variant"]
                     && item["start"] == row["start"]
@@ -736,11 +868,11 @@ mod tests {
             assert_eq!(got > gate.threshold(), reported > gate.threshold());
             let pred = got > gate.threshold();
             let is_tunnel = row["y"].as_i64().unwrap() == 1;
-            if pred == is_tunnel {
-                correct += 1;
-            }
             if is_tunnel {
                 tunnel_rows += 1;
+                if pred {
+                    true_tunnel += 1;
+                }
             } else {
                 benign += 1;
                 if pred {
@@ -753,23 +885,69 @@ mod tests {
             10,
             "every family must appear in the test capture"
         );
-        let n = test_rows.len() as f32;
-        let model_acc = correct as f32 / n;
-        let model_fp = false_tunnel as f32 / benign as f32;
-        let majority_acc = if majority_tunnel {
-            tunnel_rows as f32 / n
-        } else {
-            (test_rows.len() - tunnel_rows) as f32 / n
-        };
-        let majority_fp = if majority_tunnel { 1.0 } else { 0.0 };
         assert!(
-            model_acc > majority_acc + MATERIAL,
-            "accuracy {model_acc} does not beat constant {majority_acc} by {MATERIAL}"
+            validation_beats_constant(
+                true_tunnel,
+                false_tunnel,
+                tunnel_rows - true_tunnel,
+                benign - false_tunnel,
+                majority_tunnel
+            ),
+            "balanced accuracy does not beat constant by {MATERIAL}"
         );
-        assert!(
-            model_fp + MATERIAL < majority_fp,
-            "false tunnel rate {model_fp} is not materially below constant {majority_fp}"
+    }
+
+    #[test]
+    fn fresh_control_keeps_all_families_and_capture_predictions_after_freeze() {
+        use sha2::{Digest, Sha256};
+        let fixtures: serde_json::Value =
+            serde_json::from_str(include_str!("../../../assets/dpi/heldout_fixtures.json"))
+                .unwrap();
+        let final_control = &fixtures["final_control"];
+        assert_eq!(final_control["training_use"], false);
+        assert_eq!(final_control["evaluated_after_model_freeze"], true);
+        assert_eq!(
+            final_control["feature_schema_version"],
+            FEATURE_SCHEMA_VERSION
         );
+        assert_eq!(
+            final_control["model_sha256"],
+            format!("{:x}", Sha256::digest(include_bytes!("dpi_gate/model.rs")))
+        );
+        let mut families = std::collections::BTreeSet::new();
+        let mut captures = std::collections::BTreeSet::new();
+        let mut positive = 0;
+        let mut negative = 0;
+        for row in final_control["rows"].as_array().unwrap() {
+            families.insert(row["mask_id"].as_str().unwrap());
+            captures.insert(row["capture_id"].as_str().unwrap());
+            let probability = tunnel_probability(&feature_row(&row["x"]));
+            assert!((probability - row["p"].as_f64().unwrap() as f32).abs() < 1e-5);
+            let expected = row["y"].as_i64().unwrap() == 1;
+            assert_eq!(probability > 0.5, expected, "{}", row["capture_id"]);
+            if expected {
+                negative += 1;
+            } else {
+                positive += 1;
+            }
+        }
+        assert_eq!(families.len(), 10);
+        assert_eq!(captures.len(), 42);
+        assert_eq!(
+            positive,
+            final_control["metrics"]["raw"]["tn"].as_u64().unwrap()
+        );
+        assert_eq!(
+            negative,
+            final_control["metrics"]["raw"]["tp"].as_u64().unwrap()
+        );
+        assert!(validation_beats_constant(
+            negative as usize,
+            0,
+            0,
+            positive as usize,
+            false
+        ));
     }
 
     /// Ring buffers to WINDOW and only judges once full.

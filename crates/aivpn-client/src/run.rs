@@ -205,8 +205,8 @@ pub struct ClientArgs {
     #[arg(long, value_name = "HOST:PORT", default_value = "1.1.1.1:53")]
     pub dns_upstream: String,
 
-    /// Preferred mask profile name (e.g. webrtc_zoom_v3, quic_https_v2).
-    /// When set, overrides the bootstrap-selected mask with the named built-in preset.
+    /// Предпочитаемая база маски (например, webrtc_zoom_v3, quic_https_v2).
+    /// Выбирается из проверенного bootstrap; если ее нет, запрашивается после PFS.
     /// Неизвестное имя отклоняется до подключения.
     #[arg(long, value_name = "NAME", value_parser = parse_preset_mask)]
     pub preferred_mask: Option<String>,
@@ -344,7 +344,7 @@ fn send_admin_request(socket_addr: std::net::SocketAddrV4, line: &str) -> Option
 
 #[derive(clap::Subcommand, Debug)]
 pub enum KillSwitchAction {
-    /// Remove stale kill-switch firewall rules left by a previous session
+    /// Снять защитные правила и маршруты AIVPN после аварийного завершения
     Clear,
 }
 
@@ -692,11 +692,12 @@ pub async fn run(
         match command {
             ClientCommand::KillSwitch { action } => match action {
                 KillSwitchAction::Clear => {
-                    if let Err(error) = aivpn_client::kill_switch::KillSwitch::clear_stale() {
-                        eprintln!("Kill-switch cleanup failed: {error}");
+                    if let Err(error) = aivpn_client::kill_switch::KillSwitch::clear_for_operator()
+                    {
+                        eprintln!("Не удалось снять защиту AIVPN: {error}");
                         std::process::exit(1);
                     }
-                    println!("Kill-switch stale rules cleared.");
+                    println!("Защитные правила и маршруты AIVPN сняты.");
                     return;
                 }
             },
@@ -1444,10 +1445,21 @@ pub async fn run(
 
         // Select initial mask from cached descriptors
         // In production secure mode (no_fallback), fail if no valid descriptors are available
-        let mut initial_mask = bootstrap_cache::select_initial_mask_for_attempt(
+        let preferred_bootstrap = args
+            .polymorphic_base
+            .is_none()
+            .then_some(args.preferred_mask.as_deref())
+            .flatten();
+        let preferred_attempt = if preferred_bootstrap.is_some() {
+            handshake_fail_streak
+        } else {
+            0
+        };
+        let mut initial_mask = bootstrap_cache::select_initial_mask_with_preference(
             preshared_key.as_ref(),
-            0,
+            preferred_attempt,
             server_signing_key.as_ref(),
+            preferred_bootstrap,
         );
         if initial_mask.is_none() && !bootstrap_descriptor_urls.is_empty() {
             bootstrap_cache::refresh_from_urls(
@@ -1455,10 +1467,11 @@ pub async fn run(
                 server_signing_key.as_ref(),
             )
             .await;
-            initial_mask = bootstrap_cache::select_initial_mask_for_attempt(
+            initial_mask = bootstrap_cache::select_initial_mask_with_preference(
                 preshared_key.as_ref(),
-                0,
+                preferred_attempt,
                 server_signing_key.as_ref(),
+                preferred_bootstrap,
             );
         }
 
@@ -1544,7 +1557,9 @@ pub async fn run(
         // descriptors even at the cost of availability. An explicit
         // --preferred-mask / --polymorphic-base below still takes precedence.
         #[cfg(not(feature = "production-secure"))]
-        let initial_mask = if !no_fallback && handshake_fail_streak >= HANDSHAKE_FALLBACK_THRESHOLD
+        let initial_mask = if !no_fallback
+            && handshake_fail_streak >= HANDSHAKE_FALLBACK_THRESHOLD
+            && !(preferred_bootstrap.is_some() && initial_mask.mask_id.starts_with("bootstrap:"))
         {
             warn!(
                 "{} consecutive handshakes never connected — falling back to the built-in default mask (a cached bootstrap descriptor may be unmatchable by this server, e.g. after a server-key change)",
@@ -1573,10 +1588,11 @@ pub async fn run(
                     info!("Обновлено bootstrap-дескрипторов: {refetched}");
                 }
             }
-            bootstrap_cache::select_initial_mask_for_attempt(
+            bootstrap_cache::select_initial_mask_with_preference(
                 preshared_key.as_ref(),
                 handshake_fail_streak,
                 server_signing_key.as_ref(),
+                preferred_bootstrap,
             )
             .unwrap_or(initial_mask)
         } else {
@@ -1601,10 +1617,14 @@ pub async fn run(
                         &initial_mask.mask_id,
                         true,
                     ) {
-                        warn!(
-                            "Предпочитаемая маска '{}' не заменяет проверенный дескриптор '{}'",
-                            name, initial_mask.mask_id
-                        );
+                        if aivpn_common::mask::mask_matches_preferred_base(&initial_mask, name) {
+                            info!("Выбран проверенный bootstrap-кандидат базы '{}'", name);
+                        } else {
+                            warn!(
+                                "Базы '{}' нет среди проверенных slots; opening '{}', запрос после PFS",
+                                name, initial_mask.mask_id
+                            );
+                        }
                         initial_mask
                     } else {
                         info!("Using preferred mask '{}'", name);
@@ -1693,6 +1713,11 @@ pub async fn run(
         } else {
             initial_mask
         };
+        let post_pfs_preference = aivpn_common::mask::post_pfs_mask_preference(
+            args.preferred_mask.as_deref(),
+            args.polymorphic_base.as_deref(),
+            &initial_mask,
+        );
         // Capture the attempt's base mask family for §2 failure attribution
         // before `initial_mask` is moved into ClientConfig below.
         //
@@ -1772,7 +1797,7 @@ pub async fn run(
             proxy_dns: args.proxy_dns.clone(),
             mtls_cert: mtls_cert.clone(),
             initial_adaptive_level,
-            polymorphic_base: args.polymorphic_base.clone(),
+            polymorphic_base: post_pfs_preference,
             // §2 crowdsourced blocking feedback — opt-in, OFF unless the user
             // explicitly enables it via CLI flags (or a GUI that passes them).
             share_mask_feedback: args.share_mask_feedback,

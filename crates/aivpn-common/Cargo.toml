@@ -36,6 +36,7 @@ bytes.workspace = true
 chrono.workspace = true
 tracing.workspace = true
 portable-atomic = "1"
+web-time = "1.1"
 
 # Async (optional — needed for upload_pipeline)
 tokio = { workspace = true, optional = true }

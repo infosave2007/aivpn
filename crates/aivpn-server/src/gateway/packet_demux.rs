@@ -164,11 +164,12 @@ impl super::Gateway {
             tokio::spawn(async move {
                 while let Some(packet) = rx.recv().await {
                     let result = if packet.masked {
-                        gw.handle_unmasked_packet(
-                            &packet.packet_data,
-                            packet.client_addr,
-                            packet.quic_inner,
-                        )
+                        gw.handle_decoded_packet(super::mask_socket::DecodedPacket {
+                            payload: packet.packet_data,
+                            peer: packet.client_addr,
+                            quic: packet.quic_inner,
+                            context: packet.quic_context,
+                        })
                         .await
                     } else {
                         gw.handle_packet_with_source(
@@ -199,13 +200,13 @@ impl super::Gateway {
             .map(|_| crate::batch_io::RecvSlot::new(MAX_PACKET_SIZE))
             .collect();
 
-        let mut rates = crate::source_rates::SourceRates::default();
+        let mut rates = crate::source_rates::UdpIngressRates::default();
         loop {
             let received = tokio::select! {
                 payload = socket.decoded() => {
-                    if let Some((packet, peer, quic)) = payload {
-                        let index = gateway.worker_index_for_packet(&packet, peer, worker_count);
-                        let _ = worker_txs[index].try_send(QueuedPacket { local: None, packet_data: packet, client_addr: peer, masked: true, quic_inner: quic });
+                    if let Some(packet) = payload {
+                        let index = gateway.worker_index_for_packet(&packet.payload, packet.peer, worker_count);
+                        let _ = worker_txs[index].try_send(QueuedPacket { local: None, packet_data: packet.payload, client_addr: packet.peer, masked: true, quic_inner: packet.quic, quic_context: packet.context });
                     }
                     continue;
                 }
@@ -221,8 +222,16 @@ impl super::Gateway {
                             client_addr.ip(),
                             Instant::now(),
                             65_536,
-                            gateway.config.per_ip_pps_limit,
+                            [
+                                gateway.config.per_ip_pps_limit,
+                                gateway.config.per_ip_authenticated_pps_limit,
+                            ],
+                            socket.authenticated_quic_ingress(slot.packet(), client_addr),
                         ) {
+                            continue;
+                        }
+
+                        if socket.route_incoming(slot.packet(), client_addr) {
                             continue;
                         }
 
@@ -238,6 +247,7 @@ impl super::Gateway {
                             client_addr,
                             masked: false,
                             quic_inner: false,
+                            quic_context: None,
                         };
 
                         // try_send, not send().await: awaiting a FULL worker

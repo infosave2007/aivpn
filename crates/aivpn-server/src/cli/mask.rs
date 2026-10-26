@@ -68,11 +68,8 @@ pub(crate) fn handle_gen_mask_signing_key(path: &str) {
 /// the corpus survives `mask_verify_mode=enforce`. The reverse profile is signed
 /// first because the outer signature covers it.
 pub(crate) fn handle_sign_mask_dir(dir: &str, args: &ServerArgs) {
-    // Load server.json first so a config-only `mask_signing_key` works here
-    // too (previously only the CLI/env flag was consulted).
-    let config_path = crate::config_resolve::resolve_config_path(args);
-    let file_config = crate::config_resolve::load_server_file_config(config_path.as_deref());
-    let seed = match crate::config_resolve::resolve_mask_signing_key(args, file_config.as_ref()) {
+    // Все источники уже разрешены до вызова команды.
+    let seed = match crate::config_resolve::resolve_mask_signing_key(args, None) {
         Some(s) => s,
         None => {
             eprintln!("--sign-mask-dir requires --mask-signing-key (or config mask_signing_key)");

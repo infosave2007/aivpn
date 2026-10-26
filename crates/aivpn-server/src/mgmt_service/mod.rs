@@ -105,6 +105,34 @@ pub enum MgmtError {
     Internal(String),
 }
 
+impl MgmtError {
+    pub fn response_status(&self) -> u16 {
+        match self {
+            Self::NotFound => 404,
+            Self::Conflict(_) => 409,
+            Self::BadRequest(_) => 400,
+            Self::Forbidden => 403,
+            Self::Unavailable(_) => 503,
+            Self::Internal(_) => 500,
+        }
+    }
+
+    /// Внутренние ошибки не передают пути, ключи и содержимое файлов клиенту.
+    pub fn response_error(&self) -> aivpn_common::mgmt_error::ManagementError {
+        use aivpn_common::mgmt_error::ManagementError;
+        match self {
+            Self::Unavailable(code) if code == "public_endpoint_not_configured" => ManagementError::new(
+                code, "На сервере не задан публичный адрес. Укажите server_ip в конфигурации или AIVPN_SERVER_IP."),
+            Self::Unavailable(code) if code == "server_key_not_configured" => ManagementError::new(
+                code, "На сервере не задан постоянный ключ. Укажите key_file в конфигурации или AIVPN_KEY_FILE."),
+            Self::BadRequest(message) => ManagementError::new("invalid_request", message),
+            Self::Conflict(message) if message.contains("already exists") || message.contains("already taken") =>
+                ManagementError::new("conflict", "Клиент с таким именем уже существует. Выберите другое имя."),
+            _ => ManagementError::for_status(self.response_status()),
+        }
+    }
+}
+
 impl std::fmt::Display for MgmtError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {

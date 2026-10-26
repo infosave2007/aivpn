@@ -29,6 +29,7 @@ pub mod dpi_gate;
 
 #[cfg(feature = "client-upload")]
 pub mod mgmt;
+pub mod mgmt_error;
 
 #[cfg(feature = "client-upload")]
 pub mod mimicry;

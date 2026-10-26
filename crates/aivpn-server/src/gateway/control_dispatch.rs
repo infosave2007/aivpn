@@ -4,6 +4,7 @@
 //! of `gateway/mod.rs` — no behavior change.
 
 use super::*;
+use aivpn_common::mgmt_error::ManagementError;
 
 impl super::Gateway {
     pub(super) fn telemetry_snapshot(
@@ -80,7 +81,14 @@ impl super::Gateway {
         body: Vec<u8>,
     ) -> (u16, Vec<u8>) {
         let Some(db) = self.client_db.clone() else {
-            return (503, Vec::new());
+            return (
+                503,
+                ManagementError::new(
+                    "client_database_unavailable",
+                    "База клиентов временно недоступна. Обратитесь к администратору сервера.",
+                )
+                .to_body(),
+            );
         };
         let mask_dir = self.config.mask_dir.clone();
         let mask_operator_pubkey = self.config.mask_operator_pubkey;
@@ -216,7 +224,7 @@ impl super::Gateway {
             Ok(r) => r,
             Err(e) => {
                 error!("mgmt_service::dispatch panicked: {}", e);
-                (500, Vec::new())
+                (500, ManagementError::for_status(500).to_body())
             }
         }
     }
@@ -1270,23 +1278,34 @@ impl super::Gateway {
                     Ok(true) => info!("Device enrolled and bound for client {}", cid),
                     Ok(false) => debug!("Device binding verified for client {}", cid),
                     Err(e) => {
-                        // 3f: one-time key already used — a DIFFERENT
-                        // device already bound this one_time credential.
-                        // The session is already tag-validated/AEAD
-                        // established (this is a decrypted, authenticated
-                        // in-session control message), so PSK possession
-                        // is proven — send the specific, authenticated
-                        // HandshakeReject{reason:1} instead of the
-                        // generic Shutdown so the client can show why and
-                        // stop retrying.
-                        warn!("Device binding mismatch for {}: {}", cid, e);
+                        // Постоянный отказ относится только к несовпадению ключа.
+                        // Сбой хранилища не означает, что ключ уже использован.
+                        let mismatch = matches!(&e, aivpn_common::error::Error::Session(message)
+                            if message.starts_with("Device binding mismatch for client '"));
+                        let code = if mismatch {
+                            "device_binding_mismatch"
+                        } else if e.to_string().contains("Permission denied") {
+                            "client_database_permission_denied"
+                        } else {
+                            "client_database_unavailable"
+                        };
+                        warn!(client_id = %cid, code, binding_mismatch = mismatch, "Не удалось проверить привязку устройства");
                         self.audit_log.log(
                             AuditActor::System,
-                            "device_binding_mismatch",
+                            if mismatch {
+                                "device_binding_mismatch"
+                            } else {
+                                "device_database_unavailable"
+                            },
                             cid,
                             "denied",
                         );
-                        let reject = ControlPayload::HandshakeReject { reason: 1 };
+                        let reject = if mismatch {
+                            ControlPayload::HandshakeReject { reason: 1 }
+                        } else {
+                            // Ошибка хранилища временная, ключ клиента не отзывается.
+                            ControlPayload::Shutdown { reason: 5 }
+                        };
                         let _ = self.send_control_message(&reject, session).await;
                         let session_id = session.lock().session_id;
                         self.session_manager.remove_session(&session_id);
@@ -1345,8 +1364,24 @@ impl super::Gateway {
             let (status, body) = if status == 200 {
                 aivpn_common::diagnostics::response(method, &path, &body)
             } else {
-                (status, Vec::new())
+                (
+                    status,
+                    if status == 429 {
+                        ManagementError::rate_limited(200).to_body()
+                    } else {
+                        ManagementError::for_status(status).to_body()
+                    },
+                )
             };
+            if status >= 400 {
+                debug!(
+                    req_id,
+                    method,
+                    status,
+                    code = "diagnostic_request_failed",
+                    "Диагностический запрос отклонен"
+                );
+            }
             return self
                 .send_control_message(
                     &ControlPayload::MgmtResponse {
@@ -1360,10 +1395,17 @@ impl super::Gateway {
         }
         let session_id = session.lock().session_id;
         if !self.try_claim_mgmt_slot(session_id, Instant::now()) {
+            debug!(
+                req_id,
+                method,
+                status = 429,
+                code = "rate_limited",
+                "Запрос управления отклонен"
+            );
             let resp = ControlPayload::MgmtResponse {
                 req_id,
                 status: 429,
-                body: Vec::new(),
+                body: ManagementError::rate_limited(200).to_body(),
             };
             if let Err(e) = self.send_control_message(&resp, session).await {
                 debug!("MgmtResponse (429 throttled) send failed: {}", e);
@@ -1378,6 +1420,13 @@ impl super::Gateway {
         let role = self.session_role(session);
         if !mgmt_service::authorize(role.as_u8(), method, &path) {
             debug!(
+                req_id,
+                method,
+                status = 403,
+                code = "forbidden",
+                "Недостаточно прав для запроса управления"
+            );
+            debug!(
                 "MgmtRequest from {} denied: role={:?} method={} path={}",
                 hash_addr(&client_addr),
                 role,
@@ -1387,7 +1436,7 @@ impl super::Gateway {
             let resp = ControlPayload::MgmtResponse {
                 req_id,
                 status: 403,
-                body: Vec::new(),
+                body: ManagementError::for_status(403).to_body(),
             };
             if let Err(e) = self.send_control_message(&resp, session).await {
                 debug!("MgmtResponse (403 denied) send failed: {}", e);
@@ -1403,6 +1452,20 @@ impl super::Gateway {
         let revoke_id = mgmt_service::revoke_target(method, &path);
 
         let (status, resp_body) = self.dispatch_mgmt_request(method, path, body).await;
+        if status >= 400 {
+            let code = serde_json::from_slice::<ManagementError>(&resp_body)
+                .ok()
+                .map(|error| error.code);
+            warn!(
+                req_id,
+                method,
+                status,
+                code = code.as_deref().unwrap_or("request_failed"),
+                "Запрос управления завершился ошибкой"
+            );
+        } else {
+            debug!(req_id, method, status, "Запрос управления выполнен");
+        }
 
         // P1.3: on a successful admin revoke (204), immediately
         // force-disconnect any live session for that client on
@@ -1861,6 +1924,9 @@ impl super::Gateway {
                 loss_ppm,
                 jitter_ms,
             } => {
+                if !session.lock().accept_quality_report(Instant::now()) {
+                    return Ok(());
+                }
                 info!(
                     "QualityReport from {}: quality={} rtt={}ms loss={}ppm jitter={}ms",
                     hash_addr(&client_addr),
@@ -1897,6 +1963,15 @@ impl super::Gateway {
                     .await
                 {
                     debug!("AdaptiveHint send failed: {}", e);
+                }
+                let receiver_report = session.lock().receiver_quality_report(
+                    self.kernel_accel.is_none() || self.config.enable_neural,
+                    Instant::now(),
+                );
+                if let Some(report) = receiver_report {
+                    if let Err(error) = self.send_control_message(&report, session).await {
+                        debug!("Receiver QualityReport send failed: {}", error);
+                    }
                 }
             }
             ControlPayload::AdaptiveHint { .. } => {

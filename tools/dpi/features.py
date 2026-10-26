@@ -20,6 +20,8 @@ import numpy as np
 
 WINDOW = 24
 N_FEATURES = 23
+FEATURE_SCHEMA_VERSION = 2
+FEATURE_SCHEMA_NAME = "quic-short-header-byte0-invariant"
 SIZE_BINS = (
     (0, 100),
     (100, 300),
@@ -135,7 +137,9 @@ def percentile(sorted_sizes: list[int], q: float) -> float:
 def header_flags(packet: bytes) -> dict[str, float]:
     length = len(packet)
     stored_len = min(length, 65535)
-    byte0 = packet[0] if packet else 0
+    raw_byte0 = packet[0] if packet else 0
+    byte0 = 0x40 if raw_byte0 & 0xC0 == 0x40 else raw_byte0
+    normalized = bytes([byte0]) + packet[1:] if packet and byte0 != raw_byte0 else packet
     stun_type = (
         length >= 2 and (packet[0] & 0xC0) == 0 and packet[:2] in STUN_TYPES
     )
@@ -158,8 +162,8 @@ def header_flags(packet: bytes) -> dict[str, float]:
         "magic_ok": 1.0 if magic_ok else 0.0,
         "stun_lenok": 1.0 if stun_lenok else 0.0,
         "dns_ok": 1.0 if dns_ok else 0.0,
-        "ent16": f32(shannon_entropy(packet[:n16])),
-        "ent_full": f32(shannon_entropy(packet)),
+        "ent16": f32(shannon_entropy(normalized[:n16])),
+        "ent_full": f32(shannon_entropy(normalized)),
         "quic_long": 1.0 if length > 0 and (byte0 & 0xC0) == 0xC0 else 0.0,
         "msb": 1.0 if length > 0 and (byte0 & 0x80) != 0 else 0.0,
         "band": (
@@ -266,6 +270,12 @@ def packets_from_spec(spec: list[dict]) -> list[bytes]:
                     seed = k * int(step["seed_mul"]) + int(step["seed_add"])
                     total = int(step["total_base"]) + (k % int(step["mod"])) * int(step["scale"])
                 packets.append(rnd_pkt(total, seed))
+            elif op == "quic_short":
+                total = int(step["total"])
+                first = int(step["byte0"])
+                if total < 1 or not 0x40 <= first < 0x80:
+                    raise ValueError("неверный синтетический short header")
+                packets.append(bytes([first]) + rnd_pkt(total, int(step["seed"]))[1:])
             else:
                 raise ValueError(f"неизвестная операция пакета: {op}")
     return packets

@@ -66,6 +66,8 @@ impl<'de> Deserialize<'de> for ShapingLevel {
 pub struct GatewayConfig {
     pub listen_addr: String,
     pub per_ip_pps_limit: u64,
+    /// Отдельная конечная квота внешних пакетов QUIC после PSK/PFS admission.
+    pub per_ip_authenticated_pps_limit: u64,
     pub tun_name: String,
     pub tun_addr: String,
     pub tun_netmask: String,
@@ -73,6 +75,8 @@ pub struct GatewayConfig {
     pub server_private_key: [u8; 32],
     pub signing_key: [u8; 64],
     pub enable_nat: bool,
+    /// Включить шифрование downlink в модуле ядра. По умолчанию выключено.
+    pub kernel_downlink: bool,
     /// Enable neural resonance module (Patent 1)
     pub enable_neural: bool,
     /// Neural resonance configuration
@@ -215,7 +219,8 @@ impl Default for GatewayConfig {
     fn default() -> Self {
         Self {
             listen_addr: "0.0.0.0:443".to_string(),
-            per_ip_pps_limit: 1000,
+            per_ip_pps_limit: 5000,
+            per_ip_authenticated_pps_limit: 100_000,
             tun_name: "aivpn0".to_string(),
             tun_addr: "10.0.0.1".to_string(),
             tun_netmask: "255.255.255.0".to_string(),
@@ -223,6 +228,7 @@ impl Default for GatewayConfig {
             server_private_key: [0u8; 32],
             signing_key: [0u8; 64],
             enable_nat: true,
+            kernel_downlink: false,
             enable_neural: true,
             neural_config: NeuralConfig::default(),
             client_db: None,

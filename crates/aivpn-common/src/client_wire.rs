@@ -1,5 +1,7 @@
 use rand::RngCore;
+use std::sync::{Arc, Mutex};
 use subtle::ConstantTimeEq;
+use web_time::Instant;
 
 #[cfg(test)]
 use crate::crypto::encrypt_payload;
@@ -33,12 +35,18 @@ const RECV_REORDER_WINDOW: usize = 256;
 /// Forward tag search extent BEFORE the window is synced (first packet after a
 /// handshake/ratchet reset). Bounds the one-shot zero-RTT catch-up scan.
 const RECV_FUTURE_SEARCH_WINDOW: usize = 1024;
-/// Forward tag search extent ONCE synced. Kept small so an attacker spraying
-/// garbage UDP at the client's ip:port cannot force ~3×(FUTURE+REORDER) keyed
-/// BLAKE3 hashes per packet (a CPU-amplification DoS). A legitimate gap larger
-/// than this is rare and recovers via the RX-silence watchdog / reconnect
-/// rather than an unbounded per-packet scan.
+/// Короткий поиск обычного приема. Большие пропуски восстанавливает отдельная квота.
 const RECV_FUTURE_SEARCH_SYNCED: usize = 512;
+/// Общий предел пар (раскладка, счетчик) на одну редкую попытку, для трех окон времени.
+const RECV_RECOVERY_CANDIDATES: usize = 65_536;
+const RECV_RECOVERY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+#[derive(Default)]
+struct CounterRecoveryBudget {
+    last_attempt: Mutex<Option<Instant>>,
+    #[cfg(test)]
+    tag_checks: std::sync::atomic::AtomicUsize,
+}
 
 #[derive(Clone, Copy)]
 struct Bitset256 {
@@ -97,8 +105,13 @@ impl Bitset256 {
 
 #[derive(Clone)]
 pub struct RecvWindow {
-    highest: i64,
+    highest: Option<u64>,
     bitmap: Bitset256,
+    authenticated_counter_hint: Option<u64>,
+    preferred_tag_offset: Option<u16>,
+    counter_recovery: Arc<CounterRecoveryBudget>,
+    #[cfg(test)]
+    counter_lookups: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl Default for RecvWindow {
@@ -110,14 +123,50 @@ impl Default for RecvWindow {
 impl RecvWindow {
     pub fn new() -> Self {
         Self {
-            highest: -1,
+            highest: None,
             bitmap: Bitset256::new(),
+            authenticated_counter_hint: None,
+            preferred_tag_offset: None,
+            counter_recovery: Default::default(),
+            #[cfg(test)]
+            counter_lookups: Default::default(),
         }
     }
 
     pub fn reset(&mut self) {
-        self.highest = -1;
+        self.highest = None;
         self.bitmap.clear();
+        self.clear_authenticated_counter_hint();
+        self.preferred_tag_offset = None;
+        self.begin_counter_recovery_epoch();
+    }
+
+    /// Новая ключевая эпоха отделяет квоту от старой. Обычные Clone делят одну квоту.
+    pub fn begin_counter_recovery_epoch(&mut self) {
+        self.counter_recovery = Default::default();
+    }
+
+    fn reserve_counter_recovery(&self, now: Instant) -> bool {
+        let mut previous = self
+            .counter_recovery
+            .last_attempt
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if previous.is_some_and(|previous| {
+            now.saturating_duration_since(previous) < RECV_RECOVERY_INTERVAL
+        }) {
+            return false;
+        }
+        *previous = Some(now);
+        true
+    }
+
+    fn recovery_bounds(&self, layouts: usize) -> Option<(u64, u64)> {
+        // До первого подтвержденного пакета или ориентира нет широкого поиска.
+        self.highest.max(self.authenticated_counter_hint)?;
+        let start = self.search_bounds().1.checked_add(1)?;
+        let count = (RECV_RECOVERY_CANDIDATES / layouts.max(1)).max(1) as u64;
+        Some((start, start.saturating_add(count - 1)))
     }
 
     /// Highest downlink counter validated so far, or `None` before the first
@@ -125,7 +174,33 @@ impl RecvWindow {
     /// base the forward tag window it pushes to aivpn.ko on the most recent
     /// user-space-validated counter.
     pub fn highest(&self) -> Option<u64> {
-        (self.highest >= 0).then_some(self.highest as u64)
+        self.highest
+    }
+
+    /// Подтвержденный пакет прошлой эпохи уточняет общий монотонный счетчик
+    /// только во время staged inline rekey. Вызывать после AEAD, разбора и
+    /// всех replay-проверок, включая ядро. Bitmap и highest этой эпохи не меняются.
+    /// Подсказка переживает окончание fallback до первого mark новой эпохи
+    /// или полного reset PFS, даже если upload уже переключен по deadline.
+    pub fn observe_authenticated_counter(&mut self, counter: u64) {
+        self.authenticated_counter_hint = Some(
+            self.authenticated_counter_hint
+                .map_or(counter, |previous| previous.max(counter)),
+        );
+    }
+
+    fn clear_authenticated_counter_hint(&mut self) {
+        self.authenticated_counter_hint = None;
+    }
+
+    fn search_bounds(&self) -> (u64, u64) {
+        match self.highest.max(self.authenticated_counter_hint) {
+            None => (0, (RECV_FUTURE_SEARCH_WINDOW - 1) as u64),
+            Some(anchor) => (
+                anchor.saturating_sub((RECV_REORDER_WINDOW - 1) as u64),
+                anchor.saturating_add(RECV_FUTURE_SEARCH_SYNCED as u64),
+            ),
+        }
     }
 
     pub fn observation_counts(&self) -> (u64, u64) {
@@ -138,25 +213,34 @@ impl RecvWindow {
     }
 
     pub fn find_counter(&self, tag: &[u8; TAG_SIZE], keys: &SessionKeys) -> Option<u64> {
+        self.find_counter_in_bounds(tag, keys, self.search_bounds(), false)
+    }
+
+    fn find_counter_in_bounds(
+        &self,
+        tag: &[u8; TAG_SIZE],
+        keys: &SessionKeys,
+        (start, end): (u64, u64),
+        recovery: bool,
+    ) -> Option<u64> {
+        #[cfg(test)]
+        self.counter_lookups
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let base_tw = compute_time_window(current_timestamp_ms(), DEFAULT_WINDOW_MS);
-        let start = if self.highest < 0 {
-            0
-        } else {
-            (self.highest as u64).saturating_sub((RECV_REORDER_WINDOW - 1) as u64)
-        };
-        let end = if self.highest < 0 {
-            // One-shot zero-RTT catch-up before the window is synced.
-            RECV_FUTURE_SEARCH_WINDOW as u64
-        } else {
-            // Steady state: bounded forward search (anti CPU-amplification DoS).
-            self.highest as u64 + RECV_FUTURE_SEARCH_SYNCED as u64 + 1
-        };
+        #[cfg(not(test))]
+        let _ = recovery;
 
         for tw_offset in [0i64, -1, 1] {
             let tw = (base_tw as i64 + tw_offset) as u64;
-            for counter in start..end {
+            for counter in start..=end {
                 if !self.is_new(counter) {
                     continue;
+                }
+                #[cfg(test)]
+                if recovery {
+                    self.counter_recovery
+                        .tag_checks
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
                 let expected = generate_resonance_tag(&keys.tag_secret, counter, tw);
                 // Use constant-time comparison to prevent timing-oracle tag forgery.
@@ -170,12 +254,10 @@ impl RecvWindow {
     }
 
     pub fn mark(&mut self, counter: u64) {
-        if self.highest < 0 || counter > self.highest as u64 {
-            let shift = if self.highest < 0 {
-                RECV_REORDER_WINDOW as u64
-            } else {
-                counter - self.highest as u64
-            };
+        if self.highest.is_none_or(|highest| counter > highest) {
+            let shift = self
+                .highest
+                .map_or(RECV_REORDER_WINDOW as u64, |highest| counter - highest);
             self.bitmap = if shift >= RECV_REORDER_WINDOW as u64 {
                 let mut bitmap = Bitset256::new();
                 bitmap.set_bit(0);
@@ -185,21 +267,20 @@ impl RecvWindow {
                 bitmap.set_bit(0);
                 bitmap
             };
-            self.highest = counter as i64;
+            self.highest = Some(counter);
         } else {
-            let diff = (self.highest as u64 - counter) as usize;
-            if diff < RECV_REORDER_WINDOW {
-                self.bitmap.set_bit(diff);
+            let diff = self.highest.unwrap() - counter;
+            if diff < RECV_REORDER_WINDOW as u64 {
+                self.bitmap.set_bit(diff as usize);
             }
         }
+        self.clear_authenticated_counter_hint();
     }
 
     fn is_new(&self, counter: u64) -> bool {
-        if self.highest < 0 {
+        let Some(highest) = self.highest else {
             return true;
-        }
-
-        let highest = self.highest as u64;
+        };
         if counter > highest {
             return true;
         }
@@ -293,12 +374,8 @@ pub fn build_random_mdh_packet_with_tag_offset(
 /// from the tag/eph slots). For STUN masks the message-length field is patched
 /// post-assembly so the opening packets also satisfy nDPI's `is_stun`.
 ///
-/// QUIC limitation: a handshake packet cannot be a full RFC 9001 Initial (the
-/// Initial has no slot for the ephemeral key), so for QUIC masks the MDH stays
-/// the (long-header-shaped) `header_spec` output rather than a real Initial.
-/// The goal — no pure-random-noise opening — still holds for every mask; a
-/// genuine QUIC Initial is only produced on the data path by
-/// `MimicryEngine::build_packet`.
+/// В QUIC это внутренний блок AIVPN. Настоящий Initial и TLS создает QuicMask;
+/// этот блок передается внутри зашифрованного HTTP DATAGRAM после CONNECT-UDP.
 pub fn build_shaped_mdh_packet(
     keys: &SessionKeys,
     counter: &mut u64,
@@ -504,8 +581,20 @@ pub fn decode_packet_with_layout(
     let tag: [u8; TAG_SIZE] = packet[tag_start..tag_start + TAG_SIZE]
         .try_into()
         .map_err(|_| Error::InvalidPacket("Packet tag malformed"))?;
+    let mut recovered_from = None;
     let counter = recv_window
         .find_counter(&tag, keys)
+        .or_else(|| {
+            let bounds = recv_window.recovery_bounds(1)?;
+            if !recv_window.reserve_counter_recovery(Instant::now()) {
+                return None;
+            }
+            let counter = recv_window.find_counter_in_bounds(&tag, keys, bounds, true)?;
+            recovered_from = recv_window
+                .highest
+                .max(recv_window.authenticated_counter_hint);
+            Some(counter)
+        })
         .ok_or(Error::InvalidPacket("Invalid resonance tag"))?;
 
     let ciphertext = &packet[ct_start..];
@@ -521,7 +610,20 @@ pub fn decode_packet_with_layout(
     )?;
     let decoded = parse_downlink_inner(counter, &padded)?;
     recv_window.mark(counter);
+    recv_window.preferred_tag_offset = Some(tag_offset);
+    if let Some(previous) = recovered_from {
+        log_counter_recovery(previous, counter);
+    }
     Ok(decoded)
+}
+
+fn log_counter_recovery(previous: u64, counter: u64) {
+    tracing::info!(
+        previous,
+        counter,
+        gap = counter.saturating_sub(previous),
+        "Восстановлен счетчик приема после потери пакетов"
+    );
 }
 
 /// Strip the `pad_len(LE u16) || inner_header || payload || random_padding`
@@ -604,17 +706,62 @@ pub fn decode_downlink_with_offsets(
     candidate_mdh_lens: &mut Vec<usize>,
     tag_offsets: &[u16],
 ) -> Result<DecodedPacket> {
-    let mut offsets = vec![u16::MAX];
+    let mut offsets = Vec::with_capacity(tag_offsets.len() + 1);
+    // Предпочтение запоминается только после AEAD и разбора внутреннего пакета.
+    // Старое предпочтение не расширяет переданный вызывающим список масок.
+    if let Some(preferred) = recv_window.preferred_tag_offset {
+        if preferred == u16::MAX || tag_offsets.contains(&preferred) {
+            offsets.push(preferred);
+        }
+    }
     for &offset in tag_offsets {
         if !offsets.contains(&offset) {
             offsets.push(offset);
         }
     }
+    if !offsets.contains(&u16::MAX) {
+        offsets.push(u16::MAX);
+    }
     let mut error = Error::InvalidPacket("Invalid resonance tag");
-    for offset in offsets {
-        match decode_downlink_one_layout(packet, keys, recv_window, candidate_mdh_lens, offset) {
-            Ok(decoded) => return Ok(decoded),
+    for &offset in &offsets {
+        match decode_downlink_one_layout(
+            packet,
+            keys,
+            recv_window,
+            candidate_mdh_lens,
+            offset,
+            None,
+        ) {
+            Ok(decoded) => {
+                recv_window.preferred_tag_offset = Some(offset);
+                return Ok(decoded);
+            }
             Err(failure) => error = failure,
+        }
+    }
+    if let Some(bounds) = recv_window.recovery_bounds(offsets.len()) {
+        if recv_window.reserve_counter_recovery(Instant::now()) {
+            let previous = recv_window
+                .highest
+                .max(recv_window.authenticated_counter_hint)
+                .unwrap();
+            for offset in offsets {
+                match decode_downlink_one_layout(
+                    packet,
+                    keys,
+                    recv_window,
+                    candidate_mdh_lens,
+                    offset,
+                    Some(bounds),
+                ) {
+                    Ok(decoded) => {
+                        recv_window.preferred_tag_offset = Some(offset);
+                        log_counter_recovery(previous, decoded.counter);
+                        return Ok(decoded);
+                    }
+                    Err(failure) => error = failure,
+                }
+            }
         }
     }
     Err(error)
@@ -626,6 +773,7 @@ fn decode_downlink_one_layout(
     recv_window: &mut RecvWindow,
     candidate_mdh_lens: &mut Vec<usize>,
     tag_offset: u16,
+    recovery_bounds: Option<(u64, u64)>,
 ) -> Result<DecodedPacket> {
     let prefix_len = if tag_offset == u16::MAX { TAG_SIZE } else { 0 };
     let tag_start = if tag_offset == u16::MAX {
@@ -639,8 +787,11 @@ fn decode_downlink_one_layout(
     let tag: [u8; TAG_SIZE] = packet[tag_start..tag_start + TAG_SIZE]
         .try_into()
         .map_err(|_| Error::InvalidPacket("Packet tag malformed"))?;
-    let counter = recv_window
-        .find_counter(&tag, keys)
+    let counter = recovery_bounds
+        .map_or_else(
+            || recv_window.find_counter(&tag, keys),
+            |bounds| recv_window.find_counter_in_bounds(&tag, keys, bounds, true),
+        )
         .ok_or(Error::InvalidPacket("Invalid resonance tag"))?;
 
     // Fast path: try every MDH length we have already learned.
@@ -858,16 +1009,30 @@ mod tag_layout_tests {
     }
 
     fn initial_downlink_fixture(keys: &SessionKeys, mdh_len: usize, tag_offset: u16) -> Vec<u8> {
+        initial_downlink_fixture_at(keys, mdh_len, tag_offset, 0)
+    }
+
+    fn initial_downlink_fixture_at(
+        keys: &SessionKeys,
+        mdh_len: usize,
+        tag_offset: u16,
+        counter: u64,
+    ) -> Vec<u8> {
         let tag = generate_resonance_tag(
             &keys.tag_secret,
-            0,
+            counter,
             compute_time_window(current_timestamp_ms(), DEFAULT_WINDOW_MS),
         );
         let mut plain = vec![0, 0];
         plain.extend(build_inner_packet(InnerType::Control, 7, b"hello-v2"));
-        let envelope =
-            crypto::encrypt_session_payload(keys, PacketDirection::ServerToClient, 0, &tag, &plain)
-                .unwrap();
+        let envelope = crypto::encrypt_session_payload(
+            keys,
+            PacketDirection::ServerToClient,
+            counter,
+            &tag,
+            &plain,
+        )
+        .unwrap();
         let prefix = if tag_offset == u16::MAX { 8 } else { 0 };
         let tag_start = if tag_offset == u16::MAX {
             0
@@ -878,6 +1043,269 @@ mod tag_layout_tests {
         packet[tag_start..tag_start + 8].copy_from_slice(&tag);
         packet.extend(envelope);
         packet
+    }
+
+    #[test]
+    fn large_gap_recovers_after_an_authenticated_layout_changes() {
+        let keys = derive_session_keys(&[7; 32], None, &[8; 32]);
+        let mut window = RecvWindow::new();
+        let mut lengths = vec![48, 40];
+        let first = initial_downlink_fixture_at(&keys, 48, 27, 1000);
+        decode_downlink_with_offsets(&first, &keys, &mut window, &mut lengths, &[27]).unwrap();
+        assert_eq!(window.preferred_tag_offset, Some(27));
+        let later = initial_downlink_fixture_at(&keys, 40, 8, 17000);
+        let decoded = decode_downlink_with_offsets(
+            &later,
+            &keys,
+            &mut window,
+            &mut lengths,
+            &[u16::MAX, 27, 8],
+        )
+        .expect("Потеря пачки не должна навсегда закрывать прием новой маски");
+        assert_eq!(decoded.counter, 17000);
+        assert_eq!(window.highest(), Some(17000));
+        assert_eq!(window.preferred_tag_offset, Some(8));
+        assert!(
+            decode_downlink_with_offsets(&first, &keys, &mut window, &mut lengths, &[27, 8],)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn large_gap_recovers_with_fixed_header_layout() {
+        let keys = derive_session_keys(&[7; 32], None, &[8; 32]);
+        let mut window = RecvWindow::new();
+        let first = initial_downlink_fixture_at(&keys, 48, 27, 1000);
+        decode_packet_with_layout(&first, &keys, &mut window, 48, 27).unwrap();
+        let later = initial_downlink_fixture_at(&keys, 48, 27, 17000);
+        let decoded = decode_packet_with_layout(&later, &keys, &mut window, 48, 27)
+            .expect("Один известный заголовок должен переживать большой пропуск");
+        assert_eq!(decoded.counter, 17000);
+        assert_eq!(window.highest(), Some(17000));
+        assert!(decode_packet_with_layout(&later, &keys, &mut window, 48, 27).is_err());
+    }
+
+    #[test]
+    fn large_gap_recovers_from_authenticated_hint_without_marking_the_old_epoch() {
+        let keys = derive_session_keys(&[7; 32], None, &[8; 32]);
+        let mut window = RecvWindow::new();
+        window.observe_authenticated_counter(1000);
+        assert_eq!(window.highest(), None);
+        let later = initial_downlink_fixture_at(&keys, 48, 27, 17000);
+        decode_downlink_with_offsets(&later, &keys, &mut window, &mut vec![48], &[u16::MAX, 27])
+            .expect("Ориентир старой эпохи должен помогать при потере новых пакетов");
+        assert_eq!(window.highest(), Some(17000));
+        assert_eq!(window.observation_counts(), (1, 1));
+        assert!(!window.is_new(1000));
+    }
+
+    #[test]
+    fn recovery_budget_is_shared_by_probes_but_separate_for_real_key_epochs() {
+        let mut primary = RecvWindow::new();
+        primary.mark(1000);
+        let old_epoch = primary.clone();
+        let now = Instant::now();
+        assert!(primary.reserve_counter_recovery(now));
+        for _ in 0..32 {
+            assert!(!primary.clone().reserve_counter_recovery(now));
+        }
+        assert!(!old_epoch.reserve_counter_recovery(now));
+        assert!(old_epoch.reserve_counter_recovery(now + RECV_RECOVERY_INTERVAL));
+        primary.begin_counter_recovery_epoch();
+        assert!(primary.reserve_counter_recovery(now + RECV_RECOVERY_INTERVAL));
+        assert!(!old_epoch.reserve_counter_recovery(now + RECV_RECOVERY_INTERVAL));
+        assert_eq!(primary.highest(), Some(1000));
+        primary.reset();
+        assert_eq!(primary.recovery_bounds(1), None);
+        assert!(primary
+            .counter_recovery
+            .last_attempt
+            .lock()
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn recovery_garbage_has_a_total_work_limit_across_layouts_and_clones() {
+        use std::sync::atomic::Ordering;
+        let keys = derive_session_keys(&[7; 32], None, &[8; 32]);
+        let mut window = RecvWindow::new();
+        let garbage = vec![0; 128];
+        let offsets = [6, 8, 27, u16::MAX];
+        assert!(decode_downlink_with_offsets(
+            &garbage,
+            &keys,
+            &mut window,
+            &mut vec![48],
+            &offsets,
+        )
+        .is_err());
+        assert_eq!(
+            window.counter_recovery.tag_checks.load(Ordering::Relaxed),
+            0
+        );
+        window.mark(1000);
+        let before = (window.highest(), window.observation_counts());
+        let mut lengths = vec![48];
+        assert!(
+            decode_downlink_with_offsets(&garbage, &keys, &mut window, &mut lengths, &offsets,)
+                .is_err()
+        );
+        let work = window.counter_recovery.tag_checks.load(Ordering::Relaxed);
+        assert!(work > 0 && work <= 3 * RECV_RECOVERY_CANDIDATES);
+        // Статическую отметку удерживаем в будущем, без ожидания настенных таймеров.
+        *window.counter_recovery.last_attempt.lock().unwrap() =
+            Some(Instant::now() + std::time::Duration::from_secs(10));
+        for _ in 0..8 {
+            let mut probe = window.clone();
+            assert!(decode_downlink_with_offsets(
+                &garbage,
+                &keys,
+                &mut probe,
+                &mut lengths,
+                &offsets,
+            )
+            .is_err());
+        }
+        assert_eq!(
+            window.counter_recovery.tag_checks.load(Ordering::Relaxed),
+            work
+        );
+        assert_eq!((window.highest(), window.observation_counts()), before);
+        assert_eq!(lengths, vec![48]);
+    }
+
+    #[test]
+    fn recovery_tamper_cannot_move_replay_or_learn_a_layout() {
+        let keys = derive_session_keys(&[7; 32], None, &[8; 32]);
+        let mut window = RecvWindow::new();
+        let mut lengths = vec![48];
+        let first = initial_downlink_fixture_at(&keys, 48, 27, 1000);
+        decode_downlink_with_offsets(&first, &keys, &mut window, &mut lengths, &[27]).unwrap();
+        let before = window.observation_counts();
+        let valid = initial_downlink_fixture_at(&keys, 40, 8, 17000);
+        let mut corrupt = valid.clone();
+        *corrupt.last_mut().unwrap() ^= 1;
+        assert!(
+            decode_downlink_with_offsets(&corrupt, &keys, &mut window, &mut lengths, &[27, 8],)
+                .is_err()
+        );
+        assert_eq!(window.highest(), Some(1000));
+        assert_eq!(window.observation_counts(), before);
+        assert_eq!(window.preferred_tag_offset, Some(27));
+        assert_eq!(lengths, vec![48]);
+        *window.counter_recovery.last_attempt.lock().unwrap() = None;
+        decode_downlink_with_offsets(&valid, &keys, &mut window, &mut lengths, &[27, 8]).unwrap();
+        assert_eq!(window.highest(), Some(17000));
+        assert_eq!(window.preferred_tag_offset, Some(8));
+    }
+
+    #[test]
+    fn recovery_does_not_expand_allowed_layouts_or_wrap_counter_space() {
+        let keys = derive_session_keys(&[7; 32], None, &[8; 32]);
+        let mut window = RecvWindow::new();
+        window.mark(1000);
+        window.preferred_tag_offset = Some(8);
+        let forbidden = initial_downlink_fixture_at(&keys, 48, 8, 17000);
+        assert!(
+            decode_downlink_with_offsets(&forbidden, &keys, &mut window, &mut vec![48], &[27],)
+                .is_err()
+        );
+        assert_eq!(window.highest(), Some(1000));
+        let mut near_end = RecvWindow::new();
+        near_end.mark(u64::MAX - 2000);
+        let last = initial_downlink_fixture_at(&keys, 48, 27, u64::MAX);
+        decode_downlink_with_offsets(&last, &keys, &mut near_end, &mut vec![48], &[27]).unwrap();
+        assert_eq!(near_end.highest(), Some(u64::MAX));
+        assert_eq!(near_end.recovery_bounds(1), None);
+        let zero = initial_downlink_fixture_at(&keys, 48, 27, 0);
+        assert!(
+            decode_downlink_with_offsets(&zero, &keys, &mut near_end, &mut vec![48], &[27],)
+                .is_err()
+        );
+        assert_eq!(near_end.highest(), Some(u64::MAX));
+    }
+
+    #[test]
+    fn authenticated_counter_hint_keeps_replay_state_and_bounds_separate() {
+        let keys = derive_session_keys(&[7; 32], None, &[8; 32]);
+        let mut window = RecvWindow::new();
+        window.mark(1000);
+        window.mark(1002);
+        let counts = window.observation_counts();
+        window.observe_authenticated_counter(1100);
+        window.observe_authenticated_counter(1050);
+        assert_eq!(window.highest(), Some(1002));
+        assert_eq!(window.observation_counts(), counts);
+        assert_eq!(window.search_bounds(), (845, 1612));
+        assert!(!window.is_new(1000));
+        assert!(!window.is_new(1002));
+
+        let valid = initial_downlink_fixture_at(&keys, 20, u16::MAX, 1101);
+        let mut corrupt = valid.clone();
+        *corrupt.last_mut().unwrap() ^= 1;
+        assert!(decode_downlink_with_offsets(
+            &corrupt,
+            &keys,
+            &mut window,
+            &mut vec![20],
+            &[u16::MAX],
+        )
+        .is_err());
+        assert_eq!(window.highest(), Some(1002));
+        assert_eq!(window.authenticated_counter_hint, Some(1100));
+        decode_downlink_with_offsets(&valid, &keys, &mut window, &mut vec![20], &[u16::MAX])
+            .unwrap();
+        assert_eq!(window.highest(), Some(1101));
+        assert_eq!(window.authenticated_counter_hint, None);
+        for counter in [1000, 1002, 1101] {
+            assert!(!window.is_new(counter), "Утерян replay bit {counter}");
+            assert!(decode_downlink_with_offsets(
+                &initial_downlink_fixture_at(&keys, 20, u16::MAX, counter),
+                &keys,
+                &mut window,
+                &mut vec![20],
+                &[u16::MAX],
+            )
+            .is_err());
+        }
+
+        window.observe_authenticated_counter(1_000_000_000);
+        let (start, end) = window.search_bounds();
+        assert_eq!(end - start + 1, 768);
+        assert_eq!(window.highest(), Some(1101));
+        let mut cloned = window.clone();
+        cloned.reset();
+        assert_eq!(cloned.search_bounds(), (0, 1023));
+        assert_eq!(cloned.highest(), None);
+        assert_eq!(window.authenticated_counter_hint, Some(1_000_000_000));
+    }
+
+    #[test]
+    fn counter_search_and_replay_do_not_wrap_at_u64_max() {
+        let keys = derive_session_keys(&[7; 32], None, &[8; 32]);
+        let mut window = RecvWindow::new();
+        window.mark(u64::MAX - 100);
+        window.observe_authenticated_counter(u64::MAX - 2);
+        assert_eq!(window.search_bounds(), (u64::MAX - 257, u64::MAX));
+        let packet = initial_downlink_fixture_at(&keys, 20, u16::MAX, u64::MAX);
+        decode_downlink_with_offsets(&packet, &keys, &mut window, &mut vec![20], &[u16::MAX])
+            .unwrap();
+        assert_eq!(window.highest(), Some(u64::MAX));
+        assert_eq!(window.search_bounds(), (u64::MAX - 255, u64::MAX));
+        assert!(!window.is_new(u64::MAX));
+        assert!(!window.is_new(u64::MAX - 100));
+        let zero = initial_downlink_fixture_at(&keys, 20, u16::MAX, 0);
+        for replay in [&packet, &zero] {
+            assert!(decode_downlink_with_offsets(
+                replay,
+                &keys,
+                &mut window,
+                &mut vec![20],
+                &[u16::MAX],
+            )
+            .is_err());
+        }
     }
 
     #[test]
@@ -918,6 +1346,93 @@ mod tag_layout_tests {
             )
             .is_err());
         }
+    }
+
+    #[test]
+    fn authenticated_embedded_layout_avoids_a_legacy_counter_scan() {
+        let keys = crypto::derive_initial_session_keys(&[7; 32], Some(&[8; 32]), &[9; 32]);
+        let packet = initial_downlink_fixture(&keys, 48, 27);
+        let mut window = RecvWindow::new();
+        let decoded =
+            decode_downlink_with_offsets(&packet, &keys, &mut window, &mut vec![48], &[27])
+                .unwrap();
+        assert_eq!(decoded.payload, b"hello-v2");
+        assert_eq!(
+            window
+                .counter_lookups
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "Перед известным расположением тега перебирается заведомо чужой заголовок"
+        );
+    }
+
+    #[test]
+    fn preferred_layout_is_authenticated_and_recovers_after_mask_switches() {
+        let keys = crypto::derive_initial_session_keys(&[7; 32], Some(&[8; 32]), &[9; 32]);
+        let mut window = RecvWindow::new();
+        let mut lengths = vec![48];
+        for (counter, offset) in [(0, 27), (1, 8), (2, 8), (3, u16::MAX), (4, u16::MAX)] {
+            let packet = initial_downlink_fixture_at(&keys, 48, offset, counter);
+            let calls = window
+                .counter_lookups
+                .load(std::sync::atomic::Ordering::Relaxed);
+            let already_preferred = window.preferred_tag_offset == Some(offset);
+            let decoded =
+                decode_downlink_with_offsets(&packet, &keys, &mut window, &mut lengths, &[27, 8])
+                    .unwrap();
+            assert_eq!(decoded.counter, counter);
+            assert_eq!(window.preferred_tag_offset, Some(offset));
+            if already_preferred {
+                assert_eq!(
+                    window
+                        .counter_lookups
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                        - calls,
+                    1
+                );
+            }
+        }
+        let mut corrupt = initial_downlink_fixture_at(&keys, 48, 8, 5);
+        *corrupt.last_mut().unwrap() ^= 1;
+        assert!(
+            decode_downlink_with_offsets(&corrupt, &keys, &mut window, &mut lengths, &[27, 8])
+                .is_err()
+        );
+        assert_eq!(window.highest(), Some(4));
+        assert_eq!(window.preferred_tag_offset, Some(u16::MAX));
+        let valid = initial_downlink_fixture_at(&keys, 48, 8, 5);
+        assert!(
+            decode_downlink_with_offsets(&valid, &keys, &mut window, &mut lengths, &[27, 8])
+                .is_ok()
+        );
+        assert!(
+            decode_downlink_with_offsets(&valid, &keys, &mut window, &mut lengths, &[27, 8])
+                .is_err()
+        );
+        assert_eq!(window.highest(), Some(5));
+        assert_eq!(window.preferred_tag_offset, Some(8));
+        window.reset();
+        assert_eq!(window.highest(), None);
+        assert_eq!(window.preferred_tag_offset, None);
+    }
+
+    #[test]
+    fn cached_layout_cannot_expand_the_allowed_offsets() {
+        let keys = crypto::derive_initial_session_keys(&[7; 32], Some(&[8; 32]), &[9; 32]);
+        let mut window = RecvWindow::new();
+        let first = initial_downlink_fixture_at(&keys, 48, 8, 0);
+        let mut lengths = vec![48];
+        assert!(
+            decode_downlink_with_offsets(&first, &keys, &mut window, &mut lengths, &[8]).is_ok()
+        );
+        let second = initial_downlink_fixture_at(&keys, 48, 8, 1);
+        assert!(
+            decode_downlink_with_offsets(&second, &keys, &mut window, &mut lengths, &[27]).is_err()
+        );
+        assert_eq!(window.highest(), Some(0));
+        assert!(
+            decode_downlink_with_offsets(&second, &keys, &mut window, &mut lengths, &[8]).is_ok()
+        );
     }
 
     #[test]

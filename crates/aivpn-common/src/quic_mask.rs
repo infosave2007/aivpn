@@ -1,21 +1,21 @@
 //! Состояние QUIC внутри существующей маски.
 //!
 //! Сокетов здесь нет: вызывающий код отдает UDP payload и забирает готовые
-//! дейтаграммы. Начальные байты AIVPN едут один раз непрозрачным токеном
-//! Initial. После рукопожатия внутренние пакеты идут стандартными DATAGRAM
+//! дейтаграммы. Первый Initial содержит только штатный QUIC handshake. После TLS
+//! внутренний bootstrap и остальные пакеты идут стандартными DATAGRAM
 //! TLS 1.3, без 0-RTT и без смены адреса.
 
 use std::collections::VecDeque;
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use bytes::{Bytes, BytesMut};
 use quinn_proto::crypto::rustls::{HandshakeData, QuicClientConfig, QuicServerConfig};
 use quinn_proto::{
-    ClientConfig, Connection, ConnectionHandle, ConnectionIdGenerator, DatagramEvent, Endpoint,
-    EndpointConfig, Event, IdleTimeout, MtuDiscoveryConfig, RandomConnectionIdGenerator,
-    SendDatagramError, ServerConfig, TokenStore, TransportConfig, VarInt,
+    ClientConfig, Connection, ConnectionHandle, ConnectionId, ConnectionIdGenerator, DatagramEvent,
+    Endpoint, EndpointConfig, Event, HashedConnectionIdGenerator, IdleTimeout, MtuDiscoveryConfig,
+    RandomConnectionIdGenerator, SendDatagramError, ServerConfig, TransportConfig, VarInt,
 };
 use rustls::client::danger::{ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
@@ -30,12 +30,13 @@ const MIN_DATAGRAM: usize = 1200;
 const CID_LEN: usize = 8;
 const CID_MIN: usize = 8;
 const CID_MAX: usize = 20;
-const TOKEN_MIN: u64 = 1;
-const TOKEN_MAX: u64 = 512;
 /// Минимум поля Length: однобайтовый номер пакета и тег AEAD.
 const MIN_PACKET_REST: usize = 17;
 const SEND_BUDGET: usize = 64 * 1024;
 const RECV_BUDGET: usize = 128 * 1024;
+// Штатный предел Quinn для DATAGRAM вмещает полет широкополосного канала.
+// Очередь до TLS и потоковые окна сохраняют отдельный малый предел.
+const DATAGRAM_SEND_BUDGET: usize = 1024 * 1024;
 const IDLE: Duration = Duration::from_secs(30);
 const MAX_SEGMENTS: usize = 16;
 const ALPN_H3: &[u8] = b"h3";
@@ -87,6 +88,7 @@ pub struct QuicMask {
     setup_deadline: Instant,
     next_application_poll: Option<Instant>,
     verified_wire: crate::verified_wire::VerifiedWire,
+    routing: Option<QuicRouting>,
 }
 
 struct Identity {
@@ -94,17 +96,35 @@ struct Identity {
     key: PrivateKeyDer<'static>,
 }
 
-struct BootstrapToken(Mutex<Option<Bytes>>);
+/// Непрозрачный маршрут одного поколения. CID остаются штатными CID Quinn.
+#[derive(Clone)]
+pub struct QuicRouting {
+    initial_dcid: Vec<u8>,
+    key: u64,
+}
+
+impl QuicRouting {
+    pub fn matches(&self, packet: &[u8]) -> bool {
+        let Some(cid) = QuicMask::destination_cid(packet) else {
+            return false;
+        };
+        cid == self.initial_dcid
+            || (cid.len() == CID_LEN
+                && HashedConnectionIdGenerator::from_key(self.key)
+                    .validate(&ConnectionId::new(cid))
+                    .is_ok())
+    }
+}
 
 #[derive(Debug)]
 struct MaskServerCertVerifier;
 
 impl QuicMask {
-    /// Достает непрозрачный токен из строгого QUIC v1 Initial.
+    /// Достает штатный токен из QUIC v1 Initial, в том числе пустой.
     ///
-    /// Пакет не короче 1200 байт, обе стороны CID от 8 до 20, токен от 1 до 512.
+    /// Пакет не короче 1200 байт, DCID от 8 до 20, SCID до 20 байт.
     /// Нижние биты первого байта закрыты header protection и здесь не читаются.
-    pub fn bootstrap(packet: &[u8]) -> Option<&[u8]> {
+    pub fn initial_token(packet: &[u8]) -> Option<&[u8]> {
         if packet.len() < MIN_DATAGRAM {
             return None;
         }
@@ -126,18 +146,16 @@ impl QuicMask {
         offset += dcid_len;
         let scid_len = usize::from(*packet.get(offset)?);
         offset += 1;
-        if !(CID_MIN..=CID_MAX).contains(&scid_len) || packet.len() < offset + scid_len {
+        if scid_len > CID_MAX || packet.len() < offset + scid_len {
             return None;
         }
         offset += scid_len;
         let (token_len, eaten) = read_varint(packet.get(offset..)?)?;
         offset += eaten;
-        if !(TOKEN_MIN..=TOKEN_MAX).contains(&token_len) {
-            return None;
-        }
-        let token_len = token_len as usize;
-        let token = packet.get(offset..offset + token_len)?;
-        offset += token_len;
+        let token_len = usize::try_from(token_len).ok()?;
+        let token_end = offset.checked_add(token_len)?;
+        let token = packet.get(offset..token_end)?;
+        offset = token_end;
         let (length, eaten) = read_varint(packet.get(offset..)?)?;
         offset += eaten;
         let length = usize::try_from(length).ok()?;
@@ -148,25 +166,42 @@ impl QuicMask {
         Some(token)
     }
 
-    /// Клиент. `bootstrap` кладется в токен Initial и больше никуда.
+    /// CID назначения для ограниченной маршрутизации поколений на общем сокете.
+    pub fn destination_cid(packet: &[u8]) -> Option<&[u8]> {
+        let first = *packet.first()?;
+        if first & 0x40 == 0 {
+            return None;
+        }
+        if first & 0x80 == 0 {
+            return packet.get(1..1 + CID_LEN);
+        }
+        let length = usize::from(*packet.get(5)?);
+        if length > CID_MAX {
+            return None;
+        }
+        packet.get(6..6 + length)
+    }
+
+    pub fn routing(&self) -> Option<QuicRouting> {
+        self.routing.clone()
+    }
+
+    /// Клиент. `bootstrap` ожидает TLS и согласования CONNECT-UDP в общей очереди.
     pub fn client(
         bootstrap: &[u8],
         peer: SocketAddr,
         server_name: &str,
         now: Instant,
     ) -> Result<Self> {
-        if !(1..=512).contains(&bootstrap.len()) {
-            return Err(Error::InvalidPacket("Начальный токен вне допустимой длины"));
+        if bootstrap.is_empty() || bootstrap.len() > MAX_LOGICAL {
+            return Err(Error::InvalidPacket("Начальный пакет вне допустимой длины"));
         }
         if server_name.is_empty() || server_name.len() > 253 {
             return Err(Error::InvalidPacket("Имя сервера маски недопустимо"));
         }
-        let mut endpoint = Endpoint::new(endpoint_config()?, None, false, None);
+        let mut endpoint = Endpoint::new(endpoint_config(None)?, None, false, None);
         let mut config = ClientConfig::new(Arc::new(client_crypto()?));
         config.transport_config(transport_config()?);
-        config.token_store(Arc::new(BootstrapToken::new(Bytes::copy_from_slice(
-            bootstrap,
-        ))));
         config.initial_dst_cid_provider(Arc::new(|| {
             RandomConnectionIdGenerator::new(CID_LEN).generate_cid()
         }));
@@ -175,21 +210,30 @@ impl QuicMask {
             .map_err(|err| Error::Session(err.to_string()))?;
         let mut mask = Self::from_parts(endpoint, Some((handle, conn)), false, now);
         mask.application.set_authority(server_name)?;
+        mask.push_pending(Bytes::copy_from_slice(bootstrap))?;
         Ok(mask)
     }
 
-    /// Сервер. Вызывать только после проверки внутреннего AEAD по токену.
-    ///
-    /// Неизвестный токен для quinn не является доказательством адреса: соединение
-    /// принимается как непроверенное, Retry не отправляется.
+    /// Ограниченный транспорт до VPN admission. TLS не дает доступа к TUN.
+    /// Quinn проверяет штатные токены адреса и сохраняет anti-amplification.
     pub fn server(first_packet: &[u8], peer: SocketAddr, now: Instant) -> Result<Self> {
-        if Self::bootstrap(first_packet).is_none() {
+        if Self::initial_token(first_packet).is_none() {
             return Err(Error::InvalidPacket(
                 "Первый пакет не является QUIC Initial v1",
             ));
         }
-        let endpoint = Endpoint::new(endpoint_config()?, Some(server_config()?), false, None);
+        let routing = QuicRouting {
+            initial_dcid: Self::destination_cid(first_packet).unwrap().to_vec(),
+            key: rand::random(),
+        };
+        let endpoint = Endpoint::new(
+            endpoint_config(Some(routing.key))?,
+            Some(server_config()?),
+            false,
+            None,
+        );
         let mut mask = Self::from_parts(endpoint, None, true, now);
+        mask.routing = Some(routing);
         mask.receive(first_packet, peer, now)?;
         if mask.conn.is_none() {
             return Err(Error::InvalidPacket("Сервер не принял первый пакет"));
@@ -384,6 +428,7 @@ impl QuicMask {
             setup_deadline: now + Duration::from_secs(10),
             next_application_poll: None,
             verified_wire: Default::default(),
+            routing: None,
         }
     }
 
@@ -573,20 +618,6 @@ impl QuicMask {
     }
 }
 
-impl TokenStore for BootstrapToken {
-    fn insert(&self, _server_name: &str, _token: Bytes) {}
-
-    fn take(&self, _server_name: &str) -> Option<Bytes> {
-        self.0.lock().unwrap_or_else(|err| err.into_inner()).take()
-    }
-}
-
-impl BootstrapToken {
-    fn new(token: Bytes) -> Self {
-        Self(Mutex::new(Some(token)))
-    }
-}
-
 impl ServerCertVerifier for MaskServerCertVerifier {
     fn verify_server_cert(
         &self,
@@ -647,13 +678,18 @@ fn cached_identity() -> Result<&'static Identity> {
     Ok(CELL.get_or_init(|| made))
 }
 
-fn endpoint_config() -> Result<Arc<EndpointConfig>> {
+fn endpoint_config(routing_key: Option<u64>) -> Result<Arc<EndpointConfig>> {
     let mut config = EndpointConfig::default();
     config
         .max_udp_payload_size(WIRE_MTU)
         .map_err(|_| Error::Crypto("MTU маски вне диапазона QUIC".into()))?;
     config.grease_quic_bit(false);
-    config.cid_generator(|| Box::new(RandomConnectionIdGenerator::new(CID_LEN)));
+    config.cid_generator(move || match routing_key {
+        Some(key) => {
+            Box::new(HashedConnectionIdGenerator::from_key(key)) as Box<dyn ConnectionIdGenerator>
+        }
+        None => Box::new(RandomConnectionIdGenerator::new(CID_LEN)),
+    });
     Ok(Arc::new(config))
 }
 
@@ -676,7 +712,7 @@ fn transport_config() -> Result<Arc<TransportConfig>> {
         .min_mtu(MIN_DATAGRAM as u16)
         .mtu_discovery_config(Some(discovery))
         .datagram_receive_buffer_size(Some(RECV_BUDGET))
-        .datagram_send_buffer_size(SEND_BUDGET)
+        .datagram_send_buffer_size(DATAGRAM_SEND_BUDGET)
         .enable_segmentation_offload(true);
     Ok(Arc::new(config))
 }
@@ -764,6 +800,50 @@ fn split_segments(segment_size: Option<usize>, data: &[u8]) -> Vec<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cold_initial_has_empty_token_and_hides_inner_bootstrap() {
+        let bootstrap = b"private-aivpn-bootstrap-never-in-initial";
+        let now = Instant::now();
+        let mut client = QuicMask::client(bootstrap, addr(4433), "localhost", now).unwrap();
+        let first = client.poll(now).unwrap();
+        let packet = &first.wire[0];
+        let token_at = 7 + packet[5] as usize + packet[6 + packet[5] as usize] as usize;
+        assert_eq!(read_varint(&packet[token_at..]).unwrap().0, 0);
+        assert!(!packet
+            .windows(bootstrap.len())
+            .any(|bytes| bytes == bootstrap));
+    }
+
+    #[test]
+    fn fresh_initial_with_reused_dcid_cannot_replace_an_established_connection() {
+        let mut pipe = Pipe::connect(b"authenticated-bootstrap").unwrap();
+        let dcid = pipe.server.routing.as_ref().unwrap().initial_dcid.clone();
+        let mut endpoint = Endpoint::new(endpoint_config(None).unwrap(), None, false, None);
+        let mut config = ClientConfig::new(Arc::new(client_crypto().unwrap()));
+        config.transport_config(transport_config().unwrap());
+        config.initial_dst_cid_provider(Arc::new(move || ConnectionId::new(&dcid)));
+        let (handle, conn) = endpoint
+            .connect(pipe.now, config, addr(4433), "localhost")
+            .unwrap();
+        let mut forged = QuicMask::from_parts(endpoint, Some((handle, conn)), false, pipe.now);
+        let output = forged.poll(pipe.now).unwrap();
+        assert!(!output.wire.is_empty());
+        for packet in output.wire {
+            assert!(pipe.server.routing.as_ref().unwrap().matches(&packet));
+            pipe.server.receive(&packet, addr(44433), pipe.now).unwrap();
+        }
+        pipe.exchange(b"still-authenticated-up", b"still-authenticated-down")
+            .unwrap();
+        assert_eq!(
+            pipe.server_payloads,
+            vec![b"still-authenticated-up".to_vec()]
+        );
+        assert_eq!(
+            pipe.client_payloads,
+            vec![b"still-authenticated-down".to_vec()]
+        );
+    }
 
     fn addr(port: u16) -> SocketAddr {
         SocketAddr::from(([127, 0, 0, 1], port))
@@ -877,6 +957,8 @@ mod tests {
                 path_mtu,
             };
             pipe.drive(80)?;
+            assert_eq!(pipe.server_payloads, vec![bootstrap.to_vec()]);
+            pipe.server_payloads.clear();
             assert!(
                 pipe.client.connected && pipe.server.connected,
                 "рукопожатие не завершилось"
@@ -1002,31 +1084,31 @@ mod tests {
     }
 
     #[test]
-    fn bootstrap_parser_accepts_only_strict_initial() {
+    fn token_parser_accepts_only_strict_initial() {
         let token = b"aivpn-initial-v2-token";
         let packet = sample_initial(token, 1100, 1200);
-        assert_eq!(QuicMask::bootstrap(&packet), Some(token.as_slice()));
+        assert_eq!(QuicMask::initial_token(&packet), Some(token.as_slice()));
 
         let mut long_token = vec![0xab; 70];
         long_token[0] = 0x01;
         let wide = sample_initial(&long_token, 1000, 1200);
-        assert_eq!(QuicMask::bootstrap(&wide), Some(long_token.as_slice()));
+        assert_eq!(QuicMask::initial_token(&wide), Some(long_token.as_slice()));
 
         let mut short = packet.clone();
         short.truncate(1199);
-        assert!(QuicMask::bootstrap(&short).is_none());
+        assert!(QuicMask::initial_token(&short).is_none());
 
         let mut version = packet.clone();
         version[1] = 0xff;
-        assert!(QuicMask::bootstrap(&version).is_none());
+        assert!(QuicMask::initial_token(&version).is_none());
 
         let mut handshake = packet.clone();
         handshake[0] = 0xe0;
-        assert!(QuicMask::bootstrap(&handshake).is_none());
+        assert!(QuicMask::initial_token(&handshake).is_none());
 
         let mut fixed = packet.clone();
         fixed[0] = 0x80;
-        assert!(QuicMask::bootstrap(&fixed).is_none());
+        assert!(QuicMask::initial_token(&fixed).is_none());
 
         for bad_len in [0u8, 7, 21] {
             let mut bad = Vec::new();
@@ -1034,27 +1116,30 @@ mod tests {
             bad.extend_from_slice(&1u32.to_be_bytes());
             bad.push(bad_len);
             bad.resize(1200, 0);
-            assert!(QuicMask::bootstrap(&bad).is_none(), "cid {bad_len}");
+            assert!(QuicMask::initial_token(&bad).is_none(), "cid {bad_len}");
         }
 
         let mut empty_token = sample_initial(b"x", 1100, 1200);
         // Подменяем длину токена на 0, оставляя прежние байты дальше.
         let token_at = 5 + 1 + CID_LEN + 1 + CID_LEN;
         empty_token[token_at] = 0;
-        assert!(QuicMask::bootstrap(&empty_token).is_none());
+        assert_eq!(
+            QuicMask::initial_token(&sample_initial(b"", 1100, 1200)),
+            Some(&b""[..])
+        );
 
         let huge = vec![0xcd; 513];
         let too_big = sample_initial(&huge, 700, 1300);
-        assert!(QuicMask::bootstrap(&too_big).is_none());
+        assert_eq!(QuicMask::initial_token(&too_big), Some(huge.as_slice()));
 
         let mut overflow = sample_initial(token, 1100, 1200);
         let len_at = 5 + 1 + CID_LEN + 1 + CID_LEN + 1 + token.len();
         overflow[len_at] = 0x7f;
-        assert!(QuicMask::bootstrap(&overflow).is_none());
+        assert!(QuicMask::initial_token(&overflow).is_none());
 
         let mut tiny = sample_initial(token, 16, 0);
         tiny.resize(MIN_DATAGRAM, 0x5a);
-        assert!(QuicMask::bootstrap(&tiny).is_none());
+        assert!(QuicMask::initial_token(&tiny).is_none());
     }
 
     #[test]
@@ -1084,7 +1169,7 @@ mod tests {
         let bootstrap = vec![0x42; 80];
         let mut pipe = Pipe::connect(&bootstrap).unwrap();
         let first = &pipe.client_wire[0];
-        assert_eq!(QuicMask::bootstrap(first), Some(bootstrap.as_slice()));
+        assert_eq!(QuicMask::initial_token(first), Some(&b""[..]));
         assert!(first.len() >= MIN_DATAGRAM);
 
         let upstream = vec![0x11; MAX_LOGICAL];
@@ -1107,15 +1192,36 @@ mod tests {
     }
 
     #[test]
+    fn datagram_queue_accepts_a_broadband_flight_and_stays_bounded() {
+        let mut pipe = Pipe::connect(b"queue-budget-bootstrap").unwrap();
+        let payload = vec![0x11; 1000];
+        // Канал 100 Мбит/с с RTT 20 мс держит около 250 КБ в пути.
+        for _ in 0..256 {
+            pipe.client
+                .send(&payload)
+                .expect("Очередь меньше одного широкополосного полета");
+        }
+        let mut blocked = false;
+        for _ in 0..2048 {
+            match pipe.client.send(&payload) {
+                Ok(()) => {}
+                Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    blocked = true;
+                    break;
+                }
+                Err(error) => panic!("Неожиданная ошибка очереди: {error}"),
+            }
+        }
+        assert!(blocked, "Очередь DATAGRAM должна иметь конечный предел");
+    }
+
+    #[test]
     fn timer_loss_retransmits_with_stable_cid() {
         let bootstrap = b"loss-token-stable-cid".to_vec();
         let now = Instant::now();
         let mut client = QuicMask::client(&bootstrap, addr(4433), "localhost", now).unwrap();
         let first = client.poll(now).unwrap();
-        assert_eq!(
-            QuicMask::bootstrap(&first.wire[0]),
-            Some(bootstrap.as_slice())
-        );
+        assert_eq!(QuicMask::initial_token(&first.wire[0]), Some(&b""[..]));
         let deadline = client.deadline().expect("таймер потери");
         assert!(deadline > now);
         let second = client.poll(deadline).unwrap();
@@ -1123,10 +1229,7 @@ mod tests {
         assert_ne!(first.wire[0], second.wire[0]);
         assert_eq!(long_dcid(&first.wire[0]), long_dcid(&second.wire[0]));
         assert_eq!(long_scid(&first.wire[0]), long_scid(&second.wire[0]));
-        assert_eq!(
-            QuicMask::bootstrap(&second.wire[0]),
-            Some(bootstrap.as_slice())
-        );
+        assert_eq!(QuicMask::initial_token(&second.wire[0]), Some(&b""[..]));
 
         let mut server = QuicMask::server(&second.wire[0], addr(44433), deadline).unwrap();
         for extra in second.wire.iter().skip(1) {
@@ -1149,6 +1252,8 @@ mod tests {
             path_mtu: usize::from(WIRE_MTU),
         };
         pipe.drive(80).unwrap();
+        assert_eq!(pipe.server_payloads, vec![bootstrap]);
+        pipe.server_payloads.clear();
         let client_scid = long_scid(&first.wire[0]);
         let shorts: Vec<_> = pipe
             .server_wire
@@ -1183,10 +1288,13 @@ mod tests {
                 Ok(()) => sent += 1,
                 Err(_) => break,
             }
-            assert!(sent <= 64, "очередь отправки не ограничена");
+            assert!(
+                sent <= DATAGRAM_SEND_BUDGET / MAX_LOGICAL + 1,
+                "очередь отправки не ограничена"
+            );
         }
         assert!(sent >= 1);
-        assert!(sent <= SEND_BUDGET / MAX_LOGICAL + 1);
+        assert!(sent <= DATAGRAM_SEND_BUDGET / MAX_LOGICAL + 1);
     }
 
     #[test]

@@ -48,6 +48,17 @@ def _detected(*names: str) -> str:
 
 
 class FeatureTests(unittest.TestCase):
+    def test_quic_short_header_spin_and_protected_bits_do_not_change_features(self) -> None:
+        reference = bytes([0x40]) + features.rnd_pkt(1200, 71)[1:]
+        expected = features.vector([reference] * 24)
+        for byte0 in range(0x40, 0x80):
+            packet = bytes([byte0]) + reference[1:]
+            self.assertEqual(features.vector([packet] * 24), expected, byte0)
+
+    def test_nonquic_first_byte_is_not_normalized(self) -> None:
+        body = features.rnd_pkt(1200, 71)[1:]
+        self.assertNotEqual(features.vector([b"\x80" + body] * 24), features.vector([b"\x81" + body] * 24))
+
     def test_reference_window_matches_published_vector(self) -> None:
         ok, worst = features.reference_ok()
         self.assertTrue(ok, worst)
@@ -60,6 +71,18 @@ class FeatureTests(unittest.TestCase):
 
 
 class TeacherTests(unittest.TestCase):
+    def test_unchanged_standalone_context_must_not_already_have_negative_label(self) -> None:
+        unknown = teacher.parse_flows(_flow("Unknown", "Unknown", "DPI"))
+        self.assertFalse(train_gbdt.unchanged_context_ok(unknown, 0)[0])
+        rtp = teacher.parse_flows(_flow("RTP", "RTP", "DPI"))
+        self.assertTrue(train_gbdt.unchanged_context_ok(rtp, 0)[0])
+        self.assertFalse(train_gbdt.unchanged_context_ok(rtp, 1)[0])
+        negative = {"accepted": True, "payloads": [b"opaque"], "reason": "Unknown"}
+        rejected = train_gbdt.guard_negative_context(negative, {"accepted": False, "reason": "unchanged Unknown"})
+        self.assertFalse(rejected["accepted"])
+        self.assertIsNone(rejected["payloads"])
+        self.assertTrue(train_gbdt.guard_negative_context(negative, {"accepted": True})["accepted"])
+
     def test_positive_requires_quic_or_stun_with_dpi(self) -> None:
         flows = teacher.parse_flows(_flow("QUIC", "QUIC", "DPI", "Unidirectional Traffic"))
         detected = teacher.detected_protocols(_detected("QUIC"))
@@ -136,6 +159,25 @@ class TeacherTests(unittest.TestCase):
 
 
 class LeakageTests(unittest.TestCase):
+    def test_matched_repetitions_are_bound_to_train_or_heldout(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "a.pcap").write_bytes(b"pcap")
+            (root / "a.json").write_text("[]")
+            row = {"partition": "train", "mask_id": "quic_https_v2", "capture_id": "train/matched-r0-c0-masque", "implementation": "masque", "repetition": 0, "pcap": "a.pcap", "verified": "a.json"}
+            manifest = root / "manifest.json"
+            manifest.write_text(json.dumps({"captures": [row]}))
+            captures = train_gbdt.discover_matched_captures(root)
+            self.assertEqual(captures[0]["capture_id"], row["capture_id"])
+            row["repetition"] = 2
+            manifest.write_text(json.dumps({"captures": [row]}))
+            with self.assertRaises(ValueError):
+                train_gbdt.discover_matched_captures(root)
+            row["partition"] = "test"
+            row["capture_id"] = "test/matched-r2-c0-masque"
+            manifest.write_text(json.dumps({"captures": [row]}))
+            self.assertEqual(train_gbdt.discover_matched_captures(root)[0]["partition"], "test")
+
     def test_verified_data_copy_is_rejected_even_if_pcap_metadata_changes(self) -> None:
         captures = []
         for partition in train_gbdt.PARTITIONS:
@@ -398,7 +440,93 @@ class CaptureMembershipTests(unittest.TestCase):
             self.assertFalse(train_gbdt.verified_upstream_ok(sampled, down_path))
 
 
+class PopulationTests(unittest.TestCase):
+    def test_weights_reject_empty_one_class_and_nontrain_input(self) -> None:
+        for rows in ([], [{"mask_id": "quic_https_v2", "capture_id": "train/a", "y": 0}], [{"partition": "test", "mask_id": "quic_https_v2", "capture_id": "test/a", "y": 0}]):
+            with self.assertRaises(ValueError):
+                train_gbdt.population_weights(rows)
+
+    def test_perfect_model_beats_both_constant_majorities(self) -> None:
+        for labels in ([0, 0, 0, 1], [0, 1, 1, 1]):
+            rows = [{"y": label} for label in labels]
+            perfect = train_gbdt.confusion(rows, [float(label) for label in labels])
+            for majority in (0, 1):
+                constant = train_gbdt.majority_metrics(rows, majority)
+                self.assertTrue(train_gbdt.beats_constant(perfect, constant))
+                self.assertEqual(constant["balanced_accuracy"], 0.5)
+            self.assertEqual(perfect["balanced_accuracy"], 1.0)
+
+    def test_one_class_model_cannot_beat_a_constant(self) -> None:
+        rows = [{"y": label} for label in [0, 0, 0, 1]]
+        for label in (0, 1):
+            constant = train_gbdt.majority_metrics(rows, label)
+            self.assertFalse(train_gbdt.beats_constant(constant, constant))
+        one_class = train_gbdt.confusion([{"y": 0}], [0.0])
+        self.assertIsNone(one_class["balanced_accuracy"])
+        self.assertFalse(train_gbdt.beats_constant(one_class, one_class))
+
+    def test_class_family_weights_keep_all_rows_and_equal_group_mass(self) -> None:
+        rows = []
+        for mask in train_gbdt.MASKS:
+            for label in (0, 1):
+                count = 100 if mask == "quic_https_v2" else 2
+                rows.extend({"mask_id": mask, "capture_id": f"train/{mask}", "y": label} for _ in range(count))
+        weights = train_gbdt.population_weights(rows)
+        self.assertEqual(len(weights), len(rows))
+        self.assertTrue(all(weight > 0 for weight in weights))
+        self.assertAlmostEqual(sum(weights), len(rows))
+        for label in (0, 1):
+            mass = sum(weight for row, weight in zip(rows, weights) if row["y"] == label)
+            self.assertAlmostEqual(mass, len(rows) / 2)
+            for mask in train_gbdt.MASKS:
+                group = sum(weight for row, weight in zip(rows, weights) if row["y"] == label and row["mask_id"] == mask)
+                self.assertAlmostEqual(group, len(rows) / 20)
+        shuffled = list(reversed(rows))
+        self.assertEqual(list(train_gbdt.population_weights(shuffled)), list(reversed(weights)))
+
+    def test_original_capture_mass_does_not_depend_on_windows_or_negative_variants(self) -> None:
+        rows = []
+        for label in (0, 1):
+            for capture, count in (("train/short", 2), ("train/long", 100)):
+                rows.extend({"mask_id": "quic_https_v2", "capture_id": capture, "y": label, "variant": f"variant{index % 4}"} for index in range(count))
+        weights = train_gbdt.population_weights(rows)
+        for label in (0, 1):
+            for capture in ("train/short", "train/long"):
+                mass = sum(weight for row, weight in zip(rows, weights) if row["y"] == label and row["capture_id"] == capture)
+                self.assertAlmostEqual(mass, len(rows) / 4)
+
+
 class ShippedAssetTests(unittest.TestCase):
+    def test_final_control_is_disjoint_and_matches_frozen_model_per_capture(self) -> None:
+        repo = Path(__file__).resolve().parents[2]
+        assets = repo / "assets/dpi"
+        model = repo / "crates/aivpn-common/src/dpi_gate/model.rs"
+        final = json.loads((assets / "heldout_fixtures.json").read_text())["final_control"]
+        provenance = json.loads((assets / "provenance.json").read_text())
+        self.assertFalse(final["training_use"])
+        self.assertTrue(final["evaluated_after_model_freeze"])
+        self.assertEqual(final["model_sha256"], train_gbdt.sha256_file(model))
+        self.assertEqual(final["feature_schema_version"], features.FEATURE_SCHEMA_VERSION)
+        self.assertEqual(len(provenance["final_control_sources"]), 42)
+        original = {item[key] for item in provenance["masks"] for key in ("pcap_sha256", "verified_sha256")}
+        fresh = [item[key] for item in provenance["final_control_sources"] for key in ("pcap_sha256", "verified_sha256")]
+        self.assertEqual(len(set(fresh)), 84)
+        self.assertFalse(original.intersection(fresh))
+        parsed = train_gbdt.parse_old_model(model)
+        rows = final["rows"]
+        probabilities = [train_gbdt.walk_prob(*parsed, row["x"]) for row in rows]
+        for row, probability in zip(rows, probabilities):
+            self.assertAlmostEqual(probability, row["p"], places=6)
+            self.assertEqual(probability > 0.5, row["y"] == 1)
+        self.assertEqual({row["mask_id"] for row in rows}, set(train_gbdt.MASKS))
+        self.assertEqual(len({row["capture_id"] for row in rows}), 42)
+        self.assertEqual(train_gbdt.confusion(rows, probabilities), final["metrics"]["raw"])
+        for cohort in final["cohorts"].values():
+            self.assertEqual(cohort["raw"]["fp"], 0)
+            self.assertEqual(cohort["raw"]["fn"], 0)
+            self.assertTrue(cohort["material_met"])
+            self.assertEqual(cohort["macro"]["equal_family_balanced_accuracy"], 1.0)
+
     def test_shipped_windows_match_model_and_beat_constant(self) -> None:
         repo = Path(__file__).resolve().parents[2]
         model_path = repo / "crates/aivpn-common/src/dpi_gate/model.rs"
@@ -418,16 +546,18 @@ class ShippedAssetTests(unittest.TestCase):
         self.assertEqual(heldout["schema"], 2)
         self.assertEqual(metrics["schema"], 2)
         self.assertEqual(provenance["anchors"], 0)
-        self.assertEqual(provenance["n_captures"], 30)
-        self.assertEqual(len(provenance["masks"]), 30)
+        self.assertGreaterEqual(provenance["n_captures"], 30)
+        self.assertEqual(len(provenance["masks"]), provenance["n_captures"])
+        self.assertEqual(provenance["feature_schema"]["version"], features.FEATURE_SCHEMA_VERSION)
         hashes = {(item["verified_sha256"], item["pcap_sha256"]) for item in provenance["masks"]}
-        self.assertEqual(len(hashes), 30)
+        self.assertEqual(len(hashes), provenance["n_captures"])
         pairs = {(item["partition"], item["mask_id"]) for item in provenance["masks"]}
         self.assertEqual(pairs, train_gbdt.expected_pairs())
         self.assertEqual({row["stride"] for row in windows}, {train_gbdt.PRIMARY_STRIDE})
+        identities = {item["capture_id"]: (item["partition"], item["mask_id"]) for item in provenance["masks"]}
         for row in windows:
             self.assertNotIn("payload", json.dumps(row))
-            self.assertEqual(row["capture_id"], f"{row['partition']}/{row['mask_id']}")
+            self.assertEqual(identities[row["capture_id"]], (row["partition"], row["mask_id"]))
         blob = "\n".join(path.read_text(errors="ignore") for path in asset_dir.iterdir() if path.is_file())
         blob += model_path.read_text(errors="ignore")
         for code in train_gbdt.FORBIDDEN_CODEPOINTS:
@@ -440,11 +570,11 @@ class ShippedAssetTests(unittest.TestCase):
         self.assertEqual(sum(row["y"] for row in train_rows), heldout["train_tunnel_count"])
         self.assertEqual(len(test_rows), len(heldout["rows"]))
         by_key = {
-            (row["mask_id"], row["role"], row["variant"], row["start"]): row for row in heldout["rows"]
+            (row["capture_id"], row["role"], row["variant"], row["start"]): row for row in heldout["rows"]
         }
         probs = []
         for row in test_rows:
-            key = (row["mask_id"], row["role"], row["variant"], row["start"])
+            key = (row["capture_id"], row["role"], row["variant"], row["start"])
             shipped = by_key[key]
             self.assertEqual(shipped["x"], row["x"])
             prob = train_gbdt.walk_prob(nodes, offsets, init, lr, row["x"])

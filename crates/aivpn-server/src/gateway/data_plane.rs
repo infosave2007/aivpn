@@ -244,7 +244,7 @@ impl super::Gateway {
                 biased;
                 _ = async {
                     match deadline {
-                        Some(at) => tokio::time::sleep_until(at).await,
+                        Some(at) => aivpn_common::pacing::wait_until(at).await,
                         None => std::future::pending::<()>().await,
                     }
                 } => {

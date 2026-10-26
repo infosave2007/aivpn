@@ -126,6 +126,19 @@ pub struct PolymorphicFileConfig {
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct ServerFileConfig {
     pub listen_addr: Option<String>,
+    pub key_file: Option<String>,
+    pub clients_db: Option<String>,
+    #[serde(alias = "public_endpoint")]
+    pub server_ip: Option<String>,
+    pub audit_log: Option<String>,
+    pub per_ip_pps_limit: Option<u64>,
+    pub per_ip_authenticated_pps_limit: Option<u64>,
+    pub pool_config: Option<String>,
+    pub log_level: Option<String>,
+    pub event_webhook: Option<String>,
+    pub event_stdout: Option<bool>,
+    pub kernel_downlink: Option<bool>,
+    pub enable_nat: Option<bool>,
     pub tun_name: Option<String>,
     pub tun_addr: Option<Ipv4Addr>,
     pub tun_netmask: Option<Ipv4Addr>,
@@ -324,6 +337,47 @@ pub fn resolved_mask_verify_mode(
 }
 
 impl ServerFileConfig {
+    /// Общая проверка запуска и сохранения через API, без чтения файлов и ключей.
+    pub fn validate_runtime(&self) -> Result<(), String> {
+        for (field, value) in [
+            ("key_file", self.key_file.as_deref()),
+            ("clients_db", self.clients_db.as_deref()),
+            ("audit_log", self.audit_log.as_deref()),
+            ("pool_config", self.pool_config.as_deref()),
+            ("mask_dir", self.mask_dir.as_deref()),
+            ("management_socket", self.management_socket.as_deref()),
+            ("mask_signing_key", self.mask_signing_key.as_deref()),
+            ("mask_operator_pubkey", self.mask_operator_pubkey.as_deref()),
+        ] {
+            required_text(value, field)?;
+        }
+        if let Some(endpoint) = &self.server_ip {
+            normalize_public_endpoint(
+                endpoint,
+                self.listen_addr.as_deref().unwrap_or("0.0.0.0:443"),
+            )?;
+        }
+        if let Some(filter) = &self.log_level {
+            tracing_subscriber::EnvFilter::try_new(filter)
+                .map_err(|_| "log_level: неверный фильтр журналирования".to_string())?;
+        }
+        if let Some(mode) = &self.mask_verify_mode {
+            mode.parse::<aivpn_common::mask::MaskVerifyMode>()
+                .map_err(|_| "mask_verify_mode: нужен off, warn или enforce".to_string())?;
+        }
+        #[cfg(feature = "production-secure")]
+        if self.mask_signing_key.is_none() {
+            return Err("mask_signing_key: требуется в сборке production-secure".to_string());
+        }
+        self.validate_mask_trust()
+            .map_err(|_| "mask_verify_mode: недопустимая политика доверия маскам".to_string())?;
+        if let Some(pool) = &self.pool {
+            pool.validate_transport()
+                .map_err(|_| "pool.transport: нужен masked".to_string())?;
+        }
+        Ok(())
+    }
+
     /// Проверка полей подписи в теле `server.json` без учета флагов запуска.
     pub fn validate_mask_trust(&self) -> Result<aivpn_common::mask::MaskVerifyMode, String> {
         validate_mask_trust_config(
@@ -342,6 +396,19 @@ impl ServerFileConfig {
 /// allowlist silently didn't.
 pub const CONFIG_KNOWN_KEYS: &[&str] = &[
     "listen_addr",
+    "key_file",
+    "clients_db",
+    "server_ip",
+    "public_endpoint",
+    "audit_log",
+    "per_ip_pps_limit",
+    "per_ip_authenticated_pps_limit",
+    "pool_config",
+    "log_level",
+    "event_webhook",
+    "event_stdout",
+    "kernel_downlink",
+    "enable_nat",
     "tun_name",
     "tun_addr",
     "tun_netmask",
@@ -387,14 +454,94 @@ pub fn unknown_top_level_keys(value: &serde_json::Value) -> Vec<String> {
     unknown
 }
 
+/// Добавляет порт приема к публичному DNS-имени или IP, если порт не задан.
+pub fn normalize_public_endpoint(endpoint: &str, listen_addr: &str) -> Result<String, String> {
+    use std::net::{IpAddr, SocketAddr};
+    let invalid = || "server_ip: нужен DNS-адрес или IP с необязательным портом".to_string();
+    let endpoint = endpoint.trim();
+    let port = listen_addr
+        .parse::<SocketAddr>()
+        .map(|a| a.port())
+        .ok()
+        .or_else(|| {
+            listen_addr
+                .rsplit_once(':')
+                .and_then(|(_, p)| p.parse::<u16>().ok())
+        })
+        .unwrap_or(443);
+    if let Ok(address) = endpoint.parse::<SocketAddr>() {
+        return Ok(address.to_string());
+    }
+    if let Ok(ip) = endpoint.parse::<IpAddr>() {
+        return Ok(SocketAddr::new(ip, port).to_string());
+    }
+    if let Some(ip) = endpoint.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
+        let ip = ip.parse::<std::net::Ipv6Addr>().map_err(|_| invalid())?;
+        return Ok(SocketAddr::new(IpAddr::V6(ip), port).to_string());
+    }
+    let (host, explicit_port) = match endpoint.rsplit_once(':') {
+        Some((host, port)) => (host, Some(port.parse::<u16>().map_err(|_| invalid())?)),
+        None => (endpoint, None),
+    };
+    if host.is_empty()
+        || !host
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'-' | b'_'))
+    {
+        return Err(invalid());
+    }
+    Ok(format!("{host}:{}", explicit_port.unwrap_or(port)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn public_endpoint_adds_listen_port_once_for_dns_and_ip() {
+        for (input, expected) in [
+            ("vpn.example", "vpn.example:9443"),
+            ("vpn.example:8443", "vpn.example:8443"),
+            ("203.0.113.10", "203.0.113.10:9443"),
+            ("203.0.113.10:8443", "203.0.113.10:8443"),
+            ("2001:db8::1", "[2001:db8::1]:9443"),
+            ("[2001:db8::1]", "[2001:db8::1]:9443"),
+            ("[2001:db8::1]:8443", "[2001:db8::1]:8443"),
+        ] {
+            assert_eq!(
+                normalize_public_endpoint(input, "[::]:9443").unwrap(),
+                expected
+            );
+        }
+        for invalid in ["", "secret/path", "host:secret", "[secret]", "host:443:443"] {
+            let error = normalize_public_endpoint(invalid, "0.0.0.0:443").unwrap_err();
+            assert!(error.contains("server_ip"));
+            assert!(!error.contains("secret"));
+        }
+    }
 
     const EXAMPLE: &str = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../../deploy/config/server.json.example"
     ));
+
+    #[test]
+    fn authenticated_ingress_is_a_known_numeric_config_key() {
+        let value = serde_json::json!({"per_ip_authenticated_pps_limit":70000});
+        assert!(unknown_top_level_keys(&value).is_empty());
+        let config: ServerFileConfig = serde_json::from_value(value).unwrap();
+        assert_eq!(config.per_ip_authenticated_pps_limit, Some(70_000));
+        for invalid in [
+            serde_json::json!(false),
+            serde_json::json!("70000"),
+            serde_json::json!(-1),
+        ] {
+            assert!(serde_json::from_value::<ServerFileConfig>(
+                serde_json::json!({"per_ip_authenticated_pps_limit":invalid})
+            )
+            .is_err());
+        }
+    }
 
     /// The shipped example config must round-trip through the schema — this is
     /// what `PUT /api/v1/config` validates against, so a regression here means

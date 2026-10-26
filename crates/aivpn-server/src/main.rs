@@ -2,7 +2,7 @@
 
 use aivpn_server::server_config::MtuSetting;
 use aivpn_server::{ClientDatabase, ServerArgs};
-use clap::Parser;
+use clap::{CommandFactory, FromArgMatches};
 use std::path::Path;
 use std::sync::Arc;
 use tracing::info;
@@ -90,7 +90,8 @@ fn detect_mtu() -> u16 {
 #[tokio::main]
 async fn main() {
     // Parse arguments first (before logging for CLI commands)
-    let args = ServerArgs::parse_from(std::env::args());
+    let matches = ServerArgs::command().get_matches();
+    let mut args = ServerArgs::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
 
     // Mask validation doesn't need the server config or client DB.
     if let Some(ref path) = args.validate_mask {
@@ -108,31 +109,85 @@ async fn main() {
         cli::mask::handle_gen_mask_signing_key(path);
         return;
     }
-    // R2 Phase B: sign a mask corpus in place, then exit.
-    if let Some(ref dir) = args.sign_mask_dir {
-        cli::mask::handle_sign_mask_dir(dir, &args);
-        return;
-    }
     if let Some(ref pubkey_hex) = args.issue_cert {
         cli::cert::handle_issue_cert(pubkey_hex, &args);
         return;
     }
 
-    // Восстановление не загружает поврежденные config/DB и не держит shared owner.
-    if let Some(ref archive_path) = args.import {
+    // Recovery читает из config только пути назначения, без загрузки ключей/DB.
+    if args.import.is_some() {
+        config_resolve::resolve_import_paths(&mut args, &matches).unwrap_or_else(|error| {
+            eprintln!("{error}");
+            std::process::exit(1);
+        });
+        let archive_path = args.import.as_deref().expect("import requested");
         cli::backup::handle_import(archive_path, args.dry_run, &args);
         return;
     }
 
-    // Config, маски и DB читаются только после завершения offline restore.
-    let _runtime_owner = aivpn_server::client_db::LiveDbGuard::shared(Path::new(&args.clients_db))
-        .unwrap_or_else(|error| {
-            eprintln!("Не удалось получить блокировку серверных файлов: {error}");
+    let environment = config_resolve::collect_environment(&matches).unwrap_or_else(|error| {
+        eprintln!("{error}");
+        std::process::exit(1);
+    });
+    let mut path_args = args;
+    config_resolve::apply_restore_env(&mut path_args, &matches);
+    if path_args.clients_db.trim().is_empty() {
+        eprintln!("clients_db: пустое значение");
+        std::process::exit(1);
+    }
+    let load_effective = || {
+        // Автовыбор файла повторяется после ожидания restore: файл мог появиться.
+        let config_path = config_resolve::resolve_config_path(&path_args);
+        let raw_config = config_resolve::load_server_config_value(config_path.as_deref());
+        let mut args = ServerArgs::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
+        let config =
+            config_resolve::resolve_with_env(&mut args, &matches, raw_config, environment.clone())
+                .unwrap_or_else(|error| {
+                    eprintln!("{error}");
+                    std::process::exit(1);
+                });
+        args.config = config_path.clone();
+        (args, Some(config), config_path)
+    };
+    // Подпись корпуса на операторском узле не открывает runtime DB сервера.
+    if path_args.sign_mask_dir.is_some() {
+        let (args, _, _) = load_effective();
+        cli::mask::handle_sign_mask_dir(args.sign_mask_dir.as_deref().unwrap(), &args);
+        return;
+    }
+    // Явный путь DB известен без чтения config, поэтому restore ожидается первым.
+    let _known_db_owner = (matches.value_source("clients_db")
+        == Some(clap::parser::ValueSource::CommandLine)
+        || std::env::var_os("AIVPN_CLIENTS_DB").is_some())
+    .then(|| aivpn_server::client_db::LiveDbGuard::shared(Path::new(&path_args.clients_db)))
+    .transpose()
+    .unwrap_or_else(|error| {
+        eprintln!("Не удалось получить блокировку серверных файлов: {error}");
+        std::process::exit(1);
+    });
+    let mut effective = load_effective();
+    let mut attempts = 0;
+    let (args, file_config, config_path, _runtime_owner) = loop {
+        let database_path = effective.0.clients_db.clone();
+        let guard = aivpn_server::client_db::LiveDbGuard::shared(Path::new(&database_path))
+            .unwrap_or_else(|error| {
+                eprintln!("Не удалось получить блокировку серверных файлов: {error}");
+                std::process::exit(1);
+            });
+        // Путь из config требует первого чтения для поиска DB. Под guard читаем заново.
+        let refreshed = load_effective();
+        if refreshed.0.clients_db == database_path {
+            break (refreshed.0, refreshed.1, refreshed.2, guard);
+        }
+        drop(guard);
+        effective = refreshed;
+        attempts += 1;
+        if attempts >= 4 {
+            eprintln!("clients_db: конфигурация меняется во время запуска");
             std::process::exit(1);
-        });
+        }
+    };
 
-    let config_path = config_resolve::resolve_config_path(&args);
-    let file_config = config_resolve::load_server_file_config(config_path.as_deref());
     let effective_tun_mtu: u16 = match file_config.as_ref().and_then(|c| c.tun_mtu.as_ref()) {
         Some(MtuSetting::Fixed(v)) => *v,
         Some(MtuSetting::Auto) | None => detect_mtu(),
@@ -280,6 +335,7 @@ mod tests {
             show_client: None,
             server_ip: None,
             per_ip_pps_limit: 1000,
+            per_ip_authenticated_pps_limit: 100_000,
             mask_dir: None,
             validate_mask: None,
             list_nodes: false,
@@ -320,6 +376,7 @@ mod tests {
             export_bootstrap_descriptor: false,
             bootstrap_output: None,
             shaping_level: None,
+            log_level: None,
             role: None,
             device_pubkey: None,
         }

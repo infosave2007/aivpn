@@ -43,7 +43,7 @@ object AdminApi {
             val raw = try {
                 AivpnJni.mgmtRequest(method, path, body)
             } catch (t: Throwable) {
-                android.util.Log.e("AdminApi", "mgmtRequest($path) threw", t)
+                android.util.Log.e("AdminApi", "mgmtRequest($path) failed (${t.javaClass.simpleName})")
                 return@withContext MgmtResult(0, "")
             }
             // `raw` is nullable (the Rust side returns a null jbyteArray instead

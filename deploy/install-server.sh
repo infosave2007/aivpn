@@ -503,8 +503,13 @@ seed_config() {
 
     cp "$template" "$CONFIG_PATH"
     local listen_esc
-    listen_esc="$(sed_escape_replacement "$LISTEN_ADDR")"
+    listen_esc="$(sed_escape_replacement "$(json_escape "$LISTEN_ADDR")")"
     sed -i "s#\"listen_addr\": *\"[^\"]*\"#\"listen_addr\": \"${listen_esc}\"#" "$CONFIG_PATH"
+    if [ -n "$PUBLIC_SERVER_IP" ]; then
+        local endpoint_esc
+        endpoint_esc="$(sed_escape_replacement "$(json_escape "$PUBLIC_SERVER_IP")")"
+        sed -i "s#\"server_ip\": *null#\"server_ip\": \"${endpoint_esc}\"#" "$CONFIG_PATH"
+    fi
     # server.json can contain pool sync keys and publication/webhook tokens.
     # Keep it private from the first moment it exists.
     chmod 600 "$CONFIG_PATH"

@@ -14,6 +14,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -265,6 +266,36 @@ def _from_manifest(root: Path, manifest: Path) -> list[dict]:
     return entries
 
 
+def discover_matched_captures(root: Path) -> list[dict]:
+    """Дополнительные QUIC-сессии: repeats 0/1 в train, 2/3 только в test."""
+    doc = json.loads((root / "manifest.json").read_text())
+    rows = doc.get("captures") if isinstance(doc, dict) else None
+    if not isinstance(rows, list) or not rows:
+        raise ValueError("matched manifest: нужен непустой список captures")
+    entries = []
+    identities = set()
+    for row in rows:
+        if not isinstance(row, dict):
+            raise ValueError("matched manifest: запись должна быть объектом")
+        repetition = row.get("repetition")
+        partition = row.get("partition")
+        if type(repetition) is not int or repetition not in (0, 1, 2, 3):
+            raise ValueError("matched manifest: неизвестный repetition")
+        if partition != ("train" if repetition < 2 else "test"):
+            raise ValueError("matched manifest: holdout repetition нельзя использовать в train")
+        identity = row.get("capture_id", "")
+        if not isinstance(identity, str) or not re.fullmatch(rf"{partition}/[A-Za-z0-9_-]{{1,96}}", identity) or identity in identities:
+            raise ValueError("matched manifest: неверный или повторный capture_id")
+        if row.get("mask_id") != "quic_https_v2" or row.get("implementation") not in ("aivpn", "masque"):
+            raise ValueError("matched manifest: нужны AIVPN или MASQUE с положительной QUIC-семантикой")
+        entry = _entry(root, partition, row["mask_id"], _manifest_path(root, row.get("verified")), _manifest_path(root, row.get("pcap")), None)
+        entry.update(capture_id=identity, repetition=repetition, implementation=row["implementation"])
+        entry["packet_selection"] = "wire_short_header_length_filtered_stride16; integrity-PASS session; not post-AEAD observer"
+        entries.append(entry)
+        identities.add(identity)
+    return sorted(entries, key=lambda item: item["capture_id"])
+
+
 def _manifest_path(root: Path, value: object) -> Path:
     if not isinstance(value, str) or not value:
         raise ValueError("manifest.json: путь pcap или verified пуст")
@@ -329,6 +360,32 @@ def judge_negative(ndpi: str, capture_id: str, variant: str, payloads: list[byte
         }
     finally:
         os.unlink(path)
+
+
+def unchanged_context_ok(flows: list, returncode: int) -> tuple[bool, str]:
+    if returncode != 0 or not flows:
+        return False, "неизмененный standalone-контекст не классифицирован"
+    if any(teacher.is_unknown(flow) or teacher.is_vpn(flow) or flow.confidence != "DPI" for flow in flows):
+        return False, "неизмененный standalone-контекст уже Unknown/VPN или без DPI-уверенности"
+    return True, "неизмененный standalone-контекст известен учителю"
+
+
+def judge_unchanged(ndpi: str, payloads: list[bytes]) -> dict:
+    handle, path = tempfile.mkstemp(prefix="aivpn-dpi-control-", suffix=".pcap")
+    os.close(handle)
+    try:
+        pcapio.write_uplink_pcap(path, payloads)
+        flows, detected, rc = teacher.label_pcap(ndpi, path)
+        ok, reason = unchanged_context_ok(flows, rc)
+        return {"accepted": ok, "reason": reason, "proto": ",".join(flow.proto for flow in flows) or "none", "detected": detected, "returncode": rc}
+    finally:
+        os.unlink(path)
+
+
+def guard_negative_context(result: dict, baseline: dict) -> dict:
+    if baseline["accepted"]:
+        return result
+    return {**result, "accepted": False, "payloads": None, "reason": "Нет симметричного контроля: " + baseline["reason"]}
 
 
 def floor_f32(threshold: float) -> np.float32:
@@ -440,7 +497,57 @@ def sklearn_branch_mismatches(clf: GradientBoostingClassifier, nodes: list[tuple
 
 
 def sort_key(row: dict) -> tuple:
-    return (row["partition"], row["mask_id"], row["role"], row["variant"], row["start"], row["y"])
+    return (row["partition"], row["mask_id"], row["capture_id"], row["role"], row["variant"], row["start"], row["y"])
+
+
+def population_weights(rows: list[dict]) -> np.ndarray:
+    """Равные массы классов, семейств и исходных сессий внутри семейства.
+
+    Частота захватов не задает частоту реального трафика. Каждый имеющийся
+    (семейство, класс) получает одинаковую долю массы своего класса, а
+    исходные capture_id делят ее поровну независимо от числа окон и порч.
+    Все окна сохраняются. Отсутствующие отрицательные группы не создаются.
+    """
+    counts: dict[tuple[str, int, str], int] = defaultdict(int)
+    captures: dict[tuple[str, int], set[str]] = defaultdict(set)
+    families: dict[int, set[str]] = defaultdict(set)
+    for row in rows:
+        if row.get("partition", "train") != "train":
+            raise ValueError("веса вычисляются только по train")
+        label = row["y"]
+        mask_id = row["mask_id"]
+        capture_id = row["capture_id"]
+        if label not in (0, 1) or mask_id not in MASKS:
+            raise ValueError("неизвестная группа обучающих весов")
+        counts[(mask_id, label, capture_id)] += 1
+        captures[(mask_id, label)].add(capture_id)
+        families[label].add(mask_id)
+    if set(families) != {0, 1}:
+        raise ValueError("веса требуют оба класса")
+    return np.asarray([
+        len(rows) / (2 * len(families[row["y"]]) * len(captures[(row["mask_id"], row["y"])]) * counts[(row["mask_id"], row["y"], row["capture_id"])])
+        for row in rows
+    ], dtype=np.float64)
+
+
+def population_summary(rows: list[dict]) -> dict:
+    groups = defaultdict(lambda: {"windows": 0, "weight_sum": 0.0})
+    captures = defaultdict(lambda: {"windows": 0, "weight_sum": 0.0})
+    for row, weight in zip(rows, population_weights(rows)):
+        group = groups[(row["mask_id"], row["y"])]
+        group["windows"] += 1
+        group["weight_sum"] += float(weight)
+        capture = captures[(row["mask_id"], row["y"], row["capture_id"])]
+        capture["windows"] += 1
+        capture["weight_sum"] += float(weight)
+    return {
+        "policy": "equal_class_then_family_then_original_capture_then_windows",
+        "formula": "N / (2 * K_class * C_mask_class * N_capture_mask_class)",
+        "interpretation": "equal prior importance of supported families; not natural traffic frequency",
+        "all_windows_retained": True,
+        "groups": [{"mask_id": mask, "class": label, **group} for (mask, label), group in sorted(groups.items())],
+        "captures": [{"mask_id": mask, "class": label, "capture_id": identity, **capture} for (mask, label, identity), capture in sorted(captures.items())],
+    }
 
 
 def fit_rows(rows: list[dict]) -> tuple[GradientBoostingClassifier, list[tuple], list[int], float]:
@@ -458,7 +565,7 @@ def fit_rows(rows: list[dict]) -> tuple[GradientBoostingClassifier, list[tuple],
         max_features=None,
         random_state=SEED,
     )
-    clf.fit(matrix, labels)
+    clf.fit(matrix, labels, sample_weight=population_weights(ordered))
     if list(clf.classes_) != ["OK", "Unknown"]:
         raise RuntimeError(f"неожиданный порядок классов: {list(clf.classes_)}")
     nodes, offsets, init = export_nodes(clf)
@@ -481,6 +588,8 @@ def render_model(nodes: list[tuple], offsets: list[int], init: float, note: str)
         "",
         "use super::GbdtNode;",
         "",
+        "/// Схема признаков совпадает с Python и Rust; wire не меняется.",
+        f"pub const FEATURE_SCHEMA_VERSION: u32 = {F.FEATURE_SCHEMA_VERSION};",
         "/// Number of input features (IAT dropped - see dpi_gate).",
         f"pub const N_FEATURES: usize = {F.N_FEATURES};",
         "/// Constant raw-score offset (GradientBoosting init prior, log-odds).",
@@ -539,6 +648,11 @@ def parse_old_model(path: Path) -> tuple[list[tuple], list[int], float, float] |
         return None
 
 
+def model_feature_schema(path: Path) -> int:
+    match = re.search(r"pub const FEATURE_SCHEMA_VERSION: u32 = (\d+);", path.read_text())
+    return int(match.group(1)) if match else 1
+
+
 def score_rows(rows: list[dict], nodes, offsets, init) -> list[float]:
     return [walk_prob(nodes, offsets, init, LEARNING_RATE, row["x"]) for row in rows]
 
@@ -568,6 +682,7 @@ def confusion(rows: list[dict], probs: list[float]) -> dict:
         "recall": recall,
         "f1": f1,
         "accuracy": (tp + tn) / total if total else 0.0,
+        "balanced_accuracy": 0.5 * (tp / (tp + fn) + tn / (tn + fp)) if tp + fn and tn + fp else None,
         "n": total,
         "false_tunnel_rate": fp / (fp + tn) if fp + tn else 0.0,
         "missed_tunnel_rate": fn / (fn + tp) if fn + tp else 0.0,
@@ -595,10 +710,9 @@ def majority_metrics(rows: list[dict], majority: int) -> dict:
 
 
 def beats_constant(model: dict, baseline: dict, margin: float = MATERIAL_MARGIN) -> bool:
-    return (
-        model["accuracy"] > baseline["accuracy"] + margin
-        and model["false_tunnel_rate"] + margin < baseline["false_tunnel_rate"]
-    )
+    score = model["balanced_accuracy"]
+    constant = baseline["balanced_accuracy"]
+    return score is not None and constant is not None and score > constant + margin
 
 
 def per_mask(rows: list[dict], probs: list[float]) -> list[dict]:
@@ -657,9 +771,12 @@ def leakage_problems(captures: list[dict], rows: list[dict]) -> list[str]:
             if previous:
                 problems.append(f"одинаковые байты {hash_key} у {previous} и {item['capture_id']}")
             seen_hash[digest] = item["capture_id"]
+    identities = {item["capture_id"]: (item["partition"], item["mask_id"]) for item in captures}
+    if len(identities) != len(captures):
+        problems.append("повторный capture_id")
     groups: dict[str, str] = {}
     for row in rows:
-        if row["capture_id"] != f"{row['partition']}/{row['mask_id']}":
+        if identities.get(row["capture_id"]) != (row["partition"], row["mask_id"]):
             problems.append(f"окно {row['capture_id']} лежит в части {row['partition']}")
         previous = groups.get(row["capture_id"])
         if previous and previous != row["partition"]:
@@ -695,17 +812,25 @@ def render_report(ctx: dict) -> str:
         "",
         "## Матрица захватов",
         "",
-        "Каталог состоит из трех частей: train, val и test. В каждой части есть все 10 семейств, по одному целому захвату. Удержание сессионное: у части свой файл, свои кадры и своя сессия. Семейство из контроля не исключалось. WhatsApp с уникальным профилем SDES тоже входит в train. Прежнее разбиение, где VK Video, Telemost и WhatsApp лежали только в контроле, было диагностическим пилотом и этой оценкой не является. Этот контроль не называется нетронутым финальным удержанием: штатный генератор выбирает длину внутренней нагрузки из одного списка 8, 64, 256, 768, 1000, 4096 и меняет зерно. Общий шаблон длин не доказывает перенос на другой трафик.",
+        "Базовый каталог содержит все 10 семейств в train, val и test, по отдельной сессии. Дополнительные обычные QUIC/MASQUE и AIVPN-сессии имеют одну положительную QUIC-метку: это задача семейства протокола против Unknown, а не VPN против MASQUE. Повторы 0 и 1 допустимы в train, 2 и 3 оставлены для отдельного контроля после заморозки. Базовый генератор сохраняет длины внутренней нагрузки 8, 64, 256, 768, 1000, 4096; дополнительные сессии расширяют скорости, RTT и размеры. Контроль сессионный, семейства не исключались. Общие рецепты не доказывают перенос на произвольный трафик.",
+        "",
+        "Схема признаков 2 заменяет первый байт short header 0x40..0x7f на 0x40 только при вычислении среднего и обеих энтропий. Разрешенные spin и защищенные биты не определяют эти признаки. Wire и остальные семейства не меняются. Порог 0.5 не менялся.",
+        "",
+        "Базовые сессии используют проверенные кадры транспортного observer. Дополнительные сессии отбирают восходящие short-header кадры по длине, затем каждый шестнадцатый кадр. Это wire-only выборка исправных сессий, а не точное совпадение с live observer после AEAD. nDPI видит полный восходящий обмен; такое же ограничение контекста применяется к обеим реализациям.",
         "",
         "Провод этих захватов держит начальный и минимальный MTU 1200, верх PMTUD 1380 и внутренний бюджет 1140. Кадры прошлого провода в матрицу не входят. Если manifest не передал номер зерна, в публичные файлы он не подставляется. Различие захватов проверено попарно различными хэшами PCAP и списков кадров.",
         "",
-        "Положительная метка ставится только когда nDPI без угадывания по порту относит весь PCAP к QUIC или STUN и пишет уверенность DPI. Отрицательные окна получаются порчей того же захвата: инверсия первых байт, шум той же длины, повтор с поломанным заголовком и отдельный шум. Порча принимается только если учитель сам называет поток Unknown или известным VPN. QUIC, STUN и другой узнаваемый не-VPN протокол после порчи выбрасываются. Производные остаются в части своего захвата. Синтетические векторы старых тестов в подгонку не добавлялись.",
+        "Положительная метка требует QUIC или STUN с уверенностью DPI на целом PCAP, без угадывания по порту. Перед отрицательными порчами проверяется неизмененная выборка в том же standalone-контексте и с тем же числом кадров. Если она уже Unknown/VPN или не имеет DPI-уверенности, отрицательные метки не принимаются: отсутствие handshake нельзя приписывать порче. Иначе порча принимается только при вердикте Unknown или известный VPN. Остальные известные протоколы отклоняются. Производные остаются в части исходной сессии, синтетические векторы в fit не добавляются.",
         "",
-        "Порог 0.5, 120 деревьев, глубина 3, скорость 0.15 и seed 0 зафиксированы до подсчета val и test. Подбора по контролю не было. Основные числа считаются по неперекрывающимся окнам с шагом 24. Окна с шагом 8 в обучение не входят и приведены отдельно.",
+        "Порог 0.5, 120 деревьев, глубина 3, скорость 0.15 и seed 0 не менялись. Основные числа считаются по неперекрывающимся окнам с шагом 24. Окна с шагом 8 в обучение не входят и приведены отдельно.",
+        "",
+        "Обучающие веса задают равную априорную важность классов, семейств внутри класса и исходных capture_id внутри семейства: w = N / (2 * K_class * C_mask_class * N_capture_mask_class). Все окна сохраняются. Порчи с одним capture_id остаются одной исходной сессией. Длинный захват не получает большую массу за число окон. Это заданная популяция поддержки, а не оценка естественной частоты трафика. Отсутствующие отрицательные группы не выдумываются.",
         "",
         "| Часть | Маска | Профиль | Протокол маски | Учитель nDPI | Кадров | Окон |",
         "| --- | --- | --- | --- | --- | --- | --- |",
     ]
+    if ctx.get("base_control_exposed"):
+        lines[8:8] = ["Базовые val/test уже оценивались до исправления баланса обучающей популяции. Их числа ниже являются открытой диагностикой. Финальный контроль на новых сессиях оценивается отдельно после фиксации хэша модели; эти сессии не входят в fit.", ""]
     for item in ctx["provenance"]["masks"]:
         lines.append(
             f"| {item['partition']} | {item['title']} | `{item['mask_id']}` | {item['spoof_protocol']} | "
@@ -721,8 +846,8 @@ def render_report(ctx: dict) -> str:
             "Окно называется туннелем, если вероятность строго больше 0.5. "
             f"Константа большинства, посчитанная только по train, на контроле всегда отвечает классом {ctx['majority_name']}.",
             "",
-            "| Выбор | Точность | Точность туннеля | Полнота туннеля | F1 | Ложный туннель | Пропуск туннеля | Окон |",
-            "| --- | --- | --- | --- | --- | --- | --- | --- |",
+            "| Выбор | Точность | Balanced accuracy | Точность туннеля | Полнота туннеля | F1 | Ложный туннель | Пропуск туннеля | Окон |",
+            "| --- | --- | --- | --- | --- | --- | --- | --- | --- |",
         ]
     )
     for title, block in (
@@ -732,13 +857,13 @@ def render_report(ctx: dict) -> str:
         ("Контроль, константа", ctx["metrics"]["test_majority"]),
     ):
         lines.append(
-            f"| {title} | {fmt(block['accuracy'])} | {fmt(block['precision'])} | {fmt(block['recall'])} | "
+            f"| {title} | {fmt(block['accuracy'])} | {fmt(block['balanced_accuracy'])} | {fmt(block['precision'])} | {fmt(block['recall'])} | "
             f"{fmt(block['f1'])} | {fmt(block['false_tunnel_rate'])} | {fmt(block['missed_tunnel_rate'])} | {block['n']} |"
         )
     old_test = ctx["metrics"].get("test_old")
     if old_test:
         lines.append(
-            f"| Контроль, прежняя таблица | {fmt(old_test['accuracy'])} | {fmt(old_test['precision'])} | "
+            f"| Контроль, прежняя таблица | {fmt(old_test['accuracy'])} | {fmt(old_test['balanced_accuracy'])} | {fmt(old_test['precision'])} | "
             f"{fmt(old_test['recall'])} | {fmt(old_test['f1'])} | {fmt(old_test['false_tunnel_rate'])} | "
             f"{fmt(old_test['missed_tunnel_rate'])} | {old_test['n']} |"
         )
@@ -752,8 +877,8 @@ def render_report(ctx: dict) -> str:
     bar = "выполнен" if ctx["material_met"] else "не выполнен"
     lines.append(
         f"Заранее заданный зазор к константе равен {fmt(MATERIAL_MARGIN)}. "
-        f"На контроле он {bar}: точность {fmt(test['accuracy'])} против {fmt(ctx['metrics']['test_majority']['accuracy'])}, "
-        f"ложный туннель {fmt(test['false_tunnel_rate'])} против {fmt(ctx['metrics']['test_majority']['false_tunnel_rate'])}. "
+        f"На контроле он {bar}: balanced accuracy {fmt(test['balanced_accuracy'])} против {fmt(ctx['metrics']['test_majority']['balanced_accuracy'])}. "
+        "Balanced accuracy равна полусумме полноты обоих классов; обе константы имеют 0.5 независимо от большинства. Precision, recall и FPR приведены отдельно. "
         "После этой сверки деревья и порог не менялись."
     )
     lines.append("")
@@ -905,16 +1030,21 @@ def build_dataset(captures: list[dict], ndpi: str, spoof: dict[str, str]) -> dic
         for item in prepared:
             future = pool.submit(teacher.label_pcap, ndpi, str(item["pcap"]))
             future_map[future] = ("positive", item, None, None)
+            baseline = pool.submit(judge_unchanged, ndpi, item["packets"][:NEG_PACKETS])
+            future_map[baseline] = ("baseline", item, None, None)
             for variant in NEG_VARIANTS:
                 payloads = corrupt(variant, item["packets"], stable_seed(item["capture_id"] + ":" + variant))
                 future = pool.submit(judge_negative, ndpi, item["capture_id"], variant, payloads)
                 future_map[future] = ("negative", item, variant, payloads)
         positive_results = {}
+        baseline_results = {}
         negative_results = []
         for future in future_map:
             kind, item, variant, _payloads = future_map[future]
             if kind == "positive":
                 positive_results[item["capture_id"]] = future.result()
+            elif kind == "baseline":
+                baseline_results[item["capture_id"]] = future.result()
             else:
                 negative_results.append((item, future.result()))
 
@@ -950,6 +1080,9 @@ def build_dataset(captures: list[dict], ndpi: str, spoof: dict[str, str]) -> dic
                 "ndpi_returncode": rc,
                 "accepted_positive": ok,
                 "positive_reason": reason,
+                "standalone_context": baseline_results[item["capture_id"]],
+                **({"implementation": item["implementation"], "repetition": item["repetition"]} if "implementation" in item else {}),
+                "packet_selection": item.get("packet_selection", "authenticated_transport_observer_stride16"),
                 "header": item["header"],
                 "primary_windows": len(primary),
             }
@@ -960,6 +1093,7 @@ def build_dataset(captures: list[dict], ndpi: str, spoof: dict[str, str]) -> dic
         overlap_rows.extend(rows_from_packets(item, "positive", "verified", 0, item["packets"], OVERLAP_STRIDE))
 
     for item, result in negative_results:
+        result = guard_negative_context(result, baseline_results[item["capture_id"]])
         record = {key: value for key, value in result.items() if key != "payloads"}
         record["mask_id"] = item["mask_id"]
         record["partition"] = item["partition"]
@@ -1034,13 +1168,18 @@ def write_assets(repo: Path, ctx: dict, model_text: str, extra_forbidden: tuple[
         "schema": 2,
         "matrix": "session_holdout_all_families",
         "model_sha256": hashlib.sha256(model_text.encode()).hexdigest(),
-        "n_captures": 30,
+        "n_captures": len(ctx["provenance"]["masks"]),
+        "feature_schema": {"version": F.FEATURE_SCHEMA_VERSION, "name": F.FEATURE_SCHEMA_NAME, "short_header_byte0": "0x40; spin and protected bits removed from features only"},
+        "matched_training_sessions": sum(item.get("implementation") is not None and item["partition"] == "train" for item in ctx["provenance"]["masks"]),
         "primary_stride": PRIMARY_STRIDE,
         "overlap_stride": OVERLAP_STRIDE,
         "threshold": THRESHOLD,
         "material_margin": MATERIAL_MARGIN,
         "seed": SEED,
         "hyperparams": {"n_estimators": N_TREES, "max_depth": MAX_DEPTH, "learning_rate": LEARNING_RATE},
+        "training_weights": ctx["training_weights"],
+        "base_control_exposed": ctx.get("base_control_exposed", False),
+        "material_criterion": "balanced_accuracy > constant_balanced_accuracy + margin",
         "jobs": JOBS,
         "blas_threads": 1,
         "versions": ctx["versions"],
@@ -1053,9 +1192,11 @@ def write_assets(repo: Path, ctx: dict, model_text: str, extra_forbidden: tuple[
     }
     metrics = {
         "schema": 2,
+        "feature_schema_version": F.FEATURE_SCHEMA_VERSION,
         "threshold": THRESHOLD,
         "material_margin": MATERIAL_MARGIN,
         "material_met": ctx["material_met"],
+        "material_criterion": "balanced_accuracy > constant_balanced_accuracy + margin",
         "majority_class_tunnel": ctx["majority"] == 1,
         "counts": ctx["counts"],
         "metrics": ctx["metrics"],
@@ -1089,6 +1230,7 @@ def write_assets(repo: Path, ctx: dict, model_text: str, extra_forbidden: tuple[
         )
     heldout = {
         "schema": 2,
+        "feature_schema_version": F.FEATURE_SCHEMA_VERSION,
         "threshold": THRESHOLD,
         "material_margin": MATERIAL_MARGIN,
         "feature_names": list(F.FEATURE_NAMES),
@@ -1098,6 +1240,7 @@ def write_assets(repo: Path, ctx: dict, model_text: str, extra_forbidden: tuple[
     }
     parity = {
         "schema": 2,
+        "feature_schema_version": F.FEATURE_SCHEMA_VERSION,
         "windows": [
             {
                 "name": "reference_mix",
@@ -1113,6 +1256,18 @@ def write_assets(repo: Path, ctx: dict, model_text: str, extra_forbidden: tuple[
             }
         ],
     }
+    for first in (0x40, 0x7f):
+        spec = [{"op": "quic_short", "total": 1200, "seed": 71, "byte0": first, "repeat": 24}]
+        parity["windows"].append({"name": f"quic_short_{first}", "packets": spec, "x": json_roundtrip_features(F.vector(F.packets_from_spec(spec)))})
+    parity["validation_cases"] = []
+    for tp, fp, fn, tn, majority in (
+        (1, 0, 0, 3, 0), (1, 0, 0, 3, 1), (3, 0, 0, 1, 0), (3, 0, 0, 1, 1),
+        (0, 0, 1, 3, 0), (1, 3, 0, 0, 1), (0, 0, 0, 3, 0), (55, 45, 45, 55, 0),
+    ):
+        rows = [{"y": label} for label, count in ((1, tp), (0, fp), (1, fn), (0, tn)) for _ in range(count)]
+        probabilities = [1.0] * (tp + fp) + [0.0] * (fn + tn)
+        result = confusion(rows, probabilities)
+        parity["validation_cases"].append({"tp": tp, "fp": fp, "fn": fn, "tn": tn, "majority_tunnel": bool(majority), "balanced_accuracy": result["balanced_accuracy"], "material_met": beats_constant(result, majority_metrics(rows, majority))})
     blobs = {
         "provenance.json": json.dumps(provenance, ensure_ascii=True, indent=2) + "\n",
         "metrics.json": json.dumps(metrics, ensure_ascii=True, indent=2) + "\n",
@@ -1135,6 +1290,8 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--repo", type=Path, default=Path("."))
     parser.add_argument("--captures", type=Path, required=True)
+    parser.add_argument("--matched-captures", type=Path)
+    parser.add_argument("--base-control-exposed", action="store_true")
     parser.add_argument("--ndpi", type=Path, default=Path("target/dpi-tools/ndpi/example/ndpiReader"))
     parser.add_argument("--old-model", type=Path)
     args = parser.parse_args()
@@ -1142,6 +1299,9 @@ def main() -> int:
     ndpi = str(args.ndpi if args.ndpi.is_absolute() else repo / args.ndpi)
     if not Path(ndpi).is_file():
         print(f"нет ndpiReader: {ndpi}", file=sys.stderr)
+        return 2
+    if args.old_model and model_feature_schema(args.old_model) != F.FEATURE_SCHEMA_VERSION:
+        print("прежняя таблица имеет другую схему признаков; сравнение вероятностей отклонено", file=sys.stderr)
         return 2
     threadpool_limits(limits=1)
     assert_floor_examples()
@@ -1151,6 +1311,8 @@ def main() -> int:
         return 3
     try:
         captures = discover_captures(args.captures)
+        if args.matched_captures:
+            captures.extend(discover_matched_captures(args.matched_captures))
         print(f"захваты: {len(captures)}", file=sys.stderr)
         built = build_dataset(captures, ndpi, spoof_map(repo))
     except (OSError, ValueError, RuntimeError, json.JSONDecodeError) as exc:
@@ -1240,6 +1402,8 @@ def main() -> int:
     material_met = beats_constant(metrics["test"], metrics["test_majority"])
     ctx = {
         "rows": rows,
+        "training_weights": population_summary(train_rows),
+        "base_control_exposed": args.base_control_exposed,
         "provenance": {"masks": built["provenance_masks"]},
         "metrics": metrics,
         "counts": counts,

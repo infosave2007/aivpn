@@ -8,7 +8,6 @@ use aivpn_common::crypto;
 use aivpn_server::client_db::{ClientRole, UpdateClientParams};
 use aivpn_server::qos::{dscp_by_name, parse_bandwidth, ClientQos};
 use aivpn_server::{ClientDatabase, ServerArgs};
-use std::net::SocketAddr;
 
 pub(crate) fn load_server_public_key(args: &ServerArgs) -> Option<[u8; 32]> {
     args.key_file.as_ref().and_then(|key_file| {
@@ -60,16 +59,14 @@ pub(crate) fn build_connection_key(
     use base64::Engine;
     let server_addr = build_connection_server_addr(args, server_ip);
     let config_path = crate::config_resolve::resolve_config_path(args);
-    let file_config = crate::config_resolve::load_server_file_config(config_path.as_deref());
     let server_signing_pubkey = load_server_signing_public_key(args).and_then(|b64| {
         base64::engine::general_purpose::STANDARD
             .decode(b64)
             .ok()
             .and_then(|v| <[u8; 32]>::try_from(v).ok())
     });
-    let mask_operator_pubkey =
-        crate::config_resolve::resolve_mask_operator_pubkey(args, file_config.as_ref());
-    let mask_dir = crate::config_resolve::resolve_mask_dir(args, file_config.as_ref());
+    let mask_operator_pubkey = crate::config_resolve::resolve_mask_operator_pubkey(args, None);
+    let mask_dir = crate::config_resolve::resolve_mask_dir(args, None);
     let ctx = aivpn_server::mgmt_service::MgmtCtx {
         db,
         server_pub_key: Some(server_pub_key),
@@ -89,23 +86,12 @@ pub(crate) fn build_connection_key(
 }
 
 pub(crate) fn build_connection_server_addr(args: &ServerArgs, server_ip: &str) -> String {
-    if server_ip.parse::<SocketAddr>().is_ok() {
-        return server_ip.to_string();
-    }
-
-    let config_path = crate::config_resolve::resolve_config_path(args);
-    let file_config = crate::config_resolve::load_server_file_config(config_path.as_deref());
-    let listen_addr = crate::config_resolve::resolve_listen_addr(args, file_config.as_ref());
-
-    let port = listen_addr
-        .parse::<SocketAddr>()
-        .map(|addr| addr.port())
-        .unwrap_or(443);
-
-    if let Ok(ip) = server_ip.parse::<std::net::IpAddr>() {
-        return SocketAddr::new(ip, port).to_string();
-    }
-    format!("{}:{}", server_ip, port)
+    aivpn_server::server_config::normalize_public_endpoint(server_ip, &args.listen).unwrap_or_else(
+        |error| {
+            eprintln!("{error}");
+            std::process::exit(1);
+        },
+    )
 }
 
 /// Parses the `--role` CLI value (`user`/`viewer`/`admin`, case-insensitive).

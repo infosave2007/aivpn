@@ -285,31 +285,34 @@ impl super::Gateway {
             if socket.route_incoming(packet_data, client_addr) {
                 return Ok(());
             }
-            if let Some(bootstrap) = aivpn_common::quic_mask::QuicMask::bootstrap(packet_data) {
-                let Some(_admission) = socket.begin_initial(client_addr, packet_data) else {
-                    return Ok(());
-                };
-                let result = self
-                    .handle_unmasked_packet_with_source(bootstrap, client_addr, true, local)
-                    .await;
-                // Даже ошибка обработки освобождает ограниченный слот admission.
-                let accepted = socket.finish_initial(client_addr);
-                result?;
-                return accepted;
+            if aivpn_common::quic_mask::QuicMask::initial_token(packet_data).is_some() {
+                let _work_lease =
+                    super::preauth::PreauthLease::acquire(self.handshake_work_budget.clone())
+                        .ok_or(Error::InvalidPacket("Handshake CPU budget exhausted"))?;
+                return socket.start_initial_with_budget(
+                    client_addr,
+                    packet_data,
+                    local,
+                    self.handshake_work_budget.clone(),
+                );
             }
         }
-        self.handle_unmasked_packet_with_source(packet_data, client_addr, false, local)
+        self.handle_unmasked_packet_with_source(packet_data, client_addr, false, local, None)
             .await
     }
 
-    pub(super) async fn handle_unmasked_packet(
+    pub(super) async fn handle_decoded_packet(
         &self,
-        packet_data: &[u8],
-        client_addr: SocketAddr,
-        quic_inner: bool,
+        packet: super::mask_socket::DecodedPacket,
     ) -> Result<()> {
-        self.handle_unmasked_packet_with_source(packet_data, client_addr, quic_inner, None)
-            .await
+        self.handle_unmasked_packet_with_source(
+            &packet.payload,
+            packet.peer,
+            packet.quic,
+            packet.context.as_ref().and_then(|context| context.local),
+            packet.context.as_ref(),
+        )
+        .await
     }
 
     async fn handle_unmasked_packet_with_source(
@@ -318,7 +321,17 @@ impl super::Gateway {
         client_addr: SocketAddr,
         quic_inner: bool,
         local: Option<crate::udp_source::LocalEndpoint>,
+        quic_context: Option<&super::mask_socket::QuicContext>,
     ) -> Result<()> {
+        if let Some(context) = quic_context {
+            if !self
+                .udp_socket
+                .as_ref()
+                .is_some_and(|socket| socket.context_valid(client_addr, context))
+            {
+                return Ok(());
+            }
+        }
         // Minimum packet size check
         if packet_data.len() < TAG_SIZE + 2 {
             return Err(Error::InvalidPacket("Too short"));
@@ -1062,91 +1075,109 @@ impl super::Gateway {
         };
         let encrypted_payload = &packet_data[payload_offset..];
 
-        // Complete PFS ratchet only when the CLIENT proves it has ratcheted
-        // by sending a packet with ratcheted-key tags.
-        // Do NOT ratchet on is_new_session — the client hasn't received
-        // ServerHello yet and will keep sending packets with initial keys.
-        if is_ratcheted_tag {
-            let session_id = session.lock().session_id;
-            self.session_manager.complete_session_ratchet(&session_id);
-            let sess = session.lock();
-            info!(
-                "PFS ratchet complete for {} - send_counter={}, counter={}",
-                hash_addr(&client_addr),
-                sess.send_counter,
-                sess.counter
-            );
-        }
-
-        if quic_inner {
-            if let Some(socket) = self.udp_socket.as_ref() {
-                socket.prepare_authenticated_initial(client_addr)?;
-            }
-        }
-
-        // Захват до pad, дескрипторов и payload. Слияние bitmap гонку не закрывает.
-        let replay = {
-            let mut sess = session.lock();
-            let Some(previous_epoch) =
-                sess.authenticated_counter_epoch(counter, &authenticated_secret)
-            else {
-                return Ok(());
-            };
-            let replay = if let Some(ka) = self.kernel_accel.as_ref() {
-                self.refresh_kernel_session(&mut sess);
-                kernel_claim_deliver(Some(ka.as_ref()), &sess, counter, previous_epoch)
-            } else {
-                kernel_claim_deliver(None, &sess, counter, previous_epoch)
-            };
-            if replay == ReplayGate::Drop {
-                kernel_note_rejected(&mut sess, counter, previous_epoch);
-            } else if previous_epoch {
-                sess.mark_pre_ratchet_received(counter);
-            } else {
-                sess.mark_tag_received(counter);
-            }
-            if replay != ReplayGate::Drop && sess.commit_pending_mask() {
-                // Новая раскладка и ее отпечаток попадают в ядро после AEAD и
-                // захвата replay. Idle-сессии больше не нужен исходящий пакет.
-                self.refresh_kernel_session(&mut sess);
-            }
-            replay
-        };
-        if replay == ReplayGate::Drop {
-            return Ok(());
-        }
-
-        if let Some(socket) = self.udp_socket.as_ref() {
-            if let Some(local) = local {
-                if socket.reply_sources().record(client_addr, local, &session) {
-                    self.refresh_kernel_session(&mut session.lock());
+        {
+            let mut generation_guard = if let Some(context) = quic_context {
+                let Some(socket) = self.udp_socket.as_ref() else {
+                    return Ok(());
+                };
+                match socket.begin_quic_commit(client_addr, context, &session) {
+                    Ok(guard) => Some(guard),
+                    Err(_) => return Ok(()),
                 }
+            } else {
+                None
+            };
+            // Complete PFS ratchet only when the CLIENT proves it has ratcheted
+            // by sending a packet with ratcheted-key tags.
+            // Do NOT ratchet on is_new_session — the client hasn't received
+            // ServerHello yet and will keep sending packets with initial keys.
+            if is_ratcheted_tag {
+                let session_id = session.lock().session_id;
+                self.session_manager.complete_session_ratchet(&session_id);
+                let sess = session.lock();
+                info!(
+                    "PFS ratchet complete for {} - send_counter={}, counter={}",
+                    hash_addr(&client_addr),
+                    sess.send_counter,
+                    sess.counter
+                );
             }
-            {
+
+            // Захват до pad, дескрипторов и payload. Слияние bitmap гонку не закрывает.
+            let replay = {
                 let mut sess = session.lock();
-                if sess.confirm_mask_protocol(quic_inner) {
+                let Some(previous_epoch) =
+                    sess.authenticated_counter_epoch(counter, &authenticated_secret)
+                else {
+                    return Ok(());
+                };
+                let replay = if let Some(ka) = self.kernel_accel.as_ref() {
+                    self.refresh_kernel_session(&mut sess);
+                    kernel_claim_deliver(Some(ka.as_ref()), &sess, counter, previous_epoch)
+                } else {
+                    kernel_claim_deliver(None, &sess, counter, previous_epoch)
+                };
+                if replay == ReplayGate::Drop {
+                    kernel_note_rejected(&mut sess, counter, previous_epoch);
+                } else if previous_epoch {
+                    sess.mark_pre_ratchet_received(counter);
+                } else {
+                    sess.mark_tag_received(counter);
+                }
+                if replay != ReplayGate::Drop {
+                    if self.kernel_accel.is_none() || self.config.enable_neural {
+                        sess.observe_receiver_counter(counter, previous_epoch);
+                    } else {
+                        // Пропущенный kernel RX нельзя выдавать за потери на линии.
+                        sess.receiver_loss.reset();
+                    }
+                }
+                if replay != ReplayGate::Drop && sess.commit_pending_mask() {
+                    // Новая раскладка и ее отпечаток попадают в ядро после AEAD и
+                    // захвата replay. Idle-сессии больше не нужен исходящий пакет.
                     self.refresh_kernel_session(&mut sess);
                 }
+                replay
+            };
+            if replay == ReplayGate::Drop {
+                return Ok(());
             }
-            if quic_inner {
-                socket.authenticate(client_addr, &session);
-            } else if session
-                .lock()
-                .mask
-                .as_ref()
-                .is_some_and(aivpn_common::mask_io::uses_rtc)
-            {
-                let current = session.lock();
-                if current.is_ratcheted {
-                    socket.retire_other_rtc_session(client_addr, current.session_id);
+
+            if let Some(socket) = self.udp_socket.as_ref() {
+                if let Some(guard) = &mut generation_guard {
+                    guard.authenticate(&session);
                 }
-            } else if session
-                .lock()
-                .mask
-                .as_ref()
-                .is_some_and(|mask| !aivpn_common::mask_io::requires_userspace(mask))
-            {
-                socket.use_plain_mask(client_addr);
+                if let Some(local) = local {
+                    if socket.reply_sources().record(client_addr, local, &session) {
+                        self.refresh_kernel_session(&mut session.lock());
+                    }
+                }
+                {
+                    let mut sess = session.lock();
+                    if sess.confirm_mask_protocol(quic_inner) {
+                        self.refresh_kernel_session(&mut sess);
+                    }
+                }
+                if quic_context.is_none()
+                    && session
+                        .lock()
+                        .mask
+                        .as_ref()
+                        .is_some_and(aivpn_common::mask_io::uses_rtc)
+                {
+                    let current = session.lock();
+                    if current.is_ratcheted {
+                        socket.retire_other_rtc_session(client_addr, current.session_id);
+                    }
+                } else if quic_context.is_none()
+                    && session
+                        .lock()
+                        .mask
+                        .as_ref()
+                        .is_some_and(|mask| !aivpn_common::mask_io::requires_userspace(mask))
+                {
+                    socket.use_plain_mask(client_addr);
+                }
             }
         }
 
@@ -1349,10 +1380,7 @@ impl super::Gateway {
             // over the refresh stride while reducing CPU spent in HashMap/tag_map
             // maintenance. Stride scales with the window so per-packet precompute
             // and tag_map churn stay flat versus the old 256-window/64-stride.
-            let refresh_tags = counter.saturating_sub(sess.tag_window_base) >= 128;
-            if refresh_tags {
-                sess.update_tag_window();
-            }
+            let refresh_tags = sess.refresh_tag_window_if_needed();
 
             // Batch client stats updates to avoid taking a global write lock per packet.
             sess.pending_bytes_in = sess
