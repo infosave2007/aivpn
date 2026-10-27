@@ -1,5 +1,17 @@
 {
   "listen_addr": "0.0.0.0:443",
+  "key_file": null,
+  "clients_db": "/etc/aivpn/clients.json",
+  "server_ip": null,
+  "audit_log": "/var/log/aivpn/audit.log",
+  "per_ip_pps_limit": 5000,
+  "per_ip_authenticated_pps_limit": 100000,
+  "pool_config": null,
+  "log_level": "info",
+  "event_webhook": null,
+  "event_stdout": true,
+  "kernel_downlink": false,
+  "enable_nat": true,
   "tun_name": "aivpn0",
   "tun_mtu": "auto",
 
@@ -24,7 +36,7 @@
   "allow_peer_routing": false,
 
   "neural_enabled": true,
-  "downlink_shaping": "full",
+  "downlink_shaping": "adaptive",
 
   "mask_verify_mode": "warn",
   "mask_signing_key": null,

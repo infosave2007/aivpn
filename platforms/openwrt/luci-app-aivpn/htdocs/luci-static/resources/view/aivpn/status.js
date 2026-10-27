@@ -2,19 +2,13 @@
 'require view';
 'require rpc';
 'require ui';
+'require fs';
 
 var callInitStatus = rpc.declare({
-    object: 'luci',
-    method: 'getInitStatus',
+    object: 'service',
+    method: 'list',
     params: ['name'],
-    expect: { result: {} }
-});
-
-var callInitAction = rpc.declare({
-    object: 'luci',
-    method: 'setInitAction',
-    params: ['name', 'action'],
-    expect: { result: false }
+    expect: { aivpn: {} }
 });
 
 return view.extend({
@@ -22,8 +16,22 @@ return view.extend({
         return callInitStatus('aivpn');
     },
 
+    handleAction: function(action) {
+        return fs.exec('/etc/init.d/aivpn', [action]).then(function(result) {
+            if (result.code !== 0)
+                throw new Error(_('Service command failed'));
+            window.location.reload();
+        }).catch(function(error) {
+            ui.addNotification(null, E('p', {}, error.message));
+        });
+    },
+
     render: function(status) {
-        var running = status && status.running;
+        var instances = status && status.instances || {};
+        var running = Object.keys(instances).some(function(name) {
+            return instances[name].running === true;
+        });
+        var readonly = !L.hasViewPermission();
 
         return E('div', { 'class': 'cbi-map' }, [
             E('h2', {}, _('AIVPN Status')),
@@ -50,22 +58,14 @@ return view.extend({
                 }, [
                     E('button', {
                         'class': 'btn cbi-button cbi-button-action',
-                        'disabled': running ? true : null,
-                        'click': ui.createHandlerFn(this, function() {
-                            return callInitAction('aivpn', 'start').then(function() {
-                                window.location.reload();
-                            });
-                        })
+                        'disabled': running || readonly ? true : null,
+                        'click': ui.createHandlerFn(this, 'handleAction', 'start')
                     }, _('Start')),
                     ' ',
                     E('button', {
                         'class': 'btn cbi-button cbi-button-negative',
-                        'disabled': running ? null : true,
-                        'click': ui.createHandlerFn(this, function() {
-                            return callInitAction('aivpn', 'stop').then(function() {
-                                window.location.reload();
-                            });
-                        })
+                        'disabled': running && !readonly ? null : true,
+                        'click': ui.createHandlerFn(this, 'handleAction', 'stop')
                     }, _('Stop'))
                 ])
             ])

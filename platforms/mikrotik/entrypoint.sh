@@ -17,10 +17,21 @@ fi
 # LAN_IF: container-side LAN interface for FORWARD rules (default eth0)
 LAN_IF="${LAN_IF:-eth0}"
 TUN_IF="${AIVPN_TUN_NAME:-tun0}"
-case "$TUN_IF" in
-    ''|*[!a-zA-Z0-9_.-]*) echo '[aivpn-mikrotik] Недопустимое имя TUN' >&2; exit 1 ;;
-esac
-[ "${#TUN_IF}" -le 15 ] || { echo '[aivpn-mikrotik] Имя TUN длиннее 15 байт' >&2; exit 1; }
+for interface in "$TUN_IF" "$LAN_IF"; do
+    case "$interface" in
+        ''|[!a-zA-Z0-9]*|*[!a-zA-Z0-9_.-]*) echo '[aivpn-mikrotik] Недопустимое имя интерфейса' >&2; exit 1 ;;
+    esac
+    [ "${#interface}" -le 15 ] || { echo '[aivpn-mikrotik] Имя интерфейса длиннее 15 байт' >&2; exit 1; }
+done
+[ "$TUN_IF" != "$LAN_IF" ] || { echo '[aivpn-mikrotik] LAN и TUN должны различаться' >&2; exit 1; }
+KILL_SWITCH="${AIVPN_KILL_SWITCH:-false}"
+case "$KILL_SWITCH" in true|false) ;; *) echo '[aivpn-mikrotik] Ожидается true или false для kill-switch' >&2; exit 1 ;; esac
+if [ "$KILL_SWITCH" = true ]; then
+    for firewall in iptables ip6tables; do
+        "$firewall" -C FORWARD -i "$LAN_IF" ! -o "$TUN_IF" -j DROP 2>/dev/null ||
+            "$firewall" -I FORWARD 1 -i "$LAN_IF" ! -o "$TUN_IF" -j DROP
+    done
+fi
 sysctl -w net.ipv4.ip_forward=1 >/dev/null
 iptables -t nat -C POSTROUTING -o "$TUN_IF" -j MASQUERADE 2>/dev/null || \
     iptables -t nat -A POSTROUTING -o "$TUN_IF" -j MASQUERADE
@@ -39,13 +50,32 @@ echo "[aivpn-mikrotik] Starting aivpn-client (full-tunnel=${FULL_TUNNEL})"
 # so capture the exit status explicitly.
 export AIVPN_CONNECTION_KEY="$AIVPN_KEY"
 unset AIVPN_KEY
-while true; do
+stopping=0
+child_pid=""
+stop_service() {
+    stopping=1
+    [ -z "$child_pid" ] || kill -TERM "$child_pid" 2>/dev/null || true
+}
+trap stop_service TERM INT
+while [ "$stopping" = 0 ]; do
+    set -- --tun-name "$TUN_IF"
+    [ "$FULL_TUNNEL" = false ] || set -- "$@" --full-tunnel
+    [ "$KILL_SWITCH" = false ] || set -- "$@" --kill-switch
+    /usr/local/bin/aivpn-client "$@" &
+    child_pid=$!
     rc=0
-    if [ "${FULL_TUNNEL}" = "true" ]; then
-        /usr/local/bin/aivpn-client --tun-name "$TUN_IF" --full-tunnel || rc=$?
-    else
-        /usr/local/bin/aivpn-client --tun-name "$TUN_IF" || rc=$?
+    wait "$child_pid" || rc=$?
+    if [ "$stopping" = 1 ]; then
+        wait "$child_pid" 2>/dev/null || true
+        break
     fi
+    child_pid=""
     echo "[aivpn-mikrotik] aivpn-client exited (rc=${rc}), restarting in 5s..."
-    sleep 5
+    sleep 5 &
+    child_pid=$!
+    rc=0
+    wait "$child_pid" || rc=$?
+    child_pid=""
+    [ "$stopping" = 0 ] || break
+    [ "$rc" = 0 ] || exit "$rc"
 done

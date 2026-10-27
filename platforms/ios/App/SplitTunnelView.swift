@@ -8,23 +8,6 @@ import SwiftUI
 // Any process in the same App Group can modify these lists. Do not rely on this
 // storage for security-sensitive routing decisions.
 //
-// DOMAIN EXCLUSION IS NOT ENFORCED ON iOS (client-parity #4). `excludedDomains`
-// below is threaded all the way to PacketTunnelProvider.swift's
-// providerConfiguration (VPNManager.connect() -> "excluded_domains") and
-// stored in `settingsExcludedDomains`, but `buildSettings()` never applies it:
-// NEDNSSettings has no `matchExcludedDomains` — confirmed by a real Xcode
-// compile error when this was previously attempted, not a guess (see
-// PacketTunnelProvider.swift's buildSettings doc comment). Implementing this
-// properly would mean resolving each domain to its current IP(s) and adding
-// those as route-level `excludedRoutes` (like Android's AivpnService does),
-// which requires DNS resolution on the tunnel-setup path inside a
-// resource-budgeted Network Extension — a much larger, ongoing-resolution
-// feature this fix intentionally does not take on without the ability to
-// build/test it on-device. `addDomain`/`removeDomain` below are consequently
-// NOT wired to any SwiftUI control today (only the CIDR route section renders
-// in `SplitTunnelView.body`) — do not add a UI entry point for them without
-// first implementing the resolved-route enforcement above, or the control
-// would silently do nothing again.
 class SplitTunnelManager: ObservableObject {
     static let shared = SplitTunnelManager()
 
@@ -48,11 +31,13 @@ class SplitTunnelManager: ObservableObject {
 
     // MARK: - Domain management
 
-    func addDomain(_ domain: String) {
+    @discardableResult
+    func addDomain(_ domain: String) -> Bool {
         let d = domain.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        guard !d.isEmpty, !excludedDomains.contains(d) else { return }
+        guard excludedDomains.count < 64, DomainExclusions.validDomain(d), !excludedDomains.contains(d) else { return false }
         excludedDomains.append(d)
         saveDomains()
+        return true
     }
 
     func removeDomain(at offsets: IndexSet) {
@@ -76,21 +61,7 @@ class SplitTunnelManager: ObservableObject {
     }
 
     private func isValidCIDR(_ cidr: String) -> Bool {
-        let parts = cidr.split(separator: "/")
-        guard parts.count == 2,
-              let prefix = Int(parts[1]), prefix >= 0 else { return false }
-        let addr = String(parts[0])
-        if addr.contains(":") {
-            // IPv6 CIDRs are not supported — the tunnel only installs NEIPv4Route
-            // entries, so any IPv6 exclude would be silently dropped. Reject here
-            // so the user sees the "invalid_cidr" error instead of a silent no-op.
-            return false
-        }
-        // IPv4 CIDR — valid prefix lengths are 0–32.
-        guard prefix <= 32 else { return false }
-        let octets = addr.split(separator: ".")
-        guard octets.count == 4 else { return false }
-        return octets.allSatisfy { Int($0).map { $0 >= 0 && $0 <= 255 } ?? false }
+        CIDRRoute(cidr) != nil
     }
 
     func removeRoute(at offsets: IndexSet) {
@@ -110,10 +81,27 @@ struct SplitTunnelView: View {
 
     @State private var newRoute: String  = ""
     @State private var routeError: String?
+    @State private var newDomain = ""
+    @State private var domainError = false
 
     var body: some View {
         NavigationStack {
             List {
+                Section(header: Text(loc.t("split_domains"))) {
+                    ForEach(mgr.excludedDomains, id: \.self) { Text($0) }
+                        .onDelete { mgr.removeDomain(at: $0) }
+                    HStack {
+                        TextField("example.com", text: $newDomain)
+                            .autocorrectionDisabled().textInputAutocapitalization(.never)
+                            .onChange(of: newDomain) { _ in domainError = false }
+                        Button {
+                            if mgr.addDomain(newDomain) { newDomain = ""; domainError = false } else { domainError = true }
+                        } label: { Image(systemName: "plus.circle.fill") }
+                        .disabled(newDomain.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    }
+                    if domainError { Text(loc.t("split_domain_invalid")).foregroundColor(.red).font(.caption) }
+                    Text(loc.t("split_domain_note")).font(.caption).foregroundColor(.secondary)
+                }
                 // MARK: Excluded routes (CIDR)
                 Section(header: Text(loc.t("split_tunnel_routes"))) {
                     if mgr.excludedRoutes.isEmpty {

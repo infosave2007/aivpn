@@ -5,60 +5,68 @@
     android:layout_width="match_parent"
     android:layout_height="match_parent"
     android:orientation="vertical"
-    android:background="@color/background">
+    android:background="?attr/colorSurface">
 
-    <!-- Compact toolbar: back + title + counter -->
     <LinearLayout
         android:layout_width="match_parent"
-        android:layout_height="48dp"
+        android:layout_height="wrap_content"
+        android:minHeight="64dp"
         android:orientation="horizontal"
         android:gravity="center_vertical"
-        android:paddingHorizontal="8dp">
+        android:paddingStart="4dp"
+        android:paddingEnd="12dp"
+        android:paddingVertical="4dp">
 
         <ImageButton
             android:id="@+id/btnBack"
-            android:layout_width="40dp"
-            android:layout_height="40dp"
-            android:src="@android:drawable/ic_menu_revert"
+            android:layout_width="48dp"
+            android:layout_height="48dp"
+            android:src="@drawable/ic_vpn_back"
             android:background="?attr/selectableItemBackgroundBorderless"
-            android:contentDescription="Back"
+            android:contentDescription="@string/ui_back"
             android:scaleType="centerInside"
-            app:tint="@color/text_primary" />
+            app:tint="?attr/colorOnSurface" />
 
-        <TextView
+        <LinearLayout
             android:layout_width="0dp"
             android:layout_height="wrap_content"
             android:layout_weight="1"
-            android:text="@string/split_tunnel_title"
-            android:textSize="18sp"
-            android:textStyle="bold"
-            android:textColor="@color/text_primary"
-            android:paddingStart="4dp" />
+            android:orientation="vertical"
+            android:paddingStart="4dp">
 
-        <TextView
-            android:id="@+id/textCounter"
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:textSize="12sp"
-            android:textColor="@color/text_secondary"
-            android:paddingEnd="8dp" />
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="@string/split_tunnel_title"
+                android:textAppearance="@style/TextAppearance.Material3.TitleLarge"
+                android:textColor="?attr/colorOnSurface"
+                android:maxLines="2"
+                android:ellipsize="end"
+                android:accessibilityHeading="true" />
+
+            <TextView
+                android:id="@+id/textCounter"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:textSize="14sp"
+                android:textColor="?attr/colorOnSurfaceVariant" />
+        </LinearLayout>
     </LinearLayout>
 
-    <!-- Tab bar: Apps | Sites -->
     <com.google.android.material.tabs.TabLayout
         android:id="@+id/tabLayout"
         android:layout_width="match_parent"
-        android:layout_height="40dp"
-        android:background="@color/surface"
+        android:layout_height="wrap_content"
+        android:background="?attr/colorSurface"
         app:tabMode="fixed"
         app:tabGravity="fill"
-        app:tabTextColor="@color/text_secondary"
-        app:tabSelectedTextColor="@color/accent"
-        app:tabIndicatorColor="@color/accent"
-        app:tabIndicatorHeight="2dp"
-        app:tabTextAppearance="@android:style/TextAppearance.Widget.TabWidget" />
+        app:tabMinWidth="0dp"
+        app:tabTextColor="?attr/colorOnSurfaceVariant"
+        app:tabSelectedTextColor="?attr/colorPrimary"
+        app:tabIndicatorColor="?attr/colorPrimary"
+        app:tabIndicatorHeight="3dp"
+        app:tabRippleColor="?attr/colorPrimaryContainer" />
 
-    <!-- Apps page -->
     <FrameLayout
         android:id="@+id/pageApps"
         android:layout_width="match_parent"
@@ -70,80 +78,74 @@
             android:layout_height="match_parent"
             android:orientation="vertical">
 
-            <!-- Search row + system checkbox -->
-            <LinearLayout
+            <com.google.android.material.textfield.TextInputLayout
                 android:layout_width="match_parent"
-                android:layout_height="40dp"
-                android:orientation="horizontal"
-                android:gravity="center_vertical"
-                android:paddingHorizontal="12dp">
+                android:layout_height="wrap_content"
+                android:layout_marginHorizontal="20dp"
+                android:layout_marginTop="12dp"
+                android:hint="@string/split_tunnel_search"
+                app:startIconDrawable="@drawable/ic_vpn_search"
+                app:startIconContentDescription="@string/secondary_search"
+                app:startIconTint="?attr/colorOnSurfaceVariant"
+                style="?attr/textInputOutlinedStyle">
 
-                <EditText
+                <com.google.android.material.textfield.TextInputEditText
                     android:id="@+id/editSearch"
-                    android:layout_width="0dp"
-                    android:layout_height="36dp"
-                    android:layout_weight="1"
-                    android:hint="@string/split_tunnel_search"
-                    android:textSize="13sp"
-                    android:textColor="@color/text_primary"
-                    android:textColorHint="@color/text_secondary"
-                    android:background="@android:color/transparent"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
                     android:inputType="text"
                     android:singleLine="true"
-                    android:drawableStart="@android:drawable/ic_menu_search"
-                    android:drawablePadding="6dp"
-                    android:paddingStart="4dp"
+                    android:textSize="16sp"
+                    android:textColor="?attr/colorOnSurface"
                     android:importantForAutofill="no" />
+            </com.google.android.material.textfield.TextInputLayout>
 
-                <CheckBox
-                    android:id="@+id/checkSystem"
-                    android:layout_width="wrap_content"
-                    android:layout_height="wrap_content"
-                    android:text="@string/split_tunnel_system"
-                    android:textSize="11sp"
-                    android:textColor="@color/text_secondary"
-                    android:buttonTint="@color/text_secondary"
-                    android:minWidth="0dp"
-                    android:paddingStart="2dp" />
-            </LinearLayout>
+            <com.google.android.material.checkbox.MaterialCheckBox
+                android:id="@+id/checkSystem"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginHorizontal="12dp"
+                android:minHeight="48dp"
+                android:text="@string/split_tunnel_system"
+                android:textSize="16sp"
+                android:textColor="?attr/colorOnSurface" />
 
-            <!-- Header row: "All" + select-all checkbox -->
             <LinearLayout
                 android:id="@+id/headerRow"
                 android:layout_width="match_parent"
-                android:layout_height="36dp"
+                android:layout_height="wrap_content"
+                android:minHeight="48dp"
                 android:orientation="horizontal"
                 android:gravity="center_vertical"
-                android:paddingHorizontal="12dp"
-                android:background="@color/surface">
+                android:paddingHorizontal="20dp"
+                android:background="?attr/colorSurfaceContainer">
 
                 <TextView
                     android:layout_width="0dp"
                     android:layout_height="wrap_content"
                     android:layout_weight="1"
                     android:text="@string/split_tunnel_all"
-                    android:textSize="12sp"
-                    android:textStyle="bold"
-                    android:textColor="@color/text_secondary" />
+                    android:textSize="16sp"
+                    android:textColor="?attr/colorOnSurface" />
 
-                <CheckBox
+                <com.google.android.material.checkbox.MaterialCheckBox
                     android:id="@+id/checkAll"
-                    android:layout_width="wrap_content"
-                    android:layout_height="wrap_content"
-                    android:buttonTint="@color/accent" />
+                    android:layout_width="48dp"
+                    android:layout_height="48dp"
+                    android:minWidth="48dp"
+                    android:minHeight="48dp" />
             </LinearLayout>
 
-            <!-- App list -->
             <androidx.recyclerview.widget.RecyclerView
                 android:id="@+id/recyclerApps"
                 android:layout_width="match_parent"
                 android:layout_height="0dp"
                 android:layout_weight="1"
-                android:clipToPadding="false" />
+                android:clipToPadding="false"
+                android:paddingBottom="12dp" />
         </LinearLayout>
     </FrameLayout>
 
-    <!-- Sites page -->
     <FrameLayout
         android:id="@+id/pageSites"
         android:layout_width="match_parent"
@@ -156,81 +158,73 @@
             android:layout_height="match_parent"
             android:orientation="vertical">
 
-            <!-- Add domain row -->
             <LinearLayout
                 android:layout_width="match_parent"
-                android:layout_height="44dp"
+                android:layout_height="wrap_content"
                 android:orientation="horizontal"
                 android:gravity="center_vertical"
-                android:paddingHorizontal="12dp"
-                android:paddingVertical="4dp">
+                android:paddingHorizontal="20dp"
+                android:paddingTop="12dp"
+                android:paddingBottom="4dp">
 
-                <EditText
-                    android:id="@+id/editDomain"
+                <com.google.android.material.textfield.TextInputLayout
                     android:layout_width="0dp"
-                    android:layout_height="36dp"
+                    android:layout_height="wrap_content"
                     android:layout_weight="1"
                     android:hint="@string/split_tunnel_add_domain"
-                    android:textSize="13sp"
-                    android:textColor="@color/text_primary"
-                    android:textColorHint="@color/text_secondary"
-                    android:background="@android:color/transparent"
-                    android:inputType="textUri"
-                    android:singleLine="true"
-                    android:imeOptions="actionDone"
-                    android:paddingStart="4dp"
-                    android:importantForAutofill="no" />
+                    style="?attr/textInputOutlinedStyle">
+
+                    <com.google.android.material.textfield.TextInputEditText
+                        android:id="@+id/editDomain"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:inputType="textUri"
+                        android:singleLine="true"
+                        android:imeOptions="actionDone"
+                        android:textSize="16sp"
+                        android:textColor="?attr/colorOnSurface"
+                        android:importantForAutofill="no" />
+                </com.google.android.material.textfield.TextInputLayout>
 
                 <ImageButton
                     android:id="@+id/btnAddDomain"
-                    android:layout_width="36dp"
-                    android:layout_height="36dp"
-                    android:src="@android:drawable/ic_input_add"
+                    android:layout_width="48dp"
+                    android:layout_height="48dp"
+                    android:layout_marginStart="8dp"
+                    android:src="@drawable/ic_vpn_add"
                     android:background="?attr/selectableItemBackgroundBorderless"
-                    android:contentDescription="Add"
+                    android:contentDescription="@string/secondary_add"
                     android:scaleType="centerInside"
-                    app:tint="@color/accent" />
+                    app:tint="?attr/colorPrimary" />
             </LinearLayout>
 
-            <View
-                android:layout_width="match_parent"
-                android:layout_height="1dp"
-                android:background="@color/grey" />
-
-            <!-- Domain list -->
             <androidx.recyclerview.widget.RecyclerView
                 android:id="@+id/recyclerDomains"
                 android:layout_width="match_parent"
                 android:layout_height="0dp"
                 android:layout_weight="1"
-                android:clipToPadding="false" />
+                android:clipToPadding="false"
+                android:paddingBottom="8dp" />
 
-            <!-- Hint -->
             <TextView
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 android:text="@string/split_tunnel_domain_hint"
-                android:textSize="11sp"
-                android:textColor="@color/text_secondary"
-                android:gravity="center"
-                android:paddingStart="8dp"
-                android:paddingEnd="8dp"
+                android:textSize="14sp"
+                android:textColor="?attr/colorOnSurfaceVariant"
+                android:paddingHorizontal="20dp"
                 android:paddingTop="8dp"
-                android:paddingBottom="2dp" />
+                android:paddingBottom="4dp" />
 
-            <!-- CDN / API note — shown on API < 33 as a warning that domain exclusions are inactive -->
             <TextView
                 android:id="@+id/textDomainNote"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 android:text="@string/split_tunnel_domain_note"
-                android:textSize="10sp"
-                android:textColor="@color/text_secondary"
-                android:gravity="center"
-                android:paddingStart="8dp"
-                android:paddingEnd="8dp"
-                android:paddingBottom="8dp"
-                android:alpha="0.7"
+                android:textSize="14sp"
+                android:textColor="?attr/colorOnSurfaceVariant"
+                android:paddingHorizontal="20dp"
+                android:paddingBottom="16dp"
                 android:visibility="gone" />
         </LinearLayout>
     </FrameLayout>

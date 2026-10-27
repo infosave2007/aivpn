@@ -10,7 +10,7 @@ use std::time::Duration;
 use aivpn_common::error::{Error, Result};
 pub use aivpn_common::mask::{BootstrapChannel, BootstrapConfig, BootstrapDescriptor};
 
-use crate::bootstrap_cache::{load_descriptors, store_verified_descriptor};
+use crate::bootstrap_cache::{load_descriptors, store_descriptor, verify_received_descriptor};
 
 /// Result from a single channel load attempt
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -570,7 +570,10 @@ fn parse_descriptors_from_json(
     // Verify each descriptor
     let mut valid_descriptors = Vec::new();
     for descriptor in descriptors {
-        if store_verified_descriptor(descriptor.clone(), signing_key).is_ok() {
+        if verify_received_descriptor(&descriptor, signing_key).is_ok() {
+            if let Err(error) = store_descriptor(descriptor.clone()) {
+                tracing::warn!(%error, "Не удалось сохранить проверенный bootstrap-дескриптор в кеш");
+            }
             valid_descriptors.push(descriptor);
         }
     }
@@ -784,8 +787,43 @@ pub async fn fetch_public_bytes(url: &str, max_bytes: usize) -> Result<Vec<u8>> 
 mod tests {
     use super::*;
 
+    struct TestHome {
+        _guard: std::sync::MutexGuard<'static, ()>,
+        previous: Option<std::ffi::OsString>,
+        path: std::path::PathBuf,
+    }
+    impl TestHome {
+        fn new() -> Self {
+            let guard = crate::TEST_HOME_MUTEX
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let path = std::env::temp_dir().join(format!(
+                "aivpn-bootstrap-test-{:032x}",
+                rand::random::<u128>()
+            ));
+            std::fs::create_dir(&path).unwrap();
+            let previous = std::env::var_os("HOME");
+            std::env::set_var("HOME", &path);
+            Self {
+                _guard: guard,
+                previous,
+                path,
+            }
+        }
+    }
+    impl Drop for TestHome {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(home) => std::env::set_var("HOME", home),
+                None => std::env::remove_var("HOME"),
+            }
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
     #[test]
     fn email_bootstrap_checks_sender_subject_signature_and_complete_body() {
+        let _home = TestHome::new();
         use ed25519_dalek::Signer;
         use serde_json::json;
         let key = ed25519_dalek::SigningKey::from_bytes(&[23; 32]);
@@ -985,14 +1023,7 @@ mod tests {
 
     #[test]
     fn test_parse_descriptors_from_json_single_object() {
-        // Одиночный подписанный объект принимается так же, как массив.
-        let _guard = crate::TEST_HOME_MUTEX
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let temp = std::env::temp_dir().join("aivpn_parse_test");
-        let _ = std::fs::create_dir_all(&temp);
-        let old_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", &temp);
+        let _home = TestHome::new();
 
         let desc_json = r#"{
             "descriptor_id": "parse_single_test",
@@ -1017,13 +1048,36 @@ mod tests {
         let descs = result.unwrap();
         assert_eq!(descs.len(), 1);
         assert_eq!(descs[0].descriptor_id, "parse_single_test");
-
-        if let Some(h) = old_home {
-            std::env::set_var("HOME", h);
-        } else {
-            std::env::remove_var("HOME");
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            let lock = std::fs::OpenOptions::new()
+                .write(true)
+                .open(_home.path.join(".aivpn/bootstrap_descriptors.lock"))
+                .unwrap();
+            assert_eq!(
+                unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+                0
+            );
+            descriptor.descriptor_id = "valid_while_cache_is_locked".into();
+            descriptor.signature = key.sign(&descriptor.signing_bytes()).to_bytes();
+            let online_json = serde_json::to_string(&descriptor).unwrap();
+            let online =
+                parse_descriptors_from_json(&online_json, Some(&key.verifying_key().to_bytes()));
+            assert!(
+                online.is_ok(),
+                "Проверенный сетевой дескриптор не зависит от доступности кеша"
+            );
+            assert!(load_descriptors()
+                .iter()
+                .any(|saved| saved.descriptor_id == "valid_while_cache_is_locked"));
+            descriptor.signature[0] ^= 1;
+            assert!(parse_descriptors_from_json(
+                &serde_json::to_string(&descriptor).unwrap(),
+                Some(&key.verifying_key().to_bytes())
+            )
+            .is_err());
         }
-        let _ = std::fs::remove_dir_all(temp);
     }
 
     #[test]

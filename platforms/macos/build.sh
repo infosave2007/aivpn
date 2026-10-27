@@ -27,6 +27,7 @@ SWIFT_SOURCES=(
     "$SCRIPT_DIR/ConnectionKey.swift"
     "$SCRIPT_DIR/LaunchAgentManager.swift"
     "$SCRIPT_DIR/AdminApi.swift"
+    "$SCRIPT_DIR/LocalAdminIPC.swift"
     "$SCRIPT_DIR/AdminView.swift"
     "$SCRIPT_DIR/PoolView.swift"
     "$SCRIPT_DIR/AuditLogView.swift"
@@ -36,6 +37,7 @@ SWIFT_SOURCES=(
 )
 
 HELPER_SOURCES=(
+    "$SCRIPT_DIR/LocalAdminIPC.swift"
     "$SCRIPT_DIR/ClientBinaryPolicy.swift"
     "$SCRIPT_DIR/aivpn-helper/main.swift"
 )

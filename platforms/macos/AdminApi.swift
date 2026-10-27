@@ -1,64 +1,63 @@
 import Foundation
 
-/// Bridge to the running `aivpn-client` daemon's local admin socket — the
-/// channel that carries in-tunnel client-management (P3 in-app admin) calls
-/// on macOS.
-///
-/// ARCHITECTURE NOTE (why this isn't a C FFI wrapper like iOS/Android):
-/// The iOS/Android apps embed `aivpn-ios-core`/`aivpn-android-core` directly
-/// in-process and expose `aivpn_mgmt_request`/`aivpn_get_role`/
-/// `aivpn_qr_png` as C functions (see
-/// crates/aivpn-ios-core/include/aivpn_core.h). The macOS app does **not**
-/// link that static library — it never has. Per VPNManager.swift, the
-/// full VPN session runs as a *separate* `aivpn-client` process, either
-/// spawned by the privileged helper (root, full-tunnel) or spawned directly
-/// as the console user (SOCKS5 proxy mode). There is no in-process Rust
-/// core to call a C function on here.
-///
-/// The desktop daemon (`aivpn-client`) exposes the exact same three
-/// operations — mgmt/role/qr — over a local loopback UDP socket instead
-/// (127.0.0.1:44301, token-authenticated), added for exactly this purpose:
-/// see crates/aivpn-client/src/record_cmd.rs's `AdminCommand` enum and the
-/// admin-socket task in crates/aivpn-client/src/client.rs::run(), and the
-/// `aivpn-client mgmt`/`aivpn-client role` CLI subcommands in main.rs
-/// (documented there as "the surface the Windows egui / Linux iced GUIs …
-/// use"). This file speaks that same wire protocol directly from Swift,
-/// rather than shelling out to the CLI subcommands per call — it avoids a
-/// process spawn per request and lets us decode the reply straight into
-/// `Data`/`Codable` without an intermediate temp file for the request body.
-///
-/// Wire protocol (mirrors `send_admin_request` in
-/// crates/aivpn-client/src/main.rs and `AdminCommand`/`format_mgmt_reply`/
-/// `parse_mgmt_reply` in record_cmd.rs exactly):
-///   - Transport: one UDP datagram out, one UDP datagram back, 127.0.0.1:44301.
-///   - `"{token}:role"`                              -> `"{0|1|2}"` (bare decimal, no wrapper)
-///   - `"{token}:qr:{base64(text)}"`                  -> `"{base64(png)}"` (bare, no wrapper)
-///   - `"{token}:mgmt:{method}:{path}:{base64(body)}"` -> `"{status}:{base64(body)}"`
-///     `method`: 0=GET, 1=POST, 2=PATCH, 3=DELETE, 4=PUT (same encoding as
-///     `ControlPayload::MgmtRequest`). `status == 0` is the daemon's local
-///     "call failed" sentinel (control channel closed / no reply within its
-///     own 10s `mgmt_call` timeout) — never a real server status; treat it
-///     as a failure exactly like the `aivpn-client mgmt` CLI does (non-zero
-///     exit).
-///
-/// KNOWN LIMITATION — admin token readability in full-tunnel mode:
-/// the token lives at `/tmp/aivpn-{uid}/admin.token` (or
-/// `$XDG_RUNTIME_DIR/aivpn/admin.token` when that env var is set), where
-/// `{uid}` is the *daemon's own* uid, written mode 0600 by the daemon
-/// itself (crates/aivpn-client/src/record_cmd.rs::ensure_admin_token). In
-/// full-tunnel mode the daemon is spawned by the privileged helper as
-/// **root**, so the token lands at `/tmp/aivpn-0/admin.token`, root-owned —
-/// unreadable by this GUI process, which always runs as the console user.
-/// `readAdminToken()` then simply returns nil (permission denied surfaces
-/// as a failed file read, not a crash), and every operation below fails
-/// closed with `nil`. In SOCKS5 proxy mode (aivpn-client runs directly as
-/// the console user) the token is readable and everything works. AdminView
-/// must treat a nil result as "unavailable in this mode", not as an error
-/// worth alarming the user over — this mirrors a real, pre-existing
-/// constraint of the desktop admin-socket design, not a bug introduced
-/// here, and fixing it would mean changing `admin_token_path()` in
-/// crates/aivpn-client (out of scope: platforms/macos/ only).
+/// Управление работающим процессом aivpn-client через локальный IPC.
+/// Запросы к серверу выполняются внутри VPN-сессии. В полном туннеле запрос
+/// проходит через помощник, который проверяет подпись приложения и сессию.
+/// В режиме SOCKS5 используется TCP IPC с токеном и префиксом длины u32 BE.
+/// Ответы от прежней сессии отбрасываются до изменения состояния интерфейса.
 enum AdminApi {
+    private static let sessionLock = NSLock()
+    private static var helperSession: String?
+    private static var epoch: UInt64 = 0
+    private static let bindingKey = "aivpn.admin.binding"
+
+    static func updateHelperSession(_ session: String?) {
+        sessionLock.lock()
+        let changed = helperSession != session
+        if changed { helperSession = session; epoch &+= 1 }
+        sessionLock.unlock()
+        if changed { NotificationCenter.default.post(name: .aivpnAdminSessionChanged, object: nil) }
+    }
+
+    static func invalidateSession() {
+        sessionLock.lock()
+        helperSession = nil
+        epoch &+= 1
+        sessionLock.unlock()
+        NotificationCenter.default.post(name: .aivpnAdminSessionChanged, object: nil)
+    }
+
+    static func captureSession() -> [String: String] {
+        sessionLock.lock()
+        let session = helperSession ?? ""
+        let generation = epoch
+        sessionLock.unlock()
+        return ["token": fileToken() ?? "", "helper": session, "epoch": String(generation)]
+    }
+
+    static func isCurrent(_ session: [String: String]) -> Bool { captureSession() == session }
+
+    static func withSession<T>(_ session: [String: String], _ operation: () -> T) -> T {
+        let dictionary = Thread.current.threadDictionary
+        let previous = dictionary[bindingKey]
+        dictionary[bindingKey] = session
+        defer { dictionary[bindingKey] = previous }
+        return operation()
+    }
+
+    private static func sendOperation(_ command: String) -> String? {
+        let session = Thread.current.threadDictionary[bindingKey] as? [String: String] ?? captureSession()
+        if let token = session["token"], !token.isEmpty { return sendAdminRequest("\(token):\(command)") }
+        guard let helper = session["helper"], !helper.isEmpty,
+              let response = LocalAdminIPC.request(["action": "admin", "key": helper, "service": command]),
+              response["status"] as? String == "ok" else { return nil }
+        return response["log"] as? String
+    }
+
+    static func benchmark() -> [String: Any]? {
+        guard let reply = sendOperation("bench:9"), let data = reply.data(using: .utf8) else { return nil }
+        return (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+    }
 
     // MARK: - Config
 
@@ -67,7 +66,7 @@ enum AdminApi {
     /// Matches the FFI doc's stated bound (`aivpn_mgmt_request`: "blocks …
     /// or the call times out (10s)") so behavior is consistent with the
     /// mobile cores even though the transport differs.
-    static let timeoutSeconds: Double = 10.0
+    static let timeoutSeconds: Double = 12.0
 
     // MARK: - Role
 
@@ -92,7 +91,7 @@ enum AdminApi {
     /// Reads the admin-socket auth token this GUI process's own uid can see.
     /// Returns nil if the file doesn't exist or isn't readable by us (see
     /// the "KNOWN LIMITATION" note above) — never throws.
-    static func readAdminToken() -> String? {
+    private static func fileToken() -> String? {
         guard let raw = try? String(contentsOfFile: adminTokenPath(), encoding: .utf8) else {
             return nil
         }
@@ -103,61 +102,13 @@ enum AdminApi {
     /// Convenience for gating UI: true only when a token is currently
     /// readable, i.e. the admin channel has a chance of working at all.
     static func adminChannelAvailable() -> Bool {
-        readAdminToken() != nil
+        fileToken() != nil || !captureSession()["helper", default: ""].isEmpty
     }
 
-    // MARK: - Low-level datagram round trip
+    // MARK: - Локальный TCP-запрос
 
-    /// Sends `line` as a single UDP datagram to 127.0.0.1:44301 and blocks
-    /// (bounded by `timeoutSeconds`) for exactly one reply datagram.
-    ///
-    /// BLOCKING — this performs real socket I/O with `SO_RCVTIMEO`/
-    /// `SO_SNDTIMEO` set to `timeoutSeconds`, so a call can legitimately
-    /// take up to that long before returning. Callers (the public functions
-    /// below) MUST be invoked off the main thread; see `AdminView` for the
-    /// `DispatchQueue.global` wrapping used at the call sites.
     private static func sendAdminRequest(_ line: String) -> String? {
-        let fd = socket(AF_INET, SOCK_DGRAM, 0)
-        guard fd >= 0 else { return nil }
-        defer { close(fd) }
-
-        var timeout = timeval(tv_sec: Int(timeoutSeconds), tv_usec: 0)
-        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
-        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
-
-        var addr = sockaddr_in()
-        addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
-        addr.sin_family = sa_family_t(AF_INET)
-        addr.sin_port = socketPort.bigEndian
-        addr.sin_addr.s_addr = inet_addr(socketHost)
-
-        // CONNECT the datagram socket to the daemon's address before sending.
-        // An unconnected UDP socket accepts a reply from ANY sender, so any
-        // other process on this host could race the daemon and answer first —
-        // returning "2" to `role()` (unlocking the Admin panel for a Viewer)
-        // or an attacker-chosen `aivpn://…` to `fetchConnectionKey`, which the
-        // operator would then hand to a user. connect() makes the kernel drop
-        // every datagram whose source isn't 127.0.0.1:44301, and also picks a
-        // fixed local port so the daemon's reply is delivered here.
-        // NOTE: on BSD/macOS `sendto` with an explicit destination on a
-        // connected socket fails with EISCONN — use send/recv from here on.
-        let connected = withUnsafePointer(to: &addr) { addrPtr -> Int32 in
-            addrPtr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockPtr in
-                connect(fd, sockPtr, socklen_t(MemoryLayout<sockaddr_in>.size))
-            }
-        }
-        guard connected == 0 else { return nil }
-
-        let lineBytes = Array(line.utf8)
-        let sent = lineBytes.withUnsafeBufferPointer { buf -> Int in
-            send(fd, buf.baseAddress, buf.count, 0)
-        }
-        guard sent == lineBytes.count else { return nil }
-
-        var recvBuf = [UInt8](repeating: 0, count: 65536)
-        let received = recv(fd, &recvBuf, recvBuf.count, 0)
-        guard received > 0 else { return nil }
-        return String(bytes: recvBuf[0..<received], encoding: .utf8)
+        LocalAdminIPC.clientRequest(line)
     }
 
     // MARK: - Public operations (blocking — call off the main thread)
@@ -178,10 +129,9 @@ enum AdminApi {
     ///   third-party sending garbage to the port is possible on a shared
     ///   host, so this is treated as "no answer").
     static func mgmtRequest(method: UInt8, path: String, body: Data = Data()) -> (status: UInt16, body: Data)? {
-        guard let token = readAdminToken() else { return nil }
         let bodyB64 = body.base64EncodedString()
-        let line = "\(token):mgmt:\(method):\(path):\(bodyB64)"
-        guard let reply = sendAdminRequest(line) else { return nil }
+        let line = "mgmt:\(method):\(path):\(bodyB64)"
+        guard let reply = sendOperation(line) else { return nil }
         guard let sep = reply.firstIndex(of: ":") else { return nil }
         let statusStr = String(reply[reply.startIndex..<sep])
         let bodyB64Reply = String(reply[reply.index(after: sep)...])
@@ -197,8 +147,7 @@ enum AdminApi {
     /// unreachable/no token. Mirrors `AdminCommand::Role`'s reply: a bare
     /// decimal string, no wrapper (unlike `mgmtRequest`'s `"status:body"`).
     static func role() -> UInt8? {
-        guard let token = readAdminToken() else { return nil }
-        guard let reply = sendAdminRequest("\(token):role") else { return nil }
+        guard let reply = sendOperation("role") else { return nil }
         return UInt8(reply.trimmingCharacters(in: .whitespacesAndNewlines))
     }
 
@@ -211,9 +160,8 @@ enum AdminApi {
     /// itself also sends no reply at all on a PNG-encoding error (see
     /// client.rs), which surfaces here as an ordinary timeout.
     static func qrPngData(_ text: String) -> Data? {
-        guard let token = readAdminToken() else { return nil }
         guard let textB64 = text.data(using: .utf8)?.base64EncodedString() else { return nil }
-        guard let reply = sendAdminRequest("\(token):qr:\(textB64)") else { return nil }
+        guard let reply = sendOperation("qr:\(textB64)") else { return nil }
         return Data(base64Encoded: reply)
     }
 
@@ -256,30 +204,7 @@ enum AdminApi {
 
     // MARK: - Server settings apply-with-rollback (G-A3)
 
-    /// `GET /api/v1/masks` — thin wrapper over `mgmtRequest`, same raw
-    /// `(status, body)` contract as `poolNodes()`/`auditLog()` above.
-    ///
-    /// KNOWN GAP, verified directly against
-    /// `crates/aivpn-server/src/mgmt_service.rs`: unlike `clients`/`status`/
-    /// `audit-log`/`config/apply`/`config/confirm`/`pool/*`, `["masks"]` has
-    /// NO arm in that file's `classify_route()` match — the masks catalog
-    /// is currently a REST-only route (`management_api.rs::list_masks`,
-    /// mounted at the same `/api/v1/masks` path but only reachable over the
-    /// web-panel's Unix-socket REST API, not the in-tunnel admin-socket
-    /// `mgmt:` command this file speaks). Calling this today therefore
-    /// always fails closed — `classify_route` returns `None`, so
-    /// `authorize()` denies it before `dispatch()` is ever reached,
-    /// regardless of caller role — surfacing here as a non-200 `status`
-    /// (or, if the gateway declines to reply to an unauthorized request at
-    /// all, as `mgmtRequest` returning `nil`, the same as any other
-    /// unreachable-daemon case). This wrapper is written against the wire
-    /// shape the server-side task (extending `classify_route`/`dispatch`
-    /// with a `Route::Masks` arm reusing `management_api::MaskInfo`) is
-    /// expected to land as a natural follow-up — once that lands, this
-    /// starts working with no client-side change. Callers (`ServerSettingsStore.
-    /// refreshMasks()`) MUST treat any non-200 as "catalog unavailable" and
-    /// fall back to manual mask-id entry, never as a hard error — see that
-    /// method's doc comment.
+    /// Каталог доступных масок через VPN. Требует роли Viewer или Admin.
     static func listMasks() -> (status: UInt16, body: Data)? {
         mgmtRequest(method: 0 /* GET */, path: "/api/v1/masks")
     }
@@ -315,4 +240,8 @@ enum AdminApi {
         let body = (try? JSONSerialization.data(withJSONObject: ["token": token])) ?? Data()
         return mgmtRequest(method: 1 /* POST */, path: "/api/v1/config/confirm", body: body)
     }
+}
+
+extension Notification.Name {
+    static let aivpnAdminSessionChanged = Notification.Name("AivpnAdminSessionChanged")
 }

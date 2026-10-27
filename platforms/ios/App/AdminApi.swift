@@ -53,7 +53,7 @@ struct AdminClient: Identifiable, Codable, Equatable {
     let vpn_ip: String
     let enabled: Bool
     let one_time: Bool
-    let device_bound: Bool
+    var device_bound: Bool
     let created_at: String
     let stats: AdminClientStats
     let qos: AdminClientQos?
@@ -558,27 +558,7 @@ enum AdminApi {
         await sendNoContent(method: 1, path: "/api/v1/config/confirm", body: jsonBody(["token": token]))
     }
 
-    /// `GET /api/v1/masks` — lists mask profiles on disk (mirrors
-    /// `management_api.rs::list_masks`/`MaskInfo`).
-    ///
-    /// KNOWN GAP (verified by reading `mgmt_service.rs`'s
-    /// `classify_route`, not guessed): as of this writing, `classify_route`
-    /// has NO `Masks*` arm — only `Status`/`Clients*`/`AuditLog`/
-    /// `ConfigApply`/`ConfigConfirm`/`Pool*` are in the curated tunnel
-    /// allowlist `aivpn_mgmt_request` can reach. So this call currently
-    /// always returns `.failure(.http(status: 404))` over the tunnel,
-    /// for every role including Admin — `/api/v1/masks` is reachable only
-    /// from the REST/web-panel path (`management_api.rs`, a DIFFERENT
-    /// trust boundary iOS has no access to), not from this FFI. Kept as a
-    /// correctly-typed, forward-compatible wrapper (same shape the web
-    /// panel's `masks.list()` uses) for the day `classify_route` gains a
-    /// `Masks` arm; callers MUST treat a failure here as expected on
-    /// today's server and fall back to another mask-id source — see
-    /// `ServerSettingsView.swift`'s `serverSettingsLoadMaskChoices()`,
-    /// which falls back to the live session's `VPNManager.maskCatalog`
-    /// (the same `mask_id`/`generated` shape, sourced from the
-    /// `ControlPayload::MaskCatalog` this session already received over
-    /// the control channel) when this returns empty/failed.
+    /// Каталог доступных масок через VPN. Требует роли Viewer или Admin.
     static func listMasks() async -> Result<[AdminMaskInfo], AdminApiError> {
         await getJSON("/api/v1/masks")
     }

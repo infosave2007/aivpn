@@ -5,13 +5,23 @@ mod admin;
 mod admin_ops;
 #[cfg(windows)]
 mod app_update;
-#[cfg(windows)]
+mod appearance;
+#[cfg(any(windows, test))]
 mod assets;
 mod install_wizard;
 mod key_storage;
 mod localization;
 #[cfg(windows)]
 mod platform_win;
+#[cfg(windows)]
+mod profile_views;
+#[cfg(windows)]
+mod service_views;
+#[cfg(windows)]
+mod shell;
+mod ui_model;
+#[cfg(all(test, windows))]
+mod ui_tests;
 #[cfg(windows)]
 mod views;
 mod vpn_manager;
@@ -35,12 +45,12 @@ fn main() {
     }
 
     let settings = AppSettings::load();
-    let dark = settings.dark_mode;
+    let layout = settings.ui_layout;
 
     let vp = egui::ViewportBuilder::default()
         .with_title("AIVPN")
-        .with_inner_size([380.0, 560.0])
-        .with_min_inner_size([340.0, 420.0])
+        .with_inner_size(layout.initial_size())
+        .with_min_inner_size(layout.min_size())
         .with_resizable(true)
         .with_icon(app_icon());
 
@@ -61,18 +71,7 @@ fn main() {
         options,
         Box::new(move |cc| {
             let ctx = &cc.egui_ctx;
-            let mut fonts = egui::FontDefinitions::default();
-            fonts.font_data.insert(
-                "Inter".to_owned(),
-                egui::FontData::from_static(include_bytes!("../assets/Inter-Regular.ttf")).into(),
-            );
-            fonts
-                .families
-                .entry(egui::FontFamily::Proportional)
-                .or_default()
-                .insert(0, "Inter".to_owned());
-            ctx.set_fonts(fonts);
-            apply_theme_to_ctx(ctx, dark);
+            assets::install_fonts(ctx);
             let mut app = AivpnApp::new(settings, ctx);
             app.init_tray();
             if app.settings.connect_on_startup {
@@ -105,7 +104,7 @@ struct TrayHandles {
 #[cfg(windows)]
 use admin::{AdminRequest, AdminResponse};
 #[cfg(windows)]
-use assets::{app_icon, apply_theme_to_ctx, make_tray_icon};
+use assets::{app_icon, make_tray_icon};
 #[cfg(windows)]
 use key_storage::KeyStorage;
 #[cfg(windows)]
@@ -135,6 +134,15 @@ const ADMIN_SETTINGS_CONFIRM_TIMEOUT: std::time::Duration = std::time::Duration:
 #[cfg(windows)]
 struct AivpnApp {
     settings: AppSettings,
+    page: appearance::Page,
+    applied_dark: Option<bool>,
+    route_draft: Option<ui_model::RouteDraft>,
+    routes_error: Option<String>,
+    routes_saved: bool,
+    delete_profile: Option<usize>,
+    dlg_reveal: bool,
+    logs_open: bool,
+    log_text: String,
     vpn: VpnManager,
     keys: KeyStorage,
 
@@ -300,6 +308,7 @@ struct AivpnApp {
 
     /// `host:port`, empty = clear the global default (`None`).
     admin_settings_exit_node: String,
+    admin_settings_exit_selected: bool,
     /// Same rationale as `admin_add_exit_custom_mode` — G-B1's picker
     /// convention reused here via `Self::draw_exit_node_picker`.
     admin_settings_exit_custom_mode: bool,
@@ -403,6 +412,15 @@ impl AivpnApp {
         let (admin_tx, admin_rx) = std::sync::mpsc::channel();
         let mut app = Self {
             settings,
+            page: appearance::Page::Home,
+            applied_dark: None,
+            route_draft: None,
+            routes_error: None,
+            routes_saved: false,
+            delete_profile: None,
+            dlg_reveal: false,
+            logs_open: false,
+            log_text: String::new(),
             vpn: VpnManager::new(),
             keys: KeyStorage::load(),
             admin_tx,
@@ -463,6 +481,7 @@ impl AivpnApp {
             admin_settings_mask_confirm_busy: false,
             admin_settings_mask_rolled_back: false,
             admin_settings_exit_node: String::new(),
+            admin_settings_exit_selected: false,
             admin_settings_exit_custom_mode: false,
             admin_settings_exit_busy: false,
             admin_settings_exit_error: None,
@@ -746,7 +765,9 @@ impl AivpnApp {
         }
         if let Some(at) = self.dirty_at {
             if at.elapsed().as_secs() >= 2 {
-                self.settings.save();
+                if let Err(error) = self.settings.save() {
+                    self.show_error(error);
+                }
                 self.dirty_at = None;
             }
         }
@@ -776,7 +797,9 @@ impl AivpnApp {
                     // Hand off entirely to the elevated instance — save
                     // settings first since this process is about to exit
                     // and never reach its normal on-exit save path.
-                    self.settings.save();
+                    if let Err(error) = self.settings.save() {
+                        self.show_error(error);
+                    }
                     std::process::exit(0);
                 }
                 Err(e) => {

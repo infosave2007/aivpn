@@ -32,6 +32,7 @@ pub struct RecvSlot {
     pub len: usize,
     /// Peer address of the datagram, set by `recv_batch`.
     pub addr: Option<SocketAddr>,
+    pub(crate) local: Option<crate::udp_source::LocalEndpoint>,
 }
 
 impl RecvSlot {
@@ -40,6 +41,7 @@ impl RecvSlot {
             buf: vec![0u8; capacity],
             len: 0,
             addr: None,
+            local: None,
         }
     }
 
@@ -78,18 +80,47 @@ impl BatchIo {
     pub fn new(socket: Arc<UdpSocket>) -> Self {
         #[cfg(target_os = "linux")]
         {
-            BatchIo::Mmsg(MmsgIo { socket })
+            BatchIo::Mmsg(MmsgIo {
+                socket,
+                sources: None,
+            })
         }
         #[cfg(not(target_os = "linux"))]
         {
-            BatchIo::Single(SingleIo { socket })
+            BatchIo::Single(SingleIo {
+                socket,
+                sources: None,
+            })
+        }
+    }
+
+    pub(crate) fn with_sources(
+        socket: Arc<UdpSocket>,
+        sources: Arc<crate::udp_source::ReplySources>,
+    ) -> Self {
+        #[cfg(target_os = "linux")]
+        {
+            Self::Mmsg(MmsgIo {
+                socket,
+                sources: Some(sources),
+            })
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            Self::Single(SingleIo {
+                socket,
+                sources: Some(sources),
+            })
         }
     }
 
     /// Force the portable single-datagram implementation (tests).
     #[allow(dead_code)]
     pub fn new_single(socket: Arc<UdpSocket>) -> Self {
-        BatchIo::Single(SingleIo { socket })
+        BatchIo::Single(SingleIo {
+            socket,
+            sources: None,
+        })
     }
 }
 
@@ -118,6 +149,7 @@ impl PacketBatchIo for BatchIo {
 /// reference for `MmsgIo`.
 pub struct SingleIo {
     socket: Arc<UdpSocket>,
+    sources: Option<Arc<crate::udp_source::ReplySources>>,
 }
 
 impl SingleIo {
@@ -125,29 +157,45 @@ impl SingleIo {
         if slots.is_empty() {
             return Ok(0);
         }
-        // Block for the first datagram, then opportunistically drain
-        // whatever else is already queued without waiting.
-        let (len, addr) = self.socket.recv_from(&mut slots[0].buf).await?;
-        slots[0].len = len;
-        slots[0].addr = Some(addr);
-        let mut filled = 1;
-        while filled < slots.len() {
-            match self.socket.try_recv_from(&mut slots[filled].buf) {
-                Ok((len, addr)) => {
-                    slots[filled].len = len;
-                    slots[filled].addr = Some(addr);
-                    filled += 1;
-                }
-                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                Err(e) => return Err(e),
-            }
+        #[cfg(target_os = "linux")]
+        {
+            let (length, peer, local) =
+                crate::udp_source::recv_from(&self.socket, &mut slots[0].buf).await?;
+            slots[0].len = length;
+            slots[0].addr = Some(peer);
+            slots[0].local = local;
+            return Ok(1);
         }
-        Ok(filled)
+        #[cfg(not(target_os = "linux"))]
+        {
+            // Block for the first datagram, then opportunistically drain
+            // whatever else is already queued without waiting.
+            let (len, addr) = self.socket.recv_from(&mut slots[0].buf).await?;
+            slots[0].len = len;
+            slots[0].addr = Some(addr);
+            let mut filled = 1;
+            while filled < slots.len() {
+                match self.socket.try_recv_from(&mut slots[filled].buf) {
+                    Ok((len, addr)) => {
+                        slots[filled].len = len;
+                        slots[filled].addr = Some(addr);
+                        filled += 1;
+                    }
+                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(e) => return Err(e),
+                }
+            }
+            Ok(filled)
+        }
     }
 
     async fn send_batch(&self, msgs: &[(&[u8], SocketAddr)]) -> io::Result<()> {
         for (payload, addr) in msgs {
-            self.socket.send_to(payload, *addr).await?;
+            if let Some(sources) = &self.sources {
+                crate::udp_source::send_to(&self.socket, sources, payload, *addr).await?;
+            } else {
+                self.socket.send_to(payload, *addr).await?;
+            }
         }
         Ok(())
     }
@@ -158,6 +206,7 @@ impl SingleIo {
 #[cfg(target_os = "linux")]
 pub struct MmsgIo {
     socket: Arc<UdpSocket>,
+    sources: Option<Arc<crate::udp_source::ReplySources>>,
 }
 
 #[cfg(target_os = "linux")]
@@ -176,6 +225,7 @@ impl MmsgIo {
                 let mut addrs: [libc::sockaddr_storage; MAX_BATCH] = unsafe { std::mem::zeroed() };
                 let mut iovecs: [libc::iovec; MAX_BATCH] = unsafe { std::mem::zeroed() };
                 let mut hdrs: [libc::mmsghdr; MAX_BATCH] = unsafe { std::mem::zeroed() };
+                let mut controls = [crate::udp_source::ControlBuffer([0; 128]); MAX_BATCH];
                 for i in 0..count {
                     iovecs[i] = libc::iovec {
                         iov_base: slots[i].buf.as_mut_ptr() as *mut libc::c_void,
@@ -183,6 +233,8 @@ impl MmsgIo {
                     };
                     hdrs[i].msg_hdr.msg_iov = &mut iovecs[i];
                     hdrs[i].msg_hdr.msg_iovlen = 1;
+                    hdrs[i].msg_hdr.msg_control = controls[i].0.as_mut_ptr().cast();
+                    hdrs[i].msg_hdr.msg_controllen = controls[i].0.len();
                     hdrs[i].msg_hdr.msg_name = &mut addrs[i] as *mut _ as *mut libc::c_void;
                     hdrs[i].msg_hdr.msg_namelen =
                         std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
@@ -202,6 +254,7 @@ impl MmsgIo {
                 let n = n as usize;
                 for i in 0..n {
                     slots[i].len = hdrs[i].msg_len as usize;
+                    slots[i].local = crate::udp_source::received_local(&hdrs[i].msg_hdr);
                     slots[i].addr =
                         unsafe { socket2::SockAddr::new(addrs[i], hdrs[i].msg_hdr.msg_namelen) }
                             .as_socket();
@@ -232,6 +285,7 @@ impl MmsgIo {
                     .collect();
                 let mut iovecs: [libc::iovec; MAX_BATCH] = unsafe { std::mem::zeroed() };
                 let mut hdrs: [libc::mmsghdr; MAX_BATCH] = unsafe { std::mem::zeroed() };
+                let mut controls = [crate::udp_source::ControlBuffer([0; 128]); MAX_BATCH];
                 for (i, (payload, _)) in chunk.iter().enumerate() {
                     iovecs[i] = libc::iovec {
                         iov_base: payload.as_ptr() as *mut libc::c_void,
@@ -241,6 +295,15 @@ impl MmsgIo {
                     hdrs[i].msg_hdr.msg_iovlen = 1;
                     hdrs[i].msg_hdr.msg_name = addrs[i].as_ptr() as *mut libc::c_void;
                     hdrs[i].msg_hdr.msg_namelen = addrs[i].len();
+                    let source = self
+                        .sources
+                        .as_ref()
+                        .and_then(|sources| sources.get(chunk[i].1));
+                    crate::udp_source::attach_source(
+                        &mut hdrs[i].msg_hdr,
+                        &mut controls[i],
+                        source,
+                    );
                 }
                 let n = unsafe {
                     libc::sendmmsg(fd, hdrs.as_mut_ptr(), chunk.len() as libc::c_uint, 0)

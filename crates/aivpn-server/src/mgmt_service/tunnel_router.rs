@@ -208,14 +208,7 @@ pub fn revoke_target(method: u8, path: &str) -> Option<String> {
 }
 
 fn mgmt_error_status(e: &MgmtError) -> u16 {
-    match e {
-        MgmtError::NotFound => 404,
-        MgmtError::Conflict(_) => 409,
-        MgmtError::BadRequest(_) => 400,
-        MgmtError::Forbidden => 403,
-        MgmtError::Unavailable(_) => 503,
-        MgmtError::Internal(_) => 500,
-    }
+    e.response_status()
 }
 
 /// Serialize `value` to JSON for a `MgmtResponse` body. A serialization
@@ -232,7 +225,7 @@ fn json_response<T: Serialize>(status: u16, value: &T) -> (u16, Vec<u8>) {
 }
 
 fn err_response(e: MgmtError) -> (u16, Vec<u8>) {
-    (mgmt_error_status(&e), Vec::new())
+    (mgmt_error_status(&e), e.response_error().to_body())
 }
 
 /// Wire body for `POST /api/v1/clients` over the tunnel. Deliberately has
@@ -305,7 +298,7 @@ struct TunnelConfirmRequest {
 /// safe and well-defined to call directly (as the unit tests below do).
 pub fn dispatch(ctx: &MgmtCtx, method: u8, path: &str, body: &[u8]) -> (u16, Vec<u8>) {
     let Some(route) = classify_route(method, path) else {
-        return (404, Vec::new());
+        return err_response(MgmtError::NotFound);
     };
     match route {
         Route::Status => json_response(200, &status(ctx)),
@@ -313,7 +306,11 @@ pub fn dispatch(ctx: &MgmtCtx, method: u8, path: &str, body: &[u8]) -> (u16, Vec
         Route::ClientAdd => {
             let req: TunnelAddClientRequest = match serde_json::from_slice(body) {
                 Ok(r) => r,
-                Err(_) => return (400, Vec::new()),
+                Err(_) => {
+                    return err_response(MgmtError::BadRequest(
+                        "Некорректный JSON или параметры запроса.".into(),
+                    ))
+                }
             };
             let args = AddClientArgs {
                 name: req.name,
@@ -329,12 +326,16 @@ pub fn dispatch(ctx: &MgmtCtx, method: u8, path: &str, body: &[u8]) -> (u16, Vec
         }
         Route::ClientGet(id) => match ctx.db.find_by_id(&id) {
             Some(c) => json_response(200, &ClientView::from(c)),
-            None => (404, Vec::new()),
+            None => err_response(MgmtError::NotFound),
         },
         Route::ClientPatch(id) => {
             let req: TunnelPatchClientRequest = match serde_json::from_slice(body) {
                 Ok(r) => r,
-                Err(_) => return (400, Vec::new()),
+                Err(_) => {
+                    return err_response(MgmtError::BadRequest(
+                        "Некорректный JSON или параметры запроса.".into(),
+                    ))
+                }
             };
             let args = UpdateClientArgs {
                 name: req.name,
@@ -388,7 +389,11 @@ pub fn dispatch(ctx: &MgmtCtx, method: u8, path: &str, body: &[u8]) -> (u16, Vec
         Route::ConfigApply => {
             let req: TunnelApplyRequest = match serde_json::from_slice(body) {
                 Ok(r) => r,
-                Err(_) => return (400, Vec::new()),
+                Err(_) => {
+                    return err_response(MgmtError::BadRequest(
+                        "Некорректный JSON или параметры запроса.".into(),
+                    ))
+                }
             };
             let setting = if let Some(exit_node) = req.exit_node {
                 HeavySetting::ExitNode { addr: exit_node }
@@ -406,7 +411,11 @@ pub fn dispatch(ctx: &MgmtCtx, method: u8, path: &str, body: &[u8]) -> (u16, Vec
         Route::ConfigConfirm => {
             let req: TunnelConfirmRequest = match serde_json::from_slice(body) {
                 Ok(r) => r,
-                Err(_) => return (400, Vec::new()),
+                Err(_) => {
+                    return err_response(MgmtError::BadRequest(
+                        "Некорректный JSON или параметры запроса.".into(),
+                    ))
+                }
             };
             match confirm_config(ctx, &req.token) {
                 Ok(_) => (204, Vec::new()),
@@ -501,6 +510,51 @@ mod tests {
     use super::*;
     use crate::mgmt_service::test_support::*;
 
+    #[test]
+    fn structured_management_errors_explain_missing_prerequisites_and_bad_requests() {
+        let (dir, db) = test_db();
+        let mut c = ctx(&db, dir.path());
+        c.server_addr = None;
+        let (status, body) = dispatch(
+            &c,
+            METHOD_GET,
+            "/api/v1/clients/example/connection-key",
+            &[],
+        );
+        assert_eq!(status, 503);
+        let error: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(error["code"], "public_endpoint_not_configured");
+        assert!(!error["message"].as_str().unwrap().is_empty());
+
+        c.server_addr = Some("vpn.example.com:443".into());
+        c.server_pub_key = None;
+        let (status, body) = dispatch(
+            &c,
+            METHOD_GET,
+            "/api/v1/clients/example/connection-key",
+            &[],
+        );
+        assert_eq!(status, 503);
+        let error: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(error["code"], "server_key_not_configured");
+
+        let secret = b"{not-json-secret-that-must-not-be-echoed";
+        let (status, body) = dispatch(&c, METHOD_POST, "/api/v1/clients", secret);
+        assert_eq!(status, 400);
+        let error: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(error["code"], "invalid_request");
+        assert!(!String::from_utf8_lossy(&body).contains("not-json-secret"));
+    }
+
+    #[test]
+    fn structured_management_errors_hide_internal_details() {
+        let (status, body) = err_response(MgmtError::Internal("secret filesystem detail".into()));
+        assert_eq!(status, 500);
+        let error: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(error["code"], "internal_error");
+        assert!(!String::from_utf8_lossy(&body).contains("secret filesystem detail"));
+    }
+
     fn ctx_with_pool<'a>(
         db: &'a ClientDatabase,
         mask_dir: &'a Path,
@@ -580,7 +634,9 @@ mod tests {
 
         let (status, body) = dispatch(&c, METHOD_GET, "/api/v1/clients/does-not-exist", &[]);
         assert_eq!(status, 404);
-        assert!(body.is_empty());
+        let error: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(error["code"], "not_found");
+        assert!(!error["message"].as_str().unwrap().is_empty());
     }
     #[test]
     fn dispatch_get_existing_client_by_id_returns_200() {

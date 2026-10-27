@@ -5,9 +5,9 @@ PKG_VERSION:=1.2.0
 PKG_RELEASE:=1
 
 PKG_SOURCE_PROTO:=git
-PKG_SOURCE_URL:=https://github.com/vaminakov/aivpn.git
-# Закрепленный коммит содержит исходники приложения версии 1.2.0.
-PKG_SOURCE_VERSION:=74b5537232eb200dd2f84e3a39b6e1382767c1bc
+PKG_SOURCE_URL:=https://github.com/infosave2007/aivpn.git
+# Рецепт выпуска использует тег основного репозитория.
+PKG_SOURCE_VERSION:=v$(PKG_VERSION)
 # TODO(security): значение "skip" отключает проверку архива исходников.
 # Настоящий хеш можно получить только средствами OpenWrt. В buildroot или SDK
 # с этим пакетом выполните `make package/aivpn/download V=s` либо
@@ -27,7 +27,7 @@ define Package/aivpn
   CATEGORY:=Network
   TITLE:=AIVPN censorship-resistant VPN client
   URL:=https://github.com/infosave2007/aivpn
-  DEPENDS:=+kmod-tun
+  DEPENDS:=+kmod-tun +ip-full +nftables-json
 endef
 
 define Package/aivpn/description

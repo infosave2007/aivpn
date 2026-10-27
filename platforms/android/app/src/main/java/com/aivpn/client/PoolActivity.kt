@@ -32,6 +32,7 @@ import java.util.TimeZone
 class PoolActivity : AppCompatActivity() {
 
     private lateinit var binding: ActivityPoolBinding
+    private val loader = ScreenLoader()
 
     private val dateFormat = SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.US).apply {
         timeZone = TimeZone.getTimeZone("UTC")
@@ -44,8 +45,6 @@ class PoolActivity : AppCompatActivity() {
 
         binding.btnBack.setOnClickListener { finish() }
         binding.btnRefresh.setOnClickListener { load() }
-
-        load()
     }
 
     override fun onResume() {
@@ -55,37 +54,36 @@ class PoolActivity : AppCompatActivity() {
 
     private fun load() {
         lifecycleScope.launch {
-            val nodesResult = AdminApi.poolNodes()
-            if (nodesResult.notConnected) {
-                binding.textNotConnected.visibility = View.VISIBLE
-                binding.cardHealth.visibility = View.GONE
-                binding.textWarning.visibility = View.GONE
-                binding.textEmpty.visibility = View.GONE
-                binding.containerNodes.removeAllViews()
-                return@launch
+            loader.load currentLoad@{ isCurrent ->
+                binding.btnRefresh.isEnabled = false
+                try {
+                    val snapshot = loadPoolSnapshot(AdminApi::poolNodes, AdminApi::poolHealth, isCurrent)
+                    if (!isCurrent()) return@currentLoad
+                    val nodes = if (snapshot.nodes.ok) snapshot.nodes.bodyArray() else null
+                    if (nodes == null) {
+                        binding.textNotConnected.text = managementErrorMessage(snapshot.nodes)
+                        binding.textNotConnected.visibility = View.VISIBLE
+                        binding.cardHealth.visibility = View.GONE
+                        binding.textWarning.visibility = View.GONE
+                        binding.textEmpty.visibility = View.GONE
+                        binding.containerNodes.removeAllViews()
+                        return@currentLoad
+                    }
+                    binding.textNotConnected.visibility = View.GONE
+                    renderNodes(nodes)
+                    snapshot.health?.let { renderHealth(it) }
+                } finally {
+                    binding.btnRefresh.isEnabled = true
+                }
             }
-            binding.textNotConnected.visibility = View.GONE
-
-            val healthResult = AdminApi.poolHealth()
-
-            if (!nodesResult.ok) {
-                android.widget.Toast.makeText(
-                    this@PoolActivity,
-                    getString(R.string.admin_error_generic, nodesResult.status),
-                    android.widget.Toast.LENGTH_SHORT
-                ).show()
-                return@launch
-            }
-
-            renderHealth(healthResult)
-            renderNodes(nodesResult.bodyArray())
         }
     }
 
     private fun renderHealth(healthResult: MgmtResult) {
         val health = if (healthResult.ok) healthResult.bodyObject() else null
         if (health == null) {
-            binding.cardHealth.visibility = View.GONE
+            binding.cardHealth.visibility = View.VISIBLE
+            binding.textHealth.text = getString(R.string.pool_health_error, managementErrorMessage(healthResult))
             binding.textWarning.visibility = View.GONE
             return
         }
@@ -143,17 +141,13 @@ class PoolActivity : AppCompatActivity() {
                 LinearLayout.LayoutParams.MATCH_PARENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT
             ).apply {
-                setMargins(12.dp, 6.dp, 12.dp, 0)
+                setMargins(20.dp, 8.dp, 20.dp, 0)
             }
-            setCardBackgroundColor(getColor(R.color.surface))
-            radius = 16f.dp
-            cardElevation = 0f
-            strokeWidth = 0
         }
 
         val content = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(14.dp, 14.dp, 14.dp, 14.dp)
+            setPadding(16.dp, 16.dp, 16.dp, 16.dp)
         }
 
         val header = LinearLayout(this).apply {
@@ -161,23 +155,22 @@ class PoolActivity : AppCompatActivity() {
             gravity = Gravity.CENTER_VERTICAL
         }
         header.addView(View(this).apply {
-            layoutParams = LinearLayout.LayoutParams(10.dp, 10.dp).apply { marginEnd = 10.dp }
+            layoutParams = LinearLayout.LayoutParams(12.dp, 12.dp).apply { marginEnd = 10.dp }
             setBackgroundResource(if (connected) R.drawable.dot_green else R.drawable.dot_grey)
         })
         header.addView(TextView(this).apply {
             layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
             text = nodeId
-            textSize = 15f
-            setTypeface(typeface, android.graphics.Typeface.BOLD)
-            setTextColor(getColor(R.color.text_primary))
-            maxLines = 1
+            textSize = 16f
+            setTextColor(colorAttr(com.google.android.material.R.attr.colorOnSurface, R.color.text_primary))
+            maxLines = 2
             ellipsize = android.text.TextUtils.TruncateAt.END
         })
         if (revoked) {
             header.addView(TextView(this).apply {
                 text = getString(R.string.pool_node_revoked)
-                textSize = 11f
-                setTextColor(getColor(R.color.disconnect))
+                textSize = 14f
+                setTextColor(colorAttr(com.google.android.material.R.attr.colorError, R.color.disconnect))
             })
         }
         content.addView(header)
@@ -196,8 +189,8 @@ class PoolActivity : AppCompatActivity() {
         )
         content.addView(TextView(this).apply {
             text = subtitleParts.joinToString("  •  ")
-            textSize = 12f
-            setTextColor(getColor(R.color.text_secondary))
+            textSize = 14f
+            setTextColor(colorAttr(com.google.android.material.R.attr.colorOnSurfaceVariant, R.color.text_secondary))
             setPadding(0, 4.dp, 0, 0)
         })
 
@@ -207,15 +200,23 @@ class PoolActivity : AppCompatActivity() {
                 if (lastSeenUnix != null) dateFormat.format(Date(lastSeenUnix * 1000)) + " UTC"
                 else getString(R.string.pool_node_never)
             )
-            textSize = 11f
-            setTextColor(getColor(R.color.text_secondary))
-            setPadding(0, 2.dp, 0, 0)
+            textSize = 14f
+            setTextColor(colorAttr(com.google.android.material.R.attr.colorOnSurfaceVariant, R.color.text_secondary))
+            setPadding(0, 4.dp, 0, 0)
         })
 
         card.addView(content)
         return card
     }
 
+    private fun colorAttr(attr: Int, fallback: Int): Int {
+        val typed = android.util.TypedValue()
+        return if (theme.resolveAttribute(attr, typed, true)) {
+            if (typed.resourceId != 0) getColor(typed.resourceId) else typed.data
+        } else {
+            getColor(fallback)
+        }
+    }
+
     private val Int.dp: Int get() = (this * resources.displayMetrics.density).toInt()
-    private val Float.dp: Float get() = this * resources.displayMetrics.density
 }

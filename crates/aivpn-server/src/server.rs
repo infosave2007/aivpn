@@ -15,8 +15,8 @@ use aivpn_common::error::Result;
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 pub struct ServerArgs {
-    /// Listen address (host:port). Overridden by listen_addr in server.json. Default: 0.0.0.0:443.
-    #[arg(short, long, default_value = "0.0.0.0:443", env = "AIVPN_LISTEN")]
+    /// Адрес приема host:port. Явный флаг важнее env и server.json.
+    #[arg(short, long, default_value = "0.0.0.0:443")]
     pub listen: String,
 
     /// TUN device name (random if not specified — avoids fingerprinting)
@@ -83,25 +83,27 @@ pub struct ServerArgs {
 
     /// Public IP of this server (embedded into connection keys).
     /// Required when using --add-client or --show-client to generate connection keys.
-    #[arg(long, env = "AIVPN_SERVER_IP")]
+    #[arg(long, alias = "public-endpoint")]
     pub server_ip: Option<String>,
 
-    /// Per-IP packet rate limit for incoming UDP traffic. Kept generous for
-    /// legitimate high-throughput clients but low enough to bound the pre-auth
-    /// handshake-scan cost from a single non-spoofed source.
-    #[arg(long, env = "AIVPN_PER_IP_PPS_LIMIT", default_value_t = 5000)]
+    /// Пакетов UDP в секунду с одного IP до подтвержденного QUIC admission.
+    #[arg(long, default_value_t = 5000)]
     pub per_ip_pps_limit: u64,
+
+    /// Пакетов UDP в секунду с одного IP для активного QUIC после PSK/PFS.
+    #[arg(long, default_value_t = 100_000)]
+    pub per_ip_authenticated_pps_limit: u64,
 
     /// Directory for mask file storage.
     /// Resolved in order: CLI flag → env AIVPN_MASK_DIR → server.json "mask_dir" → default.
-    #[arg(long, env = "AIVPN_MASK_DIR")]
+    #[arg(long)]
     pub mask_dir: Option<String>,
 
     /// Unix socket path for the management HTTP API.
     /// If not specified, the management API is disabled.
     /// Example: /run/aivpn/api.sock
     #[cfg(all(feature = "management-api", unix))]
-    #[arg(long, env = "AIVPN_MANAGEMENT_SOCKET")]
+    #[arg(long)]
     pub management_socket: Option<String>,
 
     /// Validate a mask JSON file and print a quality report.
@@ -126,7 +128,7 @@ pub struct ServerArgs {
     // ── Pool ─────────────────────────────────────────────────────────────────
     /// Pool configuration JSON file path.
     /// Contains: {"peers": ["host:port", ...], "sync_port": 444, "sync_key": "hex"}
-    #[arg(long, env = "AIVPN_POOL_CONFIG")]
+    #[arg(long)]
     pub pool_config: Option<String>,
 
     // ── Backup / Restore ───────────────────────────────────────────────────────
@@ -192,11 +194,7 @@ pub struct ServerArgs {
 
     // ── Audit Log ──────────────────────────────────────────────────────────────
     /// Path to the append-only admin audit log (JSONL format).
-    #[arg(
-        long,
-        env = "AIVPN_AUDIT_LOG",
-        default_value = "/var/log/aivpn/audit.log"
-    )]
+    #[arg(long, default_value = "/var/log/aivpn/audit.log")]
     pub audit_log: String,
 
     // ── mTLS CA management ─────────────────────────────────────────────────────
@@ -222,7 +220,7 @@ pub struct ServerArgs {
     /// Allow direct routing between VPN clients (client-to-client relay, 0.9.0+).
     /// When enabled, packets from one VPN client destined for another VPN IP are
     /// forwarded directly without leaving the server. Disabled by default.
-    #[arg(long, env = "AIVPN_ALLOW_PEER_ROUTING")]
+    #[arg(long, action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true", require_equals = true, default_value_t = false)]
     pub allow_peer_routing: bool,
 
     // ── Mask management ────────────────────────────────────────────────────────
@@ -243,19 +241,19 @@ pub struct ServerArgs {
     /// raw or base64). When set, auto-generated masks are signed after the KS
     /// self-test passes. Keep this key SEPARATE from --key-file: it should
     /// live on the signing/operator host, not on every edge node.
-    #[arg(long, value_name = "PATH", env = "AIVPN_MASK_SIGNING_KEY")]
+    #[arg(long, value_name = "PATH")]
     pub mask_signing_key: Option<String>,
 
     /// Operator Ed25519 mask-verifying PUBLIC key (base64, 32 bytes) used to
     /// verify the embedded signature of masks loaded from --mask-dir.
     /// Derived automatically from --mask-signing-key when omitted.
-    #[arg(long, value_name = "BASE64", env = "AIVPN_MASK_OPERATOR_PUBKEY")]
+    #[arg(long, value_name = "BASE64")]
     pub mask_operator_pubkey: Option<String>,
 
     /// Mask signature verification mode on disk load: off | warn | enforce.
     /// warn (default) logs failures but accepts; enforce rejects unsigned or
     /// badly-signed masks. Overrides server.json "mask_verify_mode".
-    #[arg(long, value_name = "MODE", env = "AIVPN_MASK_VERIFY_MODE")]
+    #[arg(long, value_name = "MODE")]
     pub mask_verify_mode: Option<String>,
 
     /// Generate a new operator Ed25519 mask-signing key: writes the base64
@@ -282,13 +280,14 @@ pub struct ServerArgs {
     #[arg(long, value_name = "PATH")]
     pub bootstrap_output: Option<String>,
 
-    /// Downlink padding covertness↔throughput tradeoff: off | light | full
-    /// (default full). `full` pads every server→client DATA packet to the
-    /// session mask's size distribution (max covertness); `light` pads with a
-    /// small capped budget; `off` disables downlink padding (max throughput).
-    /// Overrides server.json "downlink_shaping".
-    #[arg(long, value_name = "LEVEL", env = "AIVPN_SHAPING_LEVEL")]
+    /// Паузы и padding нисходящих данных: adaptive | full | light | off.
+    /// По умолчанию adaptive. Переопределяет downlink_shaping из server.json.
+    #[arg(long, value_name = "LEVEL")]
     pub shaping_level: Option<String>,
+
+    /// Фильтр журналирования tracing, например info,aivpn_server=debug.
+    #[arg(long)]
+    pub log_level: Option<String>,
 }
 
 /// AIVPN Server instance
@@ -437,14 +436,38 @@ fn logging_filter(value: Option<&str>) -> EnvFilter {
 }
 
 pub fn init_logging() {
+    init_logging_with_level(std::env::var("RUST_LOG").ok().as_deref());
+}
+
+/// Настройка уже разрешена с приоритетом CLI, env и JSON. Без нее действует INFO.
+pub fn init_logging_with_level(level: Option<&str>) {
     tracing_subscriber::fmt()
-        .with_env_filter(logging_filter(std::env::var("RUST_LOG").ok().as_deref()))
+        .with_env_filter(logging_filter(level))
         .init();
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn authenticated_ingress_defaults_and_cli_overrides_are_independent() {
+        let defaults = ServerArgs::try_parse_from(["aivpn-server"]).unwrap();
+        assert_eq!(defaults.per_ip_pps_limit, 5000);
+        assert_eq!(defaults.per_ip_authenticated_pps_limit, 100_000);
+        for (value, expected) in [("120000", 120_000), ("0", 0)] {
+            let args = ServerArgs::try_parse_from([
+                "aivpn-server",
+                "--per-ip-pps-limit",
+                "4000",
+                "--per-ip-authenticated-pps-limit",
+                value,
+            ])
+            .unwrap();
+            assert_eq!(args.per_ip_pps_limit, 4000);
+            assert_eq!(args.per_ip_authenticated_pps_limit, expected);
+        }
+    }
 
     #[test]
     fn default_logging_does_not_enable_packet_debug() {
@@ -475,7 +498,7 @@ mod tests {
         let _ = std::fs::create_dir_all(&mask_dir);
         let mut mask = aivpn_common::mask::preset_masks::webrtc_zoom_v3();
         let signing_key = ed25519_dalek::SigningKey::from_bytes(&[72; 32]);
-        mask.sign(&signing_key);
+        crate::test_masks::sign(&mut mask, &signing_key);
         let json = serde_json::to_string_pretty(&mask).unwrap();
         std::fs::write(mask_dir.join(format!("{}.json", mask.mask_id)), &json).unwrap();
         std::fs::write(mask_dir.join(format!("{}.stats", mask.mask_id)), "{}").unwrap();

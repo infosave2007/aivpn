@@ -200,7 +200,7 @@ class KeychainStorage: ObservableObject {
     // then "locked", NOT empty: the UI shows no keys, but saveKeys() must
     // refuse to write — a save from this state would delete/overwrite items
     // that still exist and silently empty the user's key list.
-    private var storeAccessFailed = false
+    @Published private(set) var storeAccessFailed = false
 
     init() {
         loadKeys()
@@ -211,12 +211,27 @@ class KeychainStorage: ObservableObject {
         // A fresh load attempt re-evaluates store accessibility.
         storeAccessFailed = false
         // Migration: if old single-blob key exists, migrate to per-key format and remove it
-        if let json = keychain.load(key: keychainKey),
+        let current = keychain.loadResult(key: "connection_keys_v2")
+        if case .failure = current {
+            storeAccessFailed = true
+            return
+        }
+        if case .missing = current, case .failure = keychain.loadResult(key: keychainKey) {
+            storeAccessFailed = true
+            return
+        }
+        if case .found(let json) = current {
+            guard let data = json.data(using: .utf8),
+                  let decoded = try? JSONDecoder().decode([ConnectionKey].self, from: data) else {
+                storeAccessFailed = true
+                return
+            }
+            keys = decoded
+        } else if let json = keychain.load(key: keychainKey),
            let data = json.data(using: .utf8),
            let decoded = try? JSONDecoder().decode([ConnectionKey].self, from: data) {
             keys = decoded
-            keychain.delete(key: keychainKey)
-            saveKeys()
+            if saveKeys() { keychain.delete(key: keychainKey) }
         } else {
             // Load per-key format: ck_0, ck_1, ... until a slot is MISSING.
             // A slot that exists but fails to decode is skipped, not treated as
@@ -251,9 +266,8 @@ class KeychainStorage: ObservableObject {
                let data = defaults.data(forKey: "saved_connection_keys"),
                let decoded = try? JSONDecoder().decode([ConnectionKey].self, from: data) {
                 loaded = decoded
-                defaults.removeObject(forKey: "saved_connection_keys")
                 keys = loaded
-                saveKeys()
+                if saveKeys() { defaults.removeObject(forKey: "saved_connection_keys") }
             } else {
                 keys = loaded
             }
@@ -272,49 +286,19 @@ class KeychainStorage: ObservableObject {
         }
     }
 
-    /// Сохранить ключи в Keychain (per-key format: ck_0, ck_1, ...)
-    /// Each key is stored as a separate Keychain item so corruption of one entry
-    /// does not affect the others. Entries beyond the current count are deleted.
-    private func saveKeys() {
-        // Never write from an empty-after-error state: if the Keychain refused
-        // reads at load time the items are likely still there, and this write
-        // path (delete+add per slot, then trailing-slot cleanup) would destroy
-        // them. Losing one session's edits is recoverable; wiping the store on
-        // every ad-hoc re-signed update is not.
-        guard !storeAccessFailed else {
-            NSLog("AIVPN: key store is locked (Keychain access error at load) — refusing to save")
-            return
+    /// Весь список заменяется одним атомарным обновлением элемента Keychain.
+    @discardableResult
+    private func saveKeys() -> Bool {
+        guard !storeAccessFailed,
+              let encoded = try? JSONEncoder().encode(keys),
+              let json = String(data: encoded, encoding: .utf8),
+              keychain.save(key: "connection_keys_v2", value: json) else {
+            storeAccessFailed = true
+            return false
         }
-        // A failed write must ABORT the whole sequence, never continue past
-        // it: `keychain.save` deletes before it adds, so a refused add
-        // (locked machine / denied ACL) leaves slot `i` missing, and
-        // loadKeys() stops at the first missing slot — writing ck_{i+1}…
-        // and then running the trailing-slot cleanup below would strand or
-        // destroy every key after the hole. Aborting leaves the remaining
-        // slots holding their PREVIOUS values, and marks the store locked
-        // so no later save in this session can compound the damage (a
-        // relaunch re-evaluates accessibility in loadKeys).
-        for (i, key) in keys.enumerated() {
-            guard let encoded = try? JSONEncoder().encode(key),
-                  let json = String(data: encoded, encoding: .utf8) else {
-                NSLog("AIVPN: failed to encode key for slot ck_%d — aborting save", i)
-                storeAccessFailed = true
-                return
-            }
-            guard keychain.save(key: "ck_\(i)", value: json) else {
-                NSLog("AIVPN: Keychain write failed for slot ck_%d — aborting save to avoid losing later keys", i)
-                storeAccessFailed = true
-                return
-            }
-        }
-        // Remove any leftover entries beyond current count (handles deletions)
-        var next = keys.count
-        while keychain.load(key: "ck_\(next)") != nil {
-            keychain.delete(key: "ck_\(next)")
-            next += 1
-        }
+        return true
     }
-    
+
     /// Добавить новый ключ
     func addKey(name: String, keyValue: String, mtlsCertPath: String? = nil,
                 bootstrapCdnUrl: String? = nil, bootstrapTelegramToken: String? = nil,
@@ -331,8 +315,9 @@ class KeychainStorage: ObservableObject {
                                     bootstrapTelegramChat: bootstrapTelegramChat,
                                     bootstrapGithub: bootstrapGithub,
                                     serverSigningKey: serverSigningKey)
+        let previous = keys
         keys.append(newKey)
-        saveKeys()
+        guard saveKeys() else { keys = previous; return nil }
         
         // Если это первый ключ, выбрать его
         if keys.count == 1 {
@@ -345,8 +330,9 @@ class KeychainStorage: ObservableObject {
     /// Обновить имя ключа
     func updateKeyName(id: String, newName: String) {
         if let index = keys.firstIndex(where: { $0.id == id }) {
+            let previous = keys
             keys[index].name = newName
-            saveKeys()
+            if !saveKeys() { keys = previous }
         }
     }
 
@@ -367,19 +353,21 @@ class KeychainStorage: ObservableObject {
             return false
         }
 
+        let previous = keys
         keys[index] = ConnectionKey(id: id, name: name, keyValue: keyValue, mtlsCertPath: mtlsCertPath,
                                      bootstrapCdnUrl: bootstrapCdnUrl, bootstrapTelegramToken: bootstrapTelegramToken,
                                      bootstrapTelegramChat: bootstrapTelegramChat,
                                      bootstrapGithub: bootstrapGithub,
                                      serverSigningKey: serverSigningKey)
-        saveKeys()
+        guard saveKeys() else { keys = previous; return false }
         return true
     }
     
     /// Удалить ключ
     func deleteKey(id: String) {
+        let previous = keys
         keys.removeAll { $0.id == id }
-        saveKeys()
+        guard saveKeys() else { keys = previous; return }
         
         // Если удалили выбранный, выбрать другой
         if selectedKeyId == id {

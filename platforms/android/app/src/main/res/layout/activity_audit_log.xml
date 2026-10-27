@@ -5,65 +5,75 @@
     android:layout_width="match_parent"
     android:layout_height="match_parent"
     android:orientation="vertical"
-    android:background="@color/background">
+    android:background="?attr/colorSurface">
 
-    <!-- Compact toolbar: back + title + refresh (same pattern as AdminActivity/PoolActivity) -->
     <LinearLayout
         android:layout_width="match_parent"
-        android:layout_height="48dp"
+        android:layout_height="wrap_content"
+        android:minHeight="64dp"
         android:orientation="horizontal"
         android:gravity="center_vertical"
-        android:paddingHorizontal="8dp">
+        android:paddingStart="4dp"
+        android:paddingEnd="8dp"
+        android:paddingVertical="4dp">
 
         <ImageButton
             android:id="@+id/btnBack"
-            android:layout_width="40dp"
-            android:layout_height="40dp"
-            android:src="@android:drawable/ic_menu_revert"
+            android:layout_width="48dp"
+            android:layout_height="48dp"
+            android:src="@drawable/ic_vpn_back"
             android:background="?attr/selectableItemBackgroundBorderless"
-            android:contentDescription="@string/btn_cancel"
+            android:contentDescription="@string/ui_back"
             android:scaleType="centerInside"
-            app:tint="@color/text_primary" />
+            app:tint="?attr/colorOnSurface" />
 
         <TextView
             android:layout_width="0dp"
             android:layout_height="wrap_content"
             android:layout_weight="1"
             android:text="@string/audit_title"
-            android:textSize="18sp"
-            android:textStyle="bold"
-            android:textColor="@color/text_primary"
-            android:paddingStart="4dp" />
+            android:textAppearance="@style/TextAppearance.Material3.TitleLarge"
+            android:textColor="?attr/colorOnSurface"
+            android:maxLines="2"
+            android:ellipsize="end"
+            android:paddingStart="4dp"
+            android:accessibilityHeading="true" />
 
-        <ImageButton
+        <com.google.android.material.button.MaterialButton
             android:id="@+id/btnRefresh"
-            android:layout_width="40dp"
-            android:layout_height="40dp"
-            android:src="@android:drawable/ic_popup_sync"
-            android:background="?attr/selectableItemBackgroundBorderless"
-            android:contentDescription="@string/admin_refresh"
-            android:scaleType="centerInside"
-            app:tint="@color/text_primary" />
+            style="@style/Widget.Material3.Button.TextButton"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:minWidth="48dp"
+            android:minHeight="48dp"
+            android:insetTop="0dp"
+            android:insetBottom="0dp"
+            android:textSize="14sp"
+            android:textAllCaps="false"
+            android:text="@string/admin_refresh" />
     </LinearLayout>
 
     <TextView
         android:id="@+id/textNotConnected"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
+        android:layout_marginHorizontal="20dp"
+        android:layout_marginTop="8dp"
+        android:background="@color/warning_container"
         android:text="@string/admin_not_connected"
-        android:textSize="13sp"
+        android:textSize="14sp"
         android:textColor="@color/accent_lemon"
-        android:padding="14dp"
+        android:padding="16dp"
         android:visibility="gone" />
 
-    <!-- Hash-chain verification banner: green "verified" text, red "broken at #N". -->
     <TextView
         android:id="@+id/textChainStatus"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:textSize="13sp"
-        android:textStyle="bold"
-        android:padding="14dp"
+        android:layout_marginHorizontal="20dp"
+        android:layout_marginTop="8dp"
+        android:textSize="14sp"
+        android:padding="16dp"
         android:visibility="gone" />
 
     <TextView
@@ -71,8 +81,8 @@
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:text="@string/audit_no_entries"
-        android:textSize="13sp"
-        android:textColor="@color/text_secondary"
+        android:textSize="16sp"
+        android:textColor="?attr/colorOnSurfaceVariant"
         android:gravity="center"
         android:padding="32dp"
         android:visibility="gone" />
@@ -80,7 +90,8 @@
     <androidx.core.widget.NestedScrollView
         android:layout_width="match_parent"
         android:layout_height="0dp"
-        android:layout_weight="1">
+        android:layout_weight="1"
+        android:clipToPadding="false">
 
         <LinearLayout
             android:id="@+id/containerEntries"

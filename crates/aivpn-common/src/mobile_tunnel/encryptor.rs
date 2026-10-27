@@ -3,8 +3,9 @@
 //! `MobileEncryptor`; the iOS nested `IosEncryptor` was logic-identical).
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use tokio::sync::oneshot;
 
@@ -53,6 +54,7 @@ pub struct MobileEncryptor {
     pub inner: MimicryEncryptor,
     pub session: Arc<SessionRuntime>,
     pub keepalive_sent_ms: Arc<AtomicU64>,
+    pub fec_group: Arc<AtomicU8>,
     pub key_rotate_slot: Arc<Mutex<Option<SessionKeys>>>,
     pub rekey_ack: RekeyAckQueue,
     pub rekey_resend_keys: RekeyResendSlot,
@@ -72,7 +74,38 @@ impl MobileEncryptor {
 }
 
 impl PacketEncryptor for MobileEncryptor {
+    fn data_send_delay(&mut self) -> Duration {
+        self.inner.data_send_delay()
+    }
+    fn fec_metadata(&self, payload_len: usize) -> Option<crate::fec::FecMetadata> {
+        self.inner.fec_metadata(payload_len)
+    }
+    fn feed_fragmented_data(&mut self, payload: &[u8]) {
+        self.inner.feed_fragmented_data(payload);
+    }
+
+    fn active_mask(&self) -> Option<&crate::mask::MaskProfile> {
+        self.inner.active_mask()
+    }
+
+    fn data_ready(&self) -> bool {
+        self.inner.data_ready()
+    }
+
+    fn max_data_payload(&mut self, datagram_limit: usize) -> usize {
+        self.inner
+            .set_fec_group(self.fec_group.load(Ordering::Relaxed));
+        self.check_key_rotation();
+        self.inner.max_data_payload(datagram_limit)
+    }
+
+    fn encrypt_mask_bootstrap(&mut self) -> Result<Vec<u8>> {
+        self.check_key_rotation();
+        self.inner.encrypt_mask_bootstrap()
+    }
     fn encrypt_data(&mut self, payload: &[u8]) -> Result<Vec<u8>> {
+        self.inner
+            .set_fec_group(self.fec_group.load(Ordering::Relaxed));
         self.check_key_rotation();
         self.inner.encrypt_data(payload)
     }
@@ -158,6 +191,88 @@ mod tests {
     use super::*;
     use crate::crypto::{derive_session_keys, KeyPair};
 
+    #[test]
+    fn mobile_upload_uses_the_active_profile_interval() {
+        let mut encryptor = make_encryptor(
+            make_keys(11),
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(VecDeque::new())),
+        );
+        let mut mask = crate::mask::preset_masks::webrtc_vk_teams_v1();
+        mask.fsm_states.clear();
+        mask.size_iat_joint = None;
+        mask.iat_distribution = crate::mask::IATDistribution {
+            dist_type: crate::mask::IATDistType::Empirical,
+            params: vec![30.0],
+            jitter_range_ms: (0.0, 0.0),
+        };
+        *encryptor.inner.pending_mask.lock().unwrap() = Some(mask);
+        assert_eq!(encryptor.data_send_delay(), Duration::from_millis(30));
+    }
+
+    #[test]
+    fn active_uploader_applies_fec_changes_without_reconnect() {
+        let mut encryptor = make_encryptor(
+            make_keys(9),
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(VecDeque::new())),
+        );
+        *encryptor.inner.pending_mask.lock().unwrap() =
+            Some(crate::mask::preset_masks::quic_https_v2());
+        encryptor.encrypt_data_packets(&[7; 1500], 65507).unwrap();
+        assert!(encryptor.take_fec_repair().is_none());
+        encryptor.fec_group.store(2, Ordering::Relaxed);
+        encryptor.encrypt_data_packets(&[8; 1500], 65507).unwrap();
+        assert!(encryptor.take_fec_repair().is_none());
+        encryptor.encrypt_data_packets(&[9; 1500], 65507).unwrap();
+        let mut repairs = 0;
+        while let Some(packet) = encryptor.take_fec_repair() {
+            assert!(packet.len() <= crate::mask_io::MAX_QUIC_INNER);
+            repairs += 1;
+        }
+        assert_eq!(repairs, 2);
+        encryptor.fec_group.store(0, Ordering::Relaxed);
+        for _ in 0..4 {
+            encryptor.encrypt_data_packets(&[1; 1500], 65507).unwrap();
+            assert!(encryptor.take_fec_repair().is_none());
+        }
+    }
+
+    #[test]
+    fn mobile_encryptor_exposes_mask_changes_to_the_transport() {
+        let keys = make_keys(7);
+        let mut encryptor = make_encryptor(
+            keys,
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(VecDeque::new())),
+        );
+        let quic = crate::mask::preset_masks::quic_https_v2();
+        *encryptor.inner.pending_mask.lock().unwrap() = Some(quic.clone());
+        let packets = encryptor
+            .encrypt_data_packets(&vec![3; 1500], 65507)
+            .unwrap();
+        assert!(packets.len() > 1);
+        assert_eq!(encryptor.active_mask().unwrap().mask_id, quic.mask_id);
+        assert!(packets
+            .iter()
+            .all(|packet| packet.len() <= crate::mask_io::MAX_QUIC_INNER));
+        assert!(encryptor.data_ready());
+    }
+
+    #[test]
+    fn idle_keepalive_applies_pending_mask_without_control_queue() {
+        let mut encryptor = make_encryptor(
+            make_keys(8),
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(VecDeque::new())),
+        );
+        let next = crate::mask::preset_masks::quic_https_v2();
+        *encryptor.inner.pending_mask.lock().unwrap() = Some(next.clone());
+        encryptor.encrypt_keepalive().unwrap();
+        assert_eq!(encryptor.active_mask().unwrap().mask_id, next.mask_id);
+        assert!(encryptor.inner.pending_mask.lock().unwrap().is_none());
+    }
+
     fn make_keys(tag: u8) -> SessionKeys {
         let ckp = KeyPair::generate();
         let skp = KeyPair::generate();
@@ -180,6 +295,7 @@ mod tests {
             ),
             session: Arc::new(SessionRuntime::new()),
             keepalive_sent_ms: Arc::new(AtomicU64::new(0)),
+            fec_group: Arc::new(AtomicU8::new(0)),
             key_rotate_slot: slot,
             rekey_ack: ack,
             rekey_resend_keys: Arc::new(Mutex::new(None)),

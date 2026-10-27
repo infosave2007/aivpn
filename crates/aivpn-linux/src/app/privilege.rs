@@ -33,6 +33,13 @@ fn has_net_admin_cap(path: &std::path::Path) -> bool {
     const VFS_CAP_FLAGS_EFFECTIVE: u32 = 0x1;
     const CAP_NET_ADMIN_MASK: u32 = 1 << 12;
     let magic_etc = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+    // Чужая user namespace не относится к правам, выданным этим установщиком.
+    if magic_etc & 0xff00_0000 == 0x0300_0000
+        && n >= 24
+        && u32::from_le_bytes([buf[20], buf[21], buf[22], buf[23]]) != 0
+    {
+        return false;
+    }
     let permitted = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
     permitted & CAP_NET_ADMIN_MASK != 0 && magic_etc & VFS_CAP_FLAGS_EFFECTIVE != 0
 }
@@ -45,23 +52,25 @@ fn has_net_admin_cap(path: &std::path::Path) -> bool {
 #[cfg(unix)]
 fn is_trusted_system_binary(path: &std::path::Path) -> bool {
     use std::os::unix::fs::MetadataExt;
-    match std::fs::metadata(path) {
-        Ok(meta) => meta.uid() == 0 && (meta.mode() & 0o022) == 0,
-        Err(_) => false,
-    }
+    let Ok(canonical) = std::fs::canonicalize(path) else {
+        return false;
+    };
+    let Ok(file) = std::fs::metadata(&canonical) else {
+        return false;
+    };
+    file.is_file()
+        && canonical.ancestors().all(|ancestor| {
+            std::fs::symlink_metadata(ancestor).is_ok_and(|meta| {
+                meta.uid() == 0 && meta.mode() & 0o022 == 0 && !meta.file_type().is_symlink()
+            })
+        })
 }
 #[cfg(not(unix))]
 fn is_trusted_system_binary(_path: &std::path::Path) -> bool {
     false
 }
 
-/// Find every distinct `ip` binary reachable on this system: the one PATH
-/// would actually resolve for an unqualified `Command::new("ip")` call (what
-/// tunnel.rs uses), plus the common hardcoded locations. We grant
-/// capabilities to ALL of them — cheap, and removes any ambiguity about
-/// which one ends up exec'd. Paths are canonicalized and deduped by real
-/// file identity, since /usr/sbin is a symlink to /usr/bin on many distros
-/// (so granting both would otherwise setcap the same inode twice).
+/// Находим системные копии ip, чтобы снять выданные прежним установщиком права.
 fn find_ip_binaries() -> Vec<std::path::PathBuf> {
     let mut found = Vec::new();
 
@@ -90,6 +99,7 @@ fn find_ip_binaries() -> Vec<std::path::PathBuf> {
     found
         .into_iter()
         .filter_map(|p| std::fs::canonicalize(&p).ok().or(Some(p)))
+        .filter(|p| p.file_name().is_some_and(|name| name == "ip"))
         .filter(|p| seen.insert(p.clone()))
         .filter(|p| is_trusted_system_binary(p))
         .collect()
@@ -148,238 +158,210 @@ const AIVPN_POLICY_DEST: &str = "/usr/share/polkit-1/actions/com.aivpn.client.po
 /// world-readable by design (polkit needs every session to be able to read
 /// action definitions), so this check needs no privilege.
 fn policy_is_installed() -> bool {
+    if !is_trusted_system_binary(std::path::Path::new(AIVPN_POLICY_DEST)) {
+        return false;
+    }
     std::fs::read_to_string(AIVPN_POLICY_DEST)
         .map(|c| c == AIVPN_POLICY_CONTENT)
         .unwrap_or(false)
 }
 
-/// Whether the helper binary itself is installed at its fixed system path,
-/// root-owned, non-writable by group/other, and byte-for-byte identical to
-/// the `aivpn-ip-helper` binary built alongside this `aivpn-linux` release
-/// (found via `find_ip_helper_binary`). Comparing against the freshly
-/// built binary (rather than embedding source text) is required now that
-/// the helper is a compiled Rust binary, not a shell script.
-fn helper_is_installed(helper_path: &std::path::Path, built_helper: &std::path::Path) -> bool {
-    if !is_trusted_system_binary(helper_path) {
-        return false;
-    }
-    match (std::fs::read(helper_path), std::fs::read(built_helper)) {
-        (Ok(installed), Ok(built)) => installed == built,
-        _ => false,
-    }
+/// Читает ровно один файл из pipe и отклоняет неполную передачу.
+fn read_stage_file(name: &str, size: usize) -> String {
+    format!(
+        "head -c {size} > \"$stage/{name}\"\ntest \"$(wc -c < \"$stage/{name}\")\" -eq {size}\n"
+    )
 }
 
-/// AppImage binaries run from a fresh /tmp/.mount-* path each launch, so a
-/// `setcap` grant doesn't persist there. Copy the binary to a stable
-/// per-user location once and grant CAP_NET_ADMIN via a single pkexec
-/// prompt, so subsequent connects need no privilege escalation at all.
-///
-/// The client itself having CAP_NET_ADMIN isn't enough: it shells out to
-/// `ip addr`/`ip route` to configure the tunnel, and a spawned child does
-/// NOT inherit file capabilities (only "ambient" caps would propagate, and
-/// we only grant effective+permitted). So `ip` itself needs the capability
-/// too, granted in the same pkexec prompt.
-///
-/// This same one-shot pkexec prompt ALSO installs the `aivpn-ip-helper`
-/// binary and its polkit `.policy` action (see the constants above) to
-/// their fixed system-wide locations, so that once this setup has run,
-/// `run_ip_batch_privileged` in aivpn-client's tunnel.rs can request root
-/// via `pkexec /usr/local/libexec/aivpn/aivpn-ip-helper` instead of
-/// `pkexec sh -c "..."` — pkexec then matches the
-/// `com.aivpn.client.configure-network` action instead of the generic
-/// `org.freedesktop.policykit.exec` one, and that action grants
-/// `auth_admin_keep`, so disconnect→reconnect within the polkit session
-/// cache window (~5 min by default) needs no further password prompt. The
-/// helper itself validates every command against a strict whitelist before
-/// executing anything (see `crates/aivpn-client/src/bin/aivpn-ip-helper.rs`),
-/// so caching this authorization doesn't hand out more than that fixed
-/// command grammar. Folding this into the SAME pkexec invocation as the
-/// setcap call means installing the policy costs zero extra prompts over
-/// what this function already asked for.
+/// Удаляем только NET_ADMIN, сохраняя остальные права системной команды.
+fn revoke_ip_capability(path: &std::path::Path) -> String {
+    let path = shell_quote(&path.to_string_lossy());
+    format!(
+        "ip_path={path}\ncaps=$(getcap \"$ip_path\")\ncaps=${{caps#\"$ip_path \"}}\nsetcap \"$caps cap_net_admin-eip\" \"$ip_path\"\ncaps=$(getcap \"$ip_path\")\ncaps=${{caps#\"$ip_path \"}}\nif [ \"$caps\" = = ]; then setcap -r \"$ip_path\"; fi\n"
+    )
+}
+
+/// Устанавливает клиент и помощник в каталог root и проверяет результат.
 pub(super) async fn ensure_capable_binary(
     source: &std::path::Path,
     lang: &str,
     sender: &mut iced::futures::channel::mpsc::Sender<Message>,
 ) -> Result<std::path::PathBuf, String> {
-    let persisted = dirs::data_local_dir()
-        .unwrap_or_else(|| std::path::PathBuf::from("."))
-        .join("aivpn")
-        .join("aivpn-client");
+    use tokio::io::AsyncWriteExt;
+    let persisted = std::path::PathBuf::from(AIVPN_IP_HELPER_INSTALL_DIR).join("aivpn-client");
     let helper_dest = aivpn_ip_helper_path();
+    // Снимки читаются до запроса прав. Привилегированный процесс получает байты
+    // через pipe и не открывает подготовленные файлы в каталоге пользователя.
+    let client = std::fs::read(source).map_err(|error| error.to_string())?;
     let built_helper = find_ip_helper_binary().ok();
-
-    // Byte-for-byte: a length-only check let a stale persisted copy that
-    // happened to match the new build's size keep shadowing it forever.
-    let needs_copy = match (std::fs::read(&persisted), std::fs::read(source)) {
-        (Ok(p), Ok(s)) => p != s,
-        _ => true,
-    };
-
+    let helper = built_helper
+        .as_ref()
+        .map(std::fs::read)
+        .transpose()
+        .map_err(|error| error.to_string())?;
     let ip_bins = find_ip_binaries();
-    let ip_needs_cap = ip_bins.iter().any(|p| !has_net_admin_cap(p));
-
-    let policy_setup_needed = match &built_helper {
-        Some(built) => !helper_is_installed(&helper_dest, built) || !policy_is_installed(),
-        // No built aivpn-ip-helper binary found alongside aivpn-linux
-        // (e.g. an older release tarball) — nothing to install; the
-        // client will simply fall back to `pkexec sh -c "..."` at
-        // connect time. Don't block on it, and don't error out.
-        None => false,
+    let client_ok = || {
+        is_trusted_system_binary(&persisted)
+            && has_net_admin_cap(&persisted)
+            && std::fs::read(&persisted).is_ok_and(|bytes| bytes == client)
     };
-
-    let _ = sender.try_send(Message::LogLine(format!(
-        "[diag] persisted={} needs_copy={} client_has_cap={} ip_bins={:?} ip_needs_cap={} \
-         helper_dest={} built_helper={:?} policy_setup_needed={}",
-        persisted.display(),
-        needs_copy,
-        has_net_admin_cap(&persisted),
-        ip_bins,
-        ip_needs_cap,
-        helper_dest.display(),
-        built_helper,
-        policy_setup_needed
-    )));
-
-    if needs_copy || !has_net_admin_cap(&persisted) || ip_needs_cap || policy_setup_needed {
-        if let Some(parent) = persisted.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        if std::fs::copy(source, &persisted).is_err() {
-            return Err(if lang == "ru" {
-                "[!] Не удалось скопировать клиент для выдачи прав".to_string()
-            } else {
-                "[!] Failed to copy client binary for capability grant".to_string()
-            });
-        }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            if let Ok(meta) = std::fs::metadata(&persisted) {
-                let mut perm = meta.permissions();
-                perm.set_mode(0o755);
-                let _ = std::fs::set_permissions(&persisted, perm);
-            }
-        }
-
-        // Stage the helper binary + policy file as plain, unprivileged
-        // files in our own (user-owned) persisted dir. The privileged step
-        // below only ever moves/chowns *paths* we already fully control the
-        // literal bytes of — the helper's own bytes come straight from the
-        // build output (never generated/templated), and the policy's only
-        // "variable" content (the fixed exec.path annotation) is baked in
-        // at Rust-compile time via `include_str!`, not substituted here.
-        let mut staged_helper = None;
-        let mut staged_policy = None;
-        if policy_setup_needed {
-            if let Some(built) = &built_helper {
-                let parent = persisted
-                    .parent()
-                    .map(std::path::Path::to_path_buf)
-                    .unwrap_or_else(|| std::path::PathBuf::from("."));
-                let h = parent.join("aivpn-ip-helper.staged");
-                let p = parent.join("com.aivpn.client.policy.staged");
-                let staged_ok = std::fs::copy(built, &h).is_ok()
-                    && std::fs::write(&p, AIVPN_POLICY_CONTENT).is_ok();
-                if !staged_ok {
-                    let _ = sender.try_send(Message::LogLine(
-                        "[diag] failed to stage aivpn-ip-helper/policy files; skipping polkit \
-                         setup this run (will retry next connect)"
-                            .to_string(),
-                    ));
-                } else {
-                    staged_helper = Some(h);
-                    staged_policy = Some(p);
-                }
-            }
-        }
-
-        let mut script_parts: Vec<String> = Vec::new();
-        let mut setcap_cmd = vec!["setcap".to_string(), "cap_net_admin+ep".to_string()];
-        setcap_cmd.push(shell_quote(&persisted.to_string_lossy()));
-        for ip in &ip_bins {
-            setcap_cmd.push("cap_net_admin+ep".to_string());
-            setcap_cmd.push(shell_quote(&ip.to_string_lossy()));
-        }
-        script_parts.push(setcap_cmd.join(" "));
-
-        if let (Some(h), Some(p)) = (&staged_helper, &staged_policy) {
-            // Create the helper's root-owned parent directory as part of
-            // this SAME privileged step (costs zero extra prompts): mode
-            // 0755, root:root, so no unprivileged process can ever plant a
-            // substitute file at the helper's exact install path — closing
-            // the path-hijacking hole a per-user (user-writable parent
-            // directory) install location would have.
-            script_parts.push(format!(
-                "install -d -m 0755 -o root -g root {}",
-                shell_quote(AIVPN_IP_HELPER_INSTALL_DIR)
-            ));
-            script_parts.push(format!(
-                "install -m 0755 -o root -g root {} {}",
-                shell_quote(&h.to_string_lossy()),
-                shell_quote(&helper_dest.to_string_lossy())
-            ));
-            script_parts.push(format!(
-                "mkdir -p {}",
-                shell_quote("/usr/share/polkit-1/actions")
-            ));
-            script_parts.push(format!(
-                "install -m 0644 -o root -g root {} {}",
-                shell_quote(&p.to_string_lossy()),
-                shell_quote(AIVPN_POLICY_DEST)
-            ));
-            script_parts.push(format!(
-                "rm -f {} {}",
-                shell_quote(&h.to_string_lossy()),
-                shell_quote(&p.to_string_lossy())
-            ));
-        }
-
-        let script = script_parts.join(" && ");
-        let setcap = tokio::process::Command::new("pkexec")
-            .arg("sh")
-            .arg("-c")
-            .arg(&script)
-            .status()
-            .await;
-        match setcap {
-            Ok(s) if s.success() => {
-                let client_ok = has_net_admin_cap(&persisted);
-                let ip_status: Vec<String> = ip_bins
-                    .iter()
-                    .map(|p| format!("{}={}", p.display(), has_net_admin_cap(p)))
-                    .collect();
-                let helper_ok = built_helper
-                    .as_ref()
-                    .map(|b| helper_is_installed(&helper_dest, b))
-                    .unwrap_or(false);
-                let policy_ok = policy_is_installed();
-                let _ = sender.try_send(Message::LogLine(format!(
-                    "[diag] pkexec setup exit ok; verify client_cap={client_ok} ip_caps={ip_status:?} \
-                     helper_installed={helper_ok} policy_installed={policy_ok}"
-                )));
-            }
-            Ok(s) => {
-                let _ = sender.try_send(Message::LogLine(format!(
-                    "[diag] pkexec setup exited with status {s}"
-                )));
-                return Err(if lang == "ru" {
-                    "[!] Не удалось выдать права (отменено или pkexec недоступен). Подключение от имени обычного пользователя может не работать.".to_string()
-                } else {
-                    "[!] Failed to grant capabilities (cancelled or pkexec unavailable). Connecting as a regular user may not work.".to_string()
-                });
-            }
-            Err(e) => {
-                let _ = sender.try_send(Message::LogLine(format!(
-                    "[diag] pkexec failed to spawn: {e}"
-                )));
-                return Err(if lang == "ru" {
-                    "[!] Не удалось выдать права (отменено или pkexec недоступен). Подключение от имени обычного пользователя может не работать.".to_string()
-                } else {
-                    "[!] Failed to grant capabilities (cancelled or pkexec unavailable). Connecting as a regular user may not work.".to_string()
-                });
-            }
+    let helper_ok = || {
+        helper.as_ref().is_none_or(|expected| {
+            is_trusted_system_binary(&helper_dest)
+                && std::fs::read(&helper_dest).is_ok_and(|bytes| &bytes == expected)
+                && policy_is_installed()
+        })
+    };
+    if client_ok() && helper_ok() && ip_bins.iter().all(|path| !has_net_admin_cap(path)) {
+        return Ok(persisted);
+    }
+    let mut files = vec![("client", client.as_slice(), persisted.as_path(), "0755")];
+    if let Some(bytes) = &helper {
+        files.push(("helper", bytes.as_slice(), helper_dest.as_path(), "0755"));
+        files.push((
+            "policy",
+            AIVPN_POLICY_CONTENT.as_bytes(),
+            std::path::Path::new(AIVPN_POLICY_DEST),
+            "0644",
+        ));
+    }
+    let mut script = String::from("set -eu\numask 077\n");
+    script.push_str("for p in /usr /usr/local /usr/local/libexec /usr/local/libexec/aivpn /usr/share /usr/share/polkit-1 /usr/share/polkit-1/actions; do\nif [ ! -e \"$p\" ]; then install -d -m 0755 -o root -g root -- \"$p\"; fi\ntest ! -L \"$p\"\ntest \"$(stat -c %u -- \"$p\")\" = 0\ntest \"$((0$(stat -c %a -- \"$p\") & 0022))\" -eq 0\ndone\n");
+    script.push_str("stage=$(mktemp -d /usr/local/libexec/aivpn/.setup.XXXXXXXX)\ntrap 'rm -rf -- \"$stage\"' EXIT\n");
+    for (name, bytes, _, _) in &files {
+        script.push_str(&read_stage_file(name, bytes.len()));
+    }
+    for (name, _, destination, mode) in &files {
+        script.push_str(&format!(
+            "install -m {mode} -o root -g root -- \"$stage/{name}\" {}\n",
+            shell_quote(&destination.to_string_lossy())
+        ));
+    }
+    script.push_str(&format!(
+        "setcap cap_net_admin+ep {}",
+        shell_quote(&persisted.to_string_lossy())
+    ));
+    script.push('\n');
+    for ip in &ip_bins {
+        if has_net_admin_cap(ip) {
+            script.push_str(&revoke_ip_capability(ip));
         }
     }
-
+    let mut child = tokio::process::Command::new("/usr/bin/pkexec")
+        .args(["--disable-internal-agent", "sh", "-c", &script])
+        .stdin(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|error| error.to_string())?;
+    let mut input = child
+        .stdin
+        .take()
+        .ok_or_else(|| "pkexec stdin недоступен".to_string())?;
+    let write_result = async {
+        for (_, bytes, _, _) in &files {
+            input.write_all(bytes).await?;
+        }
+        input.shutdown().await
+    }
+    .await;
+    drop(input);
+    let status = child.wait().await.map_err(|error| error.to_string())?;
+    if write_result.is_err()
+        || !status.success()
+        || !client_ok()
+        || !helper_ok()
+        || ip_bins.iter().any(|path| has_net_admin_cap(path))
+    {
+        let _ = sender.try_send(Message::LogLine(format!(
+            "[diag] privileged setup failed: {status}"
+        )));
+        return Err(if lang == "ru" {
+            "Не удалось установить клиент и проверить права. Подключение отменено.".into()
+        } else {
+            "Client installation or permission verification failed. Connection cancelled.".into()
+        });
+    }
     Ok(persisted)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn capability_repair_preserves_other_flags_and_quotes_paths() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("aivpn-cap-repair-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let getcap = dir.join("getcap");
+        let setcap = dir.join("setcap");
+        std::fs::write(
+            &getcap,
+            "#!/bin/sh\nprintf '%s %s\\n' \"$1\" 'cap_net_admin,cap_net_raw=ep'\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &setcap,
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$CAP_CAPTURE\"\n",
+        )
+        .unwrap();
+        for path in [&getcap, &setcap] {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let path = dir.join("ip with 'quote");
+        let output = dir.join("result");
+        let result = std::process::Command::new("/bin/sh")
+            .args(["-ec", &revoke_ip_capability(&path)])
+            .env("PATH", &dir)
+            .env("CAP_CAPTURE", &output)
+            .status()
+            .unwrap();
+        assert!(result.success());
+        assert_eq!(
+            std::fs::read_to_string(&output).unwrap(),
+            format!(
+                "cap_net_admin,cap_net_raw=ep cap_net_admin-eip\n{}\n",
+                path.display()
+            )
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn staged_input_uses_snapshot_and_rejects_truncated_transfer() {
+        let directory = std::env::temp_dir().join(format!(
+            "aivpn-setup-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let source = directory.join("source");
+        std::fs::write(&source, b"trusted\0binary").unwrap();
+        let snapshot = std::fs::read(&source).unwrap();
+        std::fs::write(&source, b"replacement").unwrap();
+        for truncated in [false, true] {
+            let script = format!("set -e\n{}", read_stage_file("client", snapshot.len()));
+            let mut command = std::process::Command::new("sh")
+                .args(["-c", &script])
+                .env("stage", &directory)
+                .stdin(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            let mut input = command.stdin.take().unwrap();
+            input
+                .write_all(if truncated { &snapshot[..3] } else { &snapshot })
+                .unwrap();
+            drop(input);
+            let success = command.wait().unwrap().success();
+            assert_eq!(success, !truncated);
+            if success {
+                assert_eq!(std::fs::read(directory.join("client")).unwrap(), snapshot);
+            }
+        }
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 }

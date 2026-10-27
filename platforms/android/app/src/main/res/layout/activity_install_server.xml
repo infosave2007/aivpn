@@ -5,25 +5,27 @@
     android:layout_width="match_parent"
     android:layout_height="match_parent"
     android:orientation="vertical"
-    android:background="@color/background">
+    android:background="?attr/colorSurface">
 
-    <!-- Compact toolbar: back + title (same pattern as AdminActivity/PoolActivity) -->
     <LinearLayout
         android:layout_width="match_parent"
-        android:layout_height="48dp"
+        android:layout_height="wrap_content"
+        android:minHeight="64dp"
         android:orientation="horizontal"
         android:gravity="center_vertical"
-        android:paddingHorizontal="8dp">
+        android:paddingStart="4dp"
+        android:paddingEnd="16dp"
+        android:paddingVertical="4dp">
 
         <ImageButton
             android:id="@+id/btnBack"
-            android:layout_width="40dp"
-            android:layout_height="40dp"
-            android:src="@android:drawable/ic_menu_revert"
+            android:layout_width="48dp"
+            android:layout_height="48dp"
+            android:src="@drawable/ic_vpn_back"
             android:background="?attr/selectableItemBackgroundBorderless"
-            android:contentDescription="@string/btn_cancel"
+            android:contentDescription="@string/ui_back"
             android:scaleType="centerInside"
-            app:tint="@color/text_primary" />
+            app:tint="?attr/colorOnSurface" />
 
         <TextView
             android:id="@+id/textStepTitle"
@@ -31,47 +33,67 @@
             android:layout_height="wrap_content"
             android:layout_weight="1"
             android:text="@string/install_title"
-            android:textSize="18sp"
-            android:textStyle="bold"
-            android:textColor="@color/text_primary"
-            android:paddingStart="4dp" />
+            android:textAppearance="@style/TextAppearance.Material3.TitleLarge"
+            android:textColor="?attr/colorOnSurface"
+            android:maxLines="2"
+            android:ellipsize="end"
+            android:paddingStart="4dp"
+            android:accessibilityHeading="true" />
     </LinearLayout>
 
     <ScrollView
         android:layout_width="match_parent"
         android:layout_height="0dp"
         android:layout_weight="1"
-        android:fillViewport="true">
+        android:fillViewport="true"
+        android:clipToPadding="false">
 
         <FrameLayout
             android:id="@+id/contentContainer"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:padding="16dp" />
+            android:paddingHorizontal="20dp"
+            android:paddingTop="8dp"
+            android:paddingBottom="16dp" />
     </ScrollView>
 
-    <!-- Bottom action bar: Back / Next (relabeled per step by the activity) -->
+    <View
+        android:layout_width="match_parent"
+        android:layout_height="1dp"
+        android:background="?attr/colorOutline" />
+
     <LinearLayout
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:orientation="horizontal"
         android:padding="12dp"
-        android:gravity="end">
+        android:gravity="center_vertical">
 
-        <Button
+        <com.google.android.material.button.MaterialButton
             android:id="@+id/btnStepBack"
-            style="?android:attr/buttonBarButtonStyle"
+            style="@style/Widget.Material3.Button.TextButton"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
+            android:minHeight="48dp"
+            android:minWidth="48dp"
+            android:insetTop="0dp"
+            android:insetBottom="0dp"
+            android:textSize="14sp"
+            android:textAllCaps="false"
             android:text="@string/btn_cancel" />
 
-        <Button
+        <com.google.android.material.button.MaterialButton
             android:id="@+id/btnStepNext"
-            style="?android:attr/buttonBarButtonStyle"
-            android:layout_width="wrap_content"
+            android:layout_width="0dp"
             android:layout_height="wrap_content"
+            android:layout_weight="1"
             android:layout_marginStart="8dp"
-            android:textColor="@color/accent"
+            android:minHeight="48dp"
+            android:insetTop="0dp"
+            android:insetBottom="0dp"
+            android:textSize="16sp"
+            android:textAllCaps="false"
+            android:maxLines="2"
             android:text="@string/install_step_next" />
     </LinearLayout>
 

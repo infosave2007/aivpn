@@ -206,7 +206,36 @@ impl PendingConfigManager {
     /// change live).
     pub fn confirm_and_take(&self, token: &str) -> Option<PendingConfig> {
         let _guard = self.lock_mutation();
-        self.inner.remove(token).map(|(_, v)| v)
+        self.inner
+            .remove_if(token, |_, pending| !pending.is_expired(Instant::now()))
+            .map(|(_, pending)| pending)
+    }
+
+    /// Неудачный откат остается в очереди и повторяется на следующем проходе.
+    pub(crate) fn rollback_expired(
+        &self,
+        now: Instant,
+    ) -> Vec<(PendingConfig, std::io::Result<()>)> {
+        let guard = self.lock_mutation();
+        self.tick_locked(now, &guard)
+            .into_iter()
+            .map(|pending| {
+                let result = match pending.rollback_value() {
+                    Some(bytes) => {
+                        crate::client_db::write_bytes_atomic(pending.target_path(), bytes)
+                            .map_err(std::io::Error::other)
+                    }
+                    None => match std::fs::remove_file(pending.target_path()) {
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                        result => result,
+                    },
+                };
+                if result.is_err() {
+                    self.inner.insert(pending.token.clone(), pending.clone());
+                }
+                (pending, result)
+            })
+            .collect()
     }
 
     /// True when a still-pending (unconfirmed, unswept) change targets
@@ -402,6 +431,52 @@ mod tests {
     fn manager_confirm_unknown_token_returns_false() {
         let mgr = PendingConfigManager::new();
         assert!(!mgr.confirm("does-not-exist"));
+    }
+
+    #[test]
+    fn expired_token_cannot_cancel_rollback_before_cleanup_tick() {
+        let manager = PendingConfigManager::new();
+        manager.begin(pc(Instant::now(), Duration::ZERO));
+        assert!(!manager.confirm("tok-1"));
+        assert_eq!(manager.len(), 1);
+        assert_eq!(manager.tick(Instant::now()).len(), 1);
+    }
+
+    #[test]
+    fn failed_rollback_is_retried_and_restores_a_private_file_atomically() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.json");
+        std::fs::create_dir(&path).unwrap();
+        let manager = PendingConfigManager::new();
+        let pending = PendingConfig::begin(
+            "retry".into(),
+            path.clone(),
+            Some(b"original".to_vec()),
+            "test".into(),
+            Instant::now(),
+            Duration::ZERO,
+        );
+        manager.begin(pending);
+        let first = manager.rollback_expired(Instant::now());
+        assert_eq!(first.len(), 1);
+        assert!(first[0].1.is_err());
+        assert_eq!(manager.len(), 1);
+        assert!(!manager.confirm("retry"));
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+        std::fs::remove_dir(&path).unwrap();
+        let second = manager.rollback_expired(Instant::now());
+        assert_eq!(second.len(), 1);
+        assert!(second[0].1.is_ok());
+        assert_eq!(std::fs::read(&path).unwrap(), b"original");
+        assert!(manager.is_empty());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
     }
 
     #[test]

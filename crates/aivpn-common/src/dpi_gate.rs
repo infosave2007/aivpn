@@ -1,40 +1,17 @@
-//! Inline ML-DPI "reads-as-tunnel" gate (R2 Phase D).
+//! ML-DPI по окну из 24 проверенных внешних UDP-кадров.
 //!
-//! A cheap, always-on advisory discriminator that watches a session's own
-//! outbound masked wire packets and asks: *does this flow still read as its
-//! target protocol, or has it started to look like an obfuscated tunnel?* It is
-//! a **sibling** to the Neural Resonance Module (`neural.rs`): neural resonance
-//! detects drift away from the mask's *own* fingerprint (reconstruction MSE);
-//! this gate detects drift *toward* a tunnel/`Unknown` DPI classification. Both
-//! feed the same `compromised → rotate` action in the gateway.
+//! GBDT приближает офлайн-вердикт nDPI: целевой QUIC/STUN либо
+//! туннель/Unknown. Neural Resonance отдельно отслеживает отклонение
+//! статистики от эталона маски; оба детектора могут запросить ее смену.
 //!
-//! Why a learned model and not nDPI inline: nDPI (13 MB, full protocol state
-//! machines, per-flow allocation) is the right *offline* signing-time authority,
-//! but far too heavy for the datapath. So R2 trained a small GradientBoosting
-//! model to reproduce nDPI's accept/reject from features the server computes for
-//! free over a short packet window — no deep payload parsing, no protocol state
-//! machine, no per-packet regex. See `research/mask-generation/r2/` and
-//! `docs/R2_PHASE_D.md`.
+//! Обучение и проверка находятся в tools/dpi, результаты и происхождение
+//! данных в assets/dpi. Захваты разделены по сессиям; ограничения переноса
+//! на другой трафик описаны в отчете обучения. IAT не входит в 23 признака:
+//! временные характеристики обучающих сессий не задают эталон сети клиента.
 //!
-//! Feature set (23, IAT dropped — see below): packet-size moments + a 6-bin
-//! histogram, first-16-byte and full Shannon entropy, byte-0 / QUIC long-header
-//! form statistics, and the STUN structural checks nDPI keys off (type at
-//! offset 0, magic cookie `21 12 A4 42` at offset 4, and the killer
-//! `msg_len + 20 == payload_len` length-consistency predicate). IAT moments are
-//! deliberately **excluded**: the offline training pcaps have cosmetic
-//! timestamps, so IAT there only separates "synthetic vs real capture", not
-//! protocol — an honest gate must not lean on it.
-//!
-//! Perf budget: feature extraction is O(window) and the model is 120 depth-3
-//! trees, so a verdict is ~360 comparisons — evaluated **per window** on the
-//! periodic resonance-check cadence, never per packet. The only per-packet cost
-//! is `PacketMeta::from_wire` (one entropy pass over the sampled packet), and the
-//! gateway samples the same 1-in-16 packets it already samples for neural.
-//!
-//! The whole module is compiled only under the `dpi-gate` cargo feature (the
-//! server enables it transitively through its `neural` feature; clients enable
-//! it through `client-dpi-gate`, which also builds the [`ClientSelfGate`]
-//! outbound inspector below).
+//! Выборка берет первый кадр и затем каждый шестнадцатый. Признаки включают
+//! длины, энтропию и поля внешних заголовков. Модель содержит 120 деревьев
+//! глубины 3. Сервер включает модуль через neural, клиент через client-dpi-gate.
 
 use dashmap::DashMap;
 use std::collections::VecDeque;
@@ -61,6 +38,10 @@ pub struct GbdtNode {
 /// was trained on 24-packet windows, so a verdict is only meaningful once a full
 /// window has accumulated.
 pub const WINDOW: usize = 24;
+
+/// Вторая схема не использует spin и защищенные биты первого байта QUIC 1-RTT.
+pub const FEATURE_SCHEMA_VERSION: u32 = 2;
+const _: () = assert!(FEATURE_SCHEMA_VERSION == model::FEATURE_SCHEMA_VERSION);
 
 /// Size histogram bins `[lo, hi)`, identical to `features.py::SIZE_BINS`.
 const SIZE_BINS: [(u32, u32); 6] = [
@@ -105,7 +86,12 @@ impl PacketMeta {
     /// header bytes at the wire offsets checked below.
     pub fn from_wire(p: &[u8]) -> Self {
         let len = p.len();
-        let byte0 = p.first().copied().unwrap_or(0);
+        let raw_byte0 = p.first().copied().unwrap_or(0);
+        let byte0 = if raw_byte0 & 0xc0 == 0x40 {
+            0x40
+        } else {
+            raw_byte0
+        };
 
         let stun_type = len >= 2
             && (p[0] & 0xC0) == 0
@@ -136,15 +122,14 @@ impl PacketMeta {
             magic_ok,
             stun_lenok,
             dns_ok,
-            ent16: shannon_entropy(&p[..n16]) as f32,
-            ent_full: shannon_entropy(p) as f32,
+            ent16: shannon_entropy(&p[..n16], byte0) as f32,
+            ent_full: shannon_entropy(p, byte0) as f32,
         }
     }
 }
 
-/// Shannon entropy in bits/byte over `data`. Identical to `features.py::_entropy`
-/// and `gateway::compute_entropy`.
-fn shannon_entropy(data: &[u8]) -> f64 {
+/// Энтропия признака с каноническим первым байтом, без копирования wire payload.
+fn shannon_entropy(data: &[u8], first: u8) -> f64 {
     if data.is_empty() {
         return 0.0;
     }
@@ -152,6 +137,8 @@ fn shannon_entropy(data: &[u8]) -> f64 {
     for &b in data {
         counts[b as usize] += 1;
     }
+    counts[data[0] as usize] -= 1;
+    counts[first as usize] += 1;
     let len = data.len() as f64;
     let mut h = 0.0;
     for &c in &counts {
@@ -399,9 +386,6 @@ pub struct ClientSelfGate {
     stride: u32,
     /// Rolling packet counter for the stride sampler.
     seen: u32,
-    /// Verdicts are only re-evaluated every `stride` sampled packets to bound
-    /// the GBDT inference cost; this counts sampled packets since the last eval.
-    since_eval: u32,
     /// After a request is raised, suppress further requests for this many
     /// evaluated windows (avoids a request storm while a rotation is in flight).
     cooldown_windows: u32,
@@ -415,8 +399,7 @@ impl ClientSelfGate {
     /// own single flow, so one stable key into the underlying [`DpiGate`] ring.
     const SELF_SESSION: [u8; 16] = [0u8; 16];
 
-    /// Default outbound sampling stride — every 16th packet, matching the
-    /// gateway's neural/DPI sampling cadence.
+    /// Первый внешний кадр и затем каждый шестнадцатый, как на сервере.
     pub const DEFAULT_STRIDE: u32 = 16;
 
     /// Number of evaluated windows to stay quiet after raising a request.
@@ -430,7 +413,6 @@ impl ClientSelfGate {
             base_mask_id: base_mask_id.into(),
             stride: Self::DEFAULT_STRIDE,
             seen: 0,
-            since_eval: 0,
             cooldown_windows: Self::DEFAULT_COOLDOWN_WINDOWS,
             cooldown_left: 0,
         }
@@ -453,19 +435,14 @@ impl ClientSelfGate {
     /// rotate-request should be raised), else `None`. Sampling + cooldown are
     /// applied internally so the caller can call this on every packet cheaply.
     pub fn observe_wire(&mut self, wire: &[u8]) -> Option<f32> {
-        // Stride sampler: only every Nth packet enters the window.
+        // Та же выборка, что у проверенных внешних кадров сервера:
+        // первый кадр и затем каждый stride-й, без второго прореживания.
+        let sample = self.seen.is_multiple_of(self.stride);
         self.seen = self.seen.wrapping_add(1);
-        if self.seen % self.stride != 0 {
+        if !sample {
             return None;
         }
         self.gate.record_wire(Self::SELF_SESSION, wire);
-
-        // Only run GBDT inference once per full stride of sampled packets.
-        self.since_eval += 1;
-        if self.since_eval < self.stride {
-            return None;
-        }
-        self.since_eval = 0;
 
         if self.cooldown_left > 0 {
             self.cooldown_left -= 1;
@@ -508,6 +485,29 @@ impl crate::upload_pipeline::OutboundInspector for ClientSelfGate {
     }
 }
 
+#[cfg(all(test, feature = "client-dpi-gate"))]
+impl ClientSelfGate {
+    /// One already-normalized window. Live packets still enter through
+    /// [`ClientSelfGate::observe_wire`]. Tests use this to inject a shipped
+    /// feature vector without adding that vector to training.
+    fn observe_features(
+        &mut self,
+        x: &[f32; model::N_FEATURES],
+    ) -> Option<crate::protocol::ControlPayload> {
+        if self.cooldown_left > 0 {
+            self.cooldown_left -= 1;
+            return None;
+        }
+        let prob = tunnel_probability(x);
+        if prob > self.gate.threshold() {
+            self.cooldown_left = self.cooldown_windows;
+            Some(self.rotate_request())
+        } else {
+            None
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -536,9 +536,7 @@ mod tests {
             .collect()
     }
 
-    /// Feature extraction must reproduce `features.py::extract` (IAT dropped) on
-    /// a synthetic window. Reference vector generated by running features.py on
-    /// this exact window (see docs/R2_PHASE_D.md / export_model.py provenance).
+    /// Feature extraction must reproduce `tools/dpi/features.py` on this window.
     #[test]
     fn feature_extraction_matches_python_reference() {
         let window: Vec<PacketMeta> = [
@@ -555,6 +553,8 @@ mod tests {
 
         let got = extract_features(&window);
         // From features.py on the identical window (IAT features dropped):
+        assert_eq!(model::N_FEATURES, 23);
+        assert_eq!(WINDOW, 24);
         let want: [f32; model::N_FEATURES] = [
             6.0,
             440.666_67,
@@ -628,66 +628,326 @@ mod tests {
         assert!(!junk.stun_type && !junk.magic_ok);
     }
 
-    /// The embedded model classifies a known masked target-protocol window as
-    /// NOT a tunnel, and a known broken/Unknown window as a tunnel. Vectors and
-    /// reference probabilities taken from research/mask-generation/r2 (dataset +
-    /// export_model.py's test_vectors.json, masked-domain rows).
     #[test]
-    fn model_separates_masked_from_tunnel() {
-        // masked QUIC window (nDPI: QUIC) -> reads-as-target.
-        let quic: [f32; model::N_FEATURES] = [
-            24.0, 1228.5, 70.262_01, 1200.0, 1414.0, 1200.0, 1200.0, 1414.0, 0.0, 0.0, 0.0, 0.0,
-            0.875, 0.125, 3.217_366, 7.839_845, 197.875, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0,
-        ];
-        // masked STUN window (nDPI: STUN) -> reads-as-target.
-        let stun: [f32; model::N_FEATURES] = [
-            24.0, 600.5, 455.659_24, 107.0, 1358.0, 556.0, 109.0, 1342.0, 0.0, 0.375, 0.25, 0.125,
-            0.25, 0.0, 3.906_25, 7.315_663, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 0.0,
-        ];
-        // deliberately-broken mask (nDPI: Unknown) -> reads-as-tunnel.
-        let broken: [f32; model::N_FEATURES] = [
-            24.0,
-            630.125,
-            456.920_52,
-            130.0,
-            1380.0,
-            595.0,
-            153.0,
-            1380.0,
-            0.0,
-            0.333_333_34,
-            0.208_333_34,
-            0.166_666_67,
-            0.291_666_67,
-            0.0,
-            3.681_986,
-            7.382_86,
-            144.458_34,
-            0.583_333_34,
-            0.375,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-        ];
-
-        let p_quic = tunnel_probability(&quic);
-        let p_stun = tunnel_probability(&stun);
-        let p_broken = tunnel_probability(&broken);
-        assert!(p_quic < 0.1, "QUIC tunnel_prob too high: {p_quic}");
-        assert!(p_stun < 0.1, "STUN tunnel_prob too high: {p_stun}");
-        assert!(p_broken > 0.9, "broken tunnel_prob too low: {p_broken}");
-
-        // And the gate's boolean at the default 0.5 threshold.
-        let gate = DpiGate::new(0.5);
-        assert!(
-            !DpiVerdict {
-                tunnel_prob: p_stun,
-                reads_as_tunnel: p_stun > gate.threshold()
-            }
-            .reads_as_tunnel
+    fn short_header_spin_and_protected_bits_do_not_change_features() {
+        let mut packet = rnd_pkt(1200, 71);
+        packet[0] = 0x40;
+        let expected = extract_features(&[PacketMeta::from_wire(&packet); WINDOW]);
+        for byte0 in 0x40..0x80 {
+            packet[0] = byte0;
+            assert_eq!(
+                extract_features(&[PacketMeta::from_wire(&packet); WINDOW]),
+                expected,
+                "{byte0}"
+            );
+        }
+        packet[0] = 0x80;
+        let other = extract_features(&[PacketMeta::from_wire(&packet); WINDOW]);
+        packet[0] = 0x81;
+        assert_ne!(
+            extract_features(&[PacketMeta::from_wire(&packet); WINDOW]),
+            other
         );
-        assert!(p_broken > gate.threshold());
+    }
+
+    fn feature_row(value: &serde_json::Value) -> [f32; model::N_FEATURES] {
+        let items = value.as_array().expect("feature vector");
+        assert_eq!(items.len(), model::N_FEATURES);
+        let mut out = [0.0f32; model::N_FEATURES];
+        for (index, item) in items.iter().enumerate() {
+            out[index] = item.as_f64().expect("feature") as f32;
+        }
+        out
+    }
+
+    #[test]
+    fn published_feature_schema_matches_python_packet_fixtures() {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../../../assets/dpi/parity_fixtures.json")).unwrap();
+        assert_eq!(fixture["feature_schema_version"], FEATURE_SCHEMA_VERSION);
+        for window in fixture["windows"].as_array().unwrap() {
+            let mut packets = Vec::new();
+            for spec in window["packets"].as_array().unwrap() {
+                let total = spec["total"].as_u64().unwrap() as usize;
+                let repeat = spec["repeat"].as_u64().unwrap_or(1);
+                for _ in 0..repeat {
+                    let packet = match spec["op"].as_str().unwrap() {
+                        "stun" => stun_pkt(spec["msg_len"].as_u64().unwrap() as usize, total),
+                        "rnd" => rnd_pkt(total, spec["seed"].as_u64().unwrap() as usize),
+                        "quic_short" => {
+                            let mut packet =
+                                rnd_pkt(total, spec["seed"].as_u64().unwrap() as usize);
+                            packet[0] = spec["byte0"].as_u64().unwrap() as u8;
+                            packet
+                        }
+                        _ => panic!("Неизвестный генератор parity fixture"),
+                    };
+                    packets.push(PacketMeta::from_wire(&packet));
+                }
+            }
+            let actual = extract_features(&packets);
+            let expected = feature_row(&window["x"]);
+            for (index, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+                assert!(
+                    (*actual - expected).abs() <= 1e-5 * expected.abs().max(1.0),
+                    "{}: признак {index}: {actual} != {expected}",
+                    window["name"]
+                );
+            }
+        }
+    }
+
+    fn windows() -> Vec<serde_json::Value> {
+        include_str!("../../../assets/dpi/windows.jsonl")
+            .lines()
+            .filter(|line| !line.is_empty())
+            .map(|line| serde_json::from_str(line).expect("windows.jsonl"))
+            .collect()
+    }
+
+    #[test]
+    fn independent_wireguard_captures_are_detected_without_training_on_them() {
+        use sha2::{Digest, Sha256};
+        let evidence: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../assets/dpi/external_vpn_fixtures.json"
+        ))
+        .unwrap();
+        assert_eq!(evidence["feature_schema_version"], FEATURE_SCHEMA_VERSION);
+        assert_eq!(evidence["training_use"], false);
+        assert_eq!(evidence["training_overlap_checked"], true);
+        assert_eq!(
+            evidence["model_sha256"],
+            format!("{:x}", Sha256::digest(include_bytes!("dpi_gate/model.rs")))
+        );
+        assert_eq!(
+            evidence["training_provenance_sha256"],
+            format!(
+                "{:x}",
+                Sha256::digest(include_bytes!("../../../assets/dpi/provenance.json"))
+            )
+        );
+        assert_eq!(evidence["captures"].as_array().unwrap().len(), 3);
+        let mut windows = 0;
+        for capture in evidence["captures"].as_array().unwrap() {
+            assert!(capture["teacher_protocols"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|protocol| protocol == "WireGuard"));
+            for row in capture["rows"].as_array().unwrap() {
+                let probability = tunnel_probability(&feature_row(&row["x"]));
+                assert!((probability - row["p"].as_f64().unwrap() as f32).abs() < 1e-6);
+                assert!(probability > 0.5);
+                windows += 1;
+            }
+        }
+        assert_eq!(windows, 15);
+        assert_eq!(evidence["detected"], windows);
+    }
+
+    fn validation_balanced_accuracy(tp: usize, fp: usize, missed: usize, tn: usize) -> Option<f64> {
+        let positive = tp + missed;
+        let negative = fp + tn;
+        (positive > 0 && negative > 0)
+            .then(|| 0.5 * (tp as f64 / positive as f64 + tn as f64 / negative as f64))
+    }
+
+    fn validation_beats_constant(
+        tp: usize,
+        fp: usize,
+        missed: usize,
+        tn: usize,
+        majority_tunnel: bool,
+    ) -> bool {
+        let constant = if majority_tunnel {
+            validation_balanced_accuracy(tp + missed, fp + tn, 0, 0)
+        } else {
+            validation_balanced_accuracy(0, 0, tp + missed, fp + tn)
+        };
+        match (validation_balanced_accuracy(tp, fp, missed, tn), constant) {
+            (Some(score), Some(constant)) => score > constant + 0.05,
+            _ => false,
+        }
+    }
+
+    #[test]
+    fn validation_accepts_perfect_models_for_both_majorities_and_rejects_constants() {
+        for (tp, tn) in [(1, 3), (3, 1)] {
+            for majority in [false, true] {
+                assert!(validation_beats_constant(tp, 0, 0, tn, majority));
+                assert!(!validation_beats_constant(0, 0, tp, tn, majority));
+                assert!(!validation_beats_constant(tp, tn, 0, 0, majority));
+            }
+        }
+        assert!(!validation_beats_constant(0, 0, 0, 3, false));
+    }
+
+    #[test]
+    fn validation_metrics_match_python_fixtures() {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../../../assets/dpi/parity_fixtures.json")).unwrap();
+        for case in fixture["validation_cases"]
+            .as_array()
+            .expect("validation cases")
+        {
+            let count = |key: &str| case[key].as_u64().unwrap() as usize;
+            let balanced =
+                validation_balanced_accuracy(count("tp"), count("fp"), count("fn"), count("tn"));
+            assert_eq!(balanced, case["balanced_accuracy"].as_f64());
+            assert_eq!(
+                validation_beats_constant(
+                    count("tp"),
+                    count("fp"),
+                    count("fn"),
+                    count("tn"),
+                    case["majority_tunnel"].as_bool().unwrap()
+                ),
+                case["material_met"].as_bool().unwrap()
+            );
+        }
+    }
+
+    /// Shipped session-holdout windows keep the reported probability and class.
+    /// The model must beat the train-majority constant by a margin fixed before
+    /// scoring. Stale hand-written vectors are not part of this check.
+    #[test]
+    fn heldout_fixtures_match_model_and_beat_constant() {
+        const MATERIAL: f32 = 0.05;
+        let heldout: serde_json::Value =
+            serde_json::from_str(include_str!("../../../assets/dpi/heldout_fixtures.json"))
+                .unwrap();
+        assert_eq!(heldout["schema"].as_u64(), Some(2));
+        assert!((heldout["threshold"].as_f64().unwrap() as f32 - 0.5).abs() < 1e-6);
+        assert!((heldout["material_margin"].as_f64().unwrap() as f32 - MATERIAL).abs() < 1e-6);
+        let gate = DpiGate::new(0.5);
+        let rows = windows();
+        let train: Vec<&serde_json::Value> = rows
+            .iter()
+            .filter(|row| row["partition"].as_str() == Some("train"))
+            .collect();
+        let train_tunnel = train
+            .iter()
+            .filter(|row| row["y"].as_i64().unwrap() == 1)
+            .count();
+        assert_eq!(train.len() as u64, heldout["train_count"].as_u64().unwrap());
+        assert_eq!(
+            train_tunnel as u64,
+            heldout["train_tunnel_count"].as_u64().unwrap()
+        );
+        let majority_tunnel = train_tunnel * 2 >= train.len();
+        let shipped = heldout["rows"].as_array().unwrap();
+        let test_rows: Vec<&serde_json::Value> = rows
+            .iter()
+            .filter(|row| row["partition"].as_str() == Some("test"))
+            .collect();
+        assert_eq!(test_rows.len(), shipped.len());
+        let mut masks = std::collections::BTreeSet::new();
+        let mut true_tunnel = 0usize;
+        let mut benign = 0usize;
+        let mut false_tunnel = 0usize;
+        let mut tunnel_rows = 0usize;
+        for row in &test_rows {
+            assert_eq!(row["stride"].as_u64(), Some(24));
+            masks.insert(row["mask_id"].as_str().unwrap().to_string());
+            let matched = shipped.iter().find(|item| {
+                item["capture_id"] == row["capture_id"]
+                    && item["role"] == row["role"]
+                    && item["variant"] == row["variant"]
+                    && item["start"] == row["start"]
+            });
+            let matched = matched.expect("heldout row missing");
+            let features = feature_row(&row["x"]);
+            assert_eq!(features, feature_row(&matched["x"]));
+            let reported = matched["p"].as_f64().unwrap() as f32;
+            let got = tunnel_probability(&features);
+            assert!(
+                (got - reported).abs() <= 1e-4,
+                "{} got {got} reported {reported}",
+                row["capture_id"]
+            );
+            assert_eq!(got > gate.threshold(), reported > gate.threshold());
+            let pred = got > gate.threshold();
+            let is_tunnel = row["y"].as_i64().unwrap() == 1;
+            if is_tunnel {
+                tunnel_rows += 1;
+                if pred {
+                    true_tunnel += 1;
+                }
+            } else {
+                benign += 1;
+                if pred {
+                    false_tunnel += 1;
+                }
+            }
+        }
+        assert_eq!(
+            masks.len(),
+            10,
+            "every family must appear in the test capture"
+        );
+        assert!(
+            validation_beats_constant(
+                true_tunnel,
+                false_tunnel,
+                tunnel_rows - true_tunnel,
+                benign - false_tunnel,
+                majority_tunnel
+            ),
+            "balanced accuracy does not beat constant by {MATERIAL}"
+        );
+    }
+
+    #[test]
+    fn fresh_control_keeps_all_families_and_capture_predictions_after_freeze() {
+        use sha2::{Digest, Sha256};
+        let fixtures: serde_json::Value =
+            serde_json::from_str(include_str!("../../../assets/dpi/heldout_fixtures.json"))
+                .unwrap();
+        let final_control = &fixtures["final_control"];
+        assert_eq!(final_control["training_use"], false);
+        assert_eq!(final_control["evaluated_after_model_freeze"], true);
+        assert_eq!(
+            final_control["feature_schema_version"],
+            FEATURE_SCHEMA_VERSION
+        );
+        assert_eq!(
+            final_control["model_sha256"],
+            format!("{:x}", Sha256::digest(include_bytes!("dpi_gate/model.rs")))
+        );
+        let mut families = std::collections::BTreeSet::new();
+        let mut captures = std::collections::BTreeSet::new();
+        let mut positive = 0;
+        let mut negative = 0;
+        for row in final_control["rows"].as_array().unwrap() {
+            families.insert(row["mask_id"].as_str().unwrap());
+            captures.insert(row["capture_id"].as_str().unwrap());
+            let probability = tunnel_probability(&feature_row(&row["x"]));
+            assert!((probability - row["p"].as_f64().unwrap() as f32).abs() < 1e-5);
+            let expected = row["y"].as_i64().unwrap() == 1;
+            assert_eq!(probability > 0.5, expected, "{}", row["capture_id"]);
+            if expected {
+                negative += 1;
+            } else {
+                positive += 1;
+            }
+        }
+        assert_eq!(families.len(), 10);
+        assert_eq!(captures.len(), 42);
+        assert_eq!(
+            positive,
+            final_control["metrics"]["raw"]["tn"].as_u64().unwrap()
+        );
+        assert_eq!(
+            negative,
+            final_control["metrics"]["raw"]["tp"].as_u64().unwrap()
+        );
+        assert!(validation_beats_constant(
+            negative as usize,
+            0,
+            0,
+            positive as usize,
+            false
+        ));
     }
 
     /// Ring buffers to WINDOW and only judges once full.
@@ -703,7 +963,11 @@ mod tests {
             "under-full window must abstain"
         );
         gate.record_wire(sid, &stun_pkt(56, 76));
-        assert!(gate.verdict(&sid).is_some(), "full window must judge");
+        let verdict = gate.verdict(&sid).expect("full window must judge");
+        assert_eq!(
+            verdict.reads_as_tunnel,
+            verdict.tunnel_prob > gate.threshold()
+        );
         gate.cleanup(&sid);
         assert!(gate.verdict(&sid).is_none());
     }
@@ -718,111 +982,82 @@ mod tests {
         );
     }
 
-    /// The model const table loads and the known reference vectors round-trip
-    /// through the public client entry points (mirrors the server separation
-    /// test but via the exact API the client self-gate uses).
     #[cfg(feature = "client-dpi-gate")]
-    #[test]
-    fn client_gate_model_loads_and_separates() {
-        // Same masked-STUN (benign) and broken (tunnel) vectors as above.
-        let stun: [f32; model::N_FEATURES] = [
-            24.0, 600.5, 455.659_24, 107.0, 1358.0, 556.0, 109.0, 1342.0, 0.0, 0.375, 0.25, 0.125,
-            0.25, 0.0, 3.906_25, 7.315_663, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 0.0,
-        ];
-        let broken: [f32; model::N_FEATURES] = [
-            24.0,
-            630.125,
-            456.920_52,
-            130.0,
-            1380.0,
-            595.0,
-            153.0,
-            1380.0,
-            0.0,
-            0.333_333_34,
-            0.208_333_34,
-            0.166_666_67,
-            0.291_666_67,
-            0.0,
-            3.681_986,
-            7.382_86,
-            144.458_34,
-            0.583_333_34,
-            0.375,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-        ];
-        assert!(tunnel_probability(&stun) < 0.1);
-        assert!(tunnel_probability(&broken) > 0.9);
+    fn heldout_side(above: bool) -> [f32; model::N_FEATURES] {
+        let heldout: serde_json::Value =
+            serde_json::from_str(include_str!("../../../assets/dpi/heldout_fixtures.json"))
+                .unwrap();
+        let row = heldout["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| (row["p"].as_f64().unwrap() > 0.5) == above)
+            .expect("heldout has no window on this side of 0.5");
+        feature_row(&row["x"])
     }
 
-    /// The client self-gate raises a `MaskPreference` rotate-request when its own
-    /// outbound flow reads as a tunnel, and stays silent on a benign flow. Uses
-    /// stride/cooldown = 1 so a single filled window fires immediately.
+    /// A shipped below-threshold window stays quiet. A shipped above-threshold
+    /// window raises one rotate request and then honors the cooldown.
     #[cfg(feature = "client-dpi-gate")]
     #[test]
-    fn client_self_gate_raises_on_tunnel_flow() {
+    fn client_self_gate_follows_shipped_window() {
         use crate::protocol::ControlPayload;
-        use crate::upload_pipeline::OutboundInspector;
 
-        // Benign flow: well-formed STUN packets — must never raise.
-        let mut benign = ClientSelfGate::new(0.5, "quic-web")
-            .with_stride(1)
-            .with_cooldown_windows(1);
-        let mut raised = false;
-        for _ in 0..(WINDOW * 3) {
-            if benign.observe(&stun_pkt(56, 76)).is_some() {
-                raised = true;
-            }
+        let below = heldout_side(false);
+        let mut quiet = ClientSelfGate::new(0.5, "quic-web").with_cooldown_windows(1);
+        for _ in 0..4 {
+            assert!(quiet.observe_features(&below).is_none());
         }
-        assert!(!raised, "benign STUN flow must not raise a rotate-request");
 
-        // Tunnel-like flow: high-entropy random datagrams with tunnel-shaped
-        // sizes — must raise a MaskPreference for the configured base mask.
-        let mut tun = ClientSelfGate::new(0.5, "quic-web")
-            .with_stride(1)
-            .with_cooldown_windows(4);
-        let mut got: Option<ControlPayload> = None;
-        for i in 0..(WINDOW * 2) {
-            // Alternate large tunnel datagrams (as in model_separates_* broken).
-            let pkt = rnd_pkt(1200 + (i % 3) * 60, i * 7 + 1);
-            if let Some(p) = tun.observe(&pkt) {
-                got = Some(p);
-                break;
-            }
-        }
-        match got {
+        let above = heldout_side(true);
+        let mut gate = ClientSelfGate::new(0.5, "quic-web").with_cooldown_windows(4);
+        match gate.observe_features(&above) {
             Some(ControlPayload::MaskPreference { base_mask_id }) => {
                 assert_eq!(base_mask_id, "quic-web");
             }
-            other => panic!("expected a MaskPreference rotate-request, got {other:?}"),
+            other => panic!("expected a rotate request, got {other:?}"),
+        }
+        for _ in 0..4 {
+            assert!(gate.observe_features(&above).is_none());
+        }
+        assert!(gate.observe_features(&above).is_some());
+    }
+
+    #[cfg(feature = "client-dpi-gate")]
+    #[test]
+    fn client_evaluates_the_first_complete_sampled_window() {
+        let mut client = ClientSelfGate::new(0.0, "base").with_cooldown_windows(0);
+        let server = DpiGate::new(0.0);
+        for index in 0..(WINDOW * ClientSelfGate::DEFAULT_STRIDE as usize) {
+            let packet = rnd_pkt(1200, index + 1);
+            if index % ClientSelfGate::DEFAULT_STRIDE as usize == 0 {
+                server.record_wire(ClientSelfGate::SELF_SESSION, &packet);
+            }
+            let verdict = client.observe_wire(&packet);
+            if index == (WINDOW - 1) * ClientSelfGate::DEFAULT_STRIDE as usize {
+                assert_eq!(
+                    verdict,
+                    Some(
+                        server
+                            .verdict(&ClientSelfGate::SELF_SESSION)
+                            .unwrap()
+                            .tunnel_prob
+                    )
+                );
+            } else {
+                assert!(verdict.is_none());
+            }
         }
     }
 
-    /// Under-full window abstains, and the cooldown suppresses repeated requests
-    /// after the first fire.
+    /// Fewer than WINDOW sampled packets never raises, whatever the model
+    /// would say about a full window of those bytes.
     #[cfg(feature = "client-dpi-gate")]
     #[test]
-    fn client_self_gate_window_and_cooldown() {
-        let mut g = ClientSelfGate::new(0.5, "base").with_stride(1);
-        // Fewer than WINDOW samples: verdict ring not full -> never raises.
+    fn client_self_gate_abstains_before_full_window() {
+        let mut gate = ClientSelfGate::new(0.5, "base").with_stride(1);
         for _ in 0..(WINDOW - 1) {
-            assert!(g.observe_wire(&rnd_pkt(1200, 5)).is_none());
+            assert!(gate.observe_wire(&rnd_pkt(1200, 5)).is_none());
         }
-        // First full window on a tunnel flow raises; the next several evaluated
-        // windows are suppressed by the cooldown even though the flow is
-        // unchanged.
-        let mut fires = 0usize;
-        for i in 0..(WINDOW * 4) {
-            if g.observe_wire(&rnd_pkt(1200, i + 9)).is_some() {
-                fires += 1;
-            }
-        }
-        assert!(
-            fires >= 1,
-            "a sustained tunnel flow must raise at least once"
-        );
     }
 }

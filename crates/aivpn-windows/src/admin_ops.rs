@@ -62,7 +62,7 @@ impl super::AivpnApp {
                         self.admin_add_busy = false;
                     }
                     match result {
-                        Ok(_) => {
+                        Ok((_, warning)) => {
                             if editing {
                                 self.admin_edit_id = None;
                                 self.admin_edit_error = None;
@@ -71,6 +71,9 @@ impl super::AivpnApp {
                                 self.admin_add_error = None;
                             }
                             self.refresh_admin_clients();
+                            if let Some(warning) = warning {
+                                self.show_error(warning);
+                            }
                         }
                         Err(e) => {
                             if editing {
@@ -622,6 +625,10 @@ impl super::AivpnApp {
     /// (and its cached role/clients/dialogs) belongs to that one session
     /// only, never carries over to the next connect.
     pub(crate) fn reset_admin_state(&mut self) {
+        // Ответы фоновых запросов завершенной сессии остаются в старом канале.
+        let (sender, receiver) = std::sync::mpsc::channel();
+        self.admin_tx = sender;
+        self.admin_rx = receiver;
         self.admin_role = None;
         self.admin_clients_loaded = false;
         self.admin_clients.clear();
@@ -670,6 +677,7 @@ impl super::AivpnApp {
         self.admin_settings_mask_confirm_busy = false;
         self.admin_settings_mask_rolled_back = false;
         self.admin_settings_exit_node.clear();
+        self.admin_settings_exit_selected = false;
         self.admin_settings_exit_custom_mode = false;
         self.admin_settings_exit_busy = false;
         self.admin_settings_exit_error = None;

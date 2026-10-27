@@ -4,7 +4,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
 
-pub const DEFAULT_VPN_MTU: u16 = 1346;
+/// Крупные IP-пакеты делятся на фрагменты перед шифрованием и FEC.
+pub const MAX_MASK_TUN_MTU: u16 = 1500;
+/// Минимум IPv6 и безопасное начальное значение для мобильных сетей.
+pub const DEFAULT_VPN_MTU: u16 = 1280;
 pub const DEFAULT_KEEPALIVE_SECS: u8 = 8;
 pub const LEGACY_VPN_PREFIX_LEN: u8 = 24;
 pub const LEGACY_SERVER_VPN_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 1);
@@ -19,6 +22,23 @@ fn default_prefix_len() -> u8 {
 
 fn default_mtu() -> u16 {
     DEFAULT_VPN_MTU
+}
+
+#[cfg(test)]
+mod carrier_mtu_tests {
+    use super::*;
+
+    #[test]
+    fn server_assignment_caps_explicit_mtu_and_preserves_smaller_ipv4_mtu() {
+        for (requested, expected) in [(1500, 1500), (1346, 1346), (1280, 1280), (1200, 1200)] {
+            let network = VpnNetworkConfig {
+                mtu: requested,
+                ..Default::default()
+            };
+            let assignment = network.client_config("10.0.0.2".parse().unwrap()).unwrap();
+            assert_eq!(assignment.mtu, expected);
+        }
+    }
 }
 
 fn default_ipv6_prefix() -> String {
@@ -190,7 +210,7 @@ impl VpnNetworkConfig {
             client_ip,
             server_vpn_ip: self.server_vpn_ip,
             prefix_len: self.prefix_len,
-            mtu: self.mtu,
+            mtu: self.mtu.min(MAX_MASK_TUN_MTU),
             mdh_len: default_mdh_len(),
             keepalive_secs: self.keepalive_secs,
             ipv6_address: self.client_ipv6(client_ip)?.map(|(ip, _)| ip.to_string()),

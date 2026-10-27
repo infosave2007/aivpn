@@ -1,20 +1,8 @@
-//! Neural Resonance Module — Baked Mask Encoder
+//! Статистическая проверка трафика обученным автоэнкодером.
 //!
-//! Implements Signal Reconstruction Resonance (Patent 1) using a lightweight
-//! hand-rolled MLP instead of a full LLM. Each mask's signature_vector is
-//! "baked" into a tiny neural network (64 → 128 → 64) whose weights are
-//! derived deterministically from the mask's 64-float signature.
-//!
-//! Memory per mask: ~66 KB (vs ~400 MB for Qwen-0.5B).
-//! Total for 100 masks: ~6.6 MB — fits any VPS.
-//!
-//! The baked encoder learns the mask's traffic fingerprint:
-//! - Input: 64-dim feature vector extracted from live traffic
-//! - Output: 64-dim reconstruction vector
-//! - MSE(input, output) = reconstruction error = resonance score
-//!
-//! Low MSE → traffic matches the mask → healthy
-//! High MSE → traffic deviates from mask signature → DPI compromise detected
+//! Для эталонных сигнатур загружаются проверяемые веса MLP 64 -> 16 -> 64.
+//! Остальные маски используют детерминированную проекцию и живую калибровку.
+//! MSE показывает отклонение статистики, но не доказывает распознавание DPI.
 
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -35,7 +23,9 @@ use aivpn_common::mask::MaskProfile;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct NeuralConfig {
-    /// Hidden layer size for baked MLP
+    /// Библиотека обученных моделей. Без пути используется встроенный комплект.
+    pub trained_models_file: Option<std::path::PathBuf>,
+    /// Размер скрытого слоя резервной проекции для неизвестных сигнатур.
     pub hidden_size: usize,
 
     /// Resonance check interval (seconds)
@@ -73,31 +63,12 @@ fn default_dpi_gate_threshold() -> f32 {
 impl Default for NeuralConfig {
     fn default() -> Self {
         Self {
+            trained_models_file: None,
             hidden_size: 128,
             check_interval_secs: 30,
-            // Calibrated (night-sprint B1 / Part 6) against the realcap2
-            // real-capture corpora (research/mask-generation/realcap2:
-            // real_webrtc_inner.pcap 3978 pkts → 7 WebRTC_STUN masks,
-            // real_quicbulk_inner.pcap 6720 pkts → 4 QUIC masks) replayed
-            // through every bundled mask's baked encoder exactly as the
-            // gateway feeds it (uplink-only, wire size, ciphertext-level
-            // entropy, real IATs; see examples/neural_calib.rs). Healthy
-            // (uncompromised) traffic measured, 54 385 sliding windows:
-            //   webrtc family: mean 0.1894, p99 0.1977, max 0.2026
-            //   quic   family: mean 0.2486, p99 0.2600, max 0.2608
-            //   overall:       mean 0.2185, p99 0.2598, max 0.2608
-            // A live stand additionally observed healthy WebRTC at ~0.31
-            // (messier windows than the harness), so margins are taken from
-            // that upper anchor, not just the harness p99:
-            //   warning     0.35 = live 0.31 + ~13% (log-only signal)
-            //   compromised 0.50 = live 0.31 + ~61% / harness p99 + ~92%
-            // Cross-family replay (wrong corpus through a mask) lands in the
-            // SAME 0.17–0.25 band as matched traffic — the raw MSE of the
-            // untrained baked encoder is not an absolute discriminator, so
-            // these warm-up defaults exist ONLY to prevent false rotations;
-            // genuine compromise detection is the per-mask adaptive
-            // calibration (mean + 3σ / + 1.5σ) that takes over after
-            // MIN_CALIBRATION_SAMPLES. See calibration_tests below.
+            // Пороги прогрева сохраняют прежнее поведение. После 500 проверок
+            // MSE действует собственная калибровка маски, независимо от того,
+            // использует она обученные веса или детерминированную проекцию.
             compromised_threshold: 0.50,
             warning_threshold: 0.35,
             enable_anomaly_detection: true,
@@ -157,6 +128,20 @@ impl TrafficStats {
             self.inter_arrivals.pop_front();
             self.entropy_samples.pop_front();
         }
+        let elapsed_ms: f64 = self.inter_arrivals.iter().copied().sum();
+        if elapsed_ms.is_finite() && elapsed_ms > 0.0 {
+            self.pps = self.inter_arrivals.len() as f64 * 1000.0 / elapsed_ms;
+            self.bps = self
+                .packet_sizes
+                .iter()
+                .map(|&size| size as f64)
+                .sum::<f64>()
+                * 1000.0
+                / elapsed_ms;
+        } else {
+            self.pps = 0.0;
+            self.bps = 0.0;
+        }
     }
 
     /// Clear stats
@@ -192,6 +177,144 @@ pub struct BakedMaskEncoder {
     w2: Vec<f32>, // [FEAT_DIM × hidden] row-major
     b2: Vec<f32>, // [FEAT_DIM]
     hidden: usize,
+    trained: bool,
+    signature_hash: String,
+}
+
+#[cfg(test)]
+mod trained_reference_tests {
+    use super::*;
+
+    #[test]
+    fn partial_configuration_preserves_runtime_defaults() {
+        let config: NeuralConfig = serde_json::from_str(r#"{"warning_threshold":0.2}"#).unwrap();
+        let default = NeuralConfig::default();
+        assert_eq!(config.warning_threshold, 0.2);
+        assert_eq!(config.hidden_size, default.hidden_size);
+        assert_eq!(config.check_interval_secs, default.check_interval_secs);
+        assert_eq!(config.compromised_threshold, default.compromised_threshold);
+        assert_eq!(
+            config.rotation_cooldown_secs,
+            default.rotation_cooldown_secs
+        );
+        assert!(config.enable_anomaly_detection);
+    }
+
+    #[test]
+    fn invalid_configuration_cannot_spin_or_allocate_unbounded_projection() {
+        for config in [
+            NeuralConfig {
+                hidden_size: 0,
+                ..Default::default()
+            },
+            NeuralConfig {
+                hidden_size: usize::MAX,
+                ..Default::default()
+            },
+            NeuralConfig {
+                check_interval_secs: 0,
+                ..Default::default()
+            },
+            NeuralConfig {
+                warning_threshold: f32::NAN,
+                ..Default::default()
+            },
+            NeuralConfig {
+                compromised_threshold: -0.1,
+                ..Default::default()
+            },
+            NeuralConfig {
+                dpi_gate_threshold: 1.1,
+                ..Default::default()
+            },
+        ] {
+            assert!(NeuralResonanceModule::new(config).is_err());
+        }
+    }
+
+    #[test]
+    fn bundled_models_use_learned_weights_and_generalize_to_held_out_windows() {
+        let library = crate::neural_models::ModelLibrary::load(None).unwrap();
+        let fixtures: serde_json::Value =
+            serde_json::from_str(include_str!("../../../assets/neural/heldout.json")).unwrap();
+        let masks = aivpn_common::mask::preset_masks::all();
+        assert_eq!(library.len(), masks.len());
+        let mut module = NeuralResonanceModule::new(NeuralConfig::default()).unwrap();
+        module.load_model().unwrap();
+        for mask in masks {
+            let family = fixtures["mask_families"][&mask.mask_id].as_str().unwrap();
+            let raw: Vec<Vec<f32>> =
+                serde_json::from_value(fixtures["corpora"][family]["test"].clone()).unwrap();
+            let windows: Vec<[f32; 64]> = raw
+                .into_iter()
+                .map(|window| window.try_into().unwrap())
+                .collect();
+            let trained = library
+                .matching(&mask.mask_id, &mask.signature_vector)
+                .unwrap();
+            module.register_mask(&mask).unwrap();
+            let runtime = module.encoders.get(&mask.mask_id).unwrap();
+            assert!(runtime.is_trained(), "{}", mask.mask_id);
+            for window in windows.iter().take(32) {
+                assert_eq!(
+                    runtime.reconstruction_error(window),
+                    trained.score(window).unwrap()
+                );
+            }
+            let projection = BakedMaskEncoder::from_signature(&mask.signature_vector, 128);
+            let old_mean = windows
+                .iter()
+                .map(|window| projection.reconstruction_error(window))
+                .sum::<f32>()
+                / windows.len() as f32;
+            let learned_mean = trained.mean_score(&windows).unwrap();
+            let mean: Vec<f64> =
+                serde_json::from_value(fixtures["corpora"][family]["train_mean"].clone()).unwrap();
+            assert_eq!(mean.len(), FEAT_DIM);
+            let constant_mean = windows
+                .iter()
+                .map(|window| {
+                    window
+                        .iter()
+                        .zip(&mean)
+                        .map(|(value, mean)| (*value as f64 - mean).powi(2))
+                        .sum::<f64>()
+                        / FEAT_DIM as f64
+                })
+                .sum::<f64>()
+                / windows.len() as f64;
+            assert!(
+                (learned_mean as f64) < constant_mean * 0.9,
+                "{}: learned={learned_mean}, constant={constant_mean}",
+                mask.mask_id
+            );
+            assert!(
+                learned_mean < old_mean * 0.25,
+                "{}: learned={learned_mean}, projection={old_mean}",
+                mask.mask_id
+            );
+            let other = if family == "quic" { "webrtc" } else { "quic" };
+            let raw: Vec<Vec<f32>> =
+                serde_json::from_value(fixtures["corpora"][other]["test"].clone()).unwrap();
+            let foreign: Vec<[f32; 64]> = raw
+                .into_iter()
+                .map(|window| window.try_into().unwrap())
+                .collect();
+            assert!(trained.mean_score(&foreign).unwrap() > learned_mean * 4.0);
+        }
+    }
+
+    #[test]
+    fn changed_signature_does_not_reuse_an_unrelated_trained_model() {
+        let mut mask = aivpn_common::mask::preset_masks::webrtc_zoom_v3();
+        let mut module = NeuralResonanceModule::new(NeuralConfig::default()).unwrap();
+        module.load_model().unwrap();
+        module.ensure_encoder(&mask).unwrap();
+        assert!(module.encoders[&mask.mask_id].is_trained());
+        mask.signature_vector[0] += 0.01;
+        module.ensure_encoder(&mask).unwrap();
+        assert!(!module.encoders[&mask.mask_id].is_trained());
+    }
 }
 
 impl BakedMaskEncoder {
@@ -252,7 +375,26 @@ impl BakedMaskEncoder {
             w2,
             b2,
             hidden,
+            trained: false,
+            signature_hash: blake3::hash(&sig_bytes).to_hex().to_string(),
         }
+    }
+
+    fn from_trained(model: &crate::neural_training::TrainedEncoder) -> Result<Self, String> {
+        model.check_strict().map_err(|error| error.to_string())?;
+        Ok(Self {
+            w1: model.w1.clone(),
+            b1: model.b1.clone(),
+            w2: model.w2.clone(),
+            b2: model.b2.clone(),
+            hidden: model.hidden,
+            trained: true,
+            signature_hash: model.signature_hash.clone(),
+        })
+    }
+
+    pub fn is_trained(&self) -> bool {
+        self.trained
     }
 
     /// Forward pass: x → Linear → ReLU → Linear → output
@@ -673,8 +815,8 @@ pub fn encode_features(stats: &TrafficStats) -> [f32; FEAT_DIM] {
 
 // ── Per-mask MSE Auto-calibration ────────────────────────────────────────────
 
-/// Minimum samples before the adaptive threshold is used instead of the
-/// configured default.  500 packets ≈ a few seconds of typical VPN traffic.
+/// Адаптивный порог включается после 500 проверок MSE для маски.
+/// Это число проверок, а не число пакетов.
 const MIN_CALIBRATION_SAMPLES: u64 = 500;
 
 /// Minimum packet samples in the current window before an MSE is trusted at all
@@ -719,7 +861,7 @@ impl MaskCalibration {
         // adversarial session cannot steer the shared threshold (poisoning).
         if self.count >= MIN_CALIBRATION_SAMPLES {
             let s = self.std_dev();
-            if s > 0.0 && (mse as f64) > self.mean + CALIBRATION_OUTLIER_SIGMA * s {
+            if (mse as f64) > self.mean + CALIBRATION_OUTLIER_SIGMA * s {
                 return;
             }
         }
@@ -767,9 +909,8 @@ const MIN_ANOMALY_REPORTERS: usize = 3;
 pub struct AnomalyDetector {
     mask_packet_loss: HashMap<String, VecDeque<f64>>,
     mask_rtt: HashMap<String, VecDeque<f64>>,
-    /// Distinct reporters (session ids) that submitted an anomalous sample for
-    /// each mask. Gates `is_anomalous` so one client cannot forge a compromise.
-    anomalous_reporters: HashMap<String, HashSet<[u8; 16]>>,
+    /// Источники аномалий в том же окне, что потери и RTT.
+    anomalous_reporters: HashMap<String, VecDeque<Option<[u8; 16]>>>,
     baseline_loss: f64,
     baseline_rtt: f64,
 }
@@ -816,14 +957,14 @@ impl AnomalyDetector {
         // If THIS reporter's own sample looks anomalous, count it toward the
         // distinct-reporter corroboration set (bounded so it can't grow without
         // limit under a flood of spoofed-but-authenticated sessions).
-        if packet_loss > self.baseline_loss * 5.0 || rtt_ms > self.baseline_rtt * 3.0 {
-            let reporters = self
-                .anomalous_reporters
-                .entry(mask_id.to_string())
-                .or_default();
-            if reporters.len() < 256 {
-                reporters.insert(reporter);
-            }
+        let anomalous = packet_loss > self.baseline_loss * 5.0 || rtt_ms > self.baseline_rtt * 3.0;
+        let reporters = self
+            .anomalous_reporters
+            .entry(mask_id.to_string())
+            .or_default();
+        reporters.push_back(anomalous.then_some(reporter));
+        if reporters.len() > 100 {
+            reporters.pop_front();
         }
     }
 
@@ -833,7 +974,7 @@ impl AnomalyDetector {
         let distinct_reporters = self
             .anomalous_reporters
             .get(mask_id)
-            .map(|r| r.len())
+            .map(|r| r.iter().flatten().collect::<HashSet<_>>().len())
             .unwrap_or(0);
         if distinct_reporters < MIN_ANOMALY_REPORTERS {
             return false;
@@ -871,11 +1012,11 @@ impl AnomalyDetector {
 
 /// Neural Resonance Module
 ///
-/// Uses Baked Mask Encoders instead of an external LLM.
-/// Each mask's signature_vector is baked into a tiny MLP (~66KB).
-/// Total memory: O(num_masks * 66KB) — fits any VPS.
+/// Загружает обученные эталоны по сигнатурам. Для остальных масок создает
+/// проекции с живой калибровкой. Число динамических проекций ограничено.
 pub struct NeuralResonanceModule {
     config: NeuralConfig,
+    reference_models: crate::neural_models::ModelLibrary,
 
     /// Baked encoders per mask (mask_id -> encoder)
     encoders: HashMap<String, BakedMaskEncoder>,
@@ -939,8 +1080,25 @@ pub enum ResonanceStatus {
 impl NeuralResonanceModule {
     /// Create new neural module
     pub fn new(config: NeuralConfig) -> Result<Self, String> {
+        if config.hidden_size == 0 || config.hidden_size > 1024 {
+            return Err(
+                "Скрытый слой нейронной проекции должен содержать от 1 до 1024 элементов".into(),
+            );
+        }
+        if config.check_interval_secs == 0 {
+            return Err("Интервал нейронной проверки должен быть больше нуля".into());
+        }
+        if [config.warning_threshold, config.compromised_threshold]
+            .iter()
+            .any(|value| !value.is_finite() || *value < 0.0)
+            || !config.dpi_gate_threshold.is_finite()
+            || !(0.0..=1.0).contains(&config.dpi_gate_threshold)
+        {
+            return Err("Недопустимые пороги нейронной проверки".into());
+        }
         Ok(Self {
             config,
+            reference_models: Default::default(),
             encoders: HashMap::new(),
             session_stats: dashmap::DashMap::new(),
             anomaly_detector: AnomalyDetector::new(),
@@ -951,11 +1109,14 @@ impl NeuralResonanceModule {
         })
     }
 
-    /// Load model (marks as ready — no external model files needed)
+    /// Загружает встроенные эталоны либо библиотеку из конфигурации.
     pub fn load_model(&mut self) -> Result<(), String> {
+        self.reference_models =
+            crate::neural_models::ModelLibrary::load(self.config.trained_models_file.as_deref())?;
         self.loaded = true;
         info!(
-            "Baked Mask Encoder ready (hidden={}, ~{}KB per mask)",
+            "Neural encoder ready (trained models={}, fallback hidden={}, ~{}KB per fallback)",
+            self.reference_models.len(),
             self.config.hidden_size,
             (FEAT_DIM * self.config.hidden_size * 2 + self.config.hidden_size + FEAT_DIM) * 4
                 / 1024
@@ -969,16 +1130,36 @@ impl NeuralResonanceModule {
         self.encoders.contains_key(mask_id)
     }
 
+    #[cfg(test)]
+    pub(crate) fn has_trained_encoder(&self, mask_id: &str) -> bool {
+        self.encoders
+            .get(mask_id)
+            .is_some_and(BakedMaskEncoder::is_trained)
+    }
+
     /// Bake an encoder for `mask` only if one is not already registered. Used by
     /// the resonance loop to cover per-session bootstrap/polymorphic masks whose
     /// dynamically-derived `mask_id` is not among the static mask-dir encoders
     /// baked at startup — without which the neural check is inert for any session
     /// on such a mask (i.e. the common case).
     pub fn ensure_encoder(&mut self, mask: &MaskProfile) -> Result<(), String> {
-        if self.encoders.contains_key(&mask.mask_id) {
+        let signature_hash = crate::neural_training::signature_hash_hex(&mask.signature_vector)
+            .map_err(|error| error.to_string())?;
+        if self
+            .encoders
+            .get(&mask.mask_id)
+            .is_some_and(|encoder| encoder.signature_hash == signature_hash)
+        {
             return Ok(());
         }
+        let replacing = self.encoders.contains_key(&mask.mask_id);
         self.register_mask(mask)?;
+        if replacing {
+            self.mask_calibration.remove(&mask.mask_id);
+            self.last_rotation_time.remove(&mask.mask_id);
+            self.anomaly_detector.clear_mask(&mask.mask_id);
+            return Ok(());
+        }
         // Track this on-demand encoder and evict the oldest ones past the cap so
         // session-unique dynamic mask_ids can't grow memory without bound. Static
         // catalog encoders never enter this deque, so they are never evicted.
@@ -988,6 +1169,7 @@ impl NeuralResonanceModule {
                 self.encoders.remove(&old);
                 self.mask_calibration.remove(&old);
                 self.last_rotation_time.remove(&old);
+                self.anomaly_detector.clear_mask(&old);
             }
         }
         Ok(())
@@ -1002,12 +1184,19 @@ impl NeuralResonanceModule {
                 FEAT_DIM
             ));
         }
-        let encoder =
-            BakedMaskEncoder::from_signature(&mask.signature_vector, self.config.hidden_size);
+        let encoder = if let Some(model) = self
+            .reference_models
+            .matching(&mask.mask_id, &mask.signature_vector)
+        {
+            BakedMaskEncoder::from_trained(model)?
+        } else {
+            BakedMaskEncoder::from_signature(&mask.signature_vector, self.config.hidden_size)
+        };
         debug!(
-            "Baked encoder for mask '{}' ({} bytes)",
+            "Encoder for mask '{}' ({} bytes, trained={})",
             mask.mask_id,
-            encoder.memory_bytes()
+            encoder.memory_bytes(),
+            encoder.is_trained()
         );
         self.encoders.insert(mask.mask_id.clone(), encoder);
         Ok(())
@@ -1082,6 +1271,9 @@ impl NeuralResonanceModule {
 
         let features = encode_features(&stats);
         let mse = encoder.reconstruction_error(&features);
+        if !mse.is_finite() {
+            return Err("Неконечная ошибка реконструкции модели".into());
+        }
 
         // Update per-mask calibration and log when it first completes.
         {
@@ -1202,6 +1394,22 @@ mod calibration_tests {
     use super::*;
     use std::path::{Path, PathBuf};
 
+    #[test]
+    fn constant_baseline_rejects_outliers_without_becoming_desensitized() {
+        let mut calibration = MaskCalibration::default();
+        for _ in 0..MIN_CALIBRATION_SAMPLES {
+            calibration.update(0.25);
+        }
+        assert_eq!(calibration.std_dev(), 0.0);
+        let thresholds = calibration.adaptive_thresholds();
+        calibration.update(2.0);
+        assert_eq!(calibration.count, MIN_CALIBRATION_SAMPLES);
+        assert_eq!(calibration.adaptive_thresholds(), thresholds);
+        calibration.update(0.25);
+        assert_eq!(calibration.count, MIN_CALIBRATION_SAMPLES + 1);
+        assert_eq!(calibration.adaptive_thresholds(), thresholds);
+    }
+
     /// Minimal libpcap reader → (orig_len, ts_ns) per record. Supports the
     /// classic µs and ns magics in either byte order (realcap2 files are
     /// LE-µs, linktype 101 = RAW IP, so orig_len is the inner IP size).
@@ -1302,7 +1510,10 @@ mod calibration_tests {
                 serde_json::from_str(&std::fs::read_to_string(&path).expect("read mask"))
                     .expect("parse bundled mask");
             let corpus = match mask.spoof_protocol {
-                aivpn_common::mask::SpoofProtocol::WebRTC_STUN => &webrtc,
+                aivpn_common::mask::SpoofProtocol::WebRTC_STUN
+                | aivpn_common::mask::SpoofProtocol::WebRTC_DTLS_SRTP
+                | aivpn_common::mask::SpoofProtocol::WebRTC_TURN_DTLS_SRTP
+                | aivpn_common::mask::SpoofProtocol::WebRTC_SDES_SRTP => &webrtc,
                 aivpn_common::mask::SpoofProtocol::QUIC => &quic,
                 _ => continue,
             };
@@ -1365,6 +1576,30 @@ mod calibration_tests {
 #[cfg(test)]
 mod anomaly_tests {
     use super::AnomalyDetector;
+
+    #[test]
+    fn expired_reporters_do_not_corroborate_a_single_current_reporter() {
+        let mut detector = AnomalyDetector::new();
+        for reporter in 0..3 {
+            detector.record_metrics("m", [reporter; 16], 0.9, 500.0);
+        }
+        for _ in 0..100 {
+            detector.record_metrics("m", [4; 16], 0.9, 500.0);
+        }
+        assert!(!detector.is_anomalous("m"));
+    }
+
+    #[test]
+    fn sampled_traffic_updates_rate_features() {
+        let mut stats = super::TrafficStats::new();
+        for _ in 0..300 {
+            stats.add_packet(1000, 10.0, 7.0, true);
+        }
+        assert_eq!(stats.pps, 100.0);
+        assert_eq!(stats.bps, 100_000.0);
+        stats.clear();
+        assert_eq!((stats.pps, stats.bps), (0.0, 0.0));
+    }
 
     #[test]
     fn single_reporter_cannot_forge_anomaly() {

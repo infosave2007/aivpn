@@ -52,7 +52,7 @@ object ConnectionKeyParser {
             val serverVpnIp = networkConfig?.optString("server_vpn_ip")?.takeUnless { it.isNullOrBlank() }
                 ?: "10.0.0.1"
             val prefixLen = networkConfig?.optInt("prefix_len", 24) ?: 24
-            val mtu = networkConfig?.optInt("mtu", 1346) ?: 1346
+            val mtu = networkConfig?.optInt("mtu", TunnelMtu.DEFAULT) ?: TunnelMtu.DEFAULT
 
             if (!isValidIpv4(vpnIp) || !isValidIpv4(serverVpnIp) || prefixLen !in 1..30 || mtu !in 576..1500) {
                 return null

@@ -1,0 +1,11 @@
+# Зафиксированный набор для обучения GBDT-гейта.
+# Другая сборка scikit-learn иначе разрывает совпадающие пороги деревьев,
+# и встроенная таблица перестает совпадать с этим экспортом.
+# Ставить только в отдельное окружение, не в системный Python:
+#   python3 -m venv /tmp/aivpn-dpi-venv
+#   /tmp/aivpn-dpi-venv/bin/pip install -r tools/dpi/requirements.txt
+scikit-learn==1.9.0
+numpy==2.5.1
+scipy==1.18.0
+joblib==1.5.3
+threadpoolctl==3.6.0

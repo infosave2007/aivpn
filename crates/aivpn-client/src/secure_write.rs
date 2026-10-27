@@ -1,7 +1,36 @@
 //! Атомарная запись файлов состояния без перехода по символическим ссылкам.
 
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::Path;
+
+/// Кеш не должен блокировать поток на FIFO или выделять память по размеру файла.
+pub fn read_state_file(path: &Path, max_bytes: u64) -> std::io::Result<Vec<u8>> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = options.open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.len() > max_bytes {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Некорректный файл состояния",
+        ));
+    }
+    let mut bytes = Vec::new();
+    file.take(max_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > max_bytes {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Файл состояния превышает лимит",
+        ));
+    }
+    Ok(bytes)
+}
 
 /// Ошибка записи оставляет предыдущий снимок состояния доступным читателям.
 pub fn write_status_best_effort(path: &Path, bytes: &[u8]) -> bool {
@@ -28,6 +57,27 @@ pub fn write_status_best_effort(path: &Path, bytes: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn reads_only_bounded_regular_state_files() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir =
+            std::env::temp_dir().join(format!("aivpn-state-read-{:032x}", rand::random::<u128>()));
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("state");
+        std::fs::write(&path, b"state").unwrap();
+        assert_eq!(read_state_file(&path, 5).unwrap(), b"state");
+        assert!(read_state_file(&path, 4).is_err());
+        let link = dir.join("link");
+        std::os::unix::fs::symlink(&path, &link).unwrap();
+        assert!(read_state_file(&link, 5).is_err());
+        let fifo = dir.join("fifo");
+        let name = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        assert!(read_state_file(&fifo, 5).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn concurrent_writers_publish_complete_snapshots() {

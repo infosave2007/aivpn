@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Подписи вторичных экранов. Общий strings.xml не меняется. -->
+<resources>
+    <string name="secondary_add">Add</string>
+    <string name="secondary_delete">Delete</string>
+    <string name="secondary_search">Search</string>
+
+    <string name="secondary_bg_intro">These settings decide whether the VPN keeps running while the app is in the background. Fix every amber item so the tunnel is not stopped.</string>
+    <string name="secondary_bg_summary_protected">Background is ready: the required system permissions are on</string>
+    <string name="secondary_bg_summary_mostly">Almost ready: turn on Block connections without VPN so traffic cannot bypass the tunnel</string>
+    <string name="secondary_bg_summary_at_risk">Needs setup: the system can stop the VPN while the app is in the background</string>
+    <string name="secondary_bg_notifications_ok">On: the VPN stopped alert will be shown</string>
+    <string name="secondary_bg_notifications_bad">Off: VPN stop and security alerts are not shown</string>
+    <string name="secondary_bg_battery_ok">Exempt: sleep mode does not stop the VPN service</string>
+    <string name="secondary_bg_battery_bad">Not exempt: the VPN service often stops in the background. Tap Fix and choose Allow.</string>
+    <string name="secondary_bg_bg_ok">Not restricted</string>
+    <string name="secondary_bg_bg_bad">Restricted: the system will stop the VPN soon after you leave the app. Remove the restriction in App info, then Battery.</string>
+    <string name="secondary_bg_always_on_ok">On: the system starts the VPN again by itself</string>
+    <string name="secondary_bg_always_on_off">Off: turn on always-on VPN for AIVPN in system VPN settings, the gear next to AIVPN</string>
+    <string name="secondary_bg_lockdown_ok">On: if the tunnel stops, the system does not let traffic bypass the VPN</string>
+    <string name="secondary_bg_lockdown_off">Off: if the tunnel stops, traffic goes out directly. This system switch blocks that bypass.</string>
+    <string name="secondary_bg_unknown">This cannot be checked until the VPN service is running. Open the system VPN settings.</string>
+    <string name="secondary_bg_oem_desc">This manufacturer firmware may also require autostart or removing AIVPN from sleeping apps. That screen may not exist on this device.</string>
+    <string name="secondary_bg_oem_generic">Some devices also need AIVPN autostart in the manufacturer battery or security app.</string>
+    <string name="admin_created_exit_failed">Client created, but the exit node was not assigned. Select it in the client settings.</string>
+</resources>

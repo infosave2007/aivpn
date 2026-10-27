@@ -265,13 +265,8 @@ class SplitTunnelActivity : AppCompatActivity() {
             } else false
         }
 
-        // Domain exclusions require API 33 (Android 13) for addRoute(IpPrefix, excluded).
-        // On older devices, saved domains are stored but not applied to VPN routing.
-        if (android.os.Build.VERSION.SDK_INT < android.os.Build.VERSION_CODES.TIRAMISU) {
-            binding.textDomainNote.visibility = android.view.View.VISIBLE
-        } else {
-            binding.textDomainNote.visibility = android.view.View.GONE
-        }
+        binding.textDomainNote.visibility = android.view.View.VISIBLE
+
     }
 
     private fun addDomain() {
@@ -296,6 +291,10 @@ class SplitTunnelActivity : AppCompatActivity() {
             return
         }
 
+        if (excludedDomains.size >= 64) {
+            Toast.makeText(this, getString(R.string.split_tunnel_domain_limit), Toast.LENGTH_LONG).show()
+            return
+        }
         excludedDomains.add(0, raw)
         saveDomains()
         domainAdapter.notifyDataSetChanged()

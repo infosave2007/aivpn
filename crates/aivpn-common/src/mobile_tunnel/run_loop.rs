@@ -10,12 +10,11 @@
 use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::os::fd::OwnedFd;
-use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::os::unix::io::{FromRawFd, RawFd};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use tokio::io::unix::AsyncFd;
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time;
@@ -37,9 +36,97 @@ use crate::upload_pipeline::{self, UploadConfig};
 use super::encryptor::{MobileEncryptor, RekeyAckQueue, RekeyResendSlot};
 use super::io::{
     create_stop_signal, create_udp_socket, tun_async_read, tun_async_write, wait_for_stop,
+    SessionTun,
 };
 use super::platform::{PlatformIo, RecordingFeedback};
 use super::state::*;
+
+fn mobile_tx_fec_group(
+    feedback: &mut crate::quality::PeerReceiverFeedback,
+    report: Option<(u64, u32)>,
+    level: AdaptiveLevel,
+    now: Instant,
+) -> u8 {
+    if let Some((counter, loss_ppm)) = report {
+        if feedback.record(counter, loss_ppm, now) {
+            log::debug!(target: "aivpn::receiver_feedback", "Принят отчет приемника counter={} loss_ppm={} fec_group={}", counter, loss_ppm.min(1_000_000), feedback.fec_group(level, now));
+        }
+    }
+    feedback.fec_group(level, now)
+}
+
+fn refresh_mobile_tx_fec(
+    group: &AtomicU8,
+    feedback: &mut crate::quality::PeerReceiverFeedback,
+    report: Option<(u64, u32)>,
+    level: AdaptiveLevel,
+    now: Instant,
+) {
+    let selected = mobile_tx_fec_group(feedback, report, level, now);
+    let previous = group.load(Ordering::Relaxed);
+    if previous != selected {
+        group.store(selected, Ordering::Relaxed);
+        log::info!(target: "aivpn::receiver_feedback", "Изменена группа TX FEC previous={} fec_group={}", previous, selected);
+    }
+}
+
+fn decode_transition_downlink(
+    packet: &[u8],
+    keys: &SessionKeys,
+    transition_window: &mut RecvWindow,
+    primary_window: &mut RecvWindow,
+    mdh_lengths: &mut Vec<usize>,
+    tag_offsets: &[u16],
+    inline_rekey_staged: bool,
+) -> Result<crate::client_wire::DecodedPacket> {
+    let decoded =
+        decode_downlink_with_offsets(packet, keys, transition_window, mdh_lengths, tag_offsets)?;
+    if inline_rekey_staged {
+        primary_window.observe_authenticated_counter(decoded.counter);
+    }
+    Ok(decoded)
+}
+
+fn finish_rekey_transition(
+    transition_keys: &mut Option<SessionKeys>,
+    transition_window: &mut RecvWindow,
+    pending_upload_keys: &mut Option<SessionKeys>,
+    key_rotate_slot: &Mutex<Option<SessionKeys>>,
+) {
+    *transition_keys = None;
+    transition_window.reset();
+    if let Some(staged) = pending_upload_keys.take() {
+        *key_rotate_slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(staged);
+        log::info!("aivpn: переход rekey завершен, staged upload keys активированы");
+    }
+}
+
+/// Не дает серверному интервалу пережить таймаут QUIC или NAT.
+fn mobile_keepalive_interval(level: AdaptiveLevel, requested: Duration) -> Duration {
+    let requested = if level == AdaptiveLevel::Off {
+        requested
+    } else {
+        requested.min(Duration::from_secs(level.keepalive_secs()))
+    };
+    requested.min(KEEPALIVE_NAT_CAP)
+}
+
+fn resolve_direct_destination<P: PlatformIo>(
+    platform: &P,
+    host: &str,
+    port: u16,
+) -> impl std::future::Future<Output = Result<SocketAddr>> + Send + 'static {
+    let endpoint = format!("{host}:{port}");
+    let lookup = platform.resolve_host(host.to_owned(), port);
+    async move {
+        let mut addresses: Vec<_> = tokio::time::timeout(Duration::from_secs(5), lookup)
+            .await
+            .map_err(|_| Error::Session("DNS lookup timeout (5 s)".into()))??;
+        addresses.sort_by_key(|address| address.is_ipv6());
+        crate::dns_candidates::select(&endpoint, addresses)
+            .ok_or_else(|| Error::Session("Cannot resolve server host".into()))
+    }
+}
 
 /// Все фоновые задачи принадлежат одной попытке соединения.
 #[derive(Default)]
@@ -57,6 +144,18 @@ impl Drop for TunnelTasks {
             task.abort();
         }
     }
+}
+
+/// Закрытие TUN не зависит от того, когда runtime обработает отмену задач.
+async fn stop_data_plane(
+    tun: &SessionTun,
+    reader: &mut tokio::task::JoinHandle<()>,
+    sender: &mut tokio::task::JoinHandle<()>,
+) {
+    tun.close();
+    reader.abort();
+    sender.abort();
+    let _ = tokio::join!(reader, sender);
 }
 
 fn identity_reannouncements(
@@ -153,6 +252,7 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
     // path byte-for-byte unchanged.
     alt_transport: Option<Arc<dyn crate::transport::DatagramTransport>>,
 ) -> Result<()> {
+    let upload_shaping = platform.upload_shaping()?;
     if let Err(msg) = crate::mask::protected_build_requires_keys(
         server_signing_key.is_some(),
         mask_operator_pubkey.is_some(),
@@ -225,6 +325,7 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
             // fresh, and let stale streaks trip the fallback/abandon logic.
             *LAST_GOOD_MASK.lock().unwrap_or_else(|e| e.into_inner()) = None;
             DATA_STALL_STREAK.store(0, Ordering::Relaxed);
+            DATA_EXPLORATION_ROUND.store(0, Ordering::Relaxed);
             HANDSHAKE_FAIL_STREAK.store(0, Ordering::Relaxed);
             // The descriptor verdict is server-scoped for exactly the same
             // reason. It is sticky for the whole PROCESS by design (the server
@@ -259,30 +360,27 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
     let handshake_fail_streak = HANDSHAKE_FAIL_STREAK.load(Ordering::Relaxed);
 
     // ── 1. Ephemeral keypair + initial session keys ──
-    let mut keypair = KeyPair::generate();
-    let mut dh = keypair.compute_shared(&server_key)?;
+    let keypair = KeyPair::generate();
+    let dh = keypair.compute_shared(&server_key)?;
     let mut keys = derive_initial_session_keys(&dh, psk.as_ref(), &keypair.public_key_bytes());
 
     // ── 2. Create stop signal immediately — before DNS — so a disconnect press
     //    during a slow/hung cellular DNS is handled instantly, not after a 5 s wait.
     let stop_signal = create_stop_signal(&session)?;
 
-    // Resolve host; race against stop signal so disconnect is always responsive.
+    // Прямой адрес нужен только UDP; альтернативный транспорт выбирает маршрут сам.
     let dest_host = server_host.trim_start_matches('[').trim_end_matches(']');
-    let dest: SocketAddr = tokio::select! {
-        biased;
-        _ = wait_for_stop(&stop_signal) => {
-            return Ok(());
-        }
-        result = tokio::time::timeout(
-            Duration::from_secs(5),
-            tokio::net::lookup_host((dest_host, server_port)),
-        ) => {
-            result
-                .map_err(|_| Error::Session("DNS lookup timeout (5 s)".into()))?
-                .map_err(Error::Io)?
-                .min_by_key(|address| address.is_ipv6())
-                .ok_or_else(|| Error::Session("Cannot resolve server host".into()))?
+    let dns_endpoint = format!("{dest_host}:{server_port}");
+    let direct_udp = alt_transport.is_none();
+    let dest: SocketAddr = if alt_transport.is_some() {
+        crate::transport::logical_peer_addr(dest_host, server_port)
+    } else {
+        tokio::select! {
+            biased;
+            _ = wait_for_stop(&stop_signal) => {
+                return Ok(());
+            }
+            result = resolve_direct_destination(&platform, dest_host, server_port) => result?,
         }
     };
 
@@ -290,52 +388,27 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
         return Ok(());
     }
 
-    // Exempt the socket from the VPN before any traffic flows: Android calls
-    // VpnService.protect(int) through JNI, iOS is a no-op. On failure the fd
-    // is closed by create_udp_socket itself.
-    let raw_udp_fd = create_udp_socket(dest, &session, &|fd| platform.protect_socket(fd))?;
-    // Own the UDP fd immediately so the dup/fcntl/AsyncFd failure paths below
-    // (each an early `return Err`) close it via Drop instead of leaking one fd
-    // per attempt in a tight reconnect loop (LOW-1). Consumed by `UdpSocket::from`
-    // once all fallible setup has succeeded.
-    // SAFETY: create_udp_socket returns a fresh, exclusively-owned fd.
-    let owned_udp = unsafe { OwnedFd::from_raw_fd(raw_udp_fd) };
-
+    // Сразу передаем прямой сокет владельцу, чтобы ошибки настройки закрывали fd.
+    let owned_udp = if alt_transport.is_none() {
+        let raw_udp_fd = create_udp_socket(dest, &session, &|fd| platform.protect_socket(fd))?;
+        Some(unsafe { OwnedFd::from_raw_fd(raw_udp_fd) })
+    } else {
+        None
+    };
     if session.stop_requested.load(Ordering::SeqCst) {
         return Ok(());
     }
 
-    // ── 3. Set TUN fd to non-blocking for AsyncFd ──
-    let owned_tun_fd = unsafe { libc::dup(tun_fd) };
-    if owned_tun_fd < 0 {
-        return Err(Error::Io(std::io::Error::last_os_error()));
-    }
-
-    let fcntl_ret = unsafe { libc::fcntl(owned_tun_fd, libc::F_SETFL, libc::O_NONBLOCK) };
-    if fcntl_ret < 0 {
-        unsafe { libc::close(owned_tun_fd) };
-        return Err(Error::Io(std::io::Error::last_os_error()));
-    }
-    // Hand this duplicate to the SESSION, not to the `AsyncFd`: a disconnect
-    // must be able to drop the tun reference immediately instead of waiting for
-    // the tokio tasks that hold a view of it to be dropped (see
-    // `SessionRuntime::tun_write_fd`). The session guard is already active, so
-    // every `return Err` below still releases it.
-    session.tun_write_fd.store(owned_tun_fd, Ordering::SeqCst);
-    let tun = AsyncFd::new(TunFd(owned_tun_fd))?;
-
-    // Convert the owned UDP fd to a tokio UdpSocket (already connected to server).
-    let std_udp = std::net::UdpSocket::from(owned_udp);
-    std_udp.set_nonblocking(true)?;
-    let udp = Arc::new(UdpSocket::from_std(std_udp)?);
-
-    // Every session datagram goes through this. Default: a thin wrapper over
-    // the connected UDP socket (identical send/recv on the same socket — not a
-    // byte changes). When the platform supplied an alternative transport, use
-    // that instead and the UDP socket stays idle.
+    // Все датаграммы идут через выбранный транспорт.
     let transport: Arc<dyn crate::transport::DatagramTransport> = match alt_transport {
         Some(t) => t,
-        None => crate::transport::udp_transport(udp.clone()),
+        None => {
+            let std_udp = std::net::UdpSocket::from(
+                owned_udp.ok_or_else(|| Error::Session("UDP-сокет не создан".into()))?,
+            );
+            std_udp.set_nonblocking(true)?;
+            crate::transport::udp_transport(Arc::new(UdpSocket::from_std(std_udp)?))
+        }
     };
 
     // ── 4. Send init handshake (Control/Keepalive + obfuscated eph_pub) ──
@@ -372,17 +445,38 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
     // streak once so `initial_mask` below resolves identically (snapshotted at
     // the top of this function).
     if handshake_fail_streak >= HANDSHAKE_FALLBACK_THRESHOLD {
+        #[cfg(not(feature = "production-secure"))]
         log::warn!(
             "aivpn: {} consecutive handshakes never connected — falling back to a builtin preset mask (a cached bootstrap descriptor may be unmatchable by this server)",
             handshake_fail_streak
         );
+        #[cfg(feature = "production-secure")]
+        log::warn!(
+            "aivpn: {} consecutive handshakes never connected; retrying handshake, builtin fallback is disabled",
+            handshake_fail_streak
+        );
+    }
+    let handshake_descriptors = current_bootstrap_descriptors();
+    #[cfg(feature = "production-secure")]
+    if !handshake_descriptors.iter().any(|descriptor| {
+        !crate::mask::derive_bootstrap_candidates(descriptor, psk.as_ref()).is_empty()
+    }) {
+        return Err(Error::Session(
+            "production-secure требует действующий проверенный дескриптор".into(),
+        ));
     }
     let handshake_mask = resolve_sticky_handshake_mask(
         preferred_mask.as_deref(),
-        &current_bootstrap_descriptors(),
+        &handshake_descriptors,
         psk.as_ref(),
         handshake_fail_streak,
     );
+    let post_pfs_preference = crate::mask::post_pfs_mask_preference(
+        preferred_mask.as_deref(),
+        polymorphic_base.as_deref(),
+        &handshake_mask,
+    );
+    let transport = crate::mask_io::client(transport, &handshake_mask, dest, server_host.clone())?;
     // §2 crowdsourced blocking feedback: publish the attempted mask family HERE —
     // as soon as the handshake mask is resolved and BEFORE the ServerHello wait —
     // so the platform can attribute a handshake TIMEOUT (the blocked-mask case) to
@@ -416,16 +510,13 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
     if !recv_mdh_candidates.contains(&hs_mdh_len) {
         recv_mdh_candidates.push(hs_mdh_len);
     }
-    // Real send timestamp (not 0) so any ack the server sends back yields a
-    // usable RTT sample instead of poisoning the quality EWMA — mirrors
-    // desktop client.rs's `epoch_ms()` stamping on its warmup burst.
-    let keepalive = ControlPayload::Keepalive {
-        send_ts: crate::crypto::current_timestamp_ms(),
+    let client_hello = ControlPayload::ClientHello {
+        mask_id: handshake_mask.mask_id.clone(),
     }
     .encode()?;
     {
         let obf_pub = obfuscate_client_eph_pub(&keypair, &server_key);
-        let inner = build_inner_packet(InnerType::Control, send_seq, &keepalive);
+        let inner = build_inner_packet(InnerType::Control, send_seq, &client_hello);
         let pkt = build_shaped_mdh_packet(
             &keys,
             &mut send_counter,
@@ -441,7 +532,8 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
     // ── 5. Wait for ServerHello with timeout ──
     let mut recv_buf = vec![0u8; BUF_SIZE];
     let handshake_deadline = Instant::now() + HANDSHAKE_TIMEOUT;
-    let mut retry_count: u32 = 0;
+    let handshake_start = time::Instant::now();
+    let mut handshake_retry = crate::handshake_retry::HandshakeRetry::default();
     let mut recv_win = RecvWindow::new();
     let mut fragment_rx = crate::fragment::Reassembler::default();
     let (server_network_cfg, server_eph_pub) = loop {
@@ -453,11 +545,7 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
             return Err(Error::Session("Handshake timeout (10 s)".into()));
         }
 
-        let wait = std::cmp::min(
-            HANDSHAKE_RETRY_INTERVAL,
-            handshake_deadline.saturating_duration_since(now),
-        );
-        let retry = time::sleep(wait);
+        let retry = time::sleep_until(handshake_start + handshake_retry.next_at());
         tokio::pin!(retry);
 
         tokio::select! {
@@ -578,31 +666,23 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
                 if session.stop_requested.load(Ordering::SeqCst) {
                     return Ok(());
                 }
-                retry_count += 1;
-                // Rotate keypair only once, on the 2nd retry (~1.5 s after first send).
-                // Rotating on every retry created a new server session per 750 ms (~13
-                // ghost sessions per 10 s timeout), which caused CGNAT per-IP cap (5)
-                // to be hit on the 2nd handshake attempt.  A single rotation at retry 2
-                // limits server ghost sessions to 2 max while still forcing a fresh
-                // handshake if the server lost the original one.
-                if retry_count == 2 {
-                    keypair = KeyPair::generate();
-                    dh = keypair.compute_shared(&server_key)?;
-                    keys = derive_initial_session_keys(&dh, psk.as_ref(), &keypair.public_key_bytes());
-                    send_counter = 0;
-                    send_seq = 0;
-                    // Counters recorded from any pre-rotation datagram no longer
-                    // apply to the fresh session the server will create.
-                    recv_win.reset();
+                if handshake_retry.expired(handshake_start.elapsed()) {
+                    HANDSHAKE_FAIL_STREAK.fetch_add(1, Ordering::Relaxed);
+                    return Err(Error::Session("Handshake timeout (10 s)".into()));
                 }
+                // Повтор не меняет соединение и не сбрасывает счетчик.
                 let obf_pub = obfuscate_client_eph_pub(&keypair, &server_key);
-                let inner = build_inner_packet(InnerType::Control, send_seq, &keepalive);
+                let inner = build_inner_packet(InnerType::Control, send_seq, &client_hello);
                 let pkt = build_shaped_mdh_packet(&keys, &mut send_counter, &inner, Some(&obf_pub), hs_mdh_len, &handshake_mask)?;
                 send_seq = send_seq.wrapping_add(1);
                 transport.send(&pkt).await?;
+                handshake_retry.sent(handshake_start.elapsed());
             }
         }
     };
+    if direct_udp {
+        crate::dns_candidates::confirm(&dns_endpoint, dest);
+    }
     // Idempotency tracker for a mid-session ServerHello resend (see the
     // ControlPayload::ServerHello arm in the main dispatch loop below): the
     // server re-sends ServerHello — instead of a plain KeepaliveAck —
@@ -622,17 +702,34 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
             .lock()
             .unwrap_or_else(|error| error.into_inner()) = Some(cfg.clone());
     }
+    // Назначение сервера применяется до чтения TUN и объявления готовности.
+    let owned_tun = match platform.configure_tunnel(server_network_cfg.as_ref())? {
+        Some(fd) => fd,
+        None => {
+            let fd = unsafe { libc::dup(tun_fd) };
+            if fd < 0 {
+                return Err(Error::Io(std::io::Error::last_os_error()));
+            }
+            unsafe { OwnedFd::from_raw_fd(fd) }
+        }
+    };
+    if session.stop_requested.load(Ordering::SeqCst) {
+        return Ok(());
+    }
+    if !session.tun.install(owned_tun, &session.stop_requested)? {
+        return Ok(());
+    }
+    let tun = session.tun.clone();
+
     let base_keepalive = server_network_cfg
         .as_ref()
         .and_then(|c| c.keepalive_secs)
         .filter(|&s| s > 0)
         .map(|s| Duration::from_secs(s as u64))
         .unwrap_or(KEEPALIVE_INTERVAL);
-    let keepalive_interval = if level == AdaptiveLevel::Off {
-        base_keepalive
-    } else {
-        base_keepalive.min(Duration::from_secs(level.keepalive_secs()))
-    };
+    let mut active_keepalive_level = level;
+    let fec_group = Arc::new(AtomicU8::new(level.fec_n()));
+    let keepalive_interval = mobile_keepalive_interval(level, base_keepalive);
     // Shared keepalive interval (ms) the upload loop polls each tick and re-arms
     // from when it changes (see upload_pipeline::run_upload_loop). Seeded with the
     // initial interval above; the AdaptiveHint handler updates it live so a
@@ -828,17 +925,10 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
     let tun_err_tx = err_tx.clone();
     let sender_err_tx = err_tx.clone();
 
-    let read_fd = unsafe { libc::dup(tun.as_raw_fd()) };
-    if read_fd < 0 {
-        return Err(Error::Io(std::io::Error::last_os_error()));
-    }
-    // Session-owned for the same reason as the write duplicate above; the
-    // reader task only borrows it.
-    session.tun_read_fd.store(read_fd, Ordering::SeqCst);
-    let tun_read = AsyncFd::new(TunFd(read_fd))?;
+    let tun_read = tun.clone();
 
     let mut tunnel_tasks = TunnelTasks::default();
-    let tun_reader_task = tokio::spawn(async move {
+    let mut tun_reader_task = tokio::spawn(async move {
         let mut tun_buf = vec![0u8; BUF_SIZE];
         loop {
             match tun_async_read(&tun_read, &mut tun_buf).await {
@@ -878,6 +968,7 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
     tunnel_tasks.track(&tun_reader_task);
     let keepalive_sent_ms = Arc::new(AtomicU64::new(0));
     let mut quality_tracker = QualityTracker::new();
+    let mut peer_receiver_feedback = crate::quality::PeerReceiverFeedback::default();
 
     // Reset the per-session adaptive hint so the platform getter reports
     // "no hint yet" (0 in the stored +1 encoding) for this session.
@@ -935,6 +1026,10 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
     // against a live server as a continuous `aead::Error` stream at
     // `session_offset=20`.
     let initial_mask = handshake_mask.clone();
+    let mut rtc_mask_profile = initial_mask.clone();
+    if let Some(state) = transport.mask_state_offer(&rtc_mask_profile).await? {
+        let _ = ctrl_tx_recv_loop.try_send(ControlPayload::MaskState(state));
+    }
 
     // (ATTEMPTED_MASK_FAMILY is published earlier, right after `handshake_mask`
     // resolves, so a handshake TIMEOUT is still attributed to the right family.
@@ -959,7 +1054,7 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
     // an already-applied variant is harmless (mirrors desktop client.rs's
     // bounded retry task). The reply arrives as a normal MaskUpdate, handled by
     // the existing ControlPayload::MaskUpdate arm in the receive loop below.
-    if let Some(base_mask_id) = polymorphic_base.clone() {
+    if let Some(base_mask_id) = post_pfs_preference.clone() {
         let tx = ctrl_tx_recv_loop.clone();
         let confirmed = polymorphic_confirmed.clone();
         let task = tokio::spawn(async move {
@@ -1101,7 +1196,8 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
     let keys_tx = keys.clone();
     let session_for_upload = session.clone();
     let keepalive_ms_upload = keepalive_ms.clone();
-    let upload_sender_task = tokio::spawn(async move {
+    let fec_group_upload = fec_group.clone();
+    let mut upload_sender_task = tokio::spawn(async move {
         // R2 Phase D — client-side ML-DPI self-gate (feature `client-dpi-gate`,
         // OFF by default). Capture the mask family before `initial_mask` moves.
         #[cfg(feature = "client-dpi-gate")]
@@ -1117,12 +1213,14 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
             ),
             session: session_for_upload,
             keepalive_sent_ms,
+            fec_group: fec_group_upload,
             key_rotate_slot: key_rotate_for_enc,
             rekey_ack: rekey_ack_for_enc,
             rekey_resend_keys: rekey_resend_for_enc,
         };
         enc.inner.set_fec_group(level.fec_n());
         let config = UploadConfig {
+            pacing: upload_shaping,
             keepalive_interval,
             keepalive_ms: Some(keepalive_ms_upload),
             ..Default::default()
@@ -1162,29 +1260,21 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
     let mut wake_probe: Option<(Instant, Instant, Duration)> = None;
 
     loop {
+        // Срок feedback не зависит от control и готовности ветки приема.
+        refresh_mobile_tx_fec(
+            &fec_group,
+            &mut peer_receiver_feedback,
+            None,
+            active_keepalive_level,
+            Instant::now(),
+        );
         tokio::select! {
             biased;
 
             _ = wait_for_stop(&stop_signal) => {
-                // Send Shutdown 3× (50 ms apart) so the server drops the session
-                // immediately even if one UDP packet is lost on the mobile path.
-                // Route Shutdown through the upload task's single encryptor so it
-                // uses that encryptor's own counter — building it here with the
-                // receive loop's separate `send_counter` would reuse a (key, nonce)
-                // pair the upload task already consumed. Enqueue 3x so the server
-                // drops the session even if a packet is lost, then give the upload
-                // task a brief moment to flush before aborting it.
-                for _ in 0..3u8 {
-                    if ctrl_tx_recv_loop
-                        .try_send(ControlPayload::Shutdown { reason: 0 })
-                        .is_err()
-                    {
-                        break;
-                    }
-                }
-                tokio::time::sleep(Duration::from_millis(120)).await;
-                tun_reader_task.abort();
-                upload_sender_task.abort();
+                // Сокет уже закрывается stop_active_tunnel: отправка Shutdown
+                // через него невозможна. Прерываем задачи без ожидания отправки.
+                stop_data_plane(&tun, &mut tun_reader_task, &mut upload_sender_task).await;
                 return Ok(());
             }
 
@@ -1193,42 +1283,33 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
                 let n = match r {
                     Ok(n) => n,
                     Err(_) if session.stop_requested.load(Ordering::SeqCst) => {
-                        tun_reader_task.abort();
-                        upload_sender_task.abort();
+                        stop_data_plane(&tun, &mut tun_reader_task, &mut upload_sender_task).await;
                         return Ok(());
                     }
                     Err(e) => {
-                        // Abort both spawned tasks like every other exit path:
-                        // `upload_sender_task` owns tun_rx/ctrl_rx and a socket
-                        // clone, `tun_reader_task` a dup()'d TUN fd, so leaving
-                        // them detached leaks a task + fd per failed session
-                        // while the platform immediately reconnects.
-                        tun_reader_task.abort();
-                        upload_sender_task.abort();
+                        // Отправитель владеет каналами и сокетом, читатель держит
+                        // ссылку на TUN сессии. Останавливаем обе задачи до
+                        // повторного подключения после ошибки.
+                        stop_data_plane(&tun, &mut tun_reader_task, &mut upload_sender_task).await;
                         return Err(Error::Io(e));
                     }
                 };
                 log::debug!("aivpn: udp.recv() → {} bytes", n);
                 if transition_recv_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-                    transition_recv_keys = None;
                     transition_recv_deadline = None;
                     transition_grace_hard = None;
-                    transition_recv_win.reset();
                     // M3 fallback promote (desktop parity): the transition
                     // window closed without the server ever proving the rekey
                     // commit — switch TX to the staged keys anyway so TX
                     // matches the RX keys; a truly unconverged rekey then
                     // falls through to the data watchdog as before.
-                    if let Some(staged) = pending_upload_keys.take() {
-                        *key_rotate_slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(staged);
-                        log::info!(
-                            "aivpn: rekey transition window closed — promoting staged upload keys"
-                        );
-                    }
+                    finish_rekey_transition(
+                        &mut transition_recv_keys,
+                        &mut transition_recv_win,
+                        &mut pending_upload_keys,
+                        &key_rotate_slot,
+                    );
                 }
-                // Snapshot the primary window's high-water mark BEFORE decode so
-                // a forward jump afterwards measures the downlink gap (loss).
-                let prev_primary_highest = recv_win.highest();
                 let mut decoded_via_primary = false;
                 let decoded = match decode_downlink_with_offsets(
                     &udp_buf[..n],
@@ -1244,12 +1325,14 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
                     Err(e) => {
                         log::debug!("aivpn: decode failed (primary keys): {}", e);
                         if let Some(fallback_keys) = transition_recv_keys.as_ref() {
-                            let r = decode_downlink_with_offsets(
+                            let r = decode_transition_downlink(
                                 &udp_buf[..n],
                                 fallback_keys,
                                 &mut transition_recv_win,
+                                &mut recv_win,
                                 &mut recv_mdh_candidates,
-                    &recv_tag_offsets,
+                                &recv_tag_offsets,
+                                pending_upload_keys.is_some(),
                             );
                             if r.is_err() {
                                 log::debug!("aivpn: decode failed (fallback keys) — packet dropped");
@@ -1273,25 +1356,15 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
                             "aivpn: rekey commit confirmed by new-key downlink — upload switched to the new keys"
                         );
                     }
-                    // Downlink loss estimate for the quality tracker (record_gap
-                    // was previously never called, so loss_ppm() was stuck at 0
-                    // and the 30-point loss component of the quality score was
-                    // dead). A gap counts only when the counter moved FORWARD —
-                    // reordered/duplicate packets inside the window neither add
-                    // nor subtract — and the PFS-ratchet window reset (new
-                    // epoch restarts the counter) is guarded by `now > prev`.
-                    if let (Some(prev), Some(now)) = (prev_primary_highest, recv_win.highest()) {
-                        if now > prev {
-                            let gap = now - prev;
-                            if gap == 1 {
-                                quality_tracker.record_received();
-                            } else {
-                                quality_tracker.record_gap(gap.min(u32::MAX as u64) as u32);
-                            }
-                        }
-                    }
+                    let (received, span) = recv_win.observation_counts();
+                    quality_tracker.record_window(received, span);
                 }
 
+                let peer_feedback_allowed = if decoded_via_primary {
+                    !keys.packet_cipher.is_initial()
+                } else {
+                    transition_recv_keys.as_ref().is_some_and(|keys| !keys.packet_cipher.is_initial())
+                };
                 if let Some(mut decoded) = decoded {
                     if decoded.header.inner_type == InnerType::Fragment {
                         match fragment_rx.accept(&decoded.payload, Instant::now()) {
@@ -1319,8 +1392,10 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
                         // (EIO/ENOBUFS from a torn-down VpnService /
                         // NEPacketTunnelProvider) leaks them across reconnects.
                         if let Err(e) = tun_async_write(&tun, &decoded.payload).await {
-                            tun_reader_task.abort();
-                            upload_sender_task.abort();
+                            stop_data_plane(&tun, &mut tun_reader_task, &mut upload_sender_task).await;
+                            if session.stop_requested.load(Ordering::SeqCst) {
+                                return Ok(());
+                            }
                             return Err(e.into());
                         }
                         session
@@ -1350,6 +1425,14 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
                     if decoded.header.inner_type == InnerType::Control {
                         if let Ok(ctrl) = ControlPayload::decode(&decoded.payload) {
                             match ctrl {
+                                ControlPayload::MaskState(state) => {
+                                    if let Err(error) = transport.accept_mask_state(&state).await {
+                                        log::warn!("Ответ RTC не принят: {error}");
+                                    }
+                                }
+                                ControlPayload::ClientHello { .. } => {
+                                    return Err(Error::InvalidPacket("ClientHello получен от сервера"));
+                                }
                                 ControlPayload::KeyRotate { new_eph_pub } => {
                                     if ratcheted_rekey_eph_pub == Some(new_eph_pub) {
                                         // A KeyRotate for an eph_pub we ALREADY ratcheted
@@ -1529,6 +1612,7 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
                                                 Instant::now() + REKEY_TRANSITION_HARD_CAP,
                                             );
                                             transition_recv_win = recv_win.clone();
+                                            recv_win.begin_counter_recovery_epoch();
                                             keys = new_keys;
                                             // M3 (desktop `pending_upload_keys` parity):
                                             // STAGE the new TX keys instead of switching
@@ -1551,6 +1635,10 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
                                             log::info!("aivpn: inline PFS rekey complete");
                                         }
                                     }
+                                }
+                                ControlPayload::QualityReport { loss_ppm, .. } => {
+                                    let report = peer_feedback_allowed.then_some((decoded.counter, loss_ppm));
+                                    refresh_mobile_tx_fec(&fec_group, &mut peer_receiver_feedback, report, active_keepalive_level, Instant::now());
                                 }
                                 ControlPayload::KeepaliveAck { echo_ts } => {
                                     // BUGFIX (2c): this used to gate the whole update on
@@ -1582,11 +1670,7 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
                                             now_ms.saturating_sub(echo_ts).saturating_mul(1_000);
                                         quality_tracker.record_rtt(rtt_us);
                                     }
-                                    // Delivery accounting is UNCONDITIONAL: an ack with
-                                    // echo_ts == 0 carries no RTT but is still proof the
-                                    // packet arrived, so it must count for loss/jitter and
-                                    // refresh the published score.
-                                    quality_tracker.record_received();
+                                    // ACK уже учтен в replay-окне, повторно увеличивать счетчик нельзя.
                                     let score = quality_tracker.score();
                                     ACTIVE_QUALITY_SCORE.store(score, Ordering::Relaxed);
                                     // Enqueue to the upload task's encryptor rather than
@@ -1605,25 +1689,20 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
                                         "aivpn: KeepaliveAck rtt={}ms quality={}/100",
                                         quality_tracker.rtt_ms(), score
                                     );
+                                    refresh_mobile_tx_fec(&fec_group, &mut peer_receiver_feedback, None, active_keepalive_level, Instant::now());
                                 }
                                 ControlPayload::AdaptiveHint { level } => {
                                     // +1 shift: 0 is reserved for "no hint yet", so a
                                     // server hint of Off(0) still reaches the platform
                                     // as a downgrade (see the static's doc comment).
                                     ACTIVE_ADAPTIVE_LEVEL.store(level.min(3) + 1, Ordering::Relaxed);
-                                    // Re-arm the running upload loop's keepalive interval to the
-                                    // server-hinted level, mirroring desktop client.rs's
-                                    // keepalive_with_nat_cap: take the level's own keepalive_secs()
-                                    // clamped to the NAT-safe ceiling (Satellite uncapped). Clamping
-                                    // against base_keepalive (the 4s initial floor) instead would
-                                    // collapse every level to 4s and make the hint a silent no-op.
                                     let hinted = AdaptiveLevel::from_u8(level);
-                                    let requested = Duration::from_secs(hinted.keepalive_secs());
-                                    let new_ka = if hinted == AdaptiveLevel::Satellite {
-                                        requested
-                                    } else {
-                                        requested.min(KEEPALIVE_NAT_CAP)
-                                    };
+                                    active_keepalive_level = hinted;
+                                    refresh_mobile_tx_fec(&fec_group, &mut peer_receiver_feedback, None, hinted, Instant::now());
+                                    let new_ka = mobile_keepalive_interval(
+                                        hinted,
+                                        Duration::from_secs(hinted.keepalive_secs()),
+                                    );
                                     keepalive_ms.store(new_ka.as_millis() as u64, Ordering::Relaxed);
                                     log::info!(
                                         "aivpn: AdaptiveHint level={} → keepalive={}ms",
@@ -1823,9 +1902,13 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
                                                 verdict.accept
                                             };
                                         if artifact_ok {
-                                            // §3 F: once a polymorphic variant lands, signal the
-                                            // MaskPreference retry task to stop resending.
-                                            if mask.mask_id.starts_with("polymorphic:") {
+                                            // Подтверждается только подписанный ответ нужной базы и протокола.
+                                            if transport_verified == Some(true)
+                                                && mask.mask_id.starts_with("polymorphic:")
+                                                && post_pfs_preference.as_deref().is_some_and(|base| {
+                                                    crate::mask::mask_matches_preferred_base(&mask, base)
+                                                })
+                                            {
                                                 polymorphic_confirmed
                                                     .store(true, Ordering::Relaxed);
                                             }
@@ -1836,7 +1919,10 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
                                             if !recv_mdh_candidates.contains(&new_mdh) {
                                                 recv_mdh_candidates.insert(0, new_mdh);
                                             }
+                                            rtc_mask_profile = mask.clone();
+                                            transport.set_mask_profile(&mask);
                                             *mask_update_slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(mask);
+                                            let _ = ctrl_tx_recv_loop.try_send(ControlPayload::Keepalive { send_ts: crate::crypto::current_timestamp_ms() });
                                             log::info!("aivpn: MaskUpdate received — mask queued for mimicry engine");
                                         }
                                     } else {
@@ -1849,8 +1935,7 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
                                     // the platform reconnect loop kicks in, the same
                                     // way any other unrecoverable server event does.
                                     log::info!("aivpn: server requested shutdown (reason: {})", reason);
-                                    tun_reader_task.abort();
-                                    upload_sender_task.abort();
+                                    stop_data_plane(&tun, &mut tun_reader_task, &mut upload_sender_task).await;
                                     return Err(Error::Session(format!("server shutdown: {reason}")));
                                 }
                                 ControlPayload::HandshakeReject { reason } => {
@@ -1871,8 +1956,7 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
                                     );
                                     HANDSHAKE_REJECT_REASON.store(reason, Ordering::Relaxed);
                                     HANDSHAKE_REJECTED.store(true, Ordering::Relaxed);
-                                    tun_reader_task.abort();
-                                    upload_sender_task.abort();
+                                    stop_data_plane(&tun, &mut tun_reader_task, &mut upload_sender_task).await;
                                     return Err(Error::Session(format!(
                                         "HandshakeReject: reason={reason}"
                                     )));
@@ -1958,12 +2042,9 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
                                             })
                                             .unwrap_or(false);
                                         if !verified {
-                                            // Warn and IGNORE — never tear the session down.
-                                            // This packet is unauthenticated by definition,
-                                            // so ending the session here would hand any
-                                            // off-path spoofer a one-datagram session kill
-                                            // (a trivially reachable DoS). Dropping it costs
-                                            // nothing: a genuine resend arrives again.
+                                            // Действующая сессия уже закрепила проверенную
+                                            // пару ключей. Неверный повтор ее не меняет и
+                                            // не должен разрывать защищенный канал.
                                             log::warn!(
                                                 "aivpn: mid-session ServerHello rejected: ed25519 signature verification failed — possible MITM attack, ignoring"
                                             );
@@ -2000,13 +2081,10 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
                                         );
                                         if let Some(ka) = cfg.keepalive_secs.filter(|&s| s > 0) {
                                             let requested = Duration::from_secs(ka as u64);
-                                            let new_ka = if level == AdaptiveLevel::Off {
-                                                requested
-                                            } else {
-                                                requested.min(Duration::from_secs(
-                                                    level.keepalive_secs(),
-                                                ))
-                                            };
+                                            let new_ka = mobile_keepalive_interval(
+                                                active_keepalive_level,
+                                                requested,
+                                            );
                                             keepalive_ms.store(
                                                 new_ka.as_millis() as u64,
                                                 Ordering::Relaxed,
@@ -2078,7 +2156,6 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
                                 ControlPayload::Keepalive { .. }
                                 | ControlPayload::ClientCert { .. }
                                 | ControlPayload::DeviceEnrollment { .. }
-                                | ControlPayload::QualityReport { .. }
                                 | ControlPayload::MaskPreference { .. }
                                 | ControlPayload::MaskFeedback { .. } => {
                                     // Intentionally ignored on the mobile cores: this core
@@ -2102,13 +2179,9 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
 
             maybe_err = err_rx.recv() => {
                 if let Some(msg) = maybe_err {
-                    tun_reader_task.abort();
-                    upload_sender_task.abort();
-                    // A user-initiated stop neutralizes the TUN fds BEFORE the
-                    // stop-fd write lands (state.rs `stop_active_tunnel`), so
-                    // the reader task's EBADF can race ahead of the stop
-                    // signal — report a clean stop, not "TUN read failed",
-                    // for what was just the user pressing Disconnect.
+                    stop_data_plane(&tun, &mut tun_reader_task, &mut upload_sender_task).await;
+                    // Stop закрывает TUN до записи stop-сигнала. Ошибка reader
+                    // может прийти раньше сигнала, но остается обычной остановкой.
                     if session.stop_requested.load(Ordering::SeqCst) {
                         return Ok(());
                     }
@@ -2118,6 +2191,10 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
 
             // ── RX silence detector (proper interval, not recreated each iteration) ──
             _ = rx_check.tick() => {
+                refresh_mobile_tx_fec(&fec_group, &mut peer_receiver_feedback, None, active_keepalive_level, Instant::now());
+                if let Some(state) = transport.mask_state_offer(&rtc_mask_profile).await? {
+                    let _ = ctrl_tx_recv_loop.try_send(ControlPayload::MaskState(state));
+                }
                 // The receive branch performs this same transition cleanup
                 // before decoding a datagram, but it cannot run when the
                 // commit-confirming downlink itself was lost. Promote staged
@@ -2125,16 +2202,14 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
                 // an idle mobile tunnel cannot remain on old TX keys until the
                 // 120-second RX-silence reconnect.
                 if transition_recv_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-                    transition_recv_keys = None;
                     transition_recv_deadline = None;
                     transition_grace_hard = None;
-                    transition_recv_win.reset();
-                    if let Some(staged) = pending_upload_keys.take() {
-                        *key_rotate_slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(staged);
-                        log::info!(
-                            "aivpn: rekey transition timer closed — promoting staged upload keys"
-                        );
-                    }
+                    finish_rekey_transition(
+                        &mut transition_recv_keys,
+                        &mut transition_recv_win,
+                        &mut pending_upload_keys,
+                        &key_rotate_slot,
+                    );
                 }
                 // Post-freeze/suspend liveness probe (see WAKE_GAP_THRESHOLD):
                 // a tick gap ≫ RX_CHECK_INTERVAL means the process was frozen
@@ -2172,8 +2247,7 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
                         // Decodable RX after the wake moment — session alive.
                         wake_probe = None;
                     } else if tick_now >= deadline {
-                        tun_reader_task.abort();
-                        upload_sender_task.abort();
+                        stop_data_plane(&tun, &mut tun_reader_task, &mut upload_sender_task).await;
                         return Err(Error::Session(format!(
                             "post-wake liveness probe: no RX for {:?} after a {:?} \
                              freeze/suspend gap — reconnecting",
@@ -2207,8 +2281,7 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
                         reason,
                         data_plane_proven,
                     );
-                    tun_reader_task.abort();
-                    upload_sender_task.abort();
+                    stop_data_plane(&tun, &mut tun_reader_task, &mut upload_sender_task).await;
                     // Liveness: a sticky mask that keeps stalling quickly gets
                     // abandoned so AUTO can explore a different one.
                     note_data_stall_and_maybe_explore(session_established);
@@ -2242,8 +2315,7 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
                         "RX silence",
                         data_plane_proven,
                     );
-                    tun_reader_task.abort();
-                    upload_sender_task.abort();
+                    stop_data_plane(&tun, &mut tun_reader_task, &mut upload_sender_task).await;
                     return Err(Error::Session(
                         format!("No RX for {:?} — reconnecting", silence)
                     ));
@@ -2256,6 +2328,209 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
 #[cfg(test)]
 mod protocol_audit_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn data_plane_shutdown_joins_task_destruction_before_returning() {
+        struct Dropped(Arc<std::sync::atomic::AtomicUsize>);
+        impl Drop for Dropped {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let dropped = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (reader_started, reader_ready) = oneshot::channel();
+        let (sender_started, sender_ready) = oneshot::channel();
+        let reader_dropped = dropped.clone();
+        let sender_dropped = dropped.clone();
+        let mut reader = tokio::spawn(async move {
+            let _dropped = Dropped(reader_dropped);
+            reader_started.send(()).unwrap();
+            std::future::pending::<()>().await;
+        });
+        let mut sender = tokio::spawn(async move {
+            let _dropped = Dropped(sender_dropped);
+            sender_started.send(()).unwrap();
+            std::future::pending::<()>().await;
+        });
+        reader_ready.await.unwrap();
+        sender_ready.await.unwrap();
+        stop_data_plane(&SessionTun::default(), &mut reader, &mut sender).await;
+        assert!(reader.is_finished() && sender.is_finished());
+        assert_eq!(dropped.load(Ordering::SeqCst), 2);
+    }
+
+    fn assert_mobile_inline_rekey_after_old_queue(expire: bool) {
+        let old_keys = derive_session_keys(&[7; 32], None, &[8; 32]);
+        let new_keys = derive_session_keys(&[9; 32], Some(&old_keys.session_key), &[10; 32]);
+        let make_packet = |keys: &SessionKeys, mut counter| {
+            let mut downlink = keys.clone();
+            downlink.session_key = keys.session_key_s2c;
+            crate::client_wire::build_random_mdh_packet(
+                &downlink,
+                &mut counter,
+                &build_inner_packet(InnerType::Data, 0, &[0x45; 20]),
+                None,
+                20,
+            )
+            .unwrap()
+        };
+        let mut primary = RecvWindow::new();
+        primary.mark(1000);
+        let mut transition = primary.clone();
+        let mut lengths = vec![20];
+        for counter in 1001..=1700 {
+            decode_transition_downlink(
+                &make_packet(&old_keys, counter),
+                &old_keys,
+                &mut transition,
+                &mut primary,
+                &mut lengths,
+                &[u16::MAX],
+                true,
+            )
+            .unwrap();
+        }
+        assert_eq!(primary.highest(), Some(1000));
+        let old_replay = make_packet(&old_keys, 1700);
+        let mut tampered = make_packet(&old_keys, 1800);
+        *tampered.last_mut().unwrap() ^= 1;
+        let foreign_keys = derive_session_keys(&[17; 32], None, &[18; 32]);
+        let foreign = make_packet(&foreign_keys, 1800);
+        for invalid in [&old_replay, &tampered, &foreign] {
+            assert!(decode_transition_downlink(
+                invalid,
+                &old_keys,
+                &mut transition,
+                &mut primary,
+                &mut lengths,
+                &[u16::MAX],
+                true,
+            )
+            .is_err());
+        }
+        assert_eq!(transition.highest(), Some(1700));
+        let too_far = make_packet(&new_keys, 2300);
+        assert!(decode_downlink_with_offsets(
+            &too_far,
+            &new_keys,
+            &mut primary,
+            &mut lengths,
+            &[u16::MAX],
+        )
+        .is_err());
+        if expire {
+            let mut transition_keys = Some(old_keys.clone());
+            let mut staged = Some(new_keys.clone());
+            let slot = Mutex::new(None);
+            finish_rekey_transition(&mut transition_keys, &mut transition, &mut staged, &slot);
+            assert!(transition_keys.is_none());
+            assert!(staged.is_none());
+            assert_eq!(
+                slot.lock().unwrap().as_ref().unwrap().session_key,
+                new_keys.session_key
+            );
+            assert_eq!(transition.highest(), None);
+        }
+        let committed = make_packet(&new_keys, 1701);
+        decode_downlink_with_offsets(
+            &committed,
+            &new_keys,
+            &mut primary,
+            &mut lengths,
+            &[u16::MAX],
+        )
+        .expect("Общий RX Android/iOS должен видеть счетчик после старой очереди");
+        assert_eq!(primary.highest(), Some(1701));
+        assert!(decode_downlink_with_offsets(
+            &committed,
+            &new_keys,
+            &mut primary,
+            &mut lengths,
+            &[u16::MAX],
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn android_ios_inline_rekey_tracks_more_than_512_old_packets() {
+        assert_mobile_inline_rekey_after_old_queue(false);
+    }
+
+    #[test]
+    fn android_ios_inline_rekey_expiry_preserves_authenticated_cursor() {
+        assert_mobile_inline_rekey_after_old_queue(true);
+    }
+
+    #[test]
+    fn android_ios_initial_pfs_does_not_borrow_transition_counter() {
+        let keys = derive_session_keys(&[7; 32], None, &[8; 32]);
+        let mut downlink = keys.clone();
+        downlink.session_key = keys.session_key_s2c;
+        let packet = crate::client_wire::build_random_mdh_packet(
+            &downlink,
+            &mut 1001,
+            &build_inner_packet(InnerType::Data, 0, &[0x45; 20]),
+            None,
+            20,
+        )
+        .unwrap();
+        let mut primary = RecvWindow::new();
+        let mut transition = RecvWindow::new();
+        transition.mark(1000);
+        decode_transition_downlink(
+            &packet,
+            &keys,
+            &mut transition,
+            &mut primary,
+            &mut vec![20],
+            &[u16::MAX],
+            false,
+        )
+        .unwrap();
+        assert_eq!(primary.highest(), None);
+        let tag = crate::crypto::generate_resonance_tag(
+            &keys.tag_secret,
+            1513,
+            crate::crypto::compute_time_window(
+                crate::crypto::current_timestamp_ms(),
+                crate::crypto::DEFAULT_WINDOW_MS,
+            ),
+        );
+        assert_eq!(primary.find_counter(&tag, &keys), None);
+    }
+
+    #[tokio::test]
+    async fn direct_udp_resolves_the_server_on_the_platform_network() {
+        struct PhysicalNetwork;
+        impl PlatformIo for PhysicalNetwork {
+            fn resolve_host(
+                &self,
+                host: String,
+                port: u16,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<SocketAddr>>> + Send>>
+            {
+                assert_eq!(host, "vpn-platform-resolver.invalid");
+                assert_eq!(port, 443);
+                Box::pin(async {
+                    Ok(vec![
+                        "[2001:db8::1]:443".parse().unwrap(),
+                        "198.18.0.1:443".parse().unwrap(),
+                    ])
+                })
+            }
+            fn notify_ready(&self, _: &str) {
+                unreachable!()
+            }
+            fn publish_recording_feedback(&self, _: RecordingFeedback) {
+                unreachable!()
+            }
+        }
+        let selected =
+            resolve_direct_destination(&PhysicalNetwork, "vpn-platform-resolver.invalid", 443)
+                .await
+                .unwrap();
+        assert_eq!(selected, "198.18.0.1:443".parse().unwrap());
+    }
 
     #[test]
     fn duplicate_hello_reannounces_certificate_and_session_bound_device_proof() {
@@ -2331,5 +2606,113 @@ mod protocol_audit_tests {
         assert!(owner.await.unwrap_err().is_cancelled());
         let result = time::timeout(Duration::from_millis(100), child).await;
         assert!(matches!(result, Ok(Err(error)) if error.is_cancelled()));
+    }
+}
+
+#[cfg(test)]
+mod keepalive_tests {
+    use super::*;
+
+    #[test]
+    fn server_keepalive_and_adaptive_hints_stay_below_quic_idle() {
+        for level in [
+            AdaptiveLevel::Off,
+            AdaptiveLevel::from_u8(1),
+            AdaptiveLevel::from_u8(2),
+            AdaptiveLevel::Satellite,
+        ] {
+            for seconds in [1, 8, 25, 30, 255] {
+                let result = mobile_keepalive_interval(level, Duration::from_secs(seconds));
+                assert!(result <= Duration::from_secs(seconds));
+                assert!(result <= Duration::from_secs(25));
+                if level != AdaptiveLevel::Off {
+                    assert!(result <= Duration::from_secs(level.keepalive_secs()));
+                }
+            }
+        }
+        assert_eq!(
+            mobile_keepalive_interval(AdaptiveLevel::Off, Duration::from_secs(255)),
+            Duration::from_secs(25)
+        );
+        let hinted = AdaptiveLevel::from_u8(1);
+        assert_eq!(
+            mobile_keepalive_interval(hinted, Duration::from_secs(255)),
+            Duration::from_secs(hinted.keepalive_secs())
+        );
+    }
+}
+
+#[cfg(test)]
+mod fec_receiver_feedback_tests {
+    use super::*;
+
+    #[test]
+    fn fec_receiver_mobile_report_drives_only_tx_with_order_and_expiry() {
+        let now = Instant::now();
+        let mut peer = crate::quality::PeerReceiverFeedback::default();
+        let mut local = QualityTracker::new();
+        local.record_rtt(18_000);
+        local.record_window(32, 32);
+        let before = (
+            local.score(),
+            local.rtt_ms(),
+            local.loss_ppm(),
+            local.jitter_ms(),
+        );
+        let keepalive = mobile_keepalive_interval(AdaptiveLevel::Light, Duration::from_secs(6));
+        assert_eq!(
+            mobile_tx_fec_group(&mut peer, None, AdaptiveLevel::Light, now),
+            16
+        );
+        assert_eq!(
+            mobile_tx_fec_group(&mut peer, Some((100, 0)), AdaptiveLevel::Light, now),
+            0
+        );
+        assert_eq!(
+            mobile_tx_fec_group(&mut peer, Some((101, 25_000)), AdaptiveLevel::Off, now),
+            8,
+            "Local DL loss0 не отменяет peer UL loss"
+        );
+        assert_eq!(
+            mobile_tx_fec_group(&mut peer, Some((100, 0)), AdaptiveLevel::Off, now),
+            8
+        );
+        assert_eq!(
+            mobile_tx_fec_group(&mut peer, None, AdaptiveLevel::Light, now),
+            8,
+            "Initial/counterless QR и тот же hint level не стирают feedback"
+        );
+        assert_eq!(
+            mobile_tx_fec_group(
+                &mut peer,
+                None,
+                AdaptiveLevel::Light,
+                now + Duration::from_secs(30)
+            ),
+            16
+        );
+        assert_eq!(
+            (
+                local.score(),
+                local.rtt_ms(),
+                local.loss_ppm(),
+                local.jitter_ms()
+            ),
+            before
+        );
+        assert_eq!(
+            keepalive,
+            mobile_keepalive_interval(AdaptiveLevel::Light, Duration::from_secs(6))
+        );
+        peer.reset();
+        assert_eq!(
+            mobile_tx_fec_group(
+                &mut peer,
+                Some((0, 50_000)),
+                AdaptiveLevel::Off,
+                now + Duration::from_secs(31)
+            ),
+            4
+        );
     }
 }

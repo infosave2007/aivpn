@@ -27,6 +27,10 @@ INTERNAL_PATH_DIGESTS = {
 }
 SERVICE_REPORT = re.compile(r"(^|/)CODE_REVIEW(?:_[^/]*)?\.md$", re.IGNORECASE)
 TOKEN = re.compile(r"[\w-]+", re.UNICODE)
+PUBLIC_WIRE_HOSTS = {"5b95db1778928514156275eccf330997fe69b3349c76208dfee2591c12b15042"}
+WIRE_HOST_FILES = {
+    "crates/aivpn-common/src/mask_io.rs",
+}
 
 
 def tracked_paths() -> list[str]:
@@ -43,6 +47,23 @@ def digest(token: str) -> str:
     return hashlib.sha256(token.casefold().encode("utf-8")).hexdigest()
 
 
+def line_violations(relative: str, line: str) -> list[str]:
+    labels: list[str] = []
+    for match in TOKEN.finditer(line):
+        label = FORBIDDEN.get(digest(match.group(0)))
+        if not label:
+            continue
+        if relative in WIRE_HOST_FILES:
+            # Публичный домен TURN нужен на проводе. Исключение относится
+            # только к точной строке домена в реализации адаптера масок.
+            start = line.rfind('"', 0, match.start())
+            end = line.find('"', match.end())
+            if start >= 0 and end >= 0 and digest(line[start + 1:end]) in PUBLIC_WIRE_HOSTS:
+                continue
+        labels.append(label)
+    return labels
+
+
 def main() -> int:
     violations: list[str] = []
     for relative in tracked_paths():
@@ -52,6 +73,9 @@ def main() -> int:
         path_parts = pathlib.PurePosixPath(relative).parts
         if SERVICE_REPORT.search(relative) or any(
             digest(part) in INTERNAL_PATH_DIGESTS for part in path_parts
+        ) or any(
+            digest(match.group(0)) in FORBIDDEN
+            for part in path_parts for match in TOKEN.finditer(part)
         ):
             violations.append(f"{relative}: служебный путь")
             continue
@@ -62,10 +86,8 @@ def main() -> int:
             continue
         text = data.decode("utf-8", errors="ignore")
         for line_number, line in enumerate(text.splitlines(), 1):
-            for match in TOKEN.finditer(line):
-                label = FORBIDDEN.get(digest(match.group(0)))
-                if label:
-                    violations.append(f"{relative}:{line_number}: {label}")
+            for label in line_violations(relative, line):
+                violations.append(f"{relative}:{line_number}: {label}")
 
     if violations:
         print(f"FAIL: найдено нарушений границы репозитория: {len(violations)}")

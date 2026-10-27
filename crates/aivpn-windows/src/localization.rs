@@ -3,6 +3,7 @@
 //! App settings (language + theme) are persisted together in
 //! %LOCALAPPDATA%\AIVPN\settings.json. Legacy lang.txt is migrated on first load.
 
+use crate::appearance::{ColorScheme, UiLayout};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -19,6 +20,10 @@ pub struct AppSettings {
     pub lang: Lang,
     #[serde(default = "default_dark")]
     pub dark_mode: bool,
+    #[serde(default)]
+    pub ui_layout: UiLayout,
+    #[serde(default)]
+    pub color_scheme: Option<ColorScheme>,
     #[serde(default)]
     pub kill_switch: bool,
     #[serde(default)]
@@ -72,6 +77,14 @@ fn settings_path() -> PathBuf {
 }
 
 impl AppSettings {
+    pub fn effective_color_scheme(&self) -> ColorScheme {
+        self.color_scheme.unwrap_or(if self.dark_mode {
+            ColorScheme::Dark
+        } else {
+            ColorScheme::Light
+        })
+    }
+
     pub fn load() -> Self {
         let path = settings_path();
         if path.exists() {
@@ -85,7 +98,9 @@ impl AppSettings {
                     // KeyStorage::load()'s handling of legacy plaintext keys below).
                     let mut needs_save = false;
                     if !s.bootstrap_telegram_token.is_empty() {
-                        match crate::key_storage::unprotect_key(&s.bootstrap_telegram_token) {
+                        match crate::key_storage::unprotect_bootstrap_token(
+                            &s.bootstrap_telegram_token,
+                        ) {
                             Ok(decrypted) => {
                                 if decrypted == s.bootstrap_telegram_token {
                                     // Didn't change → base64 decode failed → legacy
@@ -108,7 +123,9 @@ impl AppSettings {
                         }
                     }
                     if needs_save {
-                        s.save();
+                        if let Err(error) = s.save() {
+                            crate::vpn_manager::gui_log(&error);
+                        }
                     }
                     return s;
                 }
@@ -130,6 +147,8 @@ impl AppSettings {
         AppSettings {
             lang,
             dark_mode: true,
+            ui_layout: UiLayout::FluentDesktop,
+            color_scheme: Some(ColorScheme::System),
             kill_switch: false,
             adaptive_level: 0,
             dns_proxy: String::new(),
@@ -147,41 +166,39 @@ impl AppSettings {
         }
     }
 
-    pub fn save(&self) {
+    pub fn save(&self) -> Result<(), String> {
         let path = settings_path();
-        if let Some(p) = path.parent() {
-            let _ = std::fs::create_dir_all(p);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         }
-        // Encrypt the Telegram bootstrap token before it touches disk — build a
-        // disk-only copy rather than mutating `self`, so the in-memory value the
-        // rest of the app uses (e.g. passed to aivpn-client.exe via env var)
-        // stays plaintext. Best-effort: if DPAPI is ever unavailable, fall back
-        // to writing it in plaintext (this field's pre-existing behavior) rather
-        // than losing every other setting sharing this file.
         let mut on_disk = self.clone();
         if !on_disk.bootstrap_telegram_token.is_empty() {
-            match crate::key_storage::protect_key(&on_disk.bootstrap_telegram_token) {
-                Ok(encrypted) => on_disk.bootstrap_telegram_token = encrypted,
-                Err(e) => {
-                    crate::vpn_manager::gui_log(&format!(
-                        "aivpn: bootstrap_telegram_token DPAPI encryption failed, saving plaintext: {e}"
-                    ));
-                }
-            }
+            on_disk.bootstrap_telegram_token = crate::key_storage::protect_key(
+                &on_disk.bootstrap_telegram_token,
+            )
+            .map_err(|e| format!("Cannot encrypt bootstrap token; settings were not saved: {e}"))?;
         }
-        let Ok(json) = serde_json::to_string_pretty(&on_disk) else {
-            return;
-        };
-        // Atomic write: write to .tmp then rename to prevent corrupt settings.json on crash
-        let tmp = path.with_extension("json.tmp");
-        if std::fs::write(&tmp, &json).is_ok() {
-            if let Err(e) = std::fs::rename(&tmp, &path) {
-                crate::vpn_manager::gui_log(&format!(
-                    "AppSettings::save rename {tmp:?} → {path:?}: {e}"
-                ));
-                let _ = std::fs::remove_file(&tmp);
-            }
+        let json = serde_json::to_vec_pretty(&on_disk).map_err(|e| e.to_string())?;
+        let nonce = base64::Engine::encode(
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+            aivpn_common::crypto::random_bytes(16),
+        );
+        let tmp = path.with_extension(format!("{nonce}.tmp"));
+        use std::io::Write;
+        let write = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+            .and_then(|mut file| file.write_all(&json).and_then(|_| file.sync_all()));
+        if let Err(error) = write {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(format!("Cannot save settings: {error}"));
         }
+        if let Err(error) = std::fs::rename(&tmp, &path) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(format!("Cannot save settings: {error}"));
+        }
+        Ok(())
     }
 }
 
@@ -656,5 +673,48 @@ pub fn t(lang: Lang, key: &str) -> &'static str {
 
         // Default fallback
         (_, _) => "???",
+    }
+}
+
+#[cfg(test)]
+mod appearance_settings_tests {
+    use super::*;
+    use crate::appearance::{ColorScheme, UiLayout};
+
+    #[test]
+    fn legacy_theme_and_network_preferences_survive_layout_migration() {
+        let settings: AppSettings = serde_json::from_str(r#"{"lang":"ru","dark_mode":false,"kill_switch":true,"dns_proxy":"127.0.0.1:5353","connect_on_startup":true,"preferred_mask":"quic_https_v2"}"#).unwrap();
+        assert_eq!(settings.ui_layout, UiLayout::FluentDesktop);
+        assert_eq!(settings.effective_color_scheme(), ColorScheme::Light);
+        assert!(settings.kill_switch && settings.connect_on_startup);
+        assert_eq!(settings.dns_proxy, "127.0.0.1:5353");
+        assert_eq!(settings.preferred_mask, "quic_https_v2");
+    }
+
+    #[test]
+    fn unknown_appearance_does_not_discard_saved_network_settings() {
+        let settings: AppSettings = serde_json::from_str(r#"{"ui_layout":"future","color_scheme":"future","lang":"ru","adaptive_level":3,"dns_proxy":"127.0.0.1:5353"}"#).unwrap();
+        assert_eq!(settings.ui_layout, UiLayout::FluentDesktop);
+        assert_eq!(settings.effective_color_scheme(), ColorScheme::System);
+        assert_eq!(settings.adaptive_level, 3);
+        assert_eq!(settings.dns_proxy, "127.0.0.1:5353");
+        assert_eq!(settings.lang, Lang::Ru);
+    }
+
+    #[test]
+    fn appearance_roundtrip_preserves_all_other_preferences() {
+        let mut settings: AppSettings = serde_json::from_str(r#"{"lang":"ru","kill_switch":true,"adaptive_level":2,"dns_proxy":"127.0.0.1:5353","preferred_mask":"quic_https_v2","connect_on_startup":true,"bootstrap_cdn_url":"https://example.invalid/bootstrap","country_code":"RU"}"#).unwrap();
+        let before = serde_json::to_value(&settings).unwrap();
+        settings.ui_layout = UiLayout::Compact;
+        settings.color_scheme = Some(ColorScheme::Dark);
+        let bytes = serde_json::to_vec(&settings).unwrap();
+        let loaded: AppSettings = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(loaded.ui_layout, UiLayout::Compact);
+        assert_eq!(loaded.effective_color_scheme(), ColorScheme::Dark);
+        let mut after = serde_json::to_value(loaded).unwrap();
+        for field in ["ui_layout", "color_scheme"] {
+            after[field] = before[field].clone();
+        }
+        assert_eq!(after, before);
     }
 }

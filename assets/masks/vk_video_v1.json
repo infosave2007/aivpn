@@ -1,6 +1,6 @@
 {
   "mask_id": "vk_video_v1",
-  "version": 1,
+  "version": 2,
   "created_at": 0,
   "expires_at": 18446744073709551615,
   "spoof_protocol": "QUIC",

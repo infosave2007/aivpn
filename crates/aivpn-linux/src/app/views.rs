@@ -1,340 +1,25 @@
-//! `view`/`view_*` rendering methods for the iced `App`. Moved verbatim out
-//! of `app/mod.rs` (pure move, no behavior change).
-
 use super::*;
 use iced::widget::{column, row};
 
 impl super::App {
     pub fn view(&self) -> Element<'_, Message> {
-        if self.dialog != DialogMode::None {
-            return self.view_dialog();
+        let base = super::modal::underlay(
+            self.view_main(),
+            self.pending_remove.is_some() || self.dialog != DialogMode::None,
+        );
+        if self.pending_remove.is_some() {
+            return self.dialog_overlay(base, self.view_delete_confirmation());
         }
-        self.view_main()
+        if self.dialog != DialogMode::None {
+            return self.dialog_overlay(base, self.view_dialog());
+        }
+        base
     }
 
-    fn view_main(&self) -> Element<'_, Message> {
-        let is_dark = self.settings.dark_mode;
+    pub(super) fn view_sections(&self, page: UiPage) -> Element<'_, Message> {
         let lang = self.settings.lang.as_str();
-
-        // Adaptive palette — grey tones that contrast in both light and dark themes
-        let muted = if is_dark {
-            Color::from_rgb(0.62, 0.64, 0.70)
-        } else {
-            Color::from_rgb(0.43, 0.45, 0.50)
-        };
-        // Card surface must visibly stand out from the window background.
-        // iced Theme::Dark background ≈ rgb(0.20, 0.20, 0.20); card at 0.27 gives clear delta.
-        let card_bg = if is_dark {
-            Color::from_rgb(0.26, 0.27, 0.35)
-        } else {
-            Color::from_rgb(0.92, 0.93, 0.97)
-        };
-        let card_border_color = if is_dark {
-            Color::from_rgba(1.0, 1.0, 1.0, 0.09)
-        } else {
-            Color::from_rgba(0.0, 0.0, 0.0, 0.07)
-        };
-
-        // ── Status colours ────────────────────────────────────────────────────
-        let (dot_color, status_str, status_color) = match &self.status {
-            VpnStatus::Disconnected => (
-                muted,
-                t(lang, "Disconnected").to_string(),
-                if is_dark {
-                    Color::from_rgb(0.82, 0.84, 0.90)
-                } else {
-                    Color::from_rgb(0.33, 0.35, 0.42)
-                },
-            ),
-            VpnStatus::Connecting => (
-                Color::from_rgb(1.0, 0.70, 0.15),
-                t(lang, "Connecting...").to_string(),
-                Color::from_rgb(1.0, 0.70, 0.15),
-            ),
-            VpnStatus::Connected { vpn_ip } => {
-                // MEDIUM-HIGH #3 (client parity): elapsed connection time,
-                // derived the same way Windows (vpn_manager.rs
-                // session_since_ms) and macOS (VPNManager) do — wall-clock
-                // now minus the client's session epoch — instead of never
-                // showing uptime at all. `connected_since` is already parsed
-                // by `read_traffic_stats()`/`parse_traffic_stats()` from the
-                // stats file's `since:` key; previously only consulted here
-                // to detect a silent in-process reconnect, never displayed.
-                let uptime_str = self.stats.connected_since.map(|since_ms| {
-                    let now_ms = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_millis() as u64)
-                        .unwrap_or(since_ms);
-                    let secs = now_ms.saturating_sub(since_ms) / 1000;
-                    let h = secs / 3600;
-                    let m = (secs % 3600) / 60;
-                    let s = secs % 60;
-                    if h > 0 {
-                        format!("{h}:{m:02}:{s:02}")
-                    } else {
-                        format!("{m}:{s:02}")
-                    }
-                });
-                let label = if lang == "ru" {
-                    "Подключено"
-                } else {
-                    "Connected"
-                };
-                let status_str = match &uptime_str {
-                    Some(u) => format!("{label}  {vpn_ip}  {u}"),
-                    None => format!("{label}  {vpn_ip}"),
-                };
-                (
-                    Color::from_rgb(0.25, 0.84, 0.36),
-                    status_str,
-                    Color::from_rgb(0.25, 0.84, 0.36),
-                )
-            }
-            VpnStatus::Error(e) => (
-                Color::from_rgb(0.95, 0.28, 0.18),
-                format!(
-                    "{}: {e}",
-                    if lang == "ru" {
-                        "Ошибка"
-                    } else {
-                        "Error"
-                    }
-                ),
-                Color::from_rgb(0.95, 0.28, 0.18),
-            ),
-        };
-
-        // ── Header ────────────────────────────────────────────────────────────
-        // Container-dot avoids Unicode glyph rendering issues on systems with
-        // limited fonts — renders as a 10×10 colored circle regardless.
-        let dot = container(Space::new().width(0))
-            .width(10)
-            .height(10)
-            .style(move |_: &Theme| container::Style {
-                background: Some(Background::Color(dot_color)),
-                border: Border {
-                    radius: 5.0.into(),
-                    ..Default::default()
-                },
-                ..Default::default()
-            });
-        let theme_btn = button(if self.settings.dark_mode {
-            "Light"
-        } else {
-            "Dark"
-        })
-        .on_press(Message::ToggleTheme)
-        .style(button::text);
-        let lang_btn = button(if lang == "ru" { "EN" } else { "RU" })
-            .on_press(Message::ToggleLang)
-            .style(button::text);
-        let version_label = text(concat!("v", env!("CARGO_PKG_VERSION")))
-            .size(11)
-            .color(muted);
-        let header = row![
-            dot,
-            Space::new().width(6),
-            text("AIVPN").size(17),
-            Space::new().width(Length::Fill),
-            version_label,
-            Space::new().width(4),
-            lang_btn,
-            Space::new().width(2),
-            theme_btn,
-        ]
-        .align_y(Alignment::Center);
-
-        // ── Status card ───────────────────────────────────────────────────────
-        let busy = matches!(
-            self.status,
-            VpnStatus::Connected { .. } | VpnStatus::Connecting
-        );
+        let muted = self.theme().extended_palette().background.strong.text;
         let is_connected = matches!(self.status, VpnStatus::Connected { .. });
-        let has_profile = self.storage.selected_key().is_some();
-
-        let profile_hint: Element<Message> = if let Some(k) = self.storage.selected_key() {
-            text(format!("-> {}", k.name)).size(11).color(muted).into()
-        } else if self.storage.keys.is_empty() {
-            text(t(lang, "No profiles - add one below"))
-                .size(11)
-                .color(Color::from_rgb(1.0, 0.65, 0.15))
-                .into()
-        } else {
-            text(t(lang, "Select a profile below"))
-                .size(11)
-                .color(Color::from_rgb(1.0, 0.65, 0.15))
-                .into()
-        };
-
-        let conn_btn: Element<Message> = if busy {
-            button(text(t(lang, "Disconnect")).size(13))
-                .on_press(Message::Disconnect)
-                .style(button::danger)
-                .padding([6, 14])
-                .into()
-        } else {
-            let b = button(text(t(lang, "Connect")).size(13))
-                .style(button::primary)
-                .padding([6, 14]);
-            if has_profile {
-                b.on_press(Message::Connect).into()
-            } else {
-                b.into()
-            }
-        };
-
-        let traffic_row: Element<Message> = if is_connected {
-            let mut r = row![
-                text(format!("RX {}", format_bytes(self.stats.bytes_received)))
-                    .size(11)
-                    .color(muted),
-                Space::new().width(6),
-                text(format!("TX {}", format_bytes(self.stats.bytes_sent)))
-                    .size(11)
-                    .color(muted),
-            ];
-            // Live link quality from the client's quality.json (0 = not
-            // reported yet / old client).
-            if self.stats.quality_score > 0 {
-                r = r.push(Space::new().width(6)).push(
-                    text(format!("Q {}%", self.stats.quality_score))
-                        .size(11)
-                        .color(muted),
-                );
-            }
-            r.align_y(Alignment::Center).into()
-        } else {
-            profile_hint
-        };
-
-        let status_card = container(
-            row![
-                text(status_str).color(status_color).size(14),
-                Space::new().width(8),
-                traffic_row,
-                Space::new().width(Length::Fill),
-                conn_btn,
-            ]
-            .align_y(Alignment::Center),
-        )
-        .style(move |_theme: &Theme| container::Style {
-            background: Some(Background::Color(card_bg)),
-            border: Border {
-                radius: 8.0.into(),
-                width: 1.0,
-                color: card_border_color,
-            },
-            ..Default::default()
-        })
-        .padding([10, 12])
-        .width(Length::Fill);
-
-        // 3c: brief indicator shown while this session is running on the
-        // built-in default mask (bootstrap-fallback) rather than a normal
-        // bootstrap-derived one — only meaningful while a connection is
-        // active/being attempted, and cleared on every new Connect/Disconnect
-        // (see Message::Connect / Message::Disconnect / BootstrapFallbackDetected).
-        let fallback_badge: Element<Message> = if self.bootstrap_fallback && busy {
-            text(t(lang, "Using built-in mask (fallback)"))
-                .size(11)
-                .color(Color::from_rgb(1.0, 0.65, 0.15))
-                .into()
-        } else {
-            Space::new().height(0).into()
-        };
-
-        // ── Profiles ──────────────────────────────────────────────────────────
-        let profiles_header = row![
-            text(t(lang, "Profiles")).size(14),
-            Space::new().width(Length::Fill),
-            button(t(lang, "+ Add"))
-                .on_press(Message::ShowAddDialog)
-                .style(button::text),
-        ]
-        .align_y(Alignment::Center);
-
-        let profile_rows: Vec<Element<Message>> = self
-            .storage
-            .keys
-            .iter()
-            .enumerate()
-            .map(|(i, k)| {
-                let is_selected = self.storage.selected == Some(i);
-                let name_text = text(&k.name).size(13);
-                let addr_text = text(if k.server_addr.is_empty() {
-                    "-"
-                } else {
-                    &k.server_addr
-                })
-                .size(11)
-                .color(muted);
-                let profile_col = column![name_text, addr_text].spacing(1);
-
-                let edit_btn = button(t(lang, "Edit"))
-                    .on_press(Message::ShowEditDialog(i))
-                    .style(button::text);
-                let del_btn = button("x")
-                    .on_press(Message::RemoveProfile(i))
-                    .style(button::text);
-
-                let row_content: Element<Message> = row![
-                    profile_col,
-                    Space::new().width(Length::Fill),
-                    edit_btn,
-                    del_btn,
-                ]
-                .spacing(4)
-                .align_y(Alignment::Center)
-                .into();
-
-                if is_selected {
-                    container(row_content)
-                        .padding([6, 8])
-                        .width(Length::Fill)
-                        .style(|theme: &Theme| {
-                            let palette = theme.extended_palette();
-                            container::Style {
-                                background: Some(Background::Color(palette.primary.weak.color)),
-                                border: Border {
-                                    radius: 6.0.into(),
-                                    ..Default::default()
-                                },
-                                ..Default::default()
-                            }
-                        })
-                        .into()
-                } else {
-                    button(row_content)
-                        .on_press(Message::SelectProfile(i))
-                        .width(Length::Fill)
-                        .style(button::text)
-                        .padding([6, 8])
-                        .into()
-                }
-            })
-            .collect();
-
-        let profile_list_h = ((self.storage.keys.len() * 46) + 8).max(46).min(180) as u16;
-        let profiles_list = container(
-            scrollable(
-                container(column(profile_rows).spacing(2))
-                    .width(Length::Fill)
-                    .padding(4),
-            )
-            .height(u32::from(profile_list_h)),
-        )
-        .style(|theme: &Theme| {
-            let palette = theme.extended_palette();
-            container::Style {
-                border: Border {
-                    radius: 6.0.into(),
-                    width: 1.0,
-                    color: palette.background.weak.color,
-                },
-                ..Default::default()
-            }
-        })
-        .width(Length::Fill);
         // ── Recording (visible when connected) ────────────────────────────────
         let recording_section: Element<Message> =
             if matches!(self.status, VpnStatus::Connected { .. }) {
@@ -346,7 +31,7 @@ impl super::App {
                             Color::from_rgb(0.9, 0.2, 0.1)
                         };
                         column![
-                            text(t(lang, "Record New Mask")).size(13),
+                            text(t(lang, "Record New Mask")).size(14),
                             row![
                                 text(details).color(color).size(12),
                                 Space::new().width(Length::Fill),
@@ -362,7 +47,7 @@ impl super::App {
                     RecordingState::Active(svc) => row![
                         text(format!("{} {svc}", t(lang, "Recording:")))
                             .color(Color::from_rgb(0.9, 0.2, 0.1))
-                            .size(13),
+                            .size(14),
                         Space::new().width(Length::Fill),
                         button(t(lang, "Stop"))
                             .on_press(Message::StopRecording)
@@ -372,10 +57,10 @@ impl super::App {
                     .into(),
                     RecordingState::Stopping => row![text(t(lang, "Stopping recording..."))
                         .color(Color::from_rgb(0.9, 0.6, 0.1))
-                        .size(13),]
+                        .size(14),]
                     .into(),
                     RecordingState::Idle => column![
-                        text(t(lang, "Record New Mask")).size(13),
+                        text(t(lang, "Record New Mask")).size(14),
                         row![
                             text_input("Service name", &self.recording_service)
                                 .on_input(Message::RecordServiceChanged)
@@ -433,7 +118,7 @@ impl super::App {
         // The FEC badge reflects the LIVE level the server actually runs the
         // session at (quality.json) when connected — not merely the requested
         // preference, which the adaptive controller may have overridden.
-        let live_level = if is_connected && self.stats.server_adaptive_level > 0 {
+        let live_level = if is_connected {
             self.stats.server_adaptive_level
         } else {
             self.settings.adaptive_level
@@ -441,20 +126,26 @@ impl super::App {
         let fec_text = if live_level >= 2 { " [FEC]" } else { "" };
         let fec_badge = text(fec_text)
             .color(Color::from_rgb(0.3, 0.8, 0.5))
-            .size(11);
-        let adaptive_row = row![
-            text(t(lang, "Adaptive mode")).size(13).width(130),
+            .size(12);
+        let adaptive_picker: Element<Message> = if self.profiles_locked() {
+            text(adaptive_opt.to_string()).size(14).into()
+        } else {
             pick_list(
                 AdaptiveOption::all(),
                 Some(adaptive_opt.clone()),
                 Message::AdaptiveLevelChanged,
             )
-            .width(200),
+            .width(200)
+            .into()
+        };
+        let adaptive_row = row![
+            text(t(lang, "Adaptive mode")).size(14).width(130),
+            adaptive_picker,
             fec_badge,
         ]
         .spacing(8)
         .align_y(Alignment::Center);
-        let adaptive_desc = text(adaptive_opt.desc(lang)).size(11).color(muted);
+        let adaptive_desc = text(adaptive_opt.desc(lang)).size(12).color(muted);
 
         let mask_opt = MaskOption::from_str(&self.settings.preferred_mask);
         // Dynamic picker: prefer the server-pushed catalog (which marks
@@ -474,16 +165,28 @@ impl super::App {
             .find(|c| c.id == self.settings.preferred_mask)
             .cloned()
             .or_else(|| mask_choices.first().cloned());
-        let mask_row = row![
-            text(t(lang, "Mask profile")).size(13).width(130),
+        let mask_picker: Element<Message> = if self.profiles_locked() {
+            text(
+                selected_choice
+                    .map(|c| c.display)
+                    .unwrap_or_else(|| self.settings.preferred_mask.clone()),
+            )
+            .size(14)
+            .into()
+        } else {
             pick_list(mask_choices, selected_choice, |c: MaskChoice| {
                 Message::MaskOptionChanged(c.id)
             })
-            .width(200),
+            .width(200)
+            .into()
+        };
+        let mask_row = row![
+            text(t(lang, "Mask profile")).size(14).width(130),
+            mask_picker
         ]
         .spacing(8)
         .align_y(Alignment::Center);
-        let mask_desc = text(mask_opt.desc(lang)).size(11).color(muted);
+        let mask_desc = text(mask_opt.desc(lang)).size(12).color(muted);
 
         // Polymorphic masks only make sense with a concrete (non-"auto") base mask —
         // mirrors the Windows/macOS/iOS GUIs, which all disable this control on "auto".
@@ -491,12 +194,15 @@ impl super::App {
             self.settings.preferred_mask != "auto" && !self.settings.preferred_mask.is_empty();
         let polymorphic_row = checkbox(self.settings.polymorphic_mask)
             .label(t(lang, "Polymorphic (per-session unique shape)"))
-            .on_toggle_maybe(mask_is_preset.then_some(Message::TogglePolymorphicMask));
+            .on_toggle_maybe(
+                (mask_is_preset && !self.profiles_locked())
+                    .then_some(Message::TogglePolymorphicMask),
+            );
         let polymorphic_desc = text(t(
             lang,
             "Each session gets a unique variant of the selected mask. Not used with \"Auto\".",
         ))
-        .size(11)
+        .size(12)
         .color(muted);
 
         // Stack the two toggles vertically: side by side they overflowed a
@@ -504,17 +210,21 @@ impl super::App {
         let feedback_row = column![
             checkbox(self.settings.share_mask_feedback)
                 .label(t(lang, "Share blocked-mask feedback"))
-                .on_toggle(Message::ToggleShareMaskFeedback),
+                .on_toggle_maybe(
+                    (!self.profiles_locked()).then_some(Message::ToggleShareMaskFeedback)
+                ),
             checkbox(self.settings.receive_mask_hints)
                 .label(t(lang, "Receive mask hints for my region"))
-                .on_toggle(Message::ToggleReceiveMaskHints),
+                .on_toggle_maybe(
+                    (!self.profiles_locked()).then_some(Message::ToggleReceiveMaskHints)
+                ),
         ]
         .spacing(6);
 
         let country_code_row = row![
-            text(t(lang, "Country code")).size(13).width(130),
+            text(t(lang, "Country code")).size(14).width(130),
             text_input("DE", &self.settings.country_code)
-                .on_input(Message::CountryCodeChanged)
+                .on_input_maybe((!self.profiles_locked()).then_some(Message::CountryCodeChanged))
                 .width(80),
         ]
         .spacing(8)
@@ -522,33 +232,35 @@ impl super::App {
 
         let kill_switch_row = checkbox(self.settings.kill_switch)
             .label(t(lang, "Kill switch"))
-            .on_toggle(Message::ToggleKillSwitch);
+            .on_toggle_maybe((!self.profiles_locked()).then_some(Message::ToggleKillSwitch));
         let autostart_row = checkbox(self.settings.autostart)
             .label(t(lang, "Start on login"))
             .on_toggle(Message::ToggleAutostart);
 
         let dns_row = row![
-            text(t(lang, "DNS proxy")).size(13).width(130),
+            text(t(lang, "DNS proxy")).size(14).width(130),
             text_input("127.0.0.1:5300", &self.settings.dns_proxy)
-                .on_input(Message::DnsProxyChanged)
+                .on_input_maybe((!self.profiles_locked()).then_some(Message::DnsProxyChanged))
                 .width(Length::Fill),
         ]
         .spacing(8)
         .align_y(Alignment::Center);
 
         let routes_row = row![
-            text(t(lang, "Exclude routes")).size(13).width(130),
+            text(t(lang, "Exclude routes")).size(14).width(130),
             text_input("10.0.0.0/8, 192.168.0.0/16", &self.settings.exclude_routes)
-                .on_input(Message::ExcludeRoutesChanged)
+                .on_input_maybe((!self.profiles_locked()).then_some(Message::ExcludeRoutesChanged))
                 .width(Length::Fill),
         ]
         .spacing(8)
         .align_y(Alignment::Center);
 
         let include_routes_row = row![
-            text(t(lang, "Include routes only")).size(13).width(130),
+            text(self.tr("Добавить сети", "Include networks"))
+                .size(14)
+                .width(130),
             text_input("10.0.0.0/8", &self.settings.include_routes)
-                .on_input(Message::IncludeRoutesChanged)
+                .on_input_maybe((!self.profiles_locked()).then_some(Message::IncludeRoutesChanged))
                 .width(Length::Fill),
         ]
         .spacing(8)
@@ -556,7 +268,7 @@ impl super::App {
 
         let socks5_addr_input: Element<Message> = if self.settings.socks5_enabled {
             text_input("127.0.0.1:1080", &self.settings.socks5_addr)
-                .on_input(Message::Socks5AddrChanged)
+                .on_input_maybe((!self.profiles_locked()).then_some(Message::Socks5AddrChanged))
                 .width(Length::Fill)
                 .into()
         } else {
@@ -565,7 +277,7 @@ impl super::App {
         let socks5_row = row![
             checkbox(self.settings.socks5_enabled)
                 .label(t(lang, "SOCKS5 proxy"))
-                .on_toggle(Message::ToggleSocks5),
+                .on_toggle_maybe((!self.profiles_locked()).then_some(Message::ToggleSocks5)),
             Space::new().width(8),
             socks5_addr_input,
         ]
@@ -583,50 +295,61 @@ impl super::App {
             Space::new().width(Length::Fill),
         ]
         .align_y(Alignment::Center);
-        let bootstrap_desc_text = text(bootstrap_desc(lang)).size(11).color(muted);
+        let bootstrap_desc_text = text(bootstrap_desc(lang)).size(12).color(muted);
 
         let bootstrap_box: Element<Message> = if self.bootstrap_open {
             let cdn_row = row![
-                text(t(lang, "Bootstrap CDN URL")).size(13).width(130),
+                text(t(lang, "Bootstrap CDN URL")).size(14).width(130),
                 text_input(
                     "https://cdn.example.com/bootstrap.json",
                     &self.settings.bootstrap_cdn_url
                 )
-                .on_input(Message::BootstrapCdnUrlChanged)
+                .on_input_maybe(
+                    (!self.profiles_locked()).then_some(Message::BootstrapCdnUrlChanged)
+                )
                 .width(Length::Fill),
             ]
             .spacing(8)
             .align_y(Alignment::Center);
             let telegram_token_row = row![
                 text(t(lang, "Bootstrap Telegram token"))
-                    .size(13)
+                    .size(14)
                     .width(130),
                 text_input("123456:ABC-DEF...", &self.settings.bootstrap_telegram_token)
-                    .on_input(Message::BootstrapTelegramTokenChanged)
+                    .secure(true)
+                    .on_input_maybe(
+                        (!self.profiles_locked()).then_some(Message::BootstrapTelegramTokenChanged)
+                    )
                     .width(Length::Fill),
             ]
             .spacing(8)
             .align_y(Alignment::Center);
             let telegram_chat_row = row![
-                text(t(lang, "Bootstrap Telegram chat")).size(13).width(130),
+                text(t(lang, "Bootstrap Telegram chat")).size(14).width(130),
                 text_input("@aivpn_channel", &self.settings.bootstrap_telegram_chat)
-                    .on_input(Message::BootstrapTelegramChatChanged)
+                    .on_input_maybe(
+                        (!self.profiles_locked()).then_some(Message::BootstrapTelegramChatChanged)
+                    )
                     .width(Length::Fill),
             ]
             .spacing(8)
             .align_y(Alignment::Center);
             let github_row = row![
-                text(t(lang, "Bootstrap GitHub repo")).size(13).width(130),
+                text(t(lang, "Bootstrap GitHub repo")).size(14).width(130),
                 text_input("owner/repo", &self.settings.bootstrap_github)
-                    .on_input(Message::BootstrapGithubChanged)
+                    .on_input_maybe(
+                        (!self.profiles_locked()).then_some(Message::BootstrapGithubChanged)
+                    )
                     .width(Length::Fill),
             ]
             .spacing(8)
             .align_y(Alignment::Center);
             let signing_key_row = row![
-                text(t(lang, "Server signing key")).size(13).width(130),
+                text(t(lang, "Server signing key")).size(14).width(130),
                 text_input("base64 ed25519 pubkey", &self.settings.server_signing_key)
-                    .on_input(Message::ServerSigningKeyChanged)
+                    .on_input_maybe(
+                        (!self.profiles_locked()).then_some(Message::ServerSigningKeyChanged)
+                    )
                     .width(Length::Fill),
             ]
             .spacing(8)
@@ -683,7 +406,7 @@ impl super::App {
             } else {
                 self.log_lines
                     .iter()
-                    .map(|l| text(l).size(11).into())
+                    .map(|l| text(l).size(12).into())
                     .collect()
             };
             scrollable(
@@ -754,80 +477,55 @@ impl super::App {
         // connected"/error state if attempted at the wrong time.
         let install_wizard_section = self.view_install_wizard_section();
 
-        // Wrap everything in a scrollable so settings + log are reachable
-        // in windows smaller than the full content height.
-        container(
-            scrollable(
-                column![
-                    header,
-                    Space::new().height(4),
-                    rule::horizontal(1),
-                    Space::new().height(6),
-                    status_card,
-                    fallback_badge,
-                    Space::new().height(8),
-                    rule::horizontal(1),
-                    Space::new().height(6),
-                    profiles_header,
-                    Space::new().height(4),
-                    profiles_list,
-                    Space::new().height(6),
-                    row![diag_btn, Space::new().width(8), bench_label].align_y(Alignment::Center),
-                    Space::new().height(4),
-                    rule::horizontal(1),
-                    Space::new().height(6),
-                    adaptive_row,
-                    adaptive_desc,
-                    Space::new().height(2),
-                    mask_row,
-                    mask_desc,
-                    Space::new().height(2),
-                    polymorphic_row,
-                    polymorphic_desc,
-                    Space::new().height(2),
-                    feedback_row,
-                    country_code_row,
-                    Space::new().height(2),
-                    row![kill_switch_row, Space::new().width(16), autostart_row]
-                        .align_y(Alignment::Center),
-                    dns_row,
-                    routes_row,
-                    include_routes_row,
-                    socks5_row,
-                    // Single separator after SOCKS5; the recording block adds its
-                    // own trailing separator only when connected (see recording_block).
-                    Space::new().height(6),
-                    rule::horizontal(1),
-                    recording_block,
-                    Space::new().height(6),
-                    admin_section,
-                    Space::new().height(6),
-                    pool_section,
-                    Space::new().height(6),
-                    audit_section,
-                    Space::new().height(6),
-                    server_settings_section,
-                    Space::new().height(6),
-                    install_wizard_section,
-                    Space::new().height(6),
-                    bootstrap_header,
-                    bootstrap_box,
-                    Space::new().height(4),
-                    self.view_ext_section(),
-                    Space::new().height(4),
-                    rule::horizontal(1),
-                    log_header,
-                    log_box,
-                    Space::new().height(4),
-                ]
-                .padding(16)
-                .spacing(4),
-            )
-            .height(Length::Fill),
-        )
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .into()
+        let locked_notice: Element<Message> = if self.profiles_locked()
+            && matches!(page, UiPage::Routes | UiPage::Masks | UiPage::Settings)
+        {
+            text(self.tr(
+                "Параметры соединения доступны после отключения VPN.",
+                "Disconnect VPN to edit connection settings.",
+            ))
+            .size(14)
+            .color(muted)
+            .into()
+        } else {
+            text(self.tr(
+                "Параметры соединения применяются при следующем подключении.",
+                "Connection settings apply to the next connection.",
+            ))
+            .size(12)
+            .color(muted)
+            .into()
+        };
+        match page {
+            UiPage::Routes => column![
+                self.section_title(self.tr("Маршруты", "Routes")),
+                text(self.tr("Общие параметры клиента", "Shared client settings")).size(14).color(muted),
+                locked_notice, dns_row, include_routes_row, routes_row,
+                text(self.route_summary()).size(14),
+                text(self.tr("Полный туннель и mTLS задаются в профиле.", "Full tunnel and mTLS belong to the profile.")).size(14),
+                self.edit_profile_button(),
+            ].spacing(16).into(),
+            UiPage::Masks => column![
+                self.section_title(self.tr("Маски и адаптивность", "Masks and adaptation")),
+                text(self.tr("Общие параметры клиента", "Shared client settings")).size(14).color(muted),
+                locked_notice, adaptive_row, adaptive_desc, mask_row, mask_desc, polymorphic_row,
+                polymorphic_desc, feedback_row, country_code_row, self.view_ext_section(),
+            ].spacing(14).into(),
+            UiPage::Settings => column![
+                self.section_title(self.tr("Настройки", "Settings")),
+                self.view_appearance_settings(), rule::horizontal(1), autostart_row,
+                text(self.tr("Запускает приложение при входе. VPN подключается вручную.", "Starts the app at login. Connect VPN manually.")).size(12).color(muted),
+                rule::horizontal(1), locked_notice, kill_switch_row, socks5_row,
+            ].spacing(16).into(),
+            UiPage::Service => column![
+                self.section_title(self.tr("Сервис", "Service")),
+                diag_btn, bench_label, recording_block, admin_section, pool_section, audit_section,
+                server_settings_section, install_wizard_section, bootstrap_header, bootstrap_box,
+                rule::horizontal(1), log_header, log_box,
+                text(self.tr("Закрытие окна оставляет приложение в трее. Для выхода выберите «Завершить» в трее.", "Closing the window keeps the app in the tray. Choose Quit in the tray to exit.")).size(12).color(muted),
+            ].spacing(14).into(),
+            _ => Space::new().into(),
+        }
     }
 
     /// Admin client-management panel body. Only ever called from
@@ -845,7 +543,7 @@ impl super::App {
     /// read-only metadata.
     fn view_admin_section(&self, can_mutate: bool) -> Element<'_, Message> {
         let lang = self.settings.lang.as_str();
-        let is_dark = self.settings.dark_mode;
+        let is_dark = self.is_dark();
         let muted = if is_dark {
             Color::from_rgb(0.62, 0.64, 0.70)
         } else {
@@ -863,7 +561,7 @@ impl super::App {
                 .on_press(Message::ToggleAdminPanel)
                 .style(button::text),
             if !can_mutate {
-                text(t(lang, "View only")).size(11).color(muted).into()
+                text(t(lang, "View only")).size(12).color(muted).into()
             } else {
                 Element::from(Space::new().width(0))
             },
@@ -915,16 +613,16 @@ impl super::App {
         if can_mutate {
             let adding = self.admin_busy_id.as_deref() == Some("");
             let selected = exit_node_selected(&self.admin_new_exit_node, &exit_choices);
-            let add_row = row![
+            let add_row = column![
                 text_input(t(lang, "Name"), &self.admin_new_name)
                     .on_input(Message::AdminNewNameChanged)
-                    .width(Length::FillPortion(2)),
+                    .width(Length::Fill),
                 checkbox(self.admin_new_one_time)
                     .label(t(lang, "One-time"))
                     .on_toggle(Message::AdminNewOneTimeToggled),
                 text_input("expires (RFC3339, optional)", &self.admin_new_expires)
                     .on_input(Message::AdminNewExpiresChanged)
-                    .width(Length::FillPortion(2)),
+                    .width(Length::Fill),
                 pick_list(
                     exit_choices.clone(),
                     selected,
@@ -933,7 +631,7 @@ impl super::App {
                 .width(120),
                 text_input(t(lang, "Exit node (optional)"), &self.admin_new_exit_node)
                     .on_input(Message::AdminNewExitNodeChanged)
-                    .width(Length::FillPortion(2)),
+                    .width(Length::Fill),
                 button(text(if adding {
                     t(lang, "Adding...")
                 } else {
@@ -944,8 +642,7 @@ impl super::App {
                         .then_some(Message::AdminAddClient)
                 ),
             ]
-            .spacing(6)
-            .align_y(Alignment::Center);
+            .spacing(8);
             body = body.push(add_row);
             body = body.push(exit_node_hint());
         }
@@ -960,26 +657,26 @@ impl super::App {
         for c in &self.admin_clients {
             let busy = self.admin_busy_id.as_deref() == Some(c.id.as_str());
             let title_row = row![
-                text(c.name.to_string()).size(13),
-                text(format!("[{}]", c.role_label())).size(11).color(muted),
+                text(c.name.to_string()).size(14),
+                text(format!("[{}]", c.role_label())).size(12).color(muted),
                 text(if c.enabled {
                     t(lang, "enabled")
                 } else {
                     t(lang, "disabled")
                 })
-                .size(11)
+                .size(12)
                 .color(if c.enabled { muted } else { danger }),
                 if c.one_time {
-                    text(t(lang, "one-time")).size(11).color(muted)
+                    text(t(lang, "one-time")).size(12).color(muted)
                 } else {
-                    text("").size(11)
+                    text("").size(12)
                 },
                 if let Some(exit) = &c.exit_node {
                     text(format!("{}: {}", t(lang, "Exit"), exit))
-                        .size(11)
+                        .size(12)
                         .color(muted)
                 } else {
-                    text("").size(11)
+                    text("").size(12)
                 },
             ]
             .spacing(8)
@@ -1010,13 +707,13 @@ impl super::App {
             } else if can_mutate && self.admin_edit_id.as_deref() == Some(c.id.as_str()) {
                 let edit_selected = exit_node_selected(&self.admin_edit_exit_node, &exit_choices);
                 card = card.push(
-                    row![
+                    column![
                         text_input(t(lang, "Name"), &self.admin_edit_name)
                             .on_input(Message::AdminEditNameChanged)
-                            .width(Length::FillPortion(2)),
+                            .width(Length::Fill),
                         text_input("expires (RFC3339)", &self.admin_edit_expires)
                             .on_input(Message::AdminEditExpiresChanged)
-                            .width(Length::FillPortion(2)),
+                            .width(Length::Fill),
                         pick_list(
                             exit_choices.clone(),
                             edit_selected,
@@ -1025,15 +722,14 @@ impl super::App {
                         .width(120),
                         text_input("host:port", &self.admin_edit_exit_node)
                             .on_input(Message::AdminEditExitNodeChanged)
-                            .width(Length::FillPortion(2)),
+                            .width(Length::Fill),
                         button(t(lang, "Save"))
                             .on_press_maybe((!busy).then_some(Message::AdminEditSave)),
                         button(t(lang, "Cancel"))
                             .on_press(Message::AdminEditCancel)
                             .style(button::secondary),
                     ]
-                    .spacing(6)
-                    .align_y(Alignment::Center),
+                    .spacing(8),
                 );
                 card = card.push(exit_node_hint());
             } else if can_mutate {
@@ -1063,7 +759,8 @@ impl super::App {
                             .style(button::danger),
                     ]
                     .spacing(4)
-                    .align_y(Alignment::Center),
+                    .align_y(Alignment::Center)
+                    .wrap(),
                 );
             }
             // Viewer: no row actions at all. "Key" used to be offered here as
@@ -1076,7 +773,7 @@ impl super::App {
             if let Some((kid, key)) = &self.admin_key_view {
                 if kid == &c.id {
                     card = card.push(
-                        scrollable(text(key).size(11))
+                        scrollable(text(key).size(12))
                             .width(Length::Fill)
                             .height(50),
                     );
@@ -1093,10 +790,11 @@ impl super::App {
                                 .style(button::secondary),
                         ]
                         .spacing(6)
-                        .align_y(Alignment::Center),
+                        .align_y(Alignment::Center)
+                        .wrap(),
                     );
                     if self.admin_qr_loading.as_deref() == Some(c.id.as_str()) {
-                        card = card.push(text(t(lang, "Generating QR...")).size(11).color(muted));
+                        card = card.push(text(t(lang, "Generating QR...")).size(12).color(muted));
                     }
                     if let Some((qid, handle)) = &self.admin_qr {
                         if qid == &c.id {
@@ -1143,7 +841,7 @@ impl super::App {
     /// from `view_main` behind `is_connected && admin_role == Some(2)`.
     fn view_pool_section(&self) -> Element<'_, Message> {
         let lang = self.settings.lang.as_str();
-        let is_dark = self.settings.dark_mode;
+        let is_dark = self.is_dark();
         let muted = if is_dark {
             Color::from_rgb(0.62, 0.64, 0.70)
         } else {
@@ -1238,22 +936,22 @@ impl super::App {
                 } else {
                     t(lang, "unverified")
                 })
-                .size(11)
+                .size(12)
                 .color(if n.verified { good } else { muted }),
                 text(if n.connected {
                     t(lang, "connected")
                 } else {
                     t(lang, "offline")
                 })
-                .size(11)
+                .size(12)
                 .color(if n.connected { good } else { muted }),
                 if n.revoked {
-                    text(t(lang, "revoked")).size(11).color(danger)
+                    text(t(lang, "revoked")).size(12).color(danger)
                 } else {
-                    text("").size(11)
+                    text("").size(12)
                 },
                 text(format!("{}: {}", t(lang, "Last seen"), last_seen))
-                    .size(11)
+                    .size(12)
                     .color(muted),
             ]
             .spacing(8)
@@ -1308,7 +1006,7 @@ impl super::App {
     /// network call.
     fn view_server_settings_section(&self) -> Element<'_, Message> {
         let lang = self.settings.lang.as_str();
-        let is_dark = self.settings.dark_mode;
+        let is_dark = self.is_dark();
         let muted = if is_dark {
             Color::from_rgb(0.62, 0.64, 0.70)
         } else {
@@ -1404,7 +1102,7 @@ impl super::App {
 
         // ── Active mask override (per-client, live) ─────────────────────
         body = body.push(rule::horizontal(1));
-        body = body.push(text(t(lang, "Active mask override")).size(13));
+        body = body.push(text(t(lang, "Active mask override")).size(14));
         let client_choices = admin_client_choices(&self.admin_clients);
         let selected_client = self
             .server_settings_mask_client
@@ -1443,21 +1141,30 @@ impl super::App {
             .align_y(Alignment::Center),
         );
         if client_choices.is_empty() {
-            body = body.push(text(t(lang, "No clients loaded yet")).size(11).color(muted));
+            body = body.push(text(t(lang, "No clients loaded yet")).size(12).color(muted));
         }
         if mask_choices.is_empty() {
             body = body.push(
                 text(t(lang, "No mask catalog received yet (connect once first)"))
-                    .size(11)
+                    .size(12)
                     .color(muted),
             );
         }
 
         // ── Global exit node (pool default, restart required) ───────────
         body = body.push(rule::horizontal(1));
-        body = body.push(text(t(lang, "Global exit node (pool default)")).size(13));
-        let exit_choices = exit_node_choices(lang, &self.pool_nodes);
-        let exit_selected = exit_node_selected(&self.server_settings_exit_node, &exit_choices);
+        body = body.push(text(t(lang, "Global exit node (pool default)")).size(14));
+        let mut exit_choices = exit_node_choices(lang, &self.pool_nodes);
+        exit_choices[0].display = if lang == "ru" {
+            "Отключить"
+        } else {
+            "Disable"
+        }
+        .into();
+        let exit_selected = self
+            .server_settings_exit_selected
+            .then(|| exit_node_selected(&self.server_settings_exit_node, &exit_choices))
+            .flatten();
         body = body.push(
             row![
                 pick_list(
@@ -1470,7 +1177,9 @@ impl super::App {
                     .on_input(Message::ServerSettingsExitNodeChanged)
                     .width(Length::FillPortion(2)),
                 button(t(lang, "Apply")).on_press_maybe(
-                    (!self.server_settings_busy && !pending_active)
+                    (self.server_settings_exit_selected
+                        && !self.server_settings_busy
+                        && !pending_active)
                         .then_some(Message::ServerSettingsApplyExitNode)
                 ),
             ]
@@ -1498,7 +1207,7 @@ impl super::App {
     /// here at all, nothing in this panel ever mutates anything.
     fn view_audit_section(&self) -> Element<'_, Message> {
         let lang = self.settings.lang.as_str();
-        let is_dark = self.settings.dark_mode;
+        let is_dark = self.is_dark();
         let muted = if is_dark {
             Color::from_rgb(0.62, 0.64, 0.70)
         } else {
@@ -1566,19 +1275,19 @@ impl super::App {
         for e in self.audit_entries.iter().rev() {
             let entry_row = row![
                 text(e.ts.clone())
-                    .size(11)
+                    .size(12)
                     .color(muted)
                     .width(Length::FillPortion(2)),
-                text(format!("[{}]", e.actor)).size(11).color(muted),
+                text(format!("[{}]", e.actor)).size(12).color(muted),
                 text(e.action.clone())
                     .size(12)
                     .width(Length::FillPortion(2)),
                 text(e.target.clone())
-                    .size(11)
+                    .size(12)
                     .color(muted)
                     .width(Length::FillPortion(2)),
                 text(e.result.clone())
-                    .size(11)
+                    .size(12)
                     .color(if e.result == "ok" { good } else { danger }),
             ]
             .spacing(8)
@@ -1616,7 +1325,7 @@ impl super::App {
     /// => streaming/result step).
     fn view_install_wizard_section(&self) -> Element<'_, Message> {
         let lang = self.settings.lang.as_str();
-        let is_dark = self.settings.dark_mode;
+        let is_dark = self.is_dark();
         let muted = if is_dark {
             Color::from_rgb(0.62, 0.64, 0.70)
         } else {
@@ -1657,7 +1366,7 @@ impl super::App {
             let log_items: Vec<Element<Message>> = self
                 .install_log
                 .iter()
-                .map(|l| text(l).size(11).into())
+                .map(|l| text(l).size(12).into())
                 .collect();
             body = body.push(
                 scrollable(
@@ -1703,7 +1412,7 @@ impl super::App {
                     );
                     if let Some(key) = &self.install_connection_key {
                         body = body.push(
-                            scrollable(text(key).size(11))
+                            scrollable(text(key).size(12))
                                 .width(Length::Fill)
                                 .height(50),
                         );
@@ -1822,10 +1531,10 @@ impl super::App {
 
         if self.install_script_open {
             if let Some((sha, script)) = &self.install_script {
-                body = body.push(text(format!("SHA256: {sha}")).size(11).color(muted));
+                body = body.push(text(format!("SHA256: {sha}")).size(12).color(muted));
                 body = body.push(scrollable(text(script.clone()).size(10)).height(140));
             } else {
-                body = body.push(text(t(lang, "Loading...")).size(11).color(muted));
+                body = body.push(text(t(lang, "Loading...")).size(12).color(muted));
             }
             body = body.push(
                 button(t(lang, "Close"))
@@ -1900,12 +1609,20 @@ impl super::App {
             DialogMode::None => "",
         };
 
-        let name_input =
-            text_input("Profile name", &self.dlg_name).on_input(Message::DlgNameChanged);
-        let key_input =
-            text_input("aivpn:// connection key", &self.dlg_key).on_input(Message::DlgKeyChanged);
-        let mtls_input = text_input("mTLS cert path (optional)", &self.dlg_mtls_cert)
-            .on_input(Message::DlgMtlsCertChanged);
+        let name_input = text_input(self.tr("Название профиля", "Profile name"), &self.dlg_name)
+            .id("profile-name")
+            .on_input(Message::DlgNameChanged)
+            .on_submit(Message::DlgSave);
+        let key_input = text_input("aivpn://", &self.dlg_key)
+            .on_input(Message::DlgKeyChanged)
+            .secure(!self.dlg_key_visible)
+            .on_submit(Message::DlgSave);
+        let mtls_input = text_input(
+            self.tr("Путь к сертификату", "Certificate path"),
+            &self.dlg_mtls_cert,
+        )
+        .on_input(Message::DlgMtlsCertChanged)
+        .on_submit(Message::DlgSave);
 
         let error_row: Element<Message> = if let Some(e) = &self.dlg_error {
             text(e)
@@ -1934,13 +1651,31 @@ impl super::App {
                 Space::new().height(8),
                 text(t(lang, "Connection key")).size(12),
                 key_input,
+                button(self.tr(
+                    if self.dlg_key_visible {
+                        "Скрыть ключ"
+                    } else {
+                        "Показать ключ"
+                    },
+                    if self.dlg_key_visible {
+                        "Hide key"
+                    } else {
+                        "Show key"
+                    }
+                ))
+                .on_press(Message::ToggleKeyVisibility)
+                .style(button::text),
                 Space::new().height(8),
                 text(t(lang, "mTLS cert path (optional)")).size(12),
-                mtls_input,
+                row![
+                    mtls_input,
+                    button(self.tr("Обзор...", "Browse...")).on_press(Message::BrowseMtlsCert)
+                ]
+                .spacing(8),
                 Space::new().height(6),
                 checkbox(self.dlg_full_tunnel)
                     .label(if lang == "ru" {
-                        "Full tunnel (весь трафик через VPN)"
+                        "Весь трафик через VPN"
                     } else {
                         "Full tunnel (route all traffic through VPN)"
                     })
@@ -1956,23 +1691,29 @@ impl super::App {
         .style(|theme: &Theme| {
             let palette = theme.extended_palette();
             container::Style {
-                background: Some(Background::Color(palette.background.strong.color)),
+                background: Some(Background::Color(palette.background.weak.color)),
                 border: Border {
                     radius: 8.0.into(),
                     width: 1.0,
-                    color: palette.background.weak.color,
+                    color: palette.background.strong.color,
                 },
                 ..Default::default()
             }
         })
-        .width(420);
+        .width(Length::Fill)
+        .max_width(520);
 
-        container(dialog_content)
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .align_x(iced::alignment::Horizontal::Center)
-            .align_y(iced::alignment::Vertical::Center)
-            .into()
+        container(
+            container(scrollable(dialog_content))
+                .width(Length::Fill)
+                .max_width(520),
+        )
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .align_x(iced::alignment::Horizontal::Center)
+        .align_y(iced::alignment::Vertical::Center)
+        .padding(20)
+        .into()
     }
 
     /// Render the extra settings section declared by the descriptor.
@@ -1982,7 +1723,7 @@ impl super::App {
     /// descriptor (the public build) it returns empty space, so no extra UI
     /// appears at all.
     fn view_ext_section(&self) -> Element<'_, Message> {
-        use iced::widget::{checkbox, pick_list, text, text_input, Space};
+        use iced::widget::{checkbox, pick_list, text, Space};
 
         let Some(desc) = &self.ext_descriptor else {
             return Space::new().height(0).into();
@@ -2027,7 +1768,7 @@ impl super::App {
                     if matches!(f.kind, aivpn_common::ui_ext::FieldKind::Secret) {
                         input = input.secure(true);
                     }
-                    row![text(f.label.clone()).size(13).width(160), input]
+                    row![text(f.label.clone()).size(14).width(160), input]
                         .spacing(8)
                         .align_y(Alignment::Center)
                         .into()
@@ -2040,7 +1781,7 @@ impl super::App {
                     let sel = options.get(selected).cloned();
                     let opts = options.clone();
                     row![
-                        text(f.label.clone()).size(13).width(160),
+                        text(f.label.clone()).size(14).width(160),
                         pick_list(options.clone(), sel, move |chosen| {
                             let idx = opts.iter().position(|o| o == &chosen).unwrap_or(0);
                             Message::ExtSelectChanged(key.clone(), idx)
@@ -2054,7 +1795,7 @@ impl super::App {
             col = col.push(row_el);
         }
 
-        col = col.push(button(text("Применить").size(13)).on_press(Message::ExtApply));
+        col = col.push(button(text("Применить").size(14)).on_press(Message::ExtApply));
         col.into()
     }
 }

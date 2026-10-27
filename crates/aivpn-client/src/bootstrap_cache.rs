@@ -1,5 +1,5 @@
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -7,9 +7,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 
 use aivpn_common::error::{Error, Result};
-use aivpn_common::mask::{
-    current_unix_secs, derive_bootstrap_candidates, BootstrapDescriptor, MaskProfile,
-};
+use aivpn_common::mask::{current_unix_secs, BootstrapDescriptor, MaskProfile};
 
 /// Sticky last-known-good mask (client). Set on the first real DATA RX of a
 /// session and reused in AUTO mode across reconnects instead of re-deriving from
@@ -19,11 +17,16 @@ use aivpn_common::mask::{
 /// mobile cores' `LAST_GOOD_MASK`.
 pub static LAST_GOOD_MASK: Mutex<Option<MaskProfile>> = Mutex::new(None);
 
+#[cfg(test)]
+// Проверка stall держит guard целиком, настоящий DATA writer - только при записи.
+pub(crate) static STICKY_MASK_TEST_LOCK: Mutex<()> = Mutex::new(());
+
 /// Liveness half of the sticky-mask fix (client). Counts consecutive SHORT
 /// sessions that ended on the data watchdog while a sticky mask was in use, so a
 /// mask that keeps getting throttled is abandoned (LAST_GOOD_MASK cleared) and
 /// AUTO explores a different one, instead of looping on it forever.
 static DATA_STALL_STREAK: AtomicU32 = AtomicU32::new(0);
+static DATA_EXPLORATION_ROUND: AtomicU32 = AtomicU32::new(0);
 /// A session that stayed up at least this long is a working mask; a later stall
 /// is a transient hiccup, so the streak resets and the mask stays sticky.
 const HEALTHY_SESSION_MIN: Duration = Duration::from_secs(45);
@@ -42,6 +45,7 @@ pub fn note_data_stall_and_maybe_explore(established: Instant) {
     if n >= DATA_STALL_EXPLORE_THRESHOLD {
         *LAST_GOOD_MASK.lock().unwrap_or_else(|e| e.into_inner()) = None;
         DATA_STALL_STREAK.store(0, Ordering::Relaxed);
+        DATA_EXPLORATION_ROUND.fetch_add(1, Ordering::Relaxed);
         tracing::warn!(
             "sticky mask produced {n} short data-stall sessions — clearing it so auto-mask can try a different mask"
         );
@@ -50,40 +54,16 @@ pub fn note_data_stall_and_maybe_explore(established: Instant) {
 
 const CACHE_FILE_NAME: &str = "bootstrap_descriptors.json";
 const MAX_CACHED_DESCRIPTORS: usize = 8;
+static CACHE_WRITE_LOCK: Mutex<()> = Mutex::new(());
 
-/// Bootstrap descriptor ids excluded from `select_initial_mask` for the
-/// lifetime of this process. `production-secure` builds must never fall back
-/// to an unsigned builtin mask, but without any resilience net a cached
-/// descriptor whose signer rotated its key (or an epoch the server no longer
-/// retains) wedges the client on the same dead handshake forever — selection
-/// is otherwise a deterministic newest-`created_at`-first pick. Excluding a
-/// proven-unmatchable descriptor id (without deleting it from disk — a
-/// multi-epoch server may still accept it later) lets selection advance to
-/// the next-newest still-valid SIGNED descriptor instead. See main.rs's
-/// `#[cfg(feature = "production-secure")]` handshake-fallback block.
-static EXCLUDED_DESCRIPTOR_IDS: Mutex<Vec<String>> = Mutex::new(Vec::new());
-
-/// Mark a descriptor id as unmatchable for this run's `select_initial_mask`.
-/// Idempotent. Returns `true` if this was a new exclusion.
-pub fn exclude_descriptor(descriptor_id: &str) -> bool {
-    let mut ids = EXCLUDED_DESCRIPTOR_IDS
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    if ids.iter().any(|id| id == descriptor_id) {
-        false
-    } else {
-        ids.push(descriptor_id.to_string());
-        true
-    }
+struct VolatileCache {
+    directory: Option<PathBuf>,
+    descriptors: Vec<BootstrapDescriptor>,
 }
-
-fn is_excluded(descriptor_id: &str) -> bool {
-    EXCLUDED_DESCRIPTOR_IDS
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .iter()
-        .any(|id| id == descriptor_id)
-}
+static VOLATILE_CACHE: Mutex<VolatileCache> = Mutex::new(VolatileCache {
+    directory: None,
+    descriptors: Vec::new(),
+});
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct BootstrapCacheFile {
@@ -97,43 +77,112 @@ fn cache_dir() -> PathBuf {
     std::env::temp_dir().join("aivpn")
 }
 
-fn cache_path() -> PathBuf {
-    cache_dir().join(CACHE_FILE_NAME)
-}
-
-fn load_cache_file() -> BootstrapCacheFile {
-    let path = cache_path();
-    fs::read_to_string(path)
+fn load_cache_file(path: &Path) -> BootstrapCacheFile {
+    crate::secure_write::read_state_file(path, 32 * 1024 * 1024)
         .ok()
-        .and_then(|json| serde_json::from_str(&json).ok())
+        .and_then(|json| serde_json::from_slice(&json).ok())
         .unwrap_or_default()
 }
 
 pub fn load_descriptors() -> Vec<BootstrapDescriptor> {
     let now = current_unix_secs();
-    let mut descriptors = load_cache_file().descriptors;
+    let directory = cache_dir();
+    let mut descriptors = load_cache_file(&directory.join(CACHE_FILE_NAME)).descriptors;
+    let memory = VOLATILE_CACHE
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    if memory.directory.as_ref() == Some(&directory) {
+        for descriptor in &memory.descriptors {
+            descriptors.retain(|saved| saved.descriptor_id != descriptor.descriptor_id);
+            descriptors.push(descriptor.clone());
+        }
+    }
+    drop(memory);
     descriptors.retain(|descriptor| descriptor.expires_at.saturating_add(24 * 3600) >= now);
     descriptors.sort_by(|left, right| right.created_at.cmp(&left.created_at));
     descriptors
 }
 
-pub fn select_initial_mask(preshared_key: Option<&[u8; 32]>) -> Option<MaskProfile> {
-    let now = current_unix_secs();
-    for descriptor in load_descriptors() {
-        if is_excluded(&descriptor.descriptor_id) {
-            continue;
-        }
-        if !descriptor.is_valid_at(now) {
-            continue;
-        }
-        if let Some(mask) = derive_bootstrap_candidates(&descriptor, preshared_key)
-            .into_iter()
-            .next()
-        {
-            return Some(mask);
-        }
+pub fn select_initial_mask_for_attempt(
+    preshared_key: Option<&[u8; 32]>,
+    fail_streak: u32,
+    trusted_key: Option<&[u8; 32]>,
+) -> Option<MaskProfile> {
+    select_cached_candidate(
+        &load_descriptors(),
+        preshared_key,
+        fail_streak,
+        trusted_key,
+        DATA_EXPLORATION_ROUND.load(Ordering::Relaxed),
+    )
+}
+
+pub fn select_initial_mask_with_preference(
+    preshared_key: Option<&[u8; 32]>,
+    fail_streak: u32,
+    trusted_key: Option<&[u8; 32]>,
+    preferred: Option<&str>,
+) -> Option<MaskProfile> {
+    select_cached_candidate_with_preference(
+        &load_descriptors(),
+        preshared_key,
+        fail_streak,
+        trusted_key,
+        DATA_EXPLORATION_ROUND.load(Ordering::Relaxed),
+        preferred,
+    )
+}
+
+fn select_cached_candidate(
+    descriptors: &[BootstrapDescriptor],
+    preshared_key: Option<&[u8; 32]>,
+    fail_streak: u32,
+    trusted_key: Option<&[u8; 32]>,
+    exploration_round: u32,
+) -> Option<MaskProfile> {
+    select_cached_candidate_with_preference(
+        descriptors,
+        preshared_key,
+        fail_streak,
+        trusted_key,
+        exploration_round,
+        None,
+    )
+}
+
+fn select_cached_candidate_with_preference(
+    descriptors: &[BootstrapDescriptor],
+    preshared_key: Option<&[u8; 32]>,
+    fail_streak: u32,
+    trusted_key: Option<&[u8; 32]>,
+    exploration_round: u32,
+    preferred: Option<&str>,
+) -> Option<MaskProfile> {
+    #[cfg(feature = "production-secure")]
+    if trusted_key.is_none() {
+        return None;
     }
-    None
+    // Общий файл может содержать профили разных серверов. Проверка при
+    // записи не заменяет проверку при чтении с ключом текущего подключения.
+    let trusted: Vec<_> = descriptors
+        .iter()
+        .filter(|descriptor| validate_descriptor_signature(descriptor, trusted_key).is_ok())
+        .cloned()
+        .collect();
+    let attempt = fail_streak.saturating_add(
+        exploration_round.saturating_mul(aivpn_common::mask::HANDSHAKE_FALLBACK_THRESHOLD),
+    );
+    if let Some(candidate) = preferred.and_then(|name| {
+        aivpn_common::mask::preferred_bootstrap_candidate_for_attempt(
+            &trusted,
+            preshared_key,
+            name,
+            attempt,
+        )
+    }) {
+        return Some(candidate);
+    }
+    aivpn_common::mask::bootstrap_candidate_for_attempt(&trusted, preshared_key, attempt)
 }
 
 /// Advisory file lock guarding `store_descriptor`'s read-modify-write of the
@@ -143,45 +192,104 @@ pub fn select_initial_mask(preshared_key: Option<&[u8; 32]>) -> Option<MaskProfi
 /// same pre-mutation state and each write back a version missing the
 /// other's newly-fetched descriptor — a silent lost update (the atomic
 /// tmp+rename already prevents outright file corruption, just not this).
-/// Held for the lifetime of the returned guard; released automatically when
-/// the underlying fd is closed on Drop. Unix-only (flock) — best-effort
-/// no-op elsewhere.
+/// Блокировка удерживается до завершения записи. Если файл занят, сохранение
+/// пропускается с ошибкой, а поток VPN продолжает работать. Unix использует flock.
 #[cfg(unix)]
 struct CacheFileLock {
     _file: std::fs::File,
 }
 
 #[cfg(unix)]
-impl CacheFileLock {
-    fn acquire() -> Option<Self> {
+impl Drop for CacheFileLock {
+    fn drop(&mut self) {
         use std::os::unix::io::AsRawFd;
-        let dir = cache_dir();
-        let _ = fs::create_dir_all(&dir);
-        let lock_path = dir.join("bootstrap_descriptors.lock");
+        // Одного close недостаточно: fd мог попасть в параллельно созданного
+        // ребенка до его exec. Снимаем lock независимо от оставшихся копий fd.
+        unsafe {
+            libc::flock(self._file.as_raw_fd(), libc::LOCK_UN);
+        }
+    }
+}
+
+#[cfg(unix)]
+impl CacheFileLock {
+    fn acquire(dir: &Path) -> Result<Self> {
+        use std::os::unix::{
+            fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
+            io::AsRawFd,
+        };
         let file = std::fs::OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(false)
-            .open(&lock_path)
-            .ok()?;
-        // SAFETY: flock(2) on a valid, owned fd with a plain integer
-        // operation flag. LOCK_EX blocks until the lock is available, so
-        // concurrent store_descriptor calls serialize their
-        // read-modify-write instead of interleaving. The lock is released
-        // automatically (by the kernel) when this fd is closed, including
-        // on process crash — no stale-lock cleanup needed.
-        let ret = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
-        if ret != 0 {
-            return None;
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(dir.join("bootstrap_descriptors.lock"))?;
+        let metadata = file.metadata()?;
+        if !metadata.is_file() || metadata.uid() != unsafe { libc::geteuid() } {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "Некорректный lock-файл кеша",
+            )
+            .into());
         }
-        Some(Self { _file: file })
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+        // Кеш необязателен: чужая блокировка не должна останавливать прием VPN.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        Ok(Self { _file: file })
     }
 }
 
 pub fn store_descriptor(descriptor: BootstrapDescriptor) -> Result<()> {
+    let directory = cache_dir();
+    // Проверенный сетевой дескриптор остается доступен, даже если диск занят.
+    let mut memory = VOLATILE_CACHE
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    if memory.directory.as_ref() != Some(&directory) {
+        memory.directory = Some(directory.clone());
+        memory.descriptors.clear();
+    }
+    memory
+        .descriptors
+        .retain(|saved| saved.descriptor_id != descriptor.descriptor_id);
+    memory.descriptors.insert(0, descriptor.clone());
+    memory.descriptors.truncate(MAX_CACHED_DESCRIPTORS);
+    drop(memory);
+    store_descriptor_at(descriptor, &directory)
+}
+
+fn store_descriptor_at(descriptor: BootstrapDescriptor, dir: &Path) -> Result<()> {
+    let _writer = CACHE_WRITE_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    fs::create_dir_all(&dir)?;
+    let metadata = fs::symlink_metadata(&dir)?;
+    if !metadata.is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "Кеш должен находиться в обычном каталоге",
+        )
+        .into());
+    }
     #[cfg(unix)]
-    let _lock = CacheFileLock::acquire();
-    let mut cache = load_cache_file();
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        if metadata.uid() != unsafe { libc::geteuid() } {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "Каталог кеша принадлежит другому пользователю",
+            )
+            .into());
+        }
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
+    }
+    #[cfg(unix)]
+    let _lock = CacheFileLock::acquire(&dir)?;
+    let final_path = dir.join(CACHE_FILE_NAME);
+    let mut cache = load_cache_file(&final_path);
     cache
         .descriptors
         .retain(|existing| existing.descriptor_id != descriptor.descriptor_id);
@@ -191,25 +299,13 @@ pub fn store_descriptor(descriptor: BootstrapDescriptor) -> Result<()> {
         .sort_by(|left, right| right.created_at.cmp(&left.created_at));
     cache.descriptors.truncate(MAX_CACHED_DESCRIPTORS);
 
-    let dir = cache_dir();
-    fs::create_dir_all(&dir).map_err(Error::Io)?;
-    // Lock the cache directory to the owner (0700). This matters most on the
-    // no-$HOME fallback to a shared, predictable /tmp/aivpn path: without it a
-    // local attacker could pre-create or symlink the directory and plant
-    // bootstrap descriptors (which select the initial mask, and are stored
-    // without signature verification when no signing key is configured). Owner
-    // dirs like ~/.aivpn are equally fine at 0700.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = fs::set_permissions(&dir, fs::Permissions::from_mode(0o700));
-    }
     let json = serde_json::to_string_pretty(&cache)
         .map_err(|e| Error::Session(format!("Failed to serialize bootstrap cache: {}", e)))?;
-    let final_path = cache_path();
-    let tmp_path = final_path.with_extension("tmp");
-    fs::write(&tmp_path, json).map_err(Error::Io)?;
-    fs::rename(&tmp_path, &final_path).map_err(Error::Io)
+    if crate::secure_write::write_status_best_effort(&final_path, json.as_bytes()) {
+        Ok(())
+    } else {
+        Err(std::io::Error::other("Не удалось сохранить кеш bootstrap").into())
+    }
 }
 
 fn validate_descriptor_signature(
@@ -259,14 +355,23 @@ pub fn store_verified_descriptor(
     descriptor: BootstrapDescriptor,
     trusted_key: Option<&[u8; 32]>,
 ) -> Result<()> {
+    verify_received_descriptor(&descriptor, trusted_key)?;
+    store_descriptor(descriptor)
+}
+
+/// Проверка подписи не зависит от возможности сохранить необязательный кеш.
+pub(crate) fn verify_received_descriptor(
+    descriptor: &BootstrapDescriptor,
+    trusted_key: Option<&[u8; 32]>,
+) -> Result<()> {
     #[cfg(feature = "production-secure")]
     if trusted_key.is_none() {
         return Err(Error::Session(
             "production-secure: сохранение дескриптора требует ключ подписи сервера".into(),
         ));
     }
-    validate_descriptor_signature(&descriptor, trusted_key)?;
-    store_descriptor(descriptor)
+    validate_descriptor_signature(descriptor, trusted_key)?;
+    Ok(())
 }
 
 pub async fn refresh_from_urls(urls: &[String], signing_key: Option<&[u8; 32]>) -> usize {
@@ -334,6 +439,43 @@ mod tests {
     use super::*;
     use aivpn_common::mask::BootstrapDescriptor;
 
+    #[cfg(unix)]
+    #[test]
+    fn cache_lock_is_released_even_if_a_child_inherited_its_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "aivpn-bootstrap-fork-{:032x}",
+            rand::random::<u128>()
+        ));
+        fs::create_dir(&dir).unwrap();
+        let held = CacheFileLock::acquire(&dir).unwrap();
+        let mut pipe = [-1; 2];
+        assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0);
+        if pid == 0 {
+            // После fork в дочернем процессе вызываются только системные функции.
+            unsafe {
+                libc::close(pipe[1]);
+                let mut byte = 0u8;
+                libc::read(pipe[0], (&mut byte as *mut u8).cast(), 1);
+                libc::_exit(0);
+            }
+        }
+        unsafe {
+            libc::close(pipe[0]);
+        }
+        drop(held);
+        let reacquired = CacheFileLock::acquire(&dir);
+        // Сначала освобождаем ребенка, даже если повторный захват не удался.
+        unsafe {
+            libc::close(pipe[1]);
+            libc::waitpid(pid, std::ptr::null_mut(), 0);
+        }
+        let held = reacquired.expect("Унаследованный fd не должен удерживать снятый lock");
+        drop(held);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
     fn make_desc() -> BootstrapDescriptor {
         BootstrapDescriptor {
             descriptor_id: "test_desc".to_string(),
@@ -346,6 +488,112 @@ mod tests {
             kdf_salt: [0u8; 32],
             signature: [0u8; 64],
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cache_ignores_a_planted_temporary_symlink_and_does_not_wait_on_a_lock() {
+        let dir = std::env::temp_dir().join(format!(
+            "aivpn-bootstrap-write-{:032x}",
+            rand::random::<u128>()
+        ));
+        fs::create_dir(&dir).unwrap();
+        let victim = dir.join("victim");
+        fs::write(&victim, b"original").unwrap();
+        std::os::unix::fs::symlink(&victim, dir.join("bootstrap_descriptors.tmp")).unwrap();
+        store_descriptor_at(make_desc(), &dir).unwrap();
+        assert_eq!(fs::read(&victim).unwrap(), b"original");
+        assert_eq!(
+            load_cache_file(&dir.join(CACHE_FILE_NAME))
+                .descriptors
+                .len(),
+            1
+        );
+        let _held = CacheFileLock::acquire(&dir).unwrap();
+        assert!(store_descriptor_at(make_desc(), &dir).is_err());
+        drop(_held);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn repeated_short_data_stalls_advance_the_signed_candidate() {
+        use ed25519_dalek::Signer;
+        let _cache_guard = STICKY_MASK_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let previous_round = DATA_EXPLORATION_ROUND.swap(0, Ordering::Relaxed);
+        let previous_streak = DATA_STALL_STREAK.swap(0, Ordering::Relaxed);
+        let previous_sticky = LAST_GOOD_MASK.lock().unwrap().take();
+        let signing = ed25519_dalek::SigningKey::from_bytes(&[43; 32]);
+        let key = signing.verifying_key().to_bytes();
+        let mut descriptor = make_desc();
+        descriptor.base_mask_ids = vec!["webrtc_zoom_v3".into()];
+        descriptor.candidate_count = 4;
+        descriptor.signature = signing.sign(&descriptor.signing_bytes()).to_bytes();
+        let descriptors = [descriptor];
+        let first = select_cached_candidate(&descriptors, None, 0, Some(&key), 0).unwrap();
+        *LAST_GOOD_MASK.lock().unwrap() = Some(first.clone());
+        for _ in 0..DATA_STALL_EXPLORE_THRESHOLD {
+            note_data_stall_and_maybe_explore(Instant::now() - Duration::from_secs(5));
+        }
+        let next = select_cached_candidate(
+            &descriptors,
+            None,
+            0,
+            Some(&key),
+            DATA_EXPLORATION_ROUND.load(Ordering::Relaxed),
+        )
+        .unwrap();
+        assert_ne!(first.mask_id, next.mask_id);
+        assert!(LAST_GOOD_MASK.lock().unwrap().is_none());
+        DATA_EXPLORATION_ROUND.store(previous_round, Ordering::Relaxed);
+        DATA_STALL_STREAK.store(previous_streak, Ordering::Relaxed);
+        *LAST_GOOD_MASK.lock().unwrap() = previous_sticky;
+    }
+
+    #[test]
+    fn cached_selection_rechecks_the_current_server_key() {
+        use ed25519_dalek::Signer;
+        let first_key = ed25519_dalek::SigningKey::from_bytes(&[41; 32]);
+        let second_key = ed25519_dalek::SigningKey::from_bytes(&[42; 32]);
+        let mut first = make_desc();
+        first.descriptor_id = "server-first".into();
+        first.base_mask_ids = vec!["webrtc_zoom_v3".into()];
+        first.signature = first_key.sign(&first.signing_bytes()).to_bytes();
+        let mut second = first.clone();
+        second.descriptor_id = "server-second".into();
+        second.signature = second_key.sign(&second.signing_bytes()).to_bytes();
+        let descriptors = vec![second, first];
+        let candidate = select_cached_candidate(
+            &descriptors,
+            None,
+            0,
+            Some(&first_key.verifying_key().to_bytes()),
+            0,
+        )
+        .unwrap();
+        assert!(candidate.mask_id.starts_with("bootstrap:server-first:"));
+        let candidate = select_cached_candidate(
+            &descriptors,
+            None,
+            999,
+            Some(&second_key.verifying_key().to_bytes()),
+            0,
+        )
+        .unwrap();
+        assert!(candidate.mask_id.starts_with("bootstrap:server-second:"));
+        let mut forged = descriptors[0].clone();
+        forged.signature[0] ^= 1;
+        assert!(select_cached_candidate(
+            &[forged],
+            None,
+            0,
+            Some(&second_key.verifying_key().to_bytes()),
+            0
+        )
+        .is_none());
+        #[cfg(feature = "production-secure")]
+        assert!(select_cached_candidate(&descriptors, None, 0, None, 0).is_none());
     }
 
     #[test]
@@ -375,5 +623,87 @@ mod tests {
         let desc = make_desc();
         let err = store_verified_descriptor(desc, None).unwrap_err();
         assert!(err.to_string().contains("production-secure"), "{err}");
+    }
+}
+
+#[cfg(test)]
+mod preferred_reconnect_tests {
+    use super::*;
+    use aivpn_common::mask::{preset_masks, SpoofProtocol};
+    use ed25519_dalek::Signer;
+
+    #[test]
+    fn preferred_reconnect_cache_rechecks_signatures_and_preserves_exact_slots() {
+        let now = current_unix_secs();
+        let owner = ed25519_dalek::SigningKey::from_bytes(&[71; 32]);
+        let foreign = ed25519_dalek::SigningKey::from_bytes(&[72; 32]);
+        let make = |id: &str, base: &str, signing: &ed25519_dalek::SigningKey| {
+            let mut descriptor = BootstrapDescriptor {
+                descriptor_id: id.into(),
+                version: 1,
+                created_at: now - 1,
+                expires_at: now + 3600,
+                base_mask_ids: vec![],
+                embedded_masks: vec![preset_masks::by_id(base).unwrap()],
+                candidate_count: 2,
+                kdf_salt: [73; 32],
+                signature: [0; 64],
+            };
+            descriptor.signature = signing.sign(&descriptor.signing_bytes()).to_bytes();
+            descriptor
+        };
+        let other = make("foreign-quic", "quic_https_v2", &foreign);
+        let rtc = make("owner-rtc", "webrtc_zoom_v3", &owner);
+        let quic = make("owner-quic", "quic_https_v2", &owner);
+        let descriptors = [other.clone(), rtc.clone(), quic.clone()];
+        let original: Vec<_> = descriptors
+            .iter()
+            .map(BootstrapDescriptor::signing_bytes)
+            .collect();
+        let psk = [74; 32];
+        let key = owner.verifying_key().to_bytes();
+        let pool = aivpn_common::mask::derive_bootstrap_candidates(&quic, Some(&psk));
+        for attempt in [0, 3, 6, u32::MAX] {
+            let mask = select_cached_candidate_with_preference(
+                &descriptors,
+                Some(&psk),
+                attempt,
+                Some(&key),
+                2,
+                Some("quic_https_v2"),
+            )
+            .unwrap();
+            assert_eq!(mask.spoof_protocol, SpoofProtocol::QUIC);
+            assert!(mask.mask_id.starts_with("bootstrap:owner-quic:"));
+            assert!(pool
+                .iter()
+                .any(|candidate| rmp_serde::to_vec(candidate).unwrap()
+                    == rmp_serde::to_vec(&mask).unwrap()));
+        }
+        assert_eq!(
+            descriptors
+                .iter()
+                .map(BootstrapDescriptor::signing_bytes)
+                .collect::<Vec<_>>(),
+            original
+        );
+        let mut tampered = quic;
+        tampered.kdf_salt[0] ^= 1;
+        let untrusted = [other, rtc, tampered];
+        let opening = select_cached_candidate_with_preference(
+            &untrusted,
+            Some(&psk),
+            0,
+            Some(&key),
+            0,
+            Some("quic_https_v2"),
+        )
+        .unwrap();
+        assert!(opening.mask_id.starts_with("bootstrap:owner-rtc:"));
+        assert_eq!(
+            aivpn_common::mask::post_pfs_mask_preference(Some("quic_https_v2"), None, &opening)
+                .as_deref(),
+            Some("quic_https_v2")
+        );
     }
 }

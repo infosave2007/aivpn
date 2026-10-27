@@ -217,26 +217,17 @@ pub fn derive_session_keys(
     preshared_key: Option<&[u8; 32]>,
     eph_pub: &[u8; X25519_PUBLIC_KEY_SIZE],
 ) -> SessionKeys {
-    // IKM = dh_result || preshared_key (or just dh_result if no PSK)
-    let ikm: Vec<u8> = if let Some(psk) = preshared_key {
-        let mut buf = [0u8; 64];
-        buf[..32].copy_from_slice(dh_result);
-        buf[32..].copy_from_slice(psk);
-        buf.to_vec()
-    } else {
-        dh_result.to_vec()
-    };
+    let mut input = zeroize::Zeroizing::new(Vec::with_capacity(96));
+    input.extend_from_slice(dh_result);
+    if let Some(psk) = preshared_key {
+        input.extend_from_slice(psk);
+    }
+    input.extend_from_slice(eph_pub);
 
-    // Derive keys using BLAKE3 derive_key with different contexts
-    // Context strings are combined with key material for domain separation
-    let session_key_input: Vec<u8> = [ikm.clone(), eph_pub.to_vec()].concat();
-    let tag_secret_input: Vec<u8> = [ikm.clone(), eph_pub.to_vec()].concat();
-    let prng_seed_input: Vec<u8> = [ikm, eph_pub.to_vec()].concat();
-
-    let session_key_hash = blake3::derive_key(HKDF_SESSION_KEY_CONTEXT, &session_key_input);
-    let session_key_s2c_hash = blake3::derive_key(HKDF_SESSION_KEY_S2C_CONTEXT, &session_key_input);
-    let tag_secret_hash = blake3::derive_key(HKDF_TAG_SECRET_CONTEXT, &tag_secret_input);
-    let prng_seed_hash = blake3::derive_key(HKDF_PRNG_SEED_CONTEXT, &prng_seed_input);
+    let session_key_hash = blake3::derive_key(HKDF_SESSION_KEY_CONTEXT, &input);
+    let session_key_s2c_hash = blake3::derive_key(HKDF_SESSION_KEY_S2C_CONTEXT, &input);
+    let tag_secret_hash = blake3::derive_key(HKDF_TAG_SECRET_CONTEXT, &input);
+    let prng_seed_hash = blake3::derive_key(HKDF_PRNG_SEED_CONTEXT, &input);
 
     SessionKeys {
         packet_cipher: PacketCipher::Established,

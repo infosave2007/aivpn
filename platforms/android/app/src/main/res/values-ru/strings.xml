@@ -9,7 +9,7 @@
     <string name="status_error">Ошибка: %s</string>
     <string name="status_native_lib_unavailable">Ошибка: нативная библиотека недоступна — переустановите приложение</string>
     <string name="status_cert_rejected">Сервер отклонил сертификат — требуется повторное предоставление</string>
-    <string name="status_handshake_reject_one_time_used">Этот одноразовый ключ уже был использован</string>
+    <string name="status_handshake_reject_one_time_used">Ключ подключения привязан к другому устройству</string>
     <string name="status_handshake_reject_expired">Срок действия ключа клиента истёк</string>
     <string name="status_handshake_reject_disabled">Этот клиент отключён сервером</string>
     <string name="status_handshake_reject_unspecified">Сервер отклонил подключение</string>
@@ -85,7 +85,8 @@
     <string name="split_tunnel_hint_combined">%1$s через VPN, %2$s обходят VPN</string>
     <string name="split_tunnel_add_domain">Введите домен…</string>
     <string name="split_tunnel_domain_hint">Трафик к этим доменам обходит VPN</string>
-    <string name="split_tunnel_domain_note">IP-адреса определяются при подключении. Требуется Android 13+. Адреса CDN могут меняться.</string>
+    <string name="split_tunnel_domain_note">IP-адреса определяются при подключении. Адреса CDN могут меняться. Исключаются до 64 адресов каждого семейства IP; остальные адреса остаются внутри VPN.</string>
+    <string name="split_tunnel_domain_limit">Можно исключить не более 64 доменов.</string>
     <string name="split_tunnel_apps_unavailable">Список приложений недоступен — запрещено разрешение QUERY_ALL_PACKAGES</string>
     <string name="split_tunnel_domain_invalid">Неверный формат домена</string>
     <string name="split_tunnel_domain_exists">Домен уже добавлен</string>
@@ -253,6 +254,22 @@
     <string name="admin_reject_reason_prefix">Отклонено: %s</string>
     <string name="admin_error_generic">Ошибка запроса (%d)</string>
     <string name="admin_error_with_reason">Ошибка запроса (%1$d): %2$s</string>
+    <string name="admin_error_public_endpoint">На сервере не настроен публичный адрес. Администратор сервера должен указать адрес для ключей подключения.</string>
+    <string name="admin_error_server_key">На сервере не настроен ключ сервера. Администратор сервера должен проверить настройки ключа.</string>
+    <string name="admin_error_invalid_request">Сервер отклонил параметры запроса. Проверьте введенные значения.</string>
+    <string name="admin_error_forbidden">Ваша роль на сервере не разрешает это действие.</string>
+    <string name="admin_error_not_found">Запрошенный объект или действие не найдено. Обновите данные и проверьте версию сервера.</string>
+    <string name="admin_error_conflict">Запрос конфликтует с текущим состоянием сервера. Обновите данные и повторите действие.</string>
+    <string name="admin_error_rate_limited">Слишком много запросов. Подождите и повторите запрос.</string>
+    <string name="admin_error_internal">На сервере произошла внутренняя ошибка. Повторите запрос позже.</string>
+    <string name="admin_error_unavailable">Служба управления сервером временно недоступна. Повторите запрос позже.</string>
+    <string name="admin_error_client_database">База клиентов на сервере временно недоступна. Повторите запрос позже.</string>
+    <string name="admin_error_unreachable">Сервер не ответил. Проверьте подключение к VPN и повторите запрос: время ожидания могло истечь.</string>
+    <string name="admin_error_timeout">Время ожидания ответа сервера истекло. Повторите запрос.</string>
+    <string name="admin_error_invalid_response">Сервер вернул некорректный ответ. Проверьте совместимость версий клиента и сервера.</string>
+    <string name="admin_error_retry_after">Повторите через %d сек.</string>
+    <string name="admin_error_retry_message">%1$s %2$s</string>
+    <string name="pool_health_error">Не удалось получить состояние пула: %s</string>
     <string name="admin_hint_exit_node">Выходной узел (необязательно, host:port — пусто = глобальный по умолчанию)</string>
     <string name="admin_hint_exit_node_live">Персональный выходной узел применяется вживую, без переподключения. Глобальный по умолчанию — только после перезапуска сервера.</string>
     <string name="admin_exit_option_default">(по умолчанию)</string>
@@ -290,7 +307,8 @@
     <string name="server_settings_mask_none_loaded">Список масок пока недоступен — подключитесь к VPN и откройте этот экран заново, либо введите id маски вручную.</string>
     <string name="server_settings_exit_title">Глобальный выходной узел по умолчанию (пул)</string>
     <string name="server_settings_exit_caption">Применяется только после ПЕРЕЗАПУСКА сервера — не вживую. Это резервный вариант для любого клиента без собственного персонального выходного узла.</string>
-    <string name="server_settings_exit_hint">host:port — пусто = нет</string>
+    <string name="server_settings_exit_hint">host:port</string>
+    <string name="server_settings_clear_exit">Отключить общий выходной узел</string>
     <string name="server_settings_apply">Применить</string>
     <string name="server_settings_confirm">Подтвердить</string>
     <string name="server_settings_pending_banner">Подтвердите в течение %d с, иначе изменение будет автоматически откачено</string>
@@ -381,4 +399,6 @@
     <string name="install_marker_docker_missing">Docker не установлен на целевом хосте</string>
     <string name="install_marker_compose_missing">docker compose недоступен на целевом хосте</string>
     <string name="install_marker_container_not_running">Контейнер aivpn-server не сообщил о запуске</string>
+    <string name="bench_speed">Отдача: %1$.0f кбит/с  Загрузка: %2$.0f кбит/с</string>
+    <string name="bench_failed">Не удалось выполнить тест активной сессии</string>
 </resources>

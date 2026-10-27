@@ -25,6 +25,10 @@ struct RecordingResultSummary: Equatable {
 
 struct BenchResult {
     let p50ms: Int
+    let p95ms: Int
+    let lossPct: Double
+    let uploadKbps: Double
+    let downloadKbps: Double
     let quality: Int
     let serverAddr: String
     let date: Date
@@ -47,6 +51,7 @@ private enum TunnelMessageType: String {
     case stopRecord   = "record_stop"
     case getRecordStatus = "record_status"
     case mgmtRequest  = "mgmt_request"
+    case benchmark = "benchmark"
 }
 
 // MARK: - VPNManager
@@ -58,6 +63,8 @@ class VPNManager: ObservableObject {
     @Published var isConnecting: Bool = false
     @Published var isDisconnecting: Bool = false
     @Published var lastError: String?
+    private var connectionAction = UUID()
+    private let rejectionDefaultsKey = "tunnel_handshake_reject_reason"
     @Published var bytesSent: Int64 = 0
     @Published var bytesReceived: Int64 = 0
     @Published var connectionDuration: TimeInterval = 0
@@ -117,6 +124,7 @@ class VPNManager: ObservableObject {
         didSet { UserDefaults.standard.set(countryCode, forKey: "countryCode") }
     }
     @Published var benchResult: BenchResult?
+    @Published var benchError: String?
     @Published var isBenchRunning: Bool = false
     /// Set when the user explicitly denied the VPN configuration permission.
     /// retryManagerSetup is skipped while true so the system dialog is not re-shown on every foreground.
@@ -285,6 +293,11 @@ class VPNManager: ObservableObject {
                 handshakeRejectReason = 0
                 adminRole = 0
             }
+            let defaults = UserDefaults(suiteName: "group.com.aivpn.client")
+            if let reason = defaults?.object(forKey: rejectionDefaultsKey) as? Int {
+                defaults?.removeObject(forKey: rejectionDefaultsKey)
+                showHandshakeRejection(reason)
+            }
         @unknown default:
             break
         }
@@ -296,6 +309,11 @@ class VPNManager: ObservableObject {
         guard let manager = manager else { return }
         guard !isConnecting else { return }
         guard !isConnected else { return }
+        guard !isDisconnecting else { return }
+
+        let action = UUID()
+        connectionAction = action
+        UserDefaults(suiteName: "group.com.aivpn.client")?.removeObject(forKey: rejectionDefaultsKey)
 
         isConnecting = true
         lastError = nil
@@ -307,6 +325,8 @@ class VPNManager: ObservableObject {
         recordingCapabilityKnown = false
         lastRecordingResult = nil
         certRejected = false
+        handshakeRejected = false
+        handshakeRejectReason = 0
         adminRole = 0
 
         let proto = NETunnelProviderProtocol()
@@ -315,6 +335,7 @@ class VPNManager: ObservableObject {
         proto.includeAllNetworks = killSwitch
         var providerConfig: [String: Any] = [
             "fullTunnel": fullTunnel,
+            "profileId": key.id,
         ]
         // Hand the secret to the tunnel extension exclusively via a one-time
         // shared-Keychain token (App Group, kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly).
@@ -432,6 +453,7 @@ class VPNManager: ObservableObject {
                 KeychainStorage.shared.deleteHandoffToken(handoffToken)
                 if let token = certHandoffToken { KeychainStorage.shared.deleteHandoffToken(token) }
                 DispatchQueue.main.async {
+                    guard self.connectionAction == action else { return }
                     self.isConnecting = false
                     self.lastError = error.localizedDescription
                 }
@@ -440,6 +462,11 @@ class VPNManager: ObservableObject {
             // saveToPreferences callback runs on an arbitrary queue; marshal to main
             // before touching the manager/statusObserver and calling NetworkExtension API.
             DispatchQueue.main.async {
+                guard self.connectionAction == action else {
+                    KeychainStorage.shared.deleteHandoffToken(handoffToken)
+                    if let token = certHandoffToken { KeychainStorage.shared.deleteHandoffToken(token) }
+                    return
+                }
                 self.observeStatus()
                 do {
                     try (self.manager?.connection as? NETunnelProviderSession)?.startTunnel(options: nil)
@@ -458,19 +485,40 @@ class VPNManager: ObservableObject {
     }
 
     func disconnect() {
-        // Client parity #5: disable on-demand before stopping so the system
-        // doesn't immediately fight this intentional disconnect by bringing
-        // the tunnel back up on the next network-change evaluation —
-        // NEOnDemandRuleConnect() only applies while isOnDemandEnabled is
-        // true, and that flag persists in the saved profile independent of
-        // the stop below. Best-effort or not, stopTunnel() still fires
-        // synchronously right after — a user disconnect must never be
-        // silently delayed behind a preferences save.
+        let action = UUID()
+        connectionAction = action
+        guard let manager = manager else { return }
+        isDisconnecting = true
+        // Сначала сохраняем отключение on-demand, затем останавливаем туннель.
+        if manager.isOnDemandEnabled {
+            manager.isOnDemandEnabled = false
+            manager.saveToPreferences { [weak self] error in
+                DispatchQueue.main.async {
+                    guard let self = self, self.connectionAction == action else { return }
+                    if let error = error { self.lastError = error.localizedDescription }
+                    (manager.connection as? NETunnelProviderSession)?.stopTunnel()
+                    self.syncStatus()
+                }
+            }
+        } else {
+            (manager.connection as? NETunnelProviderSession)?.stopTunnel()
+            syncStatus()
+        }
+    }
+
+    private func showHandshakeRejection(_ reason: Int) {
+        let alreadyShown = handshakeRejected && handshakeRejectReason == reason
+        handshakeRejected = true
+        handshakeRejectReason = reason
+        let key = (1...3).contains(reason) ? "handshake_reject_reason_\(reason)" : "handshake_reject_reason_0"
+        lastError = LocalizationManager.shared.t(key)
+        if !alreadyShown {
+            postNotification(title: LocalizationManager.shared.t("handshake_rejected_title"), body: lastError ?? "")
+        }
         if let manager = manager, manager.isOnDemandEnabled {
             manager.isOnDemandEnabled = false
             manager.saveToPreferences { _ in }
         }
-        (manager?.connection as? NETunnelProviderSession)?.stopTunnel()
     }
 
     /// Called when app becomes active. Always reloads from preferences so that:
@@ -568,22 +616,7 @@ class VPNManager: ObservableObject {
                     body: LocalizationManager.shared.t("cert_rejected_body"))
             }
             if let rejected = r["handshake_rejected"] as? Bool, rejected, !self.handshakeRejected {
-                self.handshakeRejected = true
-                self.handshakeRejectReason = r["handshake_reject_reason"] as? Int ?? 0
-                // The extension's in-process reconnect loop already stopped
-                // retrying (see PacketTunnelProvider's aivpn_handshake_was_rejected
-                // check) — this is a one-time explanatory notification, not a
-                // prompt to retry, so pick body text per reason code.
-                let bodyKey: String
-                switch self.handshakeRejectReason {
-                case 1: bodyKey = "handshake_reject_reason_1"
-                case 2: bodyKey = "handshake_reject_reason_2"
-                case 3: bodyKey = "handshake_reject_reason_3"
-                default: bodyKey = "handshake_reject_reason_0"
-                }
-                self.postNotification(
-                    title: LocalizationManager.shared.t("handshake_rejected_title"),
-                    body: LocalizationManager.shared.t(bodyKey))
+                self.showHandshakeRejection(r["handshake_reject_reason"] as? Int ?? 0)
             }
             if let stateStr = r["recording_state"] as? String {
                 // Don't let the tunnel's "idle" overwrite terminal states the user
@@ -767,22 +800,28 @@ class VPNManager: ObservableObject {
     // MARK: - Benchmark
 
     func runBenchmark() {
-        guard let addr = selectedKey?.serverAddress, !addr.isEmpty else { return }
-        guard !isBenchRunning else { return }
+        guard isConnected, !isBenchRunning else { return }
         isBenchRunning = true
         benchResult = nil
-        DispatchQueue.global(qos: .utility).async { [weak self] in
-            runBenchPosix(serverAddr: addr) { p50, quality in
-                DispatchQueue.main.async {
-                    guard let self = self else { return }
-                    self.isBenchRunning = false
-                    // Always publish a result: p50 == 0 means unreachable, p50 == -1 means IPv6.
-                    // The UI reads p50ms <= 0 and renders "unreachable" / "N/A" accordingly.
-                    self.benchResult = BenchResult(
-                        p50ms: p50, quality: quality,
-                        serverAddr: addr, date: Date())
-                }
+        benchError = nil
+        let address = selectedKey?.serverAddress ?? ""
+        let action = connectionAction
+        sendMessage(type: .benchmark, body: [:]) { [weak self] response in
+            guard let self else { return }
+            self.isBenchRunning = false
+            guard self.connectionAction == action, self.isConnected else { return }
+            guard let response, response["error"] == nil,
+                  let p50 = response["latency_p50_ms"] as? Double,
+                  let quality = response["quality_score"] as? Int else {
+                self.benchError = response?["error"] as? String ?? LocalizationManager.shared.t("bench_failed")
+                return
             }
+            self.benchResult = BenchResult(
+                p50ms: Int(p50), p95ms: Int(response["latency_p95_ms"] as? Double ?? 0),
+                lossPct: response["packet_loss_pct"] as? Double ?? 0,
+                uploadKbps: response["throughput_up_kbps"] as? Double ?? 0,
+                downloadKbps: response["throughput_down_kbps"] as? Double ?? 0,
+                quality: quality, serverAddr: address, date: Date())
         }
     }
 
@@ -790,99 +829,4 @@ class VPNManager: ObservableObject {
         stopTimers()
         if let obs = statusObserver { NotificationCenter.default.removeObserver(obs) }
     }
-}
-
-// MARK: - UDP Latency Probe
-
-/// Sends UDP probes to `serverAddr` (host:port) for 5 seconds and calls
-/// completion with (p50ms, qualityScore 0–100) on the calling thread.
-/// p50 == 0 means unreachable or parse error. Not called from the main thread.
-func runBenchPosix(serverAddr: String, completion: (Int, Int) -> Void) {
-    let isIPv6Bracket = serverAddr.hasPrefix("[")
-    if isIPv6Bracket {
-        completion(-1, 0)
-        return
-    }
-
-    let colonIdx = serverAddr.lastIndex(of: ":")
-    guard let idx = colonIdx else { completion(0, 0); return }
-    let host = String(serverAddr[serverAddr.startIndex..<idx])
-    let portStr = String(serverAddr[serverAddr.index(after: idx)...])
-    guard let portNum = UInt16(portStr) else { completion(0, 0); return }
-
-    var sin = sockaddr_in()
-    sin.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
-    sin.sin_family = sa_family_t(AF_INET)
-    sin.sin_port = portNum.bigEndian
-    if inet_pton(AF_INET, host, &sin.sin_addr) != 1 {
-        // L4: not an IPv4 literal — a connection key may carry a hostname.
-        // Resolve it via getaddrinfo (IPv4 only: the probe socket is AF_INET),
-        // mirroring BootstrapDiscovery's getaddrinfo usage. Runs on a utility
-        // queue (see runBenchmark), so a blocking resolve is acceptable.
-        var hints = addrinfo(ai_flags: 0, ai_family: AF_INET,
-                             ai_socktype: SOCK_DGRAM, ai_protocol: 0,
-                             ai_addrlen: 0, ai_canonname: nil, ai_addr: nil, ai_next: nil)
-        var list: UnsafeMutablePointer<addrinfo>?
-        guard getaddrinfo(host, nil, &hints, &list) == 0, let first = list else {
-            completion(0, 0); return
-        }
-        defer { freeaddrinfo(first) }
-        var resolved: in_addr?
-        var node: UnsafeMutablePointer<addrinfo>? = first
-        while let cur = node {
-            if cur.pointee.ai_family == AF_INET, let sa = cur.pointee.ai_addr {
-                resolved = sa.withMemoryRebound(to: sockaddr_in.self, capacity: 1) {
-                    $0.pointee.sin_addr
-                }
-                break
-            }
-            node = cur.pointee.ai_next
-        }
-        guard let addr4 = resolved else { completion(0, 0); return }
-        sin.sin_addr = addr4
-    }
-
-    let fd = socket(AF_INET, SOCK_DGRAM, 0)
-    guard fd >= 0 else { completion(0, 0); return }
-    defer { Darwin.close(fd) }
-
-    var tv = timeval(tv_sec: 0, tv_usec: 500_000)
-    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
-
-    let probeData = Array("aivpn-bench-probe-v1".utf8)
-    var recvBuf = [UInt8](repeating: 0, count: 256)
-    let deadline = Date().addingTimeInterval(5.0)
-    var rtts: [Double] = []
-    var sent = 0
-
-    while Date() < deadline {
-        let t0 = Date()
-        sent += 1
-        withUnsafePointer(to: sin) { sinPtr in
-            sinPtr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
-                probeData.withUnsafeBytes { bp in
-                    _ = sendto(fd, bp.baseAddress, probeData.count, 0, sa,
-                               socklen_t(MemoryLayout<sockaddr_in>.size))
-                }
-            }
-        }
-        let n = recv(fd, &recvBuf, recvBuf.count, 0)
-        let elapsed = -t0.timeIntervalSinceNow * 1000.0
-        if n > 0 {
-            rtts.append(elapsed)
-        }
-    }
-
-    guard !rtts.isEmpty else { completion(0, 0); return }
-    let sorted = rtts.sorted()
-    let p50 = sorted[max(0, Int(Double(sorted.count) * 0.5) - 1)]
-    let lossPct = Double(max(0, sent - rtts.count)) / Double(sent) * 100.0
-    let quality: Int
-    switch (p50, lossPct) {
-    case _ where p50 < 50 && lossPct < 1:   quality = 95
-    case _ where p50 < 100 && lossPct < 3:  quality = 80
-    case _ where p50 < 200 && lossPct < 10: quality = 60
-    default: quality = 30
-    }
-    completion(Int(p50), quality)
 }

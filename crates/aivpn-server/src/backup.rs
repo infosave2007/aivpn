@@ -614,6 +614,29 @@ fn import_with_limits(
         }
     };
 
+    // Проверяли исходные bytes архива. Только после hash/MAC привязываем
+    // восстановленный JSON к выбранным оператором путям следующего запуска.
+    for (rel, bytes) in &mut staged {
+        if rel == "server.json" {
+            let mut config: serde_json::Value = serde_json::from_slice(bytes)
+                .map_err(|_| Error::Session("invalid server.json in backup".into()))?;
+            let object = config
+                .as_object_mut()
+                .ok_or_else(|| Error::Session("invalid server.json in backup".into()))?;
+            for (field, path) in [
+                ("clients_db", &opts.clients_db),
+                ("mask_dir", &opts.mask_dir),
+            ] {
+                let path = path.to_str().ok_or_else(|| {
+                    Error::Session(format!("{field}: путь восстановления должен быть UTF-8"))
+                })?;
+                object.insert(field.into(), serde_json::Value::String(path.into()));
+            }
+            *bytes = serde_json::to_vec(&config)
+                .map_err(|_| Error::Session("serialize restored server.json".into()))?;
+        }
+    }
+
     if dry_run {
         return Ok(ImportSummary {
             aivpn_version: manifest.aivpn_version.clone(),
@@ -951,6 +974,65 @@ mod tests {
         assert!(summary.signed, "a MAC-verified import must report signed");
         assert!(dst.path().join("clients.json").exists());
         assert!(dst.path().join("server.json").exists());
+    }
+
+    #[test]
+    fn destination_rebase_does_not_hide_tampered_archive_config_paths() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        let archive = src.path().join("backup.tar.gz");
+        make_signed_backup(src.path(), &archive);
+        std::fs::copy(
+            src.path().join(BACKUP_KEY_FILE),
+            dst.path().join(BACKUP_KEY_FILE),
+        )
+        .unwrap();
+        let original = read_archive(&archive);
+        let sentinel = b"existing-config";
+        std::fs::write(dst.path().join("server.json"), sentinel).unwrap();
+        for replace_hash in [false, true] {
+            let mut entries = original.clone();
+            let config = entries
+                .iter_mut()
+                .find(|(name, _)| name == "server.json")
+                .unwrap();
+            config.1 = serde_json::to_vec(&serde_json::json!({
+                "clients_db":"altered-source","mask_dir":"altered-masks",
+            }))
+            .unwrap();
+            let altered_hash = blake3::hash(&config.1).to_hex().to_string();
+            if replace_hash {
+                let manifest = entries
+                    .iter_mut()
+                    .find(|(name, _)| name == MANIFEST_NAME)
+                    .unwrap();
+                let mut value: BackupManifest = serde_json::from_slice(&manifest.1).unwrap();
+                value
+                    .content_hashes
+                    .insert("server.json".into(), altered_hash);
+                manifest.1 = serde_json::to_vec(&value).unwrap();
+            }
+            let refs: Vec<_> = entries
+                .iter()
+                .map(|(name, bytes)| (name.as_str(), bytes.clone()))
+                .collect();
+            let tampered = src.path().join("tampered-paths.tar.gz");
+            write_archive(&tampered, &refs);
+            let error = import_server(&tampered, dst.path(), false)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(if replace_hash {
+                "signature mismatch"
+            } else {
+                "content does not match"
+            }));
+            assert_eq!(
+                std::fs::read(dst.path().join("server.json")).unwrap(),
+                sentinel
+            );
+            assert!(!dst.path().join("clients.json").exists());
+            assert!(!dst.path().join("masks").exists());
+        }
     }
 
     /// Regression (MAC must bind the file SET): an attacker with write

@@ -41,7 +41,8 @@ pub fn take_recording_feedback_json() -> String {
 /// Android's [`PlatformIo`]: JNI socket protection, the `onTunnelReady`
 /// callback, and the take-once recording-feedback static polled from Kotlin.
 struct AndroidPlatform {
-    vm: JavaVM,
+    upload_shaping: aivpn_common::pacing::PacingMode,
+    vm: std::sync::Arc<JavaVM>,
     vpn_service: GlobalRef,
 }
 
@@ -74,6 +75,55 @@ impl VpnProtectGuard {
 }
 
 impl aivpn_common::transport::SocketGuard for VpnProtectGuard {
+    fn resolve<'a>(
+        &'a self,
+        host: &'a str,
+        port: u16,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Vec<std::net::SocketAddr>>> + Send + 'a>,
+    > {
+        let this = self.clone();
+        let host = host.to_owned();
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || {
+                let mut env = this
+                    .vm
+                    .attach_current_thread()
+                    .map_err(|error| Error::Session(format!("JNI attach: {error}")))?;
+                let result = (|| -> jni::errors::Result<Vec<std::net::SocketAddr>> {
+                    let name = env.new_string(host)?;
+                    let addresses = env
+                        .call_method(
+                            &this.vpn_service,
+                            "resolveTransportHost",
+                            "(Ljava/lang/String;)[Ljava/lang/String;",
+                            &[jni::objects::JValue::Object(name.as_ref())],
+                        )?
+                        .l()?;
+                    let addresses = jni::objects::JObjectArray::from(addresses);
+                    let mut out = Vec::new();
+                    for index in 0..env.get_array_length(&addresses)? {
+                        let item = jni::objects::JString::from(
+                            env.get_object_array_element(&addresses, index)?,
+                        );
+                        let text: String = env.get_string(&item)?.into();
+                        if let Ok(ip) = text.split('%').next().unwrap_or(&text).parse() {
+                            out.push(std::net::SocketAddr::new(ip, port));
+                        }
+                        env.delete_local_ref(item)?;
+                    }
+                    Ok(out)
+                })();
+                if env.exception_check().unwrap_or(false) {
+                    let _ = env.exception_clear();
+                }
+                result.map_err(|error| Error::Session(format!("DNS физической сети: {error}")))
+            })
+            .await
+            .map_err(|error| Error::Session(format!("DNS: {error}")))?
+        })
+    }
+
     fn protect(&self, fd: RawFd) -> Result<()> {
         vpn_protect(&self.vm, &self.vpn_service, fd)
     }
@@ -107,6 +157,54 @@ fn vpn_protect(vm: &JavaVM, vpn_service: &GlobalRef, fd: RawFd) -> Result<()> {
 }
 
 impl PlatformIo for AndroidPlatform {
+    fn upload_shaping(&self) -> Result<aivpn_common::pacing::PacingMode> {
+        Ok(self.upload_shaping)
+    }
+
+    fn configure_tunnel(
+        &self,
+        network: Option<&aivpn_common::network_config::ClientNetworkConfig>,
+    ) -> Result<Option<std::os::fd::OwnedFd>> {
+        use std::os::fd::FromRawFd;
+        let network = serde_json::to_string(&network)?;
+        let mut env = self
+            .vm
+            .attach_current_thread()
+            .map_err(|error| Error::Session(format!("JNI attach: {error}")))?;
+        let result = (|| -> jni::errors::Result<i32> {
+            let json = env.new_string(network)?;
+            env.call_method(
+                &self.vpn_service,
+                "configureTunnel",
+                "(Ljava/lang/String;)I",
+                &[jni::objects::JValue::Object(json.as_ref())],
+            )?
+            .i()
+        })();
+        if env.exception_check().unwrap_or(false) {
+            let _ = env.exception_clear();
+        }
+        let fd = result.map_err(|error| Error::Session(format!("Настройка TUN: {error}")))?;
+        if fd < 0 {
+            return Err(Error::Session("Настройка TUN отменена".into()));
+        }
+        // Kotlin передает отдельный dup, который теперь закрывает Rust.
+        Ok(Some(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) }))
+    }
+
+    fn resolve_host(
+        &self,
+        host: String,
+        port: u16,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Vec<std::net::SocketAddr>>> + Send>,
+    > {
+        let guard = VpnProtectGuard::new(self.vm.clone(), self.vpn_service.clone());
+        Box::pin(
+            async move { aivpn_common::transport::SocketGuard::resolve(&guard, &host, port).await },
+        )
+    }
+
     fn protect_socket(&self, fd: RawFd) -> Result<()> {
         vpn_protect(&self.vm, &self.vpn_service, fd)
     }
@@ -197,13 +295,30 @@ pub async fn run_tunnel_android(
         .lock()
         .unwrap_or_else(|e| e.into_inner()) = None;
 
+    // Общая политика применяется также к прямому UDP.
+    let policy_path = files_dir_config(&vm, &vpn_service)?;
+    let runtime = aivpn_common::transport::RuntimeConfig::load_default_file(&policy_path)
+        .map_err(|error| Error::Session(format!("локальная конфигурация: {error}")))?;
+    let upload_shaping = runtime.upload_shaping;
+
     // Open the alternative transport if one was configured. A build that
     // installed no factory has none to open and stays on direct UDP.
     let alt_transport: Option<std::sync::Arc<dyn aivpn_common::transport::DatagramTransport>> =
-        build_alt_transport(&vm, &vpn_service, transport_name, transport_params_json).await?;
+        build_alt_transport(
+            &vm,
+            &vpn_service,
+            transport_name,
+            transport_params_json,
+            runtime,
+        )
+        .await?;
 
     run_tunnel_generic(
-        AndroidPlatform { vm, vpn_service },
+        AndroidPlatform {
+            upload_shaping,
+            vm: std::sync::Arc::new(vm),
+            vpn_service,
+        },
         tun_fd_int,
         server_host,
         server_port,
@@ -241,6 +356,7 @@ async fn build_alt_transport(
     vpn_service: &GlobalRef,
     transport_name: Option<String>,
     transport_params_json: Option<String>,
+    runtime: aivpn_common::transport::RuntimeConfig,
 ) -> Result<Option<std::sync::Arc<dyn aivpn_common::transport::DatagramTransport>>> {
     use std::sync::Arc;
 
@@ -271,10 +387,37 @@ async fn build_alt_transport(
     let mut registry = aivpn_common::transport::TransportRegistry::new();
     registry.register(factory);
     let params = transport_params_json.unwrap_or_default().into_bytes();
-    let cfg = aivpn_common::transport::TransportConfig::new(name, params);
+    let cfg =
+        aivpn_common::transport::TransportConfig::new(name, params).with_runtime_config(runtime);
     let transport = registry
         .open(&cfg, guard)
         .await
         .map_err(|e| Error::Session(format!("open alt transport: {e}")))?;
     Ok(Some(transport))
+}
+
+/// `Context.getFilesDir().getAbsolutePath()` плюс имя общего файла.
+fn files_dir_config(vm: &JavaVM, vpn_service: &GlobalRef) -> Result<std::path::PathBuf> {
+    let mut env = vm
+        .attach_current_thread()
+        .map_err(|error| Error::Session(format!("JNI attach: {error}")))?;
+    let outcome: jni::errors::Result<String> = env.with_local_frame(8, |env| {
+        let file = env
+            .call_method(vpn_service, "getFilesDir", "()Ljava/io/File;", &[])?
+            .l()?;
+        let path = env
+            .call_method(&file, "getAbsolutePath", "()Ljava/lang/String;", &[])?
+            .l()?;
+        let path = jni::objects::JString::from(path);
+        let text = env.get_string(&path)?.into();
+        Ok(text)
+    });
+    if matches!(env.exception_check(), Ok(true)) {
+        let _ = env.exception_clear();
+    }
+    let directory = outcome.map_err(|error| Error::Session(format!("filesDir: {error}")))?;
+    if directory.is_empty() {
+        return Err(Error::Session("filesDir пуст".into()));
+    }
+    Ok(std::path::PathBuf::from(directory).join("config.json"))
 }

@@ -33,12 +33,14 @@ fn main() -> iced::Result {
         .subscription(App::subscription)
         .theme(App::theme)
         .window(iced::window::Settings {
-            size: Size::new(480.0, 420.0),
-            min_size: Some(Size::new(480.0, 420.0)),
+            size: Size::new(900.0, 640.0),
+            min_size: Some(Size::new(640.0, 480.0)),
+            exit_on_close_request: false,
             ..Default::default()
         })
         .settings(Settings {
             antialiasing: true,
+            default_text_size: iced::Pixels(14.0),
             ..Default::default()
         })
         .run()

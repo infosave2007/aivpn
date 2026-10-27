@@ -34,7 +34,7 @@ fn node(
     let seed = [91; 32];
     let signing = ed25519_dalek::SigningKey::from_bytes(&[92; 32]);
     let mut mask = preset_masks::webrtc_zoom_v3();
-    mask.sign(&signing);
+    mask.sign(&signing).unwrap();
     let masks = dir.join("masks");
     std::fs::create_dir_all(&masks).unwrap();
     std::fs::write(

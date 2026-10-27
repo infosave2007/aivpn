@@ -29,7 +29,7 @@ pub(super) fn t<'a>(lang: &str, key: &'a str) -> &'a str {
         "Share blocked-mask feedback" => "Делиться данными о заблокированных масках",
         "Receive mask hints for my region" => "Получать подсказки масок для моего региона",
         "Country code" => "Код страны",
-        "Kill switch" => "Kill switch",
+        "Kill switch" => "Блокировать трафик при потере VPN",
         "Start on login" => "Автозапуск",
         "DNS proxy" => "DNS прокси",
         "Exclude routes" => "Исключить маршруты",

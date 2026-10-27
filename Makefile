@@ -355,6 +355,7 @@ windows: releases/
 	fi; \
 	cp assets/brand/win/aivpn.ico "$$PACKAGE_DIR/aivpn.ico"; \
 	if command -v zip >/dev/null 2>&1; then \
+	    rm -f "$$ZIP_NAME"; \
 	    (cd "$$PACKAGE_DIR" && zip -r "../aivpn-windows-gui.zip" ./*); \
 	else \
 	    python3 -c "import zipfile,pathlib; pkg=pathlib.Path('$$PACKAGE_DIR'); \
@@ -454,6 +455,7 @@ ios:
 	    PAYLOAD="$$IOS_DIR/build/Payload"; \
 	    rm -rf "$$PAYLOAD"; mkdir -p "$$PAYLOAD"; \
 	    cp -r "$$APP_PATH" "$$PAYLOAD/"; \
+	    rm -f "$$DEST"; \
 	    (cd "$$IOS_DIR/build" && zip -qr "$$DEST" Payload); \
 	    rm -rf "$$PAYLOAD"; \
 	fi; \

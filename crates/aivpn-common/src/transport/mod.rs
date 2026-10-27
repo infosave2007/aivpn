@@ -47,6 +47,17 @@ use tokio::net::UdpSocket;
 
 use crate::error::{Error, Result};
 
+#[cfg(any(target_os = "linux", target_os = "macos", windows, test))]
+mod guarded_dns;
+#[cfg(windows)]
+mod windows_guard;
+#[cfg(windows)]
+pub use windows_guard::InterfaceGuard;
+#[cfg(target_os = "macos")]
+mod macos_guard;
+#[cfg(target_os = "macos")]
+pub use macos_guard::InterfaceGuard;
+
 #[cfg(unix)]
 use std::os::unix::io::{AsRawFd, RawFd};
 
@@ -54,6 +65,14 @@ use std::os::unix::io::{AsRawFd, RawFd};
 /// IP and 8-byte UDP headers). The ceiling of the transport, not of the tunnel:
 /// what the client actually sends is bounded by the tunnel MTU, far below this.
 pub const MAX_UDP_PAYLOAD: usize = 65_507;
+
+/// Адрес для состояния маски поверх транспорта, который сам выбирает свой маршрут.
+/// Имя VPN-сервера здесь не разрешается. TEST-NET используется только как метка
+/// виртуального peer и не должен попадать в системную таблицу маршрутов.
+pub fn logical_peer_addr(host: &str, port: u16) -> SocketAddr {
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    SocketAddr::new(host.parse().unwrap_or_else(|_| [192, 0, 2, 1].into()), port)
+}
 
 /// Which concrete transport is carrying the datagrams.
 ///
@@ -95,6 +114,11 @@ pub trait DatagramTransport: Send + Sync {
     /// Send one logical AIVPN datagram. Returns the number of bytes accepted.
     async fn send(&self, datagram: &[u8]) -> std::io::Result<usize>;
 
+    /// DATA и FEC не могут уходить через bootstrap до готовности носителя.
+    async fn send_data(&self, datagram: &[u8]) -> std::io::Result<usize> {
+        self.send(datagram).await
+    }
+
     /// Receive one logical AIVPN datagram into `buf`. Returns its length.
     async fn recv(&self, buf: &mut [u8]) -> std::io::Result<usize>;
 
@@ -120,6 +144,36 @@ pub trait DatagramTransport: Send + Sync {
     /// tunnel MTU; how a transport copes with a payload that would exceed its
     /// own limit is entirely its own business and invisible here.
     fn max_datagram(&self) -> usize;
+
+    /// Обновить протокольное состояние общего слоя масок.
+    fn set_mask_profile(&self, _mask: &crate::mask::MaskProfile) {}
+    fn needs_mask_bootstrap(&self) -> bool {
+        false
+    }
+    fn mask_data_ready(&self) -> bool {
+        true
+    }
+
+    /// Общий слой масок готовит предложение только для RTC-профиля.
+    /// Вызывающий код отправляет его по управляющему каналу после PFS.
+    async fn mask_state_offer(
+        &self,
+        _mask: &crate::mask::MaskProfile,
+    ) -> Result<Option<crate::mask_state::MaskState>> {
+        Ok(None)
+    }
+
+    async fn accept_mask_state(&self, _state: &crate::mask_state::MaskState) -> Result<()> {
+        Err(Error::InvalidPacket("Согласование маски не поддерживается"))
+    }
+
+    /// Включить ограниченную выборку внешних пакетов для self-gate.
+    fn observe_wire(&self) {}
+
+    /// None означает обычный транспорт без внешнего протокола маски.
+    fn take_wire_samples(&self) -> Option<Vec<Vec<u8>>> {
+        None
+    }
 
     /// Release the transport's resources. Idempotent: calling it twice, or on a
     /// transport that already failed, must not panic.
@@ -211,6 +265,10 @@ pub fn udp_transport(socket: Arc<UdpSocket>) -> SharedTransport {
     Arc::new(UdpTransport::new(socket))
 }
 
+/// Результат платформенного разрешения имени.
+pub type ResolveFuture<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<SocketAddr>>> + Send + 'a>>;
+
 /// Keeps a transport's own sockets out of the tunnel that transport feeds.
 ///
 /// Without this a transport's packets are routed back into the very tunnel they
@@ -229,7 +287,33 @@ pub fn udp_transport(socket: Arc<UdpSocket>) -> SharedTransport {
 /// `PlatformIo` hook looks similar but is deliberately **not** `Sync` — it
 /// carries iOS's raw Swift context pointer, which nothing synchronises — so it
 /// cannot be reused here. Platforms construct a small guard alongside it.
+pub type FirewallPeerHandler = Arc<dyn Fn(SocketAddr) -> Result<()> + Send + Sync>;
+
 pub trait SocketGuard: Send + Sync {
+    /// Подключить платформенный фильтр к уже известным и новым служебным адресам.
+    fn set_firewall_peer_handler(&self, _handler: Option<FirewallPeerHandler>) -> Result<()> {
+        Ok(())
+    }
+
+    /// Разрешает конкретный служебный адрес в платформенном фильтре.
+    fn allow_peer(&self, _peer: SocketAddr) -> Result<()> {
+        Ok(())
+    }
+
+    /// Нужна ли таблица адресов служебных соединений в PF.
+    fn uses_firewall_table(&self) -> bool {
+        false
+    }
+
+    /// Согласовать таблицу служебных адресов после загрузки правил PF.
+    fn set_firewall(&self, _active: bool) -> Result<()> {
+        Ok(())
+    }
+    /// Разрешает имя вне маршрутов VPN. Платформа может использовать свой резолвер.
+    fn resolve<'a>(&'a self, host: &'a str, port: u16) -> ResolveFuture<'a> {
+        Box::pin(async move { Ok(tokio::net::lookup_host((host, port)).await?.collect()) })
+    }
+
     /// Метка для согласования маршрутов и kill-switch.
     fn routing_mark(&self) -> Option<u32> {
         None
@@ -266,6 +350,12 @@ impl SocketGuard for NoSocketGuard {}
 /// Shared handle to the platform's guard.
 pub type SharedGuard = Arc<dyn SocketGuard>;
 
+/// Защита служебных сокетов Windows с выбором физического интерфейса.
+#[cfg(any(windows, target_os = "macos"))]
+pub fn desktop_socket_guard() -> SharedGuard {
+    Arc::new(InterfaceGuard::default())
+}
+
 /// Linux guard: stamps every socket with an `SO_MARK` value.
 ///
 /// The tunnel's own routing sends everything into the tunnel device. A
@@ -285,7 +375,7 @@ pub type SharedGuard = Arc<dyn SocketGuard>;
 /// the mark is inert and the sockets route normally — which is why the tunnel
 /// installs the rule before a marked transport is opened.
 #[cfg(target_os = "linux")]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct MarkGuard {
     mark: u32,
 }
@@ -308,6 +398,18 @@ impl MarkGuard {
 
 #[cfg(target_os = "linux")]
 impl SocketGuard for MarkGuard {
+    fn resolve<'a>(
+        &'a self,
+        host: &'a str,
+        port: u16,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<SocketAddr>>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            let resolvers = guarded_dns::system_servers();
+            guarded_dns::resolve(self, &resolvers, host, port).await
+        })
+    }
+
     fn routing_mark(&self) -> Option<u32> {
         Some(self.mark)
     }
@@ -345,16 +447,33 @@ pub fn no_socket_guard() -> SharedGuard {
     Arc::new(NoSocketGuard)
 }
 
+mod runtime_config;
+pub use runtime_config::{default_config_path, read_local_config, RuntimeConfig};
+
 /// Which transport to open, and the parameters it needs.
 ///
 /// The parameters are an **opaque blob**: this crate neither parses nor
 /// validates their contents, it only hands them to the factory that claimed the
 /// name. That keeps transport-specific configuration — whatever a given
 /// transport happens to need — out of the shared code entirely.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Clone, Default, PartialEq, Eq)]
 pub struct TransportConfig {
     name: String,
     params: Vec<u8>,
+    /// Локальная политика. Не смешивается с непрозрачными params.
+    runtime: RuntimeConfig,
+}
+
+impl std::fmt::Debug for TransportConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Непрозрачные параметры могут содержать пароли и ключи.
+        formatter
+            .debug_struct("TransportConfig")
+            .field("name", &self.name)
+            .field("params_len", &self.params.len())
+            .field("runtime", &self.runtime)
+            .finish()
+    }
 }
 
 impl TransportConfig {
@@ -363,7 +482,14 @@ impl TransportConfig {
         Self {
             name: name.into(),
             params,
+            runtime: RuntimeConfig::default(),
         }
+    }
+
+    /// Подменить локальную политику. Значение из файла важнее params.
+    pub fn with_runtime_config(mut self, runtime: RuntimeConfig) -> Self {
+        self.runtime = runtime;
+        self
     }
 
     /// Name the registry looks up.
@@ -374,6 +500,11 @@ impl TransportConfig {
     /// Uninterpreted parameters for the chosen transport.
     pub fn params(&self) -> &[u8] {
         &self.params
+    }
+
+    /// Локальная политика этого запуска. В экспортируемый профиль не входит.
+    pub fn runtime_config(&self) -> &RuntimeConfig {
+        &self.runtime
     }
 }
 

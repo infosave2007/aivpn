@@ -205,7 +205,10 @@ fn main() {
             serde_json::from_str(&std::fs::read_to_string(&path).expect("read mask"))
                 .expect("parse mask");
         let (corpus, other, fam) = match mask.spoof_protocol {
-            SpoofProtocol::WebRTC_STUN => (&webrtc, &quic, "webrtc"),
+            SpoofProtocol::WebRTC_STUN
+            | SpoofProtocol::WebRTC_DTLS_SRTP
+            | SpoofProtocol::WebRTC_TURN_DTLS_SRTP
+            | SpoofProtocol::WebRTC_SDES_SRTP => (&webrtc, &quic, "webrtc"),
             SpoofProtocol::QUIC => (&quic, &webrtc, "quic"),
             _ => {
                 println!("{:<28} skipped (no matching corpus)", mask.mask_id);

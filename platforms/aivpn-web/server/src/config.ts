@@ -9,7 +9,12 @@ const envSchema = z.object({
       message: 'JWT_SECRET is still the .env.example placeholder — generate a real secret (openssl rand -base64 48)',
     }),
   // Origin for WebAuthn and CORS — must match the browser-facing URL
-  ORIGIN: z.string().url().default('http://localhost:3000'),
+  ORIGIN: z.string().url().refine((value) => {
+    const url = new URL(value)
+    return ['http:', 'https:'].includes(url.protocol) && !url.username && !url.password &&
+      url.pathname === '/' && !url.search && !url.hash
+  }, 'ORIGIN must be an HTTP(S) origin without credentials, path or query')
+    .transform((value) => new URL(value).origin).default('http://localhost:3000'),
   // Unix socket path for the aivpn management API
   UNIX_SOCK: z.string().default('/run/aivpn/api.sock'),
   PORT: z.coerce.number().int().min(1).max(65535).default(3000),

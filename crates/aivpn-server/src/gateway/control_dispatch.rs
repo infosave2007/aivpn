@@ -4,8 +4,55 @@
 //! of `gateway/mod.rs` — no behavior change.
 
 use super::*;
+use aivpn_common::mgmt_error::ManagementError;
 
 impl super::Gateway {
+    pub(super) fn telemetry_snapshot(
+        &self,
+        session: &Arc<parking_lot::Mutex<Session>>,
+    ) -> ControlPayload {
+        let sess = session.lock();
+        let buffer_pct = self
+            .tun_write_tx
+            .as_ref()
+            .map(|tx| {
+                let capacity = tx.max_capacity();
+                (capacity.saturating_sub(tx.capacity()) * 100 / capacity.max(1)) as u8
+            })
+            .unwrap_or(0);
+        ControlPayload::TelemetryResponse {
+            packet_loss: (sess.client_loss_ppm.min(1_000_000) / 100) as u16,
+            rtt_ms: sess.client_srtt_ms.min(u16::MAX as u32) as u16,
+            jitter_ms: sess.client_jitter_ms,
+            buffer_pct,
+        }
+    }
+
+    fn record_client_telemetry(
+        &self,
+        session: &Arc<parking_lot::Mutex<Session>>,
+        loss: f64,
+        rtt_ms: f64,
+    ) {
+        let (mask_id, client_id) = {
+            let sess = session.lock();
+            (
+                sess.mask.as_ref().map(|mask| mask.mask_id.clone()),
+                sess.client_id.clone(),
+            )
+        };
+        if let (Some(mask_id), Some(client_id)) = (mask_id, client_id) {
+            let mut hash = blake3::Hasher::new();
+            hash.update(b"aivpn-telemetry-reporter\0");
+            hash.update(client_id.as_bytes());
+            let mut reporter = [0; 16];
+            reporter.copy_from_slice(&hash.finalize().as_bytes()[..16]);
+            self.neural_module
+                .lock()
+                .record_telemetry(&mask_id, reporter, loss, rtt_ms);
+        }
+    }
+
     /// Build the `mgmt_service::MgmtCtx` inputs this `Gateway` actually
     /// holds and run `mgmt_service::dispatch` on a blocking thread — it
     /// does synchronous `ClientDatabase` file IO
@@ -34,7 +81,14 @@ impl super::Gateway {
         body: Vec<u8>,
     ) -> (u16, Vec<u8>) {
         let Some(db) = self.client_db.clone() else {
-            return (503, Vec::new());
+            return (
+                503,
+                ManagementError::new(
+                    "client_database_unavailable",
+                    "База клиентов временно недоступна. Обратитесь к администратору сервера.",
+                )
+                .to_body(),
+            );
         };
         let mask_dir = self.config.mask_dir.clone();
         let mask_operator_pubkey = self.config.mask_operator_pubkey;
@@ -170,7 +224,7 @@ impl super::Gateway {
             Ok(r) => r,
             Err(e) => {
                 error!("mgmt_service::dispatch panicked: {}", e);
-                (500, Vec::new())
+                (500, ManagementError::for_status(500).to_body())
             }
         }
     }
@@ -898,7 +952,7 @@ impl super::Gateway {
 
         match self
             .session_manager
-            .build_mask_update_packet(session, &variant)
+            .build_mask_update_packets(session, &variant)
         {
             Ok(packet) => {
                 // FIX L: `udp_socket` is `None` until `run()` binds
@@ -906,7 +960,7 @@ impl super::Gateway {
                 // window (or a `Gateway` is driven without `run()`,
                 // e.g. tests).
                 if let Some(sock) = self.udp_socket.as_ref() {
-                    if let Err(e) = sock.send_to(&packet, client_addr).await {
+                    if let Err(e) = sock.send_packets_to(&packet, client_addr).await {
                         warn!(
                             "Failed to send polymorphic MaskUpdate to {}: {}",
                             client_addr, e
@@ -1224,23 +1278,34 @@ impl super::Gateway {
                     Ok(true) => info!("Device enrolled and bound for client {}", cid),
                     Ok(false) => debug!("Device binding verified for client {}", cid),
                     Err(e) => {
-                        // 3f: one-time key already used — a DIFFERENT
-                        // device already bound this one_time credential.
-                        // The session is already tag-validated/AEAD
-                        // established (this is a decrypted, authenticated
-                        // in-session control message), so PSK possession
-                        // is proven — send the specific, authenticated
-                        // HandshakeReject{reason:1} instead of the
-                        // generic Shutdown so the client can show why and
-                        // stop retrying.
-                        warn!("Device binding mismatch for {}: {}", cid, e);
+                        // Постоянный отказ относится только к несовпадению ключа.
+                        // Сбой хранилища не означает, что ключ уже использован.
+                        let mismatch = matches!(&e, aivpn_common::error::Error::Session(message)
+                            if message.starts_with("Device binding mismatch for client '"));
+                        let code = if mismatch {
+                            "device_binding_mismatch"
+                        } else if e.to_string().contains("Permission denied") {
+                            "client_database_permission_denied"
+                        } else {
+                            "client_database_unavailable"
+                        };
+                        warn!(client_id = %cid, code, binding_mismatch = mismatch, "Не удалось проверить привязку устройства");
                         self.audit_log.log(
                             AuditActor::System,
-                            "device_binding_mismatch",
+                            if mismatch {
+                                "device_binding_mismatch"
+                            } else {
+                                "device_database_unavailable"
+                            },
                             cid,
                             "denied",
                         );
-                        let reject = ControlPayload::HandshakeReject { reason: 1 };
+                        let reject = if mismatch {
+                            ControlPayload::HandshakeReject { reason: 1 }
+                        } else {
+                            // Ошибка хранилища временная, ключ клиента не отзывается.
+                            ControlPayload::Shutdown { reason: 5 }
+                        };
                         let _ = self.send_control_message(&reject, session).await;
                         let session_id = session.lock().session_id;
                         self.session_manager.remove_session(&session_id);
@@ -1281,12 +1346,66 @@ impl super::Gateway {
         // below replies with SOME `MgmtResponse` — a caller
         // waiting on `req_id` must never hang, whether the
         // outcome is throttled/denied/dispatched.
+        if aivpn_common::diagnostics::is_diagnostic(&path) {
+            let status = {
+                let mut current = session.lock();
+                if !current.client_admitted
+                    || !current.mtls_ok
+                    || current.is_masked_pool_peer
+                    || current.is_site_peer
+                {
+                    403
+                } else if !current.diagnostic_budget.take(Instant::now()) {
+                    429
+                } else {
+                    200
+                }
+            };
+            let (status, body) = if status == 200 {
+                aivpn_common::diagnostics::response(method, &path, &body)
+            } else {
+                (
+                    status,
+                    if status == 429 {
+                        ManagementError::rate_limited(200).to_body()
+                    } else {
+                        ManagementError::for_status(status).to_body()
+                    },
+                )
+            };
+            if status >= 400 {
+                debug!(
+                    req_id,
+                    method,
+                    status,
+                    code = "diagnostic_request_failed",
+                    "Диагностический запрос отклонен"
+                );
+            }
+            return self
+                .send_control_message(
+                    &ControlPayload::MgmtResponse {
+                        req_id,
+                        status,
+                        body,
+                    },
+                    session,
+                )
+                .await;
+        }
         let session_id = session.lock().session_id;
         if !self.try_claim_mgmt_slot(session_id, Instant::now()) {
+            debug!(
+                req_id,
+                method,
+                status = 429,
+                code = "rate_limited",
+                "Запрос управления отклонен"
+            );
             let resp = ControlPayload::MgmtResponse {
                 req_id,
                 status: 429,
-                body: Vec::new(),
+                body: ManagementError::rate_limited(200).to_body(),
             };
             if let Err(e) = self.send_control_message(&resp, session).await {
                 debug!("MgmtResponse (429 throttled) send failed: {}", e);
@@ -1301,6 +1420,13 @@ impl super::Gateway {
         let role = self.session_role(session);
         if !mgmt_service::authorize(role.as_u8(), method, &path) {
             debug!(
+                req_id,
+                method,
+                status = 403,
+                code = "forbidden",
+                "Недостаточно прав для запроса управления"
+            );
+            debug!(
                 "MgmtRequest from {} denied: role={:?} method={} path={}",
                 hash_addr(&client_addr),
                 role,
@@ -1310,7 +1436,7 @@ impl super::Gateway {
             let resp = ControlPayload::MgmtResponse {
                 req_id,
                 status: 403,
-                body: Vec::new(),
+                body: ManagementError::for_status(403).to_body(),
             };
             if let Err(e) = self.send_control_message(&resp, session).await {
                 debug!("MgmtResponse (403 denied) send failed: {}", e);
@@ -1326,6 +1452,20 @@ impl super::Gateway {
         let revoke_id = mgmt_service::revoke_target(method, &path);
 
         let (status, resp_body) = self.dispatch_mgmt_request(method, path, body).await;
+        if status >= 400 {
+            let code = serde_json::from_slice::<ManagementError>(&resp_body)
+                .ok()
+                .map(|error| error.code);
+            warn!(
+                req_id,
+                method,
+                status,
+                code = code.as_deref().unwrap_or("request_failed"),
+                "Запрос управления завершился ошибкой"
+            );
+        } else {
+            debug!(req_id, method, status, "Запрос управления выполнен");
+        }
 
         // P1.3: on a successful admin revoke (204), immediately
         // force-disconnect any live session for that client on
@@ -1403,6 +1543,7 @@ impl super::Gateway {
                 &control,
                 ControlPayload::NodeEnrollment { .. }
                     | ControlPayload::RouteSync { .. }
+                    | ControlPayload::MaskState(_)
                     | ControlPayload::SiteData { .. }
                     | ControlPayload::Keepalive { .. }
                     | ControlPayload::KeepaliveAck { .. }
@@ -1413,6 +1554,34 @@ impl super::Gateway {
             return Ok(());
         }
         match control {
+            ControlPayload::MaskState(state) => {
+                {
+                    let current = session.lock();
+                    if current.is_removed()
+                        || !current.is_ratcheted
+                        || !current.client_admitted
+                        || state.answer
+                        || !current.mask.as_ref().is_some_and(|mask| {
+                            aivpn_common::mask_io::uses_rtc(mask)
+                                && mask.mask_id == state.mask_id
+                                && mask.version == state.mask_version
+                        })
+                    {
+                        return Err(Error::InvalidPacket(
+                            "Согласование RTC не соответствует установленной сессии",
+                        ));
+                    }
+                }
+                let socket = self
+                    .udp_socket
+                    .as_ref()
+                    .ok_or(Error::InvalidPacket("Нет сокета RTC"))?;
+                let answer = socket.accept_rtc_offer(&state, session, client_addr)?;
+                self.send_control_message(&ControlPayload::MaskState(answer), session)
+                    .await?;
+            }
+            // Подсказка профиля принимается только в начальном AEAD-обмене.
+            ControlPayload::ClientHello { .. } => {}
             ControlPayload::KeyRotate { new_eph_pub } => {
                 let (session_id, has_pending) = {
                     let sess = session.lock();
@@ -1453,13 +1622,7 @@ impl super::Gateway {
             }
             ControlPayload::TelemetryRequest { metric_flags: _ } => {
                 debug!("Telemetry request from {}", hash_addr(&client_addr));
-                // Send response
-                let response = ControlPayload::TelemetryResponse {
-                    packet_loss: 0,
-                    rtt_ms: 10,
-                    jitter_ms: 2,
-                    buffer_pct: 25,
-                };
+                let response = self.telemetry_snapshot(session);
                 self.send_control_message(&response, session).await?;
             }
             ControlPayload::TelemetryResponse {
@@ -1467,29 +1630,11 @@ impl super::Gateway {
                 rtt_ms,
                 ..
             } => {
-                let (mask_id, reporter) = {
-                    let sess = session.lock();
-                    (
-                        sess.mask.as_ref().map(|m| m.mask_id.clone()),
-                        sess.client_id.as_ref().map(|id| {
-                            let mut hash = blake3::Hasher::new();
-                            hash.update(b"aivpn-telemetry-reporter\0");
-                            hash.update(id.as_bytes());
-                            let mut reporter = [0; 16];
-                            reporter.copy_from_slice(&hash.finalize().as_bytes()[..16]);
-                            reporter
-                        }),
-                    )
-                };
-                if let (Some(ref mid), Some(reporter)) = (mask_id, reporter) {
-                    // Переподключение не создает нового независимого наблюдателя.
-                    self.neural_module.lock().record_telemetry(
-                        mid,
-                        reporter,
-                        packet_loss as f64,
-                        rtt_ms as f64,
-                    );
-                }
+                self.record_client_telemetry(
+                    session,
+                    packet_loss.min(10_000) as f64 / 10_000.0,
+                    rtt_ms as f64,
+                );
                 debug!("Telemetry response received — recorded to anomaly detector");
             }
             ControlPayload::TimeSync { .. } => {
@@ -1779,6 +1924,9 @@ impl super::Gateway {
                 loss_ppm,
                 jitter_ms,
             } => {
+                if !session.lock().accept_quality_report(Instant::now()) {
+                    return Ok(());
+                }
                 info!(
                     "QualityReport from {}: quality={} rtt={}ms loss={}ppm jitter={}ms",
                     hash_addr(&client_addr),
@@ -1792,9 +1940,19 @@ impl super::Gateway {
                 // the rekey/ratchet grace window (A5).
                 {
                     let mut s = session.lock();
-                    s.client_quality = quality;
-                    s.observe_client_rtt(rtt_ms as u32);
+                    s.client_quality = quality.min(100);
+                    if rtt_ms > 0 {
+                        s.observe_client_rtt(rtt_ms as u32);
+                    }
+                    s.client_loss_ppm = loss_ppm.min(1_000_000);
+                    s.client_jitter_ms = jitter_ms;
                 }
+                // Текущие клиенты передают QualityReport, а не устаревший TelemetryResponse.
+                self.record_client_telemetry(
+                    session,
+                    loss_ppm.min(1_000_000) as f64 / 1_000_000.0,
+                    rtt_ms as f64,
+                );
                 // Push adaptive hint back so client adjusts keepalive + FEC immediately.
                 let level = aivpn_common::quality::AdaptiveLevel::suggest(quality);
                 if let Err(e) = self
@@ -1805,6 +1963,15 @@ impl super::Gateway {
                     .await
                 {
                     debug!("AdaptiveHint send failed: {}", e);
+                }
+                let receiver_report = session.lock().receiver_quality_report(
+                    self.kernel_accel.is_none() || self.config.enable_neural,
+                    Instant::now(),
+                );
+                if let Some(report) = receiver_report {
+                    if let Err(error) = self.send_control_message(&report, session).await {
+                        debug!("Receiver QualityReport send failed: {}", error);
+                    }
                 }
             }
             ControlPayload::AdaptiveHint { .. } => {

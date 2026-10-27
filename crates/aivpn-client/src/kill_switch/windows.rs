@@ -1,7 +1,7 @@
 //! Правила WFP принадлежат приложению и не меняют политики других брандмауэров.
 
 use std::io;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::ptr::{null, null_mut};
 use windows_sys::core::GUID;
 use windows_sys::Win32::Foundation::{
@@ -52,14 +52,99 @@ fn check(code: u32) -> io::Result<()> {
     }
 }
 fn delete_filters(engine: &Engine) -> io::Result<()> {
-    for index in 0..LAYERS.len() * usize::from(FILTERS_PER_LAYER) {
-        let key = GUID::from_u128(FILTER_BASE + index as u128);
+    let mut enumeration = null_mut();
+    check(unsafe { FwpmFilterCreateEnumHandle0(engine.0, null(), &mut enumeration) })?;
+    let mut owned = Vec::new();
+    let result: io::Result<()> = (|| {
+        loop {
+            let mut entries = null_mut();
+            let mut count = 0;
+            check(unsafe {
+                FwpmFilterEnum0(engine.0, enumeration, 256, &mut entries, &mut count)
+            })?;
+            if count == 0 {
+                if !entries.is_null() {
+                    unsafe {
+                        FwpmFreeMemory0((&mut entries as *mut *mut *mut FWPM_FILTER0).cast());
+                    }
+                }
+                break;
+            }
+            for pointer in unsafe { std::slice::from_raw_parts(entries, count as usize) } {
+                let filter = unsafe { &**pointer };
+                let key = filter.subLayerKey;
+                if key.data1 == SUBLAYER.data1
+                    && key.data2 == SUBLAYER.data2
+                    && key.data3 == SUBLAYER.data3
+                    && key.data4 == SUBLAYER.data4
+                {
+                    owned.push(filter.filterKey);
+                }
+            }
+            unsafe {
+                FwpmFreeMemory0((&mut entries as *mut *mut *mut FWPM_FILTER0).cast());
+            }
+        }
+        Ok(())
+    })();
+    let destroyed = check(unsafe { FwpmFilterDestroyEnumHandle0(engine.0, enumeration) });
+    result?;
+    destroyed?;
+    for key in owned {
         let code = unsafe { FwpmFilterDeleteByKey0(engine.0, &key) };
         if code != FWP_E_FILTER_NOT_FOUND as u32 {
             check(code)?;
         }
     }
     Ok(())
+}
+
+pub(super) fn allow_transport_peer(peer: SocketAddr) -> io::Result<()> {
+    let engine = Engine::open()?;
+    let mut ip = FWPM_FILTER_CONDITION0::default();
+    ip.fieldKey = FWPM_CONDITION_IP_REMOTE_ADDRESS;
+    ip.matchType = FWP_MATCH_EQUAL;
+    let mut address6 = FWP_BYTE_ARRAY16::default();
+    let layer = match peer.ip() {
+        IpAddr::V4(address) => {
+            ip.conditionValue.r#type = FWP_UINT32;
+            ip.conditionValue.Anonymous.uint32 = u32::from(address);
+            LAYERS[0]
+        }
+        IpAddr::V6(address) => {
+            address6.byteArray16 = address.octets();
+            ip.conditionValue.r#type = FWP_BYTE_ARRAY16_TYPE;
+            ip.conditionValue.Anonymous.byteArray16 = &mut address6;
+            LAYERS[1]
+        }
+    };
+    let mut port = FWPM_FILTER_CONDITION0::default();
+    port.fieldKey = FWPM_CONDITION_IP_REMOTE_PORT;
+    port.matchType = FWP_MATCH_EQUAL;
+    port.conditionValue.r#type = FWP_UINT16;
+    port.conditionValue.Anonymous.uint16 = peer.port();
+    let mut conditions = [ip, port];
+    let digest = blake3::hash(format!("aivpn-transport:{peer}").as_bytes());
+    let key = u128::from_le_bytes(digest.as_bytes()[..16].try_into().unwrap());
+    let mut filter = FWPM_FILTER0::default();
+    filter.filterKey = GUID::from_u128(key);
+    filter.flags = FWPM_FILTER_FLAG_PERSISTENT;
+    filter.layerKey = layer;
+    filter.subLayerKey = SUBLAYER;
+    let mut weight = 25u64;
+    filter.weight.r#type = FWP_UINT64;
+    filter.weight.Anonymous.uint64 = &mut weight;
+    filter.action.r#type = FWP_ACTION_PERMIT;
+    filter.numFilterConditions = conditions.len() as u32;
+    filter.filterCondition = conditions.as_mut_ptr();
+    let mut name: Vec<u16> = "AIVPN transport".encode_utf16().chain(Some(0)).collect();
+    filter.displayData.name = name.as_mut_ptr();
+    let code = unsafe { FwpmFilterAdd0(engine.0, &filter, null_mut(), null_mut()) };
+    if code == FWP_E_ALREADY_EXISTS as u32 || code == FWP_E_SUBLAYER_NOT_FOUND as u32 {
+        Ok(())
+    } else {
+        check(code)
+    }
 }
 
 pub(super) fn activate(interface: &str, server: &str) -> io::Result<()> {

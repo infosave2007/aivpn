@@ -1,7 +1,7 @@
 import { Hono } from 'hono'
 import http from 'node:http'
-import { randomBytes, timingSafeEqual } from 'node:crypto'
-import { requireAuth } from '../auth/middleware'
+import { randomBytes } from 'node:crypto'
+import { requireAuth, liveSessionUser, type AuthUser } from '../auth/middleware'
 import { config } from '../config'
 import { isViewerAllowed } from './proxy'
 import type { UserRole } from '../db/schema'
@@ -23,7 +23,7 @@ import type { UserRole } from '../db/schema'
 
 const TICKET_TTL_MS = 60_000
 
-interface TicketEntry { userId: number; role: UserRole; expiresAt: number }
+interface TicketEntry { user: AuthUser; userId: number; role: UserRole; expiresAt: number }
 const tickets = new Map<string, TicketEntry>()
 
 function pruneTickets(now: number): void {
@@ -45,27 +45,20 @@ ticketSweeper.unref?.()
 function consumeTicket(ticket: string): TicketEntry | null {
   const now = Date.now()
   pruneTickets(now)
-  // Constant-time key lookup: compare against stored keys instead of a direct
-  // Map.get so a network attacker cannot probe ticket prefixes via timing.
-  const candidate = Buffer.from(ticket)
-  for (const [k, v] of tickets) {
-    const stored = Buffer.from(k)
-    if (stored.length === candidate.length && timingSafeEqual(stored, candidate)) {
-      tickets.delete(k) // single use — burn even before the expiry check
-      return v.expiresAt > now ? v : null
-    }
-  }
-  return null
+  if (!/^[A-Za-z0-9_-]{43}$/.test(ticket)) return null
+  const entry = tickets.get(ticket)
+  tickets.delete(ticket)
+  return entry && entry.expiresAt > now ? entry : null
 }
 
 // ── Concurrent-stream limits ─────────────────────────────────────────────────
 // Each SSE stream holds a dedicated connection to the management Unix socket;
 // without a cap an authenticated user could exhaust the Rust daemon's
-// connections. The max lifetime bounds how long a stream outlives its auth
-// check (session revocation is only evaluated at ticket minting) — clients
-// already reconnect with a freshly authenticated ticket on stream close.
+// connections. Сессия проверяется при открытии потока и каждые пять секунд.
+// После завершения клиент получает новый ticket перед переподключением.
 const MAX_STREAMS_PER_USER = 5
 const MAX_STREAM_LIFETIME_MS = 15 * 60_000
+const SESSION_RECHECK_MS = 5_000
 
 const openStreams = new Map<number, number>()
 
@@ -82,7 +75,7 @@ events.post('/ticket', requireAuth(), (c) => {
   pruneTickets(now)
   const user = c.get('user')
   const ticket = randomBytes(32).toString('base64url')
-  tickets.set(ticket, { userId: user.id, role: user.role, expiresAt: now + TICKET_TTL_MS })
+  tickets.set(ticket, { user: { ...user }, userId: user.id, role: user.role, expiresAt: now + TICKET_TTL_MS })
   return c.json({ ticket, expires_in: Math.floor(TICKET_TTL_MS / 1000) })
 })
 
@@ -91,6 +84,8 @@ events.get('/', async (c) => {
   if (!ticket) return c.json({ error: 'Missing ticket' }, 401)
   const entry = consumeTicket(ticket)
   if (!entry) return c.json({ error: 'Unauthorized' }, 401)
+  const live = await liveSessionUser(entry.userId, entry.user.session_id, entry.user.session_version)
+  if (!live || live.role !== entry.role) return c.json({ error: 'Unauthorized' }, 401)
 
   // Apply the SAME viewer RBAC the proxy applies to /api/v1/events — this
   // route bypasses proxy.ts, so without this check a viewer-minted ticket
@@ -128,6 +123,30 @@ events.get('/', async (c) => {
         },
       },
       (res) => {
+        clearTimeout(connectTimeout)
+        let checking = false
+        const recheck = setInterval(async () => {
+          if (checking) return
+          checking = true
+          try {
+            const user = await liveSessionUser(entry.userId, entry.user.session_id, entry.user.session_version)
+            if (!user || user.role !== entry.role) {
+              try { ctrl?.close() } catch {}
+              res.destroy()
+              release()
+            }
+          } catch {
+            res.destroy()
+            release()
+          } finally { checking = false }
+        }, SESSION_RECHECK_MS)
+        recheck.unref?.()
+        res.once('close', () => {
+          clearInterval(recheck)
+          clearTimeout(lifetime)
+          release()
+          try { ctrl?.close() } catch {}
+        })
         // Max lifetime: force a clean close so the client reconnects with a
         // freshly authenticated ticket (EventSource retries automatically).
         let ctrl: ReadableStreamDefaultController<Uint8Array> | null = null
@@ -174,7 +193,15 @@ events.get('/', async (c) => {
       },
     )
 
+    const connectTimeout = setTimeout(() => req.destroy(new Error('SSE upstream timeout')), 10_000)
+    connectTimeout.unref?.()
+    const abort = () => req.destroy(new Error('SSE request cancelled'))
+    c.req.raw.signal.addEventListener('abort', abort, { once: true })
+    if (c.req.raw.signal.aborted) abort()
+    req.once('close', () => c.req.raw.signal.removeEventListener('abort', abort))
+
     req.on('error', () => {
+      clearTimeout(connectTimeout)
       release()
       // Emit a NAMED "state" event: every consumer listens via
       // addEventListener('state', …), so an unnamed data-only frame (which

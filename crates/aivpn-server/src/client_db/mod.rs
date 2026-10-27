@@ -914,7 +914,7 @@ fn tighten_db_mode(path: &Path) {
 /// rename, fsync каталога. При ошибке до rename временный файл удаляется.
 /// Ошибка fsync каталога после успешного rename не откатывает запись:
 /// новый файл уже виден другим процессам, откат памяти разошелся бы с диском.
-fn write_bytes_atomic(dest: &Path, content: &[u8]) -> Result<()> {
+pub(crate) fn write_bytes_atomic(dest: &Path, content: &[u8]) -> Result<()> {
     let tmp_path = temporary_sibling(dest);
     let file = open_new_exclusive(&tmp_path)
         .map_err(|e| Error::Session(format!("Failed to create client DB temporary file: {e}")))?;

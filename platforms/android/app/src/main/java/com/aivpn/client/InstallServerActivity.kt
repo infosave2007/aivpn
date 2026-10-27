@@ -5,7 +5,7 @@ import android.os.Bundle
 import android.text.InputType
 import android.view.Gravity
 import android.view.View
-import android.widget.CheckBox
+import android.view.ViewGroup
 import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.ProgressBar
@@ -15,8 +15,13 @@ import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
+import com.google.android.material.button.MaterialButton
+import com.google.android.material.checkbox.MaterialCheckBox
+import com.google.android.material.dialog.MaterialAlertDialogBuilder
+import com.google.android.material.radiobutton.MaterialRadioButton
+import com.google.android.material.textfield.TextInputEditText
+import com.google.android.material.textfield.TextInputLayout
 import androidx.lifecycle.lifecycleScope
 import com.aivpn.client.databinding.ActivityInstallServerBinding
 import kotlinx.coroutines.Dispatchers
@@ -205,76 +210,171 @@ class InstallServerActivity : AppCompatActivity() {
 
     private val Int.dp: Int get() = (this * resources.displayMetrics.density).toInt()
 
+    private fun sectionLabel(text: String): TextView = TextView(this).apply {
+        this.text = text
+        textSize = 14f
+        setTextColor(colorAttr(com.google.android.material.R.attr.colorOnSurfaceVariant, R.color.text_secondary))
+        setPadding(0, 16.dp, 0, 4.dp)
+    }
+
+    private fun radioOption(label: String): MaterialRadioButton =
+        MaterialRadioButton(this).apply {
+            id = View.generateViewId()
+            text = label
+            textSize = 16f
+            minHeight = 48.dp
+            setTextColor(colorAttr(com.google.android.material.R.attr.colorOnSurface, R.color.text_primary))
+            layoutParams = RadioGroup.LayoutParams(
+                RadioGroup.LayoutParams.MATCH_PARENT,
+                RadioGroup.LayoutParams.WRAP_CONTENT,
+            )
+        }
+
+    private fun filledButton(label: String): MaterialButton = MaterialButton(this).apply {
+        text = label
+        textSize = 14f
+        isAllCaps = false
+        insetTop = 0
+        insetBottom = 0
+        minHeight = 48.dp
+        maxLines = 2
+        layoutParams = LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT,
+            LinearLayout.LayoutParams.WRAP_CONTENT,
+        ).apply { topMargin = 8.dp }
+    }
+
+    private fun LinearLayout.addOutlinedField(
+        hint: String,
+        value: String,
+        placeholder: String? = null,
+        inputType: Int = InputType.TYPE_CLASS_TEXT,
+        singleLine: Boolean = true,
+    ): TextInputEditText {
+        val edit = TextInputEditText(this@InstallServerActivity).apply {
+            this.inputType = inputType
+            setText(value)
+            textSize = 16f
+            importantForAutofill = View.IMPORTANT_FOR_AUTOFILL_NO
+            if (singleLine) {
+                setSingleLine(true)
+            } else {
+                minLines = 3
+                maxLines = 6
+            }
+        }
+        val box = TextInputLayout(
+            this@InstallServerActivity,
+            null,
+            com.google.android.material.R.attr.textInputOutlinedStyle,
+        ).apply {
+            this.hint = hint
+            if (placeholder != null) placeholderText = placeholder
+            addView(
+                edit,
+                LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT,
+                ),
+            )
+        }
+        addView(
+            box,
+            LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+            ).apply { topMargin = 8.dp },
+        )
+        return edit
+    }
+
+    private fun View.enclosingInput(): TextInputLayout? {
+        var current = parent
+        while (current != null) {
+            if (current is TextInputLayout) return current
+            current = current.parent
+        }
+        return null
+    }
+
+    /** Прячет поле вместе с обводкой Material. */
+    private fun View.showField(show: Boolean) {
+        val host: View = enclosingInput() ?: this
+        val state = if (show) View.VISIBLE else View.GONE
+        host.visibility = state
+        if (host !== this) visibility = state
+    }
+
+    private fun colorAttr(attr: Int, fallback: Int): Int {
+        val typed = android.util.TypedValue()
+        return if (theme.resolveAttribute(attr, typed, true)) {
+            if (typed.resourceId != 0) getColor(typed.resourceId) else typed.data
+        } else {
+            getColor(fallback)
+        }
+    }
+
     // ──────────── Step 1: target ────────────
 
     private fun buildTargetStep(): View {
-        val ctx = this
-        val layout = LinearLayout(ctx).apply { orientation = LinearLayout.VERTICAL }
+        val layout = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
 
-        fun label(res: Int) = TextView(ctx).apply {
-            text = getString(res)
-            textSize = 12f
-            setTextColor(getColor(R.color.text_secondary))
-            setPadding(0, 12.dp, 0, 2.dp)
-        }
+        val hostInput = layout.addOutlinedField(
+            hint = getString(R.string.install_hint_host),
+            value = host,
+        )
+        val portInput = layout.addOutlinedField(
+            hint = getString(R.string.install_hint_port),
+            placeholder = "22",
+            value = port,
+            inputType = InputType.TYPE_CLASS_NUMBER,
+        )
+        val userInput = layout.addOutlinedField(
+            hint = getString(R.string.install_hint_user),
+            placeholder = "root",
+            value = user,
+        )
 
-        val hostInput = EditText(ctx).apply { hint = getString(R.string.install_hint_host); setText(host); setSingleLine(true) }
-        val portInput = EditText(ctx).apply {
-            hint = "22"; setText(port); setSingleLine(true)
-            inputType = InputType.TYPE_CLASS_NUMBER
-        }
-        val userInput = EditText(ctx).apply { hint = "root"; setText(user); setSingleLine(true) }
-
-        layout.addView(label(R.string.install_hint_host)); layout.addView(hostInput)
-        layout.addView(label(R.string.install_hint_port)); layout.addView(portInput)
-        layout.addView(label(R.string.install_hint_user)); layout.addView(userInput)
-
-        layout.addView(label(R.string.install_hint_auth))
-        val authGroup = RadioGroup(ctx).apply { orientation = RadioGroup.HORIZONTAL }
-        val rbPassword = RadioButton(ctx).apply { id = View.generateViewId(); text = getString(R.string.install_auth_password) }
-        val rbKeyPem = RadioButton(ctx).apply { id = View.generateViewId(); text = getString(R.string.install_auth_key_pem) }
+        layout.addView(sectionLabel(getString(R.string.install_hint_auth)))
+        val authGroup = RadioGroup(this).apply { orientation = RadioGroup.VERTICAL }
+        val rbPassword = radioOption(getString(R.string.install_auth_password))
+        val rbKeyPem = radioOption(getString(R.string.install_auth_key_pem))
         authGroup.addView(rbPassword)
         authGroup.addView(rbKeyPem)
         authGroup.check(if (authIsPassword) rbPassword.id else rbKeyPem.id)
         layout.addView(authGroup)
 
-        val passwordInput = EditText(ctx).apply {
-            hint = getString(R.string.install_hint_password)
-            setText(password)
-            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
-            setSingleLine(true)
-            visibility = if (authIsPassword) View.VISIBLE else View.GONE
+        val passwordInput = layout.addOutlinedField(
+            hint = getString(R.string.install_hint_password),
+            value = password,
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD,
+        )
+        val keyPemInput = layout.addOutlinedField(
+            hint = getString(R.string.install_hint_key_pem),
+            value = keyPem,
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE,
+            singleLine = false,
+        )
+        val passphraseInput = layout.addOutlinedField(
+            hint = getString(R.string.install_hint_key_passphrase),
+            value = keyPassphrase,
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD,
+        )
+        fun showAuth(isPassword: Boolean) {
+            passwordInput.showField(isPassword)
+            keyPemInput.showField(!isPassword)
+            passphraseInput.showField(!isPassword)
         }
-        val keyPemInput = EditText(ctx).apply {
-            hint = getString(R.string.install_hint_key_pem)
-            setText(keyPem)
-            minLines = 3
-            maxLines = 6
-            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE
-            visibility = if (authIsPassword) View.GONE else View.VISIBLE
-        }
-        val passphraseInput = EditText(ctx).apply {
-            hint = getString(R.string.install_hint_key_passphrase)
-            setText(keyPassphrase)
-            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
-            setSingleLine(true)
-            visibility = if (authIsPassword) View.GONE else View.VISIBLE
-        }
+        showAuth(authIsPassword)
         authGroup.setOnCheckedChangeListener { _, checkedId ->
-            val isPassword = checkedId == rbPassword.id
-            passwordInput.visibility = if (isPassword) View.VISIBLE else View.GONE
-            keyPemInput.visibility = if (isPassword) View.GONE else View.VISIBLE
-            passphraseInput.visibility = if (isPassword) View.GONE else View.VISIBLE
+            showAuth(checkedId == rbPassword.id)
         }
-        layout.addView(passwordInput)
-        layout.addView(keyPemInput)
-        layout.addView(passphraseInput)
 
-        layout.addView(label(R.string.install_hint_binary_source))
-        val binaryGroup = RadioGroup(ctx).apply { orientation = RadioGroup.HORIZONTAL }
-        val rbBinaryDefault = RadioButton(ctx).apply { id = View.generateViewId(); text = getString(R.string.install_binary_default) }
-        val rbBinaryUrl = RadioButton(ctx).apply { id = View.generateViewId(); text = getString(R.string.install_binary_url) }
-        val rbBinaryFile = RadioButton(ctx).apply { id = View.generateViewId(); text = getString(R.string.install_binary_file) }
+        layout.addView(sectionLabel(getString(R.string.install_hint_binary_source)))
+        val binaryGroup = RadioGroup(this).apply { orientation = RadioGroup.VERTICAL }
+        val rbBinaryDefault = radioOption(getString(R.string.install_binary_default))
+        val rbBinaryUrl = radioOption(getString(R.string.install_binary_url))
+        val rbBinaryFile = radioOption(getString(R.string.install_binary_file))
         binaryGroup.addView(rbBinaryDefault)
         binaryGroup.addView(rbBinaryUrl)
         binaryGroup.addView(rbBinaryFile)
@@ -287,24 +387,29 @@ class InstallServerActivity : AppCompatActivity() {
         )
         layout.addView(binaryGroup)
 
-        val binaryUrlInput = EditText(ctx).apply {
-            hint = getString(R.string.install_hint_binary_url)
-            setText(binaryUrl)
-            setSingleLine(true)
-            visibility = if (binarySource == BinarySource.URL) View.VISIBLE else View.GONE
-        }
-        val binaryFileRow = LinearLayout(ctx).apply {
+        val binaryUrlInput = layout.addOutlinedField(
+            hint = getString(R.string.install_hint_binary_url),
+            value = binaryUrl,
+        )
+        val binaryFileRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
             visibility = if (binarySource == BinarySource.FILE) View.VISIBLE else View.GONE
         }
-        val binaryFileLabel = TextView(ctx).apply {
+        val binaryFileLabel = TextView(this).apply {
             text = binaryFileName.ifEmpty { getString(R.string.install_no_file_selected) }
-            textSize = 12f
-            setTextColor(getColor(R.color.text_secondary))
+            textSize = 14f
+            maxLines = 2
+            ellipsize = android.text.TextUtils.TruncateAt.END
+            setTextColor(colorAttr(com.google.android.material.R.attr.colorOnSurfaceVariant, R.color.text_secondary))
             setPadding(12.dp, 0, 0, 0)
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
         }
-        val pickFileBtn = android.widget.Button(ctx).apply { text = getString(R.string.install_pick_binary_file) }
+        val pickFileBtn = filledButton(getString(R.string.install_pick_binary_file))
+        pickFileBtn.layoutParams = LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+        )
         pickFileBtn.setOnClickListener {
             // Sync whatever the user has typed so far before backgrounding into the
             // system file picker — onBinaryFilePicked() re-renders this step on return,
@@ -315,44 +420,48 @@ class InstallServerActivity : AppCompatActivity() {
         }
         binaryFileRow.addView(pickFileBtn)
         binaryFileRow.addView(binaryFileLabel)
+        binaryUrlInput.showField(binarySource == BinarySource.URL)
         binaryGroup.setOnCheckedChangeListener { _, checkedId ->
             binarySource = when (checkedId) {
                 rbBinaryUrl.id -> BinarySource.URL
                 rbBinaryFile.id -> BinarySource.FILE
                 else -> BinarySource.DEFAULT
             }
-            binaryUrlInput.visibility = if (binarySource == BinarySource.URL) View.VISIBLE else View.GONE
+            binaryUrlInput.showField(binarySource == BinarySource.URL)
             binaryFileRow.visibility = if (binarySource == BinarySource.FILE) View.VISIBLE else View.GONE
         }
-        layout.addView(binaryUrlInput)
         layout.addView(binaryFileRow)
 
-        layout.addView(label(R.string.install_hint_mode))
-        val modeGroup = RadioGroup(ctx).apply { orientation = RadioGroup.HORIZONTAL }
-        val rbSystemd = RadioButton(ctx).apply { id = View.generateViewId(); text = getString(R.string.install_mode_systemd) }
-        val rbDocker = RadioButton(ctx).apply { id = View.generateViewId(); text = getString(R.string.install_mode_docker) }
+        layout.addView(sectionLabel(getString(R.string.install_hint_mode)))
+        val modeGroup = RadioGroup(this).apply { orientation = RadioGroup.VERTICAL }
+        val rbSystemd = radioOption(getString(R.string.install_mode_systemd))
+        val rbDocker = radioOption(getString(R.string.install_mode_docker))
         modeGroup.addView(rbSystemd)
         modeGroup.addView(rbDocker)
         modeGroup.check(if (modeIsDocker) rbDocker.id else rbSystemd.id)
         layout.addView(modeGroup)
 
-        val serverIpInput = EditText(ctx).apply { hint = getString(R.string.install_hint_server_ip); setText(serverIp); setSingleLine(true) }
-        val serverPortInput = EditText(ctx).apply {
-            hint = getString(R.string.install_hint_server_port); setText(serverPort); setSingleLine(true)
-            inputType = InputType.TYPE_CLASS_NUMBER
-        }
-        layout.addView(label(R.string.install_hint_server_ip)); layout.addView(serverIpInput)
-        layout.addView(label(R.string.install_hint_server_port)); layout.addView(serverPortInput)
+        val serverIpInput = layout.addOutlinedField(
+            hint = getString(R.string.install_hint_server_ip),
+            value = serverIp,
+        )
+        val serverPortInput = layout.addOutlinedField(
+            hint = getString(R.string.install_hint_server_port),
+            value = serverPort,
+            inputType = InputType.TYPE_CLASS_NUMBER,
+        )
 
-        val bindingCheck = CheckBox(ctx).apply {
+        val bindingCheck = MaterialCheckBox(this).apply {
             text = getString(R.string.install_device_binding)
             isChecked = deviceBinding
-            setPadding(0, 14.dp, 0, 0)
+            textSize = 16f
+            minHeight = 48.dp
+            setTextColor(colorAttr(com.google.android.material.R.attr.colorOnSurface, R.color.text_primary))
         }
-        val bindingHint = TextView(ctx).apply {
+        val bindingHint = TextView(this).apply {
             text = getString(R.string.install_device_binding_hint)
-            textSize = 11f
-            setTextColor(getColor(R.color.text_secondary))
+            textSize = 14f
+            setTextColor(colorAttr(com.google.android.material.R.attr.colorOnSurfaceVariant, R.color.text_secondary))
             setPadding(0, 2.dp, 0, 0)
             visibility = if (deviceBinding) View.VISIBLE else View.GONE
         }
@@ -507,52 +616,50 @@ class InstallServerActivity : AppCompatActivity() {
     // ──────────── Step 2: TOFU ────────────
 
     private fun buildTofuStep(): View {
-        val ctx = this
-        val layout = LinearLayout(ctx).apply { orientation = LinearLayout.VERTICAL; gravity = Gravity.CENTER_HORIZONTAL }
+        val layout = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; gravity = Gravity.CENTER_HORIZONTAL }
 
         when (val s = tofuState) {
             is TofuState.Loading -> {
-                layout.addView(ProgressBar(ctx).apply { setPadding(0, 24.dp, 0, 8.dp) })
-                layout.addView(TextView(ctx).apply {
+                layout.addView(ProgressBar(this).apply { setPadding(0, 24.dp, 0, 8.dp) })
+                layout.addView(TextView(this).apply {
                     text = getString(R.string.install_tofu_probing, host)
-                    setTextColor(getColor(R.color.text_secondary))
+                    textSize = 16f
+                    setTextColor(colorAttr(com.google.android.material.R.attr.colorOnSurfaceVariant, R.color.text_secondary))
                 })
             }
             is TofuState.Error -> {
-                layout.addView(TextView(ctx).apply {
+                layout.addView(TextView(this).apply {
                     text = getString(R.string.install_tofu_error, s.message)
-                    setTextColor(getColor(R.color.disconnect))
+                    textSize = 16f
+                    setTextColor(colorAttr(com.google.android.material.R.attr.colorError, R.color.disconnect))
                     setPadding(0, 16.dp, 0, 8.dp)
                 })
-                val retry = android.widget.Button(ctx).apply { text = getString(R.string.install_tofu_retry) }
+                val retry = filledButton(getString(R.string.install_tofu_retry))
                 retry.setOnClickListener { tofuState = TofuState.Loading; renderStep() }
                 layout.addView(retry)
             }
             is TofuState.Success -> {
-                layout.addView(TextView(ctx).apply {
+                layout.addView(TextView(this).apply {
                     text = getString(R.string.install_tofu_fingerprint_label)
-                    textSize = 12f
-                    setTextColor(getColor(R.color.text_secondary))
+                    textSize = 14f
+                    setTextColor(colorAttr(com.google.android.material.R.attr.colorOnSurfaceVariant, R.color.text_secondary))
                     setPadding(0, 16.dp, 0, 4.dp)
                 })
-                layout.addView(TextView(ctx).apply {
+                layout.addView(TextView(this).apply {
                     text = s.fingerprint
                     textSize = 16f
-                    setTypeface(typeface, android.graphics.Typeface.BOLD)
-                    setTextColor(getColor(R.color.text_primary))
+                    setTextColor(colorAttr(com.google.android.material.R.attr.colorOnSurface, R.color.text_primary))
                     setTextIsSelectable(true)
                     gravity = Gravity.CENTER_HORIZONTAL
                 })
-                layout.addView(TextView(ctx).apply {
+                layout.addView(TextView(this).apply {
                     text = getString(R.string.install_tofu_confirm_hint)
-                    textSize = 12f
-                    setTextColor(getColor(R.color.text_secondary))
+                    textSize = 14f
+                    setTextColor(colorAttr(com.google.android.material.R.attr.colorOnSurfaceVariant, R.color.text_secondary))
                     gravity = Gravity.CENTER_HORIZONTAL
                     setPadding(0, 8.dp, 0, 16.dp)
                 })
-                val showScript = android.widget.Button(ctx).apply {
-                    text = getString(R.string.install_show_script)
-                }
+                val showScript = filledButton(getString(R.string.install_show_script))
                 showScript.setOnClickListener { showScriptDialog() }
                 layout.addView(showScript)
             }
@@ -585,27 +692,31 @@ class InstallServerActivity : AppCompatActivity() {
                         AivpnJni.sshInstallScript() to AivpnJni.sshInstallScriptSha256()
                 } catch (t: Throwable) { "" to "" }
             }
-            val dialogCtx = android.view.ContextThemeWrapper(this@InstallServerActivity, R.style.Theme_AIVPN_Dialog)
-            val layout = LinearLayout(dialogCtx).apply { orientation = LinearLayout.VERTICAL; setPadding(24.dp, 16.dp, 24.dp, 0) }
-            layout.addView(TextView(dialogCtx).apply {
+            val layout = LinearLayout(this@InstallServerActivity).apply {
+                orientation = LinearLayout.VERTICAL
+                setPadding(24.dp, 16.dp, 24.dp, 0)
+            }
+            layout.addView(TextView(this@InstallServerActivity).apply {
                 text = getString(R.string.install_script_sha256, sha)
-                textSize = 12f
-                setTextColor(getColor(R.color.text_secondary))
+                textSize = 14f
+                setTextColor(colorAttr(com.google.android.material.R.attr.colorOnSurfaceVariant, R.color.text_secondary))
                 setTextIsSelectable(true)
                 setPadding(0, 0, 0, 8.dp)
             })
-            val scrollView = ScrollView(dialogCtx).apply {
-                layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 400.dp)
+            val screenCap = (resources.displayMetrics.heightPixels * 0.45f).toInt()
+            val scriptHeight = if (400.dp < screenCap) 400.dp else screenCap
+            val scrollView = ScrollView(this@InstallServerActivity).apply {
+                layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, scriptHeight)
             }
-            scrollView.addView(TextView(dialogCtx).apply {
+            scrollView.addView(TextView(this@InstallServerActivity).apply {
                 text = script
-                textSize = 10f
+                textSize = 14f
                 typeface = android.graphics.Typeface.MONOSPACE
-                setTextColor(getColor(R.color.text_primary))
+                setTextColor(colorAttr(com.google.android.material.R.attr.colorOnSurface, R.color.text_primary))
                 setTextIsSelectable(true)
             })
             layout.addView(scrollView)
-            AlertDialog.Builder(this@InstallServerActivity)
+            MaterialAlertDialogBuilder(this@InstallServerActivity)
                 .setTitle(getString(R.string.install_show_script))
                 .setView(layout)
                 .setPositiveButton(android.R.string.ok, null)
@@ -616,15 +727,15 @@ class InstallServerActivity : AppCompatActivity() {
     // ──────────── Step 3: install ────────────
 
     private fun buildInstallStep(): View {
-        val ctx = this
-        val layout = LinearLayout(ctx).apply { orientation = LinearLayout.VERTICAL }
+        val layout = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
 
         if (!installFinished) {
-            val row = LinearLayout(ctx).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
-            row.addView(ProgressBar(ctx).apply { layoutParams = LinearLayout.LayoutParams(24.dp, 24.dp) })
-            row.addView(TextView(ctx).apply {
+            val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
+            row.addView(ProgressBar(this).apply { layoutParams = LinearLayout.LayoutParams(32.dp, 32.dp) })
+            row.addView(TextView(this).apply {
                 text = getString(R.string.install_running)
-                setTextColor(getColor(R.color.text_secondary))
+                textSize = 16f
+                setTextColor(colorAttr(com.google.android.material.R.attr.colorOnSurfaceVariant, R.color.text_secondary))
                 setPadding(12.dp, 0, 0, 0)
             })
             layout.addView(row)
@@ -632,10 +743,10 @@ class InstallServerActivity : AppCompatActivity() {
             val key = finishedConnectionKey
             val code = finishedExitCode ?: -1
             if (key != null) {
-                layout.addView(TextView(ctx).apply {
+                layout.addView(TextView(this).apply {
                     text = getString(R.string.install_success)
-                    setTextColor(getColor(R.color.accent))
-                    setTypeface(typeface, android.graphics.Typeface.BOLD)
+                    textSize = 16f
+                    setTextColor(getColor(R.color.green))
                     setPadding(0, 0, 0, 8.dp)
                 })
                 if (profileAutoImported) {
@@ -643,44 +754,45 @@ class InstallServerActivity : AppCompatActivity() {
                     // "finished" marker arrived — show a confirmation + the key instead of
                     // making the user click an "Import profile" button for something
                     // that's already done.
-                    layout.addView(TextView(ctx).apply {
+                    layout.addView(TextView(this).apply {
                         text = getString(R.string.install_profile_auto_imported)
-                        setTextColor(getColor(R.color.text_secondary))
+                        textSize = 14f
+                        setTextColor(colorAttr(com.google.android.material.R.attr.colorOnSurfaceVariant, R.color.text_secondary))
                         setPadding(0, 0, 0, 4.dp)
                     })
-                    layout.addView(TextView(ctx).apply {
+                    layout.addView(TextView(this).apply {
                         text = key
-                        textSize = 11f
+                        textSize = 14f
                         typeface = android.graphics.Typeface.MONOSPACE
-                        setTextColor(getColor(R.color.text_secondary))
+                        setTextColor(colorAttr(com.google.android.material.R.attr.colorOnSurfaceVariant, R.color.text_secondary))
                         setTextIsSelectable(true)
                         setPadding(0, 0, 0, 8.dp)
                     })
                 } else {
                     // Auto-import didn't run (e.g. the key failed to parse) — fall back to
                     // the old manual path rather than silently dropping the key.
-                    val importBtn = android.widget.Button(ctx).apply { text = getString(R.string.install_import_profile) }
+                    val importBtn = filledButton(getString(R.string.install_import_profile))
                     importBtn.setOnClickListener { importProfile(key) }
                     layout.addView(importBtn)
                 }
             } else {
-                layout.addView(TextView(ctx).apply {
+                layout.addView(TextView(this).apply {
                     text = getString(R.string.install_failed, code)
-                    setTextColor(getColor(R.color.disconnect))
-                    setTypeface(typeface, android.graphics.Typeface.BOLD)
+                    textSize = 16f
+                    setTextColor(colorAttr(com.google.android.material.R.attr.colorError, R.color.disconnect))
                     setPadding(0, 0, 0, 8.dp)
                 })
             }
-            val closeBtn = android.widget.Button(ctx).apply { text = getString(R.string.btn_cancel) }
+            val closeBtn = filledButton(getString(R.string.btn_cancel))
             closeBtn.setOnClickListener { finish() }
             layout.addView(closeBtn)
         }
 
-        val logView = TextView(ctx).apply {
+        val logView = TextView(this).apply {
             text = logLines.joinToString("\n")
-            textSize = 11f
+            textSize = 14f
             typeface = android.graphics.Typeface.MONOSPACE
-            setTextColor(getColor(R.color.text_secondary))
+            setTextColor(colorAttr(com.google.android.material.R.attr.colorOnSurfaceVariant, R.color.text_secondary))
             setTextIsSelectable(true)
             setPadding(0, 16.dp, 0, 0)
         }
@@ -918,7 +1030,7 @@ class InstallServerActivity : AppCompatActivity() {
         )
         profiles.add(profile)
         SecureStorage.saveProfiles(this, profiles)
-        SecureStorage.saveActiveProfileId(this, profile.id)
+        if (!AivpnService.isServiceActive) SecureStorage.saveActiveProfileId(this, profile.id)
         Toast.makeText(this, getString(R.string.install_profile_imported), Toast.LENGTH_SHORT).show()
         finish()
     }
@@ -948,7 +1060,7 @@ class InstallServerActivity : AppCompatActivity() {
         )
         profiles.add(profile)
         SecureStorage.saveProfiles(this, profiles)
-        SecureStorage.saveActiveProfileId(this, profile.id)
+        if (!AivpnService.isServiceActive) SecureStorage.saveActiveProfileId(this, profile.id)
         profileAutoImported = true
     }
 }

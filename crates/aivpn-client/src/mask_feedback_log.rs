@@ -143,7 +143,7 @@ impl MaskFeedbackLog {
 
     /// Load from an explicit path. Never fails: corrupt/missing → empty log.
     pub fn load(path: PathBuf) -> Self {
-        let mut log = std::fs::read(&path)
+        let mut log = crate::secure_write::read_state_file(&path, 8 * 1024 * 1024)
             .ok()
             .and_then(|bytes| serde_json::from_slice::<MaskFeedbackLog>(&bytes).ok())
             .unwrap_or_default();
@@ -269,22 +269,7 @@ impl MaskFeedbackLog {
         let Ok(json) = serde_json::to_vec(self) else {
             return;
         };
-        // Write atomically via temp sibling + rename so a crash mid-write can't
-        // corrupt the log (a corrupt file would silently discard history).
-        let tmp = path.with_extension("tmp");
-        if std::fs::write(&tmp, &json).is_ok() {
-            // Defense-in-depth: the parent dir is already 0700, but chmod the
-            // file itself to 0600 too rather than trusting the process umask
-            // (default 0644 would leave this hour-granularity mask-attempt
-            // timeline group/world-readable). Mirrors the `device.key`
-            // convention used elsewhere in the client.
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
-            }
-            let _ = std::fs::rename(&tmp, path);
-        }
+        crate::secure_write::write_status_best_effort(path, &json);
     }
 }
 
@@ -330,7 +315,7 @@ impl RegionalHintsStore {
     }
 
     pub fn load(path: PathBuf) -> Self {
-        let mut store = std::fs::read(&path)
+        let mut store = crate::secure_write::read_state_file(&path, 8 * 1024 * 1024)
             .ok()
             .and_then(|bytes| serde_json::from_slice::<RegionalHintsStore>(&bytes).ok())
             .unwrap_or_default();
@@ -372,21 +357,35 @@ impl RegionalHintsStore {
         let Ok(json) = serde_json::to_vec(self) else {
             return;
         };
-        let tmp = path.with_extension("tmp");
-        if std::fs::write(&tmp, &json).is_ok() {
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
-            }
-            let _ = std::fs::rename(&tmp, path);
-        }
+        crate::secure_write::write_status_best_effort(path, &json);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn saving_feedback_and_hints_does_not_overwrite_a_temporary_symlink_target() {
+        let dir =
+            std::env::temp_dir().join(format!("aivpn-cache-link-{:032x}", rand::random::<u128>()));
+        std::fs::create_dir(&dir).unwrap();
+        let victim = dir.join("victim");
+        std::fs::write(&victim, b"original").unwrap();
+        for name in ["feedback.json", "hints.json"] {
+            let path = dir.join(name);
+            std::os::unix::fs::symlink(&victim, path.with_extension("tmp")).unwrap();
+            if name == "feedback.json" {
+                MaskFeedbackLog::load(path.clone()).save();
+            } else {
+                RegionalHintsStore::load(path.clone()).save();
+            }
+            assert_eq!(std::fs::read(&victim).unwrap(), b"original");
+            assert!(path.is_file());
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     fn temp_path(tag: &str) -> PathBuf {
         let mut p = std::env::temp_dir();

@@ -108,6 +108,28 @@ pub(crate) fn protect_key(key: &str) -> Result<String, String> {
 ///
 /// `pub(crate)` — see `protect_key` above.
 pub(crate) fn unprotect_key(stored: &str) -> Result<String, String> {
+    unprotect_value(stored, |value| {
+        ConnectionKey::from_key_string("", value).is_some()
+    })
+}
+
+pub(crate) fn unprotect_bootstrap_token(stored: &str) -> Result<String, String> {
+    unprotect_value(stored, |value| {
+        value.split_once(':').is_some_and(|(id, token)| {
+            !id.is_empty()
+                && id.bytes().all(|byte| byte.is_ascii_digit())
+                && !token.is_empty()
+                && token
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b"_-".contains(&byte))
+        })
+    })
+}
+
+fn unprotect_value(
+    stored: &str,
+    valid_plaintext: impl FnOnce(&str) -> bool,
+) -> Result<String, String> {
     #[cfg(windows)]
     {
         if let Ok(blob) = base64::engine::general_purpose::STANDARD.decode(stored) {
@@ -123,7 +145,7 @@ pub(crate) fn unprotect_key(stored: &str) -> Result<String, String> {
     // connection key. A genuine DPAPI blob that failed decryption is binary
     // garbage under base64, not key JSON, so it stays Err here and the caller
     // drops it as before.
-    if ConnectionKey::from_key_string("", stored).is_some() {
+    if valid_plaintext(stored) {
         Ok(stored.to_string())
     } else {
         Err("unreadable stored key (corrupt or from a different user/machine)".to_string())
@@ -163,7 +185,10 @@ impl ConnectionKey {
             .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(payload))
             .ok()?;
         let json: serde_json::Value = serde_json::from_slice(&json_bytes).ok()?;
-        let server_addr = json["s"].as_str().unwrap_or("").to_string();
+        let server_addr = json["s"]
+            .as_str()
+            .filter(|value| !value.trim().is_empty() && !value.chars().any(char::is_control))?
+            .to_string();
         let vpn_ip = json["i"].as_str().unwrap_or("").to_string();
 
         Some(Self {
@@ -219,8 +244,8 @@ impl KeyStorage {
                         }
                     }
                     // Remove corrupt keys in reverse order to preserve indices.
-                    for i in bad_keys.into_iter().rev() {
-                        storage.keys.remove(i);
+                    if !bad_keys.is_empty() {
+                        storage.discard_unreadable_keys(bad_keys);
                         needs_save = true;
                     }
                     // Validate selected index
@@ -239,6 +264,17 @@ impl KeyStorage {
         Self {
             keys: Vec::new(),
             selected: None,
+        }
+    }
+
+    fn discard_unreadable_keys(&mut self, indices: Vec<usize>) {
+        for index in indices.into_iter().rev() {
+            self.keys.remove(index);
+            self.selected = match self.selected {
+                Some(selected) if selected == index => None,
+                Some(selected) if selected > index => Some(selected - 1),
+                selected => selected,
+            };
         }
     }
 
@@ -261,8 +297,24 @@ impl KeyStorage {
         let json = serde_json::to_string_pretty(&on_disk)
             .map_err(|e| format!("Serialization error: {}", e))?;
         // Atomic write: tmp file + rename to avoid corrupt keys.json on crash
-        let tmp = path.with_extension("json.tmp");
-        std::fs::write(&tmp, &json).map_err(|e| format!("Cannot write {:?}: {}", tmp, e))?;
+        let nonce = base64::Engine::encode(
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+            aivpn_common::crypto::random_bytes(16),
+        );
+        let tmp = path.with_extension(format!("{nonce}.tmp"));
+        use std::io::Write;
+        let write = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+            .and_then(|mut file| {
+                file.write_all(json.as_bytes())
+                    .and_then(|_| file.sync_all())
+            });
+        if let Err(error) = write {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(format!("Cannot write {:?}: {}", tmp, error));
+        }
         std::fs::rename(&tmp, &path).map_err(|e| {
             let _ = std::fs::remove_file(&tmp);
             format!("Cannot rename {:?} → {:?}: {}", tmp, path, e)
@@ -382,5 +434,49 @@ impl KeyStorage {
             .unwrap_or_else(|| PathBuf::from("."))
             .join("AIVPN")
             .join("keys.json")
+    }
+}
+
+#[cfg(test)]
+mod bootstrap_token_tests {
+    use super::*;
+    #[test]
+    fn losing_an_unreadable_key_does_not_select_another_profile() {
+        let key = |name: &str| {
+            ConnectionKey::from_key_string(name, "eyJzIjoiMTI3LjAuMC4xOjQ0MyJ9").unwrap()
+        };
+        let mut storage = KeyStorage {
+            keys: vec![key("broken"), key("selected"), key("other")],
+            selected: Some(1),
+        };
+        storage.discard_unreadable_keys(vec![0]);
+        assert_eq!(storage.selected_key().unwrap().name, "selected");
+        storage.discard_unreadable_keys(vec![0]);
+        assert!(storage.selected_key().is_none());
+    }
+
+    #[test]
+    fn keeps_legacy_plaintext_bot_token_without_accepting_a_ciphertext_as_plaintext() {
+        assert_eq!(
+            unprotect_bootstrap_token("123456:abc_DEF-012").unwrap(),
+            "123456:abc_DEF-012"
+        );
+        assert!(unprotect_bootstrap_token("corrupt-storage-blob").is_err());
+        assert!(unprotect_bootstrap_token("123:secret with spaces").is_err());
+    }
+}
+
+#[cfg(test)]
+mod import_validation_tests {
+    use super::*;
+    #[test]
+    fn rejects_empty_profiles() {
+        for value in ["null", "[]", "{}", r#"{"s":""}"#, r#"{"s":"   "}"#] {
+            let key = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(value);
+            assert!(
+                ConnectionKey::from_key_string("bad", &key).is_none(),
+                "{value}"
+            );
+        }
     }
 }
