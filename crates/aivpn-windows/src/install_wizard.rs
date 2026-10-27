@@ -826,38 +826,51 @@ mod tests {
         .unwrap();
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-        let target = base_target();
-        let (tx, rx) = std::sync::mpsc::channel();
-        spawn_install(script.clone(), target, None, tx);
+        // Exec of a script this process has just written fails with ETXTBSY
+        // while a child forked by a parallel test still holds the write
+        // descriptor. That child execs within milliseconds, so retry.
+        let mut attempt = 0;
+        let (saw_done_marker, stderr_lines) = 'attempt: loop {
+            attempt += 1;
+            let (tx, rx) = std::sync::mpsc::channel();
+            spawn_install(script.clone(), base_target(), None, tx);
 
-        // The whole run should finish quickly; poll with a hard deadline so
-        // a regression fails the test instead of hanging the harness.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-        let mut saw_done_marker = false;
-        let mut stderr_lines = 0usize;
-        loop {
-            match rx.recv_timeout(std::time::Duration::from_millis(200)) {
-                Ok(InstallLine::Marker { step, status, .. }) => {
-                    if step == "done" {
-                        saw_done_marker = true;
+            // The whole run should finish quickly; poll with a hard deadline so
+            // a regression fails the test instead of hanging the harness.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            let mut saw_done_marker = false;
+            let mut stderr_lines = 0usize;
+            loop {
+                match rx.recv_timeout(std::time::Duration::from_millis(200)) {
+                    Ok(InstallLine::Marker {
+                        step, status, msg, ..
+                    }) => {
+                        if step == "done" {
+                            saw_done_marker = true;
+                        }
+                        if step == "gui_process" {
+                            let msg = msg.unwrap_or_default();
+                            if status != "ok" && msg.contains("os error 26") && attempt < 50 {
+                                std::thread::sleep(std::time::Duration::from_millis(20));
+                                continue 'attempt;
+                            }
+                            assert_eq!(status, "ok", "{msg}");
+                            break 'attempt (saw_done_marker, stderr_lines);
+                        }
                     }
-                    if step == "gui_process" {
-                        assert_eq!(status, "ok");
-                        break;
+                    Ok(InstallLine::Raw(_)) => stderr_lines += 1,
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "spawn_install deadlocked: stderr flood was never drained"
+                        );
                     }
-                }
-                Ok(InstallLine::Raw(_)) => stderr_lines += 1,
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                    assert!(
-                        std::time::Instant::now() < deadline,
-                        "spawn_install deadlocked: stderr flood was never drained"
-                    );
-                }
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                    panic!("sender dropped without a gui_process terminal marker");
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                        panic!("sender dropped without a gui_process terminal marker");
+                    }
                 }
             }
-        }
+        };
         assert!(saw_done_marker, "stdout marker line was lost");
         assert!(
             stderr_lines > 0,
