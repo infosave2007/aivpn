@@ -67,7 +67,7 @@ fn install_webhook_forwarder(event_bus: &EventBus) {
 #[cfg(feature = "event-webhook")]
 fn webhook_queue(event_bus: &EventBus) -> tokio::sync::mpsc::Receiver<String> {
     let (tx, rx) = tokio::sync::mpsc::channel(1024);
-    let dropped = std::sync::atomic::AtomicU64::new(0);
+    let dropped = portable_atomic::AtomicU64::new(0);
     event_bus.set_event_sink(Arc::new(move |line: &str| {
         if tx.try_send(line.to_owned()).is_err() {
             let count = dropped.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;

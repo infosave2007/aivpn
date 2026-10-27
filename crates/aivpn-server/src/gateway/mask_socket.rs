@@ -1,6 +1,7 @@
 //! Протокольное состояние маски поверх общего UDP-сокета.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use portable_atomic::AtomicU64;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::{collections::VecDeque, io, net::SocketAddr, sync::Arc, time::Instant};
 
 use aivpn_common::{
