@@ -193,7 +193,7 @@ func availableExitNodes(_ nodes: [AdminPoolNodeView]) -> [AdminPoolNodeView] {
     }
 }
 
-struct ExitNodePickerView: View {
+private struct ExitNodePickerView: View {
     @Binding var exitNode: String
     @Binding var choice: ExitNodeChoice
     let poolNodes: [AdminPoolNodeView]
