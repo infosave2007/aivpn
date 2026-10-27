@@ -6,6 +6,12 @@ on:
   pull_request:
     branches: [ "master" ]
 
+# A new push to a pull request supersedes the run still in progress for it.
+# Runs on master are never cancelled, so every merge gets a complete result.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   CARGO_TERM_COLOR: always
 

@@ -774,6 +774,21 @@ impl LiveDbGuard {
     }
 }
 
+impl Drop for LiveDbGuard {
+    fn drop(&mut self) {
+        // Unlock explicitly instead of relying on close(): a child that is
+        // still between fork and exec shares this open file description and
+        // would otherwise keep the lock alive after its owner is gone.
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            unsafe {
+                libc::flock(self._file.as_raw_fd(), libc::LOCK_UN);
+            }
+        }
+    }
+}
+
 /// Сначала исключаем живых владельцев, затем берем обычную блокировку записи.
 pub(crate) struct OfflineRestoreGuard {
     _mutation: DbFileLock,
@@ -2120,6 +2135,21 @@ mod tests {
         ips.sort();
         ips.dedup();
         assert_eq!(ips.len(), 12, "stale allocators must not reuse a VPN IP");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dropped_live_owner_releases_restore_lock_despite_inherited_descriptor() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("clients.json");
+        let db = ClientDatabase::load(&db_path, test_network_config()).unwrap();
+        // A child spawned by another thread holds a duplicate of every open
+        // descriptor until it execs. That duplicate must not keep the
+        // database live once its owner is gone.
+        let inherited = db._live_guard._file.try_clone().unwrap();
+        drop(db);
+        assert!(OfflineRestoreGuard::try_acquire(&db_path).is_ok());
+        drop(inherited);
     }
 
     fn assert_no_regular_tmp(dir: &Path) {
