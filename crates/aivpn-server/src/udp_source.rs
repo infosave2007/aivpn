@@ -147,7 +147,7 @@ pub(crate) fn received_local(message: &libc::msghdr) -> Option<LocalEndpoint> {
             let info = &*header;
             if info.cmsg_level == libc::IPPROTO_IP
                 && info.cmsg_type == libc::IP_PKTINFO
-                && info.cmsg_len
+                && info.cmsg_len as usize
                     >= libc::CMSG_LEN(std::mem::size_of::<libc::in_pktinfo>() as _) as usize
             {
                 let value =
@@ -159,7 +159,7 @@ pub(crate) fn received_local(message: &libc::msghdr) -> Option<LocalEndpoint> {
             }
             if info.cmsg_level == libc::IPPROTO_IPV6
                 && info.cmsg_type == libc::IPV6_PKTINFO
-                && info.cmsg_len
+                && info.cmsg_len as usize
                     >= libc::CMSG_LEN(std::mem::size_of::<libc::in6_pktinfo>() as _) as usize
             {
                 let value =
@@ -190,12 +190,12 @@ pub(crate) fn attach_source(
         match source.ip {
             IpAddr::V4(ip) => {
                 message.msg_controllen =
-                    libc::CMSG_SPACE(std::mem::size_of::<libc::in_pktinfo>() as _) as usize;
+                    libc::CMSG_SPACE(std::mem::size_of::<libc::in_pktinfo>() as _) as _;
                 let header = libc::CMSG_FIRSTHDR(message);
                 (*header).cmsg_level = libc::IPPROTO_IP;
                 (*header).cmsg_type = libc::IP_PKTINFO;
                 (*header).cmsg_len =
-                    libc::CMSG_LEN(std::mem::size_of::<libc::in_pktinfo>() as _) as usize;
+                    libc::CMSG_LEN(std::mem::size_of::<libc::in_pktinfo>() as _) as _;
                 let mut value: libc::in_pktinfo = std::mem::zeroed();
                 // Интерфейс выбирает маршрутизация; адрес остается тем, на который пришел запрос.
                 value.ipi_spec_dst.s_addr = u32::from_ne_bytes(ip.octets());
@@ -203,12 +203,12 @@ pub(crate) fn attach_source(
             }
             IpAddr::V6(ip) => {
                 message.msg_controllen =
-                    libc::CMSG_SPACE(std::mem::size_of::<libc::in6_pktinfo>() as _) as usize;
+                    libc::CMSG_SPACE(std::mem::size_of::<libc::in6_pktinfo>() as _) as _;
                 let header = libc::CMSG_FIRSTHDR(message);
                 (*header).cmsg_level = libc::IPPROTO_IPV6;
                 (*header).cmsg_type = libc::IPV6_PKTINFO;
                 (*header).cmsg_len =
-                    libc::CMSG_LEN(std::mem::size_of::<libc::in6_pktinfo>() as _) as usize;
+                    libc::CMSG_LEN(std::mem::size_of::<libc::in6_pktinfo>() as _) as _;
                 let mut value: libc::in6_pktinfo = std::mem::zeroed();
                 value.ipi6_addr.s6_addr = ip.octets();
                 if ip.is_unicast_link_local() {
@@ -239,7 +239,7 @@ pub(crate) async fn recv_from(
             header.msg_name = (&mut address as *mut libc::sockaddr_storage).cast();
             header.msg_namelen = std::mem::size_of_val(&address) as _;
             header.msg_control = control.0.as_mut_ptr().cast();
-            header.msg_controllen = control.0.len();
+            header.msg_controllen = control.0.len() as _;
             header.msg_iov = &mut iovec;
             header.msg_iovlen = 1;
             // Сокет неблокирующий; адрес, данные и control остаются живыми до возврата.
