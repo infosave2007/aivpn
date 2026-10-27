@@ -1,9 +1,41 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UiLayout {
+    Material,
+    #[default]
+    #[serde(other)]
+    Breeze,
+}
+
+impl std::fmt::Display for UiLayout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Material => "Material",
+            Self::Breeze => "KDE / Breeze",
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ColorScheme {
+    Light,
+    Dark,
+    #[serde(other)]
+    System,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppSettings {
     pub dark_mode: bool,
+    #[serde(default)]
+    pub ui_layout: UiLayout,
+    // Отсутствие поля сохраняет прежнее предпочтение dark_mode.
+    #[serde(default)]
+    pub color_scheme: Option<ColorScheme>,
     pub kill_switch: bool,
     pub adaptive_level: u8,
     pub dns_proxy: String,
@@ -80,6 +112,8 @@ impl Default for AppSettings {
     fn default() -> Self {
         AppSettings {
             dark_mode: true,
+            ui_layout: UiLayout::Breeze,
+            color_scheme: Some(ColorScheme::System),
             kill_switch: false,
             adaptive_level: 0,
             dns_proxy: String::new(),
@@ -135,12 +169,16 @@ impl AppSettings {
         // Write 0600 to a temp file then atomically rename (same pattern as
         // key_storage.rs): a crash mid-write can't corrupt the existing
         // settings and the Telegram token is never world-readable.
-        let tmp = path.with_extension("json.tmp");
+        let nonce = base64::Engine::encode(
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+            aivpn_common::crypto::random_bytes(16),
+        );
+        let tmp = path.with_extension(format!("{nonce}.tmp"));
         let write_result = std::fs::OpenOptions::new()
             .write(true)
-            .create(true)
-            .truncate(true)
+            .create_new(true)
             .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
             .open(&tmp)
             .and_then(|mut f| f.write_all(json.as_bytes()).and_then(|_| f.sync_all()));
         match write_result {
@@ -169,6 +207,26 @@ fn autostart_path() -> Option<PathBuf> {
     dirs::config_dir().map(|d| d.join("autostart").join("aivpn.desktop"))
 }
 
+fn desktop_exec_argument(path: &str) -> String {
+    let mut quoted = String::from("\"");
+    for character in path.chars() {
+        match character {
+            '\\' | '"' | '$' | '`' => {
+                quoted.push('\\');
+                quoted.push(character);
+            }
+            '%' => quoted.push_str("%%"),
+            _ => quoted.push(character),
+        }
+    }
+    quoted.push('"');
+    quoted
+        .replace('\\', "\\\\")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+        .replace('\t', "\\t")
+}
+
 /// Write an XDG autostart .desktop entry so AIVPN launches at login.
 pub fn write_autostart_entry() {
     let path = match autostart_path() {
@@ -190,6 +248,7 @@ pub fn write_autostart_entry() {
                 .map(|p| p.to_string_lossy().to_string())
                 .unwrap_or_else(|_| "aivpn-linux".to_string())
         });
+    let exe = desktop_exec_argument(&exe);
     let content = format!(
         "[Desktop Entry]\nType=Application\nExec={exe}\nName=AIVPN\nX-GNOME-Autostart-enabled=true\n"
     );
@@ -200,5 +259,70 @@ pub fn write_autostart_entry() {
 pub fn remove_autostart_entry() {
     if let Some(path) = autostart_path() {
         let _ = std::fs::remove_file(path);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn autostart_escapes_paths_and_field_codes() {
+        assert_eq!(
+            desktop_exec_argument("/home/a b/AIVPN.AppImage"),
+            "\"/home/a b/AIVPN.AppImage\""
+        );
+        assert_eq!(
+            desktop_exec_argument("/home/50%/AIVPN"),
+            "\"/home/50%%/AIVPN\""
+        );
+        assert_eq!(desktop_exec_argument("a\\b\"$`"), r#""a\\\\b\\"\\$\\`""#);
+        assert!(!desktop_exec_argument("a\nb").contains('\n'));
+    }
+}
+
+#[cfg(test)]
+mod appearance_tests {
+    use super::*;
+
+    #[test]
+    fn appearance_defaults_are_serialized() {
+        let value = serde_json::to_value(AppSettings::default()).unwrap();
+        assert_eq!(value["ui_layout"], "breeze");
+        assert_eq!(value["color_scheme"], "system");
+    }
+
+    #[test]
+    fn legacy_settings_keep_network_and_color_preferences() {
+        let old = r#"{"dark_mode":false,"kill_switch":true,"adaptive_level":2,"dns_proxy":"127.0.0.1:5300","include_routes":"10.0.0.0/8","preferred_mask":"youtube"}"#;
+        let restored: AppSettings = serde_json::from_str(old).unwrap();
+        let value = serde_json::to_value(restored).unwrap();
+        assert_eq!(value["ui_layout"], "breeze");
+        assert!(value["color_scheme"].is_null());
+        assert_eq!(value["dark_mode"], false);
+        assert_eq!(value["kill_switch"], true);
+        assert_eq!(value["include_routes"], "10.0.0.0/8");
+        assert_eq!(value["preferred_mask"], "youtube");
+    }
+
+    #[test]
+    fn appearance_selection_survives_restart() {
+        let value = serde_json::json!({"dark_mode":true,"kill_switch":false,"adaptive_level":0,"dns_proxy":"","ui_layout":"material","color_scheme":"light"});
+        let settings: AppSettings = serde_json::from_value(value).unwrap();
+        let saved = serde_json::to_value(settings).unwrap();
+        assert_eq!(saved["ui_layout"], "material");
+        assert_eq!(saved["color_scheme"], "light");
+    }
+}
+
+#[cfg(test)]
+mod forward_compatibility_tests {
+    use super::*;
+    #[test]
+    fn unknown_appearance_does_not_reset_connection_preferences() {
+        let settings: AppSettings = serde_json::from_str(r#"{"dark_mode":false,"kill_switch":true,"adaptive_level":3,"dns_proxy":"127.0.0.1:5353","ui_layout":"future_layout","color_scheme":"future_scheme"}"#).unwrap();
+        assert!(settings.kill_switch);
+        assert_eq!(settings.adaptive_level, 3);
+        assert_eq!(settings.dns_proxy, "127.0.0.1:5353");
     }
 }

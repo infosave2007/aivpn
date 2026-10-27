@@ -5,100 +5,97 @@
     android:layout_width="match_parent"
     android:layout_height="match_parent"
     android:orientation="vertical"
-    android:background="@color/background">
+    android:background="?attr/colorSurface">
 
-    <!-- Compact toolbar: back + title (same pattern as SplitTunnelActivity) -->
     <LinearLayout
         android:layout_width="match_parent"
-        android:layout_height="48dp"
+        android:layout_height="wrap_content"
+        android:minHeight="64dp"
         android:orientation="horizontal"
         android:gravity="center_vertical"
-        android:paddingHorizontal="8dp">
+        android:paddingStart="4dp"
+        android:paddingEnd="16dp"
+        android:paddingVertical="4dp">
 
         <ImageButton
             android:id="@+id/btnBack"
-            android:layout_width="40dp"
-            android:layout_height="40dp"
-            android:src="@android:drawable/ic_menu_revert"
+            android:layout_width="48dp"
+            android:layout_height="48dp"
+            android:src="@drawable/ic_vpn_back"
             android:background="?attr/selectableItemBackgroundBorderless"
-            android:contentDescription="Back"
+            android:contentDescription="@string/ui_back"
             android:scaleType="centerInside"
-            app:tint="@color/text_primary" />
+            app:tint="?attr/colorOnSurface" />
 
         <TextView
             android:layout_width="0dp"
             android:layout_height="wrap_content"
             android:layout_weight="1"
             android:text="@string/bg_health_title"
-            android:textSize="18sp"
-            android:textStyle="bold"
-            android:textColor="@color/text_primary"
-            android:paddingStart="4dp" />
+            android:textAppearance="@style/TextAppearance.Material3.TitleLarge"
+            android:textColor="?attr/colorOnSurface"
+            android:maxLines="2"
+            android:ellipsize="end"
+            android:paddingStart="4dp"
+            android:accessibilityHeading="true" />
     </LinearLayout>
 
     <ScrollView
         android:layout_width="match_parent"
         android:layout_height="match_parent"
-        android:fillViewport="true">
+        android:fillViewport="true"
+        android:clipToPadding="false">
 
         <LinearLayout
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:orientation="vertical"
-            android:padding="16dp">
+            android:paddingHorizontal="20dp"
+            android:paddingBottom="24dp">
 
-            <!-- Overall protected / at-risk summary -->
             <com.google.android.material.card.MaterialCardView
                 android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                app:cardBackgroundColor="@color/surface"
-                app:cardCornerRadius="16dp"
-                app:cardElevation="0dp"
-                app:strokeWidth="0dp">
+                android:layout_height="wrap_content">
 
                 <LinearLayout
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content"
                     android:orientation="horizontal"
                     android:gravity="center_vertical"
-                    android:padding="16dp">
+                    android:padding="16dp"
+                    android:minHeight="64dp">
 
                     <View
                         android:id="@+id/summaryDot"
-                        android:layout_width="14dp"
-                        android:layout_height="14dp"
+                        android:layout_width="12dp"
+                        android:layout_height="12dp"
                         android:background="@drawable/dot_grey"
-                        android:layout_marginEnd="12dp" />
+                        android:layout_marginEnd="12dp"
+                        android:importantForAccessibility="no" />
 
                     <TextView
                         android:id="@+id/textSummary"
                         android:layout_width="0dp"
                         android:layout_height="wrap_content"
                         android:layout_weight="1"
-                        android:textSize="15sp"
-                        android:textStyle="bold"
-                        android:textColor="@color/text_primary" />
+                        android:textSize="16sp"
+                        android:textColor="?attr/colorOnSurface" />
                 </LinearLayout>
             </com.google.android.material.card.MaterialCardView>
 
             <TextView
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
-                android:text="@string/bg_health_intro"
-                android:textSize="12sp"
-                android:textColor="@color/text_secondary"
-                android:paddingTop="10dp"
-                android:paddingBottom="6dp" />
+                android:text="@string/secondary_bg_intro"
+                android:textSize="14sp"
+                android:textColor="?attr/colorOnSurfaceVariant"
+                android:paddingTop="12dp"
+                android:paddingBottom="8dp" />
 
-            <!-- Checklist rows are built programmatically in BackgroundHealthActivity -->
             <com.google.android.material.card.MaterialCardView
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
-                android:layout_marginTop="6dp"
-                app:cardBackgroundColor="@color/surface"
-                app:cardCornerRadius="16dp"
-                app:cardElevation="0dp"
-                app:strokeWidth="0dp">
+                android:layout_marginTop="4dp">
 
                 <LinearLayout
                     android:id="@+id/checklistContainer"
@@ -108,16 +105,15 @@
                     android:paddingVertical="4dp" />
             </com.google.android.material.card.MaterialCardView>
 
-            <!-- Generic OEM autostart hint (always shown) -->
             <TextView
                 android:id="@+id/textOemHint"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
-                android:text="@string/bg_health_oem_generic"
-                android:textSize="12sp"
-                android:textColor="@color/text_secondary"
+                android:text="@string/secondary_bg_oem_generic"
+                android:textSize="14sp"
+                android:textColor="?attr/colorOnSurfaceVariant"
                 android:paddingTop="12dp"
-                android:paddingBottom="16dp" />
+                android:paddingBottom="8dp" />
         </LinearLayout>
     </ScrollView>
 </LinearLayout>

@@ -3,7 +3,6 @@
 //! `aivpn-android-core`. Hoisted verbatim from `android_tunnel.rs` (the base
 //! text with the latest fixes); iOS-only additions are noted inline.
 
-use std::os::fd::{AsRawFd, RawFd};
 use std::sync::atomic::{
     AtomicBool, AtomicI32, AtomicU16, AtomicU32, AtomicU64, AtomicU8, Ordering,
 };
@@ -11,6 +10,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
+
+use super::io::SessionTun;
 
 use crate::error::{Error, Result};
 use crate::mask::{
@@ -22,14 +23,9 @@ use crate::protocol::{ControlPayload, MaskOutcome};
 // ──────────── Constants ────────────
 
 pub const BUF_SIZE: usize = 2048;
-pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
-pub const HANDSHAKE_RETRY_INTERVAL: Duration = Duration::from_millis(750);
+pub use crate::handshake_retry::HANDSHAKE_TIMEOUT;
 pub const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(4); // below typical provider NAT UDP timeout (~10-15s)
-/// NAT-safe keepalive ceiling — mirror of desktop client.rs `KEEPALIVE_NAT_CAP`.
-/// An AdaptiveHint may relax the interval up to this bound (Satellite is
-/// uncapped). The initial `keepalive_interval` derives from the tiny 4s
-/// `base_keepalive`, so the re-arm must clamp against THIS ceiling, not that
-/// floor — otherwise `base.min(level)` collapses every hint back to 4s.
+/// Верхняя граница keepalive оставляет запас до таймаута QUIC 30 с.
 pub const KEEPALIVE_NAT_CAP: Duration = Duration::from_secs(25);
 pub const RX_SILENCE: Duration = Duration::from_secs(120); // absolute net: NOTHING decodes at all (control included)
 pub const RX_CHECK_INTERVAL: Duration = Duration::from_secs(2);
@@ -173,25 +169,8 @@ pub fn data_stall_confirmed(
 pub struct SessionRuntime {
     pub udp_control_fd: AtomicI32,
     pub stop_signal_fd: AtomicI32,
-    /// Rust's private duplicates of the platform-owned TUN fd — one for writing
-    /// downlink, one for the reader task.
-    ///
-    /// The session OWNS them (the `AsyncFd`s only borrow via [`TunFd`]) because
-    /// the kernel destroys a tun device only when its LAST fd closes. Android's
-    /// Kotlin layer closes its `ParcelFileDescriptor` on disconnect and gives
-    /// the native call ~3 s to unwind; a slower unwind used to leave these
-    /// duplicates alive past the interface, keeping a zombie tun that still
-    /// carried the VPN address. The next session then established a SECOND tun
-    /// with the same address, the app's packets were routed into the dead one
-    /// nobody reads, and the tunnel was "connected" with no traffic — only a
-    /// process kill (force-stop / clear-data) broke the loop.
-    ///
-    /// Released in two phases, see [`neutralize_session_fd`] and
-    /// [`close_session_fd`]: `stop_active_tunnel` drops the *tun reference*
-    /// immediately, session teardown releases the fd *number* once nothing
-    /// polls it any more.
-    pub tun_write_fd: AtomicI32,
-    pub tun_read_fd: AtomicI32,
+    /// Регистрация владеет fd; stop закрывает ее синхронно, задачи держат handle.
+    pub(crate) tun: Arc<SessionTun>,
     pub upload_bytes: AtomicU64,
     pub download_bytes: AtomicU64,
     // Wall-clock epoch ms at which this session completed its handshake, 0
@@ -215,8 +194,7 @@ impl SessionRuntime {
         Self {
             udp_control_fd: AtomicI32::new(-1),
             stop_signal_fd: AtomicI32::new(-1),
-            tun_write_fd: AtomicI32::new(-1),
-            tun_read_fd: AtomicI32::new(-1),
+            tun: Arc::new(SessionTun::default()),
             upload_bytes: AtomicU64::new(0),
             download_bytes: AtomicU64::new(0),
             connected_at_unix_ms: AtomicU64::new(0),
@@ -305,16 +283,24 @@ pub fn condemn_descriptor_mask_after_watchdog(
     if data_plane_proven || !mask_id.starts_with("bootstrap:") {
         return;
     }
-    log::warn!(
-        "aivpn: {reason} on a session handshaked with covert descriptor mask '{mask_id}' — \
-         discarding cached descriptors and falling back to a builtin preset for the next attempt"
-    );
-    if let Ok(mut g) = BOOTSTRAP_DESCRIPTORS.lock() {
-        g.clear();
+    #[cfg(feature = "production-secure")]
+    {
+        log::warn!("aivpn: {reason} on descriptor mask '{mask_id}'; retaining trusted descriptors, builtin fallback is disabled");
+        HANDSHAKE_FAIL_STREAK.store(HANDSHAKE_FALLBACK_THRESHOLD, Ordering::Relaxed);
     }
-    DISCARD_PERSISTED_DESCRIPTORS.store(true, Ordering::Relaxed);
-    DESCRIPTORS_DISTRUSTED.store(true, Ordering::Relaxed);
-    HANDSHAKE_FAIL_STREAK.store(HANDSHAKE_FALLBACK_THRESHOLD, Ordering::Relaxed);
+    #[cfg(not(feature = "production-secure"))]
+    {
+        log::warn!(
+            "aivpn: {reason} on a session handshaked with covert descriptor mask '{mask_id}' — \
+         discarding cached descriptors and falling back to a builtin preset for the next attempt"
+        );
+        if let Ok(mut g) = BOOTSTRAP_DESCRIPTORS.lock() {
+            g.clear();
+        }
+        DISCARD_PERSISTED_DESCRIPTORS.store(true, Ordering::Relaxed);
+        DESCRIPTORS_DISTRUSTED.store(true, Ordering::Relaxed);
+        HANDSHAKE_FAIL_STREAK.store(HANDSHAKE_FALLBACK_THRESHOLD, Ordering::Relaxed);
+    }
 }
 
 /// Polled by the platform after the tunnel call returns: `true` means the
@@ -328,7 +314,10 @@ pub fn take_discard_persisted_descriptors() -> bool {
 /// from the platform's persisted verdict. See
 /// [`DESCRIPTORS_DISTRUSTED_SENTINEL`].
 pub fn mark_descriptors_distrusted() {
+    #[cfg(not(feature = "production-secure"))]
     DESCRIPTORS_DISTRUSTED.store(true, Ordering::Relaxed);
+    #[cfg(feature = "production-secure")]
+    log::warn!("aivpn: ignoring an availability fallback marker in production-secure");
 }
 
 /// Drop the distrust verdict when the session targets a DIFFERENT server.
@@ -571,6 +560,7 @@ pub static LAST_GOOD_MASK: Mutex<Option<MaskProfile>> = Mutex::new(None);
 /// `DATA_STALL_EXPLORE_THRESHOLD` such sessions the sticky mask is cleared and
 /// AUTO resolution explores a different one.
 pub static DATA_STALL_STREAK: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+pub static DATA_EXPLORATION_ROUND: AtomicU32 = AtomicU32::new(0);
 /// A session that carried data and stayed up at least this long is a working
 /// mask; a later stall is a transient hiccup, not throttling, so the streak
 /// resets and the mask stays sticky.
@@ -591,6 +581,7 @@ pub fn note_data_stall_and_maybe_explore(established: Instant) {
     if n >= DATA_STALL_EXPLORE_THRESHOLD {
         *LAST_GOOD_MASK.lock().unwrap_or_else(|e| e.into_inner()) = None;
         DATA_STALL_STREAK.store(0, Ordering::Relaxed);
+        DATA_EXPLORATION_ROUND.fetch_add(1, Ordering::Relaxed);
         log::warn!(
             "aivpn: sticky mask produced {n} short data-stall sessions — clearing it so auto-mask can try a different mask"
         );
@@ -611,13 +602,31 @@ pub fn resolve_sticky_handshake_mask(
     let is_auto = preferred
         .map(str::trim)
         .is_none_or(|s| s.is_empty() || s == "auto");
-    if is_auto && fail_streak < HANDSHAKE_FALLBACK_THRESHOLD {
-        if let Some(m) = LAST_GOOD_MASK
+    if is_auto {
+        let mut sticky = LAST_GOOD_MASK
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
-        {
-            return m;
+            .unwrap_or_else(|error| error.into_inner());
+        if fail_streak < HANDSHAKE_FALLBACK_THRESHOLD {
+            if let Some(mask) = sticky.clone() {
+                return mask;
+            }
+        } else {
+            sticky.take();
+        }
+    }
+    let exploration = DATA_EXPLORATION_ROUND.load(Ordering::Relaxed);
+    if is_auto && exploration > 0 {
+        let attempt =
+            fail_streak.saturating_add(exploration.saturating_mul(HANDSHAKE_FALLBACK_THRESHOLD));
+        #[cfg(feature = "production-secure")]
+        return resolve_handshake_mask_resilient(preferred, descriptors, psk, attempt);
+        #[cfg(not(feature = "production-secure"))]
+        if fail_streak < HANDSHAKE_FALLBACK_THRESHOLD {
+            if let Some(candidate) =
+                crate::mask::bootstrap_candidate_for_attempt(descriptors, psk, attempt)
+            {
+                return candidate;
+            }
         }
     }
     resolve_handshake_mask_resilient(preferred, descriptors, psk, fail_streak)
@@ -732,77 +741,13 @@ pub fn send_control_payload(payload: ControlPayload) -> bool {
     }
 }
 
-/// A TUN fd that an `AsyncFd` may poll but must never close: ownership lives in
-/// [`SessionRuntime`] so a disconnect can drop the tun device immediately,
-/// without waiting for the tokio tasks holding these views to be dropped.
-pub struct TunFd(pub RawFd);
-
-impl AsRawFd for TunFd {
-    fn as_raw_fd(&self) -> RawFd {
-        self.0
-    }
-}
-
-/// Phase 1 of releasing a session-owned TUN fd: drop the *reference to the tun
-/// device* while keeping the fd NUMBER reserved.
-///
-/// Plain `close()` here would be a use-after-close hazard rather than a fix.
-/// The reader task may still be parked on this fd, and the number is freed the
-/// instant we close it — on Android the platform reconnects within
-/// milliseconds, so the very next session can be handed the SAME number for its
-/// own tun. The stale task would then read the NEW session's uplink packets and
-/// push them into the OLD session's (dead) channel: the same "connected, no
-/// traffic" symptom this whole path exists to prevent, just one reconnect later.
-///
-/// `dup2()` avoids that entirely. It atomically closes the old file description
-/// — releasing the tun reference, so the device dies as soon as the platform
-/// closes its own fd — and rebinds the number to `/dev/null`. Anything still
-/// polling sees a valid fd: reads fail with `EBADF` (it is write-only) and the
-/// task exits on its own, writes are discarded. The number cannot be recycled
-/// behind our back because we still hold it.
-///
-/// Idempotent. Falls back to a plain close only if `/dev/null` cannot be opened,
-/// which on Android/iOS means the process is already out of descriptors.
-pub fn neutralize_session_fd(slot: &AtomicI32) {
-    let fd = slot.load(Ordering::SeqCst);
-    if fd < 0 {
-        return;
-    }
-    let devnull = unsafe {
-        libc::open(
-            b"/dev/null\0".as_ptr() as *const libc::c_char,
-            libc::O_WRONLY | libc::O_CLOEXEC,
-        )
-    };
-    if devnull < 0 {
-        if slot.swap(-1, Ordering::SeqCst) >= 0 {
-            unsafe { libc::close(fd) };
-        }
-        return;
-    }
-    unsafe {
-        libc::dup2(devnull, fd);
-        libc::close(devnull);
-    }
-}
-
-/// Phase 2: release the fd number itself, once the session is over and nothing
-/// polls it any more. `swap(-1)` makes the caller the sole closer, so the number
-/// can never be closed twice (and thus never closed after the OS handed it to an
-/// unrelated `open`).
-pub fn close_session_fd(slot: &AtomicI32) {
-    let fd = slot.swap(-1, Ordering::SeqCst);
-    if fd >= 0 {
-        unsafe { libc::close(fd) };
-    }
-}
-
 pub struct ActiveSessionGuard {
     session: Arc<SessionRuntime>,
 }
 
 impl Drop for ActiveSessionGuard {
     fn drop(&mut self) {
+        self.session.tun.close();
         let udp_fd = self.session.udp_control_fd.swap(-1, Ordering::SeqCst);
         if udp_fd >= 0 {
             unsafe { libc::close(udp_fd) };
@@ -814,12 +759,6 @@ impl Drop for ActiveSessionGuard {
         }
 
         let mut guard = ACTIVE_SESSION.lock().unwrap_or_else(|e| e.into_inner());
-        // Normal end of a session: the run loop has returned, so both TUN views
-        // are dead and the numbers can finally be given back. Taken under the
-        // ACTIVE_SESSION lock so this can never interleave with a concurrent
-        // `stop_active_tunnel` neutralising the same slots.
-        close_session_fd(&self.session.tun_read_fd);
-        close_session_fd(&self.session.tun_write_fd);
         if let Some(current) = guard.as_ref() {
             if Arc::ptr_eq(current, &self.session) {
                 *guard = None;
@@ -855,7 +794,7 @@ pub fn activate_session(session: Arc<SessionRuntime>) -> Result<ActiveSessionGua
 }
 
 pub fn stop_active_tunnel() {
-    let (udp_fd, stop_fd) = {
+    let (session, udp_fd, stop_fd) = {
         let guard = ACTIVE_SESSION.lock().unwrap_or_else(|e| e.into_inner());
         guard
             .as_ref()
@@ -863,17 +802,8 @@ pub fn stop_active_tunnel() {
                 // Set the flag FIRST so early init phases (DNS lookup, socket
                 // creation) see it before the eventfd/UDP fd are available.
                 s.stop_requested.store(true, Ordering::SeqCst);
-                // Drop the tun references NOW, not whenever the native call
-                // finishes unwinding. Android's Kotlin layer closes its
-                // ParcelFileDescriptor on disconnect and waits only ~3 s for
-                // that unwind; anything still holding a duplicate past that
-                // point keeps the tun device alive with the VPN address on it,
-                // and the next session's interface then competes with a zombie
-                // for the app's packets. The fd numbers stay ours until the
-                // session guard drops — see `neutralize_session_fd`.
-                neutralize_session_fd(&s.tun_read_fd);
-                neutralize_session_fd(&s.tun_write_fd);
                 (
+                    Some(s.clone()),
                     s.udp_control_fd.swap(-1, Ordering::SeqCst),
                     // swap(-1) takes OWNERSHIP of the eventfd, so a concurrent
                     // ActiveSessionGuard::drop (which also swaps) can never close
@@ -887,9 +817,13 @@ pub fn stop_active_tunnel() {
                 // guard drop and the new session's activate_session() call.
                 // Mark the flag so the next session inherits the stop.
                 STOP_PENDING.store(true, Ordering::SeqCst);
-                (-1, -1)
+                (None, -1, -1)
             })
     };
+
+    if let Some(session) = session {
+        session.tun.request_stop(&session.stop_requested);
+    }
 
     if stop_fd >= 0 {
         #[cfg(any(target_os = "android", target_os = "linux"))]
@@ -972,6 +906,86 @@ pub fn get_active_connected_since_ms() -> u64 {
 mod tests {
     use super::*;
 
+    #[test]
+    fn stop_releases_tun_fd_without_runtime_progress() {
+        const CHILD: &str = "AIVPN_STOP_FD_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "mobile_tunnel::state::tests::stop_releases_tun_fd_without_runtime_progress",
+                    "--test-threads=1",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        use std::os::fd::{AsRawFd, OwnedFd};
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .build()
+            .unwrap();
+        let _entered = runtime.enter();
+        let (tun, _peer) = std::os::unix::net::UnixDatagram::pair().unwrap();
+        let platform_copy = tun.try_clone().unwrap();
+        let owned: OwnedFd = tun.into();
+        let fd = owned.as_raw_fd();
+        let session = Arc::new(SessionRuntime::new());
+        let active = activate_session(session.clone()).unwrap();
+        assert!(session.tun.install(owned, &session.stop_requested).unwrap());
+        stop_active_tunnel();
+        let still_open = unsafe { libc::fcntl(fd, libc::F_GETFD) } >= 0;
+        drop(active);
+        drop(platform_copy);
+        assert!(
+            !still_open,
+            "Stop должен синхронно освободить принадлежащий Rust fd"
+        );
+    }
+
+    #[cfg(feature = "production-secure")]
+    #[test]
+    fn secure_watchdog_preserves_trusted_descriptors_and_never_exports_fallback_marker() {
+        let previous = BOOTSTRAP_DESCRIPTORS.lock().unwrap().clone();
+        let streak = HANDSHAKE_FAIL_STREAK.load(Ordering::Relaxed);
+        let distrusted = DESCRIPTORS_DISTRUSTED.swap(false, Ordering::Relaxed);
+        let discard = DISCARD_PERSISTED_DESCRIPTORS.swap(false, Ordering::Relaxed);
+        *BOOTSTRAP_DESCRIPTORS.lock().unwrap() = vec![BootstrapDescriptor {
+            descriptor_id: "secure-test".into(),
+            version: 1,
+            created_at: 0,
+            expires_at: u64::MAX,
+            base_mask_ids: vec!["webrtc_zoom_v3".into()],
+            embedded_masks: vec![],
+            candidate_count: 1,
+            kdf_salt: [3; 32],
+            signature: [0; 64],
+        }];
+        condemn_descriptor_mask_after_watchdog(
+            "bootstrap:secure-test:webrtc_zoom_v3:0:abcd",
+            "test",
+            false,
+        );
+        mark_descriptors_distrusted();
+        assert_eq!(current_bootstrap_descriptors().len(), 1);
+        assert!(!take_discard_persisted_descriptors());
+        assert_ne!(
+            bootstrap_descriptors_json(),
+            DESCRIPTORS_DISTRUSTED_SENTINEL
+        );
+        *BOOTSTRAP_DESCRIPTORS.lock().unwrap() = previous;
+        HANDSHAKE_FAIL_STREAK.store(streak, Ordering::Relaxed);
+        DESCRIPTORS_DISTRUSTED.store(distrusted, Ordering::Relaxed);
+        DISCARD_PERSISTED_DESCRIPTORS.store(discard, Ordering::Relaxed);
+    }
+
     /// Sticky-mask liveness: after DATA_STALL_EXPLORE_THRESHOLD consecutive
     /// SHORT data-stall sessions the sticky mask is cleared so AUTO can explore
     /// alternatives; a healthy-length session resets the streak so an occasional
@@ -979,7 +993,22 @@ mod tests {
     #[test]
     fn sticky_mask_explores_after_repeated_short_stalls() {
         use std::sync::atomic::Ordering;
-        let mask = crate::mask::preset_masks::all().into_iter().next().unwrap();
+        let previous_round = DATA_EXPLORATION_ROUND.swap(0, Ordering::Relaxed);
+        let previous_mask = LAST_GOOD_MASK.lock().unwrap().clone();
+        let previous_streak = DATA_STALL_STREAK.load(Ordering::Relaxed);
+        let descriptor = BootstrapDescriptor {
+            descriptor_id: "data-stall-epoch".into(),
+            version: 1,
+            created_at: 0,
+            expires_at: u64::MAX,
+            base_mask_ids: vec!["webrtc_zoom_v3".into()],
+            embedded_masks: Vec::new(),
+            candidate_count: 4,
+            kdf_salt: [7; 32],
+            signature: [0; 64],
+        };
+        let descriptors = [descriptor];
+        let mask = crate::mask::bootstrap_candidate_for_attempt(&descriptors, None, 0).unwrap();
         let past = |secs: u64| {
             Instant::now()
                 .checked_sub(Duration::from_secs(secs))
@@ -1006,6 +1035,9 @@ mod tests {
             "cleared at threshold"
         );
 
+        let next = resolve_sticky_handshake_mask(Some("auto"), &descriptors, None, 0);
+        assert_ne!(mask.mask_id, next.mask_id);
+
         // A healthy-length session resets the streak: subsequent short stalls
         // below the threshold do NOT clear the (re-seeded) sticky mask.
         *LAST_GOOD_MASK.lock().unwrap() = Some(mask.clone());
@@ -1019,6 +1051,9 @@ mod tests {
             LAST_GOOD_MASK.lock().unwrap().is_some(),
             "healthy session reset the streak"
         );
+        *LAST_GOOD_MASK.lock().unwrap() = previous_mask;
+        DATA_STALL_STREAK.store(previous_streak, Ordering::Relaxed);
+        DATA_EXPLORATION_ROUND.store(previous_round, Ordering::Relaxed);
     }
 
     /// The data watchdog must trip on a dead DATA downlink (uplink data
@@ -1101,5 +1136,72 @@ mod tests {
             assert_eq!(data_stall_confirmed(&mut strikes, None), None);
         }
         assert_eq!(strikes, 0);
+    }
+}
+
+#[cfg(all(test, feature = "production-secure"))]
+mod preferred_reconnect_tests {
+    use super::*;
+    use ed25519_dalek::Signer;
+
+    #[test]
+    fn preferred_reconnect_mobile_keeps_quic_across_trusted_epoch_rounds() {
+        let now = crate::mask::current_unix_secs();
+        let signing = ed25519_dalek::SigningKey::from_bytes(&[63; 32]);
+        let make = |id: &str, age: u64, base: &str| {
+            let mut descriptor = BootstrapDescriptor {
+                descriptor_id: id.into(),
+                version: 1,
+                created_at: now - age,
+                expires_at: now + 3600,
+                base_mask_ids: vec![base.into()],
+                embedded_masks: vec![],
+                candidate_count: 2,
+                kdf_salt: [64; 32],
+                signature: [0; 64],
+            };
+            descriptor.signature = signing.sign(&descriptor.signing_bytes()).to_bytes();
+            assert!(descriptor
+                .verify_signature(&signing.verifying_key().to_bytes())
+                .unwrap());
+            descriptor
+        };
+        let descriptors = [
+            make("new-rtc", 1, "webrtc_zoom_v3"),
+            make("old-quic", 2, "quic_https_v2"),
+        ];
+        let before: Vec<_> = descriptors
+            .iter()
+            .map(BootstrapDescriptor::signing_bytes)
+            .collect();
+        let psk = [65; 32];
+        for attempt in [
+            0,
+            HANDSHAKE_FALLBACK_THRESHOLD,
+            HANDSHAKE_FALLBACK_THRESHOLD * 2,
+            u32::MAX,
+        ] {
+            let mask = resolve_sticky_handshake_mask(
+                Some("quic_https_v2"),
+                &descriptors,
+                Some(&psk),
+                attempt,
+            );
+            assert_eq!(
+                mask.spoof_protocol,
+                crate::mask::SpoofProtocol::QUIC,
+                "Mobile preferred потерян на попытке {attempt}"
+            );
+            assert!(mask
+                .mask_id
+                .starts_with("bootstrap:old-quic:quic_https_v2:"));
+        }
+        assert_eq!(
+            descriptors
+                .iter()
+                .map(BootstrapDescriptor::signing_bytes)
+                .collect::<Vec<_>>(),
+            before
+        );
     }
 }

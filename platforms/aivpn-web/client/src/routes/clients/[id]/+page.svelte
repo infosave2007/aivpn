@@ -1,6 +1,7 @@
 <script lang="ts">
   import { page } from '$app/stores';
   import { goto } from '$app/navigation';
+  import { onDestroy } from 'svelte';
   import { toStore } from 'svelte/store';
   import { createQuery, createMutation, useQueryClient } from '@tanstack/svelte-query';
   import { clients as clientsApi, masks as masksApi } from '$lib/api';
@@ -105,7 +106,8 @@
   const updateMut = createMutation({
     mutationFn: (data: Parameters<typeof clientsApi.update>[1]) => clientsApi.update(id, data),
     onSuccess: (updated) => {
-      qc.setQueryData(['client', id], updated);
+      qc.setQueryData(['client', updated.id], updated);
+      if (updated.id !== id) return;
       toast = 'Saved successfully';
       toastError = false;
       setTimeout(() => { toast = ''; }, 3000);
@@ -154,6 +156,16 @@
   let qrData = $state('');
   let connKeyOpen = $state(false);
   let connKey = $state('');
+  let keyRequest = 0;
+  onDestroy(() => { keyRequest += 1; });
+  $effect(() => {
+    void id;
+    keyRequest += 1;
+    connKeyOpen = false;
+    qrOpen = false;
+    connKey = '';
+    qrData = '';
+  });
 
   async function loadKey() {
     const res = await clientsApi.connectionKey(id);
@@ -170,17 +182,25 @@
   }
 
   async function showKey() {
+    const request = ++keyRequest;
     try {
-      connKey = await loadKey();
+      const key = await loadKey();
+      if (request !== keyRequest) return;
+      qrOpen = false;
+      connKey = key;
       connKeyOpen = true;
-    } catch (e) { keyError(e); }
+    } catch (e) { if (request === keyRequest) keyError(e); }
   }
 
   async function showQr() {
+    const request = ++keyRequest;
     try {
-      qrData = await loadKey();
+      const key = await loadKey();
+      if (request !== keyRequest) return;
+      connKeyOpen = false;
+      qrData = key;
       qrOpen = true;
-    } catch (e) { keyError(e); }
+    } catch (e) { if (request === keyRequest) keyError(e); }
   }
 
   function formatBytes(b: number): string {

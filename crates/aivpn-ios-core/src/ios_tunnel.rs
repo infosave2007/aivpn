@@ -55,6 +55,13 @@ struct IosPlatform {
 }
 
 impl PlatformIo for IosPlatform {
+    fn upload_shaping(&self) -> Result<aivpn_common::pacing::PacingMode> {
+        aivpn_common::transport::RuntimeConfig::load_default_file(
+            aivpn_common::transport::default_config_path(),
+        )
+        .map(|runtime| runtime.upload_shaping)
+    }
+
     fn notify_ready(&self, host: &str) {
         if let Some(cb) = self.on_ready {
             if let Ok(c_host) = CString::new(host) {

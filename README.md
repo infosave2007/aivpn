@@ -5,22 +5,22 @@
 [![CI](https://github.com/infosave2007/aivpn/actions/workflows/ci.yml/badge.svg?branch=master)](https://github.com/infosave2007/aivpn/actions/workflows/ci.yml)
 [![Crates.io Server](https://img.shields.io/crates/v/aivpn-server.svg?label=aivpn-server)](https://crates.io/crates/aivpn-server)
 [![Crates.io Client](https://img.shields.io/crates/v/aivpn-client.svg?label=aivpn-client)](https://crates.io/crates/aivpn-client)
-![Rust](https://img.shields.io/badge/rust-1.75%2B-blue.svg)
+![Rust](https://img.shields.io/badge/rust-1.97%2B-blue.svg)
 ![Platforms](https://img.shields.io/badge/platforms-Linux%20%7C%20macOS%20%7C%20Windows%20%7C%20Android%20%7C%20iOS%20%7C%20MikroTik-informational)
 
 ---
 
 ## Overview
 
-AIVPN is a UDP-based VPN system that combines standard tunnel encryption with **traffic mimicry**: outbound packets are reshaped to resemble known application protocols (WebRTC, QUIC, DNS-over-UDP), making the connection statistically indistinguishable from regular application traffic to passive observers.
+AIVPN combines UDP tunnel encryption with traffic masking. Masks define the outer protocol, packet sizes and send intervals. Being recognized as STUN or QUIC does not by itself prove statistical indistinguishability from a specific application.
 
 Key technical properties:
 
-- **InitialV2 и PFS** - начальный обмен подтверждает свежий ключ сервера; данные и управляющие команды передаются только после PFS. Для привязанных и привилегированных устройств также нужно доказательство постоянного ключа, при обязательном mTLS - действующий сертификат.
+- **InitialV2 and PFS** - the initial exchange confirms a fresh server key; data and management commands travel only after PFS. Bound and privileged devices must also prove their persistent key and, when mTLS is required, present a valid certificate.
 - **O(1) session lookup** — no session ID is transmitted in the clear. Every packet carries an 8-byte *resonance tag* derived from a timestamp and a per-session secret. The server resolves the session in constant time via a `DashMap`.
 - **Perfect Forward Secrecy** — in-flight session key rotation via X25519 ratchet. Compromising the server key does not expose past traffic.
 - **Neural Resonance module** — per-mask micro-MLP (~66 KB) monitors live traffic statistics; high reconstruction error triggers automatic mask rotation without disconnecting clients.
-- **Generative mask distributions** — masks auto-recorded from real traffic model multimodal packet-size / inter-arrival behaviour with a BIC-selected Gaussian mixture (design-doc §4 "neural-generated masks"), reproducing real DNS/QUIC/WebRTC distributions far more faithfully than a single Gaussian. It is an internal representation sampled transparently by every client, not a separate mask type.
+- **Generative mask distributions** - profiles support multimodal packet-size and inter-arrival models fitted from captured traffic with a BIC-selected Gaussian mixture. Clients sample the stored model; its presence does not establish similarity to a named application.
 - **Written in Rust** — memory-safe, no GC pauses. Client binary ≈ 2.5 MB. Runs on a $5 VPS.
 
 ---
@@ -36,7 +36,7 @@ crates/aivpn-client/     — cross-platform VPN client (Linux / macOS / Windows)
 crates/aivpn-android-core/ — JNI bridge for Android (Rust → Kotlin via C FFI)
 crates/aivpn-ios-core/   — iOS Rust staticlib (C FFI), linked by PacketTunnelProvider
 crates/aivpn-windows/    — Windows GUI (egui/eframe 0.31, manages aivpn-client.exe subprocess)
-crates/aivpn-linux/      — Linux GUI (iced 0.13, wraps aivpn-client subprocess)
+crates/aivpn-linux/      - Linux GUI (Iced 0.14, wraps aivpn-client subprocess)
 platforms/android/       — Android Kotlin app (MVVM: MainViewModel + RecyclerView)
 platforms/ios/           — iOS SwiftUI app + NetworkExtension PacketTunnelProvider
 platforms/macos/         — macOS SwiftUI menu bar app + privileged helper daemon
@@ -60,16 +60,49 @@ deploy/ci/               — CI gates run by the Makefile (see `make help`)
 | `mask.rs` | `aivpn-common` | `MaskProfile` — traffic shaping: header templates, FSM states, IAT distributions |
 | `gateway.rs` | `aivpn-server` | Central event loop: UDP receive, session dispatch, NAT forwarding, neural checks |
 | `session.rs` | `aivpn-server` | `SessionManager` — `DashMap`-based O(1) tag lookup, 256-entry replay window, 500-session cap |
-| `neural.rs` | `aivpn-server` | Neural Resonance: per-mask MLP 64→128→64, MSE threshold 0.35, auto mask rotation |
+| `neural.rs` | `aivpn-server` | Neural Resonance: per-mask MLP 64→16→64 / fallback 64→128→64, MSE threshold 0.35, auto mask rotation |
 | `client.rs` | `aivpn-client` | State machine: Unprovisioned → Connecting → Connected, key exchange, reconnection |
 | `tunnel.rs` | `aivpn-client` | Cross-platform TUN: `/dev/net/tun` (Linux), `utun` (macOS), Wintun (Windows) |
 | `mimicry.rs` | `aivpn-client` | `MimicryEngine` — applies `MaskProfile` to outbound packets |
 
-### Совместимость начального обмена и ускорителя
+### Initial exchange and accelerator compatibility
 
-В готовящейся версии 1.2.0 начальный обмен переведен на InitialV2. Он несовместим с выпущенной 1.1.0 и прежними dev-сборками 1.2.0. Обновляйте согласованно серверы, узлы pool/site/chain и все клиенты, в том числе встроенные мобильные ядра. Формат ключа подключения и протокол управляющих сообщений между серверами не меняются. Начальный AEAD использует XChaCha20-Poly1305, случайный nonce24 и контекст соединения в AAD; установленный канал сохраняет прежний формат ChaCha20-Poly1305 и kernel ABI 7.
+In the upcoming 1.2.0 release the initial exchange moves to InitialV2. It is incompatible with the released 1.1.0 and earlier 1.2.0 development builds. Update servers, pool/site/chain nodes and all clients together, including embedded mobile cores. The connection key format and the inter-server management protocol are unchanged. The initial AEAD uses XChaCha20-Poly1305 with a random 24-byte nonce and the connection context in the AAD; the established channel keeps the existing ChaCha20-Poly1305 format and kernel ABI 7.
 
-Модуль Linux требует совместимых Rust-for-Linux API, kernel headers с `CONFIG_RUST=y` и соответствующего им Rust toolchain. Номер ядра сам по себе не гарантирует поддержку. До регистрации `/dev/aivpn` модуль проверяет `file_operations.owner` в настоящей miscdevice vtable и отказывает с `ENODEV`, если API не закрепляет код модуля за открытым дескриптором. Обходить эту проверку нельзя; без ускорителя используется userspace TUN.
+The Linux module requires compatible Rust-for-Linux APIs, kernel headers built with `CONFIG_RUST=y` and the matching Rust toolchain. A kernel version number alone does not guarantee support. Before registering `/dev/aivpn`, the module checks `file_operations.owner` in the real miscdevice vtable and fails with `ENODEV` if the API does not pin the module code to the open descriptor. This check cannot be bypassed; without the accelerator, userspace TUN is used.
+
+### Mask state and outer traffic validation
+
+The QUIC mask runs bidirectional QUIC v1/TLS 1.3: it keeps CIDs and packet numbers and handles ACKs, loss, timers and connection close. The engine runs inside the shared mask layer on top of the existing UDP/DatagramTransport. A cold Initial carries an empty Token. The initial AIVPN packet travels inside an encrypted HTTP DATAGRAM after TLS, HTTP/3 SETTINGS and CONNECT-UDP; until then payload data waits in a bounded queue. When the local buffer is full, the client waits for free space while it keeps processing ACKs and control messages. The logical UDP peer terminates inside the mask; no proxy sockets are opened. A plain GET and an unrelated CONNECT-UDP receive HTTP 403. CONNECT-UDP is not equivalent to ordinary HTTP/3 requests to Avito or VK Video and does not by itself prove similarity to them. Before inner authentication the server keeps a separate bounded TLS state that grants no VPN access and cannot replace an active session. Up to 128 such states are allowed globally, at most two per UDP peer, with at most ten seconds to complete setup; processing is charged to a shared CPU budget. Until the address is validated, responses are limited to three times the received traffic. TLS verifies the handshake signature and possession of the certificate key, but not the public PKI: trust in the server comes from the inner signed AIVPN exchange. 0-RTT and connection migration are disabled.
+
+The pre-authentication inbound packet limit is set by the server's `--per-ip-pps-limit` / `AIVPN_PER_IP_PPS_LIMIT`, 5000 packets per second per IP by default. The current QUIC generation with an admitted PFS session has a separate finite limit, `--per-ip-authenticated-pps-limit` / `AIVPN_PER_IP_AUTHENTICATED_PPS_LIMIT`, 100000 by default. Queues and counters for the two classes are bounded independently; pending TLS, plain and RTC traffic keep the first limit. The CID selects the route and quota but does not authenticate the packet: Quinn AEAD and the inner AIVPN checks remain mandatory, including for a known CID.
+
+Seven profiles open the exchange with an aligned optional STUN Binding Indication attribute. After PFS, the protected `MaskState` message binds the outer protocol parameters to the profile and connection generation. Zoom and `webrtc_yandex_telemost_v1` use ICE/DTLS/SRTP; SberJazz and Telegram calls add TURN Allocate, Permission, ChannelBind and ChannelData. WhatsApp uses ICE/SRTP without DTLS, with separate per-direction keys from the protected exchange. Keys, ICE credentials and certificates are created anew for each generation. All states run in the shared mask layer on top of the existing UDP socket; queues and setup time are bounded. VK Teams and Salute still use a limited STUN carrier. Mask names and a correct outer protocol do not guarantee indistinguishability from a specific application. Older external signed profiles with a 20-byte header must be reissued; the client does not modify signed data automatically.
+
+The `telegram_calls_v1` profile targets Telegram UDP calls, not MTProto. The former `telegram_mtproto_v1`, which wrongly used QUIC, is removed from the catalog. Explicit mask selections must replace its ID; the old ID is not an alias of the new one. TURN/ICE/DTLS/SRTP reproduce the observed media-channel stages, but not Telegram's signaling protocol.
+
+The `yandex_alice_v1` profile is temporarily excluded from the bundled catalog and installation bundle. The voice RPC of the verified Alice mobile app uses TLS/TCP rather than the current STUN/UDP carrier. The smart speaker protocol has not been verified separately.
+
+The client picks size and IAT as one pair and schedules data without blocking control messages. The server uses a separate bounded queue per session and the reverse profile parameters when one is defined. In both directions IP flows are interleaved while each flow keeps its packet order: a large background transfer does not fill the whole queue ahead of DNS and new connections.
+
+`adaptive` is the default. For QUIC, the protocol's own congestion control and pacer set the rate; no second per-IP-packet IAT timer is added. For other masks, light load keeps the profile intervals; persistent queueing delay gradually raises the rate, which returns to the original once the backlog clears. The controller tracks the age of the oldest packet and the minimum of that age over a 100 ms window. A delay above 5 ms raises the rate 1.5x per window; below 1 ms the rate returns toward the original with a factor of 0.8. Acceleration is capped at 4096x. Short accelerated intervals are merged into a 1 ms quantum limited to 64 original IP packets; after a delay, old quanta give no credit. Fragmentation may produce more outer frames. An expired deadline is processed immediately; a future one keeps waiting. A profile change resets the controller. This is local queue regulation, not a measurement of physical link capacity.
+
+`full` mode keeps the original intervals under any load. Client `off` disables pauses while keeping padding and the mask format. Server `off` also disables padding, as before; server `light` caps the delay at two milliseconds and keeps a small padding budget. In `adaptive`, padding is unchanged, but intervals under load differ from the original profile. Preserving the format and encryption does not by itself prove resistance to DPI. Padding enlarges short packets but does not shrink long ones: the sizes and rate of the real workload limit how closely the profile can be matched.
+
+The policy is set locally and is not imported from the connection key:
+
+- Client: `"upload_shaping": "adaptive"`, `"full"` or `"off"` in the shared `config.json`; the CLI also reads this field from an explicitly selected `--config`. With an explicit `--config`, the default file is not merged with it. On Linux the default path is `$XDG_CONFIG_HOME/aivpn/config.json` or `$HOME/.config/aivpn/config.json`, falling back to `/etc/aivpn/config.json` when neither directory exists. A client started through sudo or a service uses that process's environment. Windows uses `%APPDATA%/aivpn/config.json` with the `C:\ProgramData\aivpn\config.json` fallback; macOS and iOS use `$HOME/Library/Application Support/aivpn/config.json`. Android uses the app's `filesDir/config.json`, including for direct UDP.
+- Server: `"downlink_shaping": "adaptive"` in `server.json` or `--shaping-level adaptive`. `full`, `light`, `off` and legacy booleans remain supported: `true` means `full`, `false` means `off`. Explicit settings are not changed by an upgrade.
+
+Restart the client process or the server service to apply a new setting. An invalid value is a configuration error, not a silent fallback to the default mode.
+
+On Linux, a full tunnel without an assigned IPv6 address blocks IPv6 with two owned blackhole routes, including when the IPv4 MTU is below 1280. With an assigned IPv6 address, the interface MTU is never below 1280. An explicit disconnect removes the owned routes; after a crash, `aivpn-client kill-switch clear` removes the firewall rules and any remaining owned IPv6 guards. Leftover IPv6 routes are not cleaned up automatically on a normal start: only an explicit operator command removes them. Update the CLI and `aivpn-ip-helper` from the same build.
+
+All 10 bundled profiles are available through `--preferred-mask` and `--polymorphic-base`; an unknown ID is rejected. The preference selects an initial candidate of the requested base from the verified bootstrap. If there is no such candidate, the client keeps the trusted opening and requests the base after PFS. `--polymorphic-base` takes precedence; later automatic server rotations still apply. Retries of the initial exchange keep the ephemeral key of a single attempt but use a fresh nonce. The whole attempt is limited to 10 seconds. Switching between the STUN and QUIC mask families does not require a new session. Outer QUIC and SRTP packets are limited to 1380 bytes; QUIC starts at 1200 UDP bytes and probes the path MTU up to 1380. The inner packet is limited to 1140 bytes for QUIC, 1324 for ICE/DTLS/SRTP and 1358 for ICE/SRTP. Padding accounts for the headers, AEAD and alignment of the selected carrier. Control messages are fragmented before encryption. QUIC and RTC run in userspace in both directions, and plain STUN TX also stays in userspace; ABI 7 is unchanged. Native installation and systemd stay the same.
+
+The default TUN MTU is 1280 bytes; an explicit TUN MTU up to 1500 is preserved. Inner DATA and FEC repairs that exceed the carrier budget are authenticated and fragmented separately, then reassembled at the receiver. FEC counts each original IP packet once. A peer must support the 1.2.0 fragment format. Every FEC member carries an authenticated group number and position, including small packets. Groups remain separate across reordering and an FEC pause; completed groups reject late originals before fragment allocation. FEC frames use the userspace receive path even when FEC was enabled after a kernel session was installed.
+
+The new QUIC mask format and bundled STUN profile versions require clients and servers to be updated together, including pool/site/chain nodes and mobile cores. The connection key format, PSK and inter-server management messages are unchanged. `make mask-gate` runs the real client and gateway over UDP with loss, delay and duplicates, verifies PFS and the reverse exchange, then parses bidirectional PCAPs with TShark and nDPI, checking the first packets separately. This validates structure and classification; it does not prove resistance to arbitrary DPI or active probing.
 
 ### Pool sync
 
@@ -114,6 +147,8 @@ Server-to-server client database synchronization uses `ControlPayload::PoolSync`
 | Pool Topology View + Per-Client Exit Node | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | SSH Server Install Wizard§ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Live Metrics Graphs† | — | — | — | — | — | — |
+
+On macOS, Kill Switch blocks new connections outside the VPN and preserves connections that were already open when it was enabled.
 
 \* Android's `VpnService` API routes all device traffic (including DNS) through the encrypted tunnel by design — there's no separate local DNS-proxy listener because none is needed; DNS leaks aren't possible on this platform.
 
@@ -294,6 +329,8 @@ sudo ./aivpn-client -k "aivpn://..."
 sudo ./aivpn-client -k "aivpn://..." --full-tunnel
 ```
 
+The Linux GUI offers two layouts: Material and KDE / Breeze. The choice is in the Settings section and persists between launches. The color theme is selected separately: light, dark or system. Changing the appearance keeps the VPN session and form input. Profiles, routes, masks and service tools share the same logic in both layouts. Disconnect the VPN before changing the profile or network settings.
+
 ### Client — macOS
 
 Download `aivpn-macos.dmg` from [Releases](https://github.com/infosave2007/aivpn/releases), drag **Aivpn.app** to Applications, launch — appears in the menu bar. Paste the connection key and click **Connect**.
@@ -306,6 +343,8 @@ sudo ./aivpn-client -k "aivpn://..."
 > The app prompts for a password via `sudo` to create the `utun` interface.
 
 ### Client — Windows
+
+The Windows GUI offers Fluent Desktop and a compact Fluent layout. Desktop is the default; the switch is in the Settings section. The layout and color theme are stored separately from connection settings. Changing the appearance keeps the VPN session, counters, timer and form input. Disconnect the VPN before manually changing the profile or network settings. Include/exclude and SOCKS5 belong to the selected profile; the DNS proxy remains a global client setting.
 
 **Installer (recommended):** download `aivpn-windows-installer.exe`, run as Administrator, launch **AIVPN** from the Start Menu.
 
@@ -437,7 +476,28 @@ aivpn-server --show-client "Name" --key-file /etc/aivpn/server.key \
 
 ## Server Configuration Reference
 
-Default config path: `config/server.json` (local) or `/etc/aivpn/server.json`. CLI flags override file values.
+Precedence of persistent settings: explicit CLI flags > environment variables > JSON file > built-in defaults. Explicit `false`, `0` and values equal to the built-in defaults also override the lower layers.
+
+Every JSON field is available through env: the name is upper-cased with the `AIVPN_` prefix, and nested fields are separated by a double underscore. For example, `pool.peers` maps to `AIVPN_POOL__PEERS`, and `network_config.server_vpn_ip` maps to `AIVPN_NETWORK_CONFIG__SERVER_VPN_IP`. Objects and arrays are passed as JSON; a nested object extends the lower layer, while an array replaces it entirely. A type error or an unknown nested env field stops startup and names the setting without printing its value.
+
+```bash
+AIVPN_CONFIG=/etc/aivpn/server.json \
+AIVPN_SERVER_IP=vpn.example.com:443 \
+AIVPN_KEY_FILE=/etc/aivpn/server.key \
+AIVPN_CLIENTS_DB=/var/lib/aivpn/clients.json \
+AIVPN_POOL__PEERS='["edge.example.com:443"]' \
+AIVPN_NEURAL_ENABLED=false \
+aivpn-server
+```
+
+The paths `key_file`, `clients_db`, `audit_log`, the public address `server_ip`, the `per_ip_pps_limit` limit, `pool_config`, `log_level`, `event_webhook`, `event_stdout`, `kernel_downlink` and `enable_nat` are set in the same JSON as the network settings. `public_endpoint` is an alias of `server_ip`. The public address accepts a DNS name, IPv4 or IPv6; if the port is omitted, the `listen_addr` port is used.
+
+The existing names `AIVPN_LISTEN`, `AIVPN_SHAPING_LEVEL` and `RUST_LOG` remain supported. The canonical names are `AIVPN_LISTEN_ADDR`, `AIVPN_DOWNLINK_SHAPING` and `AIVPN_LOG_LEVEL`. The configuration path is selected with `--config`, `AIVPN_CONFIG` or automatically from `/etc/aivpn/server.json` and `deploy/config/server.json`.
+
+In Kubernetes, the same names go into `env`/`envFrom`; the JSON file and key files can be mounted into the container. One-off actions such as `--add-client` and `--remove-client` remain CLI commands.
+
+Administration requests from all clients share one queue: a 210 ms send interval respects the server's 200 ms limit. A GET after an explicit `429` is retried at most twice within the original timeout. Mutating requests and timeouts are not retried automatically. `/diagnostics/v1/*` measurements use a separate limit and bypass the administration pause and retries. Management errors carry `code`, `message` and an optional `retry_after_ms`; the HTTP API also keeps the `error` field for the existing web panel.
+
 
 ```json
 {
@@ -452,7 +512,7 @@ Default config path: `config/server.json` (local) or `/etc/aivpn/server.json`. C
   "network_config": {
     "server_vpn_ip": "10.0.0.1",
     "prefix_len": 24,
-    "mtu": 1346,
+    "mtu": 1280,
     "keepalive_secs": 8,
     "ipv6_enabled": false,
     "ipv6_prefix": "fd10:cafe::/48"
@@ -468,7 +528,7 @@ Default config path: `config/server.json` (local) or `/etc/aivpn/server.json`. C
 |-------|---------|-------------|
 | `listen_addr` | `0.0.0.0:443` | UDP bind address. Port is embedded in connection keys automatically |
 | `tun_name` | random | TUN interface name |
-| `tun_mtu` | _(unset)_ | `"auto"` = physical MTU minus 64-byte overhead (fallback 1346); or a fixed integer |
+| `tun_mtu` | _(unset)_ | `"auto"` = physical MTU minus 64-byte overhead, capped at 1280 (fallback 1280); or a fixed integer up to 1500 |
 | `mask_dir` | `/var/lib/aivpn/masks` | Directory scanned for `.json` mask profiles |
 | `bootstrap_mask_files` | `[]` | Mask files pre-loaded at startup to reduce first-connection latency |
 | `session_timeout_secs` | `0` | Hard session cap; `0` = unlimited |
@@ -476,7 +536,7 @@ Default config path: `config/server.json` (local) or `/etc/aivpn/server.json`. C
 | `allow_peer_routing` | `false` | Route packets between VPN clients inside the subnet |
 | `network_config.server_vpn_ip` | `10.0.0.1` | Server TUN IP |
 | `network_config.prefix_len` | `24` | VPN subnet prefix |
-| `network_config.mtu` | `1346` | Inner MTU sent to clients in `ServerHello` |
+| `network_config.mtu` | `1280` | Inner MTU sent to clients in `ServerHello` |
 | `network_config.keepalive_secs` | `8` | Keepalive interval negotiated with clients |
 | `network_config.ipv6_enabled` | `false` | Enable IPv6 NAT66 |
 | `network_config.ipv6_prefix` | `fd10:cafe::/48` | ULA /48 prefix for client IPv6 addresses |
@@ -499,9 +559,25 @@ Default config path: `config/server.json` (local) or `/etc/aivpn/server.json`. C
 
 ---
 
+### Reference model training
+
+The server uses learned reference weights from `assets/neural/models.json` when the mask ID and signature hash match. `neural.trained_models_file` selects another validated library. Unknown signatures retain the calibrated projection fallback. The current references describe WebRTC and QUIC families; they do not certify individual services or DPI resistance.
+
+Prepare features from a classic RAW-IP PCAP, train, then evaluate the frozen model:
+
+```bash
+cargo run --release -p aivpn-server --example neural_dataset -- mask.json reference.pcap 40 > dataset.json
+cargo run --release -p aivpn-server --example neural_train -- dataset.json model.json evaluation.json
+cargo run --release -p aivpn-server --example neural_evaluate -- dataset.json model.json
+```
+
+`40` is an explicit size adjustment from an inner IP capture to the server observation, matching the reference preparation. Packet sizes and timestamps come from the capture; encrypted-payload entropy is modeled with uniform bytes of the same length. The exporter does not publish packet payloads or addresses. It separates train, validation and test by time, resets statistics for each partition and leaves a 256-packet gap at each boundary. Each partition must contain enough samples for the gateway's stride of 16 and minimum 32 samples per window. A model library has `schema_version: 1`, `feature_version: 1` and `models: [{"mask_id": "...", "model": <model.json>, "evaluation": <evaluation.json>}]`. Models and reports must agree on the signature hash and hidden dimension. Reports include the exact model digest, the digest of all three data partitions, and Adam parameters; library loading verifies the binding to the weights. Invalid libraries fail loading rather than silently replacing the requested models.
+
+The runtime keeps configured warm-up thresholds and derives live adaptive thresholds after 500 MSE checks per mask. Training a new encoder does not silently lower those thresholds. Aggregate held-out windows in `assets/neural/heldout.json` let tests verify the shipped weights without private captures.
+
 ## Build from Source
 
-Requires: Rust 1.75+, `cargo`, `make`.
+Requires: Rust 1.97+, `cargo`, `make`.
 
 ```bash
 git clone https://github.com/infosave2007/aivpn
@@ -682,9 +758,9 @@ Android and iOS expose the equivalent calls through JNI/FFI (`mgmtRequest`/`getR
 
 ### Connection Quality Score and Adaptive Mode
 
-AIVPN continuously computes a **0–100 quality score** from RTT (40 pts), jitter (20 pts), packet loss (30 pts), and Neural MSE (10 pts). Adaptive Mode adjusts keepalive interval and FEC group size automatically:
+AIVPN continuously computes a **0–100 quality score** from RTT (40 pts), jitter (20 pts), packet loss (30 pts), and Neural MSE (10 pts). The adaptive level selects the keepalive. The FEC column describes the initial setting and the legacy mode used when no fresh receiver report is available:
 
-| Score | Adaptive Level | Keepalive | FEC group |
+| Score | Adaptive Level | Keepalive | Initial / legacy FEC |
 |-------|---------------|-----------|-----------|
 | 80–100 | Off | 8 s | disabled |
 | 50–79 | Light | 6 s | 1/16 |
@@ -698,7 +774,16 @@ aivpn-client -k "aivpn://..." --adaptive
 
 ### Forward Error Correction (FEC)
 
-Every N uplink data packets, one XOR repair packet is emitted. If exactly one packet from a group is lost, the server reconstructs it immediately — no retransmit round-trip. N is controlled by Adaptive Mode. FEC is disabled on clean links.
+For every N original client IP packets, one XOR packet is added to recover a single loss in the group. The receiver on the server estimates counter gaps in a separate 4096-counter window and sends a report once PFS is established. Statistics appear after a range of at least 32 counters. The report drives the client's uplink FEC; the client's own RTT and jitter still select the keepalive.
+
+| Loss in the fresh receiver report | FEC |
+|----------------------------------|-----|
+| 0 | off |
+| above 0, below 1% | 1/16 |
+| 1% to below 5% | 1/8 |
+| 5% and above | 1/4 |
+
+This is a counter-based estimate, not a guarantee of recovery for every loss pattern. A report is valid for 30 seconds; an older report counter does not replace a newer one. A reconnect or a full PFS resets the estimate. With an older server, incomplete kernel RX observation or an expired report, the previous adaptive-level setting stays in effect. The server limits report processing and sending to one operation per second per session. Inter-server sessions do not answer a report with another report. The fragment format keeps the 900-byte size: with FEC active, an IP packet larger than 900 bytes needs several protected frames. Reverse FEC on the server's send path is not implemented.
 
 ### Multi-server Pool Sync
 
@@ -763,7 +848,7 @@ aivpn-client ssh-install run --host vpn.example.com --fingerprint "SHA256:..." \
 
 `ssh-install run` authenticates with exactly one of `--password-env`/`--password-stdin`/`--key-file` (never a raw `--password` argument — argv is visible via `/proc/<pid>/cmdline`), and accepts `--binary-file`/`--binary-url` to control which `aivpn-server` build gets installed, plus `--mode systemd|docker` and pass-through `--extra-arg` tokens forwarded to `install-server.sh`.
 
-В web-панели страница Backup экспортирует резервную копию и проверяет загруженный архив без изменения файлов (`POST /api/v1/backup/import?dry_run=true`). Восстановление выполняется только offline через CLI: остановите сервер и все процессы, использующие ту же базу, затем выполните `aivpn-server --import /path/backup.bin --config /path/server.json --clients-db /path/clients.json --mask-dir /path/masks`. Укажите реальные пути файлов и каталога масок. После успешного импорта запустите сервис. Работающий процесс с открытой базой блокирует восстановление; HTTP-запрос без `dry_run=true` возвращает 409. Нативные клиенты содержат только мастер установки, не мастер переноса сервера.
+In the web panel, the Backup page exports a backup and validates an uploaded archive without changing files (`POST /api/v1/backup/import?dry_run=true`). Restore runs only offline through the CLI: stop the server and every process that uses the same database, then run `aivpn-server --import /path/backup.bin --config /path/server.json --clients-db /path/clients.json --mask-dir /path/masks`. Use the real file paths and mask directory. Start the service after a successful import. A running process with the database open blocks the restore; an HTTP request without `dry_run=true` returns 409. Native clients include only the installation wizard, not the server migration wizard.
 
 CI publishes full-feature (`management-api,metrics,neural`) `aivpn-server` release binaries for both `x86_64` and `aarch64`, each with a `SHA256SUMS` file — matching what `install-server.sh`'s default `--binary-url` (GitHub Releases) fetches and verifies against.
 
@@ -921,6 +1006,12 @@ Because `enforce` rejects unsigned masks, roll it out phased — stay on `warn`
 until every server's mask directory is signed and clients carry the public key.
 The signing key is a secret: store it `0600`, readable only by the operator.
 
+
+### ML-DPI validation
+
+The GBDT receives selected outer QUIC, RTC and STUN frames after client admission and authentication. Decapsulated inner packets are not used as outer traffic. QUIC 1-RTT features ignore the spin bit and the protected bits of the first byte; bytes on the wire are unchanged. Training weights balance classes, masks and original sessions so that a long capture of one family does not crowd out the others. Training and validation are split by session; nDPI labels the complete exchange. Its labels describe conformance with the target protocol, not the probability that an ISP detects a VPN. The tools are in [tools/dpi](tools/dpi/README.md), and metrics and limitations are in the [model report](assets/dpi/report.md). Validation on a shared traffic-generation scheme does not prove resistance to arbitrary DPI.
+
+
 ## Security Model
 
 | Property | Mechanism |
@@ -951,7 +1042,7 @@ aivpn/
 ├── crates/aivpn-client/src/
 │   ├── client.rs          # Core state machine
 │   ├── tunnel.rs          # Cross-platform TUN interface
-│   ├── kill_switch.rs     # Kill-switch (nftables / pfctl / netsh)
+│   ├── kill_switch.rs     # Kill-switch (nftables / pfctl / WFP)
 │   └── mimicry.rs         # Traffic shaping engine
 ├── crates/aivpn-server/src/
 │   ├── gateway.rs         # UDP gateway, session dispatch

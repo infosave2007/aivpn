@@ -210,10 +210,14 @@ private struct PoolLinkRow: View {
                     .font(.caption2)
                     .foregroundColor(.secondary)
             }
-            if link.partition_conflict || link.subnet_mismatch {
-                Text(link.partition_conflict ? loc.t("pool_partition_conflict") : loc.t("pool_subnet_mismatch"))
+            if link.partition_conflict {
+                Text(loc.t("pool_partition_conflict"))
                     .font(.caption2)
                     .foregroundColor(.orange)
+            }
+            if link.subnet_mismatch {
+                Text(loc.t("pool_subnet_mismatch"))
+                    .font(.caption2).foregroundColor(.orange)
             }
         }
         .padding(.vertical, 3)

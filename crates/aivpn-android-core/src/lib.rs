@@ -1492,3 +1492,32 @@ pub extern "system" fn Java_com_aivpn_client_AivpnJni_getAssignedNetworkConfig(
         &aivpn_common::mobile_tunnel::assigned_network_config_json(),
     )
 }
+
+#[no_mangle]
+pub extern "system" fn Java_com_aivpn_client_AivpnJni_runBenchmark<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+) -> jni::sys::jbyteArray {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let result = (|| {
+            let tx = active_control_tx().ok_or_else(|| "No active VPN session".to_string())?;
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| e.to_string())?;
+            rt.block_on(aivpn_common::diagnostics::run(
+                active_mgmt().clone(),
+                tx,
+                Duration::from_secs(9),
+            ))
+            .map_err(|e| e.to_string())
+        })();
+        let value = match result {
+            Ok(result) => serde_json::to_value(result).unwrap_or_default(),
+            Err(error) => serde_json::json!({"error": error}),
+        };
+        value.to_string().into_bytes()
+    }))
+    .unwrap_or_default();
+    make_bytes(&mut env, &result)
+}

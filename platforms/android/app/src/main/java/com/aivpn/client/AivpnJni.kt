@@ -162,6 +162,8 @@ object AivpnJni {
     /** Connection quality score 0–100 from last KeepaliveAck RTT. 0 = no data yet. */
     external fun getQualityScore(): Int
 
+    external fun runBenchmark(): ByteArray?
+
     /**
      * Adaptive level hint from server: 0–3 (0 = server says adaptive Off — a real
      * downgrade), or -1 when no hint has been received this session. Takes effect

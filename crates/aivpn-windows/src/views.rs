@@ -1,5 +1,5 @@
 use crate::admin::{self, AdminRequest};
-use crate::assets::{decode_png_rgba, format_unix_ago};
+use crate::assets::{format_unix_ago, try_decode_png_rgba};
 use crate::install_wizard;
 use crate::localization::{t, Lang};
 use crate::vpn_manager::format_bytes;
@@ -855,6 +855,7 @@ impl super::AivpnApp {
                     lang,
                     &mut self.admin_settings_exit_node,
                     &mut self.admin_settings_exit_custom_mode,
+                    &mut self.admin_settings_exit_selected,
                     &admin::exit_node_addresses(&self.admin_pool_nodes),
                 );
                 if let Some(err) = &self.admin_settings_exit_error {
@@ -886,7 +887,7 @@ impl super::AivpnApp {
                     }
                 } else if ui
                     .add_enabled(
-                        !self.admin_settings_exit_busy,
+                        self.admin_settings_exit_selected && !self.admin_settings_exit_busy,
                         egui::Button::new(t(lang, "admin_settings_apply")),
                     )
                     .clicked()
@@ -959,6 +960,7 @@ impl super::AivpnApp {
         lang: Lang,
         value: &mut String,
         custom_mode: &mut bool,
+        selected: &mut bool,
         known_addresses: &[String],
     ) {
         use eframe::egui;
@@ -977,7 +979,16 @@ impl super::AivpnApp {
         };
 
         egui::ComboBox::from_id_salt("admin_settings_exit_node_combo")
-            .selected_text(selected_text)
+            .selected_text(if *selected {
+                selected_text
+            } else {
+                if lang == Lang::Ru {
+                    "Выберите действие"
+                } else {
+                    "Select action"
+                }
+                .to_owned()
+            })
             .width(230.0)
             .show_ui(ui, |ui| {
                 if ui
@@ -986,6 +997,7 @@ impl super::AivpnApp {
                 {
                     value.clear();
                     *custom_mode = false;
+                    *selected = true;
                 }
                 for addr in known_addresses {
                     let is_selected =
@@ -993,6 +1005,7 @@ impl super::AivpnApp {
                     if ui.selectable_label(is_selected, addr).clicked() {
                         *value = addr.clone();
                         *custom_mode = false;
+                        *selected = true;
                     }
                 }
                 if ui
@@ -1000,15 +1013,21 @@ impl super::AivpnApp {
                     .clicked()
                 {
                     *custom_mode = true;
+                    *selected = !value.trim().is_empty();
                 }
             });
 
         if matches!(choice, admin::ExitNodeChoice::Custom) {
-            ui.add(
-                egui::TextEdit::singleline(value)
-                    .desired_width(f32::INFINITY)
-                    .hint_text("exit.example.com:51820"),
-            );
+            if ui
+                .add(
+                    egui::TextEdit::singleline(value)
+                        .desired_width(f32::INFINITY)
+                        .hint_text("exit.example.com:51820"),
+                )
+                .changed()
+            {
+                *selected = !value.trim().is_empty();
+            }
         }
     }
 
@@ -1085,18 +1104,27 @@ impl super::AivpnApp {
                         ui.colored_label(egui::Color32::from_rgb(0xEF, 0x53, 0x50), err);
                     }
                     if let Some(png) = self.admin_qr_png.clone() {
-                        let texture = self.admin_qr_texture.get_or_insert_with(|| {
-                            let (rgba, w, h) = decode_png_rgba(&png);
-                            ctx.load_texture(
-                                "admin-qr",
-                                egui::ColorImage::from_rgba_unmultiplied(
-                                    [w as usize, h as usize],
-                                    &rgba,
-                                ),
-                                egui::TextureOptions::default(),
-                            )
-                        });
-                        ui.image((texture.id(), texture.size_vec2()));
+                        if self.admin_qr_texture.is_none() {
+                            match try_decode_png_rgba(&png) {
+                                Ok((rgba, w, h)) => {
+                                    self.admin_qr_texture = Some(ctx.load_texture(
+                                        "admin-qr",
+                                        egui::ColorImage::from_rgba_unmultiplied(
+                                            [w as usize, h as usize],
+                                            &rgba,
+                                        ),
+                                        egui::TextureOptions::default(),
+                                    ));
+                                }
+                                Err(error) => {
+                                    self.admin_qr_error = Some(error);
+                                    self.admin_qr_png = None;
+                                }
+                            }
+                        }
+                        if let Some(texture) = &self.admin_qr_texture {
+                            ui.image((texture.id(), texture.size_vec2()));
+                        }
                         if ui.button(t(lang, "admin_save_qr_file")).clicked() {
                             self.save_admin_qr_to_file(&png);
                         }
@@ -1177,7 +1205,13 @@ impl super::AivpnApp {
             .id(egui::Id::new("ssh_install_wizard"))
             .collapsible(false)
             .resizable(true)
-            .default_width(440.0)
+            .default_width((ctx.screen_rect().width() - 40.0).min(440.0))
+            .min_width(240.0)
+            .max_width((ctx.screen_rect().width() - 40.0).max(240.0))
+            .max_height((ctx.screen_rect().height() - 100.0).max(180.0))
+            .default_pos(egui::pos2(12.0, 12.0))
+            .constrain_to(ctx.screen_rect().shrink(8.0))
+            .vscroll(true)
             .open(&mut open)
             .show(ctx, |ui| match self.ssh_wizard_stage {
                 SshWizardStage::Form => self.draw_ssh_wizard_form(ui, lang),
@@ -1197,6 +1231,7 @@ impl super::AivpnApp {
     pub(crate) fn draw_ssh_wizard_form(&mut self, ui: &mut eframe::egui::Ui, lang: Lang) {
         use eframe::egui;
 
+        ui.spacing_mut().text_edit_width = (ui.available_width() - 120.0).clamp(100.0, 280.0);
         egui::Grid::new("ssh_wizard_target_grid")
             .num_columns(2)
             .spacing([8.0, 4.0])
@@ -1227,7 +1262,7 @@ impl super::AivpnApp {
             });
 
         ui.separator();
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.radio_value(
                 &mut self.ssh_auth_key_mode,
                 false,
@@ -1236,16 +1271,16 @@ impl super::AivpnApp {
             ui.radio_value(&mut self.ssh_auth_key_mode, true, t(lang, "ssh_auth_key"));
         });
         if self.ssh_auth_key_mode {
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.label(t(lang, "ssh_key_path"));
                 ui.text_edit_singleline(&mut self.ssh_key_path);
             });
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.label(t(lang, "ssh_key_passphrase"));
                 ui.add(egui::TextEdit::singleline(&mut self.ssh_key_passphrase).password(true));
             });
         } else {
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.label(t(lang, "ssh_password"));
                 ui.add(egui::TextEdit::singleline(&mut self.ssh_password).password(true));
             });
@@ -1257,7 +1292,7 @@ impl super::AivpnApp {
         // start_ssh_install's mapping).
         ui.separator();
         ui.label(egui::RichText::new(t(lang, "ssh_binary_source_label")).strong());
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.radio_value(
                 &mut self.ssh_binary_source_choice,
                 SshBinarySourceChoice::Default,
@@ -1277,13 +1312,13 @@ impl super::AivpnApp {
         match self.ssh_binary_source_choice {
             SshBinarySourceChoice::Default => {}
             SshBinarySourceChoice::Url => {
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     ui.label(t(lang, "ssh_binary_url_label"));
                     ui.text_edit_singleline(&mut self.ssh_binary_url);
                 });
             }
             SshBinarySourceChoice::LocalFile => {
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     ui.label(t(lang, "ssh_binary_file_label"));
                     ui.text_edit_singleline(&mut self.ssh_binary_file_path);
                 });
@@ -1292,18 +1327,18 @@ impl super::AivpnApp {
 
         ui.separator();
         ui.checkbox(&mut self.ssh_mode_docker, t(lang, "ssh_mode_docker"));
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.label(t(lang, "ssh_server_ip"));
             ui.text_edit_singleline(&mut self.ssh_server_ip);
         });
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.label(t(lang, "ssh_server_port"));
             ui.text_edit_singleline(&mut self.ssh_server_port);
         });
         ui.checkbox(&mut self.ssh_bind_device, t(lang, "ssh_bind_device"));
 
         ui.separator();
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             if ui.button(t(lang, "ssh_show_script_btn")).clicked() {
                 self.ssh_show_script = true;
                 if self.ssh_script_text.is_none() && !self.ssh_script_loading {
@@ -1353,7 +1388,7 @@ impl super::AivpnApp {
         use eframe::egui;
 
         if self.ssh_install_running {
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.spinner();
                 ui.label(t(lang, "ssh_installing"));
             });
@@ -1438,7 +1473,7 @@ impl super::AivpnApp {
                     let mut display_key = key.clone();
                     ui.add(
                         egui::TextEdit::multiline(&mut display_key)
-                            .desired_width(360.0)
+                            .desired_width(f32::INFINITY)
                             .desired_rows(3)
                             .font(egui::TextStyle::Monospace)
                             .interactive(false),
@@ -1473,7 +1508,12 @@ impl super::AivpnApp {
             .id(egui::Id::new("ssh_install_script_window"))
             .collapsible(false)
             .resizable(true)
-            .default_width(560.0)
+            .default_width((ctx.screen_rect().width() - 40.0).min(560.0))
+            .min_width(240.0)
+            .max_width((ctx.screen_rect().width() - 40.0).max(240.0))
+            .max_height((ctx.screen_rect().height() - 100.0).max(180.0))
+            .constrain_to(ctx.screen_rect().shrink(8.0))
+            .vscroll(true)
             .default_height(420.0)
             .open(&mut open)
             .show(ctx, |ui| {
@@ -1484,7 +1524,7 @@ impl super::AivpnApp {
                     ui.colored_label(egui::Color32::from_rgb(0xEF, 0x53, 0x50), err);
                 }
                 if let Some(sha256) = &self.ssh_script_sha256 {
-                    ui.horizontal(|ui| {
+                    ui.horizontal_wrapped(|ui| {
                         ui.label(egui::RichText::new(t(lang, "ssh_script_sha256")).strong());
                         ui.label(egui::RichText::new(sha256).monospace());
                         if ui.small_button(t(lang, "copy")).clicked() {

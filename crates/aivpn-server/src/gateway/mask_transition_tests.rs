@@ -45,19 +45,18 @@ async fn idle_polymorphic_mask_transition_accepts_new_keepalive_after_grace() {
 }
 
 #[tokio::test]
-async fn idle_mask_transition_accepts_changed_tag_layout_and_quic() {
+async fn idle_mask_transition_accepts_changed_tag_layout() {
     let mut legacy = preset_masks::webrtc_zoom_v3();
     legacy.tag_offset = u16::MAX;
     exercise_idle_transition(legacy, Some(8)).await;
     exercise_idle_transition(preset_masks::webrtc_zoom_v3(), Some(u16::MAX)).await;
-    exercise_idle_transition(preset_masks::quic_https_v2(), None).await;
 }
 
 async fn exercise_idle_transition(mut base: MaskProfile, new_tag_offset: Option<u16>) {
     let directory = tempfile::tempdir().unwrap();
     let mask_dir = directory.path().join("masks");
     std::fs::create_dir(&mask_dir).unwrap();
-    base.sign(&ed25519_dalek::SigningKey::from_bytes(&[71; 32]));
+    crate::test_masks::sign(&mut base, &ed25519_dalek::SigningKey::from_bytes(&[71; 32]));
     std::fs::write(
         mask_dir.join(format!("{}.json", base.mask_id)),
         serde_json::to_vec(&base).unwrap(),
@@ -82,7 +81,9 @@ async fn exercise_idle_transition(mut base: MaskProfile, new_tag_offset: Option<
     gateway
         .mask_catalog
         .set_primary_mask_id(base.mask_id.clone());
-    gateway.udp_socket = Some(Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap()));
+    gateway.udp_socket = Some(super::MaskSocket::new(Arc::new(
+        UdpSocket::bind("127.0.0.1:0").await.unwrap(),
+    )));
     let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let session = gateway
         .session_manager
@@ -124,7 +125,7 @@ async fn exercise_idle_transition(mut base: MaskProfile, new_tag_offset: Option<
         .udp_socket
         .as_ref()
         .unwrap()
-        .send_to(&packet, peer.local_addr().unwrap())
+        .send_with_mask(&packet, peer.local_addr().unwrap(), false)
         .await
         .unwrap();
     gateway

@@ -1,6 +1,6 @@
 {
   "mask_id": "quic_https_v2",
-  "version": 3,
+  "version": 4,
   "created_at": 0,
   "expires_at": 18446744073709551615,
   "spoof_protocol": "QUIC",

@@ -95,6 +95,8 @@ pub struct RecordingResult {
 /// Benchmark result parsed from `aivpn-client bench --json` output.
 #[derive(Debug, Clone, Default, serde::Deserialize)]
 pub struct BenchResult {
+    pub throughput_up_kbps: f64,
+    pub throughput_down_kbps: f64,
     pub latency_p50_ms: f64,
     pub latency_p95_ms: f64,
     pub latency_p99_ms: f64,
@@ -264,6 +266,10 @@ impl VpnManager {
 
     pub fn state(&self) -> ConnectionState {
         self.state
+    }
+
+    pub fn kill_switch_enabled(&self) -> bool {
+        self.kill_switch_active
     }
 
     pub fn stats(&self) -> &TrafficStats {
@@ -717,39 +723,19 @@ impl VpnManager {
         self.minimum_recording_ts = 0;
     }
 
-    /// Run a benchmark against the server using `aivpn-client bench --json`.
-    /// Blocks until the bench completes (call from a background thread).
-    pub fn run_bench_blocking(binary: &PathBuf, server_addr: &str) -> Option<BenchResult> {
-        if server_addr.is_empty() {
-            return None;
-        }
-        let mut cmd = Command::new(binary);
-        cmd.env_remove("AIVPN_ADMIN_LISTEN");
-        cmd.args(["bench", "--server", server_addr, "--json"]);
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            const CREATE_NO_WINDOW: u32 = 0x08000000;
-            cmd.creation_flags(CREATE_NO_WINDOW);
-        }
-        let out = match cmd.output() {
-            Ok(o) => o,
-            Err(e) => {
-                gui_log(&format!("bench: spawn failed: {e}"));
-                return None;
-            }
-        };
-        if !out.status.success() {
-            gui_log(&format!("bench: exit {}", out.status));
-            return None;
-        }
-        match serde_json::from_slice(&out.stdout) {
-            Ok(r) => Some(r),
-            Err(e) => {
-                gui_log(&format!("bench: JSON parse error: {e}"));
-                None
-            }
-        }
+    /// Диагностика текущей сессии с реквизитами, сохраненными до запуска потока.
+    pub fn run_bench_blocking(token: Option<String>) -> Option<BenchResult> {
+        let token = token?;
+        let reply = aivpn_common::local_admin::request(
+            "127.0.0.1:44301".parse().ok()?,
+            &format!("{token}:bench:10"),
+            Duration::from_secs(18),
+        )
+        .map_err(|error| gui_log(&format!("bench: {error}")))
+        .ok()?;
+        serde_json::from_str(&reply)
+            .map_err(|error| gui_log(&format!("bench: {error}")))
+            .ok()
     }
 
     /// Return the current server address (set when connect() was called).
@@ -1527,5 +1513,25 @@ mod firewall_cleanup_tests {
         .unwrap();
         assert_eq!(std::fs::read_to_string(&marker).unwrap(), "new-session");
         std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(all(test, windows))]
+impl VpnManager {
+    pub(crate) fn connected_ui_fixture() -> Self {
+        let mut manager = Self::new();
+        manager.kill_switch_active = false;
+        manager.state = ConnectionState::Connected;
+        manager.session_since_ms = Some(1_000_000);
+        manager.stats.bytes_received = 12_345_678;
+        manager.stats.bytes_sent = 2_345_678;
+        manager
+    }
+}
+
+#[cfg(all(test, windows))]
+impl VpnManager {
+    pub(crate) fn set_ui_test_kill_switch(&mut self, active: bool) {
+        self.kill_switch_active = active;
     }
 }

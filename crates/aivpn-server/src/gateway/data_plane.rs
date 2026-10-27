@@ -1,8 +1,4 @@
-//! Data-plane TUN/downlink hot path: `tun_read_loop` (drains the TUN
-//! device and dispatches to the sharded `downlink_worker`s), the
-//! dedicated `tun_write_loop`, ICMP echo-reply synthesis, and the
-//! Internet-checksum helper it uses. Pure move out of `gateway/mod.rs`
-//! — no behavior change.
+//! Прием и отправка IP-пакетов через TUN, downlink и ответы шлюза на ping.
 
 use super::*;
 
@@ -13,7 +9,7 @@ impl super::Gateway {
         mut tun_reader: tun::DeviceReader,
         tun_writer: tokio::sync::mpsc::Sender<Vec<u8>>,
         sessions: Arc<SessionManager>,
-        socket: Arc<UdpSocket>,
+        socket: Arc<MaskSocket>,
         chain_reverse_routes: Arc<DashMap<std::net::IpAddr, ([u8; 16], Instant)>>,
         chain_reverse_rx: Option<mpsc::Receiver<Vec<u8>>>,
         mask: MaskProfile,
@@ -195,7 +191,7 @@ impl super::Gateway {
         mut rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
         worker_id: usize,
         sessions: Arc<SessionManager>,
-        socket: Arc<UdpSocket>,
+        socket: Arc<MaskSocket>,
         chain_reverse_routes: Arc<DashMap<std::net::IpAddr, ([u8; 16], Instant)>>,
         mask: MaskProfile,
         recorder: Option<Arc<RecordingManager>>,
@@ -223,29 +219,65 @@ impl super::Gateway {
         // all into per-slot wire buffers, then push the whole batch out with
         // one sendmmsg. Order within the worker — and therefore per client —
         // is unchanged. Wire buffers are reused across batches.
-        let batch_io = crate::batch_io::BatchIo::new(socket.clone());
+        let batch_io = crate::batch_io::BatchIo::with_sources(socket.raw(), socket.reply_sources());
         let mut wire_bufs: Vec<Vec<u8>> = (0..crate::batch_io::MAX_BATCH)
             .map(|_| Vec::with_capacity(MAX_PACKET_SIZE))
             .collect();
-        let mut drained: Vec<Vec<u8>> = Vec::with_capacity(crate::batch_io::MAX_BATCH);
+        let mut drained: Vec<(Vec<u8>, Option<super::downlink_pacing::PacedData>)> =
+            Vec::with_capacity(crate::batch_io::MAX_BATCH);
+        let mut pacer = super::downlink_pacing::DownlinkPacer::new();
+        let mut input_closed = false;
         #[allow(clippy::type_complexity)]
         let mut sends: Vec<(
             SocketAddr,
             Option<([u8; 16], aivpn_common::recording::PacketMetadata)>,
+            bool,
         )> = Vec::with_capacity(crate::batch_io::MAX_BATCH);
 
-        while let Some(first) = rx.recv().await {
+        loop {
             drained.clear();
-            drained.push(first);
+            if input_closed && pacer.is_empty() {
+                break;
+            }
+            let deadline = pacer.next_deadline();
+            tokio::select! {
+                biased;
+                _ = async {
+                    match deadline {
+                        Some(at) => aivpn_common::pacing::wait_until(at).await,
+                        None => std::future::pending::<()>().await,
+                    }
+                } => {
+                    while drained.len() < crate::batch_io::MAX_BATCH {
+                        let Some(mut ready) = pacer.pop_ready_when(tokio::time::Instant::now(), |session_id| {
+                            if input_closed { return true; }
+                            sessions.get_session(session_id).is_none_or(|session| {
+                                let session = session.lock();
+                                !session.mask.as_ref().is_some_and(aivpn_common::mask_io::uses_rtc)
+                                    || socket.rtc_data_ready(session.client_addr)
+                            })
+                        }) else {
+                            break;
+                        };
+                        drained.push((std::mem::take(&mut ready.packet), Some(ready)));
+                    }
+                }
+                incoming = rx.recv(), if !input_closed => {
+                    match incoming {
+                        Some(packet) => drained.push((packet, None)),
+                        None => input_closed = true,
+                    }
+                }
+            }
             while drained.len() < crate::batch_io::MAX_BATCH {
                 match rx.try_recv() {
-                    Ok(p) => drained.push(p),
+                    Ok(p) => drained.push((p, None)),
                     Err(_) => break,
                 }
             }
 
             sends.clear();
-            for packet_vec in drained.drain(..) {
+            for (packet_vec, planned) in drained.drain(..) {
                 let packet = packet_vec.as_slice();
                 let n = packet.len();
                 let Some(header) = aivpn_common::ip_packet::IpPacket::parse(packet) else {
@@ -257,6 +289,9 @@ impl super::Gateway {
                 {
                     Some(s) => s,
                     None => {
+                        if planned.is_some() {
+                            continue;
+                        }
                         // PHASE 4 (reverse chain-forward): dst_ip may be an
                         // origin client that lives on a different (entry)
                         // node — this exit only ever saw it via a masked
@@ -321,6 +356,56 @@ impl super::Gateway {
                     {
                         continue;
                     }
+                    session.commit_pending_mask();
+                    if planned.as_ref().is_some_and(|plan| {
+                        plan.session_id != session.session_id
+                            || !plan.matches_profile(session.mask.as_ref().unwrap_or(&mask))
+                    }) {
+                        continue;
+                    }
+                    if session
+                        .mask
+                        .as_ref()
+                        .is_some_and(aivpn_common::mask_io::uses_rtc)
+                        && !socket.rtc_data_ready(session.client_addr)
+                    {
+                        if !input_closed {
+                            let active = session.mask.as_ref().unwrap_or(&mask);
+                            let queued = if downlink_shaping == ShapingLevel::Off {
+                                pacer.enqueue_unpaced(
+                                    session.session_id,
+                                    active,
+                                    packet_vec,
+                                    tokio::time::Instant::now(),
+                                )
+                            } else {
+                                pacer.enqueue_shaped(
+                                    session.session_id,
+                                    active,
+                                    packet_vec,
+                                    tokio::time::Instant::now(),
+                                    downlink_shaping,
+                                )
+                            };
+                            if !queued {
+                                debug!("Downlink: очередь ожидания RTC заполнена");
+                            }
+                        }
+                        continue;
+                    }
+                    if planned.is_none() && downlink_shaping != ShapingLevel::Off {
+                        session.commit_pending_mask();
+                        if !pacer.enqueue_shaped(
+                            session.session_id,
+                            session.mask.as_ref().unwrap_or(&mask),
+                            packet_vec,
+                            tokio::time::Instant::now(),
+                            downlink_shaping,
+                        ) {
+                            debug!("Downlink: очередь шейпинга заполнена, пакет отброшен");
+                        }
+                        continue;
+                    }
                     (session.client_id.clone(), session.session_id)
                 };
                 let nbytes = u32::try_from(n).unwrap_or(u32::MAX);
@@ -341,12 +426,68 @@ impl super::Gateway {
                     }
                 }
 
+                let fragment_mdh = {
+                    let mut sess = session.lock();
+                    sess.commit_pending_mask();
+                    let active = sess.mask.as_ref().unwrap_or(&mask);
+                    (n > aivpn_common::mimicry::data_payload_limit(active, SAFE_DOWNLINK_BUDGET))
+                        .then(|| packet_mdh_bytes_for_mask(active))
+                };
+                if let Some(mdh) = fragment_mdh {
+                    let frames = Self::build_inner_packets(&mdh, InnerType::Data, packet, &session);
+                    match frames {
+                        Ok((address, stateful, frames)) => {
+                            for frame in frames {
+                                match socket.send_with_mask(&frame, address, stateful).await {
+                                    Ok(bytes) => {
+                                        let iat_ms = {
+                                            let mut sess = session.lock();
+                                            let iat_ms =
+                                                sess.last_server_send.elapsed().as_secs_f64()
+                                                    * 1000.0;
+                                            sess.pending_bytes_out =
+                                                sess.pending_bytes_out.saturating_add(bytes as u64);
+                                            sess.last_server_send = Instant::now();
+                                            iat_ms
+                                        };
+                                        if let Some(ref recorder) = recorder {
+                                            if recorder.is_recording(&session_id) {
+                                                recorder.record_packet(session_id, aivpn_common::recording::PacketMetadata {
+                                                    direction: aivpn_common::recording::Direction::Downlink,
+                                                    size: frame.len() as u16,
+                                                    iat_ms,
+                                                    entropy: Self::compute_entropy(&frame) as f32,
+                                                    header_prefix: inner_l7_prefix(packet),
+                                                    timestamp_ns: std::time::SystemTime::now()
+                                                        .duration_since(std::time::UNIX_EPOCH)
+                                                        .unwrap_or_default().as_nanos() as u64,
+                                                });
+                                            }
+                                        }
+                                    }
+                                    Err(error) => {
+                                        debug!("TUN: ошибка отправки фрагментов: {error}");
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        Err(error) => debug!("TUN: ошибка сборки фрагментов: {error}"),
+                    }
+                    continue;
+                }
+
                 // Build encrypted response packet
                 // Minimize lock duration: extract only what we need under lock, then encrypt outside
-                let (session_id, client_addr, downlink_iat_ms, tag, mdh) = {
+                let (session_id, client_addr, downlink_iat_ms, tag, mdh, framing, stateful) = {
                     let mut sess = session.lock();
                     // Commit deferred mask switch if grace period has elapsed
                     sess.commit_pending_mask();
+                    if planned.as_ref().is_some_and(|plan| {
+                        !plan.matches_profile(sess.mask.as_ref().unwrap_or(&mask))
+                    }) {
+                        continue;
+                    }
                     let session_id = sess.session_id;
                     let client_addr = sess.client_addr;
                     let seq_num = sess.next_seq() as u16;
@@ -368,6 +509,36 @@ impl super::Gateway {
                     } else {
                         mask.header_template.clone()
                     };
+                    let framing = sess
+                        .mask
+                        .as_ref()
+                        .unwrap_or(&mask)
+                        .packet_framing(session_mdh.len());
+                    let base_overhead = framing.prefix_len()
+                        + session_mdh.len()
+                        + 2
+                        + 4
+                        + n
+                        + aivpn_common::crypto::POLY1305_TAG_SIZE;
+                    let stateful = sess
+                        .mask
+                        .as_ref()
+                        .is_some_and(aivpn_common::mask_io::requires_userspace);
+                    let packet_budget = if sess
+                        .mask
+                        .as_ref()
+                        .is_some_and(aivpn_common::mask_io::needs_state)
+                    {
+                        aivpn_common::mask_io::MAX_QUIC_INNER
+                    } else if sess
+                        .mask
+                        .as_ref()
+                        .is_some_and(aivpn_common::mask_io::uses_rtc)
+                    {
+                        aivpn_common::mask_io::rtc_inner_budget(sess.mask.as_ref().unwrap())
+                    } else {
+                        SAFE_DOWNLINK_BUDGET
+                    };
 
                     // A7/1c: size downlink padding from the SESSION mask's own
                     // size distribution — the same distribution + padding
@@ -383,8 +554,10 @@ impl super::Gateway {
                     // entirely.
                     let pad_len: u16 = match downlink_shaping {
                         ShapingLevel::Off => 0,
-                        ShapingLevel::Full | ShapingLevel::Light => {
-                            if let Some(ref m) = sess.mask {
+                        ShapingLevel::Adaptive | ShapingLevel::Full | ShapingLevel::Light => {
+                            {
+                                let profile = sess.mask.as_ref().unwrap_or(&mask);
+                                let m = profile.reverse_profile.as_deref().unwrap_or(profile);
                                 // `+ 4` accounts for the InnerHeader
                                 // (`InnerHeader::encode` — [u8; 4]) that is
                                 // part of the encrypted plaintext below (see
@@ -393,40 +566,39 @@ impl super::Gateway {
                                 // SAFE_DOWNLINK_BUDGET + 4 on the wire, and
                                 // every shaped packet sat 4 bytes above its
                                 // mask's target size.
-                                let base_overhead = TAG_SIZE
-                                    + session_mdh.len()
-                                    + 2
-                                    + 4
-                                    + n
-                                    + aivpn_common::crypto::POLY1305_TAG_SIZE;
-                                let target = m.size_distribution.sample(&mut rng);
-                                let requested = m.padding_strategy.calc_padding(
-                                    base_overhead,
+                                let target = planned
+                                    .as_ref()
+                                    .map(|plan| plan.target_size)
+                                    .unwrap_or_else(|| m.size_distribution.sample(&mut rng));
+                                let strategy = planned
+                                    .as_ref()
+                                    .and_then(|plan| plan.padding_override.as_ref())
+                                    .unwrap_or(&m.padding_strategy);
+                                let requested = strategy.calc_padding(
+                                    base_overhead
+                                        + aivpn_common::mask_io::carrier_overhead(profile),
                                     target,
                                     &mut rng,
                                 );
-                                let max_pad =
-                                    SAFE_DOWNLINK_BUDGET.saturating_sub(base_overhead) as u16;
+                                let max_pad = packet_budget.saturating_sub(base_overhead) as u16;
                                 let capped = requested.min(max_pad);
                                 if downlink_shaping == ShapingLevel::Light {
                                     capped.min(LIGHT_SHAPING_MAX_PAD)
                                 } else {
                                     capped
                                 }
-                            } else {
-                                0
                             }
                         }
                     };
+                    let Ok(pad_len) = framing.padding(
+                        base_overhead,
+                        pad_len,
+                        packet_budget.saturating_sub(base_overhead) as u16,
+                    ) else {
+                        continue;
+                    };
                     // Полный UDP payload: тег, заголовок маски, padding и AEAD.
-                    let estimated_out = (TAG_SIZE
-                        + session_mdh.len()
-                        + 2
-                        + 4
-                        + n
-                        + pad_len as usize
-                        + aivpn_common::crypto::POLY1305_TAG_SIZE)
-                        as u64;
+                    let estimated_out = (base_overhead + pad_len as usize) as u64;
                     sess.pending_bytes_out = sess.pending_bytes_out.saturating_add(estimated_out);
                     // Flush downlink-only traffic to client_db when threshold reached
                     let flush_out = if sess.pending_bytes_out >= 64 * 1024 {
@@ -490,15 +662,23 @@ impl super::Gateway {
                     );
                     let tag = crypto::generate_resonance_tag(&tag_secret, counter, time_window);
 
-                    (session_id, client_addr, downlink_iat_ms, tag, mdh)
+                    (
+                        session_id,
+                        client_addr,
+                        downlink_iat_ms,
+                        tag,
+                        mdh,
+                        framing,
+                        stateful,
+                    )
                 };
 
                 // Assemble: TAG | MDH | ciphertext into this packet's wire slot.
                 let wire_buf = &mut wire_bufs[sends.len()];
-                wire_buf.clear();
-                wire_buf.extend_from_slice(&tag);
-                wire_buf.extend_from_slice(&mdh);
-                wire_buf.extend_from_slice(&ciphertext_buf);
+                if let Err(error) = framing.assemble_into(wire_buf, &mdh, &tag, &ciphertext_buf) {
+                    debug!("TUN: ошибка упаковки downlink: {error}");
+                    continue;
+                }
 
                 // bytes_out already tracked inside the earlier lock scope.
                 // Recorder metadata is captured now (entropy needs this
@@ -524,79 +704,77 @@ impl super::Gateway {
                     )),
                     _ => None,
                 };
-                sends.push((client_addr, rec_meta));
+                sends.push((client_addr, rec_meta, stateful));
             }
 
             if sends.is_empty() {
                 continue;
             }
-            let msgs: Vec<(&[u8], SocketAddr)> = sends
-                .iter()
-                .enumerate()
-                .map(|(i, (addr, _))| (wire_bufs[i].as_slice(), *addr))
-                .collect();
+            let mut masked_failed = false;
+            let mut msgs = Vec::with_capacity(sends.len());
+            for (index, (addr, _, stateful)) in sends.iter().enumerate() {
+                if *stateful || socket.needs_wrapping(&wire_bufs[index], *addr) {
+                    if socket
+                        .send_data_with_mask(&wire_bufs[index], *addr, *stateful)
+                        .await
+                        .is_err()
+                    {
+                        masked_failed = true;
+                    }
+                } else {
+                    msgs.push((wire_bufs[index].as_slice(), *addr));
+                }
+            }
             match batch_io.send_batch(&msgs).await {
                 Err(e) => debug!("TUN: batched send failed: {}", e),
-                Ok(()) => {
+                Ok(()) if !masked_failed => {
                     if let Some(ref recorder) = recorder {
                         drop(msgs);
-                        for (_, rec) in sends.drain(..) {
+                        for (_, rec, _) in sends.drain(..) {
                             if let Some((sid, meta)) = rec {
                                 recorder.record_packet(sid, meta);
                             }
                         }
                     }
                 }
+                Ok(()) => debug!("Очередь протокола маски переполнена"),
             }
         }
         warn!("Downlink worker {} ended — channel closed", worker_id);
     }
 
-    /// Build ICMP Echo Reply from Echo Request
+    /// Формирует полный IPv4-пакет: TUN не пересчитывает контрольные суммы.
     fn build_icmp_echo_reply(request: &[u8], server_ip: &Ipv4Addr) -> Option<Vec<u8>> {
-        if request.len() < 28 {
+        let parsed = aivpn_common::ip_packet::IpPacket::parse(request)?;
+        if request[0] >> 4 != 4 || request[9] != 1 {
             return None;
         }
-
-        // Parse source IP
-        let src_ip = Ipv4Addr::new(request[12], request[13], request[14], request[15]);
-
-        // Parse ICMP type and code
-        let icmp_type = request[20];
-        if icmp_type != 8 {
-            return None; // Not echo request
+        let header_len = usize::from(request[0] & 15) * 4;
+        let fragment = u16::from_be_bytes([request[6], request[7]]);
+        if fragment & 0x3fff != 0 || parsed.length < header_len + 8 {
+            return None;
         }
-
-        // Build reply: swap src/dst IP, change ICMP type to 0 (echo reply)
-        let mut reply = Vec::with_capacity(request.len());
-
-        // IP header
-        reply.push(0x45); // Version 4, IHL 5
-        reply.push(0x00); // DSCP/ECN
-        let total_len = (request.len() as u16).to_be_bytes();
-        reply.extend_from_slice(&total_len);
-        reply.extend_from_slice(&request[4..6]); // Identification
-        reply.extend_from_slice(&request[6..8]); // Flags/Fragment
-        reply.push(64); // TTL
-        reply.push(1); // Protocol: ICMP
-        reply.push(0); // Header checksum (will be computed by kernel)
-        reply.push(0);
-        reply.extend_from_slice(&server_ip.octets()); // Source IP (server)
-        reply.extend_from_slice(&src_ip.octets()); // Dest IP (client)
-
-        // ICMP header
-        reply.push(0); // Type: Echo Reply
-        reply.push(request[21]); // Code
-        reply.push(0); // Checksum placeholder
-        reply.push(0);
-        reply.extend_from_slice(&request[24..28]); // ID + Sequence
-        reply.extend_from_slice(&request[28..]); // Data
-
-        // Compute ICMP checksum
+        let icmp = &request[header_len..parsed.length];
+        if icmp[0] != 8 || icmp[1] != 0 || Self::compute_checksum(icmp) != 0 {
+            return None;
+        }
+        let mut reply = vec![0; 20];
+        reply[0] = 0x45;
+        reply[1] = request[1];
+        reply[2..4].copy_from_slice(&((20 + icmp.len()) as u16).to_be_bytes());
+        reply[4..6].copy_from_slice(&request[4..6]);
+        reply[6..8].copy_from_slice(&(fragment & 0x4000).to_be_bytes());
+        reply[8] = 64;
+        reply[9] = 1;
+        reply[12..16].copy_from_slice(&server_ip.octets());
+        reply[16..20].copy_from_slice(&request[12..16]);
+        reply.extend_from_slice(icmp);
+        reply[20] = 0;
+        reply[22..24].fill(0);
         let checksum = Self::compute_checksum(&reply[20..]);
-        reply[22] = (checksum >> 8) as u8;
-        reply[23] = (checksum & 0xFF) as u8;
-
+        reply[22..24].copy_from_slice(&checksum.to_be_bytes());
+        let checksum = Self::compute_checksum(&reply[..20]);
+        reply[10..12].copy_from_slice(&checksum.to_be_bytes());
         Some(reply)
     }
 
@@ -636,5 +814,63 @@ impl super::Gateway {
             // No flush() — let the OS buffer writes for throughput
         }
         warn!("TUN write loop ended — channel closed");
+    }
+}
+
+#[cfg(test)]
+mod icmp_tests {
+    use super::*;
+
+    fn request(options: bool) -> Vec<u8> {
+        let header_len = if options { 24 } else { 20 };
+        let mut bytes = vec![0; header_len];
+        bytes[0] = 0x40 | (header_len / 4) as u8;
+        bytes[8] = 64;
+        bytes[9] = 1;
+        bytes[12..16].copy_from_slice(&[10, 0, 0, 2]);
+        bytes[16..20].copy_from_slice(&[10, 0, 0, 1]);
+        if options {
+            bytes[20..24].copy_from_slice(&[1, 1, 0, 0]);
+        }
+        bytes.extend_from_slice(&[8, 0, 0, 0, 0x12, 0x34, 0, 1, 7, 8, 9]);
+        let len = bytes.len() as u16;
+        bytes[2..4].copy_from_slice(&len.to_be_bytes());
+        let checksum = Gateway::compute_checksum(&bytes[header_len..]);
+        bytes[header_len + 2..header_len + 4].copy_from_slice(&checksum.to_be_bytes());
+        let checksum = Gateway::compute_checksum(&bytes[..header_len]);
+        bytes[10..12].copy_from_slice(&checksum.to_be_bytes());
+        bytes
+    }
+
+    #[test]
+    fn echo_reply_has_valid_ip_and_icmp_checksums_with_or_without_options() {
+        for options in [false, true] {
+            let original = request(options);
+            let reply =
+                Gateway::build_icmp_echo_reply(&original, &Ipv4Addr::new(10, 0, 0, 1)).unwrap();
+            assert_eq!(reply.len(), 31);
+            assert_eq!(Gateway::compute_checksum(&reply[..20]), 0);
+            assert_eq!(Gateway::compute_checksum(&reply[20..]), 0);
+            assert_eq!(&reply[12..20], &[10, 0, 0, 1, 10, 0, 0, 2]);
+            assert_eq!(&reply[24..], &[0x12, 0x34, 0, 1, 7, 8, 9]);
+            assert_eq!(reply[20], 0);
+        }
+    }
+
+    #[test]
+    fn echo_reply_rejects_fragments_truncation_and_bad_icmp() {
+        let gateway = Ipv4Addr::new(10, 0, 0, 1);
+        for fragment in [1u16, 0x2000] {
+            let mut bytes = request(false);
+            bytes[6..8].copy_from_slice(&fragment.to_be_bytes());
+            assert!(Gateway::build_icmp_echo_reply(&bytes, &gateway).is_none());
+        }
+        let mut bytes = request(true);
+        bytes[24] = 0;
+        assert!(Gateway::build_icmp_echo_reply(&bytes, &gateway).is_none());
+        let bytes = request(false);
+        for len in 0..bytes.len() {
+            assert!(Gateway::build_icmp_echo_reply(&bytes[..len], &gateway).is_none());
+        }
     }
 }

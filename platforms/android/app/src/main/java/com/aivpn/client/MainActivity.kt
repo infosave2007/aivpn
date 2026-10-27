@@ -1,8 +1,26 @@
 package com.aivpn.client
 
 import android.app.Activity
-import android.app.AlertDialog
+import androidx.appcompat.app.AlertDialog
+import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import android.content.Intent
+import android.content.ClipboardManager
+import android.content.Context
+import android.content.res.ColorStateList
+import android.content.res.Configuration
+import android.graphics.Typeface
+import android.graphics.drawable.GradientDrawable
+import android.text.InputType
+import android.view.Gravity
+import android.view.ViewGroup
+import android.widget.FrameLayout
+import androidx.activity.OnBackPressedCallback
+import com.google.android.material.card.MaterialCardView
+import com.google.android.material.materialswitch.MaterialSwitch
+import com.google.android.material.textfield.TextInputEditText
+import com.google.android.material.textfield.TextInputLayout
+import com.google.android.material.textfield.MaterialAutoCompleteTextView
+import com.google.android.material.button.MaterialButton
 import android.content.pm.PackageManager
 import android.net.VpnService
 import android.os.Build
@@ -27,31 +45,29 @@ import androidx.recyclerview.widget.LinearLayoutManager
 import com.aivpn.client.databinding.ActivityMainBinding
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
-import java.net.DatagramPacket
-import java.net.DatagramSocket
-import java.net.InetAddress
-import java.net.SocketTimeoutException
 import java.util.UUID
 
-/**
- * Main screen — server address, public key, connect/disconnect button,
- * connection timer, traffic stats, and EN/RU language toggle.
- *
- * v0.3.0: Uses EncryptedSharedPreferences for secure key storage.
- */
+/** Главные разделы клиента; состояние соединения принадлежит VPN-сервису. */
 class MainActivity : AppCompatActivity() {
 
     private lateinit var binding: ActivityMainBinding
     private lateinit var profilesAdapter: ProfilesAdapter
     private lateinit var viewModel: MainViewModel
     private var isConnected = false
+    private var isConnecting = false
     private var currentQualityScore: Int = 0
     private var currentRecordingService: String = ""
 
     private var profiles = mutableListOf<SecureStorage.ConnectionProfile>()
     private var activeProfileId: String? = null
+    private var activeConnectionKey: String = ""
+    private var selectedSection = R.id.nav_vpn
+    private var lastUploadBytes: Long? = null
+    private var lastDownloadBytes: Long? = null
 
     /**
      * False until onCreate's asynchronous SecureStorage load (A5) has populated
@@ -59,13 +75,19 @@ class MainActivity : AppCompatActivity() {
      * saving the not-yet-loaded (empty) list would overwrite every stored profile.
      */
     private var profilesLoaded = false
+    private var profileLoadJob: Job? = null
+    private var pendingVpnProfileId: String? = null
+    private var pendingVpnPermissionGranted = false
 
     private val vpnPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult()
     ) { result ->
         if (result.resultCode == Activity.RESULT_OK) {
-            startVpnService()
+            pendingVpnPermissionGranted = true
+            resumePendingVpnStart()
         } else {
+            pendingVpnProfileId = null
+            pendingVpnPermissionGranted = false
             Toast.makeText(this, getString(R.string.error_vpn_denied), Toast.LENGTH_SHORT).show()
         }
     }
@@ -94,10 +116,7 @@ class MainActivity : AppCompatActivity() {
         override fun run() {
             if (isConnected && connectionStartTime > 0) {
                 val elapsed = (System.currentTimeMillis() - connectionStartTime) / 1000
-                val h = elapsed / 3600
-                val m = (elapsed % 3600) / 60
-                val s = elapsed % 60
-                binding.textTimer.text = String.format("%02d:%02d:%02d", h, m, s)
+                binding.sessionStats.setElapsed(elapsed)
                 // textDuration shows the fixed session START time (see the connected
                 // branch), NOT a second elapsed counter — so it no longer ticks here.
                 timerHandler.postDelayed(this, 1000)
@@ -107,8 +126,11 @@ class MainActivity : AppCompatActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        pendingVpnProfileId = savedInstanceState?.getString("pending_vpn_profile")
+        pendingVpnPermissionGranted = savedInstanceState?.getBoolean("pending_vpn_granted") ?: false
         binding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(binding.root)
+        initializeNavigation(savedInstanceState)
 
         viewModel = ViewModelProvider(this).get(MainViewModel::class.java)
         // Restore isConnected and connectionStartTime from ViewModel so they survive rotation.
@@ -126,23 +148,18 @@ class MainActivity : AppCompatActivity() {
 
         // Android 13+: ask for notification permission up front so the user sees
         // the tunnel status notification and connect/disconnect events.
-        requestNotificationPermissionIfNeeded()
+
 
         binding.versionFooter.text = "v${BuildConfig.VERSION_NAME} · ${getString(R.string.version_tagline)}"
 
         profilesAdapter = ProfilesAdapter(
             onProfileClick = { profile ->
-                if (!isConnected) {
+                if (!isConnected && !isConnecting && !AivpnService.isServiceActive) {
                     activeProfileId = profile.id
                     SecureStorage.saveActiveProfileId(this, profile.id)
-                    binding.editConnectionKey.setText(profile.key)
+                    activeConnectionKey = profile.key
                     renderProfiles()
-                    // Sync button label to the newly selected profile
-                    val name = profiles.find { it.id == activeProfileId }?.name
-                    binding.btnConnect.text = if (name != null)
-                        "${getString(R.string.btn_connect)} · $name"
-                    else
-                        getString(R.string.btn_connect)
+                    resyncFromService()
                 }
             },
             onEditClick   = { showProfileDialog(it) },
@@ -151,73 +168,18 @@ class MainActivity : AppCompatActivity() {
         binding.profileList.layoutManager = LinearLayoutManager(this)
         binding.profileList.adapter = profilesAdapter
 
-        // A5: the legacy-key migration, the profile list and the saved language
-        // all live in EncryptedSharedPreferences — Keystore + real disk I/O,
-        // hundreds of ms on a cold start — which BootReceiver already refuses to
-        // run on its calling thread (see its goAsync() comment). Load them on
-        // Dispatchers.IO and apply the result here on the main thread; until it
-        // lands [profilesLoaded] keeps the persisting paths (connect, profile
-        // dialog) from writing the still-empty list back over stored profiles.
-        lifecycleScope.launch {
-            data class LoadResult(
-                val profiles: MutableList<SecureStorage.ConnectionProfile>,
-                val activeId: String?,
-                val legacyKey: String,
-                val language: String?,
-            )
-
-            val loaded = withContext(Dispatchers.IO) {
-                // Migrate legacy single connection key to profiles
-                migrateLegacyKey()
-                val list = SecureStorage.loadProfiles(this@MainActivity).toMutableList()
-                LoadResult(
-                    profiles = list,
-                    activeId = SecureStorage.loadActiveProfileId(this@MainActivity),
-                    // Only read for the no-profiles fallback below.
-                    legacyKey = if (list.isEmpty()) SecureStorage.loadConnectionKey(this@MainActivity) else "",
-                    language = SecureStorage.loadLanguage(this@MainActivity),
-                )
-            }
-            profiles = loaded.profiles
-            activeProfileId = loaded.activeId
-            profilesLoaded = true
-
-            // If we have an active profile, load its key into the field
-            val active = profiles.find { it.id == activeProfileId }
-            if (active != null) {
-                binding.editConnectionKey.setText(active.key)
-            } else if (profiles.isNotEmpty()) {
-                activeProfileId = profiles[0].id
-                binding.editConnectionKey.setText(profiles[0].key)
-                withContext(Dispatchers.IO) {
-                    SecureStorage.saveActiveProfileId(this@MainActivity, profiles[0].id)
-                }
-            } else {
-                // Fallback: try legacy key
-                binding.editConnectionKey.setText(loaded.legacyKey)
-            }
-
-            renderProfiles()
-
-            // Update language button label
-            updateLanguageButton(loaded.language)
-
-            // The Connect label carries the active profile name, which was still
-            // unknown when the resync at the end of onCreate rendered the state.
-            resyncFromService()
-        }
 
         binding.btnConnect.setOnClickListener {
-            if (AivpnService.isServiceActive) disconnect() else connect()
+            if (isConnecting || AivpnService.isServiceActive) disconnect() else connect()
         }
 
-        binding.btnLanguage.setOnClickListener {
-            toggleLanguage()
-        }
-
-        binding.btnAddProfile.setOnClickListener {
-            showProfileDialog(null)
-        }
+        binding.btnAddProfile.setOnClickListener { showProfileDialog(null) }
+        binding.btnEmptyAdd.setOnClickListener { showProfileDialog(null) }
+        val installServer = View.OnClickListener { startActivity(Intent(this, InstallServerActivity::class.java)) }
+        binding.btnEmptyInstall.setOnClickListener(installServer)
+        binding.btnInstallServer.setOnClickListener(installServer)
+        binding.activeProfileCard.setOnClickListener { showProfilePicker() }
+        binding.sessionStats.setOnClickListener { showDiagnosticsDialog() }
 
         binding.btnSplitTunnel.setOnClickListener {
             startActivity(Intent(this, SplitTunnelActivity::class.java))
@@ -231,7 +193,7 @@ class MainActivity : AppCompatActivity() {
         binding.btnBgHealth.setOnClickListener(openBgHealth)
         binding.textBgHealthHint.setOnClickListener(openBgHealth)
 
-        binding.btnOptions.setOnClickListener { showOptionsMenu(it) }
+
 
         updateSplitTunnelHint()
 
@@ -243,25 +205,300 @@ class MainActivity : AppCompatActivity() {
         resyncFromService()
     }
 
+    /** Перечитываем профили после возврата из мастера, не сохраняя старую копию. */
+    private fun loadProfiles() {
+        profileLoadJob?.cancel()
+        profilesLoaded = false
+        renderProfiles()
+        profileLoadJob = lifecycleScope.launch {
+            data class LoadResult(
+                val profiles: MutableList<SecureStorage.ConnectionProfile>,
+                val activeId: String?,
+                val legacyKey: String,
+                val language: String?,
+            )
+
+            val loaded = try {
+                withContext(Dispatchers.IO) {
+                    // Migrate legacy single connection key to profiles
+                    migrateLegacyKey()
+                    val list = SecureStorage.loadProfiles(this@MainActivity).toMutableList()
+                    LoadResult(
+                        profiles = list,
+                        activeId = SecureStorage.loadActiveProfileId(this@MainActivity),
+                        // Only read for the no-profiles fallback below.
+                        legacyKey = if (list.isEmpty()) SecureStorage.loadConnectionKey(this@MainActivity) else "",
+                        language = SecureStorage.loadLanguage(this@MainActivity),
+                    )
+                }
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Exception) {
+                android.util.Log.w("MainActivity", "Не удалось загрузить профили", error)
+                Toast.makeText(this@MainActivity, R.string.status_storage_unavailable, Toast.LENGTH_LONG).show()
+                return@launch
+            }
+            val runningProfile = activeProfileId.takeIf {
+                AivpnService.isServiceActive && loaded.profiles.any { profile -> profile.id == it }
+            }
+            profiles = loaded.profiles
+            activeProfileId = runningProfile ?: loaded.activeId
+            profilesLoaded = true
+
+            // If we have an active profile, load its key into the field
+            val active = profiles.find { it.id == activeProfileId }
+            if (active != null) {
+                activeConnectionKey = active.key
+            } else if (profiles.isNotEmpty()) {
+                activeProfileId = profiles[0].id
+                activeConnectionKey = profiles[0].key
+                withContext(Dispatchers.IO) {
+                    SecureStorage.saveActiveProfileId(this@MainActivity, profiles[0].id)
+                }
+            } else {
+                // Fallback: try legacy key
+                activeConnectionKey = loaded.legacyKey
+            }
+
+            renderProfiles()
+
+            // Update language button label
+            updateLanguageButton(loaded.language)
+
+            // The Connect label carries the active profile name, which was still
+            // unknown when the resync at the end of onCreate rendered the state.
+            resyncFromService()
+            resumePendingVpnStart()
+        }
+    }
+
+    private fun resumePendingVpnStart() {
+        if (!profilesLoaded || !pendingVpnPermissionGranted) return
+        val requested = pendingVpnProfileId ?: return
+        pendingVpnProfileId = null
+        pendingVpnPermissionGranted = false
+        val profile = profiles.find { it.id == requested } ?: return
+        activeProfileId = profile.id
+        activeConnectionKey = profile.key
+        SecureStorage.saveActiveProfileId(this, profile.id)
+        startVpnService(profile.id)
+    }
+
     /** Renders the current AivpnService.uiState. Used by onCreate and onResume. */
     private fun resyncFromService() {
+        val statusText = AivpnService.localizedStatus(this)
         when (AivpnService.uiState) {
             AivpnService.UiState.CONNECTED -> {
                 isConnected = true
-                updateUI(true, AivpnService.lastStatusText)
+                updateUI(true, statusText)
             }
             AivpnService.UiState.CONNECTING -> {
                 isConnected = false
-                updateUI(false, AivpnService.lastStatusText, connecting = true)
+                updateUI(false, statusText, connecting = true)
             }
             AivpnService.UiState.DISCONNECTED -> {
                 isConnected = false
                 updateUI(
                     false,
-                    AivpnService.lastStatusText.ifEmpty { getString(R.string.status_disconnected) }
+                    statusText.ifEmpty { getString(R.string.status_disconnected) }
                 )
             }
         }
+    }
+
+    private var updatingNavigation = false
+
+    private fun initializeNavigation(savedInstanceState: Bundle?) {
+        val sections = setOf(R.id.nav_vpn, R.id.nav_profiles, R.id.nav_settings)
+        selectedSection = savedInstanceState?.getInt("selected_section")?.takeIf(sections::contains) ?: R.id.nav_vpn
+        binding.mainNavigation.setOnItemSelectedListener { item ->
+            if (!updatingNavigation) selectSection(item.itemId)
+            true
+        }
+        binding.mainRail.setOnItemSelectedListener { item ->
+            if (!updatingNavigation) selectSection(item.itemId)
+            true
+        }
+        selectSection(selectedSection)
+        binding.root.post { configureNavigation() }
+        onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
+            override fun handleOnBackPressed() {
+                if (selectedSection != R.id.nav_vpn) selectSection(R.id.nav_vpn) else finish()
+            }
+        })
+    }
+
+    private fun selectSection(section: Int) {
+        selectedSection = section
+        binding.vpnPage.visibility = if (section == R.id.nav_vpn) View.VISIBLE else View.GONE
+        binding.profilesPage.visibility = if (section == R.id.nav_profiles) View.VISIBLE else View.GONE
+        binding.settingsPage.visibility = if (section == R.id.nav_settings) View.VISIBLE else View.GONE
+        binding.toolbar.setTitle(when (section) {
+            R.id.nav_profiles -> R.string.nav_profiles
+            R.id.nav_settings -> R.string.nav_settings
+            else -> R.string.app_name
+        })
+        updatingNavigation = true
+        binding.mainNavigation.selectedItemId = section
+        binding.mainRail.selectedItemId = section
+        updatingNavigation = false
+        if (section == R.id.nav_settings) renderSettings()
+    }
+
+    private fun configureNavigation() {
+        val wide = resources.configuration.screenWidthDp >= 600
+        binding.mainRail.visibility = if (wide) View.VISIBLE else View.GONE
+        binding.mainNavigation.visibility = if (wide) View.GONE else View.VISIBLE
+        listOf(binding.vpnPage, binding.profilesPage, binding.settingsPage).forEach { page ->
+            val child = page.getChildAt(0)
+            child.layoutParams = (child.layoutParams as FrameLayout.LayoutParams).apply {
+                width = if (wide) minOf(560, resources.configuration.screenWidthDp - 96).dp else ViewGroup.LayoutParams.MATCH_PARENT
+                gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
+            }
+        }
+    }
+
+    override fun onConfigurationChanged(newConfig: Configuration) {
+        super.onConfigurationChanged(newConfig)
+        configureNavigation()
+    }
+
+    override fun onSaveInstanceState(outState: Bundle) {
+        outState.putInt("selected_section", selectedSection)
+        outState.putString("pending_vpn_profile", pendingVpnProfileId)
+        outState.putBoolean("pending_vpn_granted", pendingVpnPermissionGranted)
+        super.onSaveInstanceState(outState)
+    }
+
+    private fun showProfilePicker() {
+        if (!profilesLoaded) return
+        if (isConnected || isConnecting || AivpnService.isServiceActive) {
+            MaterialAlertDialogBuilder(this).setMessage(R.string.ui_profile_locked)
+                .setPositiveButton(android.R.string.ok, null).show()
+            return
+        }
+        MaterialAlertDialogBuilder(this)
+            .setTitle(R.string.ui_choose_profile)
+            .setSingleChoiceItems(profiles.map { it.name }.toTypedArray(), profiles.indexOfFirst { it.id == activeProfileId }) { dialog, which ->
+                if (!isConnected && !isConnecting && !AivpnService.isServiceActive) {
+                    val chosen = profiles.getOrNull(which) ?: return@setSingleChoiceItems
+                    activeProfileId = chosen.id
+                    activeConnectionKey = chosen.key
+                    SecureStorage.saveActiveProfileId(this, chosen.id)
+                    renderProfiles()
+                    resyncFromService()
+                }
+                dialog.dismiss()
+            }
+            .setNegativeButton(R.string.btn_cancel, null)
+            .show()
+    }
+
+    private fun renderSettings() {
+        val container = binding.settingsContainer
+        container.removeAllViews()
+        fun group(title: Int, rows: LinearLayout.() -> Unit) {
+            container.addView(TextView(this).apply {
+                setText(title)
+                textSize = 12f
+                setTextColor(UiAppearance.color(this@MainActivity, com.google.android.material.R.attr.colorPrimary))
+                setPadding(4.dp, 20.dp, 4.dp, 8.dp)
+                androidx.core.view.ViewCompat.setAccessibilityHeading(this, true)
+            })
+            val content = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+            val card = MaterialCardView(this).apply {
+                layoutParams = LinearLayout.LayoutParams(-1, -2)
+                addView(content)
+            }
+            content.rows()
+            container.addView(card)
+        }
+        fun LinearLayout.row(icon: Int, title: Int, subtitle: String, checked: Boolean? = null, action: () -> Unit) {
+            val row = LinearLayout(this@MainActivity).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                minimumHeight = 76.dp
+                setPadding(16.dp, 12.dp, 12.dp, 12.dp)
+                val value = android.util.TypedValue()
+                theme.resolveAttribute(android.R.attr.selectableItemBackground, value, true)
+                setBackgroundResource(value.resourceId)
+                isClickable = true
+                isFocusable = true
+                setOnClickListener { action() }
+            }
+            row.addView(androidx.appcompat.widget.AppCompatImageView(this@MainActivity).apply {
+                setImageResource(icon)
+                imageTintList = ColorStateList.valueOf(UiAppearance.color(context, com.google.android.material.R.attr.colorOnSurfaceVariant))
+                importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
+            }, LinearLayout.LayoutParams(24.dp, 24.dp))
+            row.addView(LinearLayout(this@MainActivity).apply {
+                orientation = LinearLayout.VERTICAL
+                addView(TextView(context).apply { setText(title); textSize = 16f; setTextColor(UiAppearance.color(context, com.google.android.material.R.attr.colorOnSurface)) })
+                if (subtitle.isNotEmpty()) addView(TextView(context).apply {
+                    text = subtitle
+                    textSize = 12f
+                    setTextColor(UiAppearance.color(context, com.google.android.material.R.attr.colorOnSurfaceVariant))
+                    setPadding(0, 3.dp, 0, 0)
+                })
+            }, LinearLayout.LayoutParams(0, -2, 1f).apply { marginStart = 14.dp; marginEnd = 8.dp })
+            if (checked != null) {
+                row.addView(MaterialSwitch(this@MainActivity).apply {
+                    isChecked = checked
+                    minimumHeight = 48.dp
+                    contentDescription = getString(title)
+                    setOnCheckedChangeListener { _, _ -> action() }
+                }, LinearLayout.LayoutParams(-2, 48.dp))
+            } else {
+                row.addView(androidx.appcompat.widget.AppCompatImageView(this@MainActivity).apply {
+                    setImageResource(R.drawable.ic_vpn_chevron)
+                    imageTintList = ColorStateList.valueOf(UiAppearance.color(context, com.google.android.material.R.attr.colorOnSurfaceVariant))
+                    importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
+                }, LinearLayout.LayoutParams(24.dp, 24.dp))
+            }
+            if (childCount > 0) addView(View(this@MainActivity).apply {
+                setBackgroundColor(UiAppearance.color(context, com.google.android.material.R.attr.colorSurface))
+            }, LinearLayout.LayoutParams(-1, 1.dp))
+            addView(row)
+        }
+        group(R.string.ui_connection_group) {
+            row(R.drawable.ic_vpn_power, R.string.ui_auto_connect, getString(R.string.ui_auto_connect_detail),
+                BootPrefs.prefs(this@MainActivity).getBoolean(PrefsKeys.PREF_AUTO_CONNECT, false)) { onOptionsMenuItemSelected(MENU_AUTO_CONNECT) }
+            row(R.drawable.ic_vpn_route, R.string.btn_split_tunnel, binding.textSplitTunnelHint.text.toString()) { startActivity(Intent(this@MainActivity, SplitTunnelActivity::class.java)) }
+            row(R.drawable.ic_vpn_battery, R.string.ui_background, backgroundHealthMessage() ?: getString(R.string.ui_background_ok)) { startActivity(Intent(this@MainActivity, BackgroundHealthActivity::class.java)) }
+            row(R.drawable.ic_vpn_shield, R.string.ui_block_without_vpn, getString(R.string.ui_android_vpn_settings)) { onOptionsMenuItemSelected(MENU_OS_KILL_SWITCH) }
+        }
+        group(R.string.ui_masks_group) {
+            val mask = profiles.find { it.id == activeProfileId }?.maskProfile?.takeUnless { it == "auto" }
+            row(R.drawable.ic_vpn_shield, R.string.mask_profile_label, mask ?: getString(R.string.ui_mask_default)) {
+                val active = profiles.find { it.id == activeProfileId }
+                if (active != null) showProfileDialog(active) else selectSection(R.id.nav_profiles)
+            }
+            val levels = intArrayOf(R.string.adaptive_off, R.string.adaptive_light, R.string.adaptive_aggressive, R.string.adaptive_satellite)
+            row(R.drawable.ic_vpn_settings, R.string.adaptive_mode, getString(levels[adaptiveLevel()])) { onOptionsMenuItemSelected(MENU_ADAPTIVE) }
+            val privacy = getSharedPreferences(PrefsKeys.PREFS_NAME, MODE_PRIVATE)
+            val privacyEnabled = listOf(PrefsKeys.PREF_POLYMORPHIC_ENABLED, PrefsKeys.PREF_SHARE_MASK_FEEDBACK, PrefsKeys.PREF_RECEIVE_MASK_HINTS).any { privacy.getBoolean(it, false) }
+            row(R.drawable.ic_vpn_shield_check, R.string.mask_privacy, getString(if (privacyEnabled) R.string.auto_connect_state_on else R.string.auto_connect_state_off)) { onOptionsMenuItemSelected(MENU_MASK_PRIVACY) }
+            if (loadTransportDescriptor(this@MainActivity) != null) row(R.drawable.ic_vpn_route, R.string.transport_settings_title, "") { onOptionsMenuItemSelected(MENU_TRANSPORT_SETTINGS) }
+        }
+        group(R.string.ui_application_group) {
+            row(R.drawable.ic_vpn_settings, R.string.ui_appearance, UiAppearance.themeSummary(this@MainActivity)) { UiAppearance.showThemeDialog(this@MainActivity) }
+            val language = AppCompatDelegate.getApplicationLocales().toLanguageTags()
+            row(R.drawable.ic_vpn_info, R.string.label_language, when (language) { "ru" -> "Русский"; "en" -> "English"; else -> getString(R.string.ui_language_system) }) { showLanguageDialog() }
+            row(R.drawable.ic_vpn_info, R.string.diagnostics, getString(R.string.ui_diagnostics_detail)) { showDiagnosticsDialog() }
+            row(R.drawable.ic_vpn_settings, R.string.ui_tools, getString(R.string.ui_tools_group)) { showToolsDialog() }
+        }
+        val role = runCatching { if (AivpnJni.isAvailable) AivpnJni.getRole() else -1 }.getOrDefault(-1)
+        if (role == 1 || role == 2) group(R.string.ui_management_group) {
+            row(R.drawable.ic_vpn_server, R.string.admin_menu_title, getString(R.string.desc_admin_menu)) { onOptionsMenuItemSelected(MENU_ADMIN) }
+        }
+    }
+
+    private fun showToolsDialog() {
+        val labels = intArrayOf(R.string.recording, R.string.ui_bootstrap, R.string.export_logs, R.string.install_menu_title)
+        val actions = intArrayOf(MENU_RECORDING, MENU_BOOTSTRAP_DISCOVERY, MENU_EXPORT_LOGS, MENU_INSTALL_SERVER)
+        MaterialAlertDialogBuilder(this).setTitle(R.string.ui_tools)
+            .setItems(labels.map { getString(it) }.toTypedArray()) { _, which -> onOptionsMenuItemSelected(actions[which]) }
+            .setNegativeButton(R.string.btn_cancel, null).show()
     }
 
     // ──────────── Profile management ────────────
@@ -297,200 +534,165 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun renderProfiles() {
+        val active = profiles.find { it.id == activeProfileId }
+        val busy = isConnected || isConnecting || AivpnService.isServiceActive
+        profilesAdapter.editingEnabled = profilesLoaded && !busy
         profilesAdapter.activeProfileId = activeProfileId
-        profilesAdapter.editingEnabled = !isConnected
         profilesAdapter.submitList(profiles.toList())
-        binding.textProfilesEmpty.visibility =
-            if (profiles.isEmpty()) View.VISIBLE else View.GONE
+        binding.textProfilesEmpty.visibility = if (profilesLoaded && profiles.isEmpty()) View.VISIBLE else View.GONE
+        binding.profilesLockedHint.visibility = if (busy) View.VISIBLE else View.GONE
+        binding.profilesLoading.visibility = if (profilesLoaded) View.GONE else View.VISIBLE
+        binding.emptyGroup.visibility = if (profilesLoaded && profiles.isEmpty() && !busy) View.VISIBLE else View.GONE
+        binding.vpnHero.visibility = if (busy || (profilesLoaded && profiles.isNotEmpty())) View.VISIBLE else View.GONE
+        binding.activeProfileCard.visibility = if (active != null) View.VISIBLE else View.GONE
+        binding.profileHeading.visibility = binding.activeProfileCard.visibility
+        binding.activeProfileName.text = active?.name ?: getString(R.string.ui_no_profile)
+        binding.activeProfileServer.text = active?.let { ConnectionKeyParser.parse(it.key)?.server }.orEmpty()
+        binding.btnAddProfile.isEnabled = profilesLoaded && !busy
+        binding.btnEmptyAdd.isEnabled = profilesLoaded && !busy
+        binding.btnConnect.isEnabled = busy || (profilesLoaded && active != null)
     }
 
     private fun showProfileDialog(existing: SecureStorage.ConnectionProfile?) {
-        if (isConnected) return
-        // Saving from this dialog persists the whole list — not before it loaded
-        // (see [profilesLoaded]).
-        if (!profilesLoaded) return
-
-        // Use the dialog's theme context so EditText fields inherit proper colours
-        // (white text, grey hints) instead of defaulting to the dark-on-dark activity theme.
-        val dialogCtx = android.view.ContextThemeWrapper(this, R.style.Theme_AIVPN_Dialog)
-
-        val layout = LinearLayout(dialogCtx).apply {
+        if (!profilesLoaded || isConnected || isConnecting || AivpnService.isServiceActive) return
+        val layout = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(24.dp, 16.dp, 24.dp, 0)
+            setPadding(24.dp, 8.dp, 24.dp, 8.dp)
         }
-
-        val nameInput = EditText(dialogCtx).apply {
-            hint = getString(R.string.hint_profile_name)
-            setText(existing?.name ?: "")
-            setSingleLine(true)
+        fun field(parent: LinearLayout, hintId: Int, value: String, secret: Boolean = false, inputId: Int = View.NO_ID): Pair<TextInputLayout, TextInputEditText> {
+            val box = TextInputLayout(this).apply {
+                hint = getString(hintId)
+                layoutParams = LinearLayout.LayoutParams(-1, -2).apply { topMargin = 12.dp }
+                if (secret) endIconMode = TextInputLayout.END_ICON_PASSWORD_TOGGLE
+            }
+            val input = TextInputEditText(box.context).apply {
+                id = inputId
+                inputType = InputType.TYPE_CLASS_TEXT or if (secret) InputType.TYPE_TEXT_VARIATION_PASSWORD else InputType.TYPE_TEXT_VARIATION_NORMAL
+                setSingleLine(true)
+                textSize = 16f
+                importantForAutofill = View.IMPORTANT_FOR_AUTOFILL_NO
+                setText(value)
+            }
+            box.addView(input, LinearLayout.LayoutParams(-1, -2))
+            parent.addView(box)
+            return box to input
         }
-        val keyInput = EditText(dialogCtx).apply {
-            hint = getString(R.string.hint_profile_key)
-            setText(existing?.key ?: "")
-            setSingleLine(true)
-            textSize = 13f
-        }
-        val certInput = EditText(dialogCtx).apply {
-            hint = getString(R.string.mtls_cert_hint)
-            setText(existing?.mtlsCertBase64 ?: "")
-            setSingleLine(true)
+        val (nameBox, nameInput) = field(layout, R.string.ui_profile_name, existing?.name.orEmpty(), inputId = R.id.profileNameInput)
+        val (keyBox, keyInput) = field(layout, R.string.ui_profile_key, existing?.key.orEmpty(), secret = true, inputId = R.id.profileKeyInput)
+        layout.addView(MaterialButton(this, null, com.google.android.material.R.attr.borderlessButtonStyle).apply {
+            setText(R.string.ui_paste_key)
+            minimumHeight = 48.dp
+            setOnClickListener {
+                val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                val value = clipboard.primaryClip?.takeIf { it.itemCount > 0 }?.getItemAt(0)?.coerceToText(this@MainActivity)
+                if (value.isNullOrBlank()) Toast.makeText(this@MainActivity, R.string.ui_clipboard_empty, Toast.LENGTH_SHORT).show()
+                else keyInput.setText(value)
+            }
+        })
+        layout.addView(TextView(this).apply {
+            setText(R.string.ui_key_privacy)
             textSize = 12f
-        }
-        val certLabel = TextView(dialogCtx).apply {
-            text = getString(R.string.mtls_cert)
-            textSize = 12f
-            setTextColor(getColor(R.color.text_secondary))
-            setPadding(0, 8.dp, 0, 2.dp)
-        }
-
-        val dnsLabel = TextView(dialogCtx).apply {
-            text = getString(R.string.label_dns_servers)
-            textSize = 12f
-            setTextColor(getColor(R.color.text_secondary))
-            setPadding(0, 8.dp, 0, 2.dp)
-        }
-        val dnsInput = EditText(dialogCtx).apply {
-            hint = getString(R.string.hint_dns_servers)
-            setText(existing?.dnsServers?.joinToString(", ") ?: "")
-            setSingleLine(true)
-            textSize = 13f
-        }
-
-        val maskLabel = TextView(dialogCtx).apply {
-            text = getString(R.string.mask_profile_label)
-            textSize = 12f
-            setTextColor(getColor(R.color.text_secondary))
-            setPadding(0, 8.dp, 0, 2.dp)
-        }
-        // Build the mask list from the server-pushed catalog when available
-        // (marks auto-generated masks "(авто)"); otherwise fall back to presets.
-        val catalogJson = try { AivpnJni.getMaskCatalogJson() } catch (_: Throwable) { "" }
+            setTextColor(UiAppearance.color(context, com.google.android.material.R.attr.colorOnSurfaceVariant))
+        })
+        val advanced = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; visibility = View.GONE }
+        layout.addView(MaterialButton(this, null, com.google.android.material.R.attr.borderlessButtonStyle).apply {
+            setText(R.string.ui_advanced)
+            minimumHeight = 48.dp
+            setOnClickListener { advanced.visibility = if (advanced.visibility == View.VISIBLE) View.GONE else View.VISIBLE }
+        })
+        layout.addView(advanced)
+        val (certBox, certInput) = field(advanced, R.string.ui_certificate_optional, existing?.mtlsCertBase64.orEmpty(), secret = true)
+        val (_, dnsInput) = field(advanced, R.string.label_dns_servers, existing?.dnsServers?.joinToString(", ").orEmpty())
         val maskIds = mutableListOf("auto")
-        val maskDisplayList = mutableListOf(getString(R.string.mask_auto))
-        if (catalogJson.isNotEmpty()) {
-            try {
-                val arr = org.json.JSONArray(catalogJson)
-                for (i in 0 until arr.length()) {
-                    val o = arr.getJSONObject(i)
-                    val id = o.optString("mask_id")
-                    if (id.isEmpty() || id == "auto") continue
-                    val label = o.optString("label", id)
-                    val gen = o.optBoolean("generated", false)
+        val maskLabels = mutableListOf(getString(R.string.mask_auto))
+        val catalogJson = runCatching { if (AivpnJni.isAvailable) AivpnJni.getMaskCatalogJson() else "" }.getOrDefault("")
+        if (catalogJson.isNotEmpty()) runCatching {
+            val catalog = org.json.JSONArray(catalogJson)
+            for (index in 0 until catalog.length()) {
+                val item = catalog.getJSONObject(index)
+                val id = item.optString("mask_id")
+                if (id.isNotBlank() && id !in maskIds) {
                     maskIds.add(id)
-                    maskDisplayList.add(if (gen) label + getString(R.string.mask_auto_marker) else label)
+                    maskLabels.add(item.optString("label", id) + if (item.optBoolean("generated")) getString(R.string.mask_auto_marker) else "")
                 }
-            } catch (_: Throwable) {}
-        }
-        if (maskIds.size == 1) {
-            for (id in MASK_OPTIONS.drop(1)) {
-                maskIds.add(id)
-                maskDisplayList.add(id)
             }
         }
-        val maskDisplayNames = maskDisplayList.toTypedArray()
-        val maskSpinner = android.widget.Spinner(dialogCtx)
-        val maskAdapter = android.widget.ArrayAdapter(
-            dialogCtx, android.R.layout.simple_spinner_item, maskDisplayNames
-        ).also { it.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item) }
-        maskSpinner.adapter = maskAdapter
-        val currentMask = existing?.maskProfile
-        val maskIdx = if (currentMask.isNullOrEmpty() || currentMask == "auto") 0
-                      else maskIds.indexOf(currentMask).let { if (it > 0) it else 0 }
-        maskSpinner.setSelection(maskIdx)
-
-        layout.addView(nameInput)
-        layout.addView(keyInput)
-        layout.addView(certLabel)
-        layout.addView(certInput)
-        layout.addView(dnsLabel)
-        layout.addView(dnsInput)
-        layout.addView(maskLabel)
-        layout.addView(maskSpinner)
-
-        val title = if (existing != null)
-            getString(R.string.dialog_edit_profile)
-        else
-            getString(R.string.dialog_add_profile)
-
-        AlertDialog.Builder(this, R.style.Theme_AIVPN_Dialog)
-            .setTitle(title)
-            .setView(layout)
-            .setPositiveButton(getString(R.string.btn_save)) { _, _ ->
+        if (maskIds.size == 1) MASK_OPTIONS.drop(1).forEach { maskIds.add(it); maskLabels.add(it) }
+        existing?.maskProfile?.takeIf { it.isNotBlank() && it !in maskIds }?.let { maskIds.add(it); maskLabels.add(it) }
+        var selectedMask = maskIds.indexOf(existing?.maskProfile ?: "auto").coerceAtLeast(0)
+        val maskBox = TextInputLayout(this).apply {
+            hint = getString(R.string.mask_profile_label)
+            endIconMode = TextInputLayout.END_ICON_DROPDOWN_MENU
+            layoutParams = LinearLayout.LayoutParams(-1, -2).apply { topMargin = 12.dp }
+        }
+        val maskInput = MaterialAutoCompleteTextView(maskBox.context).apply {
+            inputType = InputType.TYPE_NULL
+            setSimpleItems(maskLabels.toTypedArray())
+            setText(maskLabels[selectedMask], false)
+            setOnItemClickListener { _, _, position, _ -> selectedMask = position }
+        }
+        maskBox.addView(maskInput, LinearLayout.LayoutParams(-1, -2))
+        advanced.addView(maskBox)
+        val scroll = androidx.core.widget.NestedScrollView(this).apply { addView(layout); isFillViewport = false }
+        val dialog = MaterialAlertDialogBuilder(this)
+            .setTitle(if (existing == null) R.string.dialog_add_profile else R.string.dialog_edit_profile)
+            .setView(scroll)
+            .setPositiveButton(R.string.btn_save, null)
+            .setNegativeButton(R.string.btn_cancel, null)
+            .create()
+        dialog.setOnShowListener {
+            dialog.window?.setSoftInputMode(android.view.WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE)
+            val config = resources.configuration
+            if (config.screenWidthDp <= 360 || config.screenHeightDp <= 600 || config.fontScale > 1.2f) {
+                dialog.window?.setLayout(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
+            }
+            dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener save@{
+                if (!profilesLoaded || isConnected || isConnecting || AivpnService.isServiceActive) {
+                    Toast.makeText(this, R.string.ui_profile_locked, Toast.LENGTH_SHORT).show()
+                    return@save
+                }
+                nameBox.error = null
+                keyBox.error = null
+                certBox.error = null
                 val name = nameInput.text.toString().trim()
                 val key = keyInput.text.toString().trim()
-
-                if (name.isEmpty()) {
-                    Toast.makeText(this, getString(R.string.error_profile_name_empty), Toast.LENGTH_SHORT).show()
-                    return@setPositiveButton
-                }
-                if (key.isEmpty()) {
-                    Toast.makeText(this, getString(R.string.error_profile_key_empty), Toast.LENGTH_SHORT).show()
-                    return@setPositiveButton
-                }
-                if (parseConnectionKey(key) == null) {
-                    Toast.makeText(this, getString(R.string.error_profile_key_invalid), Toast.LENGTH_SHORT).show()
-                    return@setPositiveButton
-                }
-
+                if (name.isEmpty()) { nameBox.error = getString(R.string.error_profile_name_empty); nameInput.requestFocus(); return@save }
+                if (parseConnectionKey(key) == null) { keyBox.error = getString(R.string.error_profile_key_invalid); keyInput.requestFocus(); return@save }
                 val certRaw = certInput.text.toString().trim()
-                val mtlsCert: String? = if (certRaw.isEmpty()) null else {
-                    val decoded = try {
-                        android.util.Base64.decode(certRaw, android.util.Base64.DEFAULT)
-                    } catch (_: Exception) { null }
-                    if (decoded == null || decoded.size != 104) {
-                        Toast.makeText(this, getString(R.string.mtls_cert_invalid), Toast.LENGTH_SHORT).show()
-                        return@setPositiveButton
-                    }
-                    certRaw
+                val mtlsCert = certRaw.takeIf { it.isNotEmpty() }
+                if (mtlsCert != null && runCatching { android.util.Base64.decode(mtlsCert, android.util.Base64.DEFAULT).size }.getOrNull() != 104) {
+                    advanced.visibility = View.VISIBLE
+                    certBox.error = getString(R.string.mtls_cert_invalid)
+                    certInput.requestFocus()
+                    return@save
                 }
-
-                val dnsRaw = dnsInput.text.toString().trim()
-                val dnsServers: List<String>? = if (dnsRaw.isEmpty()) null else
-                    dnsRaw.split(",").map { it.trim() }.filter { it.isNotBlank() }
-                        .takeIf { it.isNotEmpty() }
-
-                val selectedMaskIdx = maskSpinner.selectedItemPosition
-                val maskProfileValue: String? =
-                    if (selectedMaskIdx <= 0) null
-                    else maskIds.getOrNull(selectedMaskIdx)
-
+                val dnsServers = dnsInput.text.toString().split(',').map(String::trim).filter(String::isNotEmpty).takeIf { it.isNotEmpty() }
+                val mask = maskIds.getOrNull(selectedMask)?.takeUnless { it == "auto" }
                 if (existing != null) {
-                    val idx = profiles.indexOfFirst { it.id == existing.id }
-                    if (idx >= 0) {
-                        profiles[idx] = existing.copy(
-                            name = name, key = key,
-                            mtlsCertBase64 = mtlsCert, dnsServers = dnsServers,
-                            maskProfile = maskProfileValue,
-                        )
-                        // Keep the connection key field in sync when editing the active profile
-                        if (existing.id == activeProfileId) {
-                            binding.editConnectionKey.setText(key)
-                        }
-                    }
+                    val index = profiles.indexOfFirst { it.id == existing.id }
+                    if (index < 0) return@save
+                    profiles[index] = existing.copy(name = name, key = key, mtlsCertBase64 = mtlsCert, dnsServers = dnsServers, maskProfile = mask)
+                    if (activeProfileId == existing.id) activeConnectionKey = key
                 } else {
-                    val newProfile = SecureStorage.ConnectionProfile(
-                        id = UUID.randomUUID().toString(),
-                        name = name,
-                        key = key,
-                        mtlsCertBase64 = mtlsCert,
-                        dnsServers = dnsServers,
-                        maskProfile = maskProfileValue,
-                    )
-                    profiles.add(newProfile)
-                    activeProfileId = newProfile.id
-                    SecureStorage.saveActiveProfileId(this, newProfile.id)
-                    binding.editConnectionKey.setText(key)
+                    val profile = SecureStorage.ConnectionProfile(id = UUID.randomUUID().toString(), name = name, key = key,
+                        mtlsCertBase64 = mtlsCert, dnsServers = dnsServers, maskProfile = mask)
+                    profiles.add(profile)
+                    activeProfileId = profile.id
+                    activeConnectionKey = key
+                    SecureStorage.saveActiveProfileId(this, profile.id)
                 }
                 SecureStorage.saveProfiles(this, profiles)
                 renderProfiles()
+                resyncFromService()
+                dialog.dismiss()
             }
-            .setNegativeButton(getString(R.string.btn_cancel), null)
-            .show()
+        }
+        dialog.show()
     }
 
     private fun confirmDeleteProfile(profile: SecureStorage.ConnectionProfile) {
-        if (isConnected) return
-        AlertDialog.Builder(this, R.style.Theme_AIVPN_Dialog)
+        if (isConnected || isConnecting || AivpnService.isServiceActive) return
+        MaterialAlertDialogBuilder(this, R.style.Theme_AIVPN_Dialog)
             .setMessage(getString(R.string.confirm_delete_profile, profile.name))
             .setPositiveButton(getString(R.string.btn_delete)) { _, _ ->
                 profiles.removeAll { it.id == profile.id }
@@ -504,9 +706,7 @@ class MainActivity : AppCompatActivity() {
                 if (activeProfileId == profile.id) {
                     activeProfileId = profiles.firstOrNull()?.id
                     activeProfileId?.let { SecureStorage.saveActiveProfileId(this, it) }
-                    binding.editConnectionKey.setText(
-                        profiles.firstOrNull()?.key ?: ""
-                    )
+                    activeConnectionKey = profiles.firstOrNull()?.key ?: ""
                 }
                 SecureStorage.saveProfiles(this, profiles)
                 renderProfiles()
@@ -533,8 +733,9 @@ class MainActivity : AppCompatActivity() {
                     getString(R.string.split_tunnel_hint_sites, siteCount))
                 appCount > 0 -> getString(R.string.split_tunnel_vpn_count, appCount)
                 siteCount > 0 -> getString(R.string.split_tunnel_bypass_count, siteCount)
-                else -> getString(R.string.split_tunnel_desc)
+                else -> getString(R.string.split_tunnel_none)
             }
+            if (selectedSection == R.id.nav_settings) renderSettings()
         }
     }
 
@@ -543,18 +744,17 @@ class MainActivity : AppCompatActivity() {
         // Register callbacks when activity becomes visible.
         // Using onResume/onPause instead of onCreate/onDestroy prevents the race condition
         // where a destroyed (rotated) Activity nullifies callbacks registered by the new one.
-        AivpnService.statusCallback = { connected, statusText ->
-            runOnUiThread {
-                isConnected = connected
-                updateUI(connected, statusText)
-            }
+        AivpnService.statusCallback = { _, _ ->
+            runOnUiThread { resyncFromService() }
         }
 
         AivpnService.trafficCallback = { uploadBytes, downloadBytes ->
-            val quality = AivpnJni.getQualityScore()
+            val quality = if (AivpnJni.isAvailable) AivpnJni.getQualityScore() else 0
             runOnUiThread {
-                binding.textUpload.text = formatBytes(uploadBytes)
-                binding.textDownload.text = formatBytes(downloadBytes)
+                lastUploadBytes = uploadBytes
+                lastDownloadBytes = downloadBytes
+                binding.sessionStats.setTraffic(uploadBytes, downloadBytes)
+                viewModel.updateTraffic(uploadBytes, downloadBytes, quality)
                 currentQualityScore = quality
             }
         }
@@ -577,6 +777,7 @@ class MainActivity : AppCompatActivity() {
         // freezing the UI at "Connected").
         resyncFromService()
 
+        loadProfiles()
         updateSplitTunnelHint()
         updateBackgroundHealthHint()
     }
@@ -587,13 +788,17 @@ class MainActivity : AppCompatActivity() {
      * settings screen refreshes it immediately.
      */
     private fun updateBackgroundHealthHint() {
-        val atRisk = BackgroundHealth.atRisk(this)
-        binding.textBgHealthHint.text = getString(
-            if (atRisk) R.string.bg_health_hint_risk else R.string.bg_health_hint_ok
-        )
-        binding.textBgHealthHint.setTextColor(
-            getColor(if (atRisk) R.color.accent_lemon else R.color.text_secondary)
-        )
+        val message = backgroundHealthMessage()
+        binding.btnBgHealth.visibility = if (message != null) View.VISIBLE else View.GONE
+        binding.textBgHealthHint.text = message.orEmpty()
+        if (selectedSection == R.id.nav_settings) renderSettings()
+    }
+
+    private fun backgroundHealthMessage(): String? = when {
+        !BackgroundHealth.batteryExempt(this) -> getString(R.string.ui_battery_notice)
+        BackgroundHealth.backgroundRestricted(this) -> getString(R.string.ui_background_notice)
+        !BackgroundHealth.notificationsEnabled(this) -> getString(R.string.ui_notification_notice)
+        else -> null
     }
 
     override fun onPause() {
@@ -619,7 +824,7 @@ class MainActivity : AppCompatActivity() {
         // the next tap goes through.
         if (!profilesLoaded) return
 
-        val connectionKey = binding.editConnectionKey.text.toString().trim()
+        val connectionKey = activeConnectionKey.trim()
         if (connectionKey.isEmpty()) {
             Toast.makeText(this, getString(R.string.error_fill_fields), Toast.LENGTH_SHORT).show()
             return
@@ -655,7 +860,16 @@ class MainActivity : AppCompatActivity() {
         // Request VPN permission from the system
         val intent = VpnService.prepare(this)
         if (intent != null) {
-            vpnPermissionLauncher.launch(intent)
+            MaterialAlertDialogBuilder(this)
+                .setTitle(R.string.ui_vpn_permission)
+                .setMessage(R.string.ui_vpn_permission_body)
+                .setPositiveButton(R.string.ui_continue) { _, _ ->
+                    pendingVpnProfileId = activeProfileId
+                    pendingVpnPermissionGranted = false
+                    vpnPermissionLauncher.launch(intent)
+                }
+                .setNegativeButton(R.string.btn_cancel, null)
+                .show()
         } else {
             startVpnService()
         }
@@ -668,11 +882,11 @@ class MainActivity : AppCompatActivity() {
         startService(intent)
     }
 
-    private fun startVpnService() {
+    private fun startVpnService(requestedProfileId: String? = activeProfileId) {
         // Pass only the profile ID via Intent so that the server key and PSK are
         // read from EncryptedSharedPreferences inside AivpnService rather than
         // travelling through IPC as plaintext Intent extras.
-        val profileId = activeProfileId ?: return
+        val profileId = requestedProfileId ?: return
         // Mirror the active profile ID in device-protected SharedPreferences so
         // BootReceiver can read it during Direct Boot (CE storage is locked there —
         // plain CE prefs would throw IllegalStateException, not help).
@@ -688,41 +902,44 @@ class MainActivity : AppCompatActivity() {
         // Rust fires onTunnelReady after the handshake, which is also the moment
         // connectionStartTime gets stamped.
         updateUI(false, getString(R.string.status_connecting), connecting = true)
+        requestNotificationPermissionIfNeeded()
     }
 
     private fun updateUI(connected: Boolean, statusText: String, connecting: Boolean = false) {
         isConnected = connected
+        isConnecting = connecting
         val serviceActive = connected || connecting || AivpnService.isServiceActive
-        // When not connected, append the active profile name so the user can see
-        // which profile will be used without having to look at the profile list.
-        binding.btnConnect.text = if (serviceActive) {
-            getString(R.string.btn_disconnect)
-        } else {
-            val activeName = profiles.find { it.id == activeProfileId }?.name
-            if (activeName != null) "${getString(R.string.btn_connect)} · $activeName"
-            else getString(R.string.btn_connect)
-        }
-        binding.btnConnect.setBackgroundColor(
-            getColor(if (serviceActive) R.color.disconnect else R.color.accent)
-        )
+        val error = !serviceActive && statusText.isNotBlank() && statusText != getString(R.string.status_disconnected)
+        binding.btnConnect.text = getString(when {
+            connecting -> R.string.ui_cancel_connect
+            serviceActive -> R.string.btn_disconnect
+            error -> R.string.ui_retry
+            else -> R.string.btn_connect
+        })
+        binding.btnConnect.backgroundTintList = ColorStateList.valueOf(UiAppearance.color(this,
+            if (serviceActive) com.google.android.material.R.attr.colorPrimaryContainer
+            else com.google.android.material.R.attr.colorPrimary))
+        val onButton = UiAppearance.color(this, if (serviceActive)
+            com.google.android.material.R.attr.colorOnPrimaryContainer else com.google.android.material.R.attr.colorOnPrimary)
+        binding.btnConnect.setTextColor(onButton)
+        binding.btnConnect.iconTint = ColorStateList.valueOf(onButton)
+        binding.btnConnect.setIconResource(if (connecting) R.drawable.ic_vpn_close else R.drawable.ic_vpn_power)
+        binding.connectionTitle.setText(when {
+            connected -> R.string.ui_vpn_connected
+            connecting -> R.string.status_connecting
+            error -> R.string.ui_vpn_failed
+            else -> R.string.ui_vpn_disconnected
+        })
         binding.textStatus.text = statusText
-        binding.statusDot.setBackgroundResource(
-            if (connected) R.drawable.dot_green else R.drawable.dot_grey
-        )
-
-        // Show/hide stats and timer
-        val statsVisibility = if (connected) View.VISIBLE else View.GONE
-        binding.textTimer.visibility = statsVisibility
-        binding.statsRow.visibility = statsVisibility
-
-        // FEC badge: visible when connected with adaptive level >= 2
-        binding.textFecBadge.visibility =
-            if (connected && adaptiveLevel() >= 2) View.VISIBLE else View.GONE
-
-        // Lock/unlock input fields while connected
-        binding.editConnectionKey.isEnabled = !serviceActive
-        binding.btnAddProfile.isEnabled = !serviceActive
+        binding.connectProgress.visibility = if (connecting) View.VISIBLE else View.GONE
+        binding.statusIcon.visibility = if (connecting) View.INVISIBLE else View.VISIBLE
+        binding.statusIcon.setImageResource(if (connected) R.drawable.ic_vpn_shield_check else if (error) R.drawable.ic_vpn_info else R.drawable.ic_vpn_shield)
+        binding.statusIcon.imageTintList = ColorStateList.valueOf(if (connected) getColor(R.color.green)
+            else if (error) UiAppearance.color(this, com.google.android.material.R.attr.colorError)
+            else UiAppearance.color(this, com.google.android.material.R.attr.colorPrimary))
+        binding.sessionStats.visibility = if (connected) View.VISIBLE else View.GONE
         renderProfiles()
+        if (selectedSection == R.id.nav_settings) renderSettings()
 
         // Timer management — the service's connectedAtMillis is the single source
         // of truth: stamped per session in onTunnelReady, it survives Activity
@@ -743,16 +960,14 @@ class MainActivity : AppCompatActivity() {
                 connectionStartTime = serviceStart
             }
             if (isFreshSession) {
-                binding.textUpload.text = "0 B"
-                binding.textDownload.text = "0 B"
+                lastUploadBytes = null
+                lastDownloadBytes = null
             }
-            // Stats-card third field: the wall-clock time the tunnel connected
-            // (fixed), complementing the big elapsed counter above. connectionStartTime
-            // is already synced from the ViewModel at this point.
-            if (connectionStartTime > 0) {
-                binding.textDuration.text = java.text.SimpleDateFormat("HH:mm", java.util.Locale.getDefault())
-                    .format(java.util.Date(connectionStartTime))
+            if (AivpnJni.isAvailable) {
+                lastUploadBytes = AivpnJni.getUploadBytes()
+                lastDownloadBytes = AivpnJni.getDownloadBytes()
             }
+            binding.sessionStats.setTraffic(lastUploadBytes, lastDownloadBytes)
             timerHandler.removeCallbacks(timerRunnable)
             timerHandler.post(timerRunnable)
         } else {
@@ -762,145 +977,35 @@ class MainActivity : AppCompatActivity() {
                 viewModel.setDisconnected(statusText)  // resets connectionStartTime in ViewModel
             }
             timerHandler.removeCallbacks(timerRunnable)
-            binding.textTimer.text = "00:00:00"
-            binding.textDuration.text = "--:--"
+            binding.sessionStats.setElapsed(0)
             // RX/TX counters intentionally kept — show last known values during reconnect
         }
     }
 
-    private fun toggleLanguage() {
-        val currentLang = SecureStorage.loadLanguage(this)
-        val newLang = if (currentLang == "en") "ru" else "en"
-
-        SecureStorage.saveLanguage(this, newLang)
-
-        val localeList = LocaleListCompat.forLanguageTags(newLang)
-        AppCompatDelegate.setApplicationLocales(localeList)
-        // Force immediate recreation on all API levels so descriptions update
-        recreate()
+    private fun showLanguageDialog() {
+        val labels = arrayOf(getString(R.string.ui_language_system), "Русский", "English")
+        val tags = arrayOf("", "ru", "en")
+        val current = AppCompatDelegate.getApplicationLocales().toLanguageTags()
+        MaterialAlertDialogBuilder(this)
+            .setTitle(R.string.label_language)
+            .setSingleChoiceItems(labels, tags.indexOf(current).coerceAtLeast(0)) { dialog, which ->
+                lifecycleScope.launch {
+                    withContext(Dispatchers.IO) { SecureStorage.saveLanguage(this@MainActivity, tags[which]) }
+                    dialog.dismiss()
+                    AppCompatDelegate.setApplicationLocales(LocaleListCompat.forLanguageTags(tags[which]))
+                    recreate()
+                }
+            }
+            .setNegativeButton(R.string.btn_cancel, null)
+            .show()
     }
 
-    /** [savedLang] comes from onCreate's off-main-thread SecureStorage load (A5). */
     private fun updateLanguageButton(savedLang: String?) {
-        // Apply saved language on startup
-        if (savedLang != null && savedLang != "en") {
-            val localeList = LocaleListCompat.forLanguageTags(savedLang)
-            AppCompatDelegate.setApplicationLocales(localeList)
+        val language = savedLang.orEmpty()
+        if (language != AppCompatDelegate.getApplicationLocales().toLanguageTags()) {
+            AppCompatDelegate.setApplicationLocales(LocaleListCompat.forLanguageTags(language))
         }
-
-        val currentLang = (savedLang ?: "en").uppercase()
-        binding.btnLanguage.text = if (currentLang == "EN") "EN → RU" else "RU → EN"
-    }
-
-    private fun formatBytes(bytes: Long): String {
-        return when {
-            bytes < 1024 -> "$bytes B"
-            bytes < 1024 * 1024 -> String.format("%.1f KB", bytes / 1024.0)
-            bytes < 1024 * 1024 * 1024 -> String.format("%.1f MB", bytes / (1024.0 * 1024.0))
-            else -> String.format("%.2f GB", bytes / (1024.0 * 1024.0 * 1024.0))
-        }
-    }
-
-    private fun showOptionsMenu(@Suppress("UNUSED_PARAMETER") anchor: View) {
-        val currentLevel = adaptiveLevel()
-        val levelNames = arrayOf(
-            getString(R.string.adaptive_off),
-            getString(R.string.adaptive_light),
-            getString(R.string.adaptive_aggressive),
-            getString(R.string.adaptive_satellite)
-        )
-
-        val autoConnect = BootPrefs.prefs(this)
-            .getBoolean(PrefsKeys.PREF_AUTO_CONNECT, false)
-        val autoConnectLabel = getString(R.string.auto_connect_on_startup) +
-            ": " + if (autoConnect) getString(R.string.auto_connect_state_on)
-                   else getString(R.string.auto_connect_state_off)
-
-        // In-app admin entry: visible for Admin (full read/write) and Viewer
-        // (read-only list inside AdminActivity), hidden entirely for role
-        // User(0) or when the role can't be determined (e.g. .so not loaded).
-        val mgmtRole = try {
-            if (AivpnJni.isAvailable) AivpnJni.getRole() else -1
-        } catch (_: Throwable) {
-            -1
-        }
-
-        data class Item(val title: String, val desc: String, val id: Int)
-        val items = mutableListOf(
-            Item(getString(R.string.adaptive_mode) + ": " + levelNames[currentLevel],
-                 getString(R.string.desc_adaptive_mode), MENU_ADAPTIVE),
-            Item(autoConnectLabel,                   getString(R.string.desc_auto_connect),  MENU_AUTO_CONNECT),
-            Item(getString(R.string.diagnostics),    getString(R.string.desc_diagnostics),   MENU_DIAGNOSTICS),
-            Item(getString(R.string.recording),      getString(R.string.desc_recording),     MENU_RECORDING),
-            Item(getString(R.string.export_logs),    getString(R.string.desc_export_logs),   MENU_EXPORT_LOGS),
-            Item(getString(R.string.os_kill_switch), getString(R.string.desc_kill_switch),   MENU_OS_KILL_SWITCH),
-            Item(getString(R.string.bootstrap_discovery), getString(R.string.desc_bootstrap_discovery), MENU_BOOTSTRAP_DISCOVERY),
-            Item(getString(R.string.mask_privacy), getString(R.string.desc_mask_privacy), MENU_MASK_PRIVACY),
-        )
-        // Modular transport settings: only an edition that ships a descriptor
-        // asset has anything to configure. The public build ships none, so the
-        // entry never appears.
-        if (loadTransportDescriptor(this) != null) {
-            items.add(Item(getString(R.string.transport_settings_title),
-                getString(R.string.desc_transport_settings), MENU_TRANSPORT_SETTINGS))
-        }
-        if (mgmtRole == 1 || mgmtRole == 2) {
-            items.add(Item(getString(R.string.admin_menu_title), getString(R.string.desc_admin_menu), MENU_ADMIN))
-        }
-        // Installing a server is the base "set up your first server" flow, so unlike
-        // MENU_ADMIN it is NOT gated on role or an active tunnel: a fresh install with
-        // no profiles yet has mgmtRole == -1 (nothing connected), and this must still be
-        // reachable. It opens its own outbound SSH connection independent of any tunnel
-        // session (see InstallServerActivity's class doc comment) — nothing here exposes
-        // admin-only client-management functionality to a non-admin.
-        items.add(Item(getString(R.string.install_menu_title), getString(R.string.desc_install_menu), MENU_INSTALL_SERVER))
-
-        val dialogCtx = android.view.ContextThemeWrapper(this, R.style.Theme_AIVPN_Dialog)
-        val container = LinearLayout(dialogCtx).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(0, 8.dp, 0, 8.dp)
-        }
-        val scrollView = android.widget.ScrollView(dialogCtx).also { it.addView(container) }
-        val dialog = AlertDialog.Builder(this).setView(scrollView).create()
-
-        val primaryColor   = getColor(R.color.text_primary)
-        val secondaryColor = getColor(R.color.text_secondary)
-        val greyColor      = getColor(R.color.grey)
-
-        items.forEachIndexed { index, item ->
-            val row = LinearLayout(dialogCtx).apply {
-                orientation = LinearLayout.VERTICAL
-                setPadding(24.dp, 14.dp, 24.dp, 14.dp)
-                isClickable = true
-                isFocusable = true
-                val ta = dialogCtx.obtainStyledAttributes(intArrayOf(android.R.attr.selectableItemBackground))
-                background = ta.getDrawable(0)
-                ta.recycle()
-            }
-            row.addView(TextView(dialogCtx).apply {
-                text = item.title
-                textSize = 15f
-                setTextColor(primaryColor)
-                setTypeface(null, android.graphics.Typeface.BOLD)
-            })
-            row.addView(TextView(dialogCtx).apply {
-                text = item.desc
-                textSize = 12f
-                setTextColor(secondaryColor)
-                setPadding(0, 4.dp, 0, 0)
-            })
-            row.setOnClickListener { dialog.dismiss(); onOptionsMenuItemSelected(item.id) }
-            container.addView(row)
-            if (index < items.size - 1) {
-                container.addView(View(dialogCtx).apply {
-                    layoutParams = LinearLayout.LayoutParams(
-                        LinearLayout.LayoutParams.MATCH_PARENT, 1
-                    ).apply { setMargins(24.dp, 0, 24.dp, 0) }
-                    setBackgroundColor(greyColor)
-                })
-            }
-        }
-        dialog.show()
+        if (selectedSection == R.id.nav_settings) renderSettings()
     }
 
     private fun onOptionsMenuItemSelected(itemId: Int) {
@@ -913,7 +1018,7 @@ class MainActivity : AppCompatActivity() {
                     getString(R.string.adaptive_satellite)
                 )
                 var selectedLevel = adaptiveLevel()
-                AlertDialog.Builder(this)
+                MaterialAlertDialogBuilder(this)
                     .setTitle(getString(R.string.adaptive_mode))
                     .setSingleChoiceItems(names, selectedLevel) { _, which ->
                         selectedLevel = which
@@ -921,6 +1026,7 @@ class MainActivity : AppCompatActivity() {
                     .setPositiveButton(android.R.string.ok) { _, _ ->
                         getSharedPreferences(PrefsKeys.PREFS_NAME, MODE_PRIVATE)
                             .edit().putInt(PrefsKeys.ADAPTIVE_LEVEL, selectedLevel).apply()
+                        renderSettings()
                     }
                     .setNegativeButton(getString(R.string.btn_cancel), null)
                     .show()
@@ -934,6 +1040,7 @@ class MainActivity : AppCompatActivity() {
                 val msg = if (!current) getString(R.string.auto_connect_enabled)
                           else getString(R.string.auto_connect_disabled)
                 android.widget.Toast.makeText(this, msg, android.widget.Toast.LENGTH_SHORT).show()
+                renderSettings()
             }
             MENU_DIAGNOSTICS   -> showDiagnosticsDialog()
             MENU_RECORDING     -> showRecordingDialog()
@@ -1002,7 +1109,7 @@ class MainActivity : AppCompatActivity() {
         layout.addView(countryLabel)
         layout.addView(countryInput)
 
-        val dialog = AlertDialog.Builder(this, R.style.Theme_AIVPN_Dialog)
+        val dialog = MaterialAlertDialogBuilder(this, R.style.Theme_AIVPN_Dialog)
             .setTitle(getString(R.string.mask_privacy))
             .setView(layout)
             // Set with a null listener here and override the button's onClickListener
@@ -1029,6 +1136,7 @@ class MainActivity : AppCompatActivity() {
                     .putString(PrefsKeys.PREF_COUNTRY_CODE, if (validCountry) country.uppercase() else null)
                     .apply()
                 dialog.dismiss()
+                renderSettings()
             }
         }
         dialog.show()
@@ -1131,7 +1239,7 @@ class MainActivity : AppCompatActivity() {
 
         val scrollView = android.widget.ScrollView(dialogCtx).also { it.addView(container) }
 
-        AlertDialog.Builder(this, R.style.Theme_AIVPN_Dialog)
+        MaterialAlertDialogBuilder(this, R.style.Theme_AIVPN_Dialog)
             .setTitle(getString(R.string.bootstrap_discovery))
             .setView(scrollView)
             .setPositiveButton(getString(R.string.bootstrap_discover_button)) { _, _ ->
@@ -1256,7 +1364,7 @@ class MainActivity : AppCompatActivity() {
                 } catch (e: Exception) {
                     android.util.Log.w("MainActivity", "Persisting discovered descriptors failed: ${e.message}")
                 }
-                binding.editConnectionKey.setText(connectionKey)
+                activeConnectionKey = connectionKey
                 renderProfiles()
 
                 Toast.makeText(
@@ -1271,128 +1379,49 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun showDiagnosticsDialog() {
-        if (!isConnected) {
-            Toast.makeText(this, getString(R.string.status_disconnected), Toast.LENGTH_SHORT).show()
-            return
-        }
-        val serverAddr = profiles.find { it.id == activeProfileId }
-            ?.key?.let { parseConnectionKey(it)?.server } ?: ""
-        // Read the LIVE score straight from the native core, not the cached
-        // currentQualityScore — that cache is only refreshed by the traffic
-        // callback, so it can be a stale 0 captured right after connect (before
-        // the first KeepaliveAck updated the score) if no traffic has flowed
-        // since. Fall back to the cache only if the live read has no data yet.
-        val liveScore = AivpnJni.getQualityScore().takeIf { it > 0 } ?: currentQualityScore
+        val liveScore = if (isConnected && AivpnJni.isAvailable) runCatching { AivpnJni.getQualityScore() }.getOrDefault(0) else 0
         if (liveScore > 0) currentQualityScore = liveScore
-        val qualityLine = if (liveScore > 0)
-            getString(R.string.quality_score_live, liveScore)
-        else
-            getString(R.string.quality_score_no_data)
-
-        AlertDialog.Builder(this)
-            .setTitle(getString(R.string.diagnostics))
-            .setMessage(qualityLine + "\n\n" + getString(R.string.run_benchmark))
-            .setPositiveButton(getString(R.string.run_benchmark)) { _, _ ->
-                val runningToast = Toast.makeText(this, getString(R.string.bench_running), Toast.LENGTH_LONG)
-                runningToast.show()
-                lifecycleScope.launch {
-                    val stats = withContext(Dispatchers.IO) { runUDPBench(serverAddr) }
-                    runningToast.cancel()
-                    val msg = getString(R.string.bench_result, stats.p50, stats.p95, stats.lossPct.toFloat(), stats.quality)
-                    AlertDialog.Builder(this@MainActivity)
-                        .setTitle(getString(R.string.diagnostics))
-                        .setMessage(msg)
-                        .setPositiveButton(getString(R.string.btn_cancel), null)
-                        .show()
-                }
+        val quality = if (isConnected && currentQualityScore > 0) getString(R.string.quality_score_live, currentQualityScore)
+            else getString(R.string.quality_score_no_data)
+        val details = buildList {
+            add(AivpnService.localizedStatus(this@MainActivity).ifEmpty { getString(R.string.status_disconnected) })
+            profiles.find { it.id == activeProfileId }?.let { add(it.name); add(ConnectionKeyParser.parse(it.key)?.server.orEmpty()) }
+            if (isConnected) {
+                add(getString(R.string.ui_session_elapsed, binding.sessionStats.elapsedText()))
+                add(getString(R.string.ui_session_received, binding.sessionStats.receivedText()))
+                add(getString(R.string.ui_session_sent, binding.sessionStats.sentText()))
+                add(quality)
+                if (adaptiveLevel() >= 2) add(getString(R.string.fec_badge))
             }
-            .setNegativeButton(getString(R.string.btn_cancel), null)
-            .show()
+        }.joinToString("\n")
+        val dialog = MaterialAlertDialogBuilder(this)
+            .setTitle(R.string.ui_session_details)
+            .setMessage(details)
+            .setNeutralButton(R.string.export_logs) { _, _ -> exportLogs() }
+            .setNegativeButton(R.string.btn_cancel, null)
+        if (isConnected && AivpnJni.isAvailable) dialog.setPositiveButton(R.string.run_benchmark) { _, _ -> runConnectionBenchmark() }
+        dialog.show()
     }
 
-    private data class BenchStats(val p50: Int, val p95: Int, val lossPct: Double, val quality: Int)
-
-    /** Parse host:port or [IPv6]:port. Returns null on invalid input. */
-    private fun parseHostPort(addr: String): Pair<String, Int>? {
-        if (addr.startsWith("[")) {
-            val bracket = addr.indexOf(']')
-            if (bracket < 1) return null
-            val host = addr.substring(1, bracket)
-            val port = if (bracket + 1 < addr.length && addr[bracket + 1] == ':')
-                addr.substring(bracket + 2).toIntOrNull()?.takeIf { it in 1..65535 }
-            else null
-            return Pair(host, port ?: 443)
-        }
-        val lastColon = addr.lastIndexOf(':')
-        if (lastColon < 0) return null
-        val port = addr.substring(lastColon + 1).toIntOrNull()?.takeIf { it in 1..65535 } ?: return null
-        return Pair(addr.substring(0, lastColon), port)
-    }
-
-    private fun runUDPBench(serverAddr: String): BenchStats {
-        if (serverAddr.isEmpty()) return BenchStats(0, 0, 100.0, 0)
-        val (host, port) = parseHostPort(serverAddr) ?: return BenchStats(0, 0, 100.0, 0)
-
-        return try {
-            val socket = DatagramSocket()
-            // Protect the socket so bench probes bypass the VPN tunnel and reach the
-            // server directly. If protection FAILS (service gone, fd limit), abort:
-            // an unprotected probe would loop through the tunnel (bogus RTTs) and,
-            // worse, leak a direct-to-server datagram association outside the mask.
-            val protectOk = AivpnService.instance?.protect(socket) == true
-            if (!protectOk) {
-                android.util.Log.w("MainActivity", "bench: socket not protected — aborting benchmark")
-                socket.close()
-                return BenchStats(0, 0, 100.0, 0)
+    private fun runConnectionBenchmark() {
+        if (!isConnected || !AivpnJni.isAvailable) return
+        val toast = Toast.makeText(this, getString(R.string.bench_running), Toast.LENGTH_LONG)
+        toast.show()
+        lifecycleScope.launch {
+            val result = withContext(Dispatchers.IO) {
+                runCatching { AivpnJni.runBenchmark()?.let { JSONObject(String(it, Charsets.UTF_8)) } }.getOrNull()
             }
-            socket.soTimeout = 500
-            // Random payload, NOT a plaintext marker: a fixed "aivpn-bench-probe-v1"
-            // string is a trivial DPI signature that links this client to the VPN
-            // server address. Random bytes are indistinguishable from the encrypted/
-            // masked traffic already flowing to the same endpoint. The server never
-            // parses the probe anyway (RTT is estimated via the timeout fallback).
-            val probe = ByteArray(20).also { java.security.SecureRandom().nextBytes(it) }
-            val addr = InetAddress.getByName(host)
-            val deadline = System.currentTimeMillis() + 5_000L
-            val rtts = mutableListOf<Double>()
-            var sent = 0
-            try {
-                while (System.currentTimeMillis() < deadline) {
-                    val t0 = System.currentTimeMillis()
-                    sent++
-                    socket.send(DatagramPacket(probe, probe.size, addr, port))
-                    try {
-                        val buf = ByteArray(256)
-                        socket.receive(DatagramPacket(buf, buf.size))
-                        rtts.add((System.currentTimeMillis() - t0).toDouble())
-                    } catch (_: SocketTimeoutException) {
-                        val elapsed = (System.currentTimeMillis() - t0).toDouble()
-                        if (elapsed < 490) rtts.add(elapsed * 2)
-                    }
-                    Thread.sleep(100)
-                }
-            } finally {
-                socket.close()
+            toast.cancel()
+            val message = if (result == null || result.has("error")) {
+                result?.optString("error") ?: getString(R.string.bench_failed)
+            } else {
+                getString(R.string.bench_result, result.optDouble("latency_p50_ms").toInt(),
+                    result.optDouble("latency_p95_ms").toInt(), result.optDouble("packet_loss_pct"), result.optInt("quality_score")) +
+                    "\n" + getString(R.string.bench_speed, result.optDouble("throughput_up_kbps"), result.optDouble("throughput_down_kbps"))
             }
-            computeBenchStats(rtts, sent)
-        } catch (_: Exception) {
-            BenchStats(0, 0, 100.0, 0)
+            MaterialAlertDialogBuilder(this@MainActivity).setTitle(R.string.diagnostics)
+                .setMessage(message).setPositiveButton(android.R.string.ok, null).show()
         }
-    }
-
-    private fun computeBenchStats(rtts: List<Double>, sent: Int): BenchStats {
-        if (rtts.isEmpty()) return BenchStats(0, 0, 100.0, 0)
-        val sorted = rtts.sorted()
-        val p50 = sorted[(sorted.size * 0.50).toInt().coerceAtMost(sorted.size - 1)].toInt()
-        val p95 = sorted[(sorted.size * 0.95).toInt().coerceAtMost(sorted.size - 1)].toInt()
-        val lossPct = (maxOf(0, sent - rtts.size).toDouble() / sent * 100).coerceIn(0.0, 100.0)
-        val quality = when {
-            p50 < 50 && lossPct < 1.0  -> 95
-            p50 < 100 && lossPct < 3.0 -> 80
-            p50 < 200 && lossPct < 10.0 -> 60
-            else -> 30
-        }
-        return BenchStats(p50, p95, lossPct, quality)
     }
 
     override fun onDestroy() {
@@ -1453,7 +1482,7 @@ class MainActivity : AppCompatActivity() {
             hint = getString(R.string.recording_service_hint)
             setText(currentRecordingService)
         }
-        AlertDialog.Builder(this)
+        MaterialAlertDialogBuilder(this)
             .setTitle(getString(R.string.recording))
             .setView(input)
             .setPositiveButton(getString(R.string.recording_start)) { _, _ ->

@@ -69,18 +69,29 @@ Build the image using the instructions below, export it with `docker save`, and 
 
 ### Step 5 — Configure routing
 
-Route all traffic through the VPN container:
+Создайте отдельную таблицу и направьте в нее трафик с LAN-моста. В примере LAN использует `bridge` и подсеть `192.168.88.0/24`. Подставьте свои значения.
 
 ```routeros
-/ip/route/add dst-address=0.0.0.0/0 gateway=172.31.0.2 routing-table=main distance=5 comment="AIVPN default route"
+/routing/table/add name=aivpn-rt fib
+/ip/route/add dst-address=0.0.0.0/0 gateway=172.31.0.2@main routing-table=aivpn-rt comment="AIVPN LAN route"
+/routing/rule/add interface=bridge src-address=192.168.88.0/24 action=lookup-only-in-table table=aivpn-rt
 ```
 
-Or use policy routing to only route specific hosts:
+Для одного устройства укажите его адрес вместо подсети:
 
 ```routeros
-/routing/rule/add src-address=192.168.1.50/32 action=lookup-only-in-table table=aivpn-rt
-/ip/route/add dst-address=0.0.0.0/0 gateway=172.31.0.2 routing-table=aivpn-rt
+/routing/rule/add interface=bridge src-address=192.168.88.50/32 action=lookup-only-in-table table=aivpn-rt
 ```
+
+Исходный маршрут WAN в `main` нужен самому контейнеру для связи с сервером. Ограничение по входному интерфейсу исключает повторную отправку пакетов из контейнера обратно в контейнер. Не включайте эти соединения в FastTrack: он обходит отдельную таблицу маршрутизации. Установите правило AIVPN перед другими правилами, которые выбирают таблицу для того же LAN.
+
+По умолчанию при остановке VPN пакеты идут через WAN. Чтобы блокировать такой выход, включите настройку до запуска контейнера:
+
+```routeros
+/container/envs/add list=aivpn-env name=AIVPN_KILL_SWITCH value="true"
+```
+
+Эта настройка блокирует обход TUN внутри работающего контейнера. Если остановлен весь контейнер, трафик выбранных устройств не проходит через него. Пример задает только IPv4: для полного туннеля также настройте IPv6 либо отключите его на выбранном LAN.
 
 ## Environment Variables
 
@@ -88,6 +99,9 @@ Or use policy routing to only route specific hosts:
 |---|---|---|---|
 | `AIVPN_KEY` | **Yes** | — | Connection key from `aivpn-server --show-client` |
 | `AIVPN_FULL_TUNNEL` | No | `true` | Route all traffic through VPN (`true`/`false`) |
+| `AIVPN_KILL_SWITCH` | No | `false` | Блокировать выход в обход TUN при остановке VPN |
+| `AIVPN_TUN_NAME` | No | `tun0` | Имя TUN внутри контейнера |
+| `LAN_IF` | No | `eth0` | Входной интерфейс внутри контейнера |
 
 ## Checking Status
 

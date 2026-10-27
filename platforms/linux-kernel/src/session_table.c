@@ -507,12 +507,12 @@ static struct aivpn_qos_slot *aivpn_qos_create(const u8 key[16])
 }
 
 /* Session lock уже взят. Дальше qos lock, затем lock слота. Обратный порядок запрещен. */
-static void aivpn_qos_reconfigure(const struct aivpn_session_policy *in)
+static int aivpn_qos_reconfigure(const struct aivpn_session_policy *in)
 {
 	struct aivpn_qos_slot *slot;
 
 	if (!aivpn_key_nonzero(in->client_key))
-		return;
+		return 0;
 	spin_lock_bh(&aivpn_qos_lock);
 	slot = aivpn_qos_lookup(in->client_key);
 	if (!slot)
@@ -523,6 +523,7 @@ static void aivpn_qos_reconfigure(const struct aivpn_session_policy *in)
 		spin_unlock(&slot->lock);
 	}
 	spin_unlock_bh(&aivpn_qos_lock);
+	return slot ? 0 : -ENOMEM;
 }
 
 static void aivpn_qos_flush(void)
@@ -554,7 +555,7 @@ static int aivpn_session_account(struct aivpn_kern_session *s, int dir,
 	slot = aivpn_qos_lookup(s->pol.client_key);
 	if (!slot) {
 		spin_unlock_bh(&aivpn_qos_lock);
-		return AIVPN_VERDICT_DROP;
+		return AIVPN_VERDICT_FALLBACK;
 	}
 	spin_lock(&slot->lock);
 	spin_unlock_bh(&aivpn_qos_lock);
@@ -662,7 +663,7 @@ int aivpn_session_dl_reserve(struct aivpn_kern_session *s, const u8 *ip,
 	v = aivpn_session_account(s, AIVPN_DIR_DOWNLINK, nbytes, ktime_get_ns());
 	if (v != AIVPN_VERDICT_ACCEPT) {
 		spin_unlock_bh(&s->lock);
-		return -EPERM;
+		return v == AIVPN_VERDICT_FALLBACK ? -EAGAIN : -EPERM;
 	}
 	idx = s->dl_next++;
 	memcpy(out->tag, s->dl_entries[idx].tag, AIVPN_TAG_SIZE);
@@ -738,7 +739,11 @@ int aivpn_session_rx_finish(struct aivpn_kern_session *s, u32 epoch, u64 counter
 				  plain_len, aivpn_peer_is_other, s);
 	if (v != AIVPN_VERDICT_ACCEPT)
 		return v;
-	/* Захват только после адресов: FALLBACK не сжигает счетчик для userspace. */
+	/* При нехватке служебного состояния userspace получает исходный пакет
+	 * и свободный счетчик. Отказ квоты остается DROP с захватом replay. */
+	v = aivpn_session_account(s, AIVPN_DIR_UPLINK, view.length, ktime_get_ns());
+	if (v == AIVPN_VERDICT_FALLBACK)
+		return v;
 	claim = aivpn_epoch_claim(&s->replay, epoch, counter);
 	if (claim == AIVPN_CLAIM_DUP) {
 		*replay_dup = 1;
@@ -746,7 +751,6 @@ int aivpn_session_rx_finish(struct aivpn_kern_session *s, u32 epoch, u64 counter
 	}
 	if (claim != AIVPN_CLAIM_OK)
 		return AIVPN_VERDICT_FALLBACK;
-	v = aivpn_session_account(s, AIVPN_DIR_UPLINK, view.length, ktime_get_ns());
 	if (v != AIVPN_VERDICT_ACCEPT)
 		return AIVPN_VERDICT_DROP;
 	s->rx_packets++;
@@ -789,11 +793,16 @@ int aivpn_session_policy_set(const struct aivpn_session_policy *in)
 		s->pol.armed = 0;
 		s->pol.flags |= AIVPN_POL_FALLBACK;
 	}
-	if (!ret)
-		aivpn_qos_reconfigure(in);
+	if (!ret) {
+		ret = aivpn_qos_reconfigure(in);
+		if (ret) {
+			s->pol.armed = 0;
+			s->pol.flags |= AIVPN_POL_FALLBACK;
+		}
+	}
 	spin_unlock_bh(&s->lock);
 	spin_unlock_bh(&aivpn_table_lock);
-	return ret ? -EINVAL : 0;
+	return ret == -ENOMEM ? ret : ret ? -EINVAL : 0;
 }
 
 int aivpn_session_sync(struct aivpn_session_sync *io)
@@ -922,7 +931,8 @@ int aivpn_session_qos_charge(struct aivpn_qos_charge *io)
 	tokens = io->dir == AIVPN_QOS_DIR_UP ? s->pol.tokens_up : s->pol.tokens_down;
 	quota = io->dir == AIVPN_QOS_DIR_UP ? s->pol.quota_up : s->pol.quota_down;
 	tokens = aivpn_qos_budget_left(s->pol.client_key, (int)io->dir, tokens, &quota);
-	io->result = v == AIVPN_VERDICT_ACCEPT ? AIVPN_QOS_ACCEPT : AIVPN_QOS_DROP;
+	io->result = v == AIVPN_VERDICT_ACCEPT ? AIVPN_QOS_ACCEPT :
+		v == AIVPN_VERDICT_FALLBACK ? AIVPN_QOS_FALLBACK : AIVPN_QOS_DROP;
 	io->tokens_left = tokens;
 	io->quota_left = quota;
 	spin_unlock_bh(&s->lock);

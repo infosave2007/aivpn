@@ -27,6 +27,7 @@ tray-icon = "0.26"
 png = "0.18"
 winapi = { version = "0.3", features = [
     "winuser",
+    "commdlg",
     "wincrypt",
     "dpapi",
     "winbase",
@@ -41,4 +42,7 @@ winapi = { version = "0.3", features = [
     "winerror",
 ] }
 winreg = "0.52"
+
+[dev-dependencies]
+png = "0.18"
 

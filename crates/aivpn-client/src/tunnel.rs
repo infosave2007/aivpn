@@ -13,8 +13,8 @@ use aivpn_common::network_config::{ClientNetworkConfig, VpnNetworkConfig, LEGACY
 
 // Real worst-case outer overhead per packet:
 //   TAG(8) + MDH(varies, default 20) + pad_len(2) + inner_hdr(4) + random_padding(≤24) + Poly1305(16) ≈ 74 bytes.
-// Masks with MDH > ~40 bytes require a lower negotiated client MTU via ServerHello network_config.
-const WAN_SAFE_TUN_MTU: u16 = 1346;
+// Вмещает DATA и FEC во все встроенные носители при переключении масок.
+const WAN_SAFE_TUN_MTU: u16 = aivpn_common::network_config::DEFAULT_VPN_MTU;
 
 /// Whether the current process has an elevated (Administrator) token.
 /// Creating a Wintun adapter always requires this on Windows — there is no
@@ -104,21 +104,11 @@ impl TunnelConfig {
         network_config: ClientNetworkConfig,
         full_tunnel: bool,
     ) -> Self {
-        // Clamp to MAX_PACKET_SIZE (1500): client.rs's FecEncoder is
-        // hardcoded to a 1500-byte parity buffer
-        // (`FecEncoder::new(fec_n, 1500)`), and `FecEncoder::feed()` silently
-        // truncates anything longer — bytes beyond 1500 never get XORed into
-        // repair parity, so any lost packet in a group containing an
-        // oversized member gets "recovered" corrupted/truncated instead of
-        // failing loudly. `network_config.mtu` is server-controlled (pushed
-        // in `apply_server_network_override`) as well as
-        // config-file/bootstrap-controlled here at startup, up to u16::MAX —
-        // this is the single choke point both paths route through before a
-        // `TunnelConfig` (and the MTU actually applied to the TUN device) is
-        // produced.
+        // Назначение сервера и ключ подключения не могут увеличить MTU
+        // сверх бюджета носителя. Это также меньше буфера FEC на 1500 байт.
         let mtu = network_config
             .mtu
-            .min(aivpn_common::protocol::MAX_PACKET_SIZE as u16);
+            .min(aivpn_common::network_config::MAX_MASK_TUN_MTU);
         Self {
             tun_name,
             tun_addr: network_config.client_ip.to_string(),
@@ -195,10 +185,6 @@ pub struct Tunnel {
     /// Saved default gateway for full-tunnel restore
     saved_default_gw: Option<String>,
     full_tunnel_routes_active: bool,
-    /// Saved default device for full-tunnel restore on Linux (e.g. "eth0").
-    /// Stored alongside saved_default_gw; used in disable_full_tunnel().
-    #[cfg(target_os = "linux")]
-    saved_default_dev: Option<String>,
     /// Server IP for bypass route cleanup
     server_ip: Option<String>,
     /// Windows: wintun adapter interface index for explicit route binding.
@@ -211,9 +197,16 @@ pub struct Tunnel {
     split_routes_applied: Vec<String>,
     #[cfg(target_os = "linux")]
     owned_split_routes: Vec<Vec<String>>,
+    #[cfg(not(target_os = "linux"))]
     ipv6_routes_added: bool,
+    #[cfg(target_os = "linux")]
+    owned_ipv6_routes: Vec<Vec<String>>,
+    #[cfg(target_os = "linux")]
+    owned_ipv6_bypass: Option<Vec<String>>,
     ipv6_server_bypass: Option<(String, String)>,
     transport_mark: Option<u32>,
+    #[cfg(any(target_os = "macos", windows))]
+    transport_guard: Option<aivpn_common::transport::SharedGuard>,
     #[cfg(target_os = "linux")]
     transport_routes: Option<crate::transport_routes::TransportRoutes>,
     ipv6_address_applied: Option<(std::net::Ipv6Addr, u8)>,
@@ -261,24 +254,35 @@ fn kill_orphaned_pkexec_child() {
 }
 
 impl Tunnel {
-    pub fn new(config: TunnelConfig) -> Self {
+    pub fn new(mut config: TunnelConfig) -> Self {
+        config.mtu = config
+            .mtu
+            .min(aivpn_common::network_config::MAX_MASK_TUN_MTU);
+        if config.ipv6.is_some() {
+            config.mtu = config.mtu.max(1280);
+        }
         Self {
             config,
             reader: None,
             writer: None,
             saved_default_gw: None,
             full_tunnel_routes_active: false,
-            #[cfg(target_os = "linux")]
-            saved_default_dev: None,
             server_ip: None,
             wintun_if_index: None,
             #[cfg(not(target_os = "linux"))]
             split_routes_applied: Vec::new(),
             #[cfg(target_os = "linux")]
             owned_split_routes: Vec::new(),
+            #[cfg(not(target_os = "linux"))]
             ipv6_routes_added: false,
+            #[cfg(target_os = "linux")]
+            owned_ipv6_routes: Vec::new(),
+            #[cfg(target_os = "linux")]
+            owned_ipv6_bypass: None,
             ipv6_server_bypass: None,
             transport_mark: None,
+            #[cfg(any(target_os = "macos", windows))]
+            transport_guard: None,
             #[cfg(target_os = "linux")]
             transport_routes: None,
             ipv6_address_applied: None,
@@ -532,15 +536,10 @@ impl Tunnel {
         mut network_config: ClientNetworkConfig,
     ) -> Result<()> {
         network_config.validate()?;
-        // Clamp to MAX_PACKET_SIZE — see the matching comment in
-        // `TunnelConfig::from_network_config`. This is the live path that
-        // sets the TUN device's actual MTU on a server-pushed
-        // (ServerHello/mid-session) network-config override, so it must be
-        // clamped independently of that other choke point, not just rely on
-        // it.
+        // Live override соблюдает тот же бюджет, что и начальный TUN.
         network_config.mtu = network_config
             .mtu
-            .min(aivpn_common::protocol::MAX_PACKET_SIZE as u16);
+            .min(aivpn_common::network_config::MAX_MASK_TUN_MTU);
         // Remember the address the device carried BEFORE this override: on
         // Linux `ip addr replace <new>` with a different IP ADDS it as a
         // secondary address, the old one stays primary and keeps winning
@@ -579,6 +578,9 @@ impl Tunnel {
 
         #[cfg(target_os = "linux")]
         {
+            if self.config.ipv6.is_none() {
+                self.configure_ipv6()?;
+            }
             self.configure_linux()?;
             let new_cidr = self.config.client_network_config()?.cidr_string();
             if let Some(stale) = stale_cidr.filter(|old| *old != new_cidr) {
@@ -787,23 +789,9 @@ impl Tunnel {
     /// anywhere near `ExitStatus::from_raw` (which expects `code << 8` and
     /// would classify exit code 128 as a success).
     ///
-    /// Background: aivpn-linux grants CAP_NET_ADMIN to both the client
-    /// binary and every `ip` binary it finds as a *file capability* (see
-    /// `ensure_capable_binary` in `aivpn-linux/src/app.rs`). File
-    /// capabilities are silently voided at exec time if the calling process
-    /// (or any ancestor) has the `no_new_privs` bit set: per `capabilities(7)`
-    /// and `Documentation/userspace-api/no_new_privs.rst`, "execve() promises
-    /// not to grant the privilege to do anything that could not have been
-    /// done without the execve call ... file capabilities will not add to
-    /// the permitted set." `getcap` only inspects the on-disk xattr, so it
-    /// keeps reporting the capability as present even when the kernel
-    /// refuses to grant it at exec time — exactly the "verified via getcap,
-    /// yet RTNETLINK EPERM at runtime" symptom seen in the field. Rather
-    /// than trying to pin down *why* `no_new_privs` ended up set somewhere
-    /// in the process ancestry (login shell, desktop launcher, a
-    /// `systemd --user` unit with `NoNewPrivileges=yes`, AppImage/Flatpak
-    /// integration, etc.), recover unconditionally by asking pkexec for
-    /// one-shot root privilege instead of relying on the file capability.
+    /// Сетевые команды выполняются через помощник с авторизацией polkit,
+    /// если у самого процесса нет необходимых прав. Системный ip не получает
+    /// постоянных привилегий от установщика приложения.
     #[cfg(target_os = "linux")]
     pub(crate) fn run_ip_privileged(args: &[&str]) -> io::Result<i32> {
         Ok(Self::run_ip_batch_privileged(&[("cmd", args)])?
@@ -861,10 +849,22 @@ impl Tunnel {
     #[cfg(target_os = "linux")]
     fn is_trusted_root_binary(path: &std::path::Path) -> bool {
         use std::os::unix::fs::MetadataExt;
-        match std::fs::metadata(path) {
-            Ok(meta) => meta.uid() == 0 && (meta.mode() & 0o022) == 0,
-            Err(_) => false,
-        }
+        let Ok(canonical) = std::fs::canonicalize(path) else {
+            return false;
+        };
+        // В user namespace владелец системного корня может отображаться как
+        // unmapped UID. Требуем единого владельца всей цепочки от корня.
+        let Ok(root) = std::fs::metadata("/") else {
+            return false;
+        };
+        canonical.is_file()
+            && canonical.ancestors().all(|ancestor| {
+                std::fs::symlink_metadata(ancestor).is_ok_and(|meta| {
+                    meta.uid() == root.uid()
+                        && meta.mode() & 0o022 == 0
+                        && !meta.file_type().is_symlink()
+                })
+            })
     }
 
     /// Translate one `(name, ip-args)` pair — exactly the shapes already
@@ -897,6 +897,38 @@ impl Tunnel {
         {
             return None;
         }
+        match args {
+            ["-6", "route", action @ ("add" | "del"), "blackhole", prefix @ ("::/1" | "8000::/1"), "proto", "242", "metric", "1"] =>
+            {
+                return Some(format!("{name}\troute6_owned_block_{action}\t{prefix}"));
+            }
+            ["-6", "route", action @ ("add" | "del"), prefix @ ("::/1" | "8000::/1"), "dev", device, "proto", "242", "metric", "2"] =>
+            {
+                return Some(format!(
+                    "{name}\troute6_owned_tun_{action}\t{prefix}\t{device}"
+                ));
+            }
+            ["-6", "route", action @ ("add" | "del"), cidr, "dev", device, "proto", "242", "metric", "1"]
+                if cidr
+                    .strip_suffix("/128")
+                    .is_some_and(|ip| ip.parse::<std::net::Ipv6Addr>().is_ok()) =>
+            {
+                return Some(format!(
+                    "{name}\troute6_owned_bypass_{action}\t{cidr}\t{device}\t-"
+                ));
+            }
+            ["-6", "route", action @ ("add" | "del"), cidr, "dev", device, "via", gateway, "proto", "242", "metric", "1"]
+                if cidr
+                    .strip_suffix("/128")
+                    .is_some_and(|ip| ip.parse::<std::net::Ipv6Addr>().is_ok())
+                    && gateway.parse::<std::net::Ipv6Addr>().is_ok() =>
+            {
+                return Some(format!(
+                    "{name}\troute6_owned_bypass_{action}\t{cidr}\t{device}\t{gateway}"
+                ));
+            }
+            _ => {}
+        }
         let owned = args.strip_prefix(&["-6"]).unwrap_or(args);
         match owned {
             ["route", action @ ("add" | "del"), cidr, "dev", device, "proto", "242"] => {
@@ -911,6 +943,18 @@ impl Tunnel {
             _ => {}
         }
         match args {
+            ["link", "set", "dev", iface, "mtu", mtu] => {
+                Some(format!("{name}\tlink_mtu\t{iface}\t{mtu}"))
+            }
+            ["-6", "addr", action @ ("replace" | "del"), cidr, "dev", iface] => {
+                Some(format!("{name}\taddr6_{action}\t{cidr}\t{iface}"))
+            }
+            ["-6", "route", action @ ("replace" | "del" | "add"), cidr, "dev", iface] => {
+                Some(format!("{name}\troute6_{action}\t{cidr}\t{iface}"))
+            }
+            ["-6", "route", "add", cidr, "dev", iface, "via", gateway] => Some(format!(
+                "{name}\troute6_add_via\t{cidr}\t{iface}\t{gateway}"
+            )),
             ["route", "replace", "0.0.0.0/1", "dev", iface] => {
                 Some(format!("{name}\troute_replace_fulltunnel_lower\t{iface}"))
             }
@@ -1036,6 +1080,103 @@ impl Tunnel {
         child.wait_with_output()
     }
 
+    /// Даже пустой capability xattr сбрасывает ambient-права при exec.
+    /// Чужие права системного файла не меняем: используем помощник polkit.
+    #[cfg(target_os = "linux")]
+    fn can_inherit_net_admin(path: &std::path::Path) -> bool {
+        use std::os::unix::ffi::OsStrExt;
+        if unsafe { libc::geteuid() } == 0 {
+            return true;
+        }
+        let Ok(path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+            return false;
+        };
+        let result = unsafe {
+            libc::getxattr(
+                path.as_ptr(),
+                c"security.capability".as_ptr(),
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        result < 0
+            && matches!(
+                io::Error::last_os_error().raw_os_error(),
+                Some(libc::ENODATA | libc::ENOTSUP)
+            )
+    }
+
+    /// Команды firewall тоже получают имеющийся CAP_NET_ADMIN клиента.
+    /// Не передаем право исполняемым файлам из доступных пользователю каталогов.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn net_admin_command(program: &str) -> std::process::Command {
+        use std::os::unix::process::CommandExt;
+        let resolved = std::env::var_os("PATH")
+            .and_then(|paths| {
+                std::env::split_paths(&paths)
+                    .map(|directory| directory.join(program))
+                    .find(|path| {
+                        use std::os::unix::fs::PermissionsExt;
+                        path.metadata().is_ok_and(|meta| {
+                            meta.is_file() && meta.permissions().mode() & 0o111 != 0
+                        })
+                    })
+            })
+            .and_then(|path| path.canonicalize().ok());
+        let mut command = std::process::Command::new(
+            resolved
+                .as_deref()
+                .unwrap_or_else(|| std::path::Path::new(program)),
+        );
+        // Multicall выбирает iptables/ip6tables по argv[0], а не по пути exec.
+        command.arg0(program);
+        if resolved.as_deref().is_some_and(|path| {
+            Self::is_trusted_root_binary(path) && Self::can_inherit_net_admin(path)
+        }) {
+            Self::inherit_net_admin(&mut command);
+        }
+        command
+    }
+
+    /// Передаем уже имеющееся право дочерней команде без изменения файла ip.
+    /// Вызывается только для проверенного системного исполняемого файла.
+    #[cfg(target_os = "linux")]
+    fn inherit_net_admin(command: &mut std::process::Command) {
+        use std::os::unix::process::CommandExt;
+        #[repr(C)]
+        struct Header {
+            version: u32,
+            pid: i32,
+        }
+        #[derive(Clone, Copy, Default)]
+        #[repr(C)]
+        struct Data {
+            effective: u32,
+            permitted: u32,
+            inheritable: u32,
+        }
+        // После fork разрешены только системные вызовы, без выделения памяти.
+        unsafe {
+            command.pre_exec(|| {
+                let mut header = Header {
+                    version: 0x2008_0522,
+                    pid: 0,
+                };
+                let mut data = [Data::default(); 2];
+                let bit = 1 << 12;
+                if libc::syscall(libc::SYS_capget, &mut header, data.as_mut_ptr()) == 0
+                    && data[0].permitted & bit != 0
+                {
+                    data[0].inheritable |= bit;
+                    if libc::syscall(libc::SYS_capset, &header, data.as_ptr()) == 0 {
+                        libc::prctl(libc::PR_CAP_AMBIENT, libc::PR_CAP_AMBIENT_RAISE, 12, 0, 0);
+                    }
+                }
+                Ok(())
+            });
+        }
+    }
+
     /// Run a batch of named `ip <args>` invocations as ONE shell script,
     /// falling back to a SINGLE `pkexec sh -c ...` prompt for the whole
     /// batch if (and only if) any of them hits what looks like a permission
@@ -1084,8 +1225,32 @@ impl Tunnel {
                 .collect()
         };
 
-        let output = Command::new("sh").arg("-c").arg(&script).output()?;
-        let direct_results = parse_marker_statuses(&output.stdout);
+        let trusted: Vec<_> = ["/usr/sbin/ip", "/usr/bin/ip", "/sbin/ip", "/bin/ip"]
+            .into_iter()
+            .map(std::path::Path::new)
+            .filter(|path| Self::is_trusted_root_binary(path))
+            .collect();
+        if trusted.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "Не найден системный ip",
+            ));
+        }
+        let ip = trusted
+            .into_iter()
+            .find(|path| Self::can_inherit_net_admin(path));
+        let mut direct_results = Vec::with_capacity(commands.len());
+        let mut stderr_bytes = Vec::new();
+        if let Some(ip) = ip {
+            for (name, args) in commands {
+                let mut command = Command::new(ip);
+                command.args(*args).env("LC_ALL", "C");
+                Self::inherit_net_admin(&mut command);
+                let output = command.output()?;
+                direct_results.push(((*name).to_owned(), output.status.code().unwrap_or(1)));
+                stderr_bytes.extend_from_slice(&output.stderr);
+            }
+        }
         // Every command must have produced a marker line, and every one of
         // those must itself have succeeded, for the batch to count as fully
         // resolved without escalation.
@@ -1093,7 +1258,7 @@ impl Tunnel {
             return Ok(direct_results);
         }
 
-        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stderr = String::from_utf8_lossy(&stderr_bytes);
         // "No such process" (ESRCH) from `ip route del` means the route was
         // already gone — the desired end state for a delete, not an error
         // worth echoing to the user's terminal on every disconnect.
@@ -1105,7 +1270,8 @@ impl Tunnel {
             eprintln!("{}", stderr_noteworthy.join("\n"));
         }
 
-        let looks_like_permission_denied = stderr.contains("Operation not permitted");
+        let looks_like_permission_denied =
+            ip.is_none() || stderr.contains("Operation not permitted");
         if !looks_like_permission_denied {
             // Some non-permission failure (e.g. "File exists" for a route
             // that's already there) — return what we have; pkexec would
@@ -1113,11 +1279,8 @@ impl Tunnel {
             return Ok(direct_results);
         }
 
-        error!(
-            "ip batch [{}] failed with a permission error despite file capabilities being \
-             granted (getcap only checks the on-disk xattr, not whether no_new_privs blocks \
-             it at exec time — see capabilities(7)). Falling back to a single pkexec prompt \
-             for the whole batch instead of one per command.",
+        debug!(
+            "ip batch [{}] requires authorization through polkit",
             commands
                 .iter()
                 .map(|(name, _)| *name)
@@ -1322,6 +1485,22 @@ impl Tunnel {
     }
 
     /// Настроить обход до открытия сокетов альтернативного транспорта.
+    pub fn set_transport_guard(
+        &mut self,
+        guard: aivpn_common::transport::SharedGuard,
+    ) -> Result<()> {
+        self.set_transport_mark(guard.routing_mark())?;
+        #[cfg(any(target_os = "macos", windows))]
+        {
+            if self.config.kill_switch {
+                KillSwitch::prepare_transport_guard(&guard)?;
+            }
+            self.transport_guard = Some(guard);
+        }
+        Ok(())
+    }
+
+    /// Настроить отдельную таблицу маршрутов для помеченных сокетов.
     pub fn set_transport_mark(&mut self, mark: Option<u32>) -> Result<()> {
         #[cfg(target_os = "linux")]
         {
@@ -1398,7 +1577,9 @@ impl Tunnel {
             if status.success() {
                 info!("Added bypass route: {} via {}", server_ip, gw);
             } else {
-                error!("Failed to add bypass route for {}", server_ip);
+                return Err(Error::Io(io::Error::other(format!(
+                    "Не удалось добавить обходной маршрут для {server_ip}"
+                ))));
             }
         }
 
@@ -1487,7 +1668,6 @@ impl Tunnel {
         );
         self.saved_default_gw = (!gw.is_empty()).then(|| gw.clone());
         self.full_tunnel_routes_active = true;
-        self.saved_default_dev = (!default_dev.is_empty()).then(|| default_dev.clone());
 
         // 2 & 3. Bypass route for the VPN server IP + the 0/1+128/1
         // full-tunnel trick, all issued as ONE privileged batch (at most one
@@ -1768,14 +1948,8 @@ impl Tunnel {
         if let Some(server_ip) = self.server_ip.as_ref().filter(|ip| !ip.contains(':')) {
             batch.push(("del_bypass", vec!["route", "del", server_ip.as_str()]));
         }
-        // Restore default gateway
-        if let Some(ref gw) = self.saved_default_gw {
-            let mut args = vec!["route", "add", "default", "via", gw.as_str()];
-            if let Some(ref dev) = self.saved_default_dev {
-                args.extend_from_slice(&["dev", dev.as_str()]);
-            }
-            batch.push(("restore_default", args));
-        }
+        // Исходный default не удалялся. Повторное добавление теряет его metric
+        // и оставляет лишний маршрут после отключения или смены сети.
         let named_args: Vec<(&str, &[&str])> = batch
             .iter()
             .map(|(name, args)| (*name, args.as_slice()))
@@ -2151,6 +2325,10 @@ impl Tunnel {
         if let Some(mark) = self.transport_mark {
             ks = ks.with_mark(mark);
         }
+        #[cfg(any(target_os = "macos", windows))]
+        if let Some(guard) = &self.transport_guard {
+            ks = ks.with_guard(guard.clone());
+        }
         let result = ks.activate();
         // Ошибка не снимает DROP guard. Владелец нужен и для его явной очистки.
         self.kill_switch_state = Some(ks);
@@ -2171,6 +2349,7 @@ impl Tunnel {
     }
 
     /// Адрес и маршруты принадлежат только интерфейсу туннеля.
+    #[cfg(not(target_os = "linux"))]
     fn configure_ipv6(&mut self) -> Result<()> {
         if self.ipv6_address_applied != self.config.ipv6 {
             if let Some(old) = self.ipv6_address_applied {
@@ -2192,6 +2371,209 @@ impl Tunnel {
             }
         }
         Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn linux_ipv6_route_plan(&self) -> Vec<Vec<String>> {
+        if !self.config.full_tunnel || !self.full_tunnel_routes_active {
+            return Vec::new();
+        }
+        Self::linux_ipv6_routes_for(&self.config.tun_name, self.config.ipv6.is_some())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn linux_ipv6_routes_for(tun_name: &str, enabled: bool) -> Vec<Vec<String>> {
+        ["::/1", "8000::/1"]
+            .into_iter()
+            .map(|prefix| {
+                let mut args = vec!["-6".into(), "route".into(), "add".into()];
+                if !enabled {
+                    args.push("blackhole".into());
+                }
+                args.push(prefix.into());
+                if enabled {
+                    args.extend(["dev".into(), tun_name.into()]);
+                }
+                args.extend([
+                    "proto".into(),
+                    "242".into(),
+                    "metric".into(),
+                    if enabled { "2" } else { "1" }.into(),
+                ]);
+                args
+            })
+            .collect()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn ipv6_delete_args(route: &[String]) -> Vec<String> {
+        let mut args = route.to_vec();
+        args[2] = "del".into();
+        args
+    }
+
+    #[cfg(target_os = "linux")]
+    fn reconcile_ipv6_routes(
+        &mut self,
+        desired: Vec<Vec<String>>,
+        run: impl FnMut(&[String]) -> io::Result<i32>,
+    ) -> Result<()> {
+        Self::reconcile_owned_ipv6_routes(&mut self.owned_ipv6_routes, desired, run)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn reconcile_owned_ipv6_routes(
+        owned: &mut Vec<Vec<String>>,
+        desired: Vec<Vec<String>>,
+        mut run: impl FnMut(&[String]) -> io::Result<i32>,
+    ) -> Result<()> {
+        // Сначала обе новые половины. Пока действует blackhole с metric 1,
+        // переход на TUN с metric 2 не открывает физический IPv6 default.
+        for args in &desired {
+            if owned.contains(args) {
+                continue;
+            }
+            if run(args)? != 0 {
+                return Err(Error::Io(io::Error::other(
+                    "Не удалось установить маршрут IPv6",
+                )));
+            }
+            owned.push(args.clone());
+        }
+        let mut failures = Vec::new();
+        for old in owned.clone() {
+            if desired.contains(&old) {
+                continue;
+            }
+            match run(&Self::ipv6_delete_args(&old)) {
+                Ok(0) => owned.retain(|route| *route != old),
+                Ok(code) => failures.push(format!("{}: код {code}", old.join(" "))),
+                Err(error) => failures.push(format!("{}: {error}", old.join(" "))),
+            }
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(Error::Io(io::Error::other(format!(
+                "Не удалось снять собственные маршруты IPv6: {}",
+                failures.join("; ")
+            ))))
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn clear_crashed_ipv6_guards() -> Result<()> {
+        let mut routes = Self::linux_ipv6_routes_for("", false);
+        Self::reconcile_owned_ipv6_routes(&mut routes, Vec::new(), Self::run_owned_ipv6_command)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn run_owned_ipv6_command(args: &[String]) -> io::Result<i32> {
+        let borrowed: Vec<_> = args.iter().map(String::as_str).collect();
+        // Linux не учитывает тип маршрута при RTM_DELROUTE. Проверка до
+        // удаления не дает снять чужой prohibit или unicast с тем же metric.
+        if borrowed.get(2) == Some(&"del") && !Self::owned_ipv6_route_present(&borrowed)? {
+            return Ok(0);
+        }
+        let code = Self::run_ip_privileged(&borrowed)?;
+        // Внешний flush мог уже снять маршрут. Код ip не различает ESRCH и
+        // EPERM, поэтому подтверждаем отсутствие точного маршрута через JSON.
+        if code != 0
+            && borrowed.get(2) == Some(&"del")
+            && !Self::owned_ipv6_route_present(&borrowed)?
+        {
+            return Ok(0);
+        }
+        Ok(code)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn owned_ipv6_route_present(args: &[&str]) -> io::Result<bool> {
+        let (prefix, route_type, device, gateway, metric) = match args {
+            ["-6", "route", "del", "blackhole", prefix @ ("::/1" | "8000::/1"), "proto", "242", "metric", "1"] => {
+                (*prefix, "blackhole", None, None, 1)
+            }
+            ["-6", "route", "del", prefix, "dev", device, "proto", "242", "metric", metric @ ("1" | "2")] => {
+                (
+                    *prefix,
+                    "unicast",
+                    Some(*device),
+                    None,
+                    if *metric == "1" { 1 } else { 2 },
+                )
+            }
+            ["-6", "route", "del", prefix, "dev", device, "via", gateway, "proto", "242", "metric", "1"] => {
+                (*prefix, "unicast", Some(*device), Some(*gateway), 1)
+            }
+            _ => {
+                return Err(io::Error::other(
+                    "Неизвестная форма собственного маршрута IPv6",
+                ))
+            }
+        };
+        let ip = ["/usr/sbin/ip", "/usr/bin/ip", "/sbin/ip", "/bin/ip"]
+            .into_iter()
+            .map(std::path::Path::new)
+            .find(|path| Self::is_trusted_root_binary(path))
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Не найден системный ip"))?;
+        let output = std::process::Command::new(ip)
+            .args(["-j", "-6", "route", "show", "exact", prefix, "proto", "242"])
+            .output()?;
+        if !output.status.success() {
+            return Err(io::Error::other(
+                "Не удалось проверить наличие маршрута IPv6",
+            ));
+        }
+        let routes: Vec<serde_json::Value> = serde_json::from_slice(&output.stdout)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        Ok(routes.iter().any(|route| {
+            route
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unicast")
+                == route_type
+                && route.get("metric").and_then(serde_json::Value::as_u64) == Some(metric)
+                && device.is_none_or(|device| {
+                    route.get("dev").and_then(serde_json::Value::as_str) == Some(device)
+                })
+                && match (
+                    gateway,
+                    route.get("gateway").and_then(serde_json::Value::as_str),
+                ) {
+                    (None, None) => true,
+                    (Some(expected), Some(actual)) => {
+                        expected.parse::<std::net::Ipv6Addr>().ok()
+                            == actual.parse::<std::net::Ipv6Addr>().ok()
+                    }
+                    _ => false,
+                }
+        }))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn configure_ipv6(&mut self) -> Result<()> {
+        let desired = self.linux_ipv6_route_plan();
+        if !desired.is_empty() {
+            self.add_ipv6_server_bypass()?;
+        }
+        // При выключении IPv6 блокировка нужна до удаления адреса и снижения MTU.
+        if self.config.ipv6.is_none() {
+            self.reconcile_ipv6_routes(desired.clone(), Self::run_owned_ipv6_command)?;
+        }
+        if self.ipv6_address_applied != self.config.ipv6 {
+            if let Some(old) = self.ipv6_address_applied {
+                self.ipv6_address_command(old, false)?;
+                self.ipv6_address_applied = None;
+            }
+            if let Some(address) = self.config.ipv6 {
+                if self.config.mtu < 1280 {
+                    return Err(Error::InvalidPacket("IPv6 требует MTU не меньше 1280"));
+                }
+                self.ipv6_address_command(address, true)?;
+                self.ipv6_address_applied = Some(address);
+            }
+        }
+        self.reconcile_ipv6_routes(desired, Self::run_owned_ipv6_command)
     }
 
     fn add_ipv6_server_bypass(&mut self) -> Result<()> {
@@ -2231,7 +2613,9 @@ impl Tunnel {
             if let Some(gateway) = gateway {
                 args.extend_from_slice(&["via", gateway]);
             }
+            args.extend_from_slice(&["proto", "242", "metric", "1"]);
             self.ipv6_ip_command(&args)?;
+            self.owned_ipv6_bypass = Some(args.iter().map(|arg| (*arg).to_string()).collect());
             self.ipv6_server_bypass = Some((destination, interface.to_string()));
         }
         #[cfg(target_os = "macos")]
@@ -2333,16 +2717,8 @@ impl Tunnel {
         ))
     }
 
+    #[cfg(not(target_os = "linux"))]
     fn ipv6_route_command(&self, prefix: &str, add: bool) -> Result<()> {
-        #[cfg(target_os = "linux")]
-        return self.ipv6_ip_command(&[
-            "-6",
-            "route",
-            if add { "replace" } else { "del" },
-            prefix,
-            "dev",
-            &self.config.tun_name,
-        ]);
         #[cfg(target_os = "macos")]
         return Self::checked_ipv6_command(
             "/sbin/route",
@@ -2399,6 +2775,11 @@ impl Tunnel {
     }
 
     fn restore_ipv6(&mut self) {
+        #[cfg(target_os = "linux")]
+        if let Err(error) = self.reconcile_ipv6_routes(Vec::new(), Self::run_owned_ipv6_command) {
+            warn!("IPv6 route cleanup: {error}");
+        }
+        #[cfg(not(target_os = "linux"))]
         if self.ipv6_routes_added {
             for prefix in ["::/1", "8000::/1"] {
                 if let Err(error) = self.ipv6_route_command(prefix, false) {
@@ -2409,8 +2790,21 @@ impl Tunnel {
         }
         if let Some((destination, interface)) = self.ipv6_server_bypass.take() {
             #[cfg(target_os = "linux")]
-            let result =
-                self.ipv6_ip_command(&["-6", "route", "del", &destination, "dev", &interface]);
+            let result = if let Some(args) = self.owned_ipv6_bypass.take() {
+                Self::run_owned_ipv6_command(&Self::ipv6_delete_args(&args))
+                    .and_then(|code| {
+                        if code == 0 {
+                            Ok(())
+                        } else {
+                            Err(io::Error::other("Не удалось снять собственный обход IPv6"))
+                        }
+                    })
+                    .map_err(Error::Io)
+            } else {
+                Ok(())
+            };
+            #[cfg(target_os = "linux")]
+            let _ = (destination, interface);
             #[cfg(target_os = "macos")]
             let result = Self::checked_ipv6_command(
                 "/sbin/route",
@@ -2523,6 +2917,429 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn low_mtu_ipv6_block_switch_and_cleanup_preserve_foreign_routes() {
+        use std::process::Command;
+        const CHILD: &str = "AIVPN_LOW_MTU_IPV6_PARENT";
+        let namespace = std::fs::read_link("/proc/self/ns/net").unwrap();
+        if let Ok(parent) = std::env::var(CHILD) {
+            assert_ne!(
+                namespace.to_string_lossy(),
+                parent,
+                "Тест не должен менять сеть хоста"
+            );
+            let ip = |args: &[&str]| {
+                let output = Command::new("ip").args(args).output().unwrap();
+                assert!(
+                    output.status.success(),
+                    "ip {args:?}: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                String::from_utf8(output.stdout).unwrap()
+            };
+            ip(&["link", "add", "wan0", "type", "dummy"]);
+            ip(&["link", "set", "wan0", "up"]);
+            ip(&["addr", "add", "192.0.2.2/24", "dev", "wan0"]);
+            ip(&["route", "add", "default", "via", "192.0.2.1", "dev", "wan0"]);
+            ip(&[
+                "-6",
+                "addr",
+                "add",
+                "2001:db8:1::2/64",
+                "dev",
+                "wan0",
+                "nodad",
+            ]);
+            ip(&[
+                "-6", "route", "add", "default", "dev", "wan0", "proto", "99", "metric", "600",
+            ]);
+            ip(&[
+                "-6",
+                "route",
+                "add",
+                "2001:db8:feed::/48",
+                "dev",
+                "wan0",
+                "proto",
+                "99",
+                "metric",
+                "77",
+            ]);
+            let foreign = ip(&["-j", "-6", "route", "show", "proto", "99"]);
+            let runtime = tokio::runtime::Runtime::new().unwrap();
+            let mut tunnel = Tunnel::new(TunnelConfig {
+                tun_name: "low6".into(),
+                mtu: 1000,
+                full_tunnel: true,
+                ..Default::default()
+            });
+            runtime.block_on(tunnel.create()).unwrap();
+            tunnel.set_server_ip("203.0.113.7".into());
+            tunnel.enable_full_tunnel().unwrap();
+            assert!(ip(&["-6", "route", "show", "proto", "242"]).contains("blackhole"));
+            assert!(ip(&["-j", "link", "show", "dev", "low6"]).contains("\"mtu\":1000"));
+            assert!(!Command::new("ip")
+                .args(["-6", "route", "get", "2001:4860:4860::8888"])
+                .status()
+                .unwrap()
+                .success());
+            let mut assigned = tunnel.config.client_network_config().unwrap();
+            assigned.mtu = 1280;
+            assigned.ipv6_address = Some("fd10:cafe::2".into());
+            assigned.ipv6_prefix_len = Some(64);
+            runtime
+                .block_on(tunnel.apply_network_config(assigned.clone()))
+                .unwrap();
+            let routes = ip(&["-6", "route", "show", "proto", "242"]);
+            assert!(routes.contains("dev low6") && !routes.contains("blackhole"));
+            assert!(ip(&["-6", "route", "get", "2001:4860:4860::8888"]).contains("dev low6"));
+            assigned.mtu = 1000;
+            assigned.ipv6_address = None;
+            assigned.ipv6_prefix_len = None;
+            runtime
+                .block_on(tunnel.apply_network_config(assigned))
+                .unwrap();
+            let routes = ip(&["-6", "route", "show", "proto", "242"]);
+            assert!(routes.contains("blackhole") && !routes.contains("dev low6"));
+            assert!(!Command::new("ip")
+                .args(["-6", "route", "get", "2001:4860:4860::8888"])
+                .status()
+                .unwrap()
+                .success());
+            assert_eq!(ip(&["-j", "-6", "route", "show", "proto", "99"]), foreign);
+            ip(&[
+                "-6",
+                "route",
+                "del",
+                "blackhole",
+                "::/1",
+                "proto",
+                "242",
+                "metric",
+                "1",
+            ]);
+            drop(tunnel);
+            assert!(ip(&["-6", "route", "show", "proto", "242"]).is_empty());
+            assert_eq!(ip(&["-j", "-6", "route", "show", "proto", "99"]), foreign);
+            ip(&[
+                "-6", "route", "add", "8000::/1", "dev", "wan0", "proto", "99", "metric", "1",
+            ]);
+            let foreign = ip(&["-j", "-6", "route", "show", "proto", "99"]);
+            let mut conflict = Tunnel::new(TunnelConfig {
+                tun_name: "low6".into(),
+                mtu: 1000,
+                full_tunnel: true,
+                ..Default::default()
+            });
+            runtime.block_on(conflict.create()).unwrap();
+            conflict.set_server_ip("203.0.113.7".into());
+            assert!(conflict.enable_full_tunnel().is_err());
+            assert_eq!(conflict.owned_ipv6_routes.len(), 1);
+            drop(conflict);
+            assert!(ip(&["-6", "route", "show", "proto", "242"]).is_empty());
+            assert_eq!(ip(&["-j", "-6", "route", "show", "proto", "99"]), foreign);
+            return;
+        }
+        let output = Command::new("unshare")
+            .args(["-Urn"])
+            .arg(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tunnel::tests::low_mtu_ipv6_block_switch_and_cleanup_preserve_foreign_routes",
+                "--nocapture",
+            ])
+            .env(CHILD, namespace)
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if !output.status.success()
+            && stderr.starts_with("unshare:")
+            && stderr.contains("Operation not permitted")
+        {
+            eprintln!("Пространства имен запрещены: проверка маршрутов не выполнена");
+            return;
+        }
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            stderr
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn ipv6_cleanup_continues_after_a_real_permission_failure() {
+        use std::process::Command;
+        const CHILD: &str = "AIVPN_IPV6_CLEANUP_PARENT";
+        let namespace = std::fs::read_link("/proc/self/ns/net").unwrap();
+        if let Ok(parent) = std::env::var(CHILD) {
+            assert_ne!(namespace.to_string_lossy(), parent);
+            let mut owned = Vec::new();
+            Tunnel::reconcile_owned_ipv6_routes(
+                &mut owned,
+                Tunnel::linux_ipv6_routes_for("tun0", false),
+                Tunnel::run_owned_ipv6_command,
+            )
+            .unwrap();
+            let result = Tunnel::reconcile_owned_ipv6_routes(&mut owned, Vec::new(), |args| {
+                if args.iter().any(|arg| arg == "::/1") {
+                    let output = Command::new("setpriv")
+                        .args(["--bounding-set=-net_admin", "ip"])
+                        .args(args)
+                        .env("LC_ALL", "C")
+                        .output()?;
+                    assert!(
+                        String::from_utf8_lossy(&output.stderr).contains("Operation not permitted")
+                    );
+                    Ok(output.status.code().unwrap())
+                } else {
+                    Tunnel::run_owned_ipv6_command(args)
+                }
+            });
+            assert!(result.is_err(), "Настоящая ошибка прав должна сохраниться");
+            let output = Command::new("ip")
+                .args(["-6", "route", "show", "proto", "242"])
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            let routes = String::from_utf8(output.stdout).unwrap();
+            assert!(
+                !routes.contains("8000::/1"),
+                "Вторая половина осталась: {routes}"
+            );
+            assert_eq!(owned.len(), 1);
+            assert!(owned[0].iter().any(|arg| arg == "::/1"));
+            Tunnel::reconcile_owned_ipv6_routes(
+                &mut owned,
+                Vec::new(),
+                Tunnel::run_owned_ipv6_command,
+            )
+            .unwrap();
+            return;
+        }
+        let output = Command::new("unshare")
+            .args(["-Urn"])
+            .arg(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tunnel::tests::ipv6_cleanup_continues_after_a_real_permission_failure",
+                "--nocapture",
+            ])
+            .env(CHILD, namespace)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn ipv6_cleanup_aggregates_io_failures_and_retains_only_failed_routes() {
+        let mut owned = Tunnel::linux_ipv6_routes_for("tun0", false);
+        let result = Tunnel::reconcile_owned_ipv6_routes(&mut owned, Vec::new(), |args| {
+            if args.iter().any(|arg| arg == "::/1") {
+                Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "cleanup denied",
+                ))
+            } else {
+                Ok(0)
+            }
+        });
+        assert!(result.is_err());
+        assert_eq!(owned.len(), 1);
+        assert!(owned[0].iter().any(|arg| arg == "::/1"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn ipv6_policy_plan_adds_both_new_halves_before_deleting_only_owned_routes() {
+        let blocked = Tunnel::linux_ipv6_routes_for("tun0", false);
+        let tunneled = Tunnel::linux_ipv6_routes_for("tun0", true);
+        assert!(blocked.iter().all(|args| args.contains(&"blackhole".into())
+            && !args.contains(&"dev".into())
+            && args.last().unwrap() == "1"));
+        assert!(tunneled
+            .iter()
+            .all(|args| args.contains(&"tun0".into()) && args.last().unwrap() == "2"));
+        let mut owned = Vec::new();
+        let mut commands = Vec::new();
+        Tunnel::reconcile_owned_ipv6_routes(&mut owned, blocked.clone(), |args| {
+            commands.push(args.to_vec());
+            Ok(0)
+        })
+        .unwrap();
+        assert_eq!(owned, blocked);
+        commands.clear();
+        Tunnel::reconcile_owned_ipv6_routes(&mut owned, tunneled.clone(), |args| {
+            commands.push(args.to_vec());
+            Ok(0)
+        })
+        .unwrap();
+        assert_eq!(commands[..2], tunneled);
+        assert_eq!(
+            commands[2..],
+            blocked
+                .iter()
+                .map(|args| Tunnel::ipv6_delete_args(args))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(owned, tunneled);
+        commands.clear();
+        Tunnel::reconcile_owned_ipv6_routes(&mut owned, tunneled.clone(), |args| {
+            commands.push(args.to_vec());
+            Ok(0)
+        })
+        .unwrap();
+        assert!(commands.is_empty());
+        Tunnel::reconcile_owned_ipv6_routes(&mut owned, blocked.clone(), |_| Ok(0)).unwrap();
+        commands.clear();
+        Tunnel::reconcile_owned_ipv6_routes(&mut owned, Vec::new(), |args| {
+            commands.push(args.to_vec());
+            Ok(0)
+        })
+        .unwrap();
+        assert!(owned.is_empty());
+        assert_eq!(
+            commands,
+            blocked
+                .iter()
+                .map(|args| Tunnel::ipv6_delete_args(args))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn ipv6_failed_policy_switch_keeps_old_guard_and_tracks_only_successful_adds() {
+        let blocked = Tunnel::linux_ipv6_routes_for("tun0", false);
+        let tunneled = Tunnel::linux_ipv6_routes_for("tun0", true);
+        let mut owned = Vec::new();
+        assert!(
+            Tunnel::reconcile_owned_ipv6_routes(&mut owned, blocked.clone(), |_| Ok(2)).is_err()
+        );
+        assert!(
+            owned.is_empty(),
+            "Чужой конфликтующий маршрут не становится нашим"
+        );
+        owned = blocked.clone();
+        let mut commands = Vec::new();
+        assert!(
+            Tunnel::reconcile_owned_ipv6_routes(&mut owned, tunneled.clone(), |args| {
+                commands.push(args.to_vec());
+                Ok(if commands.len() == 1 { 0 } else { 2 })
+            })
+            .is_err()
+        );
+        assert_eq!(commands, tunneled);
+        assert!(owned.starts_with(&blocked));
+        assert_eq!(owned.len(), 3);
+        let mut cleanup = Vec::new();
+        Tunnel::reconcile_owned_ipv6_routes(&mut owned, Vec::new(), |args| {
+            cleanup.push(args.to_vec());
+            Ok(0)
+        })
+        .unwrap();
+        assert!(owned.is_empty());
+        assert_eq!(cleanup.len(), 3);
+        assert!(cleanup
+            .iter()
+            .all(|args| args[2] == "del" && args.windows(2).any(|pair| pair == ["proto", "242"])));
+    }
+
+    #[test]
+    fn negotiated_ipv6_never_creates_a_tun_below_1280() {
+        let tunnel = Tunnel::new(TunnelConfig {
+            mtu: 1000,
+            ipv6: Some(("fd10:cafe::2".parse().unwrap(), 64)),
+            ..Default::default()
+        });
+        assert_eq!(tunnel.config.mtu, 1280);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn full_tunnel_disconnect_preserves_dhcp_default_route() {
+        use std::process::Command;
+        const CHILD: &str = "AIVPN_DEFAULT_ROUTE_TEST_PARENT";
+        let namespace = std::fs::read_link("/proc/self/ns/net").unwrap();
+        if let Ok(parent) = std::env::var(CHILD) {
+            assert_ne!(namespace.to_string_lossy(), parent);
+            let ip = |args: &[&str]| {
+                let output = Command::new("ip").args(args).output().unwrap();
+                assert!(
+                    output.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                String::from_utf8(output.stdout).unwrap()
+            };
+            ip(&["link", "add", "wan0", "type", "dummy"]);
+            ip(&["link", "set", "wan0", "up"]);
+            ip(&["addr", "add", "192.0.2.2/24", "dev", "wan0"]);
+            ip(&[
+                "route",
+                "add",
+                "default",
+                "via",
+                "192.0.2.1",
+                "dev",
+                "wan0",
+                "proto",
+                "dhcp",
+                "metric",
+                "600",
+            ]);
+            let before = ip(&["-j", "route", "show", "default"]);
+            let runtime = tokio::runtime::Runtime::new().unwrap();
+            for _ in 0..2 {
+                let mut tunnel = Tunnel::new(TunnelConfig {
+                    tun_name: "audit0".into(),
+                    full_tunnel: true,
+                    ..TunnelConfig::default()
+                });
+                runtime.block_on(tunnel.create()).unwrap();
+                tunnel.set_server_ip("203.0.113.7".into());
+                tunnel.enable_full_tunnel().unwrap();
+                assert!(ip(&["route", "get", "1.1.1.1"]).contains("dev audit0"));
+                drop(tunnel);
+                assert_eq!(ip(&["-j", "route", "show", "default"]), before);
+            }
+            return;
+        }
+        let output = Command::new("unshare")
+            .args(["-Urn"])
+            .arg(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tunnel::tests::full_tunnel_disconnect_preserves_dhcp_default_route",
+                "--nocapture",
+            ])
+            .env(CHILD, namespace)
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if !output.status.success()
+            && stderr.starts_with("unshare:")
+            && stderr.contains("Operation not permitted")
+        {
+            eprintln!("Пространства имен запрещены: проверка маршрутов не выполнена");
+            return;
+        }
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            stderr
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn split_route_add_never_replaces_foreign_route_and_tracks_owner() {
         assert_eq!(
             Tunnel::linux_split_args("10.0.0.0/8", "tun0", None),
@@ -2621,6 +3438,21 @@ mod tests {
         assert_eq!(config.mtu, WAN_SAFE_TUN_MTU);
     }
 
+    #[tokio::test]
+    async fn explicit_and_live_tun_mtu_leave_room_for_all_mask_carriers() {
+        let network = aivpn_common::network_config::VpnNetworkConfig {
+            mtu: 1500,
+            ..Default::default()
+        };
+        let mut assigned = network.client_config("10.0.0.2".parse().unwrap()).unwrap();
+        assigned.mtu = 1500;
+        let config = TunnelConfig::from_network_config("tun-test".into(), assigned.clone(), false);
+        assert_eq!(config.mtu, 1500);
+        let mut tunnel = Tunnel::new(config);
+        tunnel.apply_network_config(assigned).await.unwrap();
+        assert_eq!(tunnel.config.mtu, 1500);
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn test_shell_quote_neutralizes_injection_attempts() {
@@ -2683,7 +3515,229 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn privileged_ip_file_requires_authorization_for_nonroot() {
+        let path = std::env::var("AIVPN_TEST_CAP_PATH").unwrap_or_else(|_| "/usr/bin/cat".into());
+        let expected =
+            std::env::var("AIVPN_TEST_CAP_EXPECTED").map_or(true, |value| value == "true");
+        assert_eq!(
+            Tunnel::can_inherit_net_admin(std::path::Path::new(&path)),
+            expected
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn privileged_command_executes_the_verified_path_not_a_writable_alias() {
+        let dir = std::env::temp_dir().join(format!(
+            "aivpn-command-alias-{:032x}",
+            rand::random::<u128>()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let alias = dir.join("system-cat");
+        std::os::unix::fs::symlink("/usr/bin/cat", &alias).unwrap();
+        let command = Tunnel::net_admin_command(alias.to_str().unwrap());
+        assert_eq!(
+            command.get_program(),
+            std::fs::canonicalize("/usr/bin/cat").unwrap()
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn net_admin_multicall_preserves_iptables_applet_names() {
+        for program in ["iptables", "ip6tables"] {
+            let mut command = Tunnel::net_admin_command(program);
+            let output = match command.arg("--version").output() {
+                Ok(output) => output,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    eprintln!("{program} отсутствует: проверка applet не выполнена");
+                    continue;
+                }
+                Err(error) => panic!("{program} --version: {error}"),
+            };
+            assert!(
+                output.status.success(),
+                "{program} --version: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stdout).starts_with(&format!("{program} v")),
+                "{}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn ip_child_retains_only_available_net_admin() {
+        fn cap(status: &str, field: &str) -> u64 {
+            u64::from_str_radix(
+                status
+                    .lines()
+                    .find_map(|line| line.strip_prefix(field))
+                    .unwrap()
+                    .trim(),
+                16,
+            )
+            .unwrap()
+        }
+        let parent = std::fs::read_to_string("/proc/self/status").unwrap();
+        let mut command = std::process::Command::new("/usr/bin/cat");
+        command.arg("/proc/self/status");
+        Tunnel::inherit_net_admin(&mut command);
+        let output = command.output().unwrap();
+        assert!(output.status.success());
+        let child = String::from_utf8(output.stdout).unwrap();
+        let available = cap(&parent, "CapPrm:") & (1 << 12);
+        assert_eq!(cap(&child, "CapEff:") & (1 << 12), available);
+        assert_eq!(cap(&child, "CapAmb:") & (1 << 12), available);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn owned_ipv6_route_forms_use_the_fixed_helper() {
+        for action in ["add", "del"] {
+            for prefix in ["::/1", "8000::/1"] {
+                assert_eq!(
+                    Tunnel::helper_line_for(
+                        "v6",
+                        &[
+                            "-6",
+                            "route",
+                            action,
+                            "blackhole",
+                            prefix,
+                            "proto",
+                            "242",
+                            "metric",
+                            "1"
+                        ]
+                    ),
+                    Some(format!("v6\troute6_owned_block_{action}\t{prefix}"))
+                );
+                assert_eq!(
+                    Tunnel::helper_line_for(
+                        "v6",
+                        &[
+                            "-6", "route", action, prefix, "dev", "tun0", "proto", "242", "metric",
+                            "2"
+                        ]
+                    ),
+                    Some(format!("v6\troute6_owned_tun_{action}\t{prefix}\ttun0"))
+                );
+            }
+            assert_eq!(
+                Tunnel::helper_line_for(
+                    "v6",
+                    &[
+                        "-6",
+                        "route",
+                        action,
+                        "2001:db8::7/128",
+                        "dev",
+                        "eth0",
+                        "proto",
+                        "242",
+                        "metric",
+                        "1"
+                    ]
+                ),
+                Some(format!(
+                    "v6\troute6_owned_bypass_{action}\t2001:db8::7/128\teth0\t-"
+                ))
+            );
+            assert_eq!(
+                Tunnel::helper_line_for(
+                    "v6",
+                    &[
+                        "-6",
+                        "route",
+                        action,
+                        "2001:db8::7/128",
+                        "dev",
+                        "eth0",
+                        "via",
+                        "fe80::1",
+                        "proto",
+                        "242",
+                        "metric",
+                        "1"
+                    ]
+                ),
+                Some(format!(
+                    "v6\troute6_owned_bypass_{action}\t2001:db8::7/128\teth0\tfe80::1"
+                ))
+            );
+        }
+        for args in [
+            vec![
+                "-6",
+                "route",
+                "add",
+                "blackhole",
+                "::/0",
+                "proto",
+                "242",
+                "metric",
+                "1",
+            ],
+            vec![
+                "-6",
+                "route",
+                "add",
+                "blackhole",
+                "::/1",
+                "proto",
+                "99",
+                "metric",
+                "1",
+            ],
+            vec![
+                "-6",
+                "route",
+                "add",
+                "blackhole",
+                "::/1",
+                "proto",
+                "242",
+                "metric",
+                "2",
+            ],
+            vec![
+                "-6", "route", "add", "::/1", "dev", "tun0", "proto", "242", "metric", "1",
+            ],
+            vec![
+                "-6",
+                "route",
+                "add",
+                "2001:db8::/64",
+                "dev",
+                "eth0",
+                "proto",
+                "242",
+                "metric",
+                "1",
+            ],
+        ] {
+            assert!(Tunnel::helper_line_for("v6", &args).is_none(), "{args:?}");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn test_helper_line_for_delete_and_restore_shapes() {
+        assert!(Tunnel::build_helper_wire(&[
+            ("mtu", &["link", "set", "dev", "aivpn0", "mtu", "1400"]),
+            ("addr", &["addr", "replace", "10.8.0.2/24", "dev", "aivpn0"]),
+            (
+                "route",
+                &["route", "replace", "10.8.0.0/24", "dev", "aivpn0"]
+            ),
+        ])
+        .is_some());
+
         // The teardown paths (disable_full_tunnel / remove_split_routes /
         // restore_ipv6) feed these shapes into run_ip_batch_privileged; each
         // must map to a whitelisted helper verb so the helper path (rather

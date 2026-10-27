@@ -88,16 +88,18 @@ struct HelperResponse: Codable {
     let pid: Int?
     let version: String?
     let log: String?
+    var session: String?
 
     init(status: String, message: String,
          connected: Bool? = nil, pid: Int? = nil,
-         version: String? = nil, log: String? = nil) {
+         version: String? = nil, log: String? = nil, session: String? = nil) {
         self.status = status
         self.message = message
         self.connected = connected
         self.pid = pid
         self.version = version
         self.log = log
+        self.session = session
     }
 }
 
@@ -110,6 +112,9 @@ var isConnected = false
 // reported), and this flag preserves the one-shot "Process exited" + last
 // error line report that getStatus owes the GUI's next status poll.
 var clientExited = false
+var managedAdminSession = UUID().uuidString
+let adminRelaySlots = DispatchSemaphore(value: 8)
+let adminRelayQueue = DispatchQueue(label: "aivpn.helper.admin", attributes: .concurrent)
 var childReapSources: [pid_t: DispatchSourceProcess] = [:]
 
 // Serial queue that serialises all connection state mutations (managedPID,
@@ -561,6 +566,7 @@ func startClient(key: String, fullTunnel: Bool, binaryPath: String?, mtlsCertPat
     }
 
     managedPID = pid
+    managedAdminSession = UUID().uuidString
     isConnected = false
     try? "\(pid)".write(toFile: PID_PATH, atomically: true, encoding: .utf8)
     log("Started aivpn-client (PID: \(pid))")
@@ -1280,7 +1286,7 @@ func handleConnection(_ clientFD: Int32) {
     guard let lenBytes = readExact(clientFD, count: 4) else { return }
     let payloadLen = Int(lenBytes[0]) << 24 | Int(lenBytes[1]) << 16
                    | Int(lenBytes[2]) << 8  | Int(lenBytes[3])
-    guard payloadLen > 0 && payloadLen <= 65535 else {
+    guard payloadLen > 0 && payloadLen <= 2 * LocalAdminIPC.maxFrame else {
         sendResponse(clientFD, HelperResponse(status: "error", message: "Invalid message length"))
         return
     }
@@ -1320,6 +1326,34 @@ func handleConnection(_ clientFD: Int32) {
                                bootstrapTelegramChat: request.bootstrapTelegramChat,
                                bootstrapGithub: request.bootstrapGithub,
                                serverSigningKey: request.serverSigningKey)
+
+    case "admin":
+        guard request.key == managedAdminSession, clientProcessAlive(),
+              let command = request.service, command.utf8.count <= LocalAdminIPC.maxFrame - 65,
+              command == "role" || command.hasPrefix("mgmt:") || command.hasPrefix("qr:") || command.hasPrefix("bench:"),
+              let token = try? String(contentsOfFile: "/tmp/aivpn-0/admin.token", encoding: .utf8),
+              token.trimmingCharacters(in: .whitespacesAndNewlines).count == 64 else {
+            response = HelperResponse(status: "error", message: "Admin session changed or unavailable")
+            break
+        }
+        guard adminRelaySlots.wait(timeout: .now()) == .success else {
+            response = HelperResponse(status: "error", message: "Too many admin requests")
+            break
+        }
+        let duplicate = dup(clientFD)
+        guard duplicate >= 0 else {
+            adminRelaySlots.signal()
+            response = HelperResponse(status: "error", message: "Admin request unavailable")
+            break
+        }
+        let session = managedAdminSession
+        adminRelayQueue.async {
+            defer { close(duplicate); adminRelaySlots.signal() }
+            let reply = relayAdminCommand(token: token.trimmingCharacters(in: .whitespacesAndNewlines), command: command)
+            sendResponse(duplicate, HelperResponse(status: reply == nil ? "error" : "ok",
+                message: reply == nil ? "Admin request failed" : "", log: reply, session: session))
+        }
+        return
 
     case "disconnect":
         response = stopClient()
@@ -1374,7 +1408,13 @@ func handleConnection(_ clientFD: Int32) {
                                   message: "Unknown action: \(request.action)")
     }
 
-    sendResponse(clientFD, response)
+    var boundResponse = response
+    boundResponse.session = managedPID > 0 ? managedAdminSession : nil
+    sendResponse(clientFD, boundResponse)
+}
+
+func relayAdminCommand(token: String, command: String) -> String? {
+    LocalAdminIPC.clientRequest("\(token):\(command)")
 }
 
 /// Send a JSON response to the client
@@ -1460,6 +1500,7 @@ func recoverExistingClient() {
             return
         }
         managedPID = pid
+    managedAdminSession = UUID().uuidString
         log("Recovered aivpn-client (PID: \(pid))")
         if let logContent = try? String(contentsOfFile: LOG_PATH, encoding: .utf8) {
             if logContent.contains("PFS ratchet complete") ||
@@ -1545,7 +1586,11 @@ func main() {
         }
 
         guard clientFD >= 0 else {
-            if errno == EINTR { continue }
+            if [EINTR, ECONNABORTED, EAGAIN, ENOBUFS, EMFILE, ENFILE].contains(errno) {
+                if errno != EINTR && errno != ECONNABORTED { usleep(100_000) }
+                continue
+            }
+            log("accept failed (errno \(errno))")
             break
         }
 

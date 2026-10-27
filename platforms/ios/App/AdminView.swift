@@ -83,7 +83,7 @@ private enum AdminExitNodeChoice: Hashable {
 /// same `address`) don't produce duplicate Picker rows.
 private func adminLoadPoolNodeAddresses() async -> [String] {
     guard case .success(let nodes) = await AdminApi.poolNodes() else { return [] }
-    let addrs = nodes.compactMap { $0.address?.trimmingCharacters(in: .whitespaces) }
+    let addrs = nodes.filter { !$0.revoked }.compactMap { $0.address?.trimmingCharacters(in: .whitespaces) }
         .filter { !$0.isEmpty }
     return Array(Set(addrs)).sorted()
 }
@@ -834,6 +834,7 @@ private struct AdminClientDetailView: View {
         isResettingDevice = false
         switch result {
         case .success:
+            client.device_bound = false
             resetMessage = loc.t("admin_reset_device_done")
         case .failure(let err):
             resetMessage = err.errorDescription

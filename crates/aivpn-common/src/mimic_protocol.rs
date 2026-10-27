@@ -1,25 +1,12 @@
-//! Per-protocol DPI-mimicry finalization.
+//! Финализация полей статической маски после сборки внутреннего пакета.
 //!
-//! A [`MimicProtocol`] names the wire protocol a mask mimics and owns the
-//! POST-ASSEMBLY fixups that make a fully-built `[mdh][ciphertext]` packet pass
-//! that protocol's *real* DPI validation (e.g. nDPI's `is_stun`).
-//!
-//! This is the extension point for mimicked protocols: adding one (QUIC, DNS,
-//! …) means adding a variant here and implementing its [`MimicProtocol::finalize`]
-//! — nothing in the packet-build path changes. The per-protocol knowledge stays
-//! in one place instead of being scattered as `spoof_protocol`-gated branches in
-//! the mimicry engine.
+//! STUN получает длины сообщения и атрибута. Для QUIC этого недостаточно:
+//! внешние кадры и таймеры обслуживает отдельный движок состояния маски.
 
 use crate::crypto::TAG_SIZE;
 use crate::mask::{MaskProfile, SpoofProtocol};
-use crate::quic_initial::{build_quic_initial, QUIC_MIN_DATAGRAM};
 
-/// The wire protocol a mask mimics, together with its post-assembly DPI fixups.
-///
-/// A small copy enum rather than a `dyn` trait: the set of mimicked protocols is
-/// closed and known at compile time, the per-protocol state lives in the
-/// [`MaskProfile`] (not the handler), and dispatch is a cheap `match`. Adding a
-/// protocol is still a one-variant, one-`finalize`-arm change.
+/// Выбор финализации статического заголовка, без состояния соединения.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MimicProtocol {
     /// No protocol-specific fixup (raw / opaque UDP).
@@ -27,7 +14,7 @@ pub enum MimicProtocol {
     /// WebRTC STUN (RFC 5389). Patches the STUN message-length field so
     /// `msg_len + 20 == udp_payload_len`, which nDPI's `is_stun` requires.
     Stun,
-    /// QUIC (RFC 9000 / 9001). No fixup yet — see [`MimicProtocol::finalize`].
+    /// QUIC: внутренний пакет передается движку состояния маски.
     Quic,
     /// DNS over UDP.
     Dns,
@@ -40,7 +27,10 @@ impl MimicProtocol {
     /// post-assembly DPI fixups.
     pub fn for_spoof(spoof: SpoofProtocol) -> Self {
         match spoof {
-            SpoofProtocol::WebRTC_STUN => MimicProtocol::Stun,
+            SpoofProtocol::WebRTC_STUN
+            | SpoofProtocol::WebRTC_DTLS_SRTP
+            | SpoofProtocol::WebRTC_TURN_DTLS_SRTP
+            | SpoofProtocol::WebRTC_SDES_SRTP => MimicProtocol::Stun,
             SpoofProtocol::QUIC => MimicProtocol::Quic,
             SpoofProtocol::DNS_over_UDP => MimicProtocol::Dns,
             SpoofProtocol::HTTPS_H2 => MimicProtocol::Tls,
@@ -48,56 +38,30 @@ impl MimicProtocol {
         }
     }
 
-    /// Whether this protocol *constructs* the entire datagram at build time
-    /// (a variable-size, crypto-built header coalesced with aivpn's ciphertext)
-    /// instead of the default in-place layout of
-    /// `[mdh-with-embedded-tag][ciphertext]` + [`finalize`].
-    ///
-    /// QUIC is the only such protocol today: a real RFC 9001 Initial cannot be
-    /// patched into a fixed buffer after the fact (its length, AEAD tag and
-    /// header protection all depend on the payload), so it is emitted directly
-    /// by [`emit`](Self::emit).
+    /// Статический профиль больше не собирает внешний QUIC без состояния.
     pub fn is_constructed(&self) -> bool {
-        matches!(self, MimicProtocol::Quic)
+        false
     }
 
-    /// Construct the full outgoing datagram for a *constructed* protocol
-    /// ([`is_constructed`](Self::is_constructed)). `tag` is the 8-byte resonance
-    /// tag and `ciphertext` is aivpn's real encrypted payload; the returned
-    /// datagram is a decoy protocol header (carrying `tag`) coalesced with
-    /// `ciphertext`. Returns `None` for the default in-place protocols, which
-    /// use the `[mdh][ciphertext]` + [`finalize`](Self::finalize) path instead.
-    pub fn emit(&self, tag: &[u8; TAG_SIZE], ciphertext: &[u8]) -> Option<Vec<u8>> {
-        match self {
-            // QUIC: coalesce a genuine, decryptable RFC 9001 v1 Initial (DCID =
-            // resonance tag) with aivpn's ciphertext, padded to nDPI's 1200-byte
-            // Initial floor. See `quic_initial::build_quic_initial`.
-            MimicProtocol::Quic => Some(build_quic_initial(tag, ciphertext, QUIC_MIN_DATAGRAM)),
-            _ => None,
-        }
+    /// Сохранено для вызывающего кода. Внешние кадры здесь не создаются.
+    pub fn emit(&self, _tag: &[u8; TAG_SIZE], _ciphertext: &[u8]) -> Option<Vec<u8>> {
+        None
     }
 
-    /// Apply protocol-specific POST-ASSEMBLY fixups to a fully-built packet so it
-    /// passes the mimicked protocol's real-DPI validation.
-    ///
-    /// Called once the entire `[mdh][ciphertext]` packet (the Variant A
-    /// embedded-tag layout, protocol header at offset 0) is assembled — the same
-    /// point at which the resonance tag is embedded. A no-op for protocols with
-    /// no length/consistency field to reconcile.
-    pub fn finalize(&self, packet: &mut [u8], mask: &MaskProfile) {
+    /// Согласует поля длины, не подменяя обмен состоянием соединения.
+    pub fn finalize(&self, packet: &mut [u8], mask: &MaskProfile) -> crate::error::Result<()> {
         match self {
             // STUN: reconcile the message-length field with the final packet
             // size. The exact computation lives on `MaskProfile` as this
             // handler's implementation detail.
-            MimicProtocol::Stun => mask.patch_stun_length(packet),
+            MimicProtocol::Stun => return mask.finalize_packet(packet),
             MimicProtocol::Quic => {
-                // QUIC is a *constructed* protocol: its RFC 9001 Initial is built
-                // whole by `emit()` at build time, not patched in place here.
-                // See `is_constructed`/`emit`. Nothing to fix up post-assembly.
+                // TLS, номера пакетов и CID принадлежат движку состояния.
             }
             // Raw/DNS/TLS carry no post-assembly consistency field today.
             MimicProtocol::Raw | MimicProtocol::Dns | MimicProtocol::Tls => {}
         }
+        Ok(())
     }
 }
 
@@ -131,19 +95,21 @@ mod tests {
     }
 
     #[test]
-    fn stun_finalize_is_byte_identical_to_patch_stun_length() {
+    fn stun_finalize_uses_the_shared_tlv_builder() {
         // The refactor must not change STUN's post-assembly behavior: routing
         // through MimicProtocol::finalize produces exactly what a direct
         // patch_stun_length call would.
         let mask = preset_masks::webrtc_zoom_v3();
         let proto = MimicProtocol::for_spoof(mask.spoof_protocol);
         assert_eq!(proto, MimicProtocol::Stun);
-        for total in [20usize, 21, 40, 170, 1380] {
+        for total in [24usize, 40, 172, 1380] {
             let mut via_finalize = vec![0u8; total];
+            via_finalize[4..8].copy_from_slice(&[0x21, 0x12, 0xa4, 0x42]);
             let mut via_direct = vec![0u8; total];
-            proto.finalize(&mut via_finalize, &mask);
+            proto.finalize(&mut via_finalize, &mask).unwrap();
             mask.patch_stun_length(&mut via_direct);
-            assert_eq!(via_finalize, via_direct);
+            assert_eq!(&via_finalize[2..4], &via_direct[2..4]);
+            crate::stun_wire::validate(&via_finalize).unwrap();
             // And the nDPI is_stun invariant holds.
             let msg_len = u16::from_be_bytes([via_finalize[2], via_finalize[3]]) as usize;
             assert_eq!(msg_len + 20, total);
@@ -157,7 +123,7 @@ mod tests {
         let proto = MimicProtocol::for_spoof(mask.spoof_protocol);
         assert_eq!(proto, MimicProtocol::Quic);
         let mut packet = vec![0xABu8; 200];
-        proto.finalize(&mut packet, &mask);
+        proto.finalize(&mut packet, &mask).unwrap();
         assert_eq!(packet, vec![0xABu8; 200]);
     }
 }

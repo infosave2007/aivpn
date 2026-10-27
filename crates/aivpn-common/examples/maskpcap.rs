@@ -1,4 +1,5 @@
-//! Записывает реальные кадры MimicryEngine в PCAP для независимой DPI-проверки.
+//! Записывает внутренние кадры MimicryEngine, без сетевого handshake.
+//! Для проверки внешнего трафика используется deploy/ci/ci-mask-gate.sh.
 use std::io::Write;
 
 use aivpn_common::client_wire::build_inner_packet;
@@ -13,6 +14,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("usage: maskpcap MASK.json OUTPUT.pcap".into());
     }
     let mask: MaskProfile = serde_json::from_slice(&std::fs::read(&args[1])?)?;
+    if mask.spoof_protocol == aivpn_common::mask::SpoofProtocol::QUIC {
+        return Err("Для QUIC нужен двусторонний обмен: deploy/ci/ci-mask-gate.sh".into());
+    }
     let mut output = std::fs::File::create(&args[2])?;
     output.write_all(&0xa1b2c3d4u32.to_le_bytes())?;
     output.write_all(&2u16.to_le_bytes())?;

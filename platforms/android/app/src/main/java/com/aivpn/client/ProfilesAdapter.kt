@@ -3,6 +3,8 @@ package com.aivpn.client
 import android.graphics.Typeface
 import android.view.LayoutInflater
 import android.view.ViewGroup
+import android.view.View
+import android.widget.PopupMenu
 import androidx.recyclerview.widget.DiffUtil
 import androidx.recyclerview.widget.ListAdapter
 import androidx.recyclerview.widget.RecyclerView
@@ -20,6 +22,11 @@ class ProfilesAdapter(
             notifyItemRangeChanged(0, itemCount)
         }
     var editingEnabled: Boolean = true
+        set(value) {
+            if (field == value) return
+            field = value
+            notifyItemRangeChanged(0, itemCount)
+        }
 
     inner class ViewHolder(val binding: ItemProfileBinding) :
         RecyclerView.ViewHolder(binding.root)
@@ -39,14 +46,29 @@ class ProfilesAdapter(
             profileServer.text = ConnectionKeyParser.serverAddrFrom(profile.key)
             profileName.setTypeface(
                 null,
-                if (isActive) Typeface.BOLD else Typeface.NORMAL
+                Typeface.NORMAL
             )
+            profileSelected.visibility = if (isActive) View.VISIBLE else View.GONE
+            root.setCardBackgroundColor(UiAppearance.color(root.context,
+                if (isActive) com.google.android.material.R.attr.colorPrimaryContainer
+                else com.google.android.material.R.attr.colorSurfaceContainer))
+            root.isEnabled = editingEnabled
             root.setOnClickListener { onProfileClick(profile) }
-            val editVis = if (editingEnabled) android.view.View.VISIBLE else android.view.View.GONE
-            btnEdit.visibility   = editVis
-            btnDelete.visibility = editVis
-            btnEdit.setOnClickListener   { onEditClick(profile) }
-            btnDelete.setOnClickListener { onDeleteClick(profile) }
+            btnMore.isEnabled = editingEnabled
+            btnMore.contentDescription = root.context.getString(R.string.ui_profile_actions, profile.name)
+            btnMore.setOnClickListener { anchor ->
+                if (!editingEnabled) return@setOnClickListener
+                PopupMenu(root.context, anchor).apply {
+                    menu.add(0, 1, 0, R.string.btn_edit)
+                    menu.add(0, 2, 1, R.string.btn_delete)
+                    setOnMenuItemClickListener { item ->
+                        if (editingEnabled) {
+                            if (item.itemId == 1) onEditClick(profile) else onDeleteClick(profile)
+                        }
+                        true
+                    }
+                }.show()
+            }
         }
     }
 

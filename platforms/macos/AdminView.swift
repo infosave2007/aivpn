@@ -26,7 +26,7 @@ struct AdminClientView: Codable, Identifiable, Equatable {
     let vpn_ip: String
     let enabled: Bool
     let one_time: Bool
-    let device_bound: Bool
+    var device_bound: Bool
     let created_at: String
     let expires_at: String?
     let role: String
@@ -184,7 +184,16 @@ private func exitNodeChoice(for value: String?, poolNodes: [AdminPoolNodeView]) 
 /// `exitNode` is the value actually sent to the server; `choice` only drives
 /// which control is shown, kept in sync with `exitNode` via `onChange`
 /// (see `ExitNodeChoice`'s doc comment above).
-private struct ExitNodePickerView: View {
+func availableExitNodes(_ nodes: [AdminPoolNodeView]) -> [AdminPoolNodeView] {
+    var seen = Set<String>()
+    return nodes.filter { node in
+        guard !node.revoked, let address = node.address,
+              !address.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return false }
+        return seen.insert(address).inserted
+    }
+}
+
+struct ExitNodePickerView: View {
     @Binding var exitNode: String
     @Binding var choice: ExitNodeChoice
     let poolNodes: [AdminPoolNodeView]
@@ -197,7 +206,7 @@ private struct ExitNodePickerView: View {
                 .foregroundColor(.secondary)
             Picker("", selection: $choice) {
                 Text(loc.t("admin_exit_node_global")).tag(ExitNodeChoice.globalDefault)
-                ForEach(poolNodes.filter { $0.address != nil }) { node in
+                ForEach(availableExitNodes(poolNodes)) { node in
                     Text("\(node.node_id) (\(node.address!))").tag(ExitNodeChoice.node(node.address!))
                 }
                 Text(loc.t("admin_exit_node_custom")).tag(ExitNodeChoice.custom)
@@ -317,10 +326,33 @@ final class AdminStore: ObservableObject {
     @Published var auditChannelUnavailable = false
     @Published var auditNotConfigured = false
 
+    func resetSession() {
+        clients = []
+        status = nil
+        role = nil
+        isLoading = false
+        channelUnavailable = true
+        poolNodes = []
+        poolHealth = nil
+        poolLoading = false
+        poolChannelUnavailable = true
+        auditEntries = []
+        auditVerified = nil
+        auditBrokenAt = nil
+        auditLoading = false
+        auditChannelUnavailable = true
+        auditNotConfigured = false
+    }
+
     private func run<T>(_ work: @escaping () -> T, completion: @escaping (T) -> Void) {
+        let binding = AdminApi.captureSession()
         DispatchQueue.global(qos: .userInitiated).async {
-            let result = work()
-            DispatchQueue.main.async { completion(result) }
+            guard AdminApi.isCurrent(binding) else { return }
+            let result = AdminApi.withSession(binding, work)
+            DispatchQueue.main.async {
+                guard AdminApi.isCurrent(binding) else { return }
+                completion(result)
+            }
         }
     }
 
@@ -368,21 +400,21 @@ final class AdminStore: ObservableObject {
                 completion(false, result?.status)
                 return
             }
-            guard let exitNode = exitNode,
-                  let created = try? JSONDecoder().decode(AdminClientView.self, from: body) else {
+            guard let exitNode else {
                 self.refreshClients()
                 completion(true, status)
                 return
             }
+            guard let created = try? JSONDecoder().decode(AdminClientView.self, from: body) else {
+                self.refreshClients()
+                completion(true, 0)
+                return
+            }
             self.updateClient(id: created.id, name: nil, enabled: nil,
                                expiresAt: nil, clearExpiresAt: false,
-                               exitNode: exitNode, clearExitNode: false) { _, _ in
-                // The client was already created successfully; a failure to
-                // apply the exit-node follow-up is surfaced to the caller as
-                // a partial success (still `true`) — refreshClients() below
-                // will show whatever the server actually ended up with.
+                               exitNode: exitNode, clearExitNode: false) { success, patchStatus in
                 self.refreshClients()
-                completion(true, status)
+                completion(true, success ? 201 : patchStatus)
             }
         }
     }
@@ -689,6 +721,11 @@ struct AdminRootView: View {
             }
         }
         .frame(minWidth: 480, minHeight: 420)
+        .onReceive(NotificationCenter.default.publisher(for: .aivpnAdminSessionChanged)) { _ in
+            selectedClient = nil
+            showAddSheet = false
+            store.resetSession()
+        }
         .onAppear {
             store.refreshRole()
             store.refreshClients()
@@ -855,6 +892,7 @@ struct AdminAddClientSheet: View {
     /// original free-text field).
     @State private var exitNodeChoice: ExitNodeChoice = .globalDefault
     @State private var isCreating = false
+    @State private var creationCompleted = false
     @State private var errorText: String?
 
     var body: some View {
@@ -890,7 +928,7 @@ struct AdminAddClientSheet: View {
                     createTapped()
                 }
                 .keyboardShortcut(.defaultAction)
-                .disabled(name.trimmingCharacters(in: .whitespaces).isEmpty || isCreating)
+                .disabled(name.trimmingCharacters(in: .whitespaces).isEmpty || isCreating || creationCompleted)
             }
         }
         .padding(20)
@@ -915,8 +953,11 @@ struct AdminAddClientSheet: View {
                             expiresAt: expiresEnabled ? expiresAt : nil,
                             exitNode: trimmedExitNode.isEmpty ? nil : trimmedExitNode) { success, status in
             isCreating = false
-            if success {
+            if success, status == 201 {
                 isPresented = false
+            } else if success {
+                creationCompleted = true
+                errorText = loc.t("admin_created_exit_failed") + " " + adminErrorMessage(status: status, loc: loc)
             } else {
                 errorText = adminErrorMessage(status: status, loc: loc)
             }
@@ -928,7 +969,7 @@ struct AdminAddClientSheet: View {
 
 struct AdminClientDetailSheet: View {
     @ObservedObject var store: AdminStore
-    let client: AdminClientView
+    @State var client: AdminClientView
     @EnvironmentObject var loc: LocalizationManager
     @Environment(\.dismiss) private var dismiss
 
@@ -949,6 +990,7 @@ struct AdminClientDetailSheet: View {
     @State private var showResetConfirm = false
     @State private var isBusy = false
     @State private var actionError: String?
+    @State private var resetFeedback: String?
 
     @State private var connectionKey: String?
     @State private var isLoadingKey = false
@@ -980,6 +1022,7 @@ struct AdminClientDetailSheet: View {
 
                 actionsSection
 
+                if let resetFeedback { Text(resetFeedback).foregroundColor(.green) }
                 if let actionError = actionError {
                     Text(actionError)
                         .font(.caption)
@@ -1232,7 +1275,10 @@ struct AdminClientDetailSheet: View {
         actionError = nil
         store.resetDevice(id: client.id) { success, status in
             isBusy = false
-            if !success {
+            if success {
+                client.device_bound = false
+                resetFeedback = loc.t("admin_reset_device_done")
+            } else {
                 actionError = adminErrorMessage(status: status, loc: loc)
             }
         }
@@ -1255,8 +1301,15 @@ struct AdminClientDetailSheet: View {
     }
 
     private func copyKey(_ key: String) {
-        NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(key, forType: .string)
+        let pasteboard = NSPasteboard.general
+        pasteboard.prepareForNewContents(with: .currentHostOnly)
+        pasteboard.setString(key, forType: .string)
+        pasteboard.setData(Data(), forType: NSPasteboard.PasteboardType("org.nspasteboard.ConcealedType"))
+        pasteboard.setData(Data(), forType: NSPasteboard.PasteboardType("org.nspasteboard.TransientType"))
+        let change = pasteboard.changeCount
+        DispatchQueue.main.asyncAfter(deadline: .now() + 120) {
+            if pasteboard.changeCount == change { pasteboard.clearContents() }
+        }
         copiedFeedback = true
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
             copiedFeedback = false

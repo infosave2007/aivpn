@@ -292,8 +292,8 @@ class LocalizationManager: ObservableObject {
             "ru": "Kill Switch (блок трафика при разрыве VPN)"
         ],
         "kill_switch_help": [
-            "en": "Block all non-VPN traffic while connected. Rules persist after unexpected process death.",
-            "ru": "Блокировать весь трафик вне VPN. Правила сохраняются после аварийного завершения."
+            "en": "Block new non-VPN connections. Existing connections stay open. Rules persist after unexpected process death.",
+            "ru": "Блокировать новые соединения вне VPN. Уже открытые соединения сохраняются. Правила сохраняются после аварийного завершения."
         ],
         "notification_connected": [
             "en": "AIVPN Connected",
@@ -528,6 +528,8 @@ class LocalizationManager: ObservableObject {
             "en": "This immediately disconnects the client and invalidates its connection key. This cannot be undone.",
             "ru": "Клиент будет немедленно отключён, а его ключ подключения станет недействительным. Это действие необратимо."
         ],
+        "admin_created_exit_failed": ["en": "Client created, but the exit node was not set. Open the client to retry.", "ru": "Клиент создан, но выходной узел не настроен. Повторите настройку в карточке клиента."],
+        "admin_reset_device_done": ["en": "Device binding reset", "ru": "Привязка устройства сброшена"],
         "admin_reset_device": [
             "en": "Reset Device Binding",
             "ru": "Сбросить привязку устройства"

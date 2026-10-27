@@ -151,7 +151,12 @@ object SecureStorage {
         var depth = 0
         while (cause != null && depth < 6) {
             // Transient Android Keystore failure — data on disk is fine; never wipe.
-            if (cause is android.security.KeyStoreException) return false
+            // Класс был скрытым на старых Android; не связываем байткод с API 33.
+            var type: Class<*>? = cause.javaClass
+            while (type != null) {
+                if (type.name == "android.security.KeyStoreException") return false
+                type = type.superclass
+            }
             // AEAD tag mismatch: the keyset/master key genuinely no longer decrypts
             // the ciphertext (backup restore, OTA, Keystore wipe) — unrecoverable.
             if (cause is javax.crypto.AEADBadTagException) return true
@@ -196,6 +201,33 @@ object SecureStorage {
         } catch (e: Exception) {
             android.util.Log.w(TAG, "Master key delete failed: ${e.message}")
         }
+    }
+
+    /** Переносит параметры транспорта целиком, сохраняя старые данные при ошибке записи. */
+    fun transportPreferences(context: Context): SharedPreferences = synchronized(this) {
+        val secure = getPrefs(context)
+        val legacy = context.getSharedPreferences(PrefsKeys.PREFS_NAME, Context.MODE_PRIVATE)
+        val values = legacy.all.filterKeys {
+            it.startsWith("ext_field_") || it == PrefsKeys.PREF_EXT_TRANSPORT_NAME ||
+                it == PrefsKeys.PREF_EXT_TRANSPORT_PARAMS
+        }
+        if (values.isNotEmpty()) {
+            val update = secure.edit()
+            for ((key, value) in values) {
+                if (secure.contains(key)) continue
+                when (value) {
+                    is String -> update.putString(key, value)
+                    is Boolean -> update.putBoolean(key, value)
+                    is Int -> update.putInt(key, value)
+                    else -> throw IllegalStateException("Неверный тип параметра транспорта")
+                }
+            }
+            check(update.commit()) { "Не удалось сохранить параметры транспорта" }
+            val cleanup = legacy.edit()
+            values.keys.forEach { cleanup.remove(it) }
+            check(cleanup.commit()) { "Не удалось удалить старые параметры транспорта" }
+        }
+        secure
     }
 
     fun saveString(context: Context, key: String, value: String) {

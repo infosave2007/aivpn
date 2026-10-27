@@ -159,6 +159,11 @@ pub(crate) fn make_kernel_downlink(sess: &mut crate::session::Session) -> Option
         return None;
     }
     let mask = sess.mask.as_ref()?;
+    // ABI ядра пока не заполняет длину атрибута и padding STUN.
+    // Прием остается ускоренным, отправку оставляем общему сборщику.
+    if mask.uses_stun_attributes() || aivpn_common::mask_io::requires_userspace(mask) {
+        return None;
+    }
     let mdh = packet_mdh_bytes_for_mask(mask);
     if mdh.is_empty() || mdh.len() > DL_MDH_MAX {
         return None;
@@ -512,13 +517,24 @@ pub(crate) fn kernel_input_from_session(
         .client_id
         .as_deref()
         .and_then(|id| db.and_then(|db| db.find_by_id(id)));
-    kernel_limits_for(
+    let mut input = kernel_limits_for(
         sess,
         client.as_ref(),
         network,
         allow_peer_routing,
         global_exit,
-    )
+    );
+    input.userspace_tx |= sess
+        .mask
+        .as_ref()
+        .is_some_and(|mask| mask.uses_stun_attributes());
+    let stateful_mask = sess
+        .mask
+        .as_ref()
+        .is_some_and(aivpn_common::mask_io::requires_userspace);
+    input.userspace_rx |= stateful_mask;
+    input.userspace_tx |= stateful_mask;
+    input
 }
 
 fn stored_policy_sig(fingerprint: u64) -> u64 {
@@ -786,7 +802,8 @@ pub(crate) fn kernel_note_rejected(
     previous_epoch: bool,
 ) {
     if previous_epoch {
-        sess.mark_pre_ratchet_received(counter);
+        // Отказ claim не подтверждает продвижение счетчика для поиска новой эпохи.
+        sess.pre_ratchet_received.insert(counter);
         return;
     }
     if counter > sess.counter {
@@ -1167,6 +1184,44 @@ mod tests {
         kernel_note_rejected(&mut sess, 7, true);
         assert!(sess.pre_ratchet_received.contains(&7));
         assert_eq!(sess.counter, 0);
+    }
+
+    #[test]
+    fn rejected_old_epoch_does_not_advance_inline_search_hint() {
+        use crate::session::SessionManager;
+        use aivpn_common::{crypto, mask::preset_masks};
+        let manager = SessionManager::new(
+            crypto::KeyPair::generate(),
+            ed25519_dalek::SigningKey::from_bytes(&[31; 32]),
+            preset_masks::webrtc_zoom_v3(),
+        );
+        let session = manager
+            .create_session(
+                "203.0.113.1:443".parse().unwrap(),
+                crypto::KeyPair::generate().public_key_bytes(),
+                None,
+                None,
+            )
+            .unwrap();
+        let id = {
+            let mut state = session.lock();
+            state.keys = crypto::derive_session_keys(&[3; 32], None, &[4; 32]);
+            state.is_ratcheted = true;
+            state.mark_tag_received(1000);
+            state.pending_rekey_keypair = Some(crypto::KeyPair::generate());
+            state.update_tag_window();
+            state.session_id
+        };
+        manager.commit_session_rekey(&id, &crypto::KeyPair::generate().public_key_bytes());
+        let mut state = session.lock();
+        assert_eq!(state.tag_search_center(), 1000);
+        kernel_note_rejected(&mut state, 1700, true);
+        assert!(state.pre_ratchet_received.contains(&1700));
+        assert_eq!(state.tag_search_center(), 1000);
+        assert_eq!(state.counter, 1000);
+        let old_tags = state.pre_ratchet_tags.clone();
+        assert!(!state.refresh_tag_window_if_needed());
+        assert_eq!(state.pre_ratchet_tags, old_tags);
     }
     #[test]
     fn packet_features_gate_only_the_required_direction() {

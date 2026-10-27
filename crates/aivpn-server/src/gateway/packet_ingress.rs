@@ -5,29 +5,155 @@
 
 use super::*;
 
-/// M1: validate an FEC-recovered payload and return the real packet length.
-///
-/// An honest XOR recovery reproduces the missing packet zero-padded up to the
-/// group's max length — the encoder XORs only each packet's real bytes
-/// (`FecEncoder::feed`), so every byte past the missing packet's end cancels
-/// to 0. A false trigger (a reordered/foreign packet counted into the
-/// accumulator until `recv == group_size - 1`) XORs ≥3 unrelated payloads
-/// whose tails do NOT cancel; its version/IHL/inner-src bytes can still pass
-/// the anti-spoof check below, so without this proof the garbage (XOR of
-/// plaintext fragments) would be forwarded to NAT.
-///
-/// Returns `Some(tot_len)` — forward exactly that many bytes — or `None` to
-/// drop.
-pub(crate) fn fec_recovered_len(recovered: &[u8]) -> Option<usize> {
-    aivpn_common::ip_packet::IpPacket::parse(recovered).map(|packet| packet.length)
+fn hinted_bootstrap_mask(
+    descriptors: &[BootstrapDescriptor],
+    preshared_key: &[u8; 32],
+    requested_id: &str,
+) -> Option<MaskProfile> {
+    for descriptor in descriptors {
+        let Some(requested) =
+            requested_id.strip_prefix(&format!("bootstrap:{}:", descriptor.descriptor_id))
+        else {
+            continue;
+        };
+        let bases: Vec<_> = if !descriptor.embedded_masks.is_empty() {
+            descriptor.embedded_masks.clone()
+        } else if descriptor.base_mask_ids.is_empty() {
+            aivpn_common::mask::preset_masks::all()
+        } else {
+            descriptor
+                .base_mask_ids
+                .iter()
+                .filter_map(|id| aivpn_common::mask::preset_masks::by_id(id))
+                .collect()
+        };
+        for base in bases {
+            let Some(tail) = requested.strip_prefix(&format!("{}:", base.mask_id)) else {
+                continue;
+            };
+            let Some(slot) = tail
+                .split_once(':')
+                .and_then(|(slot, _)| slot.parse::<u8>().ok())
+            else {
+                continue;
+            };
+            if slot >= descriptor.candidate_count {
+                continue;
+            }
+            // Старый кеш может выбирать другую базу из того же epoch и соли.
+            // Восстанавливаем только известную базу; сам дескриптор не меняется.
+            let mut pinned = descriptor.clone();
+            pinned.base_mask_ids = vec![base.mask_id.clone()];
+            if !pinned.embedded_masks.is_empty() {
+                pinned.embedded_masks = vec![base];
+            }
+            let candidate =
+                aivpn_common::mask::derive_bootstrap_candidate(&pinned, Some(preshared_key), slot)?;
+            if candidate.mask_id == requested_id {
+                return Some(candidate);
+            }
+        }
+    }
+    None
 }
 
-/// True when `seq` is stale relative to the most recently processed FecRepair
-/// seq — i.e. not ahead of it within half a u16 cycle (wrapping-safe). The
-/// client numbers all inner packets monotonically, so such a Data packet
-/// belongs to an already-closed FEC group.
-pub(crate) fn fec_seq_is_stale(repair_seq_hi: u16, seq: u16) -> bool {
-    repair_seq_hi.wrapping_sub(seq) < 0x8000
+fn hinted_initial_mask(
+    current: &MaskProfile,
+    requested_id: &str,
+    trusted: &[MaskProfile],
+) -> Option<MaskProfile> {
+    // Префикс bootstrap сам по себе не дает права заменить операторскую маску.
+    let current_message = current.signing_message().ok()?;
+    if !trusted.iter().any(|candidate| {
+        candidate.mask_id == current.mask_id
+            && candidate
+                .signing_message()
+                .is_ok_and(|message| message == current_message)
+    }) {
+        return None;
+    }
+    let requested = trusted
+        .iter()
+        .find(|candidate| candidate.mask_id == requested_id)?;
+    (packet_layout_for_mask(current) == packet_layout_for_mask(&requested)
+        && current.tag_offset == requested.tag_offset
+        && (current.spoof_protocol == requested.spoof_protocol
+            || (current.spoof_protocol.is_stun() && requested.spoof_protocol.is_stun())))
+    .then(|| requested.clone())
+}
+
+#[cfg(test)]
+mod mask_hint_tests {
+    use super::*;
+
+    #[test]
+    fn bootstrap_hint_stays_within_the_known_descriptor_and_base() {
+        let signing_key = derive_server_signing_key(&[7; 32]);
+        let base = aivpn_common::mask::preset_masks::webrtc_zoom_v3();
+        for embedded in [false, true] {
+            let descriptor = super::super::bootstrap::build_bootstrap_descriptor(
+                &[7; 32],
+                &signing_key,
+                1,
+                if embedded {
+                    std::slice::from_ref(&base)
+                } else {
+                    &[]
+                },
+            );
+            let unchanged = descriptor.signing_bytes();
+            let expected = derive_bootstrap_candidates(&descriptor, Some(&[9; 32]))[0].clone();
+            let descriptors = std::slice::from_ref(&descriptor);
+            let actual = hinted_bootstrap_mask(descriptors, &[9; 32], &expected.mask_id).unwrap();
+            assert_eq!(
+                actual.signing_message().unwrap(),
+                expected.signing_message().unwrap()
+            );
+            for invalid in [
+                expected.mask_id.replace("epoch-1:", "epoch-2:"),
+                format!("{}:extra", expected.mask_id),
+                format!("bootstrap:epoch-1:{}:255:0000", base.mask_id),
+                "bootstrap:epoch-1:unknown:0:0000".into(),
+                "bootstrap:epoch-1:webrtc_zoom_v3:0:zzzz".into(),
+            ] {
+                assert!(
+                    hinted_bootstrap_mask(descriptors, &[9; 32], &invalid).is_none(),
+                    "{invalid}"
+                );
+            }
+            assert_eq!(descriptor.signing_bytes(), unchanged);
+        }
+    }
+
+    #[test]
+    fn authenticated_builtin_hint_replaces_ambiguous_generated_bootstrap() {
+        let base = aivpn_common::mask::preset_masks::webrtc_sberjazz_v1();
+        let desired = aivpn_common::mask::preset_masks::webrtc_zoom_v3();
+        let descriptor = super::super::bootstrap::build_bootstrap_descriptor(
+            &[7; 32],
+            &derive_server_signing_key(&[7; 32]),
+            1,
+            &[base],
+        );
+        let current = (0..=255u8)
+            .flat_map(|seed| derive_bootstrap_candidates(&descriptor, Some(&[seed; 32])))
+            .find(|candidate| packet_layout_for_mask(candidate) == packet_layout_for_mask(&desired))
+            .unwrap();
+        let trusted = vec![current.clone(), desired.clone()];
+        assert!(
+            hinted_initial_mask(&current, &desired.mask_id, &trusted).is_some(),
+            "Первый совпавший bootstrap не должен подменять запрошенный протокол"
+        );
+        let mut operator = current;
+        operator.iat_distribution.params = vec![123.0];
+        assert!(hinted_initial_mask(&operator, &desired.mask_id, &trusted).is_none());
+    }
+}
+
+/// Проверяет формат восстановленного IP-пакета и нулевой хвост до максимума группы.
+/// Принадлежность к группе проверяется отдельно по защищенным метаданным FEC.
+pub(crate) fn fec_recovered_len(recovered: &[u8]) -> Option<usize> {
+    aivpn_common::ip_packet::IpPacket::parse(recovered).map(|packet| packet.length)
 }
 
 impl super::Gateway {
@@ -63,6 +189,11 @@ impl super::Gateway {
         // В ABI ядра нет срока сертификата, поэтому его проверяет userspace.
         input.userspace_rx |= mtls_required;
         input.userspace_tx |= mtls_required;
+        // В ABI ядра нет выбора локального IP для UDP-ответа через другой интерфейс.
+        input.userspace_tx |= self
+            .udp_socket
+            .as_ref()
+            .is_some_and(|socket| socket.reply_sources().needs_source(sess.client_addr));
         let _ = kernel_maintain(ka, sess, tag_offset, mdh_len, &input, false);
     }
 
@@ -134,11 +265,73 @@ impl super::Gateway {
     }
 
     /// Handle incoming packet
+    #[cfg(test)]
     pub(crate) async fn handle_packet(
         &self,
         packet_data: &[u8],
         client_addr: SocketAddr,
     ) -> Result<()> {
+        self.handle_packet_with_source(packet_data, client_addr, None)
+            .await
+    }
+
+    pub(crate) async fn handle_packet_with_source(
+        &self,
+        packet_data: &[u8],
+        client_addr: SocketAddr,
+        local: Option<crate::udp_source::LocalEndpoint>,
+    ) -> Result<()> {
+        if let Some(socket) = self.udp_socket.as_ref() {
+            if socket.route_incoming(packet_data, client_addr) {
+                return Ok(());
+            }
+            if aivpn_common::quic_mask::QuicMask::initial_token(packet_data).is_some() {
+                let _work_lease =
+                    super::preauth::PreauthLease::acquire(self.handshake_work_budget.clone())
+                        .ok_or(Error::InvalidPacket("Handshake CPU budget exhausted"))?;
+                return socket.start_initial_with_budget(
+                    client_addr,
+                    packet_data,
+                    local,
+                    self.handshake_work_budget.clone(),
+                );
+            }
+        }
+        self.handle_unmasked_packet_with_source(packet_data, client_addr, false, local, None)
+            .await
+    }
+
+    pub(super) async fn handle_decoded_packet(
+        &self,
+        packet: super::mask_socket::DecodedPacket,
+    ) -> Result<()> {
+        self.handle_unmasked_packet_with_source(
+            &packet.payload,
+            packet.peer,
+            packet.quic,
+            packet.context.as_ref().and_then(|context| context.local),
+            packet.context.as_ref(),
+        )
+        .await
+    }
+
+    async fn handle_unmasked_packet_with_source(
+        &self,
+        packet_data: &[u8],
+        client_addr: SocketAddr,
+        quic_inner: bool,
+        local: Option<crate::udp_source::LocalEndpoint>,
+        quic_context: Option<&super::mask_socket::QuicContext>,
+    ) -> Result<()> {
+        if let Some(context) = quic_context {
+            if !self
+                .udp_socket
+                .as_ref()
+                .is_some_and(|socket| socket.context_valid(client_addr, context))
+            {
+                return Ok(());
+            }
+        }
         // Minimum packet size check
         if packet_data.len() < TAG_SIZE + 2 {
             return Err(Error::InvalidPacket("Too short"));
@@ -757,19 +950,6 @@ impl super::Gateway {
                 payload_offsets.push(catalog_offset);
             }
         }
-        // QUIC-Initial mimic (coalesced datagram): a QUIC-masked DATA packet is
-        // a genuine RFC 9001 v1 Initial (DCID carries the resonance tag) with
-        // aivpn's real ciphertext appended after the Initial's Length field. The
-        // tag was already extracted at DCID offset 6 by the normal layout-aware
-        // lookup; here we add the trailing ciphertext offset as a decrypt
-        // candidate. The parse is strict (0xC0 long header, version 1, 8-byte
-        // DCID) so STUN/legacy packets never match — those paths are unchanged.
-        if let Some(layout) = aivpn_common::quic_initial::parse_quic_initial(packet_data) {
-            if !payload_offsets.contains(&layout.payload_offset) {
-                payload_offsets.insert(0, layout.payload_offset);
-            }
-        }
-
         // Set when the packet only authenticated under the retained
         // pre-ratchet keys, i.e. it is a genuine old-epoch straggler. This is
         // the ONLY sound epoch discriminator: the counter spaces of the two
@@ -895,52 +1075,110 @@ impl super::Gateway {
         };
         let encrypted_payload = &packet_data[payload_offset..];
 
-        // Complete PFS ratchet only when the CLIENT proves it has ratcheted
-        // by sending a packet with ratcheted-key tags.
-        // Do NOT ratchet on is_new_session — the client hasn't received
-        // ServerHello yet and will keep sending packets with initial keys.
-        if is_ratcheted_tag {
-            let session_id = session.lock().session_id;
-            self.session_manager.complete_session_ratchet(&session_id);
-            let sess = session.lock();
-            info!(
-                "PFS ratchet complete for {} - send_counter={}, counter={}",
-                hash_addr(&client_addr),
-                sess.send_counter,
-                sess.counter
-            );
-        }
-
-        // Захват до pad, дескрипторов и payload. Слияние bitmap гонку не закрывает.
-        let replay = {
-            let mut sess = session.lock();
-            let Some(previous_epoch) =
-                sess.authenticated_counter_epoch(counter, &authenticated_secret)
-            else {
-                return Ok(());
-            };
-            let replay = if let Some(ka) = self.kernel_accel.as_ref() {
-                self.refresh_kernel_session(&mut sess);
-                kernel_claim_deliver(Some(ka.as_ref()), &sess, counter, previous_epoch)
+        {
+            let mut generation_guard = if let Some(context) = quic_context {
+                let Some(socket) = self.udp_socket.as_ref() else {
+                    return Ok(());
+                };
+                match socket.begin_quic_commit(client_addr, context, &session) {
+                    Ok(guard) => Some(guard),
+                    Err(_) => return Ok(()),
+                }
             } else {
-                kernel_claim_deliver(None, &sess, counter, previous_epoch)
+                None
+            };
+            // Complete PFS ratchet only when the CLIENT proves it has ratcheted
+            // by sending a packet with ratcheted-key tags.
+            // Do NOT ratchet on is_new_session — the client hasn't received
+            // ServerHello yet and will keep sending packets with initial keys.
+            if is_ratcheted_tag {
+                let session_id = session.lock().session_id;
+                self.session_manager.complete_session_ratchet(&session_id);
+                let sess = session.lock();
+                info!(
+                    "PFS ratchet complete for {} - send_counter={}, counter={}",
+                    hash_addr(&client_addr),
+                    sess.send_counter,
+                    sess.counter
+                );
+            }
+
+            // Захват до pad, дескрипторов и payload. Слияние bitmap гонку не закрывает.
+            let replay = {
+                let mut sess = session.lock();
+                let Some(previous_epoch) =
+                    sess.authenticated_counter_epoch(counter, &authenticated_secret)
+                else {
+                    return Ok(());
+                };
+                let replay = if let Some(ka) = self.kernel_accel.as_ref() {
+                    self.refresh_kernel_session(&mut sess);
+                    kernel_claim_deliver(Some(ka.as_ref()), &sess, counter, previous_epoch)
+                } else {
+                    kernel_claim_deliver(None, &sess, counter, previous_epoch)
+                };
+                if replay == ReplayGate::Drop {
+                    kernel_note_rejected(&mut sess, counter, previous_epoch);
+                } else if previous_epoch {
+                    sess.mark_pre_ratchet_received(counter);
+                } else {
+                    sess.mark_tag_received(counter);
+                }
+                if replay != ReplayGate::Drop {
+                    if self.kernel_accel.is_none() || self.config.enable_neural {
+                        sess.observe_receiver_counter(counter, previous_epoch);
+                    } else {
+                        // Пропущенный kernel RX нельзя выдавать за потери на линии.
+                        sess.receiver_loss.reset();
+                    }
+                }
+                if replay != ReplayGate::Drop && sess.commit_pending_mask() {
+                    // Новая раскладка и ее отпечаток попадают в ядро после AEAD и
+                    // захвата replay. Idle-сессии больше не нужен исходящий пакет.
+                    self.refresh_kernel_session(&mut sess);
+                }
+                replay
             };
             if replay == ReplayGate::Drop {
-                kernel_note_rejected(&mut sess, counter, previous_epoch);
-            } else if previous_epoch {
-                sess.mark_pre_ratchet_received(counter);
-            } else {
-                sess.mark_tag_received(counter);
+                return Ok(());
             }
-            if replay != ReplayGate::Drop && sess.commit_pending_mask() {
-                // Новая раскладка и ее отпечаток попадают в ядро после AEAD и
-                // захвата replay. Idle-сессии больше не нужен исходящий пакет.
-                self.refresh_kernel_session(&mut sess);
+
+            if let Some(socket) = self.udp_socket.as_ref() {
+                if let Some(guard) = &mut generation_guard {
+                    guard.authenticate(&session);
+                }
+                if let Some(local) = local {
+                    if socket.reply_sources().record(client_addr, local, &session) {
+                        self.refresh_kernel_session(&mut session.lock());
+                    }
+                }
+                {
+                    let mut sess = session.lock();
+                    if sess.confirm_mask_protocol(quic_inner) {
+                        self.refresh_kernel_session(&mut sess);
+                    }
+                }
+                if quic_context.is_none()
+                    && session
+                        .lock()
+                        .mask
+                        .as_ref()
+                        .is_some_and(aivpn_common::mask_io::uses_rtc)
+                {
+                    let current = session.lock();
+                    if current.is_ratcheted {
+                        socket.retire_other_rtc_session(client_addr, current.session_id);
+                    }
+                } else if quic_context.is_none()
+                    && session
+                        .lock()
+                        .mask
+                        .as_ref()
+                        .is_some_and(|mask| !aivpn_common::mask_io::requires_userspace(mask))
+                {
+                    socket.use_plain_mask(client_addr);
+                }
             }
-            replay
-        };
-        if replay == ReplayGate::Drop {
-            return Ok(());
         }
 
         // Дескрипторы только после захвата: повтор ratchet не рассылает их снова.
@@ -995,7 +1233,7 @@ impl super::Gateway {
                             ) {
                                 match self
                                     .session_manager
-                                    .build_mask_update_packet(&session, &variant)
+                                    .build_mask_update_packets(&session, &variant)
                                 {
                                     Ok(packet) => {
                                         // FIX L: `udp_socket` is `None` until
@@ -1005,7 +1243,8 @@ impl super::Gateway {
                                         // calling `run()`, e.g. tests) must not
                                         // panic here.
                                         if let Some(sock) = self.udp_socket.as_ref() {
-                                            if let Err(e) = sock.send_to(&packet, client_addr).await
+                                            if let Err(e) =
+                                                sock.send_packets_to(&packet, client_addr).await
                                             {
                                                 warn!(
                                                     "Failed to send policy-driven polymorphic MaskUpdate to {}: {}",
@@ -1065,6 +1304,44 @@ impl super::Gateway {
         // До подтверждения PFS начальный пакет не выполняет Data или control.
         // Повторный init получает тот же Hello, но с новым случайным nonce.
         if initial_packet {
+            // Здесь уже проверены AEAD и replay. Подсказка меняет только
+            // встроенный профиль с той же раскладкой, не допуск и не ключи.
+            if let Ok(header) = InnerHeader::decode(plaintext) {
+                if header.inner_type == InnerType::Control {
+                    if let Ok(ControlPayload::ClientHello { mask_id }) =
+                        ControlPayload::decode(&plaintext[4..])
+                    {
+                        let client_id = session.lock().client_id.clone();
+                        let mut trusted = aivpn_common::mask::preset_masks::all();
+                        if let Some(client) = client_id.as_deref().and_then(|id| {
+                            self.client_db
+                                .as_ref()
+                                .and_then(|database| database.find_by_id(id))
+                        }) {
+                            let descriptors = self.bootstrap_descriptors.read();
+                            trusted.extend(descriptors.iter().flat_map(|descriptor| {
+                                derive_bootstrap_candidates(descriptor, Some(&client.psk))
+                            }));
+                            if let Some(requested) =
+                                hinted_bootstrap_mask(&descriptors, &client.psk, &mask_id)
+                            {
+                                trusted.push(requested);
+                            }
+                        }
+                        let mut sess = session.lock();
+                        if sess.initial_hello_sends == 0 {
+                            if let Some(current) = sess.mask.as_ref() {
+                                if let Some(requested) =
+                                    hinted_initial_mask(current, &mask_id, &trusted)
+                                {
+                                    sess.mask = Some(requested);
+                                    sess.rebuild_mdh_pool();
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             let pending = !session.lock().is_ratcheted;
             if pending {
                 self.send_server_hello(&session, client_addr).await?;
@@ -1103,10 +1380,7 @@ impl super::Gateway {
             // over the refresh stride while reducing CPU spent in HashMap/tag_map
             // maintenance. Stride scales with the window so per-packet precompute
             // and tag_map churn stay flat versus the old 256-window/64-stride.
-            let refresh_tags = counter.saturating_sub(sess.tag_window_base) >= 128;
-            if refresh_tags {
-                sess.update_tag_window();
-            }
+            let refresh_tags = sess.refresh_tag_window_if_needed();
 
             // Batch client stats updates to avoid taking a global write lock per packet.
             sess.pending_bytes_in = sess
@@ -1190,13 +1464,21 @@ impl super::Gateway {
                     .lock()
                     // is_rx=true: packet from client → server (uplink direction)
                     .record_traffic(session_id, packet_size, iat_ms, entropy, true);
-                // R2 Phase D — feed the same sampled packet's WIRE bytes to the
-                // inline ML-DPI gate. `packet_data` is the full UDP datagram a DPI
-                // box observes (mask header/tag bytes + ciphertext); the gate's
-                // features (STUN/QUIC header form, size, entropy) are computed
-                // from exactly these bytes. Lock-free (DashMap), one entropy pass.
-                #[cfg(feature = "neural")]
-                self.dpi_gate.record_wire(session_id, packet_data);
+            }
+            // Для STUN здесь еще доступны внешние байты. QUIC и RTC
+            // передают проверенные внешние кадры из движка маски,
+            // до снятия оболочки в этом обработчике.
+            #[cfg(feature = "neural")]
+            if !quic_inner
+                && !session
+                    .lock()
+                    .mask
+                    .as_ref()
+                    .is_some_and(aivpn_common::mask_io::uses_rtc)
+            {
+                if let Some(socket) = &self.udp_socket {
+                    socket.observe_plain_wire(&session, packet_data);
+                }
             }
             self.metrics.record_packet_received(packet_data.len());
         }
@@ -1244,6 +1526,26 @@ impl super::Gateway {
         Ok(())
     }
 
+    async fn forward_recovered_fec(
+        &self,
+        session: &Arc<parking_lot::Mutex<Session>>,
+        mut recovered: Vec<u8>,
+    ) -> Result<()> {
+        let Some(length) = fec_recovered_len(&recovered) else {
+            return Ok(());
+        };
+        recovered.truncate(length);
+        let header = aivpn_common::ip_packet::IpPacket::parse(&recovered)
+            .expect("Проверена длина восстановленного IP-пакета");
+        if !self.session_allows_source(&session.lock(), header.source)
+            || (!self.config.allow_peer_routing
+                && self.session_for_inner_ip(header.destination).is_some())
+        {
+            return Ok(());
+        }
+        self.forward_client_data(session, &recovered, false).await
+    }
+
     /// Process decrypted inner payload
     pub(super) async fn process_inner_payload(
         &self,
@@ -1256,16 +1558,23 @@ impl super::Gateway {
         }
 
         let mut inner_header = InnerHeader::decode(plaintext)?;
+        let mut fec_metadata = None;
         let assembled;
         let payload = if inner_header.inner_type == InnerType::Fragment {
+            if let Some(metadata) = aivpn_common::fragment::fec_metadata(&plaintext[4..]) {
+                if session.lock().fec_rx.is_duplicate(metadata) {
+                    return Ok(());
+                }
+            }
             match session
                 .lock()
                 .fragment_rx
-                .accept(&plaintext[4..], std::time::Instant::now())?
+                .accept_detailed(&plaintext[4..], std::time::Instant::now())?
             {
-                Some((kind, bytes)) => {
-                    inner_header.inner_type = kind;
-                    assembled = bytes;
+                Some(message) => {
+                    inner_header.inner_type = message.kind;
+                    fec_metadata = message.fec;
+                    assembled = message.payload;
                     &assembled[..]
                 }
                 None => return Ok(()),
@@ -1276,37 +1585,12 @@ impl super::Gateway {
 
         match inner_header.inner_type {
             InnerType::Data => {
-                // mTLS gate: drop Data packets until cert is verified (when required).
-                if !self.refresh_mtls_gate(&mut session.lock()) {
-                    warn!(
-                        "mtls: Data from {} rejected — certificate not yet verified",
-                        hash_addr(&client_addr)
-                    );
-                    return Ok(());
-                }
-
-                // FEC late-packet suppression: once a FecRepair was processed,
-                // any Data packet whose inner seq is not ahead of that repair
-                // belongs to an already-closed group — either the late original
-                // of a just-FEC-recovered packet (a duplicate) or a straggler
-                // that would corrupt the new group's XOR accumulator (a false
-                // `recv == group_size - 1` trigger recovers garbage into NAT).
-                // Client inner seqs are monotone; the wrapping subtraction
-                // treats seq as stale iff it lies within half a u16 cycle
-                // behind the repair.
                 {
-                    let sess = session.lock();
-                    if let Some(hi) = sess.fec_repair_seq_hi {
-                        if fec_seq_is_stale(hi, inner_header.seq_num) {
-                            debug!(
-                                "FEC: dropping late Data seq={} from {} \
-                                 (repair seq={} already processed)",
-                                inner_header.seq_num,
-                                hash_addr(&client_addr),
-                                hi
-                            );
-                            return Ok(());
-                        }
+                    let mut sess = session.lock();
+                    if !self.refresh_mtls_gate(&mut sess)
+                        || !session_allows_client_data(&sess, self.client_db.as_deref())
+                    {
+                        return Ok(());
                     }
                 }
 
@@ -1323,23 +1607,22 @@ impl super::Gateway {
                     return Ok(());
                 }
 
-                self.forward_client_data(session, payload, false).await?;
-
-                // Accumulate payload into FEC XOR buffer for server-side recovery.
-                // When FecRepair arrives we can reconstruct exactly one missing packet.
-                {
+                let recovered = if let Some(metadata) = fec_metadata {
                     let mut sess = session.lock();
-                    let len = payload.len().min(1500);
-                    if sess.fec_xor_buf.len() < len {
-                        sess.fec_xor_buf.resize(len, 0);
+                    let result = sess.fec_rx.record(metadata, payload)?;
+                    if result.complete {
+                        sess.fragment_rx.discard_fec_group(metadata.group_seq);
                     }
-                    for (a, b) in sess.fec_xor_buf[..len].iter_mut().zip(&payload[..len]) {
-                        *a ^= b;
+                    if !result.accepted {
+                        return Ok(());
                     }
-                    if len > sess.fec_xor_len {
-                        sess.fec_xor_len = len;
-                    }
-                    sess.fec_recv_count = sess.fec_recv_count.saturating_add(1);
+                    result.recovered
+                } else {
+                    None
+                };
+                self.forward_client_data(session, payload, false).await?;
+                if let Some(recovered) = recovered {
+                    self.forward_recovered_fec(session, recovered).await?;
                 }
             }
             InnerType::Control => {
@@ -1353,93 +1636,22 @@ impl super::Gateway {
             }
             InnerType::FecRepair => {
                 if let Some(repair) = FecRepair::decode(payload) {
-                    if repair.group_size > 0 {
-                        let recovered_opt = {
-                            let mut sess = session.lock();
-                            let recv = sess.fec_recv_count;
-                            let seq_ok = repair.group_seq == sess.fec_pending_seq;
-                            // Recover only when group_seq matches (XOR buffer is for this
-                            // exact group) and exactly one packet is missing.
-                            let result = if seq_ok && recv == repair.group_size.saturating_sub(1) {
-                                let xor_len = sess.fec_xor_len.max(repair.xor_data.len());
-                                let mut out = vec![0u8; xor_len];
-                                for i in 0..xor_len {
-                                    out[i] = repair.xor_data.get(i).copied().unwrap_or(0)
-                                        ^ sess.fec_xor_buf.get(i).copied().unwrap_or(0);
-                                }
-                                debug!(
-                                    "FEC: recovered {} bytes from {} (group seq={} size={})",
-                                    out.len(),
-                                    hash_addr(&client_addr),
-                                    repair.group_seq,
-                                    repair.group_size
-                                );
-                                Some(out)
-                            } else {
-                                debug!(
-                                    "FEC: group seq={} size={} recv={} seq_ok={} — no recovery",
-                                    repair.group_seq, repair.group_size, recv, seq_ok
-                                );
-                                None
-                            };
-                            // Reset accumulator; advance expected seq to the next group.
-                            sess.fec_recv_count = 0;
-                            sess.fec_xor_buf.iter_mut().for_each(|b| *b = 0);
-                            sess.fec_xor_len = 0;
-                            sess.fec_pending_seq = repair.group_seq.wrapping_add(1);
-                            // Close all earlier groups: Data packets with inner
-                            // seq <= this repair's seq are late duplicates and
-                            // are dropped at ingress (see the Data branch).
-                            sess.fec_repair_seq_hi = Some(inner_header.seq_num);
-                            result
-                        };
-
-                        if let Some(mut recovered) = recovered_opt {
-                            // Validate recovered packet with the same anti-spoof and
-                            // peer-routing checks applied to normal Data packets.
-                            // M1: `fec_recovered_len` additionally proves the XOR
-                            // really reconstructs one missing packet (all-zero
-                            // tail past the IPv4 total length) and trims the
-                            // padding; reordered-group garbage fails it here.
-                            let valid_len = fec_recovered_len(&recovered);
-                            if let Some(tot_len) = valid_len {
-                                recovered.truncate(tot_len);
-                            }
-                            if valid_len.is_none() {
-                                debug!(
-                                    "FEC anti-spoof: dropping malformed recovered packet \
-                                     (len={} ver={})",
-                                    recovered.len(),
-                                    recovered.first().map(|b| b >> 4).unwrap_or(0)
-                                );
-                            } else {
-                                let header = aivpn_common::ip_packet::IpPacket::parse(&recovered)
-                                    .expect("FEC length validated");
-                                let inner_src = header.source;
-                                let inner_dst = header.destination;
-                                let (session_vpn_ip, spoof) = {
-                                    let sess = session.lock();
-                                    (sess.vpn_ip, !self.session_allows_source(&sess, inner_src))
-                                };
-                                if spoof {
-                                    warn!(
-                                        "FEC anti-spoof: dropping recovered packet \
-                                         src={} from session owning vpn_ip={:?}",
-                                        inner_src, session_vpn_ip
-                                    );
-                                } else if !self.config.allow_peer_routing
-                                    && self.session_for_inner_ip(inner_dst).is_some()
-                                {
-                                    debug!(
-                                        "FEC: peer routing disabled — dropping \
-                                         {}->{} at ingress",
-                                        inner_src, inner_dst
-                                    );
-                                } else {
-                                    self.forward_client_data(session, &recovered, false).await?;
-                                }
-                            }
+                    let recovered = {
+                        let mut sess = session.lock();
+                        if !self.refresh_mtls_gate(&mut sess)
+                            || !session_allows_client_data(&sess, self.client_db.as_deref())
+                        {
+                            return Ok(());
                         }
+                        let group_seq = repair.group_seq;
+                        let result = sess.fec_rx.repair(repair)?;
+                        if result.complete {
+                            sess.fragment_rx.discard_fec_group(group_seq);
+                        }
+                        result.recovered
+                    };
+                    if let Some(recovered) = recovered {
+                        self.forward_recovered_fec(session, recovered).await?;
                     }
                 }
             }
@@ -1451,7 +1663,7 @@ impl super::Gateway {
 
 #[cfg(test)]
 mod tests {
-    use super::{fec_recovered_len, fec_seq_is_stale};
+    use super::fec_recovered_len;
 
     /// Minimal IPv4 packet of `len` bytes: version/IHL 0x45, tot_len = len,
     /// fixed src/dst, payload filled with `seed`.
@@ -1515,7 +1727,7 @@ mod tests {
     /// of identical header bytes), so only the length-consistency proof
     /// drops it.
     #[test]
-    fn fec_recovered_len_rejects_reordered_group_garbage() {
+    fn fec_recovered_len_rejects_nonzero_tail() {
         let src = [10, 0, 0, 2];
         let b = ipv4_packet(200, src, 0xBB); // lost member of group N
         let c = ipv4_packet(300, src, 0xCC); // lost member of group N
@@ -1552,18 +1764,5 @@ mod tests {
         v6[0] = 0x60;
         assert_eq!(fec_recovered_len(&v6), None);
         assert_eq!(fec_recovered_len(&p[..10]), None);
-    }
-
-    #[test]
-    fn fec_seq_is_stale_wraps_safely() {
-        assert!(fec_seq_is_stale(100, 99));
-        // The repair's own seq can never belong to a new Data packet.
-        assert!(fec_seq_is_stale(100, 100));
-        assert!(!fec_seq_is_stale(100, 101));
-        // u16 wrap: 65530 is 11 behind 5.
-        assert!(fec_seq_is_stale(5, 65530));
-        assert!(!fec_seq_is_stale(5, 6));
-        // Exactly half a cycle behind is treated as new.
-        assert!(!fec_seq_is_stale(0, 0x8000));
     }
 }

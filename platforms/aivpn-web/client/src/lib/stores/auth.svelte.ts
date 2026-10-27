@@ -28,6 +28,13 @@ function createAuthStore() {
   // server-side by requireAuth/requireAdmin regardless.)
   let accessToken = $state<string | null>(null);
   let user = $state<User | null>(null);
+  const sessionListeners = new Set<() => void>();
+  let sessionGeneration = 0;
+
+  function resetSession() {
+    sessionGeneration += 1;
+    for (const listener of sessionListeners) listener();
+  }
 
   removeFromStorage(LEGACY_TOKEN_KEY)
   removeFromStorage(LEGACY_USER_KEY)
@@ -36,7 +43,14 @@ function createAuthStore() {
     accessToken = token;
   }
 
+  function startSession(token: string) {
+    resetSession();
+    user = null;
+    accessToken = token;
+  }
+
   function clearToken() {
+    resetSession();
     accessToken = null;
     user = null;
     removeFromStorage(LEGACY_TOKEN_KEY)
@@ -44,13 +58,20 @@ function createAuthStore() {
   }
 
   function setUser(u: User) {
+    if (user && (user.id !== u.id || user.role !== u.role)) resetSession();
     user = u;
   }
 
   return {
     get accessToken() { return accessToken; },
     get user() { return user; },
+    get sessionGeneration() { return sessionGeneration; },
+    onSessionChange(listener: () => void) {
+      sessionListeners.add(listener);
+      return () => { sessionListeners.delete(listener); };
+    },
     setToken,
+    startSession,
     clearToken,
     setUser,
   };

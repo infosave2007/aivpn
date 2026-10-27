@@ -39,7 +39,7 @@ serde_json = "1.0"
 rmp-serde = "1.1"
 
 # Async
-tokio = { version = "1.35", features = ["full"] }
+tokio = { version = "1.53.3", features = ["full"] }
 tokio-util = { version = "0.7", features = ["codec"] }
 # Object-safe `async fn` in traits. Native RPITIT `async fn` in traits is not
 # dyn-compatible, and the transport abstraction is used as

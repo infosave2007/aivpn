@@ -534,8 +534,8 @@ pub mod bundle {
                 include_bytes!("../../../assets/masks/sber_salute_v1.json"),
             ),
             (
-                "telegram_mtproto_v1.json",
-                include_bytes!("../../../assets/masks/telegram_mtproto_v1.json"),
+                "telegram_calls_v1.json",
+                include_bytes!("../../../assets/masks/telegram_calls_v1.json"),
             ),
             (
                 "vk_video_v1.json",
@@ -560,10 +560,6 @@ pub mod bundle {
             (
                 "whatsapp_voip_v1.json",
                 include_bytes!("../../../assets/masks/whatsapp_voip_v1.json"),
-            ),
-            (
-                "yandex_alice_v1.json",
-                include_bytes!("../../../assets/masks/yandex_alice_v1.json"),
             ),
         ]
     }
@@ -603,6 +599,16 @@ pub mod bundle {
             assert!(!tmpl.is_empty());
             serde_json::from_str::<serde_json::Value>(tmpl)
                 .expect("bundled server.json.example must be valid JSON");
+        }
+
+        #[test]
+        fn installer_does_not_ship_the_disabled_alice_profile() {
+            assert!(bundled_masks().iter().all(|(_, bytes)| {
+                serde_json::from_slice::<crate::mask::MaskProfile>(bytes)
+                    .unwrap()
+                    .mask_id
+                    != "yandex_alice_v1"
+            }));
         }
 
         #[test]

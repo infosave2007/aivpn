@@ -4,31 +4,32 @@
     xmlns:app="http://schemas.android.com/apk/res-auto"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
-    android:background="@color/background">
+    android:background="?attr/colorSurface">
 
     <LinearLayout
         android:layout_width="match_parent"
         android:layout_height="match_parent"
         android:orientation="vertical">
 
-        <!-- Compact toolbar: back + title + refresh (same pattern as SplitTunnelActivity /
-             BackgroundHealthActivity) -->
         <LinearLayout
             android:layout_width="match_parent"
-            android:layout_height="48dp"
+            android:layout_height="wrap_content"
+            android:minHeight="64dp"
             android:orientation="horizontal"
             android:gravity="center_vertical"
-            android:paddingHorizontal="8dp">
+            android:paddingStart="4dp"
+            android:paddingEnd="16dp"
+            android:paddingVertical="4dp">
 
             <ImageButton
                 android:id="@+id/btnBack"
-                android:layout_width="40dp"
-                android:layout_height="40dp"
-                android:src="@android:drawable/ic_menu_revert"
+                android:layout_width="48dp"
+                android:layout_height="48dp"
+                android:src="@drawable/ic_vpn_back"
                 android:background="?attr/selectableItemBackgroundBorderless"
-                android:contentDescription="@string/btn_cancel"
+                android:contentDescription="@string/ui_back"
                 android:scaleType="centerInside"
-                app:tint="@color/text_primary" />
+                app:tint="?attr/colorOnSurface" />
 
             <TextView
                 android:id="@+id/textTitle"
@@ -36,61 +37,84 @@
                 android:layout_height="wrap_content"
                 android:layout_weight="1"
                 android:text="@string/admin_title"
-                android:textSize="18sp"
-                android:textStyle="bold"
-                android:textColor="@color/text_primary"
-                android:paddingStart="4dp" />
-
-            <ImageButton
-                android:id="@+id/btnPool"
-                android:layout_width="40dp"
-                android:layout_height="40dp"
-                android:src="@android:drawable/ic_menu_mapmode"
-                android:background="?attr/selectableItemBackgroundBorderless"
-                android:contentDescription="@string/pool_title"
-                android:scaleType="centerInside"
-                app:tint="@color/text_primary" />
-
-            <ImageButton
-                android:id="@+id/btnAudit"
-                android:layout_width="40dp"
-                android:layout_height="40dp"
-                android:src="@android:drawable/ic_menu_recent_history"
-                android:background="?attr/selectableItemBackgroundBorderless"
-                android:contentDescription="@string/audit_title"
-                android:scaleType="centerInside"
-                app:tint="@color/text_primary" />
-
-            <!-- Admin-only (G-A3): visibility toggled in AdminActivity#onCreate, mirrors fabAdd -->
-            <ImageButton
-                android:id="@+id/btnSettings"
-                android:layout_width="40dp"
-                android:layout_height="40dp"
-                android:src="@android:drawable/ic_menu_manage"
-                android:background="?attr/selectableItemBackgroundBorderless"
-                android:contentDescription="@string/server_settings_title"
-                android:scaleType="centerInside"
-                app:tint="@color/text_primary" />
-
-            <ImageButton
-                android:id="@+id/btnRefresh"
-                android:layout_width="40dp"
-                android:layout_height="40dp"
-                android:src="@android:drawable/ic_popup_sync"
-                android:background="?attr/selectableItemBackgroundBorderless"
-                android:contentDescription="@string/admin_refresh"
-                android:scaleType="centerInside"
-                app:tint="@color/text_primary" />
+                android:textAppearance="@style/TextAppearance.Material3.TitleLarge"
+                android:textColor="?attr/colorOnSurface"
+                android:maxLines="2"
+                android:ellipsize="end"
+                android:paddingStart="4dp"
+                android:accessibilityHeading="true" />
         </LinearLayout>
+
+        <HorizontalScrollView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:scrollbars="none"
+            android:fillViewport="true">
+
+            <LinearLayout
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:minHeight="48dp"
+                android:orientation="horizontal"
+                android:gravity="center_vertical|end"
+                android:paddingHorizontal="8dp">
+
+                <ImageButton
+                    android:id="@+id/btnPool"
+                    android:layout_width="48dp"
+                    android:layout_height="48dp"
+                    android:src="@drawable/ic_vpn_server"
+                    android:background="?attr/selectableItemBackgroundBorderless"
+                    android:contentDescription="@string/pool_title"
+                    android:scaleType="centerInside"
+                    app:tint="?attr/colorOnSurface" />
+
+                <ImageButton
+                    android:id="@+id/btnAudit"
+                    android:layout_width="48dp"
+                    android:layout_height="48dp"
+                    android:src="@drawable/ic_vpn_timer"
+                    android:background="?attr/selectableItemBackgroundBorderless"
+                    android:contentDescription="@string/audit_title"
+                    android:scaleType="centerInside"
+                    app:tint="?attr/colorOnSurface" />
+
+                <ImageButton
+                    android:id="@+id/btnSettings"
+                    android:layout_width="48dp"
+                    android:layout_height="48dp"
+                    android:src="@drawable/ic_vpn_settings"
+                    android:background="?attr/selectableItemBackgroundBorderless"
+                    android:contentDescription="@string/server_settings_title"
+                    android:scaleType="centerInside"
+                    app:tint="?attr/colorOnSurface" />
+
+                <com.google.android.material.button.MaterialButton
+                    android:id="@+id/btnRefresh"
+                    style="@style/Widget.Material3.Button.TextButton"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:minWidth="48dp"
+                    android:minHeight="48dp"
+                    android:insetTop="0dp"
+                    android:insetBottom="0dp"
+                    android:textSize="14sp"
+                    android:textAllCaps="false"
+                    android:text="@string/admin_refresh" />
+            </LinearLayout>
+        </HorizontalScrollView>
 
         <TextView
             android:id="@+id/textNotConnected"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
+            android:layout_marginHorizontal="20dp"
+            android:layout_marginTop="8dp"
+            android:background="@color/warning_container"
             android:text="@string/admin_not_connected"
-            android:textSize="13sp"
+            android:textSize="14sp"
             android:textColor="@color/accent_lemon"
-            android:padding="14dp"
+            android:padding="16dp"
             android:visibility="gone" />
 
         <TextView
@@ -98,8 +122,8 @@
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:text="@string/admin_no_clients"
-            android:textSize="13sp"
-            android:textColor="@color/text_secondary"
+            android:textSize="16sp"
+            android:textColor="?attr/colorOnSurfaceVariant"
             android:gravity="center"
             android:padding="32dp"
             android:visibility="gone" />
@@ -110,8 +134,8 @@
             android:layout_height="0dp"
             android:layout_weight="1"
             android:clipToPadding="false"
-            android:paddingTop="4dp"
-            android:paddingBottom="84dp" />
+            android:paddingTop="8dp"
+            android:paddingBottom="96dp" />
     </LinearLayout>
 
     <com.google.android.material.floatingactionbutton.FloatingActionButton
@@ -120,9 +144,9 @@
         android:layout_height="wrap_content"
         android:layout_gravity="bottom|end"
         android:layout_margin="20dp"
-        android:src="@android:drawable/ic_input_add"
-        app:backgroundTint="@color/accent"
-        app:tint="@color/text_primary"
+        android:src="@drawable/ic_vpn_add"
+        app:backgroundTint="?attr/colorPrimary"
+        app:tint="?attr/colorOnPrimary"
         android:contentDescription="@string/admin_add_client" />
 
 </FrameLayout>

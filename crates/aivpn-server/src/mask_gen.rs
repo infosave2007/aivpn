@@ -204,10 +204,7 @@ pub async fn generate_and_store_mask(
     // обратный профиль, и тот остается проверяемым отдельно.
     match store.operator_signing_key().cloned() {
         Some(key) => {
-            if let Some(rev) = profile.reverse_profile.as_mut() {
-                rev.sign(&key);
-            }
-            profile.sign(&key);
+            profile.sign(&key)?;
             info!(
                 "Mask '{}' signed with operator Ed25519 key",
                 profile.mask_id
@@ -1279,7 +1276,7 @@ fn build_mask_profile(service: &str, analysis: &AnalysisResult) -> Result<MaskPr
         size_distribution,
         iat_distribution,
         size_iat_joint: analysis.size_iat_joint.clone(),
-        padding_strategy: PaddingStrategy::RandomUniform { min: 0, max: 64 },
+        padding_strategy: PaddingStrategy::MatchDistribution,
         fsm_states: analysis.fsm_states.clone(),
         fsm_initial_state: analysis.fsm_initial_state,
         signature_vector,
@@ -1332,7 +1329,7 @@ fn build_reverse_profile(mask_id: &str, analysis: &AnalysisResult) -> Option<Box
         // Downlink is server-shaped (A7); the joint model is applied to uplink
         // client shaping, so the reverse profile keeps the 1-D marginals.
         size_iat_joint: None,
-        padding_strategy: PaddingStrategy::RandomUniform { min: 0, max: 64 },
+        padding_strategy: PaddingStrategy::MatchDistribution,
         fsm_states: vec![FSMState {
             state_id: 0,
             transitions: vec![],
@@ -1776,43 +1773,12 @@ fn detect_mimic_protocol(recorded_header_prefix: &[u8]) -> Option<(SpoofProtocol
     None
 }
 
-/// Canonical STUN `HeaderSpec` for detected-protocol masks: mirrors the
-/// hand-authored `webrtc_zoom_v3` preset's structure exactly — binding
-/// request type@0 (2 bytes), STUN message-length@2 (a `Length` field, 2
-/// bytes big-endian), magic cookie@4 (4 bytes), an 8-byte tag-carrier slot@8,
-/// and the remaining 4-byte transaction-id tail@16 (20 bytes total).
-///
-/// A raw recorded header cannot be trusted as-is: `MimicProtocol::Stun`'s
-/// post-assembly fixup (`MaskProfile::patch_stun_length`) needs a `Length`
-/// field at a known offset to satisfy nDPI's `is_stun` invariant
-/// (`msg_len + 20 == udp_payload_len`), which recorded bytes have no reason
-/// to expose correctly. The empirical value of the recording (size/IAT/FSM
-/// distributions) is kept; only the header structure is replaced with this
-/// known-valid one.
+/// Новые маски используют ту же раскладку STUN, что и встроенный профиль.
 fn canonical_stun_header_spec() -> HeaderSpec {
-    HeaderSpec::structured(vec![
-        HeaderField::Fixed {
-            bytes: vec![0x00, 0x01],
-        },
-        HeaderField::Length {
-            len: 2,
-            endian: HeaderEndian::Big,
-        },
-        HeaderField::Fixed {
-            bytes: vec![0x21, 0x12, 0xA4, 0x42],
-        },
-        HeaderField::Id {
-            len: 8,
-            mode: IdFieldMode::Random,
-        },
-        HeaderField::Id {
-            len: 4,
-            mode: IdFieldMode::Random,
-        },
-    ])
+    aivpn_common::mask::preset_masks::webrtc_zoom_v3()
+        .header_spec
+        .expect("Встроенный STUN-профиль содержит header_spec")
 }
-
-/// Header/protocol/tag-layout fields derived for a generated `MaskProfile`.
 struct MimicFields {
     spoof_protocol: SpoofProtocol,
     header_spec: Option<HeaderSpec>,
@@ -2710,6 +2676,13 @@ mod tests {
         let mask = build_mask_profile("zoom_stun", &analysis).expect("mask should build");
 
         assert_eq!(mask.spoof_protocol, SpoofProtocol::WebRTC_STUN);
+        assert!(
+            matches!(
+                mask.padding_strategy,
+                aivpn_common::mask::PaddingStrategy::MatchDistribution
+            ),
+            "Генератор не применяет выбранные размеры"
+        );
         assert_eq!(mask.tag_offset, 8);
         assert_eq!(mask.embedded_tag_offset(), Some(8));
 
@@ -2718,11 +2691,7 @@ mod tests {
             .as_ref()
             .expect("STUN mask must carry a header_spec");
         let generated = spec.generate_static();
-        assert_eq!(
-            generated.len(),
-            20,
-            "canonical STUN header must be exactly 20 bytes"
-        );
+        assert_eq!(generated.len(), 24, "Заголовок STUN должен вмещать атрибут");
         assert_eq!(
             &generated[4..8],
             &[0x21, 0x12, 0xA4, 0x42],
@@ -2736,8 +2705,9 @@ mod tests {
         assert_eq!(proto, MimicProtocol::Stun);
 
         let mut packet = generated.clone();
-        packet.extend_from_slice(&[0xABu8; 137]); // stand-in ciphertext tail
-        proto.finalize(&mut packet, &mask);
+        packet.extend_from_slice(&[0xABu8; 136]);
+        mask.finalize_packet(&mut packet).unwrap();
+        aivpn_common::stun_wire::validate(&packet).unwrap();
 
         let msg_len = u16::from_be_bytes([packet[2], packet[3]]) as usize;
         assert_eq!(
@@ -2763,9 +2733,9 @@ mod tests {
 
         let proto = MimicProtocol::for_spoof(mask.spoof_protocol);
         assert_eq!(proto, MimicProtocol::Quic);
-        // QUIC is fully constructed at build time (RFC 9001 Initial); the
-        // detector only needs to route the mask to that path.
-        assert!(proto.is_constructed());
+        // Внешние кадры создает движок состояния, а не статический профиль.
+        assert!(!proto.is_constructed());
+        assert!(aivpn_common::mask_io::needs_state(&mask));
     }
 
     #[test]

@@ -29,6 +29,8 @@ pub const MAX_SESSIONS: usize = 500;
 /// Session idle timeout (default)
 pub const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
+const QUALITY_REPORT_MIN_INTERVAL: Duration = Duration::from_secs(1);
+
 /// Session hard timeout — 0 means unlimited (Issue #33).
 /// Configurable via `session_timeout_secs` in server.json.
 /// PFS ratchet already handles key rotation, so forced session
@@ -177,6 +179,8 @@ pub struct Session {
     pub expected_tags: HashMap<u64, [u8; TAG_SIZE]>,
     /// Counter value used as the base for the currently precomputed tag window.
     pub tag_window_base: u64,
+    /// Ориентир поиска после принятых старых пакетов. Replay новой эпохи не меняет.
+    tag_search_hint: Option<u64>,
     /// Received tag bitmap (for anti-replay)
     pub received_bitmap: ReplayWindow,
     /// Accumulated inbound bytes to flush into client_db in batches.
@@ -195,6 +199,9 @@ pub struct Session {
     pub ratcheted_expected_tags: HashMap<u64, [u8; TAG_SIZE]>,
     /// Whether session has completed PFS ratchet
     pub is_ratcheted: bool,
+    /// До PFS ответ ограничен по времени, частоте и общему числу отправок.
+    pub initial_hello_sends: u8,
+    pub initial_hello_last_sent: Option<Instant>,
     /// Assigned VPN IP (e.g. 10.0.0.2)
     pub vpn_ip: Option<Ipv4Addr>,
     /// Registered client ID (from client_db) for traffic accounting
@@ -206,6 +213,11 @@ pub struct Session {
     pub pre_ratchet_tags: HashMap<u64, [u8; TAG_SIZE]>,
     /// Deadline until which pre_ratchet_tags are still accepted.
     pub pre_ratchet_expire: Option<Instant>,
+    /// Inline rekey сохраняет счетчик; начальный PFS начинает его с нуля.
+    pre_ratchet_monotonic: bool,
+    /// Принятый счетчик старой эпохи и центр ее ограниченного окна тегов.
+    pre_ratchet_counter: u64,
+    pre_ratchet_window_base: u64,
     /// Anti-replay set for pre_ratchet_tags — prevents replaying old-key packets
     /// during the grace window (C-S-2). Keyed by the raw packet counter: a 256-bit
     /// bitmap aliased counters 256 apart within the 511-wide tag window, so two
@@ -276,6 +288,7 @@ pub struct Session {
 
     /// Допуск клиента к адресу после PFS и обязательных доказательств личности.
     pub client_admitted: bool,
+    pub diagnostic_budget: aivpn_common::diagnostics::DiagnosticBudget,
 
     /// Повтор запроса proof/cert ограничен одной отправкой в секунду.
     pub authentication_retry_at: Option<Instant>,
@@ -298,30 +311,24 @@ pub struct Session {
     pub bytes_since_rekey: u64,
     /// Last reported client-side quality score (0–100). Updated via QualityReport (0.9.0+).
     pub client_quality: u8,
+    /// Наблюдение своего RX, отдельно от replay и присланной клиентом телеметрии.
+    pub(crate) receiver_loss: aivpn_common::quality::ReceiverLossWindow,
+    receiver_report_sent_at: Option<Instant>,
+    pub(crate) quality_report_received_at: Option<Instant>,
     /// Smoothed client RTT in ms (EWMA of QualityReport rtt_ms). 0 = unknown.
     /// Used to scale the rekey/ratchet grace window so high-latency links
     /// (e.g. satellite) don't silently drop in-flight packets at the key seam.
     pub client_srtt_ms: u32,
+    /// Последние потери и джиттер из отчета текущего клиента.
+    pub client_loss_ppm: u32,
+    pub client_jitter_ms: u16,
 
-    // --- FEC server-side recovery state (0.9.0+) ---
-    /// Data packets received in the current FEC group (reset on each FecRepair).
-    pub fec_recv_count: u8,
-    /// XOR accumulator for in-flight FEC group payloads.
-    pub fec_xor_buf: Vec<u8>,
-    /// Max payload length seen in the current FEC group.
-    pub fec_xor_len: usize,
-    /// Next expected FEC group_seq. Mismatches indicate a lost FecRepair
-    /// and mean the XOR buffer is stale — recovery must be skipped.
-    pub fec_pending_seq: u16,
-    /// Inner seq_num of the most recently processed FecRepair packet.
-    /// The client numbers all inner packets monotonically, so a Data packet
-    /// arriving after this repair with a seq NOT AHEAD of it belongs to an
-    /// already-closed group: it is either the just-FEC-recovered packet
-    /// arriving late (a duplicate) or a straggler whose group is gone —
-    /// either way it must not be delivered again nor pollute the new group's
-    /// XOR accumulator (a false `recv == group_size - 1` trigger recovers
-    /// garbage). None until the first FecRepair is seen.
-    pub fec_repair_seq_hi: Option<u16>,
+    /// Счетчик проверенных внешних STUN-кадров, независимо от AEAD и его ротации.
+    pub plain_wire_seen: u64,
+    /// Независимые группы FEC с проверенными позициями исходных IP-пакетов.
+    pub fec_rx: aivpn_common::fec::FecReceiver,
+    /// Завершенные поколения RTC сохраняются и при освобождении полного пула.
+    pub rtc_retired_offers: std::collections::VecDeque<[u8; 16]>,
     /// Highest mask-catalog version already pushed to this client. The gateway
     /// bumps a global catalog version whenever the mask set changes; when this
     /// lags behind, the next Keepalive triggers a fresh `MaskCatalog` push.
@@ -473,6 +480,34 @@ impl ReplayWindow {
 }
 
 impl Session {
+    pub(crate) fn retire_rtc_offer(&mut self, id: [u8; 16]) {
+        if !self.rtc_retired_offers.contains(&id) {
+            self.rtc_retired_offers.push_back(id);
+            while self.rtc_retired_offers.len() > 64 {
+                self.rtc_retired_offers.pop_front();
+            }
+        }
+    }
+
+    pub(crate) fn admit_initial_hello(&mut self, now: Instant) -> bool {
+        if self.is_ratcheted {
+            return true;
+        }
+        if self.initial_hello_sends >= 16
+            || now.saturating_duration_since(self.created_at)
+                >= aivpn_common::handshake_retry::HANDSHAKE_TIMEOUT
+            || (self.initial_hello_sends >= 2
+                && self.initial_hello_last_sent.is_some_and(|last| {
+                    now.saturating_duration_since(last) < Duration::from_millis(200)
+                }))
+        {
+            return false;
+        }
+        self.initial_hello_sends += 1;
+        self.initial_hello_last_sent = Some(now);
+        true
+    }
+
     pub(crate) fn is_removed(&self) -> bool {
         self.removed
     }
@@ -541,6 +576,8 @@ impl Session {
             .copied()
             .filter(|&counter| !self.counter_is_fresh(counter))
             .collect();
+        self.pre_ratchet_counter = self.counter;
+        self.pre_ratchet_window_base = self.tag_window_base;
         self.pre_ratchet_tags = std::mem::take(&mut self.expected_tags);
         self.pre_ratchet_expire = Some(Instant::now() + grace);
     }
@@ -553,12 +590,14 @@ impl Session {
             hi,
             &words,
         );
+        self.clear_consumed_tag_hint();
     }
 
     /// Заменить локальное окно окном новой эпохи, не смешивая со старым.
     pub fn adopt_shared_replay(&mut self, hi: u64, words: [u64; 8]) {
         self.counter = hi;
         self.received_bitmap.words = words;
+        self.clear_consumed_tag_hint();
     }
 
     /// Обычный Data принадлежит конкретному клиенту; площадки передают SiteData.
@@ -595,6 +634,7 @@ impl Session {
             send_counter: 0,
             expected_tags: HashMap::with_capacity(TAG_WINDOW_SIZE),
             tag_window_base: 0,
+            tag_search_hint: None,
             received_bitmap: ReplayWindow::default(),
             pending_bytes_in: 0,
             pending_bytes_out: 0,
@@ -603,10 +643,15 @@ impl Session {
             ratcheted_keys: None,
             ratcheted_expected_tags: HashMap::new(),
             is_ratcheted: false,
+            initial_hello_sends: 0,
+            initial_hello_last_sent: None,
             vpn_ip: None,
             client_id: None,
             pre_ratchet_tags: HashMap::new(),
             pre_ratchet_expire: None,
+            pre_ratchet_monotonic: false,
+            pre_ratchet_counter: 0,
+            pre_ratchet_window_base: 0,
             pre_ratchet_received: std::collections::HashSet::new(),
             pre_ratchet_keys: None,
             mtls_ok: true,
@@ -621,6 +666,7 @@ impl Session {
             last_partition_check: None,
             bootstrap_descriptors_sent: false,
             client_admitted: false,
+            diagnostic_budget: Default::default(),
             authentication_retry_at: None,
             pending_rekey_keypair: None,
             pending_rekey_attempts: 0,
@@ -628,12 +674,15 @@ impl Session {
             last_rekey_at: now,
             bytes_since_rekey: 0,
             client_quality: 100,
+            receiver_loss: Default::default(),
+            receiver_report_sent_at: None,
+            quality_report_received_at: None,
             client_srtt_ms: 0,
-            fec_recv_count: 0,
-            fec_xor_buf: Vec::new(),
-            fec_xor_len: 0,
-            fec_pending_seq: 0,
-            fec_repair_seq_hi: None,
+            client_loss_ppm: 0,
+            client_jitter_ms: 0,
+            plain_wire_seen: 0,
+            fec_rx: Default::default(),
+            rtc_retired_offers: Default::default(),
             mask_catalog_version_sent: 0,
             capabilities_sent: false,
             client_packet_features: None,
@@ -704,18 +753,104 @@ impl Session {
         (nonce, counter)
     }
 
-    /// Update expected tags for validation window
+    /// Учитывает принятый пакет для статистики, не меняя криптографическое окно.
+    pub(crate) fn observe_receiver_counter(&mut self, counter: u64, previous_epoch: bool) {
+        if self.is_ratcheted && (!previous_epoch || self.pre_ratchet_monotonic) {
+            self.receiver_loss.observe(counter);
+        }
+    }
+
+    /// Ограничивает запись телеметрии и ответы на нее независимо от квоты DATA.
+    pub(crate) fn accept_quality_report(&mut self, now: Instant) -> bool {
+        if self
+            .quality_report_received_at
+            .is_some_and(|last| now.saturating_duration_since(last) < QUALITY_REPORT_MIN_INTERVAL)
+        {
+            return false;
+        }
+        self.quality_report_received_at = Some(now);
+        true
+    }
+
+    /// Возвращает отчет только при полном наблюдении обычной клиентской сессии.
+    pub(crate) fn receiver_quality_report(
+        &mut self,
+        observation_complete: bool,
+        now: Instant,
+    ) -> Option<ControlPayload> {
+        if !observation_complete
+            || !self.is_ratcheted
+            || !self.client_admitted
+            || self.kernel_faulted
+            || self.client_id.is_none()
+            || self.is_site_peer
+            || self.is_masked_pool_peer
+        {
+            return None;
+        }
+        let loss_ppm = self.receiver_loss.loss_ppm()?;
+        if self
+            .receiver_report_sent_at
+            .is_some_and(|last| now.saturating_duration_since(last) < QUALITY_REPORT_MIN_INTERVAL)
+        {
+            return None;
+        }
+        self.receiver_report_sent_at = Some(now);
+        Some(ControlPayload::QualityReport {
+            // Обратный отчет описывает только RX-потери, без оценки RTT и джиттера.
+            quality: 0,
+            rtt_ms: 0,
+            loss_ppm,
+            jitter_ms: 0,
+        })
+    }
+
+    /// Центр ограниченного поиска, отдельно от принятого счетчика и bitmap.
+    pub(crate) fn tag_search_center(&self) -> u64 {
+        self.counter
+            .max(self.tag_search_hint.unwrap_or(self.counter))
+    }
+
+    fn clear_consumed_tag_hint(&mut self) {
+        if self
+            .tag_search_hint
+            .is_some_and(|hint| self.counter >= hint)
+        {
+            self.tag_search_hint = None;
+        }
+    }
+
+    /// Обновление зависит от центра поиска, а не от счетчика отдельного старого пакета.
+    pub(crate) fn refresh_tag_window_if_needed(&mut self) -> bool {
+        let primary_advanced = self
+            .tag_search_center()
+            .saturating_sub(self.tag_window_base)
+            >= 128;
+        let previous_advanced = self.pre_ratchet_monotonic
+            && self.pre_ratchet_keys_in_grace().is_some()
+            && self
+                .pre_ratchet_counter
+                .saturating_sub(self.pre_ratchet_window_base)
+                >= 128;
+        if !primary_advanced && !previous_advanced {
+            return false;
+        }
+        self.update_tag_window();
+        true
+    }
+
+    /// Обновить ограниченное окно тегов, не отмечая пакеты новой эпохи принятыми.
     pub fn update_tag_window(&mut self) {
         let time_window =
             crypto::compute_time_window(crypto::current_timestamp_ms(), DEFAULT_WINDOW_MS);
 
-        // Pre-compute tags for a bidirectional window around the highest
-        // validated counter so minor UDP reordering does not fall out of the
-        // fast path lookup map.
+        // Старые принятые пакеты сдвигают поиск нового ключа, но не его replay.
+        // Окно остается ограниченным и допускает небольшую перестановку UDP.
         self.expected_tags.clear();
-        self.tag_window_base = self.counter;
+        let center = self.tag_search_center();
+        self.tag_window_base = center;
         let window_back = TAG_WINDOW_SIZE as u64 - 1;
-        let window_start = self.counter.saturating_sub(window_back);
+        let window_start = center.saturating_sub(window_back);
         // While a rekey is pending, reach further FORWARD so the client's
         // re-sent KeyRotate response — old-key authenticated but potentially
         // thousands of counters ahead of our frozen inbound counter — lands
@@ -727,7 +862,7 @@ impl Session {
             } else {
                 0
             };
-        let window_end = self.counter.saturating_add(window_fwd);
+        let window_end = center.saturating_add(window_fwd);
 
         for counter_val in window_start..=window_end {
             let tag =
@@ -735,6 +870,32 @@ impl Session {
             self.expected_tags.insert(counter_val, tag);
         }
         self.tag_window_tw = time_window;
+
+        // Старый отправитель продолжает передачу до подтверждения нового ключа.
+        // Его окно движется после принятого AEAD, не увеличивая размер и срок grace.
+        if self.pre_ratchet_monotonic
+            && self.pre_ratchet_keys_in_grace().is_some()
+            && self
+                .pre_ratchet_counter
+                .saturating_sub(self.pre_ratchet_window_base)
+                >= 128
+        {
+            let center = self.pre_ratchet_counter;
+            let start = center.saturating_sub(TAG_WINDOW_SIZE as u64 - 1);
+            let end = center.saturating_add(TAG_WINDOW_SIZE as u64 - 1 + REKEY_TAG_LOOKAHEAD);
+            let secret = &self.pre_ratchet_keys.as_ref().unwrap().tag_secret;
+            self.pre_ratchet_tags.clear();
+            for counter in start..=end {
+                self.pre_ratchet_tags.insert(
+                    counter,
+                    crypto::generate_resonance_tag(secret, counter, time_window),
+                );
+            }
+            // Удаляем replay-записи лишь после отсечения соответствующих тегов.
+            self.pre_ratchet_received
+                .retain(|counter| *counter >= start);
+            self.pre_ratchet_window_base = center;
+        }
     }
 
     /// Validate received tag (constant-time)
@@ -763,8 +924,9 @@ impl Session {
         };
 
         let history_window = TAG_WINDOW_SIZE as u64 - 1;
-        let window_start = self.counter.saturating_sub(history_window);
-        let window_end = self.counter.saturating_add(
+        let center = self.tag_search_center();
+        let window_start = center.saturating_sub(history_window);
+        let window_end = center.saturating_add(
             TAG_WINDOW_SIZE as u64 - 1
                 + if self.pending_rekey_keypair.is_some() {
                     REKEY_TAG_LOOKAHEAD
@@ -884,6 +1046,7 @@ impl Session {
             self.received_bitmap.shift_left(shift);
             self.counter = counter;
             self.received_bitmap.set_bit(0);
+            self.clear_consumed_tag_hint();
             return;
         }
 
@@ -891,6 +1054,7 @@ impl Session {
         if bit_index < TAG_WINDOW_SIZE {
             self.received_bitmap.set_bit(bit_index);
         }
+        self.clear_consumed_tag_hint();
     }
 
     /// Pre-ratchet keys, but only while the grace window is still open.
@@ -914,9 +1078,14 @@ impl Session {
         }
     }
 
-    /// Mark a pre-ratchet counter as received so it cannot be replayed (C-S-2).
+    /// Отметить старый пакет после успешных AEAD и replay claim.
     pub fn mark_pre_ratchet_received(&mut self, counter: u64) {
-        self.pre_ratchet_received.insert(counter);
+        if self.pre_ratchet_received.insert(counter) && self.pre_ratchet_monotonic {
+            self.pre_ratchet_counter = self.pre_ratchet_counter.max(counter);
+            if counter > self.counter {
+                self.tag_search_hint = Some(self.tag_search_center().max(counter));
+            }
+        }
     }
 
     /// Get next sequence number for inner header
@@ -930,16 +1099,15 @@ impl Session {
     pub fn update_fsm(&mut self) {
         if let Some(mask) = &self.mask {
             let duration_ms = self.fsm_state_start.elapsed().as_millis() as u64;
-            let (new_state, _size_override, _iat_override, _padding_override) =
-                mask.process_transition(self.fsm_state, self.fsm_packets, duration_ms);
-
-            if new_state != self.fsm_state {
-                self.fsm_state = new_state;
+            if let Some(transition) =
+                mask.matching_transition(self.fsm_state, self.fsm_packets, duration_ms)
+            {
+                self.fsm_state = transition.next_state;
                 self.fsm_packets = 0;
                 self.fsm_state_start = Instant::now();
             }
         }
-        self.fsm_packets += 1;
+        self.fsm_packets = self.fsm_packets.saturating_add(1);
     }
 
     /// Check if session is idle
@@ -1001,6 +1169,11 @@ impl Session {
     /// Complete PFS ratchet: switch to ratcheted keys, zeroize old ones
     pub fn complete_ratchet(&mut self) {
         if let Some(ratcheted_keys) = self.ratcheted_keys.take() {
+            self.pre_ratchet_monotonic = false;
+            self.tag_search_hint = None;
+            self.receiver_loss.reset();
+            self.receiver_report_sent_at = None;
+            self.quality_report_received_at = None;
             // Preserve old expected_tags for an RTT-scaled grace so client
             // packets already in-flight with the pre-ratchet keys are not
             // dropped (see rekey_grace).
@@ -1037,20 +1210,40 @@ impl Session {
         const MASK_GRACE_PERIOD: Duration = Duration::from_millis(500);
         if let Some((_, sent_at)) = &self.pending_mask {
             if sent_at.elapsed() >= MASK_GRACE_PERIOD {
-                let (new_mask, _) = self.pending_mask.take().unwrap();
-                info!("Committing deferred mask switch to '{}'", new_mask.mask_id);
-                self.mask = Some(new_mask);
-                // 1a: the old pool's headers belong to the mask we just left
-                // — rebuild before the next downlink packet picks one up.
-                self.rebuild_mdh_pool();
-                // Reset FSM state for the new mask
-                self.fsm_state = 0;
-                self.fsm_packets = 0;
-                self.fsm_state_start = Instant::now();
-                return true;
+                return self.activate_pending_mask();
             }
         }
         false
+    }
+
+    /// AEAD-пакет в новом внешнем протоколе подтверждает доставку MaskUpdate.
+    pub fn confirm_mask_protocol(&mut self, stateful: bool) -> bool {
+        let current = self
+            .mask
+            .as_ref()
+            .is_some_and(aivpn_common::mask_io::needs_state);
+        let pending = self
+            .pending_mask
+            .as_ref()
+            .map(|(mask, _)| aivpn_common::mask_io::needs_state(mask));
+        if current != stateful && pending == Some(stateful) {
+            self.activate_pending_mask()
+        } else {
+            false
+        }
+    }
+
+    fn activate_pending_mask(&mut self) -> bool {
+        let Some((new_mask, _)) = self.pending_mask.take() else {
+            return false;
+        };
+        info!("Committing deferred mask switch to '{}'", new_mask.mask_id);
+        self.mask = Some(new_mask);
+        self.rebuild_mdh_pool();
+        self.fsm_state = 0;
+        self.fsm_packets = 0;
+        self.fsm_state_start = Instant::now();
+        true
     }
 }
 
@@ -1265,26 +1458,31 @@ impl SessionManager {
     ) -> Result<Arc<Mutex<Session>>> {
         let _allocation = self.allocation_lock.lock();
         let mut previous = None;
+        let mut abandoned = Vec::new();
         if let Some(client_id) = client_id {
             for entry in self.sessions.iter() {
                 let session = entry.value().lock();
                 if session.client_id.as_deref() == Some(client_id) {
-                    if previous.is_some() {
-                        return Err(Error::Session(
-                            "Client replacement is already pending".into(),
-                        ));
+                    if !session.is_ratcheted && !session.client_admitted {
+                        abandoned.push((session.session_id, session.client_addr.ip()));
+                    } else {
+                        if previous.is_some() {
+                            return Err(Error::Session(
+                                "Client replacement is already pending".into(),
+                            ));
+                        }
+                        previous = Some(session.client_addr.ip());
                     }
-                    previous = Some(session.client_addr.ip());
                 }
             }
         }
         // Резерв ограничен общим лимитом; старый сеанс жив до принятия нового.
-        let global_limit = if client_id.is_some() && previous.is_none() {
+        let global_limit = if client_id.is_some() && previous.is_none() && abandoned.is_empty() {
             MAX_SESSIONS - 10
         } else {
             MAX_SESSIONS
         };
-        if self.sessions.len() >= global_limit {
+        if self.sessions.len().saturating_sub(abandoned.len()) >= global_limit {
             return Err(Error::Session("Max sessions reached".into()));
         }
 
@@ -1295,7 +1493,11 @@ impl SessionManager {
             .filter(|e| e.value().lock().client_addr.ip() == client_addr.ip())
             .count();
         let replaces_same_ip = previous.is_some_and(|ip| ip == client_addr.ip());
-        if ip_count.saturating_sub(usize::from(replaces_same_ip)) >= 5 {
+        let abandoned_ip_count = abandoned
+            .iter()
+            .filter(|(_, ip)| *ip == client_addr.ip())
+            .count();
+        if ip_count.saturating_sub(abandoned_ip_count + usize::from(replaces_same_ip)) >= 5 {
             return Err(Error::Session("Per-IP session limit reached".into()));
         }
 
@@ -1319,7 +1521,13 @@ impl SessionManager {
             let replaces_same_subnet = previous.is_some_and(
                 |ip| matches!(ip, std::net::IpAddr::V4(ip) if u32::from(ip) >> 8 == subnet24),
             );
-            if subnet_count.saturating_sub(usize::from(replaces_same_subnet)) >= 10 {
+            let abandoned_subnet_count = abandoned.iter().filter(|(_, ip)| {
+                matches!(ip, std::net::IpAddr::V4(ip) if u32::from(*ip) >> 8 == subnet24)
+            }).count();
+            if subnet_count
+                .saturating_sub(abandoned_subnet_count + usize::from(replaces_same_subnet))
+                >= 10
+            {
                 return Err(Error::Session(
                     "Per-subnet (/24) session limit reached".into(),
                 ));
@@ -1329,8 +1537,14 @@ impl SessionManager {
         // DH1: server_static * client_eph → initial keys (0-RTT)
         let dh1 = self.server_keys.compute_shared(&eph_pub)?;
 
-        let session =
-            self.build_and_insert_session(client_addr, eph_pub, dh1, preshared_key, false)?;
+        let session = self.build_and_insert_session(
+            client_addr,
+            eph_pub,
+            dh1,
+            preshared_key,
+            false,
+            &abandoned,
+        )?;
         let session_id = {
             let mut session = session.lock();
             session.client_id = client_id.map(str::to_owned);
@@ -1368,7 +1582,7 @@ impl SessionManager {
         // DH1: shared pool server keypair * dialer's ephemeral pub → initial keys
         let dh1 = pool_kp.compute_shared(&eph_pub)?;
 
-        self.build_and_insert_session(client_addr, eph_pub, dh1, Some(*pool_psk), true)
+        self.build_and_insert_session(client_addr, eph_pub, dh1, Some(*pool_psk), true, &[])
     }
 
     /// Shared core of `create_session` and `create_masked_pool_peer_session`:
@@ -1389,6 +1603,7 @@ impl SessionManager {
         dh1: [u8; 32],
         preshared_key: Option<[u8; 32]>,
         is_masked_pool_peer: bool,
+        abandoned: &[([u8; 16], std::net::IpAddr)],
     ) -> Result<Arc<Mutex<Session>>> {
         // Never log key material (DH shared secret, PSK, tag_secret) — even at
         // trace, RUST_LOG is operator-controllable and these secrets are what
@@ -1430,6 +1645,12 @@ impl SessionManager {
             initial_keys,
             eph_pub,
         )));
+
+        // Удаляем только незавершенные handshake той же подтвержденной PSK-личности.
+        // Новый keyspace уже захвачен: replay не может вытеснить текущую попытку.
+        for (id, _) in abandoned {
+            self.remove_session(id);
+        }
 
         // Setup ratchet state + populate tag maps
         {
@@ -1687,7 +1908,7 @@ impl SessionManager {
                     } else {
                         0
                     };
-                return counter - sess.counter <= ahead;
+                return counter <= sess.tag_search_center().saturating_add(ahead);
             }
             let distance = sess.counter - counter;
             distance < TAG_WINDOW_SIZE as u64 && !sess.received_bitmap.get_bit(distance as usize)
@@ -1699,6 +1920,7 @@ impl SessionManager {
                 if sess
                     .pre_ratchet_expire
                     .is_some_and(|expiry| Instant::now() < expiry)
+                    && sess.pre_ratchet_tags.contains_key(&indexed.counter)
                     && !sess.pre_ratchet_received.contains(&indexed.counter) =>
             {
                 sess.pre_ratchet_keys.as_ref()
@@ -1874,13 +2096,15 @@ impl SessionManager {
                 }
                 // Copy [u8;32] (Copy type) and release the mutex before the
                 // BLAKE3 iterations that would otherwise hold it.
-                (sess.counter, sess.keys.tag_secret)
+                (sess.tag_search_center(), sess.keys.tag_secret)
             };
 
             for tw_offset in [0i64, -1, 1] {
                 let tw = (current_tw as i64 + tw_offset) as u64;
                 for i in 0..=RECOVERY_RANGE {
-                    let c = base.wrapping_add(i);
+                    let Some(c) = base.checked_add(i) else {
+                        break;
+                    };
                     let expected = crypto::generate_resonance_tag(&tag_secret, c, tw);
                     if bool::from(expected.ct_eq(tag)) {
                         // За время поиска другой worker мог сменить эпоху или
@@ -2012,6 +2236,16 @@ impl SessionManager {
 
     /// Complete PFS ratchet for a session: switch to ratcheted keys, remove old tags
     pub fn complete_session_ratchet(&self, session_id: &[u8; 16]) {
+        // Готовая сессия не должна захватывать общий lock на каждом DATA-пакете.
+        let pending = self
+            .sessions
+            .get(session_id)
+            .is_some_and(|entry| entry.value().lock().ratcheted_keys.is_some());
+        if !pending {
+            return;
+        }
+        // Не допускаем превращения вытесняемого handshake в живую сессию.
+        let _allocation = self.allocation_lock.lock();
         if let Some(session) = self.sessions.get(session_id) {
             let mut sess = session.lock();
             if sess.ratcheted_keys.is_none() {
@@ -2037,6 +2271,9 @@ impl SessionManager {
                 sess.pre_ratchet_received.clear();
                 sess.pre_ratchet_expire = None;
                 sess.pre_ratchet_keys = None;
+                sess.pre_ratchet_counter = 0;
+                sess.pre_ratchet_window_base = 0;
+                sess.pre_ratchet_monotonic = false;
                 self.reindex_session(&sess);
             }
         }
@@ -2188,8 +2425,6 @@ impl SessionManager {
         session: &Arc<Mutex<Session>>,
         new_mask: &MaskProfile,
     ) -> Result<Vec<u8>> {
-        use aivpn_common::crypto::{encrypt_session_payload, PacketDirection};
-
         // Serialize mask profile → mask_data (MessagePack to match client's rmp_serde::from_slice)
         let mask_data = rmp_serde::to_vec(new_mask)
             .map_err(|e| Error::Session(format!("Failed to serialize mask: {}", e)))?;
@@ -2204,9 +2439,50 @@ impl SessionManager {
         };
         let encoded = control.encode()?;
 
+        self.encrypt_mask_update_piece(&mut session.lock(), &encoded, InnerType::Control)
+    }
+
+    /// Подписывает обновление маски и разбивает его до шифрования.
+    pub fn build_mask_update_packets(
+        &self,
+        session: &Arc<Mutex<Session>>,
+        new_mask: &MaskProfile,
+    ) -> Result<(Vec<Vec<u8>>, bool)> {
+        let mask_data =
+            rmp_serde::to_vec(new_mask).map_err(|error| Error::Session(error.to_string()))?;
+        let signature = self.sign_mask(&mask_data);
+        let encoded = ControlPayload::MaskUpdate {
+            mask_data,
+            signature,
+        }
+        .encode()?;
+        let (kind, pieces) = if encoded.len() > aivpn_common::fragment::FRAGMENT_DATA_SIZE {
+            (
+                InnerType::Fragment,
+                aivpn_common::fragment::split(InnerType::Control, &encoded)?,
+            )
+        } else {
+            (InnerType::Control, vec![encoded])
+        };
         let mut sess = session.lock();
+        let stateful =
+            aivpn_common::mask_io::needs_state(sess.mask.as_ref().unwrap_or(&self.default_mask));
+        let packets = pieces
+            .iter()
+            .map(|piece| self.encrypt_mask_update_piece(&mut sess, piece, kind))
+            .collect::<Result<Vec<_>>>()?;
+        Ok((packets, stateful))
+    }
+
+    fn encrypt_mask_update_piece(
+        &self,
+        sess: &mut Session,
+        encoded: &[u8],
+        kind: InnerType,
+    ) -> Result<Vec<u8>> {
+        use aivpn_common::crypto::{encrypt_session_payload, PacketDirection};
         let inner_header = InnerHeader {
-            inner_type: InnerType::Control,
+            inner_type: kind,
             seq_num: sess.next_seq() as u16,
         };
         let mut inner_payload = inner_header.encode().to_vec();
@@ -2214,7 +2490,18 @@ impl SessionManager {
 
         // Encrypt (same logic as Gateway::build_packet)
         let (_, counter) = sess.next_send_nonce();
-        let pad_len = 16u16;
+        let transport_mask = sess.mask.as_ref().unwrap_or(&self.default_mask);
+        let mdh = if let Some(ref spec) = transport_mask.header_spec {
+            spec.generate(&mut rand::thread_rng())
+        } else {
+            transport_mask.header_template.clone()
+        };
+        let base = mdh.len()
+            + crypto::session_payload_overhead(&sess.keys)
+            + 2
+            + inner_payload.len()
+            + crypto::POLY1305_TAG_SIZE;
+        let pad_len = transport_mask.wire_padding(base, 16, 19)?;
         let mut padded = Vec::with_capacity(2 + inner_payload.len() + pad_len as usize);
         padded.extend_from_slice(&pad_len.to_le_bytes());
         padded.extend_from_slice(&inner_payload);
@@ -2240,19 +2527,10 @@ impl SessionManager {
 
         // Wrap MaskUpdate in the session's current mask. The switch to `new_mask`
         // happens only after the packet is successfully delivered.
-        let transport_mask = sess.mask.as_ref().unwrap_or(&self.default_mask);
-        let mdh = if let Some(ref spec) = transport_mask.header_spec {
-            let mut rng = rand::thread_rng();
-            spec.generate(&mut rng)
-        } else {
-            transport_mask.header_template.clone()
-        };
 
         // Assemble: TAG | MDH | ciphertext
         let mut packet = Vec::with_capacity(TAG_SIZE + mdh.len() + ciphertext.len());
-        packet.extend_from_slice(&tag);
-        packet.extend_from_slice(&mdh);
-        packet.extend_from_slice(&ciphertext);
+        transport_mask.assemble_packet_into(&mut packet, &mdh, &tag, &ciphertext)?;
 
         Ok(packet)
     }
@@ -2431,6 +2709,7 @@ impl SessionManager {
         // Preserve old keys for an RTT-scaled grace window (in-flight packets from client).
         let grace = sess.inline_rekey_grace();
         sess.preserve_replay_for_grace(grace);
+        sess.pre_ratchet_monotonic = true;
 
         // Install new keys, retaining the outgoing ones for the grace window so
         // in-flight old-key packets can actually be decrypted (see
@@ -2469,7 +2748,13 @@ impl SessionManager {
         sess.update_tag_window();
         self.reindex_session(&sess);
 
-        info!("Session inline rekey complete (new keys installed)");
+        info!(
+            receive_counter = sess.counter,
+            search_center = sess.tag_search_center(),
+            send_counter = sess.send_counter,
+            previous_window_end = sess.pre_ratchet_tags.keys().max().copied(),
+            "Session inline rekey complete (new keys installed)"
+        );
     }
 }
 
@@ -2497,6 +2782,139 @@ mod tests {
             make_keys(1),
             [0u8; X25519_PUBLIC_KEY_SIZE],
         )
+    }
+
+    #[test]
+    fn fec_receiver_incoming_reports_bound_work_independently_of_data_rate() {
+        let mut state = make_session();
+        let now = Instant::now();
+        assert!(state.accept_quality_report(now));
+        for milliseconds in 0..1000 {
+            assert!(!state.accept_quality_report(now + Duration::from_millis(milliseconds)));
+        }
+        assert!(state.accept_quality_report(now + Duration::from_secs(1)));
+        assert!(!state.accept_quality_report(now));
+    }
+
+    #[test]
+    fn fec_receiver_reports_have_a_shared_monotonic_rate_limit() {
+        let mut state = make_session();
+        state.is_ratcheted = true;
+        state.client_admitted = true;
+        state.client_id = Some("registered-client".into());
+        for counter in 0..64 {
+            state.observe_receiver_counter(counter, false);
+        }
+        let now = Instant::now();
+        assert!(state.receiver_quality_report(true, now).is_some());
+        assert!(state
+            .receiver_quality_report(true, now + Duration::from_millis(999))
+            .is_none());
+        assert!(state
+            .receiver_quality_report(true, now + Duration::from_secs(1))
+            .is_some());
+        assert!(state.receiver_quality_report(true, now).is_none());
+    }
+
+    #[test]
+    fn fec_receiver_full_pfs_resets_observation_and_excludes_initial_old() {
+        let mut state = make_session();
+        state.is_ratcheted = true;
+        for counter in 1000..1064 {
+            state.observe_receiver_counter(counter, false);
+        }
+        assert_eq!(state.receiver_loss.counts(), (64, 64));
+        state.ratcheted_keys = Some(make_keys(9));
+        state.complete_ratchet();
+        assert_eq!(state.receiver_loss.counts(), (0, 0));
+        state.observe_receiver_counter(1064, true);
+        assert_eq!(state.receiver_loss.counts(), (0, 0));
+        state.observe_receiver_counter(0, false);
+        assert_eq!(state.receiver_loss.counts(), (1, 1));
+        assert!(state.receiver_loss.loss_ppm().is_none());
+    }
+
+    #[test]
+    fn inline_old_window_moves_below_a_newer_primary_counter() {
+        let mut state = make_session();
+        state.mark_tag_received(1000);
+        state.pending_rekey_keypair = Some(KeyPair::generate());
+        state.update_tag_window();
+        state.preserve_replay_for_grace(Duration::from_secs(30));
+        state.pre_ratchet_monotonic = true;
+        state.pre_ratchet_keys = Some(std::mem::replace(&mut state.keys, make_keys(9)));
+        state.pending_rekey_keypair = None;
+        state.update_tag_window();
+        state.mark_tag_received(10000);
+        state.update_tag_window();
+        let before = state.pre_ratchet_tags.keys().max().copied().unwrap();
+        state.mark_pre_ratchet_received(1128);
+        assert!(state.refresh_tag_window_if_needed());
+        assert_eq!(state.counter, 10000);
+        assert!(state.pre_ratchet_tags.keys().max().copied().unwrap() > before);
+        let tag = state.pre_ratchet_tags[&5700];
+        assert_eq!(state.validate_tag(&tag), Some((5700, false)));
+    }
+
+    #[test]
+    fn inline_old_window_at_counter_limit_does_not_wrap() {
+        let mut state = make_session();
+        state.mark_tag_received(u64::MAX - 300);
+        state.pending_rekey_keypair = Some(KeyPair::generate());
+        state.update_tag_window();
+        let capacity = state.expected_tags.len();
+        state.preserve_replay_for_grace(Duration::from_secs(30));
+        state.pre_ratchet_monotonic = true;
+        state.pre_ratchet_keys = Some(std::mem::replace(&mut state.keys, make_keys(9)));
+        state.pending_rekey_keypair = None;
+        state.update_tag_window();
+        state.mark_pre_ratchet_received(u64::MAX - 20);
+        assert!(state.refresh_tag_window_if_needed());
+        assert!(state.pre_ratchet_tags.len() <= capacity);
+        assert_eq!(state.pre_ratchet_tags.keys().max(), Some(&u64::MAX));
+        assert!(!state.pre_ratchet_tags.contains_key(&0));
+        let tag = state.pre_ratchet_tags[&u64::MAX];
+        assert_eq!(state.validate_tag(&tag), Some((u64::MAX, false)));
+    }
+
+    #[test]
+    fn fsm_self_transition_restarts_the_packet_budget() {
+        let mut session = make_session();
+        let mut mask = aivpn_common::mask::preset_masks::webrtc_zoom_v3();
+        mask.fsm_initial_state = 0;
+        mask.fsm_states = vec![aivpn_common::mask::FSMState {
+            state_id: 0,
+            transitions: vec![aivpn_common::mask::FSMTransition {
+                condition: aivpn_common::mask::TransitionCondition::AfterPackets(3),
+                next_state: 0,
+                size_override: None,
+                iat_override: None,
+                padding_override: None,
+            }],
+        }];
+        session.mask = Some(mask);
+        session.fsm_packets = 2;
+        session.update_fsm();
+        assert_eq!(session.fsm_packets, 3);
+        session.update_fsm();
+        assert_eq!(session.fsm_packets, 1);
+    }
+
+    #[test]
+    fn initial_hello_budget_bounds_bursts_total_and_lifetime() {
+        let mut session = make_session();
+        let start = session.created_at;
+        assert!(session.admit_initial_hello(start));
+        assert!(session.admit_initial_hello(start));
+        assert!(!session.admit_initial_hello(start + Duration::from_millis(199)));
+        for step in 1..=14 {
+            assert!(session.admit_initial_hello(start + Duration::from_millis(200 * step)));
+        }
+        assert!(!session.admit_initial_hello(start + Duration::from_secs(4)));
+        let mut expired = make_session();
+        assert!(!expired.admit_initial_hello(expired.created_at + Duration::from_secs(10)));
+        expired.is_ratcheted = true;
+        assert!(expired.admit_initial_hello(expired.created_at + Duration::from_secs(60)));
     }
 
     // ── RTT-scaled rekey grace (A5) ───────────────────────────────────────────
@@ -2826,7 +3244,13 @@ mod tests {
             .as_ref()
             .map(|spec| spec.min_length())
             .unwrap_or(transport_mask.header_template.len());
-        let tag: [u8; 8] = packet[..8].try_into().unwrap();
+        let prefix = transport_mask.effective_tag_prefix_len(mdh_len);
+        let tag_offset = if prefix == 0 {
+            transport_mask.tag_offset as usize
+        } else {
+            0
+        };
+        let tag: [u8; 8] = packet[tag_offset..tag_offset + 8].try_into().unwrap();
         let dh = client.compute_shared(&manager.server_public_key()).unwrap();
         let keys = crypto::derive_initial_session_keys(&dh, None, &client.public_key_bytes());
         let padded = crypto::decrypt_session_payload(
@@ -2834,7 +3258,7 @@ mod tests {
             crypto::PacketDirection::ServerToClient,
             0,
             &tag,
-            &packet[8 + mdh_len..],
+            &packet[prefix + mdh_len..],
         )
         .expect("до PFS MaskUpdate обязан использовать InitialV2");
         assert_eq!(
@@ -2863,6 +3287,65 @@ mod tests {
                 &tag,
             )
             .unwrap()
+    }
+
+    #[test]
+    fn replayed_initial_cannot_discard_the_pending_handshake() {
+        let manager = make_manager();
+        let pending = pending_authenticated_client(&manager, 1000);
+        let (id, eph, secret) = {
+            let session = pending.lock();
+            (session.session_id, session.eph_pub, session.keys.tag_secret)
+        };
+        let tag = crypto::generate_resonance_tag(
+            &secret,
+            0,
+            crypto::compute_time_window(crypto::current_timestamp_ms(), DEFAULT_WINDOW_MS),
+        );
+        let error = manager
+            .create_authenticated_session(
+                "127.0.0.1:2000".parse().unwrap(),
+                eph,
+                [2; 32],
+                "10.0.0.8".parse().unwrap(),
+                "client",
+                &tag,
+            )
+            .err()
+            .expect("Повторный initial должен быть отклонен");
+        assert!(matches!(
+            error,
+            Error::InvalidPacket("Replayed initial handshake")
+        ));
+        assert_eq!(manager.session_count(), 1);
+        assert!(manager.get_session(&id).is_some());
+        assert!(!pending.lock().is_removed());
+    }
+
+    #[test]
+    fn abandoned_replacement_can_be_superseded_without_dropping_the_live_owner() {
+        let manager = make_manager();
+        let live = pending_authenticated_client(&manager, 1000);
+        let live_id = live.lock().session_id;
+        manager.complete_session_ratchet(&live_id);
+        live.lock().client_admitted = true;
+        let vip = "10.0.0.8".parse().unwrap();
+        manager.bind_vpn_ip(&vip, &live_id);
+        let abandoned = pending_authenticated_client(&manager, 2000);
+        let abandoned_id = abandoned.lock().session_id;
+        let replacement = pending_authenticated_client(&manager, 3000);
+        assert_eq!(manager.session_count(), 2);
+        assert!(manager.get_session(&abandoned_id).is_none());
+        assert!(abandoned.lock().is_removed());
+        assert!(!replacement.lock().is_removed());
+        assert_eq!(
+            manager
+                .get_session_by_vpn_ip(&vip)
+                .unwrap()
+                .lock()
+                .session_id,
+            live_id
+        );
     }
 
     #[test]
@@ -3662,6 +4145,123 @@ mod tests {
         assert!(mgr.find_session_by_tag(&tag).unwrap().is_some());
         session.lock().pending_rekey_keypair = None;
         assert!(mgr.find_session_by_tag(&tag).is_err());
+    }
+
+    fn inline_backlog_fixture() -> (SessionManager, Arc<Mutex<Session>>, SessionKeys) {
+        let (manager, session, _) = make_manager_with_session();
+        let old = make_keys(11);
+        let id = {
+            let mut state = session.lock();
+            state.keys = old.clone();
+            state.is_ratcheted = true;
+            state.ratcheted_keys = None;
+            state.ratcheted_expected_tags.clear();
+            state.mark_tag_received(1000);
+            state.pending_rekey_keypair = Some(KeyPair::generate());
+            state.update_tag_window();
+            state.session_id
+        };
+        manager.commit_session_rekey(&id, &KeyPair::generate().public_key_bytes());
+        (manager, session, old)
+    }
+
+    #[test]
+    fn inline_old_epoch_backlog_keeps_tag_refresh_amortized() {
+        let (_, session, old) = inline_backlog_fixture();
+        let mut state = session.lock();
+        let before = state.received_bitmap.words;
+        let mut refreshes = 0;
+        for counter in 1001..=1700 {
+            assert_eq!(
+                state.authenticated_counter_epoch(counter, &old.tag_secret),
+                Some(true)
+            );
+            state.mark_pre_ratchet_received(counter);
+            if counter.saturating_sub(state.tag_window_base) >= 128 {
+                state.update_tag_window();
+                refreshes += 1;
+            }
+        }
+        assert_eq!(state.counter, 1000);
+        assert_eq!(state.received_bitmap.words, before);
+        assert!(
+            refreshes <= 6,
+            "Обновлений на 700 старых пакетов: {refreshes}"
+        );
+    }
+
+    #[test]
+    fn inline_old_epoch_backlog_keeps_first_new_tag_indexed_after_expiry() {
+        for expired in [false, true] {
+            let (manager, session, old) = inline_backlog_fixture();
+            let (id, keys) = {
+                let mut state = session.lock();
+                let before = state.received_bitmap.words;
+                for counter in 1001..=1700 {
+                    assert_eq!(
+                        state.authenticated_counter_epoch(counter, &old.tag_secret),
+                        Some(true)
+                    );
+                    state.mark_pre_ratchet_received(counter);
+                }
+                assert_eq!(state.counter, 1000);
+                assert_eq!(state.received_bitmap.words, before);
+                if expired {
+                    state.pre_ratchet_expire = Some(Instant::now() - Duration::from_secs(1));
+                }
+                state.update_tag_window();
+                (state.session_id, state.keys.clone())
+            };
+            if expired {
+                manager.cleanup_expired();
+            }
+            manager.refresh_session_tags(&id);
+            let tw = session.lock().tag_window_tw;
+            let tag = crypto::generate_resonance_tag(&keys.tag_secret, 1701, tw);
+            let found = manager.find_session_by_tag(&tag).unwrap();
+            assert!(found.is_some(), "Новый тег потерян, expired={expired}");
+            assert_eq!(found.unwrap().1, 1701);
+            assert_eq!(session.lock().counter, 1000);
+            session.lock().mark_tag_received(1701);
+            assert!(manager.find_session_by_tag(&tag).is_err());
+        }
+    }
+
+    #[test]
+    fn initial_pfs_old_epoch_does_not_move_the_reset_counter_index() {
+        let mut state = make_session();
+        state.mark_tag_received(1000);
+        state.update_tag_window();
+        state.ratcheted_keys = Some(make_keys(19));
+        state.update_ratcheted_tag_window();
+        state.complete_ratchet();
+        state.mark_pre_ratchet_received(1001);
+        state.update_tag_window();
+        assert_eq!(state.counter, 0);
+        assert_eq!(state.tag_window_base, 0);
+        assert!(state.expected_tags.contains_key(&0));
+    }
+
+    #[test]
+    fn inline_search_hint_is_consumed_by_kernel_replay_or_full_pfs_reset() {
+        for operation in 0..3 {
+            let (_, session, _) = inline_backlog_fixture();
+            let mut state = session.lock();
+            state.mark_pre_ratchet_received(1700);
+            assert_eq!(state.tag_search_center(), 1700);
+            match operation {
+                0 => state.absorb_shared_replay(1800, [1; 8]),
+                1 => state.adopt_shared_replay(1800, [1; 8]),
+                _ => {
+                    state.ratcheted_keys = Some(make_keys(25));
+                    state.update_ratcheted_tag_window();
+                    state.complete_ratchet();
+                    state.mark_pre_ratchet_received(1800);
+                    assert_eq!(state.tag_search_center(), 0);
+                }
+            }
+            assert_eq!(state.tag_search_hint, None);
+        }
     }
 
     /// M2 regression: a replayed old packet whose counter sits behind

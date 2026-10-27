@@ -618,7 +618,7 @@ struct ContentView: View {
                                         showBootstrapAdvanced = false
                                     }
                                 } else {
-                                    vpn.lastError = loc.t("duplicate_key")
+                                    vpn.lastError = loc.t(KeychainStorage.shared.storeAccessFailed ? "admin_key_save_failed" : "duplicate_key")
                                 }
                             } else {
                                 if vpn.addKey(name: name, keyValue: connectionKey,
@@ -641,7 +641,7 @@ struct ContentView: View {
                                         showBootstrapAdvanced = false
                                     }
                                 } else {
-                                    vpn.lastError = loc.t("duplicate_key")
+                                    vpn.lastError = loc.t(KeychainStorage.shared.storeAccessFailed ? "admin_key_save_failed" : "duplicate_key")
                                 }
                             }
                         }
@@ -768,6 +768,8 @@ struct ContentView: View {
                                         .font(.caption)
                                         .foregroundColor(result.lossPct > 5 ? .red : .secondary)
                                 }
+                                Text("↑ \(Int(result.uploadKbps))  ↓ \(Int(result.downloadKbps)) kbps")
+                                    .font(.caption).foregroundColor(.secondary)
                                 Text("P50: \(Int(result.p50))ms  P95: \(Int(result.p95))ms  P99: \(Int(result.p99))ms")
                                     .font(.caption)
                                     .foregroundColor(.secondary)
@@ -1219,6 +1221,8 @@ func serverAddrFromConnectionKey(_ key: String) -> String? {
 }
 
 struct BenchDisplayResult {
+    let uploadKbps: Double
+    let downloadKbps: Double
     let p50: Double
     let p95: Double
     let p99: Double

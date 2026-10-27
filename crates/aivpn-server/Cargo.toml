@@ -16,6 +16,7 @@ name = "aivpn-mask-repair"
 path = "src/bin/aivpn-mask-repair.rs"
 
 [dependencies]
+tempfile = { version = "3", optional = true }
 aivpn-common = { path = "../aivpn-common", version = "*" }
 # FORK-B pool-sync dialer: the server embeds a headless control-only
 # `AivpnClient` to dial pool peers as a masked pool-client (see
@@ -45,6 +46,8 @@ portable-atomic = "1"
 # Serialization
 serde.workspace = true
 serde_json.workspace = true
+serde_path_to_error = "0.1"
+serde_ignored = "0.1"
 rmp-serde.workspace = true
 
 # Utils
@@ -83,8 +86,8 @@ dns = ["reqwest"]
 # Structured-event webhook delivery (`AIVPN_EVENT_WEBHOOK` → HTTP POST per
 # event) — see `bootstrap.rs::install_webhook_forwarder`.
 event-webhook = ["reqwest"]
-management-api = ["axum", "tower", "hyper", "hyper-util", "tokio-stream", "anyhow"]
-production-secure = []
+management-api = ["axum", "tower", "hyper", "hyper-util", "tokio-stream", "anyhow", "dep:tempfile"]
+production-secure = ["aivpn-client/production-secure"]
 bootstrap-publish = ["reqwest", "hmac"]
 
 # Management API (Unix socket HTTP server)
@@ -117,6 +120,7 @@ version = "1"
 optional = true
 
 [dev-dependencies]
+async-trait.workspace = true
 tempfile = "3"
 http-body-util = "0.1"
 hyper = { version = "1", features = ["full"] }

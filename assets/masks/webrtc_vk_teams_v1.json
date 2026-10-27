@@ -1,12 +1,12 @@
 {
   "mask_id": "webrtc_vk_teams_v1",
-  "version": 3,
+  "version": 5,
   "created_at": 0,
   "expires_at": 18446744073709551615,
   "spoof_protocol": "WebRTC_STUN",
   "header_template": [
     0,
-    1,
+    17,
     0,
     1,
     33,
@@ -24,9 +24,13 @@
     49,
     217,
     86,
-    15
+    15,
+    192,
+    114,
+    0,
+    0
   ],
-  "eph_pub_offset": 20,
+  "eph_pub_offset": 24,
   "eph_pub_length": 32,
   "size_distribution": {
     "dist_type": "Histogram",
@@ -62,369 +66,84 @@
       0.35
     ],
     "jitter_range_ms": [
-      5.0,
-      25.0
+      5,
+      25
     ]
   },
-  "size_iat_joint": {
-    "params": [
-      6.0,
-      0.048242397339902585,
-      101.74479166666667,
-      8.917328124999997,
-      20.831728453809657,
-      -0.0641396714181251,
-      6.540921551255299,
-      0.001699311934531212,
-      531.6444319574241,
-      10.055878079436935,
-      190.79159492399032,
-      0.0,
-      1.0,
-      0.061709142601884634,
-      371.98427918148394,
-      10.055878079436935,
-      8.61006942280732,
-      0.0,
-      1.0,
-      0.289271058917696,
-      372.45926862732995,
-      10.055878079436935,
-      8.606942851064833,
-      0.0,
-      1.0,
-      0.2962050996361943,
-      372.468717984801,
-      10.055878079436935,
-      8.606613351393086,
-      0.0,
-      1.0,
-      0.3028729895697913,
-      372.43106641968774,
-      10.11436808679547,
-      8.594705238557781,
-      4.345756297191717,
-      8.296632912603524
-    ]
-  },
-  "padding_strategy": {
-    "RandomUniform": {
-      "min": 0,
-      "max": 64
-    }
-  },
+  "size_iat_joint": null,
+  "padding_strategy": "MatchDistribution",
   "fsm_states": [
     {
       "state_id": 0,
-      "transitions": [
-        {
-          "condition": {
-            "Random": 0.12041885
-          },
-          "next_state": 0,
-          "size_override": {
-            "dist_type": "Parametric",
-            "bins": [],
-            "parametric_type": "Gmm",
-            "parametric_params": [
-              1.0,
-              1.0,
-              101.74931397106967,
-              20.846822255230187
-            ]
-          },
-          "iat_override": {
-            "dist_type": "Gmm",
-            "params": [
-              1.0,
-              1.0,
-              8.917328124999997,
-              6.541236017537178
-            ],
-            "jitter_range_ms": [
-              0.0,
-              0.0
-            ]
-          },
-          "padding_override": null
-        },
-        {
-          "condition": {
-            "Random": 0.005235602
-          },
-          "next_state": 1,
-          "size_override": {
-            "dist_type": "Parametric",
-            "bins": [],
-            "parametric_type": "Gmm",
-            "parametric_params": [
-              1.0,
-              1.0,
-              531.6444319574241,
-              190.79159492399032
-            ]
-          },
-          "iat_override": {
-            "dist_type": "Gmm",
-            "params": [
-              1.0,
-              1.0,
-              9.708428571428572,
-              9.905670235593679
-            ],
-            "jitter_range_ms": [
-              0.0,
-              0.0
-            ]
-          },
-          "padding_override": null
-        },
-        {
-          "condition": {
-            "Random": 0.87434554
-          },
-          "next_state": 5,
-          "size_override": {
-            "dist_type": "Parametric",
-            "bins": [],
-            "parametric_type": "Gmm",
-            "parametric_params": [
-              1.0,
-              1.0,
-              372.4791060329992,
-              8.60623899929007
-            ]
-          },
-          "iat_override": {
-            "dist_type": "Gmm",
-            "params": [
-              1.0,
-              1.0,
-              10.11436808679547,
-              9.365880390068916
-            ],
-            "jitter_range_ms": [
-              0.0,
-              0.0
-            ]
-          },
-          "padding_override": null
-        }
-      ]
-    },
-    {
-      "state_id": 1,
-      "transitions": [
-        {
-          "condition": {
-            "Random": 0.85714287
-          },
-          "next_state": 1,
-          "size_override": {
-            "dist_type": "Parametric",
-            "bins": [],
-            "parametric_type": "Gmm",
-            "parametric_params": [
-              1.0,
-              1.0,
-              531.6444319574241,
-              190.79159492399032
-            ]
-          },
-          "iat_override": {
-            "dist_type": "Gmm",
-            "params": [
-              1.0,
-              1.0,
-              9.708428571428572,
-              9.905670235593679
-            ],
-            "jitter_range_ms": [
-              0.0,
-              0.0
-            ]
-          },
-          "padding_override": null
-        },
-        {
-          "condition": {
-            "Random": 0.14285715
-          },
-          "next_state": 5,
-          "size_override": {
-            "dist_type": "Parametric",
-            "bins": [],
-            "parametric_type": "Gmm",
-            "parametric_params": [
-              1.0,
-              1.0,
-              372.4791060329992,
-              8.60623899929007
-            ]
-          },
-          "iat_override": {
-            "dist_type": "Gmm",
-            "params": [
-              1.0,
-              1.0,
-              10.11436808679547,
-              9.365880390068916
-            ],
-            "jitter_range_ms": [
-              0.0,
-              0.0
-            ]
-          },
-          "padding_override": null
-        }
-      ]
-    },
-    {
-      "state_id": 2,
       "transitions": []
-    },
-    {
-      "state_id": 3,
-      "transitions": []
-    },
-    {
-      "state_id": 4,
-      "transitions": []
-    },
-    {
-      "state_id": 5,
-      "transitions": [
-        {
-          "condition": {
-            "Random": 0.044456206
-          },
-          "next_state": 0,
-          "size_override": {
-            "dist_type": "Parametric",
-            "bins": [],
-            "parametric_type": "Gmm",
-            "parametric_params": [
-              1.0,
-              1.0,
-              101.74931397106967,
-              20.846822255230187
-            ]
-          },
-          "iat_override": {
-            "dist_type": "Gmm",
-            "params": [
-              1.0,
-              1.0,
-              8.917328124999997,
-              6.541236017537178
-            ],
-            "jitter_range_ms": [
-              0.0,
-              0.0
-            ]
-          },
-          "padding_override": null
-        },
-        {
-          "condition": {
-            "Random": 0.9555438
-          },
-          "next_state": 5,
-          "size_override": {
-            "dist_type": "Parametric",
-            "bins": [],
-            "parametric_type": "Gmm",
-            "parametric_params": [
-              1.0,
-              1.0,
-              372.4791060329992,
-              8.60623899929007
-            ]
-          },
-          "iat_override": {
-            "dist_type": "Gmm",
-            "params": [
-              1.0,
-              1.0,
-              10.11436808679547,
-              9.365880390068916
-            ],
-            "jitter_range_ms": [
-              0.0,
-              0.0
-            ]
-          },
-          "padding_override": null
-        }
-      ]
     }
   ],
   "fsm_initial_state": 0,
   "signature_vector": [
-    0.0,
-    0.0,
-    0.0,
-    0.0,
-    0.0,
-    0.0,
-    0.0,
-    0.0,
-    0.0,
-    0.0,
-    0.0,
-    0.0,
-    0.0,
-    0.0,
-    0.0,
-    0.0,
-    0.0,
-    0.0,
-    0.0,
-    0.0,
-    0.0,
-    0.0,
-    0.0,
-    0.0,
-    0.0,
-    0.0,
-    0.0,
-    0.0,
-    0.0,
-    0.0,
-    0.0,
-    0.0,
-    0.0,
-    0.0,
-    0.0,
-    0.0,
-    0.0,
-    0.0,
-    0.0,
-    0.0,
-    0.0,
-    0.0,
-    0.0,
-    0.0,
-    0.0,
-    0.0,
-    0.0,
-    0.0,
-    0.0,
-    0.0,
-    0.0,
-    0.0,
-    0.0,
-    0.0,
-    0.0,
-    0.0,
-    0.0,
-    0.0,
-    0.0,
-    0.0,
-    0.0,
-    0.0,
-    0.0,
-    0.0
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0
   ],
   "reverse_profile": null,
   "signature": [
@@ -500,7 +219,7 @@
         "kind": "Fixed",
         "bytes": [
           0,
-          1
+          17
         ]
       },
       {
@@ -526,6 +245,18 @@
         "kind": "Id",
         "len": 4,
         "mode": "Random"
+      },
+      {
+        "kind": "Fixed",
+        "bytes": [
+          192,
+          114
+        ]
+      },
+      {
+        "kind": "Length",
+        "len": 2,
+        "endian": "Big"
       }
     ]
   },

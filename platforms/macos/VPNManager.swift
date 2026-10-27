@@ -76,6 +76,7 @@ struct HelperResponse: Codable {
     let pid: Int?
     let version: String?
     let log: String?
+    let session: String?
 }
 
 struct RecordingInfoSnapshot: Codable {
@@ -465,6 +466,7 @@ class VPNManager: ObservableObject {
     private func sendToHelper(_ request: HelperRequest, timeoutSeconds: Double = 3.0,
                               completion: @escaping (HelperResponse?) -> Void) {
         let sockPath = self.socketPath
+        let generation = self.connectGeneration
         DispatchQueue.global(qos: .userInitiated).async {
             let fd = socket(AF_UNIX, SOCK_STREAM, 0)
             guard fd >= 0 else {
@@ -582,7 +584,10 @@ class VPNManager: ObservableObject {
                     NSLog("AIVPN IPC[%@]: helper replied status=%@ message=%@",
                           request.action, response.status, response.message)
                 }
-                DispatchQueue.main.async { completion(response) }
+                DispatchQueue.main.async {
+                    if self.connectGeneration == generation { AdminApi.updateHelperSession(response.session) }
+                    completion(response)
+                }
             } else {
                 NSLog("AIVPN IPC[%@]: undecodable response (%d bytes): %@",
                       request.action, accum.count,
@@ -642,6 +647,7 @@ class VPNManager: ObservableObject {
         lastConnectCountryCode = countryCode
 
         connectGeneration += 1
+        AdminApi.invalidateSession()
         isConnecting = true
         lastError = nil
         bytesSent = 0
@@ -892,21 +898,20 @@ class VPNManager: ObservableObject {
     /// Run `aivpn-client bench --server <addr> --json` and return parsed result.
     /// Calls completion on the main thread; passes nil on failure.
     func runBench(serverAddr: String, completion: @escaping (BenchDisplayResult?) -> Void) {
-        runBundledClientCommand(["bench", "--server", serverAddr, "--json"]) { success, output in
-            guard success,
-                  let data = output.data(using: .utf8),
-                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-                completion(nil)
-                return
+        let binding = AdminApi.captureSession()
+        DispatchQueue.global(qos: .utility).async {
+            let json = AdminApi.withSession(binding) { AdminApi.benchmark() }
+            DispatchQueue.main.async {
+                guard AdminApi.isCurrent(binding), let json, json["error"] == nil else { completion(nil); return }
+                completion(BenchDisplayResult(
+                    uploadKbps: json["throughput_up_kbps"] as? Double ?? 0,
+                    downloadKbps: json["throughput_down_kbps"] as? Double ?? 0,
+                    p50: json["latency_p50_ms"] as? Double ?? 0,
+                    p95: json["latency_p95_ms"] as? Double ?? 0,
+                    p99: json["latency_p99_ms"] as? Double ?? 0,
+                    lossPct: json["packet_loss_pct"] as? Double ?? 0,
+                    qualityScore: json["quality_score"] as? Int ?? 0))
             }
-            let result = BenchDisplayResult(
-                p50: json["latency_p50_ms"] as? Double ?? 0,
-                p95: json["latency_p95_ms"] as? Double ?? 0,
-                p99: json["latency_p99_ms"] as? Double ?? 0,
-                lossPct: json["packet_loss_pct"] as? Double ?? 0,
-                qualityScore: json["quality_score"] as? Int ?? 0
-            )
-            completion(result)
         }
     }
 
@@ -915,6 +920,8 @@ class VPNManager: ObservableObject {
     ///   mode). Used by performFastReconnect() to sequence a reconnect without racing
     ///   isConnected/isConnecting, which are only flipped once the helper responds.
     func disconnect(completion: (() -> Void)? = nil) {
+        connectGeneration += 1
+        AdminApi.invalidateSession()
         if isProxyMode {
             stopProxyMode()
             completion?()

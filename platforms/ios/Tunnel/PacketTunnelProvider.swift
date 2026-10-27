@@ -40,6 +40,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         }
     }
     private let appGroup = "group.com.aivpn.client"
+    private var persistentProfileSuffix = ""
     private var canRecord: Bool = false
     private let bridgeQueue = DispatchQueue(label: "com.aivpn.tunnel.bridge")
     private var recordingPhase: String = "idle"
@@ -70,7 +71,6 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     private var settingsServerHost: String = ""
     private var settingsFullTunnel: Bool = false
     private var settingsExcludedRoutes: [String] = []
-    private var settingsExcludedDomains: [String] = []
     private var settingsAdaptiveLevel: Int = 0
     private var settingsKillSwitch: Bool = false
     private var rehomeWatch: DispatchSourceTimer?
@@ -88,7 +88,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     // Rust session is stopped so the retry loop reconnects on the new path
     // immediately instead of waiting out the RX-silence watchdogs.
     private var pathMonitor: NWPathMonitor?
-    private var lastPathSignature: String?
+    private var pathChanges = NetworkPathChanges()
     // L5: count of inbound (packetFlow → Rust) packets dropped because the
     // bridge socket buffer was full (write() EAGAIN). Debug visibility only.
     // Touched exclusively on bridgeQueue.
@@ -136,6 +136,16 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         //   3. Direct embed in providerConfiguration as final fallback (also
         //      fresh from the current connect(), so it overwrites the persistent
         //      copy too).
+        if let profileId = cfg["profileId"] as? String {
+            guard let id = UUID(uuidString: profileId) else {
+                completionHandler(makeError("invalid profile id"))
+                return
+            }
+            persistentProfileSuffix = ":" + id.uuidString
+        } else {
+            persistentProfileSuffix = ""
+        }
+        appGroupDefaults?.removeObject(forKey: "tunnel_handshake_reject_reason")
         let keyStr: String
         if let token = cfg["keyToken"] as? String,
            let secret = retrieveHandoffSecret(token: token) {
@@ -278,14 +288,14 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         appliedVpnIP           = vpnIP
         settingsServerHost     = key.serverHost
         settingsFullTunnel     = fullTunnel
-        settingsExcludedRoutes = excludedRoutes
-        settingsExcludedDomains = excludedDomains
+        let resolvedExclusions = fullTunnel ? DomainExclusions.routes(excludedDomains) : []
+        guard !isStopped else { completionHandler(makeError("Tunnel stopped")); return }
+        settingsExcludedRoutes = excludedRoutes + resolvedExclusions
         settingsAdaptiveLevel  = adaptiveLevel
         settingsKillSwitch     = killSwitch
         let settings = buildSettings(vpnIP: vpnIP, serverHost: key.serverHost,
                                      fullTunnel: fullTunnel,
-                                     excludedRoutes: excludedRoutes,
-                                     excludedDomains: excludedDomains,
+                                     excludedRoutes: settingsExcludedRoutes,
                                      adaptiveLevel: adaptiveLevel,
                                      killSwitch: killSwitch)
 
@@ -532,6 +542,8 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                 // instead of burning the backoff budget hammering a refusal
                 // that will repeat identically on every attempt.
                 if aivpn_handshake_was_rejected() != 0 {
+                    self.appGroupDefaults?.set(Int(aivpn_get_handshake_reject_reason()), forKey: "tunnel_handshake_reject_reason")
+                    self.appGroupDefaults?.synchronize()
                     os_log(.error, "aivpn: server sent HandshakeReject (reason=%d) — authenticated refusal, giving up",
                            aivpn_get_handshake_reject_reason())
                     break
@@ -717,6 +729,19 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                 "role":            Int(aivpn_get_role()),
             ]
             completionHandler?(serialize(resp))
+
+        case "benchmark":
+            DispatchQueue.global(qos: .utility).async {
+                var buffer = [UInt8](repeating: 0, count: 4096)
+                let written = buffer.withUnsafeMutableBufferPointer {
+                    aivpn_run_benchmark($0.baseAddress, $0.count)
+                }
+                guard written > 0, written <= buffer.count else {
+                    completionHandler?(serialize(["error": "Benchmark failed"]))
+                    return
+                }
+                completionHandler?(Data(buffer.prefix(written)))
+            }
 
         case "mgmt_request":
             // Phase A in-app admin: the live control channel (and every
@@ -984,26 +1009,16 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     /// aivpn_stop_tunnel() so the in-extension retry loop (startTunnel's thread)
     /// reconnects on the NEW path immediately, instead of waiting for the
     /// RX-silence watchdogs to notice the dead flow on the old one. The handler
-    /// runs on bridgeQueue; lastPathSignature is touched only there.
+    /// runs on bridgeQueue; pathChanges is touched only there.
     private func startPathMonitor() {
         pathMonitor?.cancel()
+        pathChanges = NetworkPathChanges()
         let monitor = NWPathMonitor()
         monitor.pathUpdateHandler = { [weak self] path in
             guard let self = self, !self.isStopped else { return }
-            var sig = path.status == .satisfied ? "up" : "down"
-            for iface in path.availableInterfaces {
-                sig += "|\(iface.type)#\(iface.name)"
-            }
-            let previous = self.lastPathSignature
-            self.lastPathSignature = sig
-            // The first callback merely reports the current path — never
-            // restart on it.
-            guard let prev = previous, prev != sig else { return }
-            // While the path is down there is nothing to reconnect TO; the
-            // transition back to satisfied fires its own change event.
-            guard path.status == .satisfied else { return }
-            os_log(.info, "aivpn: network path changed (%{public}@ -> %{public}@) — restarting tunnel session",
-                   prev, sig)
+            let interfaces = path.availableInterfaces.map { "\($0.type)#\($0.name)" }
+            guard self.pathChanges.update(satisfied: path.status == .satisfied, interfaces: interfaces) else { return }
+            os_log(.info, "aivpn: primary network path changed - restarting tunnel session")
             // Stops ONLY the Rust session: isStopped stays false, so the retry
             // loop treats the exit as an internal error and reconnects.
             aivpn_stop_tunnel()
@@ -1038,7 +1053,6 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             let settings = self.buildSettings(vpnIP: network.clientIp, serverHost: self.settingsServerHost,
                                               fullTunnel: self.settingsFullTunnel,
                                               excludedRoutes: self.settingsExcludedRoutes,
-                                              excludedDomains: self.settingsExcludedDomains,
                                               adaptiveLevel: self.settingsAdaptiveLevel,
                                               killSwitch: self.settingsKillSwitch,
                                               network: network)
@@ -1067,13 +1081,13 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     private func buildSettings(vpnIP: String, serverHost: String,
                                fullTunnel: Bool,
                                excludedRoutes: [String] = [],
-                               excludedDomains: [String] = [],
                                adaptiveLevel: Int = 0,
                                killSwitch: Bool = false,
                                network: NetworkAssignment? = nil) -> NEPacketTunnelNetworkSettings {
         let settings = NEPacketTunnelNetworkSettings(tunnelRemoteAddress: serverHost)
-        let desiredMtu = adaptiveLevel >= 2 ? 1200 : (adaptiveLevel == 1 ? 1300 : 1346)
-        settings.mtu = NSNumber(value: max(fullTunnel || network?.ipv6Address != nil ? 1280 : 576, min(desiredMtu, network?.mtu ?? desiredMtu)))
+        settings.mtu = NSNumber(value: NetworkAssignment.tunnelMtu(
+            requested: network?.mtu, adaptiveLevel: adaptiveLevel,
+            requiresIpv6: fullTunnel || network?.ipv6Address != nil))
 
         // M1: derive the VPN /24 from the ACTUAL assigned address instead of
         // hardcoding 10.8.0.x — an operator running a different pool subnet
@@ -1115,16 +1129,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             // M1: the VPN-side resolver is the .1 of the ACTUAL assigned /24
             // (the server-side gateway convention), not a hardcoded 10.8.0.1.
             let dns = NEDNSSettings(servers: [network?.serverVpnIp ?? "\(subnetPrefix).1", Self.fallbackPublicDNS])
-            // matchDomains = nil routes ALL domains through VPN DNS (full-tunnel DNS behaviour).
-            // NEDNSSettings has no matchExcludedDomains — domain-level DNS exclusion is not
-            // supported by the iOS NetworkExtension API (confirmed by a real Xcode compile
-            // error when this was previously attempted — not a guess). Route-level split
-            // tunnel (excludedRoutes, CIDR-based) still applies; see buildSettings above.
-            // `excludedDomains` is threaded through from providerConfiguration but is NOT
-            // applied here for that reason — see PacketTunnelProvider.startTunnel and
-            // SplitTunnelView.swift. True domain-based exclusion would require resolving
-            // each domain to its current IP(s) and adding those as excludedRoutes, which is
-            // a much larger, ongoing-resolution feature outside this fix's scope.
+            // DNS идет через VPN; доменные исключения уже преобразованы в маршруты.
             settings.dnsSettings = dns
         }
 
@@ -1135,6 +1140,10 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             let prefix = network?.ipv6PrefixLen ?? 64
             let ipv6 = NEIPv6Settings(addresses: [address], networkPrefixLengths: [NSNumber(value: prefix)])
             ipv6.includedRoutes = [NEIPv6Route.default()]
+            ipv6.excludedRoutes = excludedRoutes.compactMap { value in
+                guard let route = CIDRRoute(value), route.isIPv6 else { return nil }
+                return NEIPv6Route(destinationAddress: route.address, networkPrefixLength: NSNumber(value: route.prefixLen))
+            }
             settings.ipv6Settings = ipv6
         }
         if !fullTunnel, let address = network?.ipv6Address, let prefix = network?.ipv6PrefixLen {
@@ -1161,26 +1170,8 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     /// Parses a CIDR string (e.g. "192.168.1.0/24") into an NEIPv4Route.
     /// Returns nil for malformed input.
     private func parseCIDR(_ cidr: String) -> NEIPv4Route? {
-        let parts = cidr.split(separator: "/")
-        guard parts.count == 2,
-              let prefixLen = Int(parts[1]), prefixLen >= 0, prefixLen <= 32 else {
-            return nil
-        }
-        let address = String(parts[0])
-        let mask = prefixLengthToMask(prefixLen)
-        // Validate that address looks like an IPv4 dotted-decimal string
-        guard address.split(separator: ".").count == 4 else { return nil }
-        return NEIPv4Route(destinationAddress: address, subnetMask: mask)
-    }
-
-    /// Converts a prefix length (0-32) to a dotted-decimal subnet mask string.
-    private func prefixLengthToMask(_ length: Int) -> String {
-        let bits: UInt32 = length == 0 ? 0 : ~UInt32(0) << (32 - length)
-        let b0 = (bits >> 24) & 0xFF
-        let b1 = (bits >> 16) & 0xFF
-        let b2 = (bits >>  8) & 0xFF
-        let b3 =  bits        & 0xFF
-        return "\(b0).\(b1).\(b2).\(b3)"
+        guard let route = CIDRRoute(cidr), let mask = route.ipv4Netmask else { return nil }
+        return NEIPv4Route(destinationAddress: route.address, subnetMask: mask)
     }
 
     // MARK: - Device key (JIT enrollment)
@@ -1589,15 +1580,9 @@ private struct TunnelConnectionKey {
               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let s    = json["s"] as? String else { return nil }
 
-        let parts = s.split(separator: ":").map(String.init)
-        guard parts.count >= 2, let port = UInt16(parts.last ?? "") else { return nil }
-        var host = parts.dropLast().joined(separator: ":")
-        // Strip IPv6 brackets: "[::1]" → "::1" (aivpn_run_tunnel expects a bare address)
-        if host.hasPrefix("[") && host.hasSuffix("]") {
-            host = String(host.dropFirst().dropLast())
-        }
-        serverHost = host
-        serverPort = port
+        guard let endpoint = VPNServerEndpoint(s) else { return nil }
+        serverHost = endpoint.host
+        serverPort = endpoint.port
 
         // `k` (server X25519 pubkey) and `p` (PSK) are 32 bytes each, encoded as
         // STANDARD base64 by the server (crates/aivpn-server/src/main.rs
@@ -1683,7 +1668,7 @@ extension PacketTunnelProvider {
     fileprivate func storePersistentKey(_ keyStr: String) {
         guard let data = keyStr.data(using: .utf8) else { return }
         let service = "com.aivpn.client.tunnel-handoff"
-        let account = "aivpn_persistent_connection_key"
+        let account = "aivpn_persistent_connection_key" + persistentProfileSuffix
         let del: [CFString: Any] = [
             kSecClass:           kSecClassGenericPassword,
             kSecAttrService:     service,
@@ -1715,7 +1700,7 @@ extension PacketTunnelProvider {
     fileprivate func storePersistentCert(_ certB64: String) {
         guard let data = certB64.data(using: .utf8) else { return }
         let service = "com.aivpn.client.tunnel-handoff"
-        let account = "aivpn_persistent_mtls_cert"
+        let account = "aivpn_persistent_mtls_cert" + persistentProfileSuffix
         let del: [CFString: Any] = [
             kSecClass:           kSecClassGenericPassword,
             kSecAttrService:     service,
@@ -1743,7 +1728,7 @@ extension PacketTunnelProvider {
     /// Returns nil before any cert has been persisted.
     fileprivate func retrievePersistentCert() -> String? {
         let service = "com.aivpn.client.tunnel-handoff"
-        let account = "aivpn_persistent_mtls_cert"
+        let account = "aivpn_persistent_mtls_cert" + persistentProfileSuffix
         let query: [CFString: Any] = [
             kSecClass:           kSecClassGenericPassword,
             kSecAttrService:     service,
@@ -1763,7 +1748,7 @@ extension PacketTunnelProvider {
     /// Returns nil on the very first tunnel start (before any key has been persisted).
     fileprivate func retrievePersistentKey() -> String? {
         let service = "com.aivpn.client.tunnel-handoff"
-        let account = "aivpn_persistent_connection_key"
+        let account = "aivpn_persistent_connection_key" + persistentProfileSuffix
         let query: [CFString: Any] = [
             kSecClass:           kSecClassGenericPassword,
             kSecAttrService:     service,

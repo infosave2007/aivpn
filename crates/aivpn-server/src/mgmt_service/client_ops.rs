@@ -204,14 +204,14 @@ pub fn reset_device(ctx: &MgmtCtx, id: &str) -> Result<(), MgmtError> {
 /// JSON body: `{s,k,p,i,n}` always, plus `sk`/`mop` when those keys are
 /// configured on this node.
 pub fn connection_key(ctx: &MgmtCtx, id: &str) -> Result<String, MgmtError> {
-    let (pub_key, server_addr) = match (&ctx.server_pub_key, &ctx.server_addr) {
-        (Some(k), Some(a)) => (k, a.as_str()),
-        _ => {
-            return Err(MgmtError::Unavailable(
-                "--server-ip or --key-file not configured; cannot build connection key".into(),
-            ))
-        }
-    };
+    let server_addr = ctx
+        .server_addr
+        .as_deref()
+        .ok_or_else(|| MgmtError::Unavailable("public_endpoint_not_configured".into()))?;
+    let pub_key = ctx
+        .server_pub_key
+        .as_ref()
+        .ok_or_else(|| MgmtError::Unavailable("server_key_not_configured".into()))?;
     let client = ctx.db.find_by_id(id).ok_or(MgmtError::NotFound)?;
     let client_net_cfg = ctx
         .db

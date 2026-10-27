@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Подписи вторичных экранов. Общий strings.xml не меняется. -->
+<resources>
+    <string name="secondary_add">Добавить</string>
+    <string name="secondary_delete">Удалить</string>
+    <string name="secondary_search">Поиск</string>
+
+    <string name="secondary_bg_intro">Эти настройки решают, продолжит ли VPN работать, когда приложение свернуто. Исправьте все желтые пункты, чтобы туннель не останавливался.</string>
+    <string name="secondary_bg_summary_protected">Фон в порядке: нужные системные разрешения включены</string>
+    <string name="secondary_bg_summary_mostly">Почти готово: включите «Блокировать соединения без VPN», чтобы трафик не шел мимо туннеля</string>
+    <string name="secondary_bg_summary_at_risk">Нужна настройка: система может остановить VPN, когда приложение свернуто</string>
+    <string name="secondary_bg_notifications_ok">Включены: оповещение «VPN остановлен» будет видно</string>
+    <string name="secondary_bg_notifications_bad">Выключены: оповещения об остановке VPN и о безопасности не показываются</string>
+    <string name="secondary_bg_battery_ok">Исключено: режим сна не останавливает службу VPN</string>
+    <string name="secondary_bg_battery_bad">Не исключено: служба VPN часто останавливается в фоне. Нажмите «Исправить» и выберите «Разрешить».</string>
+    <string name="secondary_bg_bg_ok">Не ограничена</string>
+    <string name="secondary_bg_bg_bad">Ограничена: система остановит VPN вскоре после выхода из приложения. Снимите ограничение в разделе «О приложении», затем «Батарея».</string>
+    <string name="secondary_bg_always_on_ok">Включен: система сама поднимает VPN снова</string>
+    <string name="secondary_bg_always_on_off">Выключен: включите постоянный VPN для AIVPN в системных настройках, значок шестеренки рядом с AIVPN</string>
+    <string name="secondary_bg_lockdown_ok">Включено: если туннель остановится, система не пустит трафик мимо VPN</string>
+    <string name="secondary_bg_lockdown_off">Выключено: если туннель остановится, трафик пойдет напрямую. Этот системный переключатель запрещает такой обход.</string>
+    <string name="secondary_bg_unknown">Пока служба VPN не запущена, это нельзя проверить. Откройте системные настройки VPN.</string>
+    <string name="secondary_bg_oem_desc">Прошивка этого производителя может отдельно требовать автозапуск или исключение AIVPN из спящих приложений. Такого экрана может не быть.</string>
+    <string name="secondary_bg_oem_generic">На части устройств автозапуск AIVPN включается в фирменном приложении батареи или безопасности.</string>
+    <string name="admin_created_exit_failed">Клиент создан, но выходной узел не назначен. Выберите его в настройках клиента.</string>
+</resources>

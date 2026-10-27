@@ -4,30 +4,32 @@
     xmlns:app="http://schemas.android.com/apk/res-auto"
     android:layout_width="match_parent"
     android:layout_height="wrap_content"
+    android:minHeight="56dp"
     android:orientation="horizontal"
     android:gravity="center_vertical"
-    android:paddingHorizontal="12dp"
-    android:paddingVertical="8dp">
+    android:paddingStart="20dp"
+    android:paddingEnd="8dp"
+    android:paddingVertical="4dp">
 
     <TextView
         android:id="@+id/textDomain"
         android:layout_width="0dp"
         android:layout_height="wrap_content"
         android:layout_weight="1"
-        android:textSize="14sp"
-        android:textColor="@color/text_primary"
-        android:maxLines="1"
+        android:textSize="16sp"
+        android:textColor="?attr/colorOnSurface"
+        android:maxLines="2"
         android:ellipsize="end"
-        android:paddingStart="4dp" />
+        android:paddingEnd="8dp" />
 
     <ImageButton
         android:id="@+id/btnDelete"
-        android:layout_width="32dp"
-        android:layout_height="32dp"
-        android:src="@android:drawable/ic_menu_close_clear_cancel"
+        android:layout_width="48dp"
+        android:layout_height="48dp"
+        android:src="@drawable/ic_vpn_delete"
         android:background="?attr/selectableItemBackgroundBorderless"
-        android:contentDescription="Delete"
+        android:contentDescription="@string/secondary_delete"
         android:scaleType="centerInside"
-        app:tint="@color/text_secondary" />
+        app:tint="?attr/colorError" />
 
 </LinearLayout>

@@ -7,7 +7,7 @@
 
 use std::sync::Arc;
 
-use tokio::net::UdpSocket;
+use super::MaskSocket;
 use tracing::{info, warn};
 
 use aivpn_common::protocol::ControlPayload;
@@ -33,7 +33,7 @@ impl Gateway {
     }
 
     pub(crate) async fn handle_recording_outcome(
-        socket: &Arc<UdpSocket>,
+        socket: &Arc<MaskSocket>,
         sessions: &Arc<SessionManager>,
         store: &Arc<MaskStore>,
         mdh: &[u8],
