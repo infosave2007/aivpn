@@ -161,6 +161,7 @@ impl CacheFileLock {
         let file = std::fs::OpenOptions::new()
             .write(true)
             .create(true)
+            .truncate(false)
             .open(&lock_path)
             .ok()?;
         // SAFETY: flock(2) on a valid, owned fd with a plain integer
@@ -252,15 +253,18 @@ fn validate_descriptor_signature(
 ///
 /// `trusted_key` should be the operator's ed25519 signing public key. When `Some`, the
 /// signature is verified and unsigned/invalid descriptors are rejected. When `None` the
-/// descriptor is stored without signature verification — callers must only pass `None` in
-/// development/test contexts where a signing key is not yet available.
-///
-/// TODO(production-secure): all call sites should supply the operator signing key once
-/// a dedicated ed25519 signing keypair is added to the connection-key format.
+/// Обычная сборка может сохранить дескриптор без проверки подписи.
+/// production-secure отклоняет None до записи.
 pub fn store_verified_descriptor(
     descriptor: BootstrapDescriptor,
     trusted_key: Option<&[u8; 32]>,
 ) -> Result<()> {
+    #[cfg(feature = "production-secure")]
+    if trusted_key.is_none() {
+        return Err(Error::Session(
+            "production-secure: сохранение дескриптора требует ключ подписи сервера".into(),
+        ));
+    }
     validate_descriptor_signature(&descriptor, trusted_key)?;
     store_descriptor(descriptor)
 }
@@ -283,6 +287,9 @@ pub async fn refresh_from_urls(urls: &[String], signing_key: Option<&[u8; 32]>) 
         return 0;
     }
 
+    let Ok(client) = crate::bootstrap_loader::bootstrap_http_client(Duration::from_secs(10)) else {
+        return 0;
+    };
     let mut stored = 0usize;
     for url in urls {
         // Same SSRF guard as the active loader channels: these URLs come from
@@ -291,9 +298,12 @@ pub async fn refresh_from_urls(urls: &[String], signing_key: Option<&[u8; 32]>) 
             tracing::warn!("Bootstrap descriptor URL rejected: {}", e);
             continue;
         }
-        let Ok(response) = reqwest::get(url).await else {
+        let Ok(response) = client.get(url).send().await else {
             continue;
         };
+        if !response.status().is_success() {
+            continue;
+        }
         let Ok(body) = crate::bootstrap_loader::read_body_capped(response).await else {
             continue;
         };
@@ -357,5 +367,13 @@ mod tests {
         desc.signature = [1u8; 64];
         let res = validate_descriptor_signature(&desc, Some(&dummy_key));
         assert!(res.is_err());
+    }
+
+    #[cfg(feature = "production-secure")]
+    #[test]
+    fn production_secure_store_requires_key() {
+        let desc = make_desc();
+        let err = store_verified_descriptor(desc, None).unwrap_err();
+        assert!(err.to_string().contains("production-secure"), "{err}");
     }
 }

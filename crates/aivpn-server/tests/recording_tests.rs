@@ -278,8 +278,8 @@ fn test_recording_manager_lifecycle() {
 
 #[test]
 fn test_mask_store_crud() {
+    let _ = std::fs::remove_dir_all("/tmp/aivpn-test-masks-crud");
     let catalog = Arc::new(MaskCatalog::new());
-    let initial_count = catalog.available_count();
     let store = MaskStore::new(
         catalog.clone(),
         std::path::PathBuf::from("/tmp/aivpn-test-masks-crud"),
@@ -309,45 +309,62 @@ fn test_mask_store_crud() {
         },
     };
 
-    store.add_mask(entry).unwrap();
+    #[cfg(feature = "production-secure")]
+    {
+        let err = store
+            .add_mask(entry)
+            .expect_err("production-secure must reject an unsigned preset written into the store");
+        assert!(
+            err.to_string().contains("отклонена"),
+            "unexpected rejection: {err}"
+        );
+        assert!(store.get_mask(&mask_id).is_none());
+        let _ = std::fs::remove_dir_all("/tmp/aivpn-test-masks-crud");
+        return;
+    }
+    #[cfg(not(feature = "production-secure"))]
+    {
+        let initial_count = catalog.available_count();
+        store.add_mask(entry).unwrap();
 
-    // Check it's in the catalog
-    assert!(catalog.available_count() > initial_count);
+        // Check it's in the catalog
+        assert!(catalog.available_count() > initial_count);
 
-    // List
-    let masks = store.list_masks();
-    assert!(!masks.is_empty());
-    assert!(masks.iter().any(|m| m.stats.mask_id == mask_id));
+        // List
+        let masks = store.list_masks();
+        assert!(!masks.is_empty());
+        assert!(masks.iter().any(|m| m.stats.mask_id == mask_id));
 
-    // Get
-    let got = store.get_mask(&mask_id);
-    assert!(got.is_some());
-    assert_eq!(got.unwrap().stats.confidence, 0.85);
+        // Get
+        let got = store.get_mask(&mask_id);
+        assert!(got.is_some());
+        assert_eq!(got.unwrap().stats.confidence, 0.85);
 
-    // Record usage
-    store.record_usage(&mask_id);
-    let got = store.get_mask(&mask_id).unwrap();
-    assert_eq!(got.stats.times_used, 1);
-    assert_eq!(got.stats.success_rate, 1.0);
+        // Record usage
+        store.record_usage(&mask_id);
+        let got = store.get_mask(&mask_id).unwrap();
+        assert_eq!(got.stats.times_used, 1);
+        assert_eq!(got.stats.success_rate, 1.0);
 
-    // Record failure
-    store.record_failure(&mask_id);
-    let got = store.get_mask(&mask_id).unwrap();
-    assert_eq!(got.stats.times_used, 2);
-    assert_eq!(got.stats.times_failed, 1);
-    assert!((got.stats.success_rate - 0.5).abs() < 0.01);
+        // Record failure
+        store.record_failure(&mask_id);
+        let got = store.get_mask(&mask_id).unwrap();
+        assert_eq!(got.stats.times_used, 2);
+        assert_eq!(got.stats.times_failed, 1);
+        assert!((got.stats.success_rate - 0.5).abs() < 0.01);
 
-    // Still active (not enough usages for deactivation threshold)
-    assert!(got.stats.is_active);
+        // Still active (not enough usages for deactivation threshold)
+        assert!(got.stats.is_active);
 
-    // Delete
-    store.delete_mask(&mask_id);
-    assert!(store.get_mask(&mask_id).is_none());
+        // Delete
+        store.delete_mask(&mask_id).unwrap();
+        assert!(store.get_mask(&mask_id).is_none());
 
-    // Cleanup
-    let _ = std::fs::remove_dir_all("/tmp/aivpn-test-masks-crud");
+        // Cleanup
+        let _ = std::fs::remove_dir_all("/tmp/aivpn-test-masks-crud");
 
-    println!("✅ MaskStore CRUD operations work correctly");
+        println!("✅ MaskStore CRUD operations work correctly");
+    }
 }
 
 // ─── Test: Full Pipeline (MaskGen) ───────────────────────────────────────────
@@ -447,12 +464,20 @@ async fn test_full_mask_generation_pipeline() {
     // Cleanup
     let _ = std::fs::remove_dir_all(&storage_dir);
 
-    // Assert success
+    #[cfg(not(feature = "production-secure"))]
     assert!(
         result.is_ok(),
         "Full mask generation pipeline should succeed: {:?}",
         result.err()
     );
+    #[cfg(feature = "production-secure")]
+    {
+        let err = result.expect_err(
+            "production-secure generation without a signing key must fail before storing a mask",
+        );
+        let text = err.to_string();
+        assert!(text.contains("production-secure"), "{text}");
+    }
 }
 
 // ─── Test: End-to-End with RecordingManager ──────────────────────────────────
@@ -509,17 +534,30 @@ async fn test_end_to_end_recording() {
     let result =
         aivpn_server::mask_gen::generate_and_store_mask("e2e_test_service", &packets, &store).await;
 
-    assert!(
-        result.is_ok(),
-        "E2E pipeline should succeed: {:?}",
-        result.err()
-    );
-    let mask_id = result.unwrap();
-    println!("✅ E2E mask generated: '{}'", mask_id);
+    #[cfg(not(feature = "production-secure"))]
+    {
+        assert!(
+            result.is_ok(),
+            "E2E pipeline should succeed: {:?}",
+            result.err()
+        );
+        let mask_id = result.unwrap();
+        println!("✅ E2E mask generated: '{}'", mask_id);
 
-    // 5. Verify stored mask
-    let entry = store.get_mask(&mask_id);
-    assert!(entry.is_some());
+        // 5. Verify stored mask
+        let entry = store.get_mask(&mask_id);
+        assert!(entry.is_some());
+    }
+    #[cfg(feature = "production-secure")]
+    {
+        let err = result
+            .expect_err("production-secure recording pipeline must not store an unsigned mask");
+        assert!(err.to_string().contains("production-secure"), "{err}");
+        assert!(
+            store.list_masks().is_empty(),
+            "no mask file should appear without a signing key"
+        );
+    }
 
     // Cleanup
     let _ = std::fs::remove_dir_all(&storage_dir);

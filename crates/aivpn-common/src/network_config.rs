@@ -1,4 +1,4 @@
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, Ipv6Addr};
 
 use serde::{Deserialize, Serialize};
 
@@ -40,7 +40,7 @@ pub struct VpnNetworkConfig {
     /// ip6tables/nftables masquerading and assign IPv6 addresses to clients.
     #[serde(default)]
     pub ipv6_enabled: bool,
-    /// IPv6 ULA prefix allocated to VPN clients. Must be a /48.
+    /// Префикс IPv6 для клиентов, до /96 включительно.
     #[serde(default = "default_ipv6_prefix")]
     pub ipv6_prefix: String,
 }
@@ -60,6 +60,12 @@ impl Default for VpnNetworkConfig {
 
 impl VpnNetworkConfig {
     pub fn validate(&self) -> Result<()> {
+        if self.ipv6_enabled {
+            self.ipv6_gateway()?;
+            if self.mtu < 1280 {
+                return Err(Error::InvalidPacket("IPv6 requires MTU of at least 1280"));
+            }
+        }
         if !(1..=30).contains(&self.prefix_len) {
             return Err(Error::InvalidPacket(
                 "VPN prefix length must be in range 1..=30",
@@ -94,6 +100,52 @@ impl VpnNetworkConfig {
         format!("{}/{}", self.network_addr(), self.prefix_len)
     }
 
+    /// Адрес шлюза IPv6 берется из настроенного префикса.
+    pub fn ipv6_gateway(&self) -> Result<(std::net::Ipv6Addr, u8)> {
+        let invalid = || Error::InvalidPacket("Invalid VPN IPv6 prefix");
+        let (address, prefix) = self.ipv6_prefix.split_once('/').ok_or_else(invalid)?;
+        let address = address
+            .parse::<std::net::Ipv6Addr>()
+            .map_err(|_| invalid())?;
+        let prefix = prefix.parse::<u8>().map_err(|_| invalid())?;
+        if prefix == 0 || prefix > 96 || address.is_multicast() || address.is_loopback() {
+            return Err(invalid());
+        }
+        let mask = u128::MAX << (128 - prefix);
+        let gateway = Ipv6Addr::from((u128::from(address) & mask) | 1);
+        if gateway.is_loopback()
+            || gateway.is_unicast_link_local()
+            || gateway.to_ipv4_mapped().is_some()
+        {
+            return Err(invalid());
+        }
+        Ok((gateway, prefix))
+    }
+
+    /// Последние 32 бита адреса сохраняют выданный клиенту IPv4.
+    pub fn client_ipv6(&self, client_ip: Ipv4Addr) -> Result<Option<(Ipv6Addr, u8)>> {
+        if !self.ipv6_enabled {
+            return Ok(None);
+        }
+        if !self.is_usable_host(client_ip) || client_ip == self.server_vpn_ip {
+            return Err(Error::InvalidPacket(
+                "Invalid client IPv4 for IPv6 allocation",
+            ));
+        }
+        let (gateway, prefix) = self.ipv6_gateway()?;
+        let base = u128::from(gateway) & (u128::MAX << (128 - prefix));
+        Ok(Some((
+            Ipv6Addr::from(base | u128::from(u32::from(client_ip))),
+            prefix,
+        )))
+    }
+
+    pub fn client_ip_for_ipv6(&self, address: Ipv6Addr) -> Option<Ipv4Addr> {
+        let client_ip = Ipv4Addr::from(u128::from(address) as u32);
+        let assigned = self.client_ipv6(client_ip).ok().flatten()?.0;
+        (assigned == address).then_some(client_ip)
+    }
+
     pub fn server_ip_string(&self) -> String {
         self.server_vpn_ip.to_string()
     }
@@ -123,6 +175,7 @@ impl VpnNetworkConfig {
     }
 
     pub fn client_config(&self, client_ip: Ipv4Addr) -> Result<ClientNetworkConfig> {
+        self.validate()?;
         if !self.is_usable_host(client_ip) {
             return Err(Error::InvalidPacket(
                 "Client VPN IP is outside configured VPN subnet",
@@ -140,7 +193,8 @@ impl VpnNetworkConfig {
             mtu: self.mtu,
             mdh_len: default_mdh_len(),
             keepalive_secs: self.keepalive_secs,
-            ipv6_address: None,
+            ipv6_address: self.client_ipv6(client_ip)?.map(|(ip, _)| ip.to_string()),
+            ipv6_prefix_len: self.client_ipv6(client_ip)?.map(|(_, prefix)| prefix),
         })
     }
 
@@ -179,6 +233,8 @@ pub struct ClientNetworkConfig {
     /// None when the server has IPv6 disabled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ipv6_address: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ipv6_prefix_len: Option<u8>,
 }
 
 fn default_mdh_len() -> u16 {
@@ -186,7 +242,7 @@ fn default_mdh_len() -> u16 {
 }
 
 impl ClientNetworkConfig {
-    pub const WIRE_SIZE: usize = 13;
+    pub const WIRE_SIZE: usize = 30;
     /// Wire-format / protocol-capability version.
     ///
     /// v2 (Variant A DPI fix) introduces **mask-defined tag offsets**: the 8-byte
@@ -199,6 +255,7 @@ impl ClientNetworkConfig {
     const WIRE_VERSION: u8 = 2;
 
     pub fn validate(&self) -> Result<()> {
+        self.client_ipv6()?;
         VpnNetworkConfig {
             server_vpn_ip: self.server_vpn_ip,
             prefix_len: self.prefix_len,
@@ -209,6 +266,22 @@ impl ClientNetworkConfig {
         }
         .client_config(self.client_ip)
         .map(|_| ())
+    }
+
+    pub fn client_ipv6(&self) -> Result<Option<(Ipv6Addr, u8)>> {
+        match (&self.ipv6_address, self.ipv6_prefix_len) {
+            (None, None) => Ok(None),
+            (Some(address), Some(prefix)) if (1..=96).contains(&prefix) && self.mtu >= 1280 => {
+                let address: Ipv6Addr = address
+                    .parse()
+                    .map_err(|_| Error::InvalidPacket("Invalid client IPv6"))?;
+                if address.is_unspecified() || address.is_loopback() || address.is_multicast() {
+                    return Err(Error::InvalidPacket("Invalid client IPv6"));
+                }
+                Ok(Some((address, prefix)))
+            }
+            _ => Err(Error::InvalidPacket("Invalid client IPv6 configuration")),
+        }
     }
 
     pub fn netmask(&self) -> Ipv4Addr {
@@ -231,11 +304,15 @@ impl ClientNetworkConfig {
         buf[4..8].copy_from_slice(&self.server_vpn_ip.octets());
         buf[8..12].copy_from_slice(&self.client_ip.octets());
         buf[12] = self.keepalive_secs.unwrap_or(0);
+        if let Ok(Some((address, prefix))) = self.client_ipv6() {
+            buf[13] = prefix;
+            buf[14..30].copy_from_slice(&address.octets());
+        }
         buf
     }
 
     pub fn decode_wire(data: &[u8]) -> Result<Self> {
-        // Accept both old (12-byte) and new (13-byte) wire format
+        // Первые 12-13 байт совместимы с предыдущими клиентами; IPv6 занимает 30 байт.
         if data.len() < 12 {
             return Err(Error::InvalidPacket(
                 "Client network config has invalid wire length",
@@ -264,6 +341,13 @@ impl ClientNetworkConfig {
             None
         };
 
+        if data.len() > 13 && data.len() != Self::WIRE_SIZE {
+            return Err(Error::InvalidPacket("Truncated IPv6 network config"));
+        }
+        if data.len() == Self::WIRE_SIZE && data[13] == 0 && data[14..].iter().any(|b| *b != 0) {
+            return Err(Error::InvalidPacket("IPv6 address without prefix length"));
+        }
+        let ipv6 = data.len() == Self::WIRE_SIZE && data[13] != 0;
         let config = Self {
             prefix_len: data[1],
             mtu: u16::from_le_bytes([data[2], data[3]]),
@@ -271,7 +355,12 @@ impl ClientNetworkConfig {
             client_ip: Ipv4Addr::new(data[8], data[9], data[10], data[11]),
             mdh_len: default_mdh_len(),
             keepalive_secs,
-            ipv6_address: None,
+            ipv6_address: if ipv6 {
+                Some(Ipv6Addr::from(<[u8; 16]>::try_from(&data[14..30]).unwrap()).to_string())
+            } else {
+                None
+            },
+            ipv6_prefix_len: if ipv6 { Some(data[13]) } else { None },
         };
         config.validate()?;
         Ok(config)
@@ -311,6 +400,71 @@ mod tests {
     use super::*;
 
     #[test]
+    fn ipv6_assignment_roundtrips_and_rejects_other_prefixes() {
+        let network = VpnNetworkConfig {
+            ipv6_enabled: true,
+            ipv6_prefix: "fd12:3456:789a::/64".into(),
+            ..Default::default()
+        };
+        let ipv4 = Ipv4Addr::new(10, 0, 0, 2);
+        let config = network.client_config(ipv4).unwrap();
+        let (ipv6, prefix) = config.client_ipv6().unwrap().unwrap();
+        assert_eq!(ipv6, "fd12:3456:789a::a00:2".parse::<Ipv6Addr>().unwrap());
+        assert_eq!(prefix, 64);
+        assert_eq!(network.client_ip_for_ipv6(ipv6), Some(ipv4));
+        assert_eq!(
+            network.client_ip_for_ipv6("fd99::a00:2".parse().unwrap()),
+            None
+        );
+        assert_eq!(
+            ClientNetworkConfig::decode_wire(&config.encode_wire()).unwrap(),
+            config
+        );
+        for length in 14..ClientNetworkConfig::WIRE_SIZE {
+            assert!(ClientNetworkConfig::decode_wire(&config.encode_wire()[..length]).is_err());
+        }
+        let mut low_mtu = network;
+        low_mtu.mtu = 1279;
+        assert!(low_mtu.client_config(ipv4).is_err());
+    }
+
+    #[test]
+    fn ipv6_gateway_uses_configured_prefix() {
+        let mut config = VpnNetworkConfig::default();
+        config.ipv6_enabled = true;
+        config.ipv6_prefix = "fd00:1234::abcd/64".to_string();
+        assert_eq!(
+            config.ipv6_gateway().unwrap(),
+            ("fd00:1234::1".parse().unwrap(), 64)
+        );
+        config.ipv6_prefix = "fd00::/129".to_string();
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn client_config_rejects_invalid_server_network() {
+        for (server_vpn_ip, prefix_len) in [
+            (Ipv4Addr::new(10, 0, 0, 1), 0),
+            (Ipv4Addr::new(10, 0, 0, 0), 24),
+            (Ipv4Addr::new(10, 0, 0, 255), 24),
+        ] {
+            let network = VpnNetworkConfig {
+                server_vpn_ip,
+                prefix_len,
+                ..Default::default()
+            };
+            assert!(network.client_config(Ipv4Addr::new(10, 0, 0, 2)).is_err());
+            let mut wire = VpnNetworkConfig::default()
+                .client_config(Ipv4Addr::new(10, 0, 0, 2))
+                .unwrap()
+                .encode_wire();
+            wire[1] = prefix_len;
+            wire[4..8].copy_from_slice(&server_vpn_ip.octets());
+            assert!(ClientNetworkConfig::decode_wire(&wire).is_err());
+        }
+    }
+
+    #[test]
     fn wire_roundtrip_preserves_client_network_config() {
         let config = ClientNetworkConfig {
             client_ip: Ipv4Addr::new(10, 150, 0, 2),
@@ -320,6 +474,7 @@ mod tests {
             mdh_len: 20,
             keepalive_secs: Some(4),
             ipv6_address: None,
+            ipv6_prefix_len: None,
         };
 
         let decoded = ClientNetworkConfig::decode_wire(&config.encode_wire()).unwrap();

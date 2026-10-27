@@ -138,6 +138,7 @@ int aivpn_get_adaptive_level_hint(void);
 /// pool re-home — re-apply tunnel network settings with this address or the
 /// server's anti-spoof check silently drops all uplink data.
 unsigned int aivpn_get_assigned_vpn_ip(void);
+size_t aivpn_get_assigned_network_config(char *buf, size_t capacity);
 
 /// Monotonically increasing counter, bumped each time new mask-recording
 /// feedback (RecordingAck/RecordingComplete/RecordingFailed/RecordingStatus)

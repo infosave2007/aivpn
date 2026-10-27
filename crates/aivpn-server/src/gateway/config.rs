@@ -115,7 +115,6 @@ pub struct GatewayConfig {
     pub qos_enforcer: Arc<QosEnforcer>,
     /// Multi-hop exit node forwarder.  When `Some`, client Data packets are
     /// relayed to the exit node instead of being NAT-forwarded locally.
-    pub chain_forwarder: Option<Arc<crate::chain_forwarder::ChainForwarder>>,
     /// Optional mTLS certificate policy.  `None` = no cert verification.
     pub mtls: Option<crate::mtls::MtlsConfig>,
     /// When `true`, this node accepts `ChainForward` control messages and
@@ -230,18 +229,7 @@ pub struct GatewayConfig {
     /// the global default then stays whatever it was resolved to at
     /// startup, exactly like pre-P1 behavior.
     pub server_config_path: Option<std::path::PathBuf>,
-    /// Wave B1 (pool topology read endpoints): whether pool sync is
-    /// configured on this node AT ALL — i.e. `server.json`'s `pool` block
-    /// is present — regardless of `pool.transport`. `Gateway` only ever
-    /// receives a live `node_registry`/`pool_dialer` handle (via
-    /// `set_node_registry`/`set_pool_dialer`) on a MASKED-transport node
-    /// (see `main.rs`'s pool-sync wiring); the legacy, mask-independent
-    /// `PeerSyncer` path runs entirely outside `Gateway` and is invisible to
-    /// it. This flag is how `dispatch_mgmt_request` tells "pool configured,
-    /// but running the legacy transport with no queryable link state"
-    /// (`PoolHealth::transport == "legacy"`) apart from "no pool sync at
-    /// all" (`"none"`) when `pool_dialer` is `None` either way. Defaults to
-    /// `false`.
+    /// Наличие настройки пула отличает отключенный пул от еще не подключенного.
     pub pool_configured: bool,
 }
 
@@ -276,7 +264,6 @@ impl Default for GatewayConfig {
                 webhook_url: None,
             }),
             qos_enforcer: Arc::new(QosEnforcer::new()),
-            chain_forwarder: None,
             mtls: None,
             exit_node_enabled: false,
             audit_log: AuditLogger::disabled(),

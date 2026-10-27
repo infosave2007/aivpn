@@ -16,6 +16,7 @@ use aivpn_client::mask_feedback_log::{MaskFeedbackLog, RegionalHintsStore};
 use aivpn_client::server_pool::{PoolMode, ServerEntry, ServerPool};
 use aivpn_client::tunnel::TunnelConfig;
 use aivpn_client::AivpnClient;
+#[cfg(not(feature = "production-secure"))]
 use aivpn_common::mask::preset_masks;
 #[cfg(not(feature = "production-secure"))]
 use aivpn_common::mask::preset_masks::bootstrap_default;
@@ -31,10 +32,39 @@ use std::sync::Arc;
 use std::time::Duration;
 use tracing::{error, info, warn};
 
+/// §2 L3 - minimum server-reported success score for a regional hint to be
+/// allowed to bias initial mask selection. Below this the bootstrap-selected
+/// mask is kept, so a weak/noisy hint never displaces the default choice.
+const HINT_BIAS_MIN_SCORE: f32 = 0.5;
+
+/// Initial reconnect backoff, also the value a healthy session resets to.
+const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
+/// Upper bound on the reconnect backoff.
+const MAX_BACKOFF: Duration = Duration::from_secs(60);
+/// A session that stayed connected at least this long is considered healthy;
+/// its reconnect backoff resets to `INITIAL_BACKOFF` instead of continuing to
+/// grow. The threshold comfortably exceeds normal handshake time so that only
+/// genuinely established sessions (well past connect) trigger a reset.
+const HEALTHY_CONNECTION_THRESHOLD: Duration = Duration::from_secs(30);
+
+async fn wait_reconnect_backoff(backoff: Duration, shutdown: &AtomicBool) {
+    let deadline = tokio::time::Instant::now() + backoff;
+    while !shutdown.load(Ordering::SeqCst) && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep_until(
+            deadline.min(tokio::time::Instant::now() + Duration::from_millis(100)),
+        )
+        .await;
+    }
+}
+
 /// AIVPN Client - Censorship-resistant VPN client
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 pub struct ClientArgs {
+    /// Локальный адрес управления; каждому экземпляру нужен отдельный порт.
+    #[arg(long, global = true, env = "AIVPN_ADMIN_LISTEN", default_value = "127.0.0.1:44301", value_parser = aivpn_client::record_cmd::parse_admin_addr)]
+    pub admin_listen: std::net::SocketAddrV4,
+
     /// Server address (e.g., 1.2.3.4:443)
     #[arg(short, long)]
     pub server: Option<String>,
@@ -110,6 +140,10 @@ pub struct ClientArgs {
     /// Example: --proxy-listen 127.0.0.1:1080
     #[arg(long, value_name = "HOST:PORT")]
     pub proxy_listen: Option<String>,
+
+    /// DNS-серверы SOCKS5 внутри VPN, до четырех IPv4-адресов.
+    #[arg(long, value_delimiter = ',', default_value = "1.1.1.1,9.9.9.9")]
+    pub proxy_dns: Vec<std::net::Ipv4Addr>,
 
     /// Path to a 104-byte mTLS client certificate (raw binary or base64-encoded).
     /// Required when the server has `mtls.required = true`.
@@ -237,8 +271,8 @@ pub enum ClientCommand {
         #[arg(long)]
         token: Option<String>,
         /// Admin-socket address of the running client daemon.
-        #[arg(long, default_value = "127.0.0.1:44301")]
-        socket: String,
+        #[arg(long, value_parser = aivpn_client::record_cmd::parse_admin_addr)]
+        socket: Option<std::net::SocketAddrV4>,
     },
     /// P2.3-desktop: report the server-assigned role (0=User, 1=Viewer,
     /// 2=Admin) cached by the running client daemon.
@@ -247,8 +281,8 @@ pub enum ClientCommand {
         #[arg(long)]
         token: Option<String>,
         /// Admin-socket address of the running client daemon.
-        #[arg(long, default_value = "127.0.0.1:44301")]
-        socket: String,
+        #[arg(long, value_parser = aivpn_client::record_cmd::parse_admin_addr)]
+        socket: Option<std::net::SocketAddrV4>,
     },
     /// Wave C2b-CLI: desktop bridge to the server SSH-installer
     /// (`aivpn_common::ssh_install`, re-exported as `aivpn_client::ssh_install`).
@@ -294,14 +328,15 @@ impl MgmtMethod {
 /// `role` CLI subcommands, which — unlike the pre-existing `record`
 /// subcommand (fire-and-forget, polls a status file) — need the daemon's
 /// direct reply.
-fn send_admin_request(socket_addr: &str, line: &str) -> Option<String> {
+fn send_admin_request(socket_addr: std::net::SocketAddrV4, line: &str) -> Option<String> {
     let socket = std::net::UdpSocket::bind("127.0.0.1:0").ok()?;
     socket
         .set_read_timeout(Some(std::time::Duration::from_secs(5)))
         .ok()?;
-    socket.send_to(line.as_bytes(), socket_addr).ok()?;
+    socket.connect(socket_addr).ok()?;
+    socket.send(line.as_bytes()).ok()?;
     let mut buf = [0u8; 65536];
-    let (len, _addr) = socket.recv_from(&mut buf).ok()?;
+    let len = socket.recv(&mut buf).ok()?;
     std::str::from_utf8(&buf[..len]).ok().map(|s| s.to_string())
 }
 
@@ -348,7 +383,7 @@ struct ClientFileConfig {
 
 fn load_client_file_config(path: Option<&str>) -> Option<ClientFileConfig> {
     let resolved = path?;
-    std::fs::read_to_string(&resolved)
+    std::fs::read_to_string(resolved)
         .ok()
         .and_then(|json| serde_json::from_str::<ClientFileConfig>(&json).ok())
 }
@@ -370,12 +405,65 @@ fn decode_base64_key(label: &str, encoded: &str) -> [u8; 32] {
 }
 
 // In development mode, derive a deterministic bootstrap mask from the PSK when no cached descriptors are available.
+#[cfg(not(feature = "production-secure"))]
 fn bootstrap_mask_for_psk(psk: &[u8; 32]) -> aivpn_common::mask::MaskProfile {
     use blake3;
     let presets = preset_masks::all();
     let hash = blake3::derive_key("aivpn-bootstrap-mask-v1", psk);
     let idx = hash[0] as usize % presets.len();
     presets[idx].clone()
+}
+
+/// Режим проверки масок.
+///
+/// В production-secure пустое значение становится enforce. Явные off и warn
+/// возвращают ошибку: сборка не должна молча ослабить проверку. Пустая строка
+/// тоже ошибка, это не отсутствие поля.
+fn parse_client_mask_verify_mode(
+    raw: Option<&str>,
+) -> Result<aivpn_common::mask::MaskVerifyMode, String> {
+    #[cfg(feature = "production-secure")]
+    {
+        match raw {
+            None => Ok(aivpn_common::mask::MaskVerifyMode::Enforce),
+            Some(text) => match text.trim() {
+                "" => Err("mask_verify_mode: пустое значение".to_string()),
+                other => match other.parse::<aivpn_common::mask::MaskVerifyMode>() {
+                    Ok(aivpn_common::mask::MaskVerifyMode::Enforce) => {
+                        Ok(aivpn_common::mask::MaskVerifyMode::Enforce)
+                    }
+                    Ok(mode) => Err(format!(
+                        "production-secure принимает только mask_verify_mode=enforce, получено '{mode:?}'"
+                    )),
+                    Err(e) => Err(e),
+                },
+            },
+        }
+    }
+    #[cfg(not(feature = "production-secure"))]
+    {
+        match raw {
+            None => Ok(aivpn_common::mask::MaskVerifyMode::default()),
+            Some(text) => text.parse(),
+        }
+    }
+}
+
+#[cfg(any(feature = "production-secure", test))]
+fn production_secure_client_keys_present(
+    signing: Option<&[u8; 32]>,
+    operator: Option<&[u8; 32]>,
+) -> bool {
+    signing.is_some() && operator.is_some()
+}
+
+/// Неподписанный пресет не должен вытеснять маску из проверенного дескриптора.
+/// Если замены нет или текущая маска не из дескриптора, выбор пресета остается.
+fn unsigned_preset_replaces_authenticated_descriptor(
+    mask_id: &str,
+    replacement_is_preset: bool,
+) -> bool {
+    replacement_is_preset && mask_id.starts_with("bootstrap:")
 }
 
 /// Точка входа клиента.
@@ -398,12 +486,14 @@ pub async fn run(
     // Собирается один раз на процесс: реестр неизменен после старта, а каждая
     // итерация переподключения получает тот же Arc.
     let registry = std::sync::Arc::new(transport_registry(extra));
+    let mut args = ClientArgs::parse();
 
     // On Windows, stderr inheritance via Stdio::from(File) is unreliable for
     // cross-compiled (MinGW) binaries with CREATE_NO_WINDOW. Write the log
     // directly to %LOCALAPPDATA%\AIVPN\client.log instead.
     #[cfg(target_os = "windows")]
     let _log_guard = {
+        let admin_addr = args.admin_listen;
         let args: Vec<String> = std::env::args().collect();
         // Only write to the persistent log file for the main VPN connection mode.
         // Subcommands (record, kill-switch, bench, mgmt, role, ssh-install) are
@@ -432,8 +522,15 @@ pub async fn run(
         let log_path = if is_subcommand {
             None
         } else {
-            std::env::var_os("LOCALAPPDATA")
-                .map(|p| std::path::PathBuf::from(p).join("AIVPN").join("client.log"))
+            std::env::var_os("LOCALAPPDATA").map(|p| {
+                std::path::PathBuf::from(p).join("AIVPN").join(
+                    if admin_addr == aivpn_client::record_cmd::DEFAULT_ADMIN_ADDR {
+                        "client.log".to_string()
+                    } else {
+                        format!("client-{}.log", admin_addr.port())
+                    },
+                )
+            })
         };
 
         if let Some(ref path) = log_path {
@@ -576,8 +673,6 @@ pub async fn run(
         });
     }
 
-    // Parse arguments
-    let mut args = ClientArgs::parse();
     if args.connection_key.is_none() {
         if let Ok(val) = std::env::var("AIVPN_CONNECTION_KEY") {
             args.connection_key = Some(val);
@@ -590,7 +685,10 @@ pub async fn run(
         match command {
             ClientCommand::KillSwitch { action } => match action {
                 KillSwitchAction::Clear => {
-                    aivpn_client::kill_switch::KillSwitch::clear_stale();
+                    if let Err(error) = aivpn_client::kill_switch::KillSwitch::clear_stale() {
+                        eprintln!("Kill-switch cleanup failed: {error}");
+                        std::process::exit(1);
+                    }
                     println!("Kill-switch stale rules cleared.");
                     return;
                 }
@@ -654,12 +752,13 @@ pub async fn run(
                     }),
                     None => Vec::new(),
                 };
+                let socket = socket.unwrap_or(args.admin_listen);
                 let token = token
-                    .or_else(aivpn_client::record_cmd::read_admin_token)
+                    .or_else(|| aivpn_client::record_cmd::read_admin_token_at(socket))
                     .unwrap_or_default();
                 let body_b64 = aivpn_client::record_cmd::encode_body_b64(&body);
                 let line = format!("{token}:mgmt:{}:{path}:{body_b64}", method.as_u8());
-                match send_admin_request(&socket, &line) {
+                match send_admin_request(socket, &line) {
                     Some(reply) => match aivpn_client::record_cmd::parse_mgmt_reply(&reply) {
                         Some((status, resp_body)) => {
                             eprintln!("{status}");
@@ -682,11 +781,12 @@ pub async fn run(
                 return;
             }
             ClientCommand::Role { token, socket } => {
+                let socket = socket.unwrap_or(args.admin_listen);
                 let token = token
-                    .or_else(aivpn_client::record_cmd::read_admin_token)
+                    .or_else(|| aivpn_client::record_cmd::read_admin_token_at(socket))
                     .unwrap_or_default();
                 let line = format!("{token}:role");
-                match send_admin_request(&socket, &line) {
+                match send_admin_request(socket, &line) {
                     Some(reply) => println!("{reply}"),
                     None => {
                         eprintln!("No reply from daemon at {socket} (is aivpn-client running?)");
@@ -701,15 +801,22 @@ pub async fn run(
                 std::process::exit(code);
             }
             ClientCommand::Record { action } => {
+                let store =
+                    aivpn_client::record_cmd::RecordingStatusStore::for_endpoint(args.admin_listen);
+                let token = aivpn_client::record_cmd::read_admin_token_at(args.admin_listen)
+                    .unwrap_or_else(|| {
+                        eprintln!(
+                            "No admin token at {} (is this client running?)",
+                            args.admin_listen
+                        );
+                        std::process::exit(1);
+                    });
                 match action {
                     RecordAction::Start { service } => {
-                        aivpn_client::record_cmd::handle_recording_status(true, Some(&service));
-                        let token =
-                            aivpn_client::record_cmd::read_admin_token().unwrap_or_default();
                         match std::net::UdpSocket::bind("127.0.0.1:0").and_then(|s| {
                             s.send_to(
                                 format!("{token}:record_start:{service}").as_bytes(),
-                                "127.0.0.1:44301",
+                                args.admin_listen,
                             )
                             .map(|_| s)
                         }) {
@@ -721,14 +828,8 @@ pub async fn run(
                         }
                     }
                     RecordAction::Stop => {
-                        let prior = aivpn_client::record_cmd::read_local_status();
-                        aivpn_client::record_cmd::mark_recording_stop_requested(
-                            prior.as_ref().and_then(|status| status.service.as_deref()),
-                        );
-                        let token =
-                            aivpn_client::record_cmd::read_admin_token().unwrap_or_default();
                         match std::net::UdpSocket::bind("127.0.0.1:0").and_then(|s| {
-                            s.send_to(format!("{token}:record_stop").as_bytes(), "127.0.0.1:44301")
+                            s.send_to(format!("{token}:record_stop").as_bytes(), args.admin_listen)
                                 .map(|_| s)
                         }) {
                             Ok(_) => {}
@@ -738,31 +839,28 @@ pub async fn run(
                         println!("Run 'aivpn-client record status' to inspect progress.");
                     }
                     RecordAction::Status => {
-                        let before = aivpn_client::record_cmd::read_local_status()
+                        let before = store
+                            .read_local_status()
                             .map(|status| status.updated_at_ms)
                             .unwrap_or(0);
-                        let token =
-                            aivpn_client::record_cmd::read_admin_token().unwrap_or_default();
                         if let Ok(socket) = std::net::UdpSocket::bind("127.0.0.1:0") {
                             let _ = socket.send_to(
                                 format!("{token}:record_status").as_bytes(),
-                                "127.0.0.1:44301",
+                                args.admin_listen,
                             );
                         }
                         let start = std::time::Instant::now();
                         let mut latest = None;
                         while start.elapsed() < std::time::Duration::from_secs(2) {
-                            if let Some(status) = aivpn_client::record_cmd::read_local_status() {
-                                if status.updated_at_ms >= before {
+                            if let Some(status) = store.read_local_status() {
+                                if status.updated_at_ms > before {
                                     latest = Some(status);
                                     break;
                                 }
                             }
                             std::thread::sleep(std::time::Duration::from_millis(100));
                         }
-                        if let Some(status) =
-                            latest.or_else(aivpn_client::record_cmd::read_local_status)
-                        {
+                        if let Some(status) = latest.or_else(|| store.read_local_status()) {
                             aivpn_client::record_cmd::print_local_status(&status);
                         } else {
                             println!("No recording status is available yet.");
@@ -834,6 +932,7 @@ pub async fn run(
                             mdh_len: 20,
                             keepalive_secs: None,
                             ipv6_address: None,
+                            ipv6_prefix_len: None,
                         })
                 })
             })
@@ -978,7 +1077,13 @@ pub async fn run(
     // Lower initial MTU for restrictive mobile networks (MTS, Megafon) when adaptive is on.
     let network_config = if adaptive_on {
         aivpn_common::network_config::ClientNetworkConfig {
-            mtu: network_config.mtu.min(1200),
+            mtu: network_config
+                .mtu
+                .min(if network_config.ipv6_address.is_some() {
+                    1280
+                } else {
+                    1200
+                }),
             ..network_config
         }
     } else {
@@ -1036,18 +1141,16 @@ pub async fn run(
         })
         .or(conn_mop_b64)
         .map(|b64| decode_base64_key("mask operator pubkey", &b64));
-    let mask_verify_mode: aivpn_common::mask::MaskVerifyMode =
-        match args.mask_verify_mode.clone().or_else(|| {
-            file_config
-                .as_ref()
-                .and_then(|c| c.mask_verify_mode.clone())
-        }) {
-            None => aivpn_common::mask::MaskVerifyMode::default(),
-            Some(s) => s.parse().unwrap_or_else(|e| {
-                error!("{}", e);
-                std::process::exit(1);
-            }),
-        };
+    let mask_verify_raw = args.mask_verify_mode.clone().or_else(|| {
+        file_config
+            .as_ref()
+            .and_then(|c| c.mask_verify_mode.clone())
+    });
+    let mask_verify_mode = parse_client_mask_verify_mode(mask_verify_raw.as_deref())
+        .unwrap_or_else(|e| {
+            error!("{}", e);
+            std::process::exit(1);
+        });
 
     // Parse PSK
     let preshared_key: Option<[u8; 32]> = psk_bytes.and_then(|v| {
@@ -1060,8 +1163,15 @@ pub async fn run(
         }
     });
 
-    let network_config = network_config;
-
+    #[cfg(feature = "production-secure")]
+    if !production_secure_client_keys_present(
+        server_signing_key.as_ref(),
+        mask_operator_pubkey.as_ref(),
+    ) {
+        error!("production-secure требует оба ключа: server signing key и mask operator pubkey");
+        std::process::exit(1);
+    }
+    #[cfg(not(feature = "production-secure"))]
     if server_signing_key.is_none() {
         warn!("No --server-signing-key provided; bootstrap descriptors accepted without signature verification");
     }
@@ -1086,7 +1196,10 @@ pub async fn run(
     }
 
     // Build multi-channel bootstrap configuration if any channels are specified
-    let mut bootstrap_config = BootstrapConfig::default();
+    let mut bootstrap_config = BootstrapConfig {
+        trusted_signing_key: server_signing_key,
+        ..Default::default()
+    };
     if let Some(cdn_url) = &args.bootstrap_cdn_url {
         bootstrap_config = bootstrap_config.with_cdn(cdn_url, "custom");
     }
@@ -1213,10 +1326,14 @@ pub async fn run(
     // aggregates per region and drops feedback without one).
     let feedback_share_enabled = args.share_mask_feedback && country_code.is_some();
 
-    // Start DNS proxy once before the reconnect loop so it stays alive across
-    // tunnel restarts. If created inside the loop, the handle is dropped at the
-    // end of each iteration and the proxy is killed during the backoff sleep —
-    // creating a DNS leak window on every reconnect.
+    if args.dns_proxy.is_some()
+        && (proxy_listen.is_some() || !cfg!(any(target_os = "linux", target_os = "macos")))
+    {
+        error!("--dns-proxy requires a Linux/macOS TUN; SOCKS uses its own DNS through the tunnel");
+        return;
+    }
+    // Слушатель живет между попытками, пересылка разрешена только для готового TUN.
+    let dns_proxy_gate = aivpn_client::dns_proxy::DnsProxyGate::default();
     let _dns_proxy_handle = args.dns_proxy.as_deref().and_then(|bind_str| {
         // Unlike every other malformed-input path in this file
         // (--server-key, --proxy-listen, --mtls-cert, --mask-verify-mode,
@@ -1251,9 +1368,11 @@ pub async fn run(
                 listen_addr: bind_addr,
                 upstream_addr,
             },
+            dns_proxy_gate.clone(),
         ))
     });
 
+    let mut reconnect_kill_switch: Option<aivpn_client::kill_switch::KillSwitch> = None;
     loop {
         if shutdown.load(Ordering::SeqCst) {
             info!("Shutdown requested, stopping client loop");
@@ -1299,6 +1418,7 @@ pub async fn run(
                         "No valid bootstrap descriptors available and fallback disabled. \
                          Ensure multi-channel bootstrap is configured or descriptors are cached."
                     );
+                    println!("AIVPN-STATUS reconnecting");
                     tokio::time::sleep(backoff).await;
                     backoff = std::cmp::min(backoff * 2, max_backoff);
                     continue;
@@ -1312,6 +1432,7 @@ pub async fn run(
                     Some(mask) => mask,
                     None => {
                         error!("No valid bootstrap descriptors available");
+                        println!("AIVPN-STATUS reconnecting");
                         tokio::time::sleep(backoff).await;
                         backoff = std::cmp::min(backoff * 2, max_backoff);
                         continue;
@@ -1425,8 +1546,19 @@ pub async fn run(
         } else if let Some(ref name) = args.preferred_mask {
             match aivpn_common::mask::preset_masks::by_id(name.as_str()) {
                 Some(m) => {
-                    info!("Using preferred mask '{}'", name);
-                    m
+                    if unsigned_preset_replaces_authenticated_descriptor(
+                        &initial_mask.mask_id,
+                        true,
+                    ) {
+                        warn!(
+                            "Предпочитаемая маска '{}' не заменяет проверенный дескриптор '{}'",
+                            name, initial_mask.mask_id
+                        );
+                        initial_mask
+                    } else {
+                        info!("Using preferred mask '{}'", name);
+                        m
+                    }
                 }
                 None => {
                     warn!(
@@ -1454,11 +1586,38 @@ pub async fn run(
         //   - Only applies when a hinted mask is a KNOWN built-in preset with a
         //     success score at or above `HINT_BIAS_MIN_SCORE`; otherwise the
         //     bootstrap-selected mask is kept unchanged.
-        let initial_mask = if args.receive_mask_hints
-            && !no_fallback
+        // production-secure не подменяет маску открытия региональным пресетом.
+        // В обычной сборке подсказка тоже не вытесняет дескриптор bootstrap:.
+        #[cfg(feature = "production-secure")]
+        if args.receive_mask_hints
             && args.preferred_mask.is_none()
             && args.polymorphic_base.is_none()
         {
+            warn!(
+                "production-secure: региональные подсказки не заменяют маску открытия неподписанным пресетом"
+            );
+        }
+        #[cfg(feature = "production-secure")]
+        let hints_allowed = false;
+        #[cfg(not(feature = "production-secure"))]
+        let hints_allowed = {
+            let requested = args.receive_mask_hints
+                && !no_fallback
+                && args.preferred_mask.is_none()
+                && args.polymorphic_base.is_none();
+            if requested
+                && unsigned_preset_replaces_authenticated_descriptor(&initial_mask.mask_id, true)
+            {
+                warn!(
+                    "Региональная подсказка не заменяет проверенный дескриптор '{}' неподписанным пресетом",
+                    initial_mask.mask_id
+                );
+                false
+            } else {
+                requested
+            }
+        };
+        let initial_mask = if hints_allowed {
             if let Some(cc) = country_code {
                 let hints = RegionalHintsStore::load_default().for_region(cc);
                 let biased = hints.into_iter().find_map(|(mask_id, score)| {
@@ -1559,6 +1718,7 @@ pub async fn run(
             initial_mask,
             tun_config,
             proxy_listen,
+            proxy_dns: args.proxy_dns.clone(),
             mtls_cert: mtls_cert.clone(),
             initial_adaptive_level,
             polymorphic_base: args.polymorphic_base.clone(),
@@ -1575,36 +1735,30 @@ pub async fn run(
             inbound_control_tap: None,
             node_identity: None,
             pool_node_id: None,
+            remote_verified_node: None,
+            remote_enroll_hook: None,
             transport: transport_config(),
         };
 
         match AivpnClient::new(config) {
             Ok(mut client) => {
+                client.set_dns_proxy_gate(dns_proxy_gate.clone());
                 client.set_transport_registry(registry.clone(), guard.clone());
                 info!("Client initialized successfully (TUN: {})", tun_name);
 
-                // Write initial stats file (platform-appropriate paths)
-                #[cfg(target_os = "windows")]
-                {
-                    if let Some(local_app) = std::env::var_os("LOCALAPPDATA") {
-                        let dir = std::path::PathBuf::from(local_app).join("AIVPN");
-                        let _ = std::fs::create_dir_all(&dir);
-                        let _ = std::fs::write(dir.join("traffic.stats"), "sent:0,received:0");
-                    }
-                    let _ = std::fs::write(
-                        std::env::temp_dir().join("aivpn-traffic.stats"),
-                        "sent:0,received:0",
-                    );
-                }
-                #[cfg(not(target_os = "windows"))]
-                {
-                    let _ = std::fs::write("/var/run/aivpn/traffic.stats", "sent:0,received:0");
-                    let _ = std::fs::write("/tmp/aivpn-traffic.stats", "sent:0,received:0");
-                }
-                aivpn_client::record_cmd::reset_local_status();
+                client.set_admin_listen(args.admin_listen);
 
                 let connect_started = std::time::Instant::now();
                 let run_result = client.run(shutdown.clone()).await;
+                if matches!(&run_result, Err(aivpn_common::Error::Io(error)) if error.kind() == std::io::ErrorKind::AddrInUse)
+                {
+                    error!("Local address already in use; choose distinct --admin-listen and --proxy-listen ports");
+                    client.deactivate_kill_switch();
+                    if let Some(ks) = &mut reconnect_kill_switch {
+                        ks.deactivate();
+                    }
+                    std::process::exit(1);
+                }
 
                 // §2 L2 failure attribution — did this attempt ever reach a
                 // connected state? An attempt that never connected is evidence
@@ -1677,7 +1831,11 @@ pub async fn run(
                                 handshake_reject_message(client.reject_reason())
                             );
                             client.deactivate_kill_switch();
-                            break;
+                            if let Some(ks) = &mut reconnect_kill_switch {
+                                ks.deactivate();
+                            }
+                            // Сохраняем rejected последним статусом для читателя stdout.
+                            return;
                         }
                         // A connection that stayed up beyond the healthy threshold is
                         // treated as a genuinely established session, so its backoff
@@ -1695,6 +1853,9 @@ pub async fn run(
                             e,
                             backoff.as_secs()
                         );
+                        if let Some(ks) = client.take_kill_switch() {
+                            reconnect_kill_switch = Some(ks);
+                        }
                     }
                 }
             }
@@ -1712,9 +1873,14 @@ pub async fn run(
             break;
         }
 
-        tokio::time::sleep(backoff).await;
+        println!("AIVPN-STATUS reconnecting");
+        wait_reconnect_backoff(backoff, &shutdown).await;
         backoff = std::cmp::min(backoff * 2, max_backoff);
     }
+    if let Some(ks) = &mut reconnect_kill_switch {
+        ks.deactivate();
+    }
+    println!("AIVPN-STATUS disconnected");
 }
 
 /// Parse an `aivpn://` connection key and return the decoded JSON value.
@@ -1732,21 +1898,6 @@ fn parse_connection_key(conn_key: &str) -> Result<serde_json::Value, String> {
         .map_err(|e| format!("Invalid connection key base64: {}", e))?;
     serde_json::from_slice(&json_bytes).map_err(|e| format!("Malformed connection key JSON: {}", e))
 }
-
-/// §2 L3 — minimum server-reported success score for a regional hint to be
-/// allowed to bias initial mask selection. Below this the bootstrap-selected
-/// mask is kept, so a weak/noisy hint never displaces the default choice.
-const HINT_BIAS_MIN_SCORE: f32 = 0.5;
-
-/// Initial reconnect backoff, also the value a healthy session resets to.
-const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
-/// Upper bound on the reconnect backoff.
-const MAX_BACKOFF: Duration = Duration::from_secs(60);
-/// A session that stayed connected at least this long is considered healthy;
-/// its reconnect backoff resets to `INITIAL_BACKOFF` instead of continuing to
-/// grow. The threshold comfortably exceeds normal handshake time so that only
-/// genuinely established sessions (well past connect) trigger a reset.
-const HEALTHY_CONNECTION_THRESHOLD: Duration = Duration::from_secs(30);
 
 /// Whether a session with the given uptime should reset the reconnect backoff.
 fn should_reset_backoff(uptime: Duration) -> bool {
@@ -1767,12 +1918,74 @@ fn fallback_network_config(tun_addr: &str) -> ClientNetworkConfig {
         mdh_len: 20,
         keepalive_secs: None,
         ipv6_address: None,
+        ipv6_prefix_len: None,
     }
+}
+
+/// Which datagram transport this run should open, if configuration names one.
+///
+/// Deliberately configuration-only: there is no command-line flag and no UI
+/// control for this, so the choice cannot be made accidentally and does not
+/// have to be represented anywhere a user can see. `AIVPN_TRANSPORT` names the
+/// transport; `AIVPN_TRANSPORT_PARAMS` carries base64 parameters that are
+/// passed through without being parsed here - what they mean is entirely the
+/// business of whichever factory claimed the name.
+///
+/// `None` - the case in a build that registers nothing - is the direct UDP
+/// socket the client has always used.
+fn transport_config() -> Option<aivpn_common::transport::TransportConfig> {
+    let name = std::env::var("AIVPN_TRANSPORT")
+        .ok()
+        .filter(|s| !s.trim().is_empty())?;
+    let params = std::env::var("AIVPN_TRANSPORT_PARAMS")
+        .ok()
+        .and_then(|s| base64::engine::general_purpose::STANDARD.decode(s).ok())
+        .unwrap_or_default();
+    Some(aivpn_common::transport::TransportConfig::new(
+        name.trim(),
+        params,
+    ))
+}
+
+/// The transports this binary can open.
+///
+/// This function is the extension point: a build that plugs in additional
+/// datagram transports registers them here, and nothing else in the client
+/// changes - it resolves whatever `transport_config()` asks for against this
+/// registry and otherwise knows nothing about what is in it. The default build
+/// registers none, so the only path is the direct UDP socket.
+fn transport_registry(
+    extra: Vec<std::sync::Arc<dyn aivpn_common::transport::TransportFactory>>,
+) -> aivpn_common::transport::TransportRegistry {
+    let mut registry = aivpn_common::transport::TransportRegistry::new();
+    for factory in extra {
+        registry.register(factory);
+    }
+    registry
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_interrupts_reconnect_backoff() {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let flag = shutdown.clone();
+        let task = tokio::spawn(async move {
+            wait_reconnect_backoff(Duration::from_secs(60), &flag).await;
+        });
+        tokio::task::yield_now().await;
+        shutdown.store(true, Ordering::SeqCst);
+        tokio::time::advance(Duration::from_millis(101)).await;
+        tokio::task::yield_now().await;
+        let finished = task.is_finished();
+        task.abort();
+        assert!(
+            finished,
+            "intentional shutdown must not wait the full backoff"
+        );
+    }
 
     /// Build a valid aivpn:// connection key from a JSON object literal.
     fn make_conn_key(json: &str) -> String {
@@ -1781,6 +1994,40 @@ mod tests {
     }
 
     // ── valid key round-trip ──────────────────────────────────────────────────
+
+    #[test]
+    fn admin_endpoint_is_available_before_and_after_subcommand() {
+        for argv in [
+            vec![
+                "aivpn-client",
+                "--admin-listen",
+                "127.0.0.1:44302",
+                "record",
+                "status",
+            ],
+            vec![
+                "aivpn-client",
+                "record",
+                "status",
+                "--admin-listen",
+                "127.0.0.1:44302",
+            ],
+        ] {
+            assert_eq!(
+                ClientArgs::try_parse_from(argv)
+                    .unwrap()
+                    .admin_listen
+                    .port(),
+                44302
+            );
+        }
+        let args =
+            ClientArgs::try_parse_from(["aivpn-client", "role", "--socket", "127.0.0.1:44303"])
+                .unwrap();
+        assert!(
+            matches!(args.command, Some(ClientCommand::Role { socket: Some(addr), .. }) if addr.port() == 44303)
+        );
+    }
 
     #[test]
     fn test_parse_connection_key_valid_full() {
@@ -1889,46 +2136,63 @@ mod tests {
         let key = decode_base64_key("test key", &b64);
         assert_eq!(key, [0u8; 32]);
     }
-}
 
-/// Which datagram transport this run should open, if configuration names one.
-///
-/// Deliberately configuration-only: there is no command-line flag and no UI
-/// control for this, so the choice cannot be made accidentally and does not
-/// have to be represented anywhere a user can see. `AIVPN_TRANSPORT` names the
-/// transport; `AIVPN_TRANSPORT_PARAMS` carries base64 parameters that are
-/// passed through without being parsed here — what they mean is entirely the
-/// business of whichever factory claimed the name.
-///
-/// `None` — the case in a build that registers nothing — is the direct UDP
-/// socket the client has always used.
-fn transport_config() -> Option<aivpn_common::transport::TransportConfig> {
-    let name = std::env::var("AIVPN_TRANSPORT")
-        .ok()
-        .filter(|s| !s.trim().is_empty())?;
-    let params = std::env::var("AIVPN_TRANSPORT_PARAMS")
-        .ok()
-        .and_then(|s| base64::engine::general_purpose::STANDARD.decode(s).ok())
-        .unwrap_or_default();
-    Some(aivpn_common::transport::TransportConfig::new(
-        name.trim(),
-        params,
-    ))
-}
-
-/// The transports this binary can open.
-///
-/// This function is the extension point: a build that plugs in additional
-/// datagram transports registers them here, and nothing else in the client
-/// changes — it resolves whatever `transport_config()` asks for against this
-/// registry and otherwise knows nothing about what is in it. The default build
-/// registers none, so the only path is the direct UDP socket.
-fn transport_registry(
-    extra: Vec<std::sync::Arc<dyn aivpn_common::transport::TransportFactory>>,
-) -> aivpn_common::transport::TransportRegistry {
-    let mut registry = aivpn_common::transport::TransportRegistry::new();
-    for factory in extra {
-        registry.register(factory);
+    #[test]
+    fn preset_does_not_replace_bootstrap_descriptor() {
+        assert!(unsigned_preset_replaces_authenticated_descriptor(
+            "bootstrap:epoch:webrtc_zoom_v3:1:aa",
+            true
+        ));
+        assert!(!unsigned_preset_replaces_authenticated_descriptor(
+            "webrtc_zoom_v3",
+            true
+        ));
+        assert!(!unsigned_preset_replaces_authenticated_descriptor(
+            "bootstrap:epoch:webrtc_zoom_v3:1:aa",
+            false
+        ));
+        assert!(production_secure_client_keys_present(
+            Some(&[1u8; 32]),
+            Some(&[2u8; 32])
+        ));
+        assert!(!production_secure_client_keys_present(
+            None,
+            Some(&[2u8; 32])
+        ));
+        assert!(!production_secure_client_keys_present(
+            Some(&[1u8; 32]),
+            None
+        ));
     }
-    registry
+
+    #[cfg(not(feature = "production-secure"))]
+    #[test]
+    fn client_verify_mode_defaults_to_warn() {
+        assert_eq!(
+            parse_client_mask_verify_mode(None).unwrap(),
+            aivpn_common::mask::MaskVerifyMode::Warn
+        );
+        assert_eq!(
+            parse_client_mask_verify_mode(Some("off")).unwrap(),
+            aivpn_common::mask::MaskVerifyMode::Off
+        );
+        assert!(parse_client_mask_verify_mode(Some("nope")).is_err());
+    }
+
+    #[cfg(feature = "production-secure")]
+    #[test]
+    fn client_verify_mode_production_secure_enforce_only() {
+        assert_eq!(
+            parse_client_mask_verify_mode(None).unwrap(),
+            aivpn_common::mask::MaskVerifyMode::Enforce
+        );
+        assert_eq!(
+            parse_client_mask_verify_mode(Some("enforce")).unwrap(),
+            aivpn_common::mask::MaskVerifyMode::Enforce
+        );
+        let off = parse_client_mask_verify_mode(Some("off")).unwrap_err();
+        assert!(off.contains("production-secure"), "{off}");
+        assert!(parse_client_mask_verify_mode(Some("warn")).is_err());
+        assert!(parse_client_mask_verify_mode(Some("  ")).is_err());
+    }
 }

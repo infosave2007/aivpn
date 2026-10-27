@@ -18,6 +18,7 @@ WORKDIR /app
 # listed in Cargo.toml to be present to resolve the workspace at all.
 COPY Cargo.toml Cargo.lock ./
 COPY crates crates/
+COPY vendor vendor/
 COPY assets/masks assets/masks/
 
 RUN cargo build --locked --release --target "${TARGET_TRIPLE}" -p aivpn-client --bin aivpn-client \
@@ -25,7 +26,7 @@ RUN cargo build --locked --release --target "${TARGET_TRIPLE}" -p aivpn-client -
 
 # Stage 2: minimal runtime image with iproute2 for ip commands
 FROM alpine:3.24
-RUN apk add --no-cache iproute2 ca-certificates \
+RUN apk add --no-cache iproute2 iptables ca-certificates \
     && rm -rf /var/cache/apk/*
 
 COPY --from=builder /aivpn-client /usr/local/bin/aivpn-client

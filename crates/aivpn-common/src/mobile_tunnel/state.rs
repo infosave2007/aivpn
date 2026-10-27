@@ -204,6 +204,12 @@ pub struct SessionRuntime {
     pub stop_requested: AtomicBool,
 }
 
+impl Default for SessionRuntime {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SessionRuntime {
     pub fn new() -> Self {
         Self {
@@ -459,6 +465,21 @@ pub static ACTIVE_ADAPTIVE_LEVEL: AtomicU8 = AtomicU8::new(0);
 /// anti-spoof check — the platform polls this via getAssignedVpnIp() and
 /// rebuilds the TUN with the server's address when it differs.
 pub static ASSIGNED_VPN_IP: AtomicU32 = AtomicU32::new(0);
+/// Последний подтвержденный ServerHello; платформы применяют адреса и MTU вместе.
+pub static ASSIGNED_NETWORK_CONFIG: Mutex<Option<crate::network_config::ClientNetworkConfig>> =
+    Mutex::new(None);
+
+pub fn assigned_network_config_json() -> String {
+    ASSIGNED_NETWORK_CONFIG
+        .lock()
+        .ok()
+        .and_then(|config| {
+            config
+                .as_ref()
+                .and_then(|value| serde_json::to_string(value).ok())
+        })
+        .unwrap_or_default()
+}
 
 // §2 crowdsourced blocking feedback — process-global state polled by Kotlin
 // via the JNI getters in `lib.rs`, following the same reset-at-session-start
@@ -589,7 +610,7 @@ pub fn resolve_sticky_handshake_mask(
 ) -> MaskProfile {
     let is_auto = preferred
         .map(str::trim)
-        .map_or(true, |s| s.is_empty() || s == "auto");
+        .is_none_or(|s| s.is_empty() || s == "auto");
     if is_auto && fail_streak < HANDSHAKE_FALLBACK_THRESHOLD {
         if let Some(m) = LAST_GOOD_MASK
             .lock()

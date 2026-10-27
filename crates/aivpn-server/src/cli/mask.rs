@@ -125,7 +125,36 @@ pub(crate) fn handle_sign_mask_dir(dir: &str, args: &ServerArgs) {
     println!("✅ Signed {signed} mask(s) in '{dir}' with the operator key.");
 }
 
+#[cfg(test)]
 pub(crate) fn load_bootstrap_masks(
+    file_config: Option<&ServerFileConfig>,
+) -> Result<Vec<MaskProfile>, String> {
+    load_bootstrap_masks_trusted(file_config, None, None, None)
+}
+
+/// Загружает bootstrap-маски с проверкой подписи. CLI/env перекрывают поля файла.
+/// Пустой набор файлов не проверяет доверие: `--list-masks` без масок жив.
+pub(crate) fn load_bootstrap_masks_trusted(
+    file_config: Option<&ServerFileConfig>,
+    signing_key: Option<&str>,
+    operator_pubkey: Option<&str>,
+    verify_mode: Option<&str>,
+) -> Result<Vec<MaskProfile>, String> {
+    let masks = load_bootstrap_masks_unverified(file_config)?;
+    if masks.is_empty() {
+        return Ok(masks);
+    }
+    verify_bootstrap_masks(
+        &masks,
+        file_config,
+        signing_key,
+        operator_pubkey,
+        verify_mode,
+    )?;
+    Ok(masks)
+}
+
+fn load_bootstrap_masks_unverified(
     file_config: Option<&ServerFileConfig>,
 ) -> Result<Vec<MaskProfile>, String> {
     let Some(files) = file_config.and_then(|config| config.bootstrap_mask_files.clone()) else {
@@ -135,33 +164,124 @@ pub(crate) fn load_bootstrap_masks(
     let mut masks = Vec::new();
     for file in files {
         let content = std::fs::read_to_string(&file).map_err(|e| format!("{}: {}", file, e))?;
-
-        // Trim whitespace to check if file is empty
         let trimmed = content.trim();
         if trimmed.is_empty() {
-            // Skip empty files silently
             continue;
         }
-
-        // Try to parse as a single MaskProfile first
         if let Ok(mask) = serde_json::from_str::<MaskProfile>(trimmed) {
             masks.push(mask);
             continue;
         }
-
-        // Try to parse as an array of MaskProfile
         if let Ok(arr) = serde_json::from_str::<Vec<MaskProfile>>(trimmed) {
             masks.extend(arr);
             continue;
         }
-
-        // If both fail, return an error
         return Err(format!(
             "{}: invalid JSON format, expected MaskProfile object or array of MaskProfile objects",
             file
         ));
     }
     Ok(masks)
+}
+
+fn prefer_override<'a>(over: Option<&'a str>, file_value: Option<&'a str>) -> Option<&'a str> {
+    match over {
+        Some(value) => Some(value),
+        None => file_value,
+    }
+}
+
+fn verify_bootstrap_masks(
+    masks: &[MaskProfile],
+    file_config: Option<&ServerFileConfig>,
+    signing_key: Option<&str>,
+    operator_pubkey: Option<&str>,
+    verify_mode: Option<&str>,
+) -> Result<(), String> {
+    let signing = prefer_override(
+        signing_key,
+        file_config.and_then(|cfg| cfg.mask_signing_key.as_deref()),
+    );
+    let pubkey_b64 = prefer_override(
+        operator_pubkey,
+        file_config.and_then(|cfg| cfg.mask_operator_pubkey.as_deref()),
+    );
+    let mode = prefer_override(
+        verify_mode,
+        file_config.and_then(|cfg| cfg.mask_verify_mode.as_deref()),
+    );
+    let resolved =
+        aivpn_server::server_config::resolved_mask_verify_mode(signing, pubkey_b64, mode)?;
+    let operator = match pubkey_b64 {
+        Some(b64) => Some(decode_operator_pubkey(b64)?),
+        None => match signing {
+            Some(path) => Some(pubkey_from_signing_file(path)?),
+            None => None,
+        },
+    };
+    for mask in masks {
+        let verdict = aivpn_common::mask::verify_mask_artifact(mask, operator.as_ref(), resolved);
+        if !verdict.accept {
+            return Err(format!(
+                "bootstrap mask '{}': подпись отклонена ({:?}, mask_verify_mode={:?})",
+                mask.mask_id, verdict.detail, resolved
+            ));
+        }
+        if matches!(
+            verdict.detail,
+            aivpn_common::mask::MaskVerifyDetail::Unsigned
+                | aivpn_common::mask::MaskVerifyDetail::Invalid
+        ) {
+            eprintln!(
+                "bootstrap mask '{}': подпись не проверена ({:?}), режим {:?}",
+                mask.mask_id, verdict.detail, resolved
+            );
+        }
+    }
+    Ok(())
+}
+
+fn decode_operator_pubkey(b64: &str) -> Result<[u8; 32], String> {
+    use base64::Engine;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(b64.trim())
+        .map_err(|e| format!("mask_operator_pubkey: {e}"))?;
+    if bytes.len() != 32 {
+        return Err(format!(
+            "mask_operator_pubkey: ожидалось 32 байта, получено {}",
+            bytes.len()
+        ));
+    }
+    let mut key = [0u8; 32];
+    key.copy_from_slice(&bytes);
+    Ok(key)
+}
+
+/// Читает seed и возвращает публичный ключ. Ошибка файла - это `Err`, не exit:
+/// загрузчик масок отдает ее вызывающему коду.
+fn pubkey_from_signing_file(path: &str) -> Result<[u8; 32], String> {
+    use base64::Engine;
+    let data = std::fs::read(path).map_err(|e| format!("mask_signing_key '{}': {}", path, e))?;
+    let bytes = if data.len() == 32 {
+        data
+    } else {
+        let text = String::from_utf8_lossy(&data);
+        base64::engine::general_purpose::STANDARD
+            .decode(text.trim())
+            .map_err(|e| format!("mask_signing_key '{}': {}", path, e))?
+    };
+    if bytes.len() != 32 {
+        return Err(format!(
+            "mask_signing_key '{}': ожидалось 32 байта, получено {}",
+            path,
+            bytes.len()
+        ));
+    }
+    let mut seed = [0u8; 32];
+    seed.copy_from_slice(&bytes);
+    Ok(ed25519_dalek::SigningKey::from_bytes(&seed)
+        .verifying_key()
+        .to_bytes())
 }
 
 /// --list-masks: print mask JSON filenames from mask-dir

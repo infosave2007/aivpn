@@ -62,22 +62,20 @@
     importing = true;
     importResult = '';
     try {
-      // apiFetch skips the default JSON Content-Type for File/Blob bodies,
-      // so the backup binary is sent with the browser-derived type instead
-      // of a mislabeled application/json.
-      const res = await apiFetch('/api/v1/backup/import', {
+      // Сервер только проверяет архив. Восстановление выполняется offline через CLI.
+      const res = await apiFetch('/api/v1/backup/import?dry_run=true', {
         method: 'POST',
         body: importFile,
       });
       if (!res.ok) {
         const t = await res.text();
-        throw new Error(t || 'Import failed');
+        throw new Error(t || 'Не удалось проверить архив');
       }
-      importResult = 'Backup imported successfully';
+      importResult = 'Архив проверен. Файлы сервера не изменены. Для восстановления остановите сервер и используйте CLI.';
       importError = false;
       importFile = null;
     } catch (e: unknown) {
-      importResult = e instanceof Error ? e.message : 'Import failed';
+      importResult = e instanceof Error ? e.message : 'Не удалось проверить архив';
       importError = true;
     } finally {
       importing = false;
@@ -127,7 +125,10 @@
   </div>
 
   <div class="bg-white dark:bg-gray-800 rounded-xl p-6 border border-gray-200 dark:border-gray-700 space-y-4">
-    <h2 class="text-base font-semibold text-gray-900 dark:text-white">Import</h2>
+    <h2 class="text-base font-semibold text-gray-900 dark:text-white">Проверка резервной копии</h2>
+    <p class="text-sm text-gray-500 dark:text-gray-400">Восстановление доступно только при остановленном сервере. Загрузите архив на сервер, остановите сервис и все процессы, использующие базу, затем выполните:</p>
+    <pre class="overflow-x-auto text-xs bg-gray-100 dark:bg-gray-900 p-3 rounded"><code>aivpn-server --import /path/backup.bin --config /path/server.json --clients-db /path/clients.json --mask-dir /path/masks</code></pre>
+    <p class="text-sm text-gray-500 dark:text-gray-400">Здесь можно проверить архив без изменения файлов.</p>
 
     {#if importResult}
       <div class="p-3 rounded-lg text-sm {importError ? 'bg-red-50 dark:bg-red-900/20 text-red-700 dark:text-red-400 border border-red-200' : 'bg-green-50 dark:bg-green-900/20 text-green-700 dark:text-green-400 border border-green-200'}">
@@ -164,7 +165,7 @@
       disabled={!importFile || importing}
       class="w-full py-2 bg-indigo-600 hover:bg-indigo-700 disabled:opacity-50 text-white rounded-lg text-sm font-medium"
     >
-      {importing ? 'Importing...' : 'Import Backup'}
+      {importing ? 'Проверка...' : 'Проверить архив'}
     </button>
   </div>
 </div>

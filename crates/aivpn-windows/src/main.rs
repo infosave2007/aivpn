@@ -96,8 +96,8 @@ fn main() {
 struct TrayHandles {
     _icon: tray_icon::TrayIcon,
     connect_item: tray_icon::menu::MenuItem,
-    show_item: tray_icon::menu::MenuItem,
-    quit_item: tray_icon::menu::MenuItem,
+    _show_item: tray_icon::menu::MenuItem,
+    _quit_item: tray_icon::menu::MenuItem,
 }
 
 // ── App struct ─────────────────────────────────────────────────────────────
@@ -109,7 +109,7 @@ use assets::{app_icon, apply_theme_to_ctx, make_tray_icon};
 #[cfg(windows)]
 use key_storage::KeyStorage;
 #[cfg(windows)]
-use localization::{t, AppSettings, Lang};
+use localization::{t, AppSettings};
 #[cfg(windows)]
 use platform_win::{
     bring_window_to_front, claim_single_instance_mutex, focus_existing_instance, is_elevated,
@@ -118,9 +118,7 @@ use platform_win::{
 #[cfg(windows)]
 use std::time::Instant;
 #[cfg(windows)]
-use vpn_manager::{
-    format_bytes, gui_log, BenchResult, ConnectionState, RecordingState, VpnManager,
-};
+use vpn_manager::{format_bytes, gui_log, BenchResult, ConnectionState, VpnManager};
 
 #[cfg(windows)]
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -380,7 +378,6 @@ enum SshWizardStage {
     /// Target host/auth/options form, not yet probed.
     Form,
     /// Fingerprint confirmed ("I trust this host") — ready to install.
-    Confirmed,
     /// `spawn_install` running, streaming `ssh_install_log`.
     Installing,
     /// Terminal state reached (`ssh_install_done_ok` is `Some`).
@@ -614,8 +611,8 @@ impl AivpnApp {
                 self.tray = Some(TrayHandles {
                     _icon: icon,
                     connect_item,
-                    show_item,
-                    quit_item,
+                    _show_item: show_item,
+                    _quit_item: quit_item,
                 });
                 // Background thread: poll TrayIconEvent + MenuEvent and restore the window
                 // via Win32. Must run in bg thread so Quit/Connect/Show work even when
@@ -865,9 +862,5 @@ impl AivpnApp {
                 let _ = tray._icon.set_icon(Some(icon));
             }
         }
-    }
-
-    fn show_window_win32(&self) {
-        bring_window_to_front();
     }
 }

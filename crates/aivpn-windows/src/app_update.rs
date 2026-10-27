@@ -546,8 +546,12 @@ impl eframe::App for super::AivpnApp {
                                 };
                                 ui.label(
                                     egui::RichText::new(format!(
-                                        "P50: {:.0}ms  Q:{}/100",
-                                        r.latency_p50_ms, r.quality_score
+                                        "P50/P95/P99: {:.0}/{:.0}/{:.0}ms  Loss: {:.1}%  Q:{}/100",
+                                        r.latency_p50_ms,
+                                        r.latency_p95_ms,
+                                        r.latency_p99_ms,
+                                        r.packet_loss_pct,
+                                        r.quality_score
                                     ))
                                     .color(qc)
                                     .size(12.0),

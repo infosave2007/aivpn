@@ -8,11 +8,12 @@
 
 mod config;
 mod control_handler;
+mod device_identity;
 mod kernel_offload;
 mod reject;
 mod session;
 
-pub use config::{ClientConfig, ClientState};
+pub use config::{ClientConfig, ClientState, RemoteEnrollHook};
 pub use reject::handshake_reject_message;
 use reject::handshake_reject_token;
 
@@ -30,7 +31,7 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, error, info, warn};
 
 use aivpn_common::client_wire::{
-    build_inner_packet, decode_downlink_any_mdh_len, obfuscate_client_eph_pub, DecodedPacket,
+    build_inner_packet, decode_downlink_with_offsets, obfuscate_client_eph_pub, DecodedPacket,
     RecvWindow,
 };
 use aivpn_common::crypto::{self, KeyPair, SessionKeys, X25519_PUBLIC_KEY_SIZE};
@@ -472,6 +473,7 @@ pub struct AivpnClient {
     send_seq: u32,
     _recv_seq: u32,
     recv_window: RecvWindow,
+    fragment_rx: aivpn_common::fragment::Reassembler,
     transition_recv_window: RecvWindow,
     recv_mdh_len: usize,
     /// Every distinct downlink MDH length this session has used, most-recent
@@ -482,23 +484,21 @@ pub struct AivpnClient {
     /// rekey/mask rotation. Seeded with the bootstrap length; extended on every
     /// mask update.
     recv_mdh_candidates: Vec<usize>,
+    recv_tag_offsets: Vec<u16>,
     // Traffic counters
     bytes_sent: Arc<AtomicU64>,
     bytes_received: Arc<AtomicU64>,
-    /// Client's currently-effective VPN IP (the `client_ip` half of the last
-    /// applied `ClientNetworkConfig`). Seeded from the static key's `i` field
-    /// at construction and updated live by `apply_server_network_override` on
-    /// every server-confirmed network change, including a pool re-home that
-    /// assigns a different IP than the key's. Shared with the stats-writer
-    /// task (below) so file-based GUIs (Windows, whose child stdout is piped
-    /// to `Stdio::null()`) can observe the re-home the same way Linux's
-    /// stdout `AIVPN-STATUS` line does.
+    /// Текущий VPN IP для traffic.stats. Начальное значение берется из конфига,
+    /// а apply_server_network_override обновляет его при смене адреса сервером.
     current_vpn_ip: Arc<Mutex<String>>,
     // Pre-allocated buffers for zero-copy I/O (OPTIMIZATION)
     _send_buf: Vec<u8>,
     _recv_buf: Vec<u8>,
     proxy_handle: Option<crate::proxy::ProxyHandle>,
+    dns_proxy_gate: Option<crate::dns_proxy::DnsProxyGate>,
     // Recording tracking
+    admin_listen: std::net::SocketAddrV4,
+    recording_status: crate::record_cmd::RecordingStatusStore,
     active_recording_session: Option<[u8; 16]>,
     keepalive_interval: Duration,
     /// Shared keepalive interval in milliseconds with the upload task for dynamic updates.
@@ -593,6 +593,23 @@ pub struct AivpnClient {
     /// only valid within its 10 s window, so a rotation forces a re-push.
     #[cfg(target_os = "linux")]
     kernel_tags_tw: u64,
+    /// Эпоха ключа s2c в ядре. Ноль значит, что rotate еще не было.
+    #[cfg(target_os = "linux")]
+    kernel_epoch: u32,
+    /// Прошлая эпоха после смены ключа. Ноль значит, что старого окна в ядре нет.
+    #[cfg(target_os = "linux")]
+    kernel_prev_epoch: u32,
+    /// Ключ s2c текущей эпохи. Повтор маски с тем же ключом эпоху не меняет.
+    #[cfg(target_os = "linux")]
+    kernel_epoch_key: [u8; 32],
+    /// Ядро держит окно replay. Счетчик такого пакета берется только replay_claim.
+    #[cfg(target_os = "linux")]
+    kernel_replay_bound: bool,
+    #[cfg(target_os = "linux")]
+    kernel_faulted: bool,
+    /// Смещение тега последней установки. Смена смещения переставляет сессию.
+    #[cfg(target_os = "linux")]
+    kernel_installed_tag_offset: u16,
     /// Interface on which the XDP early-filter was attached (Linux only).
     #[cfg(target_os = "linux")]
     xdp_iface: Option<String>,
@@ -609,6 +626,11 @@ pub struct AivpnClient {
 }
 
 impl AivpnClient {
+    pub fn set_admin_listen(&mut self, addr: std::net::SocketAddrV4) {
+        self.admin_listen = addr;
+        self.recording_status = crate::record_cmd::RecordingStatusStore::for_endpoint(addr);
+    }
+
     /// Create new client
     pub fn new(config: ClientConfig) -> Result<Self> {
         let keypair = KeyPair::generate();
@@ -618,7 +640,13 @@ impl AivpnClient {
         let bytes_received = Arc::new(AtomicU64::new(0));
         let initial_vpn_ip = config.tun_config.tun_addr.clone();
 
-        let static_keypair = load_or_generate_static_keypair();
+        // Межсерверный канал доказывает node identity и не трогает ключ устройства.
+        let recv_tag_offsets = vec![config.initial_mask.tag_offset];
+        let static_keypair = if config.control_only {
+            None
+        } else {
+            load_or_generate_static_keypair()?
+        };
         let initial_adaptive_level = config.initial_adaptive_level;
         let initial_keepalive = keepalive_with_nat_cap(
             initial_adaptive_level,
@@ -654,6 +682,18 @@ impl AivpnClient {
             #[cfg(target_os = "linux")]
             kernel_tags_tw: 0,
             #[cfg(target_os = "linux")]
+            kernel_epoch: 0,
+            #[cfg(target_os = "linux")]
+            kernel_prev_epoch: 0,
+            #[cfg(target_os = "linux")]
+            kernel_epoch_key: [0u8; 32],
+            #[cfg(target_os = "linux")]
+            kernel_replay_bound: false,
+            #[cfg(target_os = "linux")]
+            kernel_faulted: false,
+            #[cfg(target_os = "linux")]
+            kernel_installed_tag_offset: u16::MAX,
+            #[cfg(target_os = "linux")]
             xdp_iface: None,
             upload_state: None,
             transition_recv_keys: None,
@@ -673,9 +713,11 @@ impl AivpnClient {
             send_seq: 0,
             _recv_seq: 0,
             recv_window: RecvWindow::new(),
+            fragment_rx: aivpn_common::fragment::Reassembler::default(),
             transition_recv_window: RecvWindow::new(),
             recv_mdh_len,
             recv_mdh_candidates: vec![recv_mdh_len],
+            recv_tag_offsets,
             bytes_sent: bytes_sent.clone(),
             bytes_received: bytes_received.clone(),
             current_vpn_ip: Arc::new(Mutex::new(initial_vpn_ip)),
@@ -683,6 +725,11 @@ impl AivpnClient {
             _send_buf: Vec::with_capacity(MAX_PACKET_SIZE),
             _recv_buf: Vec::with_capacity(MAX_PACKET_SIZE),
             proxy_handle: None,
+            dns_proxy_gate: None,
+            admin_listen: crate::record_cmd::DEFAULT_ADMIN_ADDR,
+            recording_status: crate::record_cmd::RecordingStatusStore::for_endpoint(
+                crate::record_cmd::DEFAULT_ADMIN_ADDR,
+            ),
             active_recording_session: None,
             keepalive_interval: initial_keepalive,
             keepalive_interval_ms: Arc::new(AtomicU64::new(initial_keepalive.as_millis() as u64)),
@@ -825,6 +872,10 @@ impl AivpnClient {
         // protocol above this point is unchanged either way — it only ever sees
         // `DatagramTransport`.
         if let Some(cfg) = self.config.transport.clone() {
+            if self.config.proxy_listen.is_none() && !self.config.control_only {
+                self.tunnel
+                    .set_transport_mark(self.socket_guard.routing_mark())?;
+            }
             let transport = self
                 .transport_registry
                 .open(&cfg, self.socket_guard.clone())
@@ -925,6 +976,30 @@ impl AivpnClient {
     /// it directly: the tunnel still needs the server's address for its own
     /// routing (the host route and the kill-switch exemption are keyed on it).
     async fn finish_connect(&mut self, server_addr: SocketAddr) -> Result<()> {
+        // Новый транспорт означает новую попытку, даже при повторном connect()
+        // того же объекта. Старые ключи и replay-окна к ней не относятся.
+        self.keypair = KeyPair::generate();
+        self.counter = 0;
+        self.send_seq = 0;
+        self.recv_window.reset();
+        self.transition_recv_window.reset();
+        self.fragment_rx = aivpn_common::fragment::Reassembler::default();
+        self.session_keys = None;
+        self.upload_state = None;
+        self.transition_recv_keys = None;
+        self.transition_recv_deadline = None;
+        self.transition_grace_hard = None;
+        self.pending_upload_keys = None;
+        self.ratcheted_server_eph_pub = None;
+        self.ratcheted_rekey_eph_pub = None;
+        self.rekey_response_eph = None;
+        self.terminal_rejected = false;
+        self.reject_reason = 0;
+        self.recv_mdh_len = packet_mdh_len_for_mask(&self.config.initial_mask);
+        self.recv_mdh_candidates = vec![self.recv_mdh_len];
+        self.recv_tag_offsets = vec![self.config.initial_mask.tag_offset];
+        self.ever_connected.store(false, Ordering::Relaxed);
+
         // Auto-detect kernel acceleration (Linux only).
         #[cfg(target_os = "linux")]
         {
@@ -945,36 +1020,36 @@ impl AivpnClient {
             // packet through the softirq fallback path for zero benefit, the
             // exact regression removed in 13984c5.
             //
-            // OPT-IN and OFF by default (AIVPN_CLIENT_KERNEL_RX=1 to enable).
-            // Client-side kernel downlink RX offloads only in full-tunnel mode,
-            // but a tag-window miss drops the packet into the softirq fallback
-            // queue, and on the server the equivalent fallback-regime tag churn
-            // was observed to starve the downlink and stall the tunnel (the
-            // 13984c5 bug family). Client acceleration also has little upside —
-            // the client is not CPU-bound like a multi-client server — so it
-            // ships disabled and is enabled explicitly for testing/opt-in only.
+            // Обычный туннель сам открывает модуль. Хук ставится только после
+            // политики ROLE_CLIENT. Прокси и control-only без TUN остаются в userspace.
+            if let Some(old) = self.kernel_accel.take() {
+                if self.kernel_replay_bound || self.kernel_installed {
+                    let _ = old.session_remove(&self.kernel_session_id);
+                }
+            }
             self.kernel_installed = false;
             self.kernel_hooked = false;
             self.kernel_tun_set = false;
-            let kernel_rx_enabled = std::env::var("AIVPN_CLIENT_KERNEL_RX")
-                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-                .unwrap_or(false);
-            if self.config.proxy_listen.is_some() || self.config.control_only || !kernel_rx_enabled
+            self.kernel_replay_bound = false;
+            self.kernel_faulted = false;
+            self.kernel_epoch = 0;
+            self.kernel_prev_epoch = 0;
+            self.kernel_epoch_key = [0u8; 32];
+            self.kernel_installed_tag_offset = u16::MAX;
+            self.kernel_installed_mdh_len = 0;
+            if self.config.proxy_listen.is_some()
+                || self.config.control_only
+                || self
+                    .transport
+                    .as_ref()
+                    .is_none_or(|transport| transport.raw_fd().is_none())
             {
-                // Proxy mode (no TUN to inject into) or not opted in: user-space
-                // data path exactly as before.
                 self.kernel_accel = None;
             } else {
                 self.kernel_accel = KernelAccel::try_open().map(Arc::new);
                 if self.kernel_accel.is_some() {
                     info!(
-                        "Kernel acceleration: aivpn.ko detected (AIVPN_CLIENT_KERNEL_RX=1) \
-                         — downlink decrypt will be offloaded after the PFS ratchet"
-                    );
-                } else {
-                    info!(
-                        "Kernel acceleration: requested but aivpn.ko not available \
-                         — using built-in user-space data path"
+                        "Kernel acceleration: aivpn.ko detected, downlink offload waits for client policy"
                     );
                 }
             }
@@ -1007,7 +1082,7 @@ impl AivpnClient {
         // Initialize mimicry engine
         self.mimicry_engine = Some(MimicryEngine::new(self.config.initial_mask.clone()));
 
-        // Derive session keys (Zero-RTT)
+        // Начальные ключи нужны только до подтвержденного PFS обмена.
         let dh_result = self
             .keypair
             .compute_shared(&self.config.server_public_key)?;
@@ -1020,7 +1095,7 @@ impl AivpnClient {
                 "absent"
             }
         );
-        self.session_keys = Some(crypto::derive_session_keys(
+        self.session_keys = Some(crypto::derive_initial_session_keys(
             &dh_result,
             self.config.preshared_key.as_ref(),
             &self.keypair.public_key_bytes(),
@@ -1107,6 +1182,15 @@ impl AivpnClient {
             self.tunnel
                 .apply_network_config(network_config.clone())
                 .await?;
+        } else if let Some(proxy) = &self.proxy_handle {
+            proxy
+                .update_network(
+                    network_config.client_ip,
+                    network_config.server_vpn_ip,
+                    network_config.prefix_len,
+                )
+                .await
+                .map_err(Error::Io)?;
         }
         // Ipv4Addr is Copy — capture before `network_config` moves into
         // `from_network_config` below.
@@ -1114,22 +1198,12 @@ impl AivpnClient {
         self.config.tun_config =
             TunnelConfig::from_network_config(tun_name, network_config, full_tunnel);
 
-        // HIGH #2 (client parity): this override just applied a genuinely
-        // different network config — either the first server confirmation of
-        // this session, or a pool re-home to a different server-assigned VPN
-        // IP than the one derived from the static key. Publish the new IP on
-        // both channels the GUIs consume: the shared value read by the
-        // stats-writer task's traffic.stats `ip:` field (Windows pipes the
-        // child's stdout to Stdio::null(), so it can only observe this via
-        // the stats file), and the "AIVPN-STATUS connected <ip>" stdout line
-        // the Linux GUI already parses (previously never emitted — it only
-        // had an unreachable doc comment describing this exact protocol).
+        // Обновляем IP в статистике. Событие connected отправляет обработчик
+        // ServerHello после успешного ratchet, независимо от смены сети.
         *self
             .current_vpn_ip
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = new_client_ip.to_string();
-        println!("AIVPN-STATUS connected {}", new_client_ip);
-
         Ok(())
     }
 
@@ -1154,7 +1228,7 @@ impl AivpnClient {
         #[cfg(target_os = "linux")]
         {
             if let Some(ka) = self.kernel_accel.take() {
-                if self.kernel_installed {
+                if self.kernel_installed || self.kernel_replay_bound {
                     let _ = ka.session_remove(&self.kernel_session_id);
                 }
                 // KernelAccel::drop → IOC_FLUSH.
@@ -1162,9 +1236,22 @@ impl AivpnClient {
             self.kernel_installed = false;
             self.kernel_hooked = false;
             self.kernel_tun_set = false;
+            self.kernel_replay_bound = false;
+            self.kernel_faulted = false;
+            self.kernel_epoch = 0;
+            self.kernel_prev_epoch = 0;
+            self.kernel_epoch_key = [0u8; 32];
+            self.kernel_installed_tag_offset = u16::MAX;
         }
 
-        self.transport = None;
+        if let Some(transport) = self.transport.take() {
+            match tokio::time::timeout(Duration::from_secs(3), transport.close()).await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => warn!("Transport close failed: {error}"),
+                Err(_) => warn!("Transport close timed out"),
+            }
+        }
+        let _ = self.tunnel.set_transport_mark(None);
 
         // Detach XDP filter (Linux only, best-effort)
         #[cfg(target_os = "linux")]
@@ -1308,6 +1395,9 @@ impl AivpnClient {
 
     /// Update mask profile
     pub fn update_mask(&mut self, new_mask: MaskProfile) {
+        if !self.recv_tag_offsets.contains(&new_mask.tag_offset) {
+            self.recv_tag_offsets.push(new_mask.tag_offset);
+        }
         let new_mdh_len = packet_mdh_len_for_mask(&new_mask);
         self.recv_mdh_len = new_mdh_len;
         // Keep the new length as the primary (front) candidate but retain every
@@ -1319,16 +1409,19 @@ impl AivpnClient {
             "Updating mask to {} (mdh_len: {})",
             new_mask.mask_id, new_mdh_len
         );
-        // K6: the kernel session's ciphertext offset is frozen at install time;
-        // if the primary downlink MDH length changed, re-install so kernel
-        // offload keeps hitting (stale offset is safe — -EBADMSG falls back to
-        // user-space — but accelerates nothing).
-        #[cfg(target_os = "linux")]
-        if self.kernel_installed && self.kernel_installed_mdh_len != new_mdh_len {
-            self.kernel_install_session();
-        }
         if let Some(ref mut engine) = self.mimicry_engine {
             engine.update_mask(new_mask.clone());
+        }
+        // Движок уже на новой маске: insert увидит ее смещение тега.
+        // Тот же ключ оставляет окно replay, меняется только раскладка.
+        #[cfg(target_os = "linux")]
+        if self.kernel_accel.is_some() && (self.kernel_replay_bound || self.kernel_installed) {
+            let tag_offset = kernel_offload::kernel_tag_offset(&new_mask, new_mdh_len);
+            if self.kernel_installed_mdh_len != new_mdh_len
+                || self.kernel_installed_tag_offset != tag_offset
+            {
+                self.kernel_install_session();
+            }
         }
         let mut pending = self.pending_mask.lock().unwrap_or_else(|e| e.into_inner());
         *pending = Some(new_mask);
@@ -1487,8 +1580,7 @@ impl AivpnClient {
 
     /// §2 crowdsourced blocking feedback — most recent region hints received
     /// from the server (only populated when `receive_mask_hints` is on).
-    /// TODO(v1): mask selection does not yet consult this; it is stored here
-    /// as the integration point for a future selection-preference pass.
+    /// При переподключении выбор маски учитывает сохраненные оценки региона.
     pub fn regional_mask_hints(&self) -> Option<&[(String, f32)]> {
         self.regional_mask_hints.as_deref()
     }
@@ -1528,37 +1620,14 @@ impl AivpnClient {
         self.bytes_received.load(Ordering::Relaxed)
     }
 
-    fn write_quality_file(score: u8, rtt_ms: u16, jitter_ms: u16, adaptive_level: u8) {
+    fn write_quality_file(&self, score: u8, rtt_ms: u16, jitter_ms: u16, adaptive_level: u8) {
         let content = format!(
             r#"{{"quality":{},"rtt_ms":{},"jitter_ms":{},"adaptive":{}}}"#,
             score, rtt_ms, jitter_ms, adaptive_level
         );
-        // O_NOFOLLOW/create_new-hardened atomic write (secure_write.rs): this
-        // falls back to a predictable world-writable /tmp path, which a
-        // local attacker could pre-plant as a symlink to a file this
-        // (possibly root-run) process can write.
-        #[cfg(windows)]
-        {
-            let path = std::env::temp_dir().join("aivpn-quality.json");
+        for path in crate::record_cmd::local_status_paths(self.admin_listen, "quality.json") {
             if !crate::secure_write::write_status_best_effort(&path, content.as_bytes()) {
-                debug!("quality file write failed");
-            }
-        }
-        #[cfg(not(windows))]
-        {
-            let primary = std::path::PathBuf::from("/var/run/aivpn/quality.json");
-            let fallback = std::path::PathBuf::from("/tmp/aivpn-quality.json");
-            let dir_ok = primary
-                .parent()
-                .map(std::fs::create_dir_all)
-                .map(|r| r.is_ok())
-                .unwrap_or(false);
-            let wrote = dir_ok
-                && crate::secure_write::write_status_best_effort(&primary, content.as_bytes());
-            if !wrote
-                && !crate::secure_write::write_status_best_effort(&fallback, content.as_bytes())
-            {
-                debug!("quality file write failed");
+                debug!("quality file write failed: {}", path.display());
             }
         }
     }
@@ -1566,6 +1635,14 @@ impl AivpnClient {
     /// Deactivate the kill-switch on intentional exit. Do NOT call during reconnects.
     pub fn deactivate_kill_switch(&mut self) {
         self.tunnel.deactivate_kill_switch();
+    }
+
+    pub fn take_kill_switch(&mut self) -> Option<crate::kill_switch::KillSwitch> {
+        self.tunnel.take_kill_switch()
+    }
+
+    pub fn set_dns_proxy_gate(&mut self, gate: crate::dns_proxy::DnsProxyGate) {
+        self.dns_proxy_gate = Some(gate);
     }
 }
 
@@ -1576,77 +1653,16 @@ impl Drop for AivpnClient {
     }
 }
 
-/// Load static X25519 keypair from `~/.config/aivpn/device.key` or generate and save a new one.
-/// Returns None when HOME is unset or on unrecoverable I/O errors — device binding is optional.
-fn load_or_generate_static_keypair() -> Option<KeyPair> {
-    use std::fs;
-    #[cfg(unix)]
-    use std::os::unix::fs::PermissionsExt;
-
-    let home = dirs_home()?; // skip persistence when HOME is unset
-    let dir = home.join(".config").join("aivpn");
-    let path = dir.join("device.key");
-
-    if path.exists() {
-        match fs::read(&path) {
-            Ok(bytes) if bytes.len() == 32 => {
-                let mut arr = [0u8; 32];
-                arr.copy_from_slice(&bytes);
-                return Some(KeyPair::from_private_key(arr));
-            }
-            Ok(_) => {
-                warn!("device.key has wrong size — regenerating");
-            }
-            Err(e) => {
-                warn!("Cannot read device.key: {}", e);
-                return None;
-            }
-        }
-    }
-
-    // Generate new keypair and persist atomically with correct permissions from the start.
-    let kp = KeyPair::generate();
-    let mut priv_bytes = kp.export_private_key();
-
-    if let Err(e) = fs::create_dir_all(&dir) {
-        warn!("Cannot create ~/.config/aivpn: {}", e);
-        return Some(kp); // proceed without persistence
-    }
-    // Tighten directory to owner-only (700) so siblings are not enumerable.
-    #[cfg(unix)]
-    let _ = fs::set_permissions(&dir, fs::Permissions::from_mode(0o700));
-
-    // Write to a temp sibling atomically, then rename.
-    let tmp_path = path.with_extension("tmp");
-    let write_result = (|| -> std::io::Result<()> {
-        #[cfg(unix)]
-        {
-            use std::io::Write;
-            use std::os::unix::fs::OpenOptionsExt;
-            let mut f = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(&tmp_path)?;
-            f.write_all(&priv_bytes)?;
-            f.sync_all()?;
-        }
-        #[cfg(not(unix))]
-        fs::write(&tmp_path, &priv_bytes)?;
-        fs::rename(&tmp_path, &path)
-    })();
-
-    // Zeroize key bytes regardless of write outcome before they leave scope.
-    priv_bytes.iter_mut().for_each(|b| *b = 0);
-
-    match write_result {
-        Ok(()) => info!("New device keypair generated and saved to {:?}", path),
-        Err(e) => {
-            warn!("Cannot write device.key: {}", e);
-            let _ = fs::remove_file(&tmp_path);
-        }
-    }
-    Some(kp)
+/// Загружает постоянный ключ устройства, не заменяя поврежденный файл.
+fn load_or_generate_static_keypair() -> Result<Option<KeyPair>> {
+    #[cfg(test)]
+    let _home_guard = crate::TEST_HOME_MUTEX
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    dirs_home()
+        .map(|home| device_identity::load_or_create(&home.join(".config").join("aivpn")))
+        .transpose()
+        .map_err(Error::Io)
 }
 
 fn dirs_home() -> Option<std::path::PathBuf> {
@@ -1671,6 +1687,7 @@ mod tests {
             initial_mask: mask,
             tun_config: crate::tunnel::TunnelConfig::default(),
             proxy_listen: None,
+            proxy_dns: vec![std::net::Ipv4Addr::new(1, 1, 1, 1)],
             mtls_cert: None,
             initial_adaptive_level: AdaptiveLevel::Off,
             polymorphic_base: None,
@@ -1685,8 +1702,370 @@ mod tests {
             inbound_control_tap: None,
             node_identity: None,
             pool_node_id: None,
+            remote_verified_node: None,
+            remote_enroll_hook: None,
             transport: None,
         }
+    }
+
+    #[tokio::test]
+    async fn reconnect_same_object_uses_fresh_ephemeral_and_empty_replay_state() {
+        let mut config = make_test_config();
+        config.control_only = true;
+        config.server_public_key = KeyPair::generate().public_key_bytes();
+        let mut client = AivpnClient::new(config).unwrap();
+        client.connect().await.unwrap();
+        let first_eph = client.keypair.public_key_bytes();
+        let first_key = client.session_keys.as_ref().unwrap().session_key;
+        client.counter = 77;
+        client.send_seq = 19;
+        client.recv_window.mark(51);
+        client.transition_recv_window.mark(31);
+        client.fragment_rx = aivpn_common::fragment::Reassembler::default();
+        client.disconnect().await;
+        client.connect().await.unwrap();
+        assert_ne!(client.keypair.public_key_bytes(), first_eph);
+        assert_ne!(client.session_keys.as_ref().unwrap().session_key, first_key);
+        assert_eq!(client.counter, 0);
+        assert_eq!(client.send_seq, 0);
+        assert_eq!(client.recv_window.highest(), None);
+        assert_eq!(client.transition_recv_window.highest(), None);
+        assert!(client.transition_recv_keys.is_none());
+        assert!(client.ratcheted_server_eph_pub.is_none());
+        client.disconnect().await;
+    }
+
+    #[tokio::test]
+    async fn second_server_hello_cannot_rekey_or_override_network() {
+        let mut config = make_test_config();
+        config.control_only = true;
+        config.server_public_key = KeyPair::generate().public_key_bytes();
+        let mut client = AivpnClient::new(config).unwrap();
+        client.connect().await.unwrap();
+        let first_eph = KeyPair::generate().public_key_bytes();
+        client
+            .handle_server_control(ControlPayload::ServerHello {
+                server_eph_pub: first_eph,
+                signature: [0; 64],
+                network_config: None,
+            })
+            .await
+            .unwrap();
+        let first_keys = client.session_keys.clone().unwrap();
+        client.counter = 41;
+        let mut different_network = client.config.tun_config.client_network_config().unwrap();
+        different_network.client_ip = "10.0.0.99".parse().unwrap();
+        client
+            .handle_server_control(ControlPayload::ServerHello {
+                server_eph_pub: KeyPair::generate().public_key_bytes(),
+                signature: [0; 64],
+                network_config: Some(different_network),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            client.session_keys.as_ref().unwrap().session_key,
+            first_keys.session_key
+        );
+        assert_eq!(client.ratcheted_server_eph_pub, Some(first_eph));
+        assert_eq!(client.counter, 41);
+        assert_eq!(*client.current_vpn_ip.lock().unwrap(), "10.0.0.2");
+        client.disconnect().await;
+    }
+
+    fn initial_downlink_packet(
+        keys: &SessionKeys,
+        counter: &mut u64,
+        inner: &[u8],
+        mdh_len: usize,
+    ) -> Vec<u8> {
+        let tag = crypto::generate_resonance_tag(
+            &keys.tag_secret,
+            *counter,
+            crypto::compute_time_window(crypto::current_timestamp_ms(), crypto::DEFAULT_WINDOW_MS),
+        );
+        let mut plain = vec![0, 0];
+        plain.extend(inner);
+        let envelope = crypto::encrypt_session_payload(
+            keys,
+            crypto::PacketDirection::ServerToClient,
+            *counter,
+            &tag,
+            &plain,
+        )
+        .unwrap();
+        *counter += 1;
+        let mut packet = tag.to_vec();
+        packet.resize(8 + mdh_len, 0);
+        packet.extend(envelope);
+        packet
+    }
+
+    #[tokio::test]
+    async fn delayed_initial_v2_hello_from_another_node_has_no_side_effects() {
+        let mut config = make_test_config();
+        config.control_only = true;
+        config.server_public_key = KeyPair::generate().public_key_bytes();
+        let mut client = AivpnClient::new(config).unwrap();
+        client.connect().await.unwrap();
+        let initial_keys = client.session_keys.clone().unwrap();
+        assert!(initial_keys.packet_cipher.is_initial());
+        let first_eph = KeyPair::generate().public_key_bytes();
+        let first_hello = ControlPayload::ServerHello {
+            server_eph_pub: first_eph,
+            signature: [0; 64],
+            network_config: None,
+        };
+        let inner = build_inner_packet(InnerType::Control, 0, &first_hello.encode().unwrap());
+        let mut counter = 0;
+        let packet =
+            initial_downlink_packet(&initial_keys, &mut counter, &inner, client.recv_mdh_len);
+        client.receive_and_write_packet(&packet).await.unwrap();
+        let first_key = client.session_keys.as_ref().unwrap().session_key;
+        assert_eq!(
+            client.session_keys.as_ref().unwrap().packet_cipher,
+            crypto::PacketCipher::Established
+        );
+        client.counter = 9;
+        let mut config = client.config.tun_config.client_network_config().unwrap();
+        config.client_ip = "10.0.0.99".parse().unwrap();
+        let other_hello = ControlPayload::ServerHello {
+            server_eph_pub: KeyPair::generate().public_key_bytes(),
+            signature: [0; 64],
+            network_config: Some(config),
+        };
+        let inner = build_inner_packet(InnerType::Control, 1, &other_hello.encode().unwrap());
+        let packet =
+            initial_downlink_packet(&initial_keys, &mut counter, &inner, client.recv_mdh_len);
+        client.receive_and_write_packet(&packet).await.unwrap();
+        assert_eq!(client.session_keys.as_ref().unwrap().session_key, first_key);
+        assert_eq!(client.ratcheted_server_eph_pub, Some(first_eph));
+        assert_eq!(client.counter, 9);
+        assert_eq!(*client.current_vpn_ip.lock().unwrap(), "10.0.0.2");
+        client.disconnect().await;
+    }
+
+    #[tokio::test]
+    async fn capabilities_are_announced_after_confirmed_server_hello() {
+        let mut config = make_test_config();
+        config.control_only = true;
+        config.server_public_key = KeyPair::generate().public_key_bytes();
+        let mut client = AivpnClient::new(config).unwrap();
+        client.control_handle();
+        let mut controls = client.preset_control_rx.take().unwrap();
+        client.connect().await.unwrap();
+        assert!(controls.try_recv().is_err());
+        client
+            .handle_server_control(ControlPayload::ServerHello {
+                server_eph_pub: KeyPair::generate().public_key_bytes(),
+                signature: [0; 64],
+                network_config: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            client.session_keys.as_ref().unwrap().packet_cipher,
+            crypto::PacketCipher::Established
+        );
+        let mut announced = None;
+        while let Ok(control) = controls.try_recv() {
+            if let ControlPayload::Capabilities { role, features } = control {
+                announced = Some((role, features));
+            }
+        }
+        assert_eq!(
+            announced,
+            Some((0, aivpn_common::protocol::CLIENT_PACKET_FEATURES))
+        );
+        client.disconnect().await;
+    }
+
+    fn server_hello_stdout(scenario: &str) -> Vec<String> {
+        let home = std::env::temp_dir().join(format!(
+            "aivpn-hello-status-{:032x}",
+            rand::random::<u128>()
+        ));
+        std::fs::create_dir(&home).unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "client::tests::test_server_hello_stdout_scenario",
+                "--nocapture",
+            ])
+            .env("AIVPN_TEST_HELLO_SCENARIO", scenario)
+            .env("HOME", &home)
+            .env("XDG_CONFIG_HOME", &home)
+            .env("XDG_RUNTIME_DIR", &home)
+            .output()
+            .unwrap();
+        std::fs::remove_dir_all(home).unwrap();
+        assert!(
+            output.status.success(),
+            "Сценарий {scenario} завершился ошибкой:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .filter_map(|line| {
+                line.find("AIVPN-STATUS ")
+                    .map(|offset| line[offset..].trim().to_string())
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn test_server_hello_stdout_scenario() {
+        // Отдельный процесс позволяет проверить stdout без перехвата вывода других тестов.
+        let Ok(scenario) = std::env::var("AIVPN_TEST_HELLO_SCENARIO") else {
+            return;
+        };
+        let mut config = make_test_config();
+        config.server_public_key = KeyPair::generate().public_key_bytes();
+        config.proxy_listen = Some("127.0.0.1:0".parse().unwrap());
+        let mut client = AivpnClient::new(config).unwrap();
+        client
+            .finish_connect("127.0.0.1:443".parse().unwrap())
+            .await
+            .unwrap();
+        if scenario == "no_hello" {
+            assert!(!client.ever_connected());
+            return;
+        }
+
+        let mut network_config = client.config.tun_config.client_network_config().unwrap();
+        if matches!(scenario.as_str(), "changed" | "missing_keys") {
+            network_config.client_ip = "10.0.0.4".parse().unwrap();
+        }
+        let mut hello = ControlPayload::ServerHello {
+            server_eph_pub: KeyPair::generate().public_key_bytes(),
+            signature: [0; 64],
+            network_config: (scenario != "no_override").then_some(network_config),
+        };
+        if scenario == "invalid_signature" {
+            client.config.server_signing_key = Some(
+                ed25519_dalek::SigningKey::from_bytes(&[42; 32])
+                    .verifying_key()
+                    .to_bytes(),
+            );
+            assert!(client.handle_server_control(hello).await.is_err());
+            return;
+        }
+        if scenario == "missing_keys" {
+            client.session_keys = None;
+            assert!(client.handle_server_control(hello).await.is_err());
+            return;
+        }
+
+        client.handle_server_control(hello.clone()).await.unwrap();
+        assert!(client.ever_connected());
+        match scenario.as_str() {
+            "duplicate" => {
+                client.handle_server_control(hello).await.unwrap();
+            }
+            "reratchet" | "network_update" => {
+                if let ControlPayload::ServerHello {
+                    server_eph_pub,
+                    network_config,
+                    ..
+                } = &mut hello
+                {
+                    *server_eph_pub = KeyPair::generate().public_key_bytes();
+                    if scenario == "network_update" {
+                        network_config.as_mut().unwrap().client_ip = "10.0.0.4".parse().unwrap();
+                    }
+                }
+                client.handle_server_control(hello).await.unwrap();
+                if scenario == "network_update" {
+                    assert_eq!(*client.current_vpn_ip.lock().unwrap(), "10.0.0.2");
+                }
+            }
+            "reconnect" => {
+                client.disconnect().await;
+                client
+                    .finish_connect("127.0.0.1:443".parse().unwrap())
+                    .await
+                    .unwrap();
+                client.handle_server_control(hello).await.unwrap();
+            }
+            "same" | "changed" | "no_override" => {}
+            _ => panic!("Неизвестный сценарий"),
+        }
+    }
+
+    #[test]
+    fn test_connected_stdout_for_matching_network() {
+        assert_eq!(
+            server_hello_stdout("same"),
+            ["AIVPN-STATUS connected 10.0.0.2"]
+        );
+    }
+
+    #[test]
+    fn test_connected_stdout_without_network_override() {
+        assert_eq!(
+            server_hello_stdout("no_override"),
+            ["AIVPN-STATUS connected 10.0.0.2"]
+        );
+    }
+
+    #[test]
+    fn test_connected_stdout_uses_server_assigned_ip() {
+        assert_eq!(
+            server_hello_stdout("changed"),
+            ["AIVPN-STATUS connected 10.0.0.4"]
+        );
+    }
+
+    #[test]
+    fn test_connected_stdout_not_repeated_for_duplicate_hello() {
+        assert_eq!(
+            server_hello_stdout("duplicate"),
+            ["AIVPN-STATUS connected 10.0.0.2"]
+        );
+    }
+
+    #[test]
+    fn test_connected_stdout_not_repeated_for_reratchet() {
+        assert_eq!(
+            server_hello_stdout("reratchet"),
+            ["AIVPN-STATUS connected 10.0.0.2"]
+        );
+    }
+
+    #[test]
+    fn test_connected_stdout_not_repeated_for_network_update() {
+        assert_eq!(
+            server_hello_stdout("network_update"),
+            ["AIVPN-STATUS connected 10.0.0.2"]
+        );
+    }
+
+    #[test]
+    fn test_connected_stdout_emitted_again_after_reconnect() {
+        assert_eq!(
+            server_hello_stdout("reconnect"),
+            [
+                "AIVPN-STATUS connected 10.0.0.2",
+                "AIVPN-STATUS connected 10.0.0.2",
+            ]
+        );
+    }
+
+    #[test]
+    fn test_connected_stdout_waits_for_server_hello() {
+        assert!(server_hello_stdout("no_hello").is_empty());
+    }
+
+    #[test]
+    fn test_connected_stdout_not_emitted_for_invalid_signature() {
+        assert!(server_hello_stdout("invalid_signature").is_empty());
+    }
+
+    #[test]
+    fn test_connected_stdout_not_emitted_when_ratchet_fails() {
+        assert!(server_hello_stdout("missing_keys").is_empty());
     }
 
     // ── initial state ─────────────────────────────────────────────────────────
@@ -2373,9 +2752,8 @@ mod tests {
         let dh1 = client_kp
             .compute_shared(&server_static_kp.public_key_bytes())
             .unwrap();
-        let mut initial_keys =
-            crypto::derive_session_keys(&dh1, None, &client_kp.public_key_bytes());
-        initial_keys.session_key_s2c = initial_keys.session_key;
+        let initial_keys =
+            crypto::derive_initial_session_keys(&dh1, None, &client_kp.public_key_bytes());
         client.session_keys = Some(initial_keys.clone());
         client.transition_recv_keys = None;
         client.transition_recv_deadline = None;
@@ -2405,14 +2783,7 @@ mod tests {
         let mut send_counter = 0u64;
         // First delivery: the server's ORIGINAL ServerHello, encrypted with
         // the pre-ratchet (initial) keys.
-        let packet1 = aivpn_common::client_wire::build_random_mdh_packet(
-            &initial_keys,
-            &mut send_counter,
-            &inner,
-            None,
-            mdh_len,
-        )
-        .unwrap();
+        let packet1 = initial_downlink_packet(&initial_keys, &mut send_counter, &inner, mdh_len);
         client
             .receive_and_write_packet(&packet1)
             .await
@@ -2431,14 +2802,7 @@ mod tests {
         // this models gateway.rs's Keepalive-triggered resend path. It must
         // arrive within the client's transition_recv_deadline to be
         // decodable at all (otherwise it would just be dropped/warned).
-        let packet2 = aivpn_common::client_wire::build_random_mdh_packet(
-            &initial_keys,
-            &mut send_counter,
-            &inner,
-            None,
-            mdh_len,
-        )
-        .unwrap();
+        let packet2 = initial_downlink_packet(&initial_keys, &mut send_counter, &inner, mdh_len);
         client
             .receive_and_write_packet(&packet2)
             .await
@@ -2882,26 +3246,28 @@ mod tests {
         // keys until the server proves the commit, so the server's inbound
         // counter keeps sliding with the data stream and every re-sent
         // response lands inside its ±TAG_WINDOW_SIZE tag band.
-        let sent = sent_responses.lock().unwrap_or_else(|e| e.into_inner());
-        assert_eq!(
-            sent.len(),
-            2,
-            "retransmitted KeyRotate must trigger a re-send of the response, \
+        let client_rekey_eph_pub = {
+            let sent = sent_responses.lock().unwrap_or_else(|e| e.into_inner());
+            assert_eq!(
+                sent.len(),
+                2,
+                "retransmitted KeyRotate must trigger a re-send of the response, \
              not a silent ignore"
-        );
-        assert_eq!(
-            sent[1].0, sent[0].0,
-            "re-sent response must carry the SAME client eph pub as the \
+            );
+            assert_eq!(
+                sent[1].0, sent[0].0,
+                "re-sent response must carry the SAME client eph pub as the \
              original — a fresh one could desync if the original response \
              was merely delayed and the server commits it first"
-        );
-        assert_eq!(
-            sent[1].1.session_key, old_keys.session_key,
-            "re-sent response must be encrypted with the OLD keys — the \
+            );
+            assert_eq!(
+                sent[1].1.session_key, old_keys.session_key,
+                "re-sent response must be encrypted with the OLD keys - the \
              server never committed and cannot read the new ones"
-        );
-        let client_rekey_eph_pub = sent[0].0;
-        drop(sent);
+            );
+            sent[0].0
+        };
+
         // M3: after the re-send the upload keys must be restored to the OLD
         // keys (the rekey is still unconfirmed) — the committed new keys sit
         // staged in `pending_upload_keys` until the server's first new-key

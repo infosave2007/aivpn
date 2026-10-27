@@ -38,9 +38,14 @@ object ConnectionKeyParser {
             val json = JSONObject(String(jsonBytes))
             val server = json.getString("s")
             val serverKey = json.getString("k")
-            val psk = json.optString("p").takeUnless { it.isNullOrBlank() }
-            val serverSigningKey = json.optString("sk").takeUnless { it.isNullOrBlank() }
-            val maskOperatorPubkey = json.optString("mop").takeUnless { it.isNullOrBlank() }
+            fun optionalKey(field: String): String? {
+                val value = if (json.has(field) && !json.isNull(field)) json.getString(field) else null
+                decodeOptionalKey(value, field)
+                return value
+            }
+            val psk = optionalKey("p")
+            val serverSigningKey = optionalKey("sk")
+            val maskOperatorPubkey = optionalKey("mop")
             val networkConfig = json.optJSONObject("n")
             val vpnIp = networkConfig?.optString("client_ip")?.takeUnless { it.isNullOrBlank() }
                 ?: json.optString("i").takeUnless { it.isNullOrBlank() } ?: return null

@@ -21,11 +21,12 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::time;
 
 use crate::client_wire::{
-    build_inner_packet, build_shaped_mdh_packet, decode_downlink_any_mdh_len,
-    decode_packet_with_mdh_len, obfuscate_client_eph_pub, process_server_hello_with_mdh_len,
-    RecvWindow,
+    build_inner_packet, build_shaped_mdh_packet, decode_downlink_with_offsets,
+    obfuscate_client_eph_pub, process_server_hello_with_offsets, RecvWindow,
 };
-use crate::crypto::{derive_session_keys, device_enrollment_proof, KeyPair, SessionKeys};
+use crate::crypto::{
+    derive_initial_session_keys, derive_session_keys, device_enrollment_proof, KeyPair, SessionKeys,
+};
 use crate::error::{Error, Result};
 use crate::mask::{decode_bootstrap_descriptor, MaskProfile, HANDSHAKE_FALLBACK_THRESHOLD};
 use crate::mimicry::MimicryEncryptor;
@@ -40,13 +41,50 @@ use super::io::{
 use super::platform::{PlatformIo, RecordingFeedback};
 use super::state::*;
 
-/// Runs one whole tunnel session (exactly one connection attempt) on the
-/// calling task.
-///
-/// Returns `Err` on any tunnel failure, so the platform's reconnect loop
-/// kicks in. A STOP (user disconnect) returns `Ok(())` — the Android
-/// convention; `run_tunnel_ios` re-maps that to `Err` in its adapter so the
-/// Swift side keeps seeing -1 on stop exactly as before.
+/// Все фоновые задачи принадлежат одной попытке соединения.
+#[derive(Default)]
+struct TunnelTasks(Vec<tokio::task::AbortHandle>);
+
+impl TunnelTasks {
+    fn track<T>(&mut self, task: &tokio::task::JoinHandle<T>) {
+        self.0.push(task.abort_handle());
+    }
+}
+
+impl Drop for TunnelTasks {
+    fn drop(&mut self) {
+        for task in &self.0 {
+            task.abort();
+        }
+    }
+}
+
+fn identity_reannouncements(
+    cert: Option<&[u8]>,
+    static_privkey: Option<&[u8; 32]>,
+    server_key: &[u8; 32],
+    server_eph_pub: &[u8; 32],
+    client_eph_pub: &[u8; 32],
+) -> Result<Vec<ControlPayload>> {
+    let mut controls = Vec::with_capacity(2);
+    if let Some(cert) = cert {
+        controls.push(ControlPayload::ClientCert {
+            cert_bytes: cert.to_vec(),
+        });
+    }
+    if let Some(private) = static_privkey {
+        let keypair = KeyPair::from_private_key(*private);
+        let shared = keypair.compute_shared(server_key)?;
+        controls.push(ControlPayload::DeviceEnrollment {
+            static_pub: keypair.public_key_bytes(),
+            dh_proof: device_enrollment_proof(&shared, server_eph_pub, client_eph_pub),
+        });
+    }
+    Ok(controls)
+}
+
+/// Выполняет одну попытку подключения. Ошибка запускает внешний reconnect,
+/// запрос пользователя на остановку завершает попытку без ошибки.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_tunnel_generic<P: PlatformIo>(
     platform: P,
@@ -115,6 +153,17 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
     // path byte-for-byte unchanged.
     alt_transport: Option<Arc<dyn crate::transport::DatagramTransport>>,
 ) -> Result<()> {
+    if let Err(msg) = crate::mask::protected_build_requires_keys(
+        server_signing_key.is_some(),
+        mask_operator_pubkey.is_some(),
+    ) {
+        return Err(Error::Session(msg));
+    }
+    let mask_verify_mode =
+        match crate::mask::resolve_protected_mask_verify_mode(Some(mask_verify_mode)) {
+            Ok(mode) => mode,
+            Err(msg) => return Err(Error::Session(msg)),
+        };
     let level = AdaptiveLevel::from_u8(adaptive_level);
     let session = Arc::new(SessionRuntime::new());
     let _active_session_guard = activate_session(session.clone())?;
@@ -133,6 +182,9 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
     // Clear last session's server-assigned VPN IP; this attempt's ServerHello
     // will re-populate it (or leave it 0 for old servers).
     ASSIGNED_VPN_IP.store(0, Ordering::Relaxed);
+    *ASSIGNED_NETWORK_CONFIG
+        .lock()
+        .unwrap_or_else(|error| error.into_inner()) = None;
     ACTIVE_FEEDBACK_THRESHOLD.store(0, Ordering::Relaxed);
     ACTIVE_FEEDBACK_INTERVAL.store(0, Ordering::Relaxed);
     MASK_FEEDBACK_SENT.store(false, Ordering::Relaxed);
@@ -209,14 +261,14 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
     // ── 1. Ephemeral keypair + initial session keys ──
     let mut keypair = KeyPair::generate();
     let mut dh = keypair.compute_shared(&server_key)?;
-    let mut keys = derive_session_keys(&dh, psk.as_ref(), &keypair.public_key_bytes());
+    let mut keys = derive_initial_session_keys(&dh, psk.as_ref(), &keypair.public_key_bytes());
 
     // ── 2. Create stop signal immediately — before DNS — so a disconnect press
     //    during a slow/hung cellular DNS is handled instantly, not after a 5 s wait.
     let stop_signal = create_stop_signal(&session)?;
 
     // Resolve host; race against stop signal so disconnect is always responsive.
-    let dest_str = format!("{}:{}", server_host, server_port);
+    let dest_host = server_host.trim_start_matches('[').trim_end_matches(']');
     let dest: SocketAddr = tokio::select! {
         biased;
         _ = wait_for_stop(&stop_signal) => {
@@ -224,13 +276,13 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
         }
         result = tokio::time::timeout(
             Duration::from_secs(5),
-            tokio::net::lookup_host(&dest_str),
+            tokio::net::lookup_host((dest_host, server_port)),
         ) => {
             result
                 .map_err(|_| Error::Session("DNS lookup timeout (5 s)".into()))?
                 .map_err(Error::Io)?
-                .find(|a| a.is_ipv4())
-                .ok_or_else(|| Error::Session("Cannot resolve server host to IPv4".into()))?
+                .min_by_key(|address| address.is_ipv6())
+                .ok_or_else(|| Error::Session("Cannot resolve server host".into()))?
         }
     };
 
@@ -359,6 +411,7 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
     // drops any packet whose mask differs and strands the tunnel on the first
     // rekey. Seeded with the fixed handshake/control length plus the bootstrap
     // mask's own length; extended when MaskUpdate arrives.
+    let mut recv_tag_offsets = vec![handshake_mask.tag_offset];
     let mut recv_mdh_candidates: Vec<usize> = vec![mdh_len];
     if !recv_mdh_candidates.contains(&hs_mdh_len) {
         recv_mdh_candidates.push(hs_mdh_len);
@@ -390,6 +443,7 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
     let handshake_deadline = Instant::now() + HANDSHAKE_TIMEOUT;
     let mut retry_count: u32 = 0;
     let mut recv_win = RecvWindow::new();
+    let mut fragment_rx = crate::fragment::Reassembler::default();
     let (server_network_cfg, server_eph_pub) = loop {
         let now = Instant::now();
         if now >= handshake_deadline {
@@ -435,11 +489,9 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
                         // an already-failed decode, which is harmless.
                         let peeked = [hs_mdh_len, mdh_len].into_iter().find_map(|len| {
                             let mut reject_peek_win = recv_win.clone();
-                            decode_packet_with_mdh_len(
-                                &recv_buf[..n],
-                                &keys,
-                                &mut reject_peek_win,
-                                len,
+                            decode_downlink_with_offsets(
+                                &recv_buf[..n], &keys, &mut reject_peek_win,
+                                &mut vec![len], &recv_tag_offsets,
                             )
                             .ok()
                         });
@@ -476,7 +528,7 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
                         let hello_mdh_len = if hs_mdh_len != mdh_len {
                             let (mut k, mut w, mut c) =
                                 (keys.clone(), recv_win.clone(), send_counter);
-                            if process_server_hello_with_mdh_len(
+                            if process_server_hello_with_offsets(
                                 &recv_buf[..n],
                                 &mut k,
                                 &keypair,
@@ -484,6 +536,7 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
                                 &mut c,
                                 hs_mdh_len,
                                 server_signing_key.as_ref(),
+                                &recv_tag_offsets,
                             )
                             .is_ok()
                             {
@@ -494,7 +547,7 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
                         } else {
                             mdh_len
                         };
-                        match process_server_hello_with_mdh_len(
+                        match process_server_hello_with_offsets(
                             &recv_buf[..n],
                             &mut keys,
                             &keypair,
@@ -502,6 +555,7 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
                             &mut send_counter,
                             hello_mdh_len,
                             server_signing_key.as_ref(),
+                            &recv_tag_offsets,
                         ) {
                             Ok((cfg, server_eph_pub)) => break (cfg, server_eph_pub),
                             Err(e) => {
@@ -534,7 +588,7 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
                 if retry_count == 2 {
                     keypair = KeyPair::generate();
                     dh = keypair.compute_shared(&server_key)?;
-                    keys = derive_session_keys(&dh, psk.as_ref(), &keypair.public_key_bytes());
+                    keys = derive_initial_session_keys(&dh, psk.as_ref(), &keypair.public_key_bytes());
                     send_counter = 0;
                     send_seq = 0;
                     // Counters recorded from any pre-rotation datagram no longer
@@ -558,12 +612,15 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
     // is the one we just ratcheted against in the wait loop above, so any
     // later ServerHello carrying the SAME eph_pub is that resend, not a fresh
     // ratchet event — mirrors desktop client.rs's `ratcheted_server_eph_pub`.
-    let mut ratcheted_server_eph_pub: Option<[u8; 32]> = Some(server_eph_pub);
+    let ratcheted_server_eph_pub: Option<[u8; 32]> = Some(server_eph_pub);
     // Publish the server-assigned VPN IP for the platform's mismatch check
     // (see the ASSIGNED_VPN_IP doc comment: a pool re-home leaves the
     // key-embedded IP stale and the anti-spoof check kills all uplink data).
     if let Some(cfg) = server_network_cfg.as_ref() {
         ASSIGNED_VPN_IP.store(u32::from(cfg.client_ip), Ordering::Relaxed);
+        *ASSIGNED_NETWORK_CONFIG
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(cfg.clone());
     }
     let base_keepalive = server_network_cfg
         .as_ref()
@@ -584,7 +641,7 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
     let keepalive_ms = Arc::new(portable_atomic::AtomicU64::new(
         keepalive_interval.as_millis() as u64,
     ));
-    let mut transition_recv_keys: Option<SessionKeys> = Some(derive_session_keys(
+    let mut transition_recv_keys: Option<SessionKeys> = Some(derive_initial_session_keys(
         &dh,
         psk.as_ref(),
         &keypair.public_key_bytes(),
@@ -606,9 +663,12 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
     // past the server's band, so the re-sent response could never authenticate
     // and the session desynced until the watchdogs fired.
     let mut pending_upload_keys: Option<SessionKeys> = None;
-    if let Some(cert) = mtls_cert {
+    if let Some(cert) = mtls_cert.as_ref() {
         let cert_len_debug = cert.len();
-        let cert_payload = ControlPayload::ClientCert { cert_bytes: cert }.encode()?;
+        let cert_payload = ControlPayload::ClientCert {
+            cert_bytes: cert.clone(),
+        }
+        .encode()?;
         let inner = build_inner_packet(InnerType::Control, send_seq, &cert_payload);
         let pkt = build_shaped_mdh_packet(
             &keys,
@@ -777,6 +837,7 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
     session.tun_read_fd.store(read_fd, Ordering::SeqCst);
     let tun_read = AsyncFd::new(TunFd(read_fd))?;
 
+    let mut tunnel_tasks = TunnelTasks::default();
     let tun_reader_task = tokio::spawn(async move {
         let mut tun_buf = vec![0u8; BUF_SIZE];
         loop {
@@ -785,10 +846,24 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
                     if n == 0 {
                         continue;
                     }
-                    if tun_buf[0] >> 4 != 4 {
+                    let Some(packet) = crate::ip_packet::IpPacket::parse(&tun_buf[..n]) else {
                         continue;
+                    };
+                    if let std::net::IpAddr::V6(source) = packet.source {
+                        let assigned = ASSIGNED_NETWORK_CONFIG.lock().ok().and_then(|config| {
+                            config
+                                .as_ref()
+                                .and_then(|value| value.client_ipv6().ok().flatten())
+                        });
+                        if assigned.map(|(address, _)| address) != Some(source) {
+                            continue;
+                        }
                     }
-                    if tun_tx.send(tun_buf[..n].to_vec()).await.is_err() {
+                    if tun_tx
+                        .send(tun_buf[..packet.length].to_vec())
+                        .await
+                        .is_err()
+                    {
                         break;
                     }
                 }
@@ -800,6 +875,7 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
         }
     });
 
+    tunnel_tasks.track(&tun_reader_task);
     let keepalive_sent_ms = Arc::new(AtomicU64::new(0));
     let mut quality_tracker = QualityTracker::new();
 
@@ -886,7 +962,7 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
     if let Some(base_mask_id) = polymorphic_base.clone() {
         let tx = ctrl_tx_recv_loop.clone();
         let confirmed = polymorphic_confirmed.clone();
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             for attempt in 0..5u8 {
                 if confirmed.load(Ordering::Relaxed) {
                     return;
@@ -904,6 +980,7 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
                 tokio::time::sleep(Duration::from_millis(500 * (attempt as u64 + 1))).await;
             }
         });
+        tunnel_tasks.track(&task);
     }
 
     // §2 crowdsourced blocking feedback (opt-in, OFF by default). Mirrors
@@ -972,17 +1049,40 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
                     // removes that fixed offset.
                     send_seq = send_seq.wrapping_add(1);
                     let udp_feedback = transport.clone();
-                    tokio::spawn(async move {
+                    let task = tokio::spawn(async move {
                         let jitter_ms = rand::random::<u16>() % 3001;
                         time::sleep(Duration::from_millis(jitter_ms as u64)).await;
                         if udp_feedback.send(&pkt).await.is_ok() {
                             MASK_FEEDBACK_SENT.store(true, Ordering::Relaxed);
                         }
                     });
+                    tunnel_tasks.track(&task);
                 }
             }
         }
     }
+
+    let packet_features = ControlPayload::Capabilities {
+        role: 0,
+        features: crate::protocol::CLIENT_PACKET_FEATURES
+            | if level.fec_n() > 0 {
+                crate::protocol::CLIENT_FEC_ACTIVE
+            } else {
+                0
+            },
+    }
+    .encode()?;
+    let inner = build_inner_packet(InnerType::Control, send_seq, &packet_features);
+    let packet = build_shaped_mdh_packet(
+        &keys,
+        &mut send_counter,
+        &inner,
+        None,
+        hs_mdh_len,
+        &handshake_mask,
+    )?;
+    send_seq = send_seq.wrapping_add(1);
+    transport.send(&packet).await?;
 
     let mask_update_slot: Arc<Mutex<Option<MaskProfile>>> = Arc::new(Mutex::new(None));
     let mask_update_for_enc = Arc::clone(&mask_update_slot);
@@ -1048,6 +1148,7 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
             let _ = sender_err_tx.send(format!("Upload pipeline: {e}")).await;
         }
     });
+    tunnel_tasks.track(&upload_sender_task);
     // Periodic check for RX silence — uses a proper Interval so it's not
     // recreated every select! iteration (which would reset the timer).
     let mut rx_check = time::interval(RX_CHECK_INTERVAL);
@@ -1129,11 +1230,12 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
                 // a forward jump afterwards measures the downlink gap (loss).
                 let prev_primary_highest = recv_win.highest();
                 let mut decoded_via_primary = false;
-                let decoded = match decode_downlink_any_mdh_len(
+                let decoded = match decode_downlink_with_offsets(
                     &udp_buf[..n],
                     &keys,
                     &mut recv_win,
                     &mut recv_mdh_candidates,
+                    &recv_tag_offsets,
                 ) {
                     Ok(decoded) => {
                         decoded_via_primary = true;
@@ -1142,11 +1244,12 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
                     Err(e) => {
                         log::debug!("aivpn: decode failed (primary keys): {}", e);
                         if let Some(fallback_keys) = transition_recv_keys.as_ref() {
-                            let r = decode_downlink_any_mdh_len(
+                            let r = decode_downlink_with_offsets(
                                 &udp_buf[..n],
                                 fallback_keys,
                                 &mut transition_recv_win,
                                 &mut recv_mdh_candidates,
+                    &recv_tag_offsets,
                             );
                             if r.is_err() {
                                 log::debug!("aivpn: decode failed (fallback keys) — packet dropped");
@@ -1189,7 +1292,17 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
                     }
                 }
 
-                if let Some(decoded) = decoded {
+                if let Some(mut decoded) = decoded {
+                    if decoded.header.inner_type == InnerType::Fragment {
+                        match fragment_rx.accept(&decoded.payload, Instant::now()) {
+                            Ok(Some((kind, payload))) => {
+                                decoded.header.inner_type = kind;
+                                decoded.payload = payload;
+                            }
+                            Ok(None) => continue,
+                            Err(error) => { log::warn!("Invalid fragment: {}", error); continue; }
+                        }
+                    }
                     // Only a successfully authenticated packet proves the link is
                     // alive — advancing the watchdog on raw recv() would let
                     // undecodable (e.g. spoofed) datagrams mask a dead downlink.
@@ -1663,11 +1776,11 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
                                     // it, so the payload is dropped before even being decoded.
                                     let transport_verified: Option<bool> =
                                         server_signing_key.map(|signing_key| {
-                                            use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+                                            use ed25519_dalek::{Signature, VerifyingKey};
                                             match VerifyingKey::from_bytes(&signing_key) {
                                                 Ok(vk) => {
                                                     let sig = Signature::from_bytes(&signature);
-                                                    vk.verify(&mask_data, &sig).is_ok()
+                                                    vk.verify_strict(&mask_data, &sig).is_ok()
                                                 }
                                                 Err(_) => false,
                                             }
@@ -1718,6 +1831,7 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
                                             }
                                             // Track the new mask's downlink length so subsequent
                                             // server DATA/control packets framed with it decode.
+                                            if !recv_tag_offsets.contains(&mask.tag_offset) { recv_tag_offsets.push(mask.tag_offset); }
                                             let new_mdh = mask.mdh_len();
                                             if !recv_mdh_candidates.contains(&new_mdh) {
                                                 recv_mdh_candidates.insert(0, new_mdh);
@@ -1779,13 +1893,29 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
                                         decode_bootstrap_descriptor(&descriptor_data)
                                     {
                                         let id = descriptor.descriptor_id.clone();
-                                        store_bootstrap_descriptor(descriptor);
-                                        log::info!(
-                                            "aivpn: BootstrapDescriptorUpdate stored ({} bytes, descriptor {}) — \
-                                             covert mask available for next reconnect",
-                                            descriptor_data.len(),
-                                            id
+                                        // Обычная сборка доверяет AEAD-каналу сессии.
+                                        // production-secure дополнительно проверяет подпись
+                                        // дескриптора ключом сервера и не кладет чужой blob.
+                                        #[cfg(feature = "production-secure")]
+                                        let signature_ok = server_signing_key.as_ref().is_some_and(
+                                            |key| matches!(descriptor.verify_signature(key), Ok(true)),
                                         );
+                                        #[cfg(not(feature = "production-secure"))]
+                                        let signature_ok = true;
+                                        if signature_ok {
+                                            store_bootstrap_descriptor(descriptor);
+                                            log::info!(
+                                                "aivpn: BootstrapDescriptorUpdate stored ({} bytes, descriptor {}) - \
+                                                 covert mask available for next reconnect",
+                                                descriptor_data.len(),
+                                                id
+                                            );
+                                        } else {
+                                            log::warn!(
+                                                "aivpn: BootstrapDescriptorUpdate rejected: подпись не прошла проверку (descriptor {})",
+                                                id
+                                            );
+                                        }
                                     } else {
                                         log::warn!(
                                             "aivpn: BootstrapDescriptorUpdate received ({} bytes) but failed to parse",
@@ -1798,6 +1928,13 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
                                     signature,
                                     network_config,
                                 } => {
+                                    if !crate::client_wire::server_hello_matches_connection(
+                                        ratcheted_server_eph_pub,
+                                        &server_eph_pub,
+                                    ) {
+                                        log::warn!("aivpn: ServerHello другого узла после завершенного handshake проигнорирован");
+                                        continue;
+                                    }
                                     // MEDIUM-HIGH: the server resends ServerHello (instead of a
                                     // plain KeepaliveAck) whenever it gets a Keepalive from a
                                     // session it still considers un-ratcheted — its own
@@ -1809,7 +1946,7 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
                                     // up on the session — stranding a healthy tunnel. Mirrors
                                     // desktop client.rs's unified ServerHello handler.
                                     if let Some(signing_key) = server_signing_key.as_ref() {
-                                        use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+                                        use ed25519_dalek::{Signature, VerifyingKey};
                                         let verified = VerifyingKey::from_bytes(signing_key)
                                             .ok()
                                             .map(|vk| {
@@ -1817,7 +1954,7 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
                                                 msg.extend_from_slice(&server_eph_pub);
                                                 msg.extend_from_slice(&keypair.public_key_bytes());
                                                 let sig = Signature::from_bytes(&signature);
-                                                vk.verify(&msg, &sig).is_ok()
+                                                vk.verify_strict(&msg, &sig).is_ok()
                                             })
                                             .unwrap_or(false);
                                         if !verified {
@@ -1834,81 +1971,29 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
                                         }
                                     }
 
-                                    let is_duplicate_hello =
-                                        ratcheted_server_eph_pub == Some(server_eph_pub);
-                                    if is_duplicate_hello {
-                                        // A resend for an eph_pub we already ratcheted against.
-                                        // Re-deriving here would use our already-ratcheted
-                                        // session_key as PSK instead of the original pre-ratchet
-                                        // key, permanently diverging from the server's (single)
-                                        // ratchet — mirrors the desktop comment. The
-                                        // confirmation prod below (sent on BOTH paths) is
-                                        // exactly what clears the server's "un-ratcheted" flag.
-                                        log::debug!(
-                                            "aivpn: duplicate mid-session ServerHello for already-ratcheted eph_pub — re-confirming without re-ratcheting"
-                                        );
-                                    } else {
-                                        log::info!(
-                                            "aivpn: mid-session ServerHello — completing PFS ratchet"
-                                        );
-                                        match keypair.compute_shared(&server_eph_pub) {
-                                            Ok(dh2) => {
-                                                let ratcheted = derive_session_keys(
-                                                    &dh2,
-                                                    Some(&keys.session_key),
-                                                    &keypair.public_key_bytes(),
-                                                );
-                                                // Keep accepting old inbound keys until the server
-                                                // proves it has switched too. Same transition
-                                                // parameters as the inline-KeyRotate rekey path
-                                                // above: the full REKEY_TRANSITION_GRACE (the old
-                                                // 2 s window expired before the server's first
-                                                // retransmit could arrive), a hard re-arm ceiling,
-                                                // and a CLONE of the recv window so the primary
-                                                // keeps its `highest` counter across the switch.
-                                                transition_recv_keys = Some(keys.clone());
-                                                transition_recv_deadline =
-                                                    Some(Instant::now() + REKEY_TRANSITION_GRACE);
-                                                transition_grace_hard = Some(
-                                                    Instant::now() + REKEY_TRANSITION_HARD_CAP,
-                                                );
-                                                transition_recv_win = recv_win.clone();
-                                                keys = ratcheted;
-                                                ratcheted_server_eph_pub = Some(server_eph_pub);
-                                                recv_win.reset();
-                                                // A fresh PFS ratchet supersedes any staged
-                                                // inline-rekey upload keys (anomalous ordering
-                                                // — the server only sends KeyRotate to
-                                                // ratcheted sessions — but never let a stale
-                                                // staging clobber the ratcheted upload keys
-                                                // later; mirrors desktop control_handler.rs).
-                                                pending_upload_keys = None;
-                                                // Publish to the upload task so outbound traffic
-                                                // switches too. Unlike the initial handshake ratchet
-                                                // (which starts the upload encryptor fresh at
-                                                // counter 0), this goes through the key-rotate slot,
-                                                // which keeps the send counter MONOTONIC by design
-                                                // (see mimicry.rs's `update_keys` doc comment) rather
-                                                // than resetting it — safe because the key changed,
-                                                // so no (key, nonce) pair is ever reused.
-                                                *key_rotate_slot
-                                                    .lock()
-                                                    .unwrap_or_else(|e| e.into_inner()) =
-                                                    Some(keys.clone());
-                                                log::info!("aivpn: mid-session PFS ratchet complete");
+                                    // После начального обмена Hello только подтверждает
+                                    // ту же пару. Для смены ключей служит KeyRotate.
+                                    log::debug!("aivpn: повторный ServerHello, подтверждаем установленные ключи");
+
+                                    // Сервер может ждать потерянный cert или proof уже
+                                    // после PFS. Их снова шифрует единственный uploader.
+                                    match identity_reannouncements(
+                                        mtls_cert.as_deref(), static_privkey.as_ref(),
+                                        &server_key, &server_eph_pub, &keypair.public_key_bytes(),
+                                    ) {
+                                        Ok(controls) => for control in controls {
+                                            if ctrl_tx_recv_loop.try_send(control).is_err() {
+                                                log::debug!("aivpn: очередь объявлений занята, повторим на следующем Hello");
                                             }
-                                            Err(e) => {
-                                                log::warn!(
-                                                    "aivpn: mid-session ServerHello DH failed: {e}"
-                                                );
-                                            }
-                                        }
+                                        },
+                                        Err(error) => log::warn!("aivpn: не удалось повторить доказательство устройства: {error}"),
                                     }
 
                                     // Re-apply network_config the same way the pre-loop handler
                                     // does (ASSIGNED_VPN_IP for the pool re-home mismatch check,
                                     // keepalive interval for the NAT-safe/adaptive-level combo).
                                     if let Some(cfg) = network_config.as_ref() {
+                                        *ASSIGNED_NETWORK_CONFIG.lock().unwrap_or_else(|error| error.into_inner()) = Some(cfg.clone());
                                         ASSIGNED_VPN_IP.store(
                                             u32::from(cfg.client_ip),
                                             Ordering::Relaxed,
@@ -1929,12 +2014,7 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
                                         }
                                     }
 
-                                    // Prod the server with fresh confirmation traffic under
-                                    // the (now) ratcheted keys so it observes the ratchet and
-                                    // stops resending — sent on BOTH paths, duplicate or not:
-                                    // the new-eph path needs the confirmation just as much as
-                                    // the duplicate one, and skipping it there left the server
-                                    // resending until it gave up on the session.
+                                    // Свежий keepalive подтверждает серверу прием первого Hello.
                                     let _ = ctrl_tx_recv_loop.try_send(ControlPayload::Keepalive {
                                         send_ts: crate::crypto::current_timestamp_ms(),
                                     });
@@ -1983,6 +2063,7 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
                                 | ControlPayload::RouteSync { .. }
                                 | ControlPayload::ChainForward { .. }
                                 | ControlPayload::PartitionAnnounce { .. }
+                                | ControlPayload::SiteData { .. }
                                 | ControlPayload::NodeEnrollment { .. }
                                 | ControlPayload::MgmtRequest { .. }
                                 | ControlPayload::RecordingStatusRequest
@@ -2169,5 +2250,86 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod protocol_audit_tests {
+    use super::*;
+
+    #[test]
+    fn duplicate_hello_reannounces_certificate_and_session_bound_device_proof() {
+        let server = KeyPair::from_private_key([19; 32]);
+        let device = KeyPair::from_private_key([23; 32]);
+        let controls = identity_reannouncements(
+            Some(&[7; 104]),
+            Some(&[23; 32]),
+            &server.public_key_bytes(),
+            &[3; 32],
+            &[5; 32],
+        )
+        .unwrap();
+        assert_eq!(controls.len(), 2);
+        assert!(
+            matches!(&controls[0], ControlPayload::ClientCert { cert_bytes } if cert_bytes == &[7; 104])
+        );
+        let ControlPayload::DeviceEnrollment {
+            static_pub,
+            dh_proof,
+        } = &controls[1]
+        else {
+            panic!("Нет DeviceEnrollment");
+        };
+        assert_eq!(*static_pub, device.public_key_bytes());
+        let server_dh = server.compute_shared(static_pub).unwrap();
+        assert_eq!(
+            *dh_proof,
+            device_enrollment_proof(&server_dh, &[3; 32], &[5; 32])
+        );
+        assert_ne!(
+            *dh_proof,
+            device_enrollment_proof(&server_dh, &[4; 32], &[5; 32])
+        );
+        assert!(identity_reannouncements(
+            None,
+            None,
+            &server.public_key_bytes(),
+            &[3; 32],
+            &[5; 32]
+        )
+        .unwrap()
+        .is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn protocol_audit_tunnel_tasks_stop_on_scope_exit() {
+        let (started_tx, started_rx) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            let _ = started_tx.send(());
+            std::future::pending::<()>().await;
+        });
+        started_rx.await.unwrap();
+        let mut tasks = TunnelTasks::default();
+        tasks.track(&task);
+        drop(tasks);
+        let result = time::timeout(Duration::from_millis(100), task).await;
+        assert!(matches!(result, Ok(Err(error)) if error.is_cancelled()));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn protocol_audit_tunnel_tasks_stop_when_owner_is_cancelled() {
+        let (sender, receiver) = oneshot::channel();
+        let owner = tokio::spawn(async move {
+            let child = tokio::spawn(std::future::pending::<()>());
+            let mut tasks = TunnelTasks::default();
+            tasks.track(&child);
+            sender.send(child).unwrap();
+            std::future::pending::<()>().await;
+        });
+        let child = receiver.await.unwrap();
+        owner.abort();
+        assert!(owner.await.unwrap_err().is_cancelled());
+        let result = time::timeout(Duration::from_millis(100), child).await;
+        assert!(matches!(result, Ok(Err(error)) if error.is_cancelled()));
     }
 }

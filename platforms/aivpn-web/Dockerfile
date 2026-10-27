@@ -6,7 +6,8 @@ FROM oven/bun:1.3.14 AS builder
 WORKDIR /app
 
 # Copy workspace manifests first for layer caching
-COPY package.json ./
+COPY package.json bun.lock ./
+COPY patches/ ./patches/
 COPY server/package.json ./server/
 COPY client/package.json ./client/
 

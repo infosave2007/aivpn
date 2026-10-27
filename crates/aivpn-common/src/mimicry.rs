@@ -12,7 +12,9 @@ use std::time::{Duration, Instant};
 use tracing::debug;
 
 use crate::client_wire::build_inner_packet;
-use crate::crypto::{self, encrypt_payload, SessionKeys, NONCE_SIZE, POLY1305_TAG_SIZE, TAG_SIZE};
+use crate::crypto::{
+    self, encrypt_session_payload, PacketDirection, SessionKeys, POLY1305_TAG_SIZE, TAG_SIZE,
+};
 use crate::error::Result;
 use crate::fec::FecEncoder;
 use crate::mask::{IATDistribution, MaskProfile, PaddingStrategy, SizeDistribution, SpoofProtocol};
@@ -214,7 +216,13 @@ impl MimicryEngine {
         };
 
         let target_size = self.sample_packet_size();
-        let base_overhead = tag_prefix_len + mdh.len() + 2 + plaintext.len() + POLY1305_TAG_SIZE;
+        let envelope_overhead = crypto::session_payload_overhead(keys);
+        let base_overhead = tag_prefix_len
+            + mdh.len()
+            + envelope_overhead
+            + 2
+            + plaintext.len()
+            + POLY1305_TAG_SIZE;
         let requested_pad_len = self.calc_padding(base_overhead, target_size);
         let packet_budget = SAFE_OUTER_PACKET_BUDGET.min(MAX_PACKET_SIZE);
 
@@ -257,10 +265,19 @@ impl MimicryEngine {
         // solving `<= packet_budget` for `pad_len` gives this reserved overhead.
         let emits_quic = eph_pub.is_none() && constructed_ok;
         let budget_overhead = if emits_quic {
-            crate::quic_initial::quic_initial_overhead() + 2 + plaintext.len() + POLY1305_TAG_SIZE
+            crate::quic_initial::quic_initial_overhead()
+                + envelope_overhead
+                + 2
+                + plaintext.len()
+                + POLY1305_TAG_SIZE
         } else {
             base_overhead
         };
+        if keys.packet_cipher.is_initial() && budget_overhead > packet_budget {
+            return Err(crate::error::Error::InvalidPacket(
+                "InitialV2 packet exceeds outer budget",
+            ));
+        }
         let max_pad_len = packet_budget.saturating_sub(budget_overhead) as u16;
         let pad_len = requested_pad_len.min(max_pad_len);
 
@@ -275,14 +292,18 @@ impl MimicryEngine {
         // (nonce-reuse would break ChaCha20-Poly1305 confidentiality).
         let packet_counter = *counter;
         *counter += 1;
-        let nonce = self.generate_nonce(packet_counter);
-        let ciphertext = encrypt_payload(&keys.session_key, &nonce, &padded)?;
-
         let time_window = crypto::compute_time_window(
             crypto::current_timestamp_ms(),
             crate::crypto::DEFAULT_WINDOW_MS,
         );
         let tag = crypto::generate_resonance_tag(&keys.tag_secret, packet_counter, time_window);
+        let ciphertext = encrypt_session_payload(
+            keys,
+            PacketDirection::ClientToServer,
+            packet_counter,
+            &tag,
+            &padded,
+        )?;
 
         // Constructed protocols (QUIC) build the WHOLE datagram from the tag +
         // ciphertext (a crypto-built decoy header coalesced with aivpn's real
@@ -322,12 +343,6 @@ impl MimicryEngine {
             packet.extend_from_slice(&ciphertext);
         }
         Ok(packet)
-    }
-
-    fn generate_nonce(&self, counter: u64) -> [u8; NONCE_SIZE] {
-        let mut nonce = [0u8; NONCE_SIZE];
-        nonce[0..8].copy_from_slice(&counter.to_le_bytes());
-        nonce
     }
 
     pub fn spoof_protocol(&self) -> SpoofProtocol {
@@ -414,6 +429,10 @@ impl MimicryEncryptor {
 }
 
 impl PacketEncryptor for MimicryEncryptor {
+    fn data_ready(&self) -> bool {
+        !self.keys.packet_cipher.is_initial()
+    }
+
     fn encrypt_data(&mut self, payload: &[u8]) -> Result<Vec<u8>> {
         self.check_mask();
         let inner = build_inner_packet(InnerType::Data, self.seq, payload);
@@ -436,6 +455,14 @@ impl PacketEncryptor for MimicryEncryptor {
             }
         }
         Ok(pkt)
+    }
+
+    fn encrypt_fragment(&mut self, payload: &[u8]) -> Result<Vec<u8>> {
+        self.check_mask();
+        let inner = build_inner_packet(InnerType::Fragment, self.seq, payload);
+        self.seq = self.seq.wrapping_add(1);
+        self.engine
+            .build_packet(&inner, &self.keys, &mut self.counter, None)
     }
 
     fn encrypt_control(&mut self, payload: &ControlPayload) -> Result<Vec<u8>> {
@@ -495,13 +522,71 @@ pub fn bootstrap_mask_for_psk(psk: Option<&[u8; 32]>) -> MaskProfile {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::client_wire::{decode_packet_with_layout, decode_packet_with_mdh_len, RecvWindow};
     use crate::mask::preset_masks::webrtc_zoom_v3;
+
+    #[test]
+    fn maximum_management_request_roundtrips_through_encrypted_fragments() {
+        use crate::fragment::Reassembler;
+        let mut keys = SessionKeys {
+            packet_cipher: crate::crypto::PacketCipher::Established,
+            session_key: [1; 32],
+            session_key_s2c: [2; 32],
+            tag_secret: [3; 32],
+            prng_seed: [4; 32],
+        };
+        let mask = webrtc_zoom_v3();
+        let mdh_len = mask
+            .header_spec
+            .as_ref()
+            .map(|spec| spec.min_length())
+            .unwrap_or_else(|| mask.header_template.len());
+        let tag_offset = mask.tag_offset;
+        let mut sender =
+            MimicryEncryptor::new(keys.clone(), 0, 0, mask, Arc::new(Mutex::new(None)));
+        let request = ControlPayload::MgmtRequest {
+            req_id: 51,
+            method: 1,
+            path: "/api/v1/clients".into(),
+            body: vec![b'x'; 262144],
+        };
+        let packets = sender.encrypt_control_packets(&request).unwrap();
+        assert!(packets.len() > 200);
+        assert!(packets.iter().all(|packet| packet.len() <= 1500));
+        // Декодер downlink использует S2C; здесь проверяем фактически зашифрованный C2S.
+        keys.session_key_s2c = keys.session_key;
+        let mut window = RecvWindow::new();
+        let mut fragments = Reassembler::default();
+        let mut received = None;
+        for packet in packets {
+            let decoded =
+                decode_packet_with_layout(&packet, &keys, &mut window, mdh_len, tag_offset)
+                    .unwrap();
+            assert_eq!(decoded.header.inner_type, InnerType::Fragment);
+            assert!(
+                decode_packet_with_layout(&packet, &keys, &mut window, mdh_len, tag_offset)
+                    .is_err()
+            );
+            if let Some((kind, payload)) = fragments
+                .accept(&decoded.payload, std::time::Instant::now())
+                .unwrap()
+            {
+                assert_eq!(kind, InnerType::Control);
+                received = Some(ControlPayload::decode(&payload).unwrap());
+            }
+        }
+        assert_eq!(
+            received.unwrap().encode().unwrap(),
+            request.encode().unwrap()
+        );
+    }
 
     #[test]
     fn test_mimicry_engine_builds_packet() {
         let mask = webrtc_zoom_v3();
         let mut engine = MimicryEngine::new(mask);
         let keys = SessionKeys {
+            packet_cipher: crate::crypto::PacketCipher::Established,
             session_key: [0u8; 32],
             session_key_s2c: [0u8; 32],
             tag_secret: [0u8; 32],
@@ -511,6 +596,80 @@ mod tests {
         let packet = engine.build_packet(b"Hello, World!", &keys, &mut counter, None);
         assert!(packet.is_ok());
         assert_eq!(counter, 1);
+    }
+
+    #[test]
+    fn mimicry_data_ready_only_after_initial_keys_are_replaced() {
+        let keys = crypto::derive_initial_session_keys(&[1; 32], None, &[3; 32]);
+        let mut encryptor =
+            MimicryEncryptor::new(keys, 0, 0, webrtc_zoom_v3(), Arc::new(Mutex::new(None)));
+        assert!(!encryptor.data_ready());
+        encryptor.update_keys(crypto::derive_session_keys(&[4; 32], None, &[3; 32]));
+        assert!(encryptor.data_ready());
+    }
+
+    #[test]
+    fn initial_v2_mimicry_uses_bound_random_nonce_envelope() {
+        let keys = crypto::derive_initial_session_keys(&[1; 32], None, &[3; 32]);
+        let mask = webrtc_zoom_v3();
+        let tag_offset = mask.tag_offset as usize;
+        let mdh_len = mask.header_spec.as_ref().unwrap().min_length();
+        let mut engine = MimicryEngine::new(mask);
+        let mut counter = 7;
+        let packet = engine
+            .build_packet(b"initial payload", &keys, &mut counter, None)
+            .unwrap();
+        let tag: [u8; 8] = packet[tag_offset..tag_offset + 8].try_into().unwrap();
+        let padded = crypto::decrypt_session_payload(
+            &keys,
+            crypto::PacketDirection::ClientToServer,
+            7,
+            &tag,
+            &packet[mdh_len..],
+        )
+        .expect("MimicryEngine должен учитывать mode ключей, а не наличие eph slot");
+        assert_eq!(&padded[2..2 + b"initial payload".len()], b"initial payload");
+        assert_eq!(counter, 8);
+    }
+
+    #[test]
+    fn initial_v2_mimicry_reserves_nonce_in_outer_packet_budget() {
+        let keys = crypto::derive_initial_session_keys(&[1; 32], None, &[3; 32]);
+        for mut mask in [webrtc_zoom_v3(), crate::mask::preset_masks::quic_https_v2()] {
+            mask.padding_strategy = PaddingStrategy::Fixed { size: u16::MAX };
+            let mut engine = MimicryEngine::new(mask);
+            let mut counter = 0;
+            let packet = engine
+                .build_packet(&vec![0x55; 1100], &keys, &mut counter, None)
+                .unwrap();
+            assert!(
+                packet.len() <= SAFE_OUTER_PACKET_BUDGET,
+                "outer packet {} exceeds {}",
+                packet.len(),
+                SAFE_OUTER_PACKET_BUDGET
+            );
+        }
+    }
+
+    #[test]
+    fn initial_v2_mimicry_rejects_payload_that_cannot_fit_without_padding() {
+        let keys = crypto::derive_initial_session_keys(&[1; 32], None, &[3; 32]);
+        let mut large_header = webrtc_zoom_v3();
+        large_header.header_spec = None;
+        large_header.header_template = vec![0; 1200];
+        for (mask, payload_len) in [
+            (webrtc_zoom_v3(), 1346),
+            (crate::mask::preset_masks::quic_https_v2(), 1346),
+            (large_header, 200),
+        ] {
+            let mut engine = MimicryEngine::new(mask);
+            assert!(
+                engine
+                    .build_packet(&vec![0x55; payload_len], &keys, &mut 0, None)
+                    .is_err(),
+                "неотправляемый initial пакет должен быть отклонен до шифрования"
+            );
+        }
     }
 
     #[test]
@@ -544,7 +703,6 @@ mod tests {
 
     #[test]
     fn embedded_stun_packet_roundtrips_and_shows_magic_cookie() {
-        use crate::client_wire::{decode_packet_with_layout, RecvWindow};
         use crate::crypto::{
             compute_time_window, current_timestamp_ms, generate_resonance_tag, DEFAULT_WINDOW_MS,
         };
@@ -558,6 +716,7 @@ mod tests {
 
         let mut engine = MimicryEngine::new(mask);
         let keys = SessionKeys {
+            packet_cipher: crate::crypto::PacketCipher::Established,
             session_key: [7u8; 32],
             session_key_s2c: [7u8; 32],
             tag_secret: [9u8; 32],
@@ -592,7 +751,6 @@ mod tests {
 
     #[test]
     fn embedded_quic_packet_roundtrips_and_shows_long_header() {
-        use crate::client_wire::{decode_packet_with_layout, RecvWindow};
         use crate::mask::preset_masks::quic_https_v2;
         use crate::protocol::InnerType;
 
@@ -602,6 +760,7 @@ mod tests {
 
         let mut engine = MimicryEngine::new(mask);
         let keys = SessionKeys {
+            packet_cipher: crate::crypto::PacketCipher::Established,
             session_key: [1u8; 32],
             session_key_s2c: [1u8; 32],
             tag_secret: [2u8; 32],
@@ -642,7 +801,6 @@ mod tests {
 
     #[test]
     fn quic_mask_with_non_dcid_tag_offset_falls_back_to_legacy_layout() {
-        use crate::client_wire::{decode_packet_with_mdh_len, RecvWindow};
         use crate::crypto::{
             compute_time_window, current_timestamp_ms, generate_resonance_tag, DEFAULT_WINDOW_MS,
         };
@@ -663,6 +821,7 @@ mod tests {
 
         let mut engine = MimicryEngine::new(mask);
         let keys = SessionKeys {
+            packet_cipher: crate::crypto::PacketCipher::Established,
             session_key: [1u8; 32],
             session_key_s2c: [1u8; 32],
             tag_secret: [2u8; 32],
@@ -688,7 +847,6 @@ mod tests {
 
     #[test]
     fn legacy_mask_still_prefixes_tag() {
-        use crate::client_wire::{decode_packet_with_mdh_len, RecvWindow};
         use crate::crypto::{
             compute_time_window, current_timestamp_ms, generate_resonance_tag, DEFAULT_WINDOW_MS,
         };
@@ -702,6 +860,7 @@ mod tests {
 
         let mut engine = MimicryEngine::new(mask);
         let keys = SessionKeys {
+            packet_cipher: crate::crypto::PacketCipher::Established,
             session_key: [3u8; 32],
             session_key_s2c: [3u8; 32],
             tag_secret: [4u8; 32],
@@ -726,7 +885,6 @@ mod tests {
 
     #[test]
     fn overlapping_tag_and_eph_falls_back_to_legacy() {
-        use crate::client_wire::{decode_packet_with_mdh_len, RecvWindow};
         use crate::protocol::InnerType;
 
         // Malformed mask: tag slot [8,16) overlaps eph_pub slot [10,42).
@@ -741,6 +899,7 @@ mod tests {
         let mdh_len = mask.header_spec.as_ref().unwrap().min_length();
         let mut engine = MimicryEngine::new(mask);
         let keys = SessionKeys {
+            packet_cipher: crate::crypto::PacketCipher::Established,
             session_key: [5u8; 32],
             session_key_s2c: [5u8; 32],
             tag_secret: [6u8; 32],
@@ -768,6 +927,7 @@ mod tests {
         assert_eq!(mask.stun_length_field_offset(), Some(2));
         let mut engine = MimicryEngine::new(mask);
         let keys = SessionKeys {
+            packet_cipher: crate::crypto::PacketCipher::Established,
             session_key: [7u8; 32],
             session_key_s2c: [7u8; 32],
             tag_secret: [9u8; 32],
@@ -806,12 +966,12 @@ mod tests {
         // In the legacy tag-prefix layout the STUN header is shifted past the
         // 8-byte tag; patch_stun_length must NOT run (it would corrupt the tag).
         // The packet still round-trips, proving the length patch stayed clear.
-        use crate::client_wire::{decode_packet_with_mdh_len, RecvWindow};
         let mut mask = webrtc_zoom_v3();
         mask.tag_offset = u16::MAX;
         let mdh_len = mask.header_spec.as_ref().unwrap().min_length();
         let mut engine = MimicryEngine::new(mask);
         let keys = SessionKeys {
+            packet_cipher: crate::crypto::PacketCipher::Established,
             session_key: [3u8; 32],
             session_key_s2c: [3u8; 32],
             tag_secret: [4u8; 32],
@@ -844,6 +1004,7 @@ mod tests {
         );
         let mut engine = MimicryEngine::new(mask);
         let keys = SessionKeys {
+            packet_cipher: crate::crypto::PacketCipher::Established,
             session_key: [1u8; 32],
             session_key_s2c: [1u8; 32],
             tag_secret: [2u8; 32],
@@ -882,6 +1043,7 @@ mod tests {
     fn test_mimicry_encryptor_data() {
         let mask = webrtc_zoom_v3();
         let keys = SessionKeys {
+            packet_cipher: crate::crypto::PacketCipher::Established,
             session_key: [0u8; 32],
             session_key_s2c: [0u8; 32],
             tag_secret: [0u8; 32],

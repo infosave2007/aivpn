@@ -211,22 +211,12 @@ class VPNManager: ObservableObject {
         startNetworkPathMonitor()
     }
 
-    /// Returns the bundled aivpn-client path that is acceptable to the privileged helper.
-    /// Only paths inside /Applications/ or /Library/ are in the helper's allowlist.
-    /// Returns nil when running from DerivedData/Downloads — helper then uses DEFAULT_CLIENT_PATH.
+    /// Перемещенное приложение использует системную копию через helper.
     private func helperClientBinaryPath() -> String? {
-        let candidates = [
-            Bundle.main.bundlePath + "/Contents/Resources/aivpn-client",
-            Bundle.main.bundlePath + "/Contents/MacOS/aivpn-client",
-        ]
-        let trustedPrefixes = ["/Applications/", "/Library/"]
-        for path in candidates {
-            let trusted = trustedPrefixes.contains(where: { path.hasPrefix($0) })
-            if trusted, FileManager.default.isExecutableFile(atPath: path) {
-                return path
-            }
-        }
-        return nil
+        ClientBinaryPolicy.bundledPath(
+            bundlePath: Bundle.main.bundlePath,
+            isExecutable: { FileManager.default.isExecutableFile(atPath: $0) }
+        )
     }
 
     /// Returns the bundled aivpn-client path for use as the current user (proxy mode, no helper).
@@ -253,7 +243,7 @@ class VPNManager: ObservableObject {
         DispatchQueue.global(qos: .userInitiated).async {
             let task = Process()
             task.executableURL = URL(fileURLWithPath: binaryPath)
-            task.arguments = args
+            task.arguments = ["--admin-listen", "127.0.0.1:44301"] + args
 
             let outputPipe = Pipe()
             task.standardOutput = outputPipe
@@ -761,7 +751,7 @@ class VPNManager: ObservableObject {
         // process via `ps`. The Rust client falls back to the env var when -k
         // is absent and scrubs it from its own environment after parsing
         // (crates/aivpn-client/src/main.rs). Mirrors the Linux/Windows GUIs.
-        var processArgs = ["--proxy-listen", "127.0.0.1:\(proxyPort)"]
+        var processArgs = ["--admin-listen", "127.0.0.1:44301", "--proxy-listen", "127.0.0.1:\(proxyPort)"]
         // Polymorphic base takes precedence over preferredMask, mirroring the
         // helper's startClient() behavior for the full-tunnel connect path.
         // Same pattern gate as aivpn-helper/main.swift's isAcceptableMaskId —

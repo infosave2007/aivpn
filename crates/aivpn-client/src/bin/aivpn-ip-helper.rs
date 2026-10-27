@@ -62,6 +62,8 @@ const MAX_STDIN_BYTES: usize = 64 * 1024;
 /// / `run_ip_privileged` in `crates/aivpn-client/src/tunnel.rs`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Verb {
+    SplitAdd,
+    SplitDel,
     /// `ip addr replace <CIDR> dev <IFACE>`
     AddrReplaceDev,
     /// `ip addr del <CIDR> dev <IFACE>` — removes the stale address after a
@@ -104,6 +106,8 @@ enum Verb {
 impl Verb {
     fn parse(s: &str) -> Option<Verb> {
         Some(match s {
+            "split_add" => Verb::SplitAdd,
+            "split_del" => Verb::SplitDel,
             "addr_replace" => Verb::AddrReplaceDev,
             "addr_del" => Verb::AddrDelDev,
             "route_replace_dev" => Verb::RouteReplaceDev,
@@ -127,6 +131,7 @@ impl Verb {
     /// shape requires — enforced exactly, no optional/variadic fields.
     fn field_count(self) -> usize {
         match self {
+            Verb::SplitAdd | Verb::SplitDel => 3,
             Verb::AddrReplaceDev => 2,                   // CIDR, IFACE
             Verb::AddrDelDev => 2,                       // CIDR, IFACE
             Verb::RouteReplaceDev => 2,                  // CIDR, IFACE
@@ -245,6 +250,45 @@ fn parse_line(line: &str, line_no: usize) -> Result<ParsedCommand, String> {
     }
 
     let argv = match verb {
+        Verb::SplitAdd | Verb::SplitDel => {
+            let (cidr, device, gateway) = (rest[0], rest[1], rest[2]);
+            let (address, prefix) = cidr.split_once('/').ok_or("split route requires CIDR")?;
+            let ip = address
+                .parse::<std::net::IpAddr>()
+                .map_err(|_| "invalid split address")?;
+            let prefix = prefix.parse::<u8>().map_err(|_| "invalid split prefix")?;
+            if prefix > if ip.is_ipv6() { 128 } else { 32 } || !is_valid_iface(device) {
+                return Err("invalid split route prefix or interface".into());
+            }
+            let mut argv = vec![];
+            if ip.is_ipv6() {
+                argv.push("-6".to_owned());
+            }
+            argv.extend(
+                [
+                    "route",
+                    if verb == Verb::SplitAdd { "add" } else { "del" },
+                    cidr,
+                ]
+                .into_iter()
+                .map(String::from),
+            );
+            if gateway != "-" {
+                let gw = gateway
+                    .parse::<std::net::IpAddr>()
+                    .map_err(|_| "invalid split gateway")?;
+                if gw.is_ipv6() != ip.is_ipv6() {
+                    return Err("split gateway family mismatch".into());
+                }
+                argv.extend(["via", gateway].into_iter().map(String::from));
+            }
+            argv.extend(
+                ["dev", device, "proto", "242"]
+                    .into_iter()
+                    .map(String::from),
+            );
+            argv
+        }
         Verb::AddrReplaceDev | Verb::AddrDelDev => {
             let (cidr, iface) = (rest[0], rest[1]);
             if !is_valid_cidr(cidr) {
@@ -508,6 +552,39 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn owned_split_route_is_narrow_and_dual_stack() {
+        let add = parse_line("split\tsplit_add\t2001:db8::/64\teth0\tfe80::1", 1).unwrap();
+        assert_eq!(
+            add.argv,
+            [
+                "-6",
+                "route",
+                "add",
+                "2001:db8::/64",
+                "via",
+                "fe80::1",
+                "dev",
+                "eth0",
+                "proto",
+                "242"
+            ]
+        );
+        let del = parse_line("split\tsplit_del\t10.0.0.0/8\ttun0\t-", 1).unwrap();
+        assert_eq!(
+            del.argv,
+            ["route", "del", "10.0.0.0/8", "dev", "tun0", "proto", "242"]
+        );
+        for line in [
+            "split\tsplit_add\t2001:db8::/64\teth0\t192.0.2.1",
+            "split\tsplit_add\t10.0.0.0/33\ttun0\t-",
+            "split\tsplit_add\t10.0.0.0/8\teth0;id\t-",
+            "split\tsplit_add\t10.0.0.0/8\ttun0\t-\t254",
+        ] {
+            assert!(parse_line(line, 1).is_err());
+        }
+    }
 
     // ── ipv6 blackhole verb ─────────────────────────────────────────
 

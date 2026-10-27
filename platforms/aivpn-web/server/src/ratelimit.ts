@@ -51,7 +51,7 @@ export function checkRateLimit(key: string, maxReqs: number, windowMs: number): 
   // Evict timestamps that slid out of the window.
   const cutoff = now - windowMs
   let expired = 0
-  while (expired < log.length && log[expired] <= cutoff) expired++
+  while (expired < log.length && log[expired]! <= cutoff) expired++
   if (expired > 0) log.splice(0, expired)
 
   if (log.length >= maxReqs) return false
@@ -73,7 +73,7 @@ export function isRateLimited(key: string, maxReqs: number, windowMs: number): b
 
   const cutoff = Date.now() - windowMs
   let expired = 0
-  while (expired < log.length && log[expired] <= cutoff) expired++
+  while (expired < log.length && log[expired]! <= cutoff) expired++
   if (expired > 0) log.splice(0, expired)
 
   if (log.length === 0) {
@@ -116,7 +116,7 @@ export function scheduleRateLimitCleaner(maxWindowMs: number): void {
   setInterval(() => {
     const now = Date.now()
     for (const [key, log] of rateLimitMap.entries()) {
-      if (log.length === 0 || now - log[log.length - 1] > maxWindowMs * 2) {
+      if (log.length === 0 || now - log[log.length - 1]! > maxWindowMs * 2) {
         rateLimitMap.delete(key)
       }
     }

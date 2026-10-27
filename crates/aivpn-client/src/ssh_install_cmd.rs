@@ -402,6 +402,7 @@ fn post_connect_error_marker_line(err: &ssh_install::SshInstallError) -> String 
         // transport keepalives can't catch. A distinct code so a GUI can say
         // "install timed out, retry is safe".
         ssh_install::SshInstallError::Timeout(_) => "timeout",
+        ssh_install::SshInstallError::OutputLineTooLong(_) => "output_line_too_long",
         // Unreachable in practice post-Connected (these only ever occur
         // during the initial `connect()` handshake), but matched explicitly
         // rather than falling into a catch-all so this stays exhaustive if
@@ -904,6 +905,16 @@ mod tests {
         let line = connect_error_marker_line(&err);
         let marker = ssh_install::parse_marker_line(&line).expect("must parse as a marker");
         assert_eq!(marker.code.as_deref(), Some("auth_failed"));
+    }
+
+    #[test]
+    fn oversized_remote_line_has_distinct_install_error_marker() {
+        let error = ssh_install::SshInstallError::OutputLineTooLong(1_048_577);
+        let line = post_connect_error_marker_line(&error);
+        let marker = ssh_install::parse_marker_line(&line).unwrap();
+        assert_eq!(marker.step, "install");
+        assert_eq!(marker.status, "error");
+        assert_eq!(marker.code.as_deref(), Some("output_line_too_long"));
     }
 
     #[test]

@@ -57,6 +57,7 @@ LISTEN_ADDR="${AIVPN_LISTEN:-}"
 
 BINARY_BASE_URL="${AIVPN_BINARY_BASE_URL:-$DEFAULT_BINARY_BASE_URL}"
 BINARY_FILE=""
+RELEASE_PUBLIC_KEY="${AIVPN_RELEASE_PUBKEY:-}"
 MASKS_URL="${AIVPN_MASKS_URL:-}"
 MASKS_DIR_OVERRIDE=""
 
@@ -173,6 +174,8 @@ Docker Compose (--mode docker). Idempotent — safe to re-run to upgrade.
   --binary-url URL           Base URL to fetch aivpn-server-linux-<arch> (+.SHA256SUMS) from.
                               Default: ${DEFAULT_BINARY_BASE_URL}
                               (env AIVPN_BINARY_BASE_URL)
+  --release-pubkey BASE64    Trusted Ed25519 release public key (DER, base64).
+                              Required for downloads (env AIVPN_RELEASE_PUBKEY).
   --binary-file PATH         Use a local binary instead of downloading (e.g. scp'd ahead of
                               time). If PATH.SHA256SUMS exists next to it, it is verified too.
   --masks-url URL            URL to a masks.tar.gz to seed /var/lib/aivpn/masks from, used
@@ -399,6 +402,24 @@ ensure_tun_device() {
 
 # ─── binary fetch + verify + install ────────────────────────────────────────
 
+verify_release_signature() {
+    local asset="$1" url="$2" scratch
+    if [ -z "${RELEASE_PUBLIC_KEY:-}" ]; then
+        emit_marker "verify_release" "error" "missing_public_key" "set --release-pubkey to the trusted release key"
+        return 1
+    fi
+    scratch="$(mktemp -d)"
+    if ! printf '%s' "$RELEASE_PUBLIC_KEY" | base64 -d > "$scratch/public.der" ||
+        ! curl -fsSL --retry 2 --retry-delay 2 -o "$scratch/signature" "${url}.sig" ||
+        ! openssl pkeyutl -verify -rawin -pubin -keyform DER -inkey "$scratch/public.der" \
+            -in "$asset" -sigfile "$scratch/signature" >/dev/null 2>&1; then
+        rm -rf "$scratch"
+        emit_marker "verify_release" "error" "invalid_signature" "release signature verification failed"
+        return 1
+    fi
+    rm -rf "$scratch"
+}
+
 fetch_and_install_binary() {
     CURRENT_STEP="fetch_binary"
     local arch asset tmpdir
@@ -438,6 +459,9 @@ fetch_and_install_binary() {
         fi
     fi
 
+    if [ -z "$BINARY_FILE" ]; then
+        verify_release_signature "$tmpdir/$asset" "${BINARY_BASE_URL}/${asset}" || exit 1
+    fi
     CURRENT_STEP="verify_binary"
     if [ -f "$tmpdir/${asset}.SHA256SUMS" ]; then
         if (cd "$tmpdir" && sha256sum -c "${asset}.SHA256SUMS" >/dev/null 2>&1); then
@@ -526,14 +550,36 @@ seed_masks() {
         local mtmp
         mtmp="$(mktemp -d)"
         if curl -fsSL --retry 2 --retry-delay 2 -o "$mtmp/masks.tar.gz" "$url" 2>/dev/null; then
-            tar -xzf "$mtmp/masks.tar.gz" -C "$mtmp" 2>/dev/null || true
+            if ! curl -fsSL --retry 2 --retry-delay 2 -o "$mtmp/masks.tar.gz.SHA256SUMS" "${url}.SHA256SUMS"; then
+                rm -rf "$mtmp"
+                emit_marker "seed_masks" "error" "checksum_download_failed" "mask checksum is required"
+                exit 1
+            fi
+            local expected
+            expected="$(awk '$2 == "masks.tar.gz" || $2 == "*masks.tar.gz" {print $1}' "$mtmp/masks.tar.gz.SHA256SUMS")"
+            if [[ ! "$expected" =~ ^[[:xdigit:]]{64}$ ]] ||
+                ! (cd "$mtmp" && printf '%s  masks.tar.gz\n' "$expected" | sha256sum -c - >/dev/null 2>&1); then
+                rm -rf "$mtmp"
+                emit_marker "seed_masks" "error" "checksum_mismatch" "mask checksum verification failed"
+                exit 1
+            fi
+            if ! verify_release_signature "$mtmp/masks.tar.gz" "$url"; then
+                rm -rf "$mtmp"
+                exit 1
+            fi
+            mkdir "$mtmp/unpacked"
+            if ! tar -xzf "$mtmp/masks.tar.gz" -C "$mtmp/unpacked" --no-same-owner --no-same-permissions; then
+                rm -rf "$mtmp"
+                emit_marker "seed_masks" "error" "invalid_archive" "mask archive extraction failed"
+                exit 1
+            fi
             while IFS= read -r -d '' f; do
                 base="$(basename "$f")"
                 if [ ! -f "$MASK_DIR/$base" ]; then
                     cp "$f" "$MASK_DIR/$base"
                     copied=$((copied + 1))
                 fi
-            done < <(find "$mtmp" -maxdepth 3 -name '*.json' -print0)
+            done < <(find "$mtmp/unpacked" -maxdepth 3 -type f -name '*.json' -print0)
             emit_marker "seed_masks" "ok" "remote_fetch" \
                 "seeded ${copied} mask file(s) into ${MASK_DIR} from ${url}"
         else
@@ -859,6 +905,7 @@ parse_args() {
             --mode) need_arg "$@"; INSTALL_MODE="$2"; shift 2 ;;
             --port) need_arg "$@"; PORT="$2"; shift 2 ;;
             --listen) need_arg "$@"; LISTEN_ADDR="$2"; shift 2 ;;
+            --release-pubkey) need_arg "$@"; RELEASE_PUBLIC_KEY="$2"; shift 2 ;;
             --binary-url) need_arg "$@"; BINARY_BASE_URL="$2"; shift 2 ;;
             --binary-file) need_arg "$@"; BINARY_FILE="$2"; shift 2 ;;
             --masks-url) need_arg "$@"; MASKS_URL="$2"; shift 2 ;;

@@ -25,6 +25,8 @@ enum aivpn_stat_id {
 	AIVPN_STAT_INJECT_FAIL,    /* TUN inject failed (no dev)            */
 	AIVPN_STAT_TX_ENCRYPT_OK,  /* downlink encrypt succeeded            */
 	AIVPN_STAT_TX_ENCRYPT_FAIL,/* downlink encrypt failed               */
+	AIVPN_STAT_POLICY_DROP,    /* политика запретила пакет              */
+	AIVPN_STAT_POLICY_FALLBACK,/* режим не поддержан, пакет в userspace */
 	AIVPN_STAT__COUNT
 };
 

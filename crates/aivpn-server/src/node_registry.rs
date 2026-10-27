@@ -1,45 +1,19 @@
-//! Pool-node identity binding store (Phase 4 — per-node cryptographic
-//! identity, RECEIVE/BIND side).
-//!
-//! Analogous to the client device-binding model in `client_db.rs`
-//! (`ClientConfig::device_pubkey` / one-time enrollment), but at the pool
-//! level: a peer's self-asserted `node_id` (a plain string, e.g. its
-//! `host:port`) is otherwise unauthenticated — anyone who can complete the
-//! masked pool-client handshake can claim to BE any `node_id`. This module
-//! binds `node_id` to a durable Ed25519 `node_pub` the first time a peer
-//! proves ownership of it via a valid `ControlPayload::NodeEnrollment` (see
-//! `aivpn_common::crypto::{node_identity_from_seed,
-//! node_enrollment_signing_bytes, verify_node_enrollment}`), and rejects any
-//! later claim of the same `node_id` from a different key — Trust-On-First-
-//! Use (TOFU), same trust model as client device binding.
-//!
-//! Persisted to `pool_nodes.json`, sibling to `clients.json`. Two on-disk
-//! shapes are understood:
-//!
-//! - Legacy (pre-revocation) flat form, still the load-compat target for
-//!   any file written before this module gained durable revocation:
-//!   `{ "<node_id>": "<base64 32-byte pubkey>" }`.
-//! - Current structured form, written by `persist()`:
-//!   `{ "nodes": { "<node_id>": "<base64 32-byte pubkey>" }, "revoked": ["<node_id>", ...] }`.
-//!
-//! `load()` tries the structured form first and falls back to the legacy
-//! flat form so an existing deployment's `pool_nodes.json` keeps working
-//! across the upgrade with no migration step.
-
-use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
-use std::sync::atomic::Ordering;
-
-use base64::Engine as _;
-use parking_lot::{Mutex, RwLock};
-use portable_atomic::AtomicU64;
-use serde::{Deserialize, Serialize};
-use tracing::{error, info, warn};
+//! Постоянные привязки идентичностей узлов и запреты повторного enrollment.
+//! Поврежденный реестр запрещает аутентификацию до устранения ошибки и перезапуска.
 
 use aivpn_common::crypto;
+use base64::Engine as _;
+use parking_lot::Mutex;
+use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Read, Write};
+use std::path::{Path, PathBuf};
+use tracing::{error, warn};
 
-/// On-disk structured form written by `NodeRegistry::persist`. See the
-/// module doc for the legacy flat form this is loaded alongside.
+const NODE_ENROLL_WINDOW_MS: u64 = 60_000;
+const MAX_REGISTRY_BYTES: u64 = 16 * 1024 * 1024;
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct PersistedStore {
     nodes: HashMap<String, String>,
@@ -47,163 +21,155 @@ struct PersistedStore {
     revoked: Vec<String>,
 }
 
-/// Freshness window for `NodeEnrollment` proofs — mirrors the resonance-tag
-/// time-window pattern used elsewhere in the protocol. A `time_window` more
-/// than 2 windows away from "now" (60s each — see `compute_time_window`) is
-/// rejected as stale, bounding how long a captured enrollment message can be
-/// replayed.
-const NODE_ENROLL_WINDOW_MS: u64 = 60_000;
-
-/// Result of `NodeRegistry::authenticate`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NodeAuthOutcome {
-    /// `node_id` was already bound to this exact `node_pub` — proof checks
-    /// out against the existing pin.
     Verified,
-    /// `node_id` was not previously bound; this proof bound it to `node_pub`
-    /// for the first time (TOFU).
     BoundNew,
-    /// The proof was rejected. The `&'static str` is a short, log-friendly
-    /// reason — never attacker-controlled text.
     Rejected(&'static str),
 }
 
-/// Thread-safe, file-persisted store of `node_id -> node_pub` bindings,
-/// plus a durable set of revoked `node_id`s (see the D3 fix note on
-/// `revoke`).
-pub struct NodeRegistry {
-    path: PathBuf,
-    nodes: RwLock<HashMap<String, [u8; 32]>>,
-    /// `node_id`s an operator has explicitly revoked. Checked in
-    /// `authenticate` *before* the TOFU auto-add path, so a revoked
-    /// identity cannot be silently re-bound by whoever next completes a
-    /// masked handshake claiming that `node_id` — durable protection,
-    /// not just "unbound until the next arrival".
-    revoked: RwLock<HashSet<String>>,
-    allow_auto_add: bool,
-    /// Per-process counter mixed into the persist-temp-file name so two
-    /// concurrent `persist()` calls (e.g. two TOFU binds racing in
-    /// different tasks) never collide on `{path}.{pid}.tmp` and fail the
-    /// rename with ENOENT (D5 fix).
-    tmp_counter: AtomicU64,
-    /// Serializes `persist()` end to end — snapshot, write and rename under
-    /// one lock.
-    ///
-    /// Unique temp names stopped the two writers from clobbering each
-    /// other's file, but not from inverting: a thread that snapshots the map
-    /// and is then descheduled can rename its stale copy over a newer one,
-    /// dropping every binding added in between. Taking this lock before the
-    /// snapshot makes the last rename always carry the newest state.
-    ///
-    /// It is not the `nodes` lock: holding that across file I/O would block
-    /// every reader for the duration of a write.
-    persist_lock: Mutex<()>,
+#[derive(Default)]
+struct RegistryState {
+    nodes: HashMap<String, [u8; 32]>,
+    revoked: HashSet<String>,
+    // Неудачно сохраненный запрет действует в текущем процессе до явной отмены.
+    unsaved_revocations: HashSet<String>,
+    existed: bool,
+    poisoned: bool,
 }
 
-/// Decode a base64-encoded 32-byte Ed25519 public key, logging and
-/// returning `None` on any malformed entry rather than failing the whole
-/// load.
-fn decode_pubkey(node_id: &str, b64: &str) -> Option<[u8; 32]> {
-    match base64::engine::general_purpose::STANDARD
-        .decode(b64)
-        .ok()
-        .and_then(|b| <[u8; 32]>::try_from(b).ok())
+pub struct NodeRegistry {
+    path: PathBuf,
+    allow_auto_add: bool,
+    state: Mutex<RegistryState>,
+    #[cfg(test)]
+    fail_write: std::sync::atomic::AtomicBool,
+}
+
+fn secure_options() -> OpenOptions {
+    let mut options = OpenOptions::new();
+    #[cfg(unix)]
     {
-        Some(pub_bytes) => Some(pub_bytes),
-        None => {
-            warn!(
-                "pool_nodes.json: skipping node '{}' with malformed pubkey",
-                node_id
-            );
-            None
-        }
+        use std::os::unix::fs::OpenOptionsExt;
+        options
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
     }
+    options
+}
+
+fn invalid_data(message: &str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, message)
 }
 
 impl NodeRegistry {
-    /// Load `pool_nodes.json` from `path`. A missing file is treated as an
-    /// empty registry (fresh deployment); a malformed file is logged and
-    /// treated as empty as well — this store gates an anti-entropy control
-    /// channel, not the data plane, so failing to load it must never block
-    /// server startup the way a corrupt `clients.json` would.
-    ///
-    /// Accepts either on-disk shape described in the module doc: the
-    /// current structured `{ "nodes": {...}, "revoked": [...] }` form is
-    /// tried first, falling back to the legacy flat `{node_id: pubkey}`
-    /// form (which has no revocation data, so `revoked` starts empty).
     pub fn load(path: PathBuf, allow_auto_add: bool) -> Self {
-        let (nodes, revoked) = match std::fs::read_to_string(&path) {
-            Ok(content) if content.trim().is_empty() => (HashMap::new(), HashSet::new()),
-            Ok(content) => Self::parse_persisted(&content, &path),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (HashMap::new(), HashSet::new()),
-            Err(e) => {
-                error!(
-                    "Failed to read pool_nodes.json at {:?}: {} — starting with an empty node registry",
-                    path, e
-                );
-                (HashMap::new(), HashSet::new())
-            }
-        };
-
-        Self {
+        let registry = Self {
             path,
-            nodes: RwLock::new(nodes),
-            revoked: RwLock::new(revoked),
             allow_auto_add,
-            tmp_counter: AtomicU64::new(0),
-            persist_lock: Mutex::new(()),
+            state: Mutex::new(RegistryState::default()),
+            #[cfg(test)]
+            fail_write: std::sync::atomic::AtomicBool::new(false),
+        };
+        if let Err(error) = registry.check_health() {
+            error!("Реестр узлов недоступен: {error}");
         }
+        registry
     }
 
-    /// Parse file contents in either on-disk shape. Tries the structured
-    /// form first (it has a required `nodes` field, so it simply fails to
-    /// deserialize — no ambiguity risk — against a legacy flat file whose
-    /// top-level values are base64 strings, not an object/array) and falls
-    /// back to the legacy flat `{node_id: pubkey}` map.
-    fn parse_persisted(
-        content: &str,
-        path: &std::path::Path,
-    ) -> (HashMap<String, [u8; 32]>, HashSet<String>) {
-        if let Ok(store) = serde_json::from_str::<PersistedStore>(content) {
-            let mut map = HashMap::with_capacity(store.nodes.len());
-            for (node_id, b64) in store.nodes {
-                if let Some(pub_bytes) = decode_pubkey(&node_id, &b64) {
-                    map.insert(node_id, pub_bytes);
-                }
-            }
-            let revoked: HashSet<String> = store.revoked.into_iter().collect();
-            return (map, revoked);
+    fn lock_file(&self) -> io::Result<File> {
+        let file = secure_options()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(self.path.with_extension("json.lock"))?;
+        if !file.metadata()?.is_file() {
+            return Err(invalid_data(
+                "Блокировка реестра не является обычным файлом",
+            ));
         }
-
-        match serde_json::from_str::<HashMap<String, String>>(content) {
-            Ok(raw) => {
-                let mut map = HashMap::with_capacity(raw.len());
-                for (node_id, b64) in raw {
-                    if let Some(pub_bytes) = decode_pubkey(&node_id, &b64) {
-                        map.insert(node_id, pub_bytes);
-                    }
-                }
-                (map, HashSet::new())
-            }
-            Err(e) => {
-                error!(
-                    "Failed to parse pool_nodes.json at {:?}: {} — starting with an empty node registry",
-                    path, e
-                );
-                (HashMap::new(), HashSet::new())
-            }
-        }
+        file.lock()?;
+        Ok(file)
     }
 
-    /// Authenticate a `NodeEnrollment` proof and, depending on prior state,
-    /// bind, verify, or reject it. Never overwrites an existing binding —
-    /// a mismatch is always `Rejected`, never a silent re-pin.
-    ///
-    /// `server_eph_pub`/`client_eph_pub` are the CALLER's session's ephemeral
-    /// X25519 transcript (see `Session::server_eph_pub`/`Session::eph_pub`
-    /// in `gateway.rs`'s masked pool-peer handling) — passed straight through
-    /// to [`crypto::verify_node_enrollment`] so a proof captured on one
-    /// session can never be replayed onto another (B2/D2 fix).
+    fn refresh(&self, state: &mut RegistryState) -> io::Result<()> {
+        if state.poisoned {
+            return Err(invalid_data(
+                "Реестр узлов заблокирован после ошибки чтения",
+            ));
+        }
+        let result = (|| {
+            let mut file = match secure_options().read(true).open(&self.path) {
+                Ok(file) => file,
+                Err(error) if error.kind() == io::ErrorKind::NotFound && !state.existed => {
+                    return Ok(())
+                }
+                Err(error) => return Err(error),
+            };
+            let metadata = file.metadata()?;
+            if !metadata.is_file() || metadata.len() > MAX_REGISTRY_BYTES {
+                return Err(invalid_data("Некорректный файл реестра узлов"));
+            }
+            let mut content = String::new();
+            (&mut file)
+                .take(MAX_REGISTRY_BYTES + 1)
+                .read_to_string(&mut content)?;
+            if content.len() as u64 > MAX_REGISTRY_BYTES {
+                return Err(invalid_data("Реестр узлов превышает лимит"));
+            }
+            let store = match serde_json::from_str::<PersistedStore>(&content) {
+                Ok(store) => store,
+                Err(_) => PersistedStore {
+                    nodes: serde_json::from_str(&content)
+                        .map_err(|_| invalid_data("Поврежденный JSON реестра узлов"))?,
+                    revoked: Vec::new(),
+                },
+            };
+            let mut nodes = HashMap::new();
+            for (node_id, encoded) in store.nodes {
+                let key: [u8; 32] = base64::engine::general_purpose::STANDARD
+                    .decode(encoded)
+                    .ok()
+                    .and_then(|bytes| bytes.try_into().ok())
+                    .ok_or_else(|| invalid_data("Поврежденный ключ узла"))?;
+                let verifying = ed25519_dalek::VerifyingKey::from_bytes(&key)
+                    .map_err(|_| invalid_data("Некорректный ключ узла"))?;
+                if node_id.trim().is_empty() || verifying.is_weak() {
+                    return Err(invalid_data("Недопустимая идентичность узла"));
+                }
+                nodes.insert(node_id, key);
+            }
+            state.nodes = nodes;
+            state.revoked = store.revoked.into_iter().collect();
+            state
+                .revoked
+                .extend(state.unsaved_revocations.iter().cloned());
+            state.existed = true;
+            Ok(())
+        })();
+        if result.is_err() {
+            state.poisoned = true;
+        }
+        result
+    }
+
+    pub fn check_health(&self) -> io::Result<()> {
+        let mut state = self.state.lock();
+        let _file = self.lock_file()?;
+        self.refresh(&mut state)
+    }
+
+    /// Проверяет актуальный запрет, в том числе записанный отдельным CLI-процессом.
+    pub fn is_authorized(&self, node_id: &str, node_pub: &[u8; 32]) -> bool {
+        let mut state = self.state.lock();
+        let Ok(_file) = self.lock_file() else {
+            return false;
+        };
+        self.refresh(&mut state).is_ok()
+            && state.nodes.get(node_id) == Some(node_pub)
+            && !state.revoked.contains(node_id)
+    }
+
     pub fn authenticate(
         &self,
         node_id: &str,
@@ -218,207 +184,170 @@ impl NodeRegistry {
         if time_window.abs_diff(cur) > 2 {
             return NodeAuthOutcome::Rejected("stale enrollment");
         }
-
-        if !crypto::verify_node_enrollment(
-            node_pub,
-            node_id,
-            time_window,
-            signature,
-            server_eph_pub,
-            client_eph_pub,
-        ) {
+        if node_id.trim().is_empty()
+            || !crypto::verify_node_enrollment(
+                node_pub,
+                node_id,
+                time_window,
+                signature,
+                server_eph_pub,
+                client_eph_pub,
+            )
+        {
             return NodeAuthOutcome::Rejected("bad signature");
         }
-
-        // D3 fix: a revoked node_id must never be silently re-bound via
-        // TOFU by whoever next completes a masked handshake claiming it —
-        // check the durable revocation tombstone before any bound-check or
-        // auto-add logic runs. This also wins over an existing binding: a
-        // node_id that is both revoked and still bound (revoke() normally
-        // clears the binding too, but a legacy/partial-write state could
-        // leave both) is rejected here, never silently re-verified.
-        if self.revoked.read().contains(node_id) {
+        let mut state = self.state.lock();
+        let Ok(_file) = self.lock_file() else {
+            return NodeAuthOutcome::Rejected("registry unavailable");
+        };
+        if self.refresh(&mut state).is_err() {
+            return NodeAuthOutcome::Rejected("registry unavailable");
+        }
+        if state.revoked.contains(node_id) {
             return NodeAuthOutcome::Rejected("revoked node — re-approval required");
         }
-
-        // Look up first under a read lock; only take the write lock (and
-        // persist) on the TOFU bind path, so the common "already bound,
-        // verified" case never blocks concurrent readers against each other.
-        {
-            let nodes = self.nodes.read();
-            if let Some(stored) = nodes.get(node_id) {
-                return if stored == node_pub {
-                    NodeAuthOutcome::Verified
-                } else {
-                    NodeAuthOutcome::Rejected("node_pub mismatch — impostor or key rotation")
-                };
-            }
+        if let Some(stored) = state.nodes.get(node_id) {
+            return if stored == node_pub {
+                NodeAuthOutcome::Verified
+            } else {
+                NodeAuthOutcome::Rejected("node_pub mismatch - impostor or key rotation")
+            };
         }
-
         if !self.allow_auto_add {
             return NodeAuthOutcome::Rejected("unknown node, auto-add disabled");
         }
-
-        {
-            let mut nodes = self.nodes.write();
-            // Re-check under the write lock: another thread may have bound
-            // this node_id between the read-lock check above and here.
-            match nodes.get(node_id) {
-                Some(stored) if stored == node_pub => return NodeAuthOutcome::Verified,
-                Some(_) => {
-                    return NodeAuthOutcome::Rejected(
-                        "node_pub mismatch — impostor or key rotation",
-                    )
-                }
-                None => {
-                    nodes.insert(node_id.to_string(), *node_pub);
-                }
-            }
+        state.nodes.insert(node_id.to_string(), *node_pub);
+        if let Err(error) = self.persist(&state) {
+            state.nodes.remove(node_id);
+            warn!("Не удалось сохранить привязку узла: {error}");
+            return NodeAuthOutcome::Rejected("registry persistence failed");
         }
-
-        if let Err(e) = self.persist() {
-            warn!(
-                "Failed to persist pool_nodes.json after binding '{}': {}",
-                node_id, e
-            );
-        }
-        info!("pool node '{}' bound (TOFU) to a new identity key", node_id);
+        state.existed = true;
         NodeAuthOutcome::BoundNew
     }
 
-    /// Remove a bound node AND add it to the durable revocation tombstone
-    /// (D3 fix), persisting the change. Unlike the pre-fix behavior (which
-    /// only removed the binding), this makes revocation stick: `authenticate`
-    /// rejects any later `NodeEnrollment` for this `node_id` — even from the
-    /// legitimate node itself — until an operator calls `unrevoke`. Without
-    /// this, `allow_auto_add=true` (the default) meant the very next
-    /// enrollment for the node_id — from anyone who can complete the masked
-    /// handshake, not necessarily the original owner — would instantly
-    /// re-bind it via TOFU, giving a revoke no durable effect.
-    ///
-    /// Returns `true` if either the binding was removed or the node_id was
-    /// newly added to the revoked set (i.e. state actually changed).
+    pub fn try_revoke(&self, node_id: &str) -> io::Result<bool> {
+        let mut state = self.state.lock();
+        let operation = (|| {
+            let _file = self.lock_file()?;
+            self.refresh(&mut state)?;
+            let changed =
+                state.nodes.remove(node_id).is_some() | state.revoked.insert(node_id.to_string());
+            self.persist(&state)?;
+            state.existed = true;
+            state.unsaved_revocations.remove(node_id);
+            Ok(changed)
+        })();
+        if operation.is_err() {
+            state.nodes.remove(node_id);
+            state.revoked.insert(node_id.to_string());
+            state.unsaved_revocations.insert(node_id.to_string());
+        }
+        operation
+    }
+
     pub fn revoke(&self, node_id: &str) -> bool {
-        let mut changed = false;
-        {
-            let mut nodes = self.nodes.write();
-            if nodes.remove(node_id).is_some() {
-                changed = true;
-            }
-        }
-        {
-            let mut revoked = self.revoked.write();
-            if revoked.insert(node_id.to_string()) {
-                changed = true;
-            }
-        }
-        if changed {
-            if let Err(e) = self.persist() {
-                warn!(
-                    "Failed to persist pool_nodes.json after revoking '{}': {}",
-                    node_id, e
-                );
-            }
-        }
-        changed
+        self.try_revoke(node_id).unwrap_or_else(|error| {
+            warn!("Не удалось сохранить отзыв узла: {error}");
+            false
+        })
     }
 
-    /// Remove `node_id` from the revoked set, persisting the change, so an
-    /// operator can deliberately re-allow a node to (re-)bind via TOFU (or
-    /// simply be `Verified` again if it somehow retained its old binding).
-    /// Needed as the counterpart to `revoke` now that revocation is durable
-    /// rather than just "unbound until next arrival". Returns `true` if the
-    /// node_id was in the revoked set and was removed.
+    pub fn try_unrevoke(&self, node_id: &str) -> io::Result<bool> {
+        let mut state = self.state.lock();
+        let _file = self.lock_file()?;
+        self.refresh(&mut state)?;
+        let removed = state.revoked.remove(node_id);
+        if !removed {
+            return Ok(false);
+        }
+        if let Err(error) = self.persist(&state) {
+            state.revoked.insert(node_id.to_string());
+            return Err(error);
+        }
+        state.existed = true;
+        state.unsaved_revocations.remove(node_id);
+        Ok(true)
+    }
+
     pub fn unrevoke(&self, node_id: &str) -> bool {
-        let removed = {
-            let mut revoked = self.revoked.write();
-            revoked.remove(node_id)
-        };
-        if removed {
-            if let Err(e) = self.persist() {
-                warn!(
-                    "Failed to persist pool_nodes.json after unrevoking '{}': {}",
-                    node_id, e
-                );
-            }
-        }
-        removed
+        self.try_unrevoke(node_id).unwrap_or_else(|error| {
+            warn!("Не удалось отменить отзыв узла: {error}");
+            false
+        })
     }
 
-    /// All bound nodes, sorted by `node_id`.
     pub fn list(&self) -> Vec<(String, [u8; 32])> {
-        let nodes = self.nodes.read();
-        let mut out: Vec<(String, [u8; 32])> = nodes.iter().map(|(k, v)| (k.clone(), *v)).collect();
-        out.sort_by(|a, b| a.0.cmp(&b.0));
-        out
+        if self.check_health().is_err() {
+            return Vec::new();
+        }
+        let state = self.state.lock();
+        let mut nodes: Vec<_> = state
+            .nodes
+            .iter()
+            .filter(|(id, _)| !state.revoked.contains(*id))
+            .map(|(id, key)| (id.clone(), *key))
+            .collect();
+        nodes.sort_by(|a, b| a.0.cmp(&b.0));
+        nodes
     }
 
-    /// All revoked `node_id`s, sorted.
     pub fn list_revoked(&self) -> Vec<String> {
-        let revoked = self.revoked.read();
-        let mut out: Vec<String> = revoked.iter().cloned().collect();
-        out.sort();
-        out
+        let _ = self.check_health();
+        let mut revoked: Vec<_> = self.state.lock().revoked.iter().cloned().collect();
+        revoked.sort();
+        revoked
     }
 
-    /// Serialize and atomically persist the current bindings AND the
-    /// revoked-set tombstone to `self.path` via a temp-file-then-rename,
-    /// mirroring `ClientDatabase::save`. Takes its own read locks internally
-    /// (never called while a caller already holds `nodes`/`revoked` locked)
-    /// so this can never deadlock against the RwLocks.
-    fn persist(&self) -> std::io::Result<()> {
-        // Held across snapshot, write and rename: see `persist_lock`.
-        let _serialize = self.persist_lock.lock();
-
-        let encoded_nodes: HashMap<String, String> = {
-            let nodes = self.nodes.read();
-            nodes
+    fn persist(&self, state: &RegistryState) -> io::Result<()> {
+        #[cfg(test)]
+        if self.fail_write.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(io::Error::other("injected write failure"));
+        }
+        let store = PersistedStore {
+            nodes: state
+                .nodes
                 .iter()
-                .map(|(k, v)| {
+                .map(|(id, key)| {
                     (
-                        k.clone(),
-                        base64::engine::general_purpose::STANDARD.encode(v),
+                        id.clone(),
+                        base64::engine::general_purpose::STANDARD.encode(key),
                     )
                 })
-                .collect()
+                .collect(),
+            revoked: state.revoked.iter().cloned().collect(),
         };
-        let mut revoked_list: Vec<String> = {
-            let revoked = self.revoked.read();
-            revoked.iter().cloned().collect()
-        };
-        revoked_list.sort();
-
-        let store = PersistedStore {
-            nodes: encoded_nodes,
-            revoked: revoked_list,
-        };
-        let content = serde_json::to_string_pretty(&store)
-            .map_err(|e| std::io::Error::other(format!("serialize pool_nodes.json: {}", e)))?;
-
-        // D5 fix: mix a per-process, monotonically increasing counter into
-        // the temp-file name alongside the PID. Two concurrent TOFU binds
-        // in the same process (e.g. two `authenticate` calls racing on
-        // different node_ids) previously both wrote `{path}.{pid}.tmp`; the
-        // second `fs::write` would clobber the first's temp file mid-write
-        // (or the first `fs::rename` would find its source already gone,
-        // returning ENOENT), corrupting the persisted state or spuriously
-        // failing. The PID alone only disambiguates across processes.
-        let suffix = self.tmp_counter.fetch_add(1, Ordering::Relaxed);
-        let tmp_path = self
+        let content = serde_json::to_vec_pretty(&store).map_err(io::Error::other)?;
+        let temporary = self
             .path
-            .with_extension(format!("{}.{}.tmp", std::process::id(), suffix));
-        std::fs::write(&tmp_path, &content)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            if let Err(e) =
-                std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o600))
+            .with_extension(format!("{:032x}.tmp", rand::random::<u128>()));
+        let mut file = secure_options()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)?;
+        let result = (|| {
+            file.write_all(&content)?;
+            file.sync_all()?;
+            fs::rename(&temporary, &self.path)?;
+            // После rename новое состояние уже видно другим процессам. При ошибке
+            // fsync каталога не откатываем только память к предыдущему состоянию.
+            if let Err(error) = File::open(
+                self.path
+                    .parent()
+                    .filter(|p| !p.as_os_str().is_empty())
+                    .unwrap_or(Path::new(".")),
+            )
+            .and_then(|dir| dir.sync_all())
             {
-                warn!("Failed to set pool_nodes.json permissions to 0600: {}", e);
+                warn!("Реестр записан, но fsync каталога не выполнен: {error}");
             }
+            Ok(())
+        })();
+        drop(file);
+        if result.is_err() {
+            let _ = fs::remove_file(temporary);
         }
-        std::fs::rename(&tmp_path, &self.path)?;
-        Ok(())
+        result
     }
 }
 
@@ -542,7 +471,7 @@ mod tests {
         );
         assert_eq!(
             outcome,
-            NodeAuthOutcome::Rejected("node_pub mismatch — impostor or key rotation")
+            NodeAuthOutcome::Rejected("node_pub mismatch - impostor or key rotation")
         );
 
         // The original binding must be untouched.
@@ -953,5 +882,129 @@ mod tests {
         assert_eq!(reg.list().len(), 8);
         let reloaded = NodeRegistry::load(path, true);
         assert_eq!(reloaded.list().len(), 8);
+    }
+    fn enroll(registry: &NodeRegistry, id: &str, seed: u8) -> NodeAuthOutcome {
+        let (key, window, signature) = build_enrollment(&[seed; 32], id);
+        registry.authenticate(
+            id,
+            &key,
+            window,
+            &signature,
+            &TEST_SERVER_EPH,
+            &TEST_CLIENT_EPH,
+        )
+    }
+
+    #[test]
+    fn corrupt_registry_never_resets_trust() {
+        for content in ["", "{", r#"{"nodes":{"peer":"broken"},"revoked":[]}"#] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = registry_path(&dir);
+            fs::write(&path, content).unwrap();
+            let registry = NodeRegistry::load(path.clone(), true);
+            assert!(registry.check_health().is_err());
+            assert!(matches!(
+                enroll(&registry, "peer", 4),
+                NodeAuthOutcome::Rejected(_)
+            ));
+            assert_eq!(fs::read_to_string(&path).unwrap(), content);
+            fs::write(&path, "{}").unwrap();
+            assert!(registry.check_health().is_err());
+        }
+    }
+
+    #[test]
+    fn independent_instances_share_pins_and_revocations() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = registry_path(&dir);
+        let first = NodeRegistry::load(path.clone(), true);
+        let second = NodeRegistry::load(path.clone(), true);
+        assert_eq!(enroll(&first, "one", 1), NodeAuthOutcome::BoundNew);
+        assert_eq!(enroll(&second, "two", 2), NodeAuthOutcome::BoundNew);
+        assert_eq!(first.list().len(), 2);
+        let key = crypto::node_identity_from_seed(&[1; 32])
+            .verifying_key()
+            .to_bytes();
+        assert!(first.is_authorized("one", &key));
+        assert!(second.try_revoke("one").unwrap());
+        assert!(!first.is_authorized("one", &key));
+        assert!(matches!(
+            enroll(&first, "one", 3),
+            NodeAuthOutcome::Rejected(_)
+        ));
+        assert!(second.try_unrevoke("one").unwrap());
+        assert_eq!(enroll(&second, "one", 3), NodeAuthOutcome::BoundNew);
+        assert!(!first.is_authorized("one", &key));
+        assert_eq!(first.list().len(), 2);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+    }
+
+    #[test]
+    fn failed_writes_never_grant_trust_and_revocation_remains_local() {
+        use std::sync::atomic::Ordering;
+        let dir = tempfile::tempdir().unwrap();
+        let path = registry_path(&dir);
+        let registry = NodeRegistry::load(path.clone(), true);
+        registry.fail_write.store(true, Ordering::Relaxed);
+        assert_eq!(
+            enroll(&registry, "peer", 1),
+            NodeAuthOutcome::Rejected("registry persistence failed")
+        );
+        assert!(registry.list().is_empty());
+        assert!(!path.exists());
+        registry.fail_write.store(false, Ordering::Relaxed);
+        assert_eq!(enroll(&registry, "peer", 1), NodeAuthOutcome::BoundNew);
+        registry.fail_write.store(true, Ordering::Relaxed);
+        assert!(registry.try_revoke("peer").is_err());
+        assert!(matches!(
+            enroll(&registry, "peer", 1),
+            NodeAuthOutcome::Rejected(_)
+        ));
+        assert!(registry.try_unrevoke("peer").is_err());
+        assert!(matches!(
+            enroll(&registry, "peer", 1),
+            NodeAuthOutcome::Rejected(_)
+        ));
+        registry.fail_write.store(false, Ordering::Relaxed);
+        registry.try_revoke("peer").unwrap();
+        assert_eq!(NodeRegistry::load(path, true).list_revoked(), vec!["peer"]);
+    }
+
+    #[test]
+    fn removed_registry_does_not_allow_new_tofu() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = registry_path(&dir);
+        let registry = NodeRegistry::load(path.clone(), true);
+        assert_eq!(enroll(&registry, "peer", 1), NodeAuthOutcome::BoundNew);
+        fs::remove_file(path).unwrap();
+        assert!(matches!(
+            enroll(&registry, "peer", 2),
+            NodeAuthOutcome::Rejected(_)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn registry_and_lock_symlinks_are_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = registry_path(&dir);
+        let victim = dir.path().join("victim.json");
+        fs::write(&victim, "{}").unwrap();
+        std::os::unix::fs::symlink(&victim, &path).unwrap();
+        assert!(NodeRegistry::load(path.clone(), true)
+            .check_health()
+            .is_err());
+        fs::remove_file(&path).unwrap();
+        fs::remove_file(path.with_extension("json.lock")).unwrap();
+        std::os::unix::fs::symlink(&victim, path.with_extension("json.lock")).unwrap();
+        assert!(NodeRegistry::load(path, true).check_health().is_err());
+        assert_eq!(fs::read_to_string(victim).unwrap(), "{}");
     }
 }

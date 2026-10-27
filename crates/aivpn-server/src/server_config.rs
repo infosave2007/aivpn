@@ -189,6 +189,8 @@ pub struct ServerFileConfig {
     pub neural: Option<NeuralConfig>,
     #[serde(default)]
     pub bootstrap_publish: Option<BootstrapPublishConfig>,
+    #[serde(default)]
+    pub passive_distribution: Option<crate::passive_distribution::PassiveDistributionConfig>,
     /// §2 crowdsourced-feedback tuning, pushed to opted-in clients via
     /// `FeedbackConfig` so thresholds can change without a client release.
     #[serde(default)]
@@ -198,18 +200,141 @@ pub struct ServerFileConfig {
     /// remains the only way a client gets a polymorphic mask).
     #[serde(default)]
     pub polymorphic: Option<PolymorphicFileConfig>,
-    /// R2 Phase B: path to the operator Ed25519 mask-signing key (32-byte
-    /// seed, raw or base64). Signs auto-generated masks post self-test.
+    /// Путь к приватному ключу подписи масок (Ed25519, 32 байта, сырые или
+    /// base64). Им подписываются маски после самопроверки генератора.
+    /// В сборке production-secure поле обязательно: без него конфигурация
+    /// невалидна, а генератор отказывается писать маску.
     #[serde(default)]
     pub mask_signing_key: Option<String>,
-    /// R2 Phase B: operator Ed25519 verifying public key (base64, 32 bytes)
-    /// for mask-load verification. Derived from `mask_signing_key` if absent.
+    /// Публичный ключ оператора (base64, 32 байта) для проверки подписи при
+    /// загрузке. Если поля нет, ключ выводится из `mask_signing_key`.
     #[serde(default)]
     pub mask_operator_pubkey: Option<String>,
-    /// R2 Phase B: mask verification mode on disk load: "off" | "warn"
-    /// (default) | "enforce".
+    /// Режим проверки масок при загрузке: "off", "warn" или "enforce".
+    /// В обычной сборке пустое поле означает warn. В production-secure
+    /// допустимы только пустое поле и "enforce": off и warn отклоняются.
     #[serde(default)]
     pub mask_verify_mode: Option<String>,
+}
+
+/// Непустое значение опциональной строки. `None` остается отсутствием поля.
+/// Строка из пробелов считается ошибкой: оператор задал поле, но значения нет.
+fn required_text<'a>(value: Option<&'a str>, field: &str) -> Result<Option<&'a str>, String> {
+    match value {
+        None => Ok(None),
+        Some(raw) => {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                Err(format!("{field}: пустое значение"))
+            } else {
+                Ok(Some(trimmed))
+            }
+        }
+    }
+}
+
+/// Сборка production-secure не выпускает неподписанные маски.
+pub fn mask_generation_requires_signing_key() -> bool {
+    cfg!(feature = "production-secure")
+}
+
+/// Режим, который реально применяет хранилище масок.
+///
+/// В production-secure это всегда `enforce`, даже если вызывающий код передал
+/// `off` или `warn`. Так пропущенная проверка конфигурации не ослабляет
+/// загрузку. Явный `off`/`warn` при этом все равно ошибка
+/// [`validate_mask_trust_config`]: старт сервера должен остановиться, а не
+/// молча подменить режим.
+pub fn effective_mask_verify_mode(
+    requested: aivpn_common::mask::MaskVerifyMode,
+) -> aivpn_common::mask::MaskVerifyMode {
+    #[cfg(feature = "production-secure")]
+    {
+        let _ = requested;
+        aivpn_common::mask::MaskVerifyMode::Enforce
+    }
+    #[cfg(not(feature = "production-secure"))]
+    {
+        requested
+    }
+}
+
+/// Проверка полей подписи масок.
+///
+/// Сюда передают уже слитые значения: флаг командной строки и переменная
+/// окружения важнее `server.json`. Метод [`ServerFileConfig::validate_mask_trust`]
+/// проверяет только файл, это путь `PUT /api/v1/config`.
+///
+/// Обычная сборка: ключ необязателен, пустой режим означает `warn`,
+/// `off`/`warn`/`enforce` допустимы, неизвестная строка отклоняется.
+///
+/// production-secure: `mask_signing_key` обязателен. Режим либо не задан
+/// (тогда действует `enforce`), либо явно `enforce`. `off` и `warn`
+/// невалидны. Публичный ключ может отсутствовать: он выводится из приватного.
+pub fn validate_mask_trust_config(
+    mask_signing_key: Option<&str>,
+    mask_operator_pubkey: Option<&str>,
+    mask_verify_mode: Option<&str>,
+) -> Result<aivpn_common::mask::MaskVerifyMode, String> {
+    let signing_key = required_text(mask_signing_key, "mask_signing_key")?;
+    let _operator_pubkey = required_text(mask_operator_pubkey, "mask_operator_pubkey")?;
+    let mode_raw = required_text(mask_verify_mode, "mask_verify_mode")?;
+
+    let requested = match mode_raw {
+        None => None,
+        Some(text) => Some(text.parse::<aivpn_common::mask::MaskVerifyMode>()?),
+    };
+
+    #[cfg(feature = "production-secure")]
+    {
+        if signing_key.is_none() {
+            return Err(
+                "production-secure требует mask_signing_key: без ключа оператора \
+                 сервер не должен выпускать маски"
+                    .to_string(),
+            );
+        }
+        match requested {
+            None | Some(aivpn_common::mask::MaskVerifyMode::Enforce) => {
+                Ok(aivpn_common::mask::MaskVerifyMode::Enforce)
+            }
+            Some(other) => Err(format!(
+                "production-secure принимает только mask_verify_mode=enforce, получено '{other:?}'"
+            )),
+        }
+    }
+    #[cfg(not(feature = "production-secure"))]
+    {
+        let _ = signing_key;
+        Ok(requested.unwrap_or(aivpn_common::mask::MaskVerifyMode::Warn))
+    }
+}
+
+/// Слитый режим после проверки доверия и эффективного режима сборки.
+///
+/// Сначала [`validate_mask_trust_config`]: в production-secure явные `off` и
+/// `warn` и пустой `mask_signing_key` возвращают ошибку, старт останавливается.
+/// Затем [`effective_mask_verify_mode`], чтобы пропущенная проверка не ослабила
+/// уже принятый режим.
+pub fn resolved_mask_verify_mode(
+    mask_signing_key: Option<&str>,
+    mask_operator_pubkey: Option<&str>,
+    mask_verify_mode: Option<&str>,
+) -> Result<aivpn_common::mask::MaskVerifyMode, String> {
+    let requested =
+        validate_mask_trust_config(mask_signing_key, mask_operator_pubkey, mask_verify_mode)?;
+    Ok(effective_mask_verify_mode(requested))
+}
+
+impl ServerFileConfig {
+    /// Проверка полей подписи в теле `server.json` без учета флагов запуска.
+    pub fn validate_mask_trust(&self) -> Result<aivpn_common::mask::MaskVerifyMode, String> {
+        validate_mask_trust_config(
+            self.mask_signing_key.as_deref(),
+            self.mask_operator_pubkey.as_deref(),
+            self.mask_verify_mode.as_deref(),
+        )
+    }
 }
 
 /// Every top-level key `ServerFileConfig` currently understands. Kept next to
@@ -240,6 +365,7 @@ pub const CONFIG_KNOWN_KEYS: &[&str] = &[
     "neural_enabled",
     "neural",
     "bootstrap_publish",
+    "passive_distribution",
     "feedback",
     "polymorphic",
     "mask_signing_key",
@@ -342,5 +468,142 @@ mod tests {
                 .is_err()
         );
         assert!(serde_json::from_str::<ServerFileConfig>(r#"{ "tun_mtu": "fast" }"#).is_err());
+    }
+
+    #[test]
+    fn shipped_example_mask_trust_matches_build() {
+        let cfg: ServerFileConfig = serde_json::from_str(EXAMPLE).unwrap();
+        let result = cfg.validate_mask_trust();
+        #[cfg(not(feature = "production-secure"))]
+        assert_eq!(
+            result.expect("dev example stays valid without a signing key"),
+            aivpn_common::mask::MaskVerifyMode::Warn
+        );
+        #[cfg(feature = "production-secure")]
+        assert!(
+            result.is_err(),
+            "example config has no mask_signing_key and must fail production-secure validation"
+        );
+    }
+
+    #[test]
+    fn mask_trust_rejects_blank_and_unknown_mode() {
+        let blank = validate_mask_trust_config(Some("  "), None, None);
+        assert!(blank.is_err(), "blank signing key path is not a value");
+        let unknown =
+            validate_mask_trust_config(Some("/etc/aivpn/mask-signing.key"), None, Some("strict"));
+        assert!(unknown.is_err(), "unknown verify mode must be rejected");
+        let blank_mode =
+            validate_mask_trust_config(Some("/etc/aivpn/mask-signing.key"), None, Some(" "));
+        assert!(blank_mode.is_err(), "blank verify mode is not the default");
+    }
+
+    #[cfg(not(feature = "production-secure"))]
+    #[test]
+    fn dev_mask_trust_keeps_optional_key_and_warn_default() {
+        assert_eq!(
+            validate_mask_trust_config(None, None, None).unwrap(),
+            aivpn_common::mask::MaskVerifyMode::Warn
+        );
+        assert_eq!(
+            validate_mask_trust_config(None, None, Some("off")).unwrap(),
+            aivpn_common::mask::MaskVerifyMode::Off
+        );
+        assert_eq!(
+            validate_mask_trust_config(Some("/etc/aivpn/mask-signing.key"), None, Some("enforce"))
+                .unwrap(),
+            aivpn_common::mask::MaskVerifyMode::Enforce
+        );
+        assert!(!mask_generation_requires_signing_key());
+        assert_eq!(
+            effective_mask_verify_mode(aivpn_common::mask::MaskVerifyMode::Warn),
+            aivpn_common::mask::MaskVerifyMode::Warn
+        );
+    }
+
+    #[cfg(feature = "production-secure")]
+    #[test]
+    fn production_secure_mask_trust_requires_signing_key_and_enforce() {
+        assert!(
+            validate_mask_trust_config(None, Some("cHVibGlj"), None).is_err(),
+            "pubkey alone does not replace the signing key"
+        );
+        assert!(validate_mask_trust_config(None, None, Some("enforce")).is_err());
+        assert!(
+            validate_mask_trust_config(Some("/etc/aivpn/mask-signing.key"), None, Some("warn"))
+                .is_err(),
+            "warn must not weaken a production-secure build"
+        );
+        assert!(
+            validate_mask_trust_config(Some("/etc/aivpn/mask-signing.key"), None, Some("off"))
+                .is_err(),
+            "off must not weaken a production-secure build"
+        );
+        assert_eq!(
+            validate_mask_trust_config(Some("/etc/aivpn/mask-signing.key"), None, None).unwrap(),
+            aivpn_common::mask::MaskVerifyMode::Enforce
+        );
+        assert_eq!(
+            validate_mask_trust_config(
+                Some("/etc/aivpn/mask-signing.key"),
+                Some("cHVibGlj"),
+                Some(" ENFORCE ")
+            )
+            .unwrap(),
+            aivpn_common::mask::MaskVerifyMode::Enforce
+        );
+        assert!(mask_generation_requires_signing_key());
+        assert_eq!(
+            effective_mask_verify_mode(aivpn_common::mask::MaskVerifyMode::Off),
+            aivpn_common::mask::MaskVerifyMode::Enforce
+        );
+        assert_eq!(
+            effective_mask_verify_mode(aivpn_common::mask::MaskVerifyMode::Warn),
+            aivpn_common::mask::MaskVerifyMode::Enforce
+        );
+    }
+
+    #[test]
+    fn resolved_mask_verify_mode_matches_effective_policy() {
+        #[cfg(not(feature = "production-secure"))]
+        {
+            assert_eq!(
+                resolved_mask_verify_mode(None, None, None).unwrap(),
+                aivpn_common::mask::MaskVerifyMode::Warn
+            );
+            assert_eq!(
+                resolved_mask_verify_mode(None, None, Some("off")).unwrap(),
+                aivpn_common::mask::MaskVerifyMode::Off
+            );
+        }
+        #[cfg(feature = "production-secure")]
+        {
+            assert!(resolved_mask_verify_mode(None, None, None).is_err());
+            assert!(resolved_mask_verify_mode(
+                Some("/etc/aivpn/mask-signing.key"),
+                None,
+                Some("off")
+            )
+            .is_err());
+            assert!(resolved_mask_verify_mode(
+                Some("/etc/aivpn/mask-signing.key"),
+                None,
+                Some("warn")
+            )
+            .is_err());
+            assert_eq!(
+                resolved_mask_verify_mode(Some("/etc/aivpn/mask-signing.key"), None, None).unwrap(),
+                aivpn_common::mask::MaskVerifyMode::Enforce
+            );
+            assert_eq!(
+                resolved_mask_verify_mode(
+                    Some("/etc/aivpn/mask-signing.key"),
+                    None,
+                    Some("enforce")
+                )
+                .unwrap(),
+                aivpn_common::mask::MaskVerifyMode::Enforce
+            );
+        }
     }
 }

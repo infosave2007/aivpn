@@ -6,6 +6,7 @@ import {
 } from 'drizzle-orm/sqlite-core'
 import {
   pgTable,
+  integer as pgInteger,
   serial,
   varchar,
   boolean,
@@ -13,7 +14,6 @@ import {
   bigint,
   jsonb,
 } from 'drizzle-orm/pg-core'
-import { IS_SQLITE } from '../config'
 
 // ─── SQLite schema ───────────────────────────────────────────────────────────
 
@@ -84,11 +84,9 @@ export const sqliteWebAudit = sqliteTable('web_audit', {
 })
 
 // ─── PostgreSQL schema ───────────────────────────────────────────────────────
-// Guarded: drizzle-orm 0.44.x + Bun 1.3.x has a pgTable builder incompatibility.
-// These are only evaluated when IS_SQLITE=false to avoid the startup crash.
+// Обе схемы строятся независимо и используют типы своего SQL-диалекта.
 
-/* eslint-disable @typescript-eslint/no-explicit-any */
-export const pgUsers: any = IS_SQLITE ? null : pgTable('users', {
+export const pgUsers = pgTable('users', {
   id: serial('id').primaryKey(),
   username: varchar('username', { length: 64 }).notNull().unique(),
   password_hash: varchar('password_hash', { length: 255 }),
@@ -96,8 +94,8 @@ export const pgUsers: any = IS_SQLITE ? null : pgTable('users', {
   totp_secret: varchar('totp_secret', { length: 128 }),
   totp_enabled: boolean('totp_enabled').notNull().default(false),
   // Last accepted RFC 6238 time step — one-time-use enforcement (auth/totp.ts)
-  totp_last_step: integer('totp_last_step'),
-  session_version: integer('session_version').notNull().default(0),
+  totp_last_step: pgInteger('totp_last_step'),
+  session_version: pgInteger('session_version').notNull().default(0),
   passkey_only: boolean('passkey_only').notNull().default(false),
   oidc_iss: varchar('oidc_iss', { length: 512 }),
   oidc_sub: varchar('oidc_sub', { length: 256 }),
@@ -105,9 +103,9 @@ export const pgUsers: any = IS_SQLITE ? null : pgTable('users', {
   last_login: timestamp('last_login', { withTimezone: true }),
 })
 
-export const pgSessions: any = IS_SQLITE ? null : pgTable('sessions', {
+export const pgSessions = pgTable('sessions', {
   id: varchar('id', { length: 64 }).primaryKey(),
-  user_id: integer('user_id')
+  user_id: pgInteger('user_id')
     .notNull()
     .references(() => pgUsers.id, { onDelete: 'cascade' }),
   refresh_token_hash: varchar('refresh_token_hash', { length: 128 }).notNull(),
@@ -119,9 +117,9 @@ export const pgSessions: any = IS_SQLITE ? null : pgTable('sessions', {
   created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
 })
 
-export const pgPasskeys: any = IS_SQLITE ? null : pgTable('passkeys', {
+export const pgPasskeys = pgTable('passkeys', {
   id: varchar('id', { length: 64 }).primaryKey(),
-  user_id: integer('user_id')
+  user_id: pgInteger('user_id')
     .notNull()
     .references(() => pgUsers.id, { onDelete: 'cascade' }),
   credential_id: varchar('credential_id', { length: 512 }).notNull().unique(),
@@ -134,9 +132,9 @@ export const pgPasskeys: any = IS_SQLITE ? null : pgTable('passkeys', {
   last_used_at: timestamp('last_used_at', { withTimezone: true }),
 })
 
-export const pgWebAudit: any = IS_SQLITE ? null : pgTable('web_audit', {
+export const pgWebAudit = pgTable('web_audit', {
   id: serial('id').primaryKey(),
-  user_id: integer('user_id').references(() => pgUsers.id, { onDelete: 'set null' }),
+  user_id: pgInteger('user_id').references(() => pgUsers.id, { onDelete: 'set null' }),
   action: varchar('action', { length: 128 }).notNull(),
   target: varchar('target', { length: 256 }),
   result: varchar('result', { length: 16 }).notNull(),

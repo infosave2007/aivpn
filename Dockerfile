@@ -22,6 +22,7 @@ RUN apt-get update && apt-get install -y \
 # moment a member is added.
 COPY Cargo.toml Cargo.lock ./
 COPY crates crates/
+COPY vendor vendor/
 COPY assets/masks assets/masks/
 
 # Build in release mode with the committed Cargo.lock (--locked → reproducible).

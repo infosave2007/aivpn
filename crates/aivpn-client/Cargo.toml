@@ -36,15 +36,11 @@ ssh-install = ["aivpn-common/ssh-install"]
 aivpn-common = { path = "../aivpn-common", version = "*", features = ["client-upload", "qr"] }
 
 # Crypto
-chacha20poly1305.workspace = true
-x25519-dalek.workspace = true
 blake3.workspace = true
-subtle.workspace = true
 ed25519-dalek = "2.0"
 
 # Async
 tokio.workspace = true
-tokio-util.workspace = true
 
 # Networking - use latest tun with async support
 tun = { version = "0.7", features = ["async"] }
@@ -59,22 +55,20 @@ rmp-serde.workspace = true
 rand.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
-thiserror.workspace = true
 bytes.workspace = true
-chrono.workspace = true
 clap = { version = "4.4", features = ["derive", "env"] }
 base64 = "0.22"
-hex = "0.4"
 portable-atomic = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
 # Userspace TCP/IP stack for proxy mode (--proxy-listen)
-smoltcp = { version = "0.11", default-features = false, features = ["socket-dns", "alloc", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-tcp", "socket-udp"] }
+smoltcp = { version = "0.11", default-features = false, features = ["socket-dns", "dns-max-server-count-4", "alloc", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-tcp", "socket-udp"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_Rpc", "Win32_NetworkManagement_WindowsFilteringPlatform", "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis"] }
 winapi = { version = "0.3", features = [
     "processthreadsapi",
     "securitybaseapi",

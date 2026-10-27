@@ -50,9 +50,11 @@
 
 ### Шаг 4 — Создать и запустить контейнер
 
+Соберите образ по инструкции ниже, сохраните его через `docker save` и загрузите `aivpn-mikrotik.tar` в `disk1/` через WinBox. Импорт из файла не требует опубликованного образа в Docker Hub. [Описание импорта RouterOS](https://help.mikrotik.com/docs/spaces/ROS/pages/84901929/Container#Container-OptionB:ImportimagefromPC).
+
 ```routeros
 /container/add \
-    remote-image=infosave2007/aivpn-mikrotik:latest \
+    file=disk1/aivpn-mikrotik.tar \
     interface=veth-aivpn \
     start-on-boot=yes \
     envlist=aivpn-env \
@@ -110,14 +112,17 @@ aivpn-server --show-client "my-mikrotik" \
 ```bash
 # Одна архитектура (arm64)
 docker build \
-    --platform linux/amd64 \
+    --platform linux/arm64 \
     --build-arg MUSL_IMAGE_TAG=aarch64-musl \
     --build-arg TARGET_TRIPLE=aarch64-unknown-linux-musl \
     -t aivpn-mikrotik:arm64 \
-    -f aivpn-mikrotik/Dockerfile .
+    -f platforms/mikrotik/Dockerfile .
+
+# Сохранить для импорта на роутере
+docker save --output aivpn-mikrotik.tar aivpn-mikrotik:arm64
 
 # Мульти-архитектурная публикация
-./aivpn-mikrotik/build-mikrotik.sh infosave2007/aivpn-mikrotik:latest
+./platforms/mikrotik/build-mikrotik.sh infosave2007/aivpn-mikrotik:latest
 ```
 
 ## Устранение неисправностей

@@ -440,7 +440,7 @@ pub fn encode_features(stats: &TrafficStats) -> [f32; FEAT_DIM] {
         features[28] =
             stats.inter_arrivals.iter().filter(|&&t| t > 500.0).count() as f32 / n as f32;
         let ns_s = sorted.len();
-        features[30] = saturate(sorted[(ns_s / 10).max(0)], IAT_SAT_MS);
+        features[30] = saturate(sorted[ns_s / 10], IAT_SAT_MS);
         features[31] = saturate(sorted[(ns_s * 9 / 10).min(ns_s - 1)], IAT_SAT_MS);
     }
 
@@ -619,7 +619,7 @@ pub fn encode_features(stats: &TrafficStats) -> [f32; FEAT_DIM] {
         let mut sz_sorted: Vec<f32> = stats.packet_sizes.iter().map(|&s| s as f32).collect();
         sz_sorted.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         let ns_sz = sz_sorted.len();
-        features[56] = (sz_sorted[(ns_sz / 10).max(0)] / 1500.0).min(1.0);
+        features[56] = (sz_sorted[ns_sz / 10] / 1500.0).min(1.0);
         features[57] = (sz_sorted[ns_sz / 4] / 1500.0).min(1.0);
         features[58] = (sz_sorted[ns_sz * 3 / 4] / 1500.0).min(1.0);
         features[59] = (sz_sorted[(ns_sz * 9 / 10).min(ns_sz - 1)] / 1500.0).min(1.0);
@@ -640,7 +640,7 @@ pub fn encode_features(stats: &TrafficStats) -> [f32; FEAT_DIM] {
         features[61] = stats
             .inter_arrivals
             .iter()
-            .filter(|&&t| t >= 10.0 && t <= 100.0)
+            .filter(|&&t| (10.0..=100.0).contains(&t))
             .count() as f32
             / n as f32;
         if !stats.packet_sizes.is_empty() {
@@ -772,6 +772,12 @@ pub struct AnomalyDetector {
     anomalous_reporters: HashMap<String, HashSet<[u8; 16]>>,
     baseline_loss: f64,
     baseline_rtt: f64,
+}
+
+impl Default for AnomalyDetector {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl AnomalyDetector {

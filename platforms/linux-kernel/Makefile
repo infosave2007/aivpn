@@ -4,9 +4,8 @@ KVER ?= $(shell uname -r)
 KDIR ?= /lib/modules/$(KVER)/build
 PWD  := $(shell pwd)
 
-# Enforce minimum kernel version 6.1
-KVER_MAJOR := $(shell echo $(KVER) | cut -d. -f1)
-KVER_MINOR := $(shell echo $(KVER) | cut -d. -f2 | cut -d- -f1)
+# Номер ядра не гарантирует совместимость Rust API. dev.rs проверяет owner
+# настоящей miscdevice vtable перед регистрацией; NULL означает отказ загрузки.
 
 # XDP BPF program — compiled with clang targeting BPF, independent of kbuild.
 # Best-effort: skipped silently if clang is not installed.
@@ -27,9 +26,10 @@ xdp:
 	fi
 
 _check_kver:
-	@if [ "$(KVER_MAJOR)" -lt 6 ] || \
-	   { [ "$(KVER_MAJOR)" -eq 6 ] && [ "$(KVER_MINOR)" -lt 1 ]; }; then \
-		echo "ERROR: Linux 6.1+ required, got $(KVER)" >&2; exit 1; fi
+	@test -r "$(KDIR)/Makefile" || { \
+		echo "ERROR: недоступны kernel headers: $(KDIR)" >&2; exit 1; }
+	@grep -qx 'CONFIG_RUST=y' "$(KDIR)/include/config/auto.conf" || { \
+		echo "ERROR: нужны kernel headers с CONFIG_RUST=y и совместимый Rust toolchain" >&2; exit 1; }
 
 clean:
 	$(MAKE) -C $(KDIR) M=$(PWD) clean

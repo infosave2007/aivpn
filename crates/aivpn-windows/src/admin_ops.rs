@@ -81,13 +81,6 @@ impl super::AivpnApp {
                         }
                     }
                 }
-                AdminResponse::ClientDeleted { id, result } => {
-                    self.admin_busy_ids.remove(&id);
-                    match result {
-                        Ok(()) => self.refresh_admin_clients(),
-                        Err(e) => self.show_error(e),
-                    }
-                }
                 AdminResponse::ClientRevoked { id, result } => {
                     self.admin_busy_ids.remove(&id);
                     if self.admin_revoke_id.as_deref() == Some(id.as_str()) {
@@ -174,6 +167,13 @@ impl super::AivpnApp {
                     }
                 }
                 AdminResponse::ConfigApplied { setting, result } => {
+                    let result = result.and_then(|response| {
+                        if response.applied {
+                            Ok(response)
+                        } else {
+                            Err("Server did not apply the requested configuration".to_string())
+                        }
+                    });
                     match setting {
                         admin::ConfigSetting::ActiveMask => self.admin_settings_mask_busy = false,
                         admin::ConfigSetting::ExitNode => self.admin_settings_exit_busy = false,

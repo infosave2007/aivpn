@@ -27,6 +27,9 @@ on:
 permissions:
   contents: write
 
+env:
+  AIVPN_RELEASE_PUBKEY: ${{ vars.RELEASE_PUBLIC_KEY }}
+
 jobs:
   build-linux-server-asset:
     runs-on: ubuntu-latest
@@ -34,6 +37,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name || github.event.inputs.tag || github.ref }}
 
       - name: Setup Rust Toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -46,13 +51,6 @@ jobs:
       - name: Build full-feature Linux x86_64 server asset
         run: make server
 
-      # Artifact integrity: publish a SHA256SUMS file alongside the binary so
-      # `make deploy` / `make server-deploy` can verify what they downloaded
-      # before chmod +x / running it. No GPG/cosign signing key is available
-      # in this repo's CI yet — a published checksum is the floor, not the
-      # full answer (it proves the download wasn't corrupted/tampered with in
-      # transit from GitHub's CDN, not that the release itself is authentic;
-      # that needs a signing key + verification step as a follow-up).
       - name: Generate SHA256SUMS
         run: |
           cd releases
@@ -73,6 +71,22 @@ jobs:
           path: releases/aivpn-server-linux-x86_64.SHA256SUMS
           if-no-files-found: error
 
+      - name: Install signing OpenSSL on macOS
+        if: runner.os == 'macOS'
+        run: |
+          brew install openssl@3
+          echo "$(brew --prefix openssl@3)/bin" >> "$GITHUB_PATH"
+
+      - name: Sign release assets
+        shell: bash
+        env:
+          RELEASE_SIGNING_KEY_PEM: ${{ secrets.RELEASE_SIGNING_KEY_PEM }}
+          RELEASE_PUBLIC_KEY: ${{ vars.RELEASE_PUBLIC_KEY }}
+        run: |
+          assets=()
+          while IFS= read -r -d '' asset; do assets+=("$asset"); done < <(find releases -maxdepth 1 -type f ! -name "*.sig" -print0)
+          deploy/ci/sign-release-assets.sh "${assets[@]}"
+
       - name: Publish asset to GitHub Release
         if: github.event_name == 'release' || github.event.inputs.tag != ''
         uses: softprops/action-gh-release@v2
@@ -80,7 +94,9 @@ jobs:
           tag_name: ${{ github.event.release.tag_name || github.event.inputs.tag }}
           files: |
             releases/aivpn-server-linux-x86_64
+            releases/aivpn-server-linux-x86_64.sig
             releases/aivpn-server-linux-x86_64.SHA256SUMS
+            releases/aivpn-server-linux-x86_64.SHA256SUMS.sig
           fail_on_unmatched_files: true
 
   build-linux-server-aarch64-asset:
@@ -89,6 +105,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name || github.event.inputs.tag || github.ref }}
 
       # Full feature set (management-api, metrics, neural), musl static
       # cross-build — see the server-musl-aarch64-full target in the Makefile
@@ -117,6 +135,22 @@ jobs:
           path: releases/aivpn-server-linux-aarch64.SHA256SUMS
           if-no-files-found: error
 
+      - name: Install signing OpenSSL on macOS
+        if: runner.os == 'macOS'
+        run: |
+          brew install openssl@3
+          echo "$(brew --prefix openssl@3)/bin" >> "$GITHUB_PATH"
+
+      - name: Sign release assets
+        shell: bash
+        env:
+          RELEASE_SIGNING_KEY_PEM: ${{ secrets.RELEASE_SIGNING_KEY_PEM }}
+          RELEASE_PUBLIC_KEY: ${{ vars.RELEASE_PUBLIC_KEY }}
+        run: |
+          assets=()
+          while IFS= read -r -d '' asset; do assets+=("$asset"); done < <(find releases -maxdepth 1 -type f ! -name "*.sig" -print0)
+          deploy/ci/sign-release-assets.sh "${assets[@]}"
+
       - name: Publish asset to GitHub Release
         if: github.event_name == 'release' || github.event.inputs.tag != ''
         uses: softprops/action-gh-release@v2
@@ -124,7 +158,9 @@ jobs:
           tag_name: ${{ github.event.release.tag_name || github.event.inputs.tag }}
           files: |
             releases/aivpn-server-linux-aarch64
+            releases/aivpn-server-linux-aarch64.sig
             releases/aivpn-server-linux-aarch64.SHA256SUMS
+            releases/aivpn-server-linux-aarch64.SHA256SUMS.sig
           fail_on_unmatched_files: true
 
   build-macos-release-assets:
@@ -133,6 +169,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name || github.event.inputs.tag || github.ref }}
 
       - name: Setup Rust Toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -151,6 +189,22 @@ jobs:
             releases/aivpn-macos.dmg
           if-no-files-found: error
 
+      - name: Install signing OpenSSL on macOS
+        if: runner.os == 'macOS'
+        run: |
+          brew install openssl@3
+          echo "$(brew --prefix openssl@3)/bin" >> "$GITHUB_PATH"
+
+      - name: Sign release assets
+        shell: bash
+        env:
+          RELEASE_SIGNING_KEY_PEM: ${{ secrets.RELEASE_SIGNING_KEY_PEM }}
+          RELEASE_PUBLIC_KEY: ${{ vars.RELEASE_PUBLIC_KEY }}
+        run: |
+          assets=()
+          while IFS= read -r -d '' asset; do assets+=("$asset"); done < <(find releases -maxdepth 1 -type f ! -name "*.sig" -print0)
+          deploy/ci/sign-release-assets.sh "${assets[@]}"
+
       - name: Publish macOS assets to GitHub Release
         if: github.event_name == 'release' || github.event.inputs.tag != ''
         uses: softprops/action-gh-release@v2
@@ -158,7 +212,9 @@ jobs:
           tag_name: ${{ github.event.release.tag_name || github.event.inputs.tag }}
           files: |
             releases/aivpn-macos.pkg
+            releases/aivpn-macos.pkg.sig
             releases/aivpn-macos.dmg
+            releases/aivpn-macos.dmg.sig
           fail_on_unmatched_files: true
 
   build-android-release-asset:
@@ -176,6 +232,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name || github.event.inputs.tag || github.ref }}
 
       - name: Set up Java
         uses: actions/setup-java@v4
@@ -215,12 +273,30 @@ jobs:
           path: releases/aivpn-android.apk
           if-no-files-found: error
 
+      - name: Install signing OpenSSL on macOS
+        if: runner.os == 'macOS'
+        run: |
+          brew install openssl@3
+          echo "$(brew --prefix openssl@3)/bin" >> "$GITHUB_PATH"
+
+      - name: Sign release assets
+        shell: bash
+        env:
+          RELEASE_SIGNING_KEY_PEM: ${{ secrets.RELEASE_SIGNING_KEY_PEM }}
+          RELEASE_PUBLIC_KEY: ${{ vars.RELEASE_PUBLIC_KEY }}
+        run: |
+          assets=()
+          while IFS= read -r -d '' asset; do assets+=("$asset"); done < <(find releases -maxdepth 1 -type f ! -name "*.sig" -print0)
+          deploy/ci/sign-release-assets.sh "${assets[@]}"
+
       - name: Publish Android APK to GitHub Release
         if: github.event_name == 'release' || github.event.inputs.tag != ''
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.event.release.tag_name || github.event.inputs.tag }}
-          files: releases/aivpn-android.apk
+          files: |
+            releases/aivpn-android.apk
+            releases/aivpn-android.apk.sig
           fail_on_unmatched_files: true
 
   build-musl-release-assets:
@@ -245,6 +321,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name || github.event.inputs.tag || github.ref }}
 
       - name: Build musl release artifact
         run: make ${{ matrix.make_target }}
@@ -256,12 +334,30 @@ jobs:
           path: releases/${{ matrix.artifact_name }}
           if-no-files-found: error
 
+      - name: Install signing OpenSSL on macOS
+        if: runner.os == 'macOS'
+        run: |
+          brew install openssl@3
+          echo "$(brew --prefix openssl@3)/bin" >> "$GITHUB_PATH"
+
+      - name: Sign release assets
+        shell: bash
+        env:
+          RELEASE_SIGNING_KEY_PEM: ${{ secrets.RELEASE_SIGNING_KEY_PEM }}
+          RELEASE_PUBLIC_KEY: ${{ vars.RELEASE_PUBLIC_KEY }}
+        run: |
+          assets=()
+          while IFS= read -r -d '' asset; do assets+=("$asset"); done < <(find releases -maxdepth 1 -type f ! -name "*.sig" -print0)
+          deploy/ci/sign-release-assets.sh "${assets[@]}"
+
       - name: Publish asset to GitHub Release
         if: github.event_name == 'release' || github.event.inputs.tag != ''
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.event.release.tag_name || github.event.inputs.tag }}
-          files: releases/${{ matrix.artifact_name }}
+          files: |
+            releases/${{ matrix.artifact_name }}
+            releases/${{ matrix.artifact_name }}.sig
           fail_on_unmatched_files: true
 
   build-windows-release-assets:
@@ -270,6 +366,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name || github.event.inputs.tag || github.ref }}
 
       - name: Install cross-compilation dependencies
         run: |
@@ -291,6 +389,22 @@ jobs:
             releases/aivpn-windows-gui.zip
           if-no-files-found: error
 
+      - name: Install signing OpenSSL on macOS
+        if: runner.os == 'macOS'
+        run: |
+          brew install openssl@3
+          echo "$(brew --prefix openssl@3)/bin" >> "$GITHUB_PATH"
+
+      - name: Sign release assets
+        shell: bash
+        env:
+          RELEASE_SIGNING_KEY_PEM: ${{ secrets.RELEASE_SIGNING_KEY_PEM }}
+          RELEASE_PUBLIC_KEY: ${{ vars.RELEASE_PUBLIC_KEY }}
+        run: |
+          assets=()
+          while IFS= read -r -d '' asset; do assets+=("$asset"); done < <(find releases -maxdepth 1 -type f ! -name "*.sig" -print0)
+          deploy/ci/sign-release-assets.sh "${assets[@]}"
+
       - name: Publish Windows assets to GitHub Release
         if: github.event_name == 'release' || github.event.inputs.tag != ''
         uses: softprops/action-gh-release@v2
@@ -298,7 +412,9 @@ jobs:
           tag_name: ${{ github.event.release.tag_name || github.event.inputs.tag }}
           files: |
             releases/aivpn-windows-installer.exe
+            releases/aivpn-windows-installer.exe.sig
             releases/aivpn-windows-gui.zip
+            releases/aivpn-windows-gui.zip.sig
           fail_on_unmatched_files: true
 
   build-ios-release-asset:
@@ -307,6 +423,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name || github.event.inputs.tag || github.ref }}
 
       - name: Setup Rust Toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -326,10 +444,58 @@ jobs:
           path: releases/aivpn-ios.ipa
           if-no-files-found: error
 
+      - name: Install signing OpenSSL on macOS
+        if: runner.os == 'macOS'
+        run: |
+          brew install openssl@3
+          echo "$(brew --prefix openssl@3)/bin" >> "$GITHUB_PATH"
+
+      - name: Sign release assets
+        shell: bash
+        env:
+          RELEASE_SIGNING_KEY_PEM: ${{ secrets.RELEASE_SIGNING_KEY_PEM }}
+          RELEASE_PUBLIC_KEY: ${{ vars.RELEASE_PUBLIC_KEY }}
+        run: |
+          assets=()
+          while IFS= read -r -d '' asset; do assets+=("$asset"); done < <(find releases -maxdepth 1 -type f ! -name "*.sig" -print0)
+          deploy/ci/sign-release-assets.sh "${assets[@]}"
+
       - name: Publish iOS asset to GitHub Release
         if: github.event_name == 'release' || github.event.inputs.tag != ''
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.event.release.tag_name || github.event.inputs.tag }}
-          files: releases/aivpn-ios.ipa
+          files: |
+            releases/aivpn-ios.ipa
+            releases/aivpn-ios.ipa.sig
+          fail_on_unmatched_files: true
+
+  masks-release-asset:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name || github.event.inputs.tag || github.ref }}
+      - name: Package masks
+        run: |
+          mkdir -p releases
+          tar -czf releases/masks.tar.gz -C assets/masks .
+          cd releases
+          sha256sum masks.tar.gz > masks.tar.gz.SHA256SUMS
+      - name: Sign masks
+        env:
+          RELEASE_SIGNING_KEY_PEM: ${{ secrets.RELEASE_SIGNING_KEY_PEM }}
+          RELEASE_PUBLIC_KEY: ${{ vars.RELEASE_PUBLIC_KEY }}
+        run: deploy/ci/sign-release-assets.sh releases/masks.tar.gz releases/masks.tar.gz.SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: masks-release
+          path: releases/masks.tar.gz*
+          if-no-files-found: error
+      - name: Publish masks
+        if: github.event_name == 'release' || github.event.inputs.tag != ''
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.release.tag_name || github.event.inputs.tag }}
+          files: releases/masks.tar.gz*
           fail_on_unmatched_files: true

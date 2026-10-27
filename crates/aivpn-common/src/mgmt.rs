@@ -168,19 +168,18 @@ impl MgmtClient {
             path: path.to_string(),
             body,
         };
-        if let Err(e) = control_tx.send(payload).await {
-            return Err(Error::Channel(e.to_string()));
-        }
-
-        match tokio::time::timeout(timeout, resp_rx).await {
-            Ok(Ok(result)) => Ok(result),
-            Ok(Err(_)) => {
-                // Sender side dropped without sending, which
-                // `on_mgmt_response` never does — defensive guard only.
-                Err(Error::Session(
-                    "mgmt_call: response channel closed unexpectedly".into(),
-                ))
-            }
+        // Один таймаут ограничивает и очередь отправки, и ожидание ответа.
+        let request = async {
+            control_tx
+                .send(payload)
+                .await
+                .map_err(|e| Error::Channel(e.to_string()))?;
+            resp_rx.await.map_err(|_| {
+                Error::Session("mgmt_call: response channel closed unexpectedly".into())
+            })
+        };
+        match tokio::time::timeout(timeout, request).await {
+            Ok(result) => result,
             Err(_) => Err(Error::Session(format!(
                 "mgmt_call: timed out awaiting MgmtResponse for req_id={}",
                 req_id
@@ -192,6 +191,35 @@ impl MgmtClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn mgmt_call_timeout_includes_waiting_for_channel_capacity() {
+        let mgmt = MgmtClient::new();
+        let (control_tx, mut control_rx) = mpsc::channel(1);
+        control_tx
+            .send(ControlPayload::Keepalive { send_ts: 1 })
+            .await
+            .unwrap();
+        let result = tokio::time::timeout(
+            Duration::from_secs(11),
+            mgmt.mgmt_call(
+                &control_tx,
+                0,
+                "/api/v1/clients",
+                vec![],
+                Duration::from_secs(10),
+            ),
+        )
+        .await
+        .expect("Переполненный канал должен учитывать таймаут запроса");
+        assert!(result.is_err());
+        assert!(mgmt.pending.lock().unwrap().is_empty());
+        assert!(matches!(
+            control_rx.try_recv(),
+            Ok(ControlPayload::Keepalive { .. })
+        ));
+        assert!(control_rx.try_recv().is_err());
+    }
 
     #[test]
     fn cached_role_defaults_to_user_before_any_capabilities_message() {

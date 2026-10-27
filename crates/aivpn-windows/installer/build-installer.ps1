@@ -13,13 +13,14 @@ $intermediateOutputExe = Join-Path $buildRoot 'aivpn-windows-installer.exe'
 $makensis = 'C:\Program Files (x86)\NSIS\makensis.exe'
 
 $cargoToml = Join-Path $repoRoot 'Cargo.toml'
-$appVersion = '0.2.0'
-if (Test-Path $cargoToml) {
-    $match = Select-String -Path $cargoToml -Pattern '^version\s*=\s*"([^"]+)"' | Select-Object -First 1
-    if ($match -and $match.Matches.Count -gt 0) {
-        $appVersion = $match.Matches[0].Groups[1].Value
-    }
+if (-not (Test-Path $cargoToml)) {
+    throw 'Missing workspace Cargo.toml.'
 }
+$match = Select-String -Path $cargoToml -Pattern '^version\s*=\s*"([^"]+)"' | Select-Object -First 1
+if (-not $match -or $match.Matches.Count -eq 0) {
+    throw 'Unable to determine the application version from Cargo.toml.'
+}
+$appVersion = $match.Matches[0].Groups[1].Value
 
 if (-not (Test-Path (Join-Path $packageDir 'aivpn.exe'))) {
     throw 'Missing releases\\aivpn-windows-package\\aivpn.exe. Build the release package first.'

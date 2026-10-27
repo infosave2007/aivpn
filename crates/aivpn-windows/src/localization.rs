@@ -185,37 +185,7 @@ impl AppSettings {
     }
 }
 
-/// Load theme preference (defaults to dark).
-pub fn load_theme() -> bool {
-    AppSettings::load().dark_mode
-}
-
-/// Persist theme preference alongside language setting.
-pub fn save_theme(dark: bool) {
-    let mut s = AppSettings::load();
-    s.dark_mode = dark;
-    s.save();
-}
-
 impl Lang {
-    pub fn load() -> Self {
-        AppSettings::load().lang
-    }
-
-    pub fn save(&self) {
-        let mut s = AppSettings::load();
-        s.lang = *self;
-        s.save();
-    }
-
-    pub fn toggle(&mut self) {
-        *self = match self {
-            Lang::En => Lang::Ru,
-            Lang::Ru => Lang::En,
-        };
-        self.save();
-    }
-
     pub fn label(&self) -> &'static str {
         match self {
             Lang::En => "EN",
@@ -543,6 +513,10 @@ pub fn t(lang: Lang, key: &str) -> &'static str {
         (Lang::Ru, "admin_pool_revoked") => "отозван",
         (Lang::En, "admin_pool_last_seen") => "Last seen",
         (Lang::Ru, "admin_pool_last_seen") => "Последний раз в сети",
+        (Lang::En, "admin_device_bound") => "Device binding enabled",
+        (Lang::Ru, "admin_device_bound") => "Включена привязка к устройству",
+        (Lang::En, "admin_pool_diverged") => "Pool databases have diverged",
+        (Lang::Ru, "admin_pool_diverged") => "Базы узлов пула различаются",
         (Lang::En, "admin_pool_partition_conflict") => {
             "⚠ Partition conflict: a peer claims the same VPN-IP partition as this node"
         }

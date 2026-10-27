@@ -88,7 +88,7 @@ mod tests {
 
     #[test]
     fn catalog_json_roundtrips() {
-        let masks = vec![
+        let masks = [
             ("webrtc_zoom_v3".to_string(), "Zoom".to_string(), false),
             ("auto_quic_v1".to_string(), "QUIC".to_string(), true),
         ];
