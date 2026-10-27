@@ -260,6 +260,17 @@ pub(crate) async fn recv_from(
     }
 }
 
+/// Tests share mask socket helpers across platforms; without IP_PKTINFO
+/// the local destination is unknown.
+#[cfg(all(test, not(target_os = "linux")))]
+pub(crate) async fn recv_from(
+    socket: &UdpSocket,
+    buffer: &mut [u8],
+) -> io::Result<(usize, SocketAddr, Option<LocalEndpoint>)> {
+    let (length, peer) = socket.recv_from(buffer).await?;
+    Ok((length, peer, None))
+}
+
 pub(crate) async fn send_to(
     socket: &UdpSocket,
     sources: &ReplySources,
