@@ -72,6 +72,17 @@ jobs:
         python3 deploy/ci/test-openwrt-init.py
         python3 deploy/ci/test-macos-admin-ipc.py
 
+    # Разрешение действует только на одноразовом runner, маршруты создаются в новом namespace.
+    - name: Prepare network namespace regression tests
+      run: |
+        if [ -f /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+        fi
+        unshare --user --map-root-user --net sh -eu -c '
+          ip -6 route add blackhole 2001:db8::/32
+          ip -6 route del blackhole 2001:db8::/32
+        '
+
     - name: Run tests
       run: cargo test --locked --workspace --exclude aivpn-windows --features "aivpn-server/management-api,aivpn-server/metrics,aivpn-server/dns,aivpn-server/passive-distribution,aivpn-server/neural,aivpn-client/client-dpi-gate" --verbose
 
