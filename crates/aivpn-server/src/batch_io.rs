@@ -234,7 +234,7 @@ impl MmsgIo {
                     hdrs[i].msg_hdr.msg_iov = &mut iovecs[i];
                     hdrs[i].msg_hdr.msg_iovlen = 1;
                     hdrs[i].msg_hdr.msg_control = controls[i].0.as_mut_ptr().cast();
-                    hdrs[i].msg_hdr.msg_controllen = controls[i].0.len();
+                    hdrs[i].msg_hdr.msg_controllen = controls[i].0.len() as _;
                     hdrs[i].msg_hdr.msg_name = &mut addrs[i] as *mut _ as *mut libc::c_void;
                     hdrs[i].msg_hdr.msg_namelen =
                         std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;

@@ -241,8 +241,13 @@ jobs:
           distribution: temurin
           java-version: '17'
 
+      # The action installs "tools platform-tools" by default, but the legacy
+      # "tools" package is no longer in the SDK repository and sdkmanager fails.
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
+        with:
+          packages: platform-tools
+          log-accepted-android-sdk-licenses: false
 
       - name: Install Android NDK and build prerequisites
         run: |

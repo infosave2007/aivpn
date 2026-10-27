@@ -4,10 +4,11 @@
 //! транспорта принадлежат вызывающему коду. Протокольный движок маски
 //! получает пакеты и таймеры, а затем возвращает готовые UDP payload.
 
+use portable_atomic::AtomicU64;
 use std::collections::VecDeque;
 use std::io;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 

@@ -1,6 +1,6 @@
 # Changelog
 
-## [1.2.0] - not yet released
+## [1.2.0] - 2026-10-27
 
 > **Dual-stack networking, signed distribution and application hardening.** This release extends IPv6 support across the tunnel, adds large management messages and new bootstrap/distribution channels, and fixes session, storage and platform security issues. Inter-server connections now use masked handshake sessions throughout; static legacy sessions and the server mode without a database are removed.
 

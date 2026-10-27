@@ -67,7 +67,7 @@ deploy/ci/               — CI gates run by the Makefile (see `make help`)
 
 ### Initial exchange and accelerator compatibility
 
-In the upcoming 1.2.0 release the initial exchange moves to InitialV2. It is incompatible with the released 1.1.0 and earlier 1.2.0 development builds. Update servers, pool/site/chain nodes and all clients together, including embedded mobile cores. The connection key format and the inter-server management protocol are unchanged. The initial AEAD uses XChaCha20-Poly1305 with a random 24-byte nonce and the connection context in the AAD; the established channel keeps the existing ChaCha20-Poly1305 format and kernel ABI 7.
+Starting with 1.2.0, the initial exchange uses InitialV2. It is incompatible with 1.1.0 and earlier 1.2.0 development builds. Update servers, pool/site/chain nodes and all clients together, including embedded mobile cores. The connection key format and the inter-server management protocol are unchanged. The initial AEAD uses XChaCha20-Poly1305 with a random 24-byte nonce and the connection context in the AAD; the established channel keeps the existing ChaCha20-Poly1305 format and kernel ABI 7.
 
 The Linux module requires compatible Rust-for-Linux APIs, kernel headers built with `CONFIG_RUST=y` and the matching Rust toolchain. A kernel version number alone does not guarantee support. Before registering `/dev/aivpn`, the module checks `file_operations.owner` in the real miscdevice vtable and fails with `ENODEV` if the API does not pin the module code to the open descriptor. This check cannot be bypassed; without the accelerator, userspace TUN is used.
 

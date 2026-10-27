@@ -17,7 +17,7 @@ RUN apt-get update && apt-get install -y \
 COPY Cargo.toml Cargo.lock ./
 COPY crates crates/
 COPY vendor vendor/
-COPY assets/masks assets/masks/
+COPY assets assets/
 
 # --locked: build the exact dependency set recorded in Cargo.lock, so the test
 # client is built from the same graph as the server image.

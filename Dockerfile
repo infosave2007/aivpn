@@ -23,7 +23,7 @@ RUN apt-get update && apt-get install -y \
 COPY Cargo.toml Cargo.lock ./
 COPY crates crates/
 COPY vendor vendor/
-COPY assets/masks assets/masks/
+COPY assets assets/
 
 # Build in release mode with the committed Cargo.lock (--locked → reproducible).
 # Full feature set so the image works with the web panel (management-api →

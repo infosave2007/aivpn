@@ -269,7 +269,7 @@ define _musl
 	  printf 'COPY Cargo.toml Cargo.lock ./\n'; \
 	  printf 'COPY crates crates/\n'; \
 	  printf 'COPY vendor vendor/\n'; \
-	  printf 'COPY assets/masks assets/masks/\n'; \
+	  printf 'COPY assets assets/\n'; \
 	  printf 'RUN if [ -n "$$BUILD_FEATURES" ]; then cargo build --locked --release --target "$$TARGET_TRIPLE" -p "$$CRATE_NAME" --bin "$$BINARY_NAME" --features "$$BUILD_FEATURES"; else cargo build --locked --release --target "$$TARGET_TRIPLE" -p "$$CRATE_NAME" --bin "$$BINARY_NAME"; fi\n'; \
 	} > "$$TMPDF"; \
 	trap "rm -f $$TMPDF; docker rm -f $$CTR >/dev/null 2>&1 || true" EXIT; \
