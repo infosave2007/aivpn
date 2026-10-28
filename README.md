@@ -1,3 +1,9 @@
+<p>
+<sub><strong>Experimental Project.</strong> AIVPN is an engineering research project exploring network protocols and methods of protecting data in transit. It does not guarantee the ability to bypass network restrictions, anonymity, or protection against detection and blocking. The project has no political objectives.</sub><br>
+<sub>The project is not intended for unlawful use. Users must comply with the laws applicable where they are located and use the software at their own risk. The author does not endorse unlawful use of the project.</sub><br>
+<sub>Third-party claims about the project's guaranteed effectiveness or political purpose do not represent the author's position.</sub>
+</p>
+
 🌐 [Русский](README_RU.md) | [中文](README_CN.md)
 
 # AIVPN
