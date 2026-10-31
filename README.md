@@ -4,7 +4,7 @@
 <sub>Third-party claims about the project's guaranteed effectiveness or political purpose do not represent the author's position.</sub>
 </p>
 
-🌐 [Русский](README_RU.md) | [中文](README_CN.md)
+🌐 [Русский](README_RU.md) | [中文](README_CN.md) | [日本語](README_JA.md)
 
 # AIVPN
 
