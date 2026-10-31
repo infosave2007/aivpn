@@ -1,4 +1,4 @@
-🌐 [English](README.md) | [Русский](README_RU.md)
+🌐 [English](README.md) | [Русский](README_RU.md) | [日本語](README_JA.md)
 
 # AIVPN
 
