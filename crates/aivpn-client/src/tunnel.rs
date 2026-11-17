@@ -513,6 +513,11 @@ impl Tunnel {
             }
             if let Some(ref idx) = self.wintun_if_index {
                 info!("Wintun interface index: {}", idx);
+                if let Ok(ifindex) = idx.parse::<u32>() {
+                    crate::net_change::set_own_tun_ifindex(ifindex);
+                } else {
+                    debug!("net_change: Wintun interface index is not numeric; events will not be filtered");
+                }
             } else {
                 // Without the interface index, configure_windows() would add VPN routes
                 // bound to the default gateway NIC instead of the wintun adapter, silently

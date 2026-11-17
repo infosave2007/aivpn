@@ -32,17 +32,43 @@ use tokio::sync::Notify;
 /// is torn down. Cheap (one relaxed atomic store) and safe to call when no
 /// listener is running or on platforms that have none.
 ///
-/// Only the Linux listener consumes this today. The Windows
-/// `NotifyIpInterfaceChange` callback receives a `MIB_IPINTERFACE_ROW` it
-/// currently ignores; filtering there would mean committing to that struct's
-/// binary layout, which the FFI block below is already flagged as unable to
-/// verify in this environment — so Windows keeps relying on the
-/// `last_rx`-based guard in `client::session` plus the poll-based watchdogs.
+/// Linux and Windows listeners use this index to filter changes caused by the client TUN.
 pub fn set_own_tun_ifindex(ifindex: u32) {
     #[cfg(target_os = "linux")]
     linux_impl::set_own_tun_ifindex(ifindex);
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(windows)]
+    windows_impl::set_own_tun_ifindex(ifindex);
+    #[cfg(not(any(target_os = "linux", windows)))]
     let _ = ifindex;
+}
+
+fn has_foreign_interface_change(changed_ifindices: &[Option<u32>], own_ifindex: u32) -> bool {
+    own_ifindex == 0
+        || changed_ifindices
+            .iter()
+            .any(|changed| *changed != Some(own_ifindex))
+}
+
+#[cfg(test)]
+mod interface_change_tests {
+    use super::has_foreign_interface_change;
+
+    #[test]
+    fn own_tun_interface_change_is_ignored() {
+        assert!(!has_foreign_interface_change(&[Some(7), Some(7)], 7));
+    }
+
+    #[test]
+    fn other_or_unattributed_interface_change_is_preserved() {
+        assert!(has_foreign_interface_change(&[Some(3)], 7));
+        assert!(has_foreign_interface_change(&[None], 7));
+        assert!(has_foreign_interface_change(&[Some(7), Some(3)], 7));
+    }
+
+    #[test]
+    fn unknown_own_interface_keeps_conservative_behavior() {
+        assert!(has_foreign_interface_change(&[Some(7)], 0));
+    }
 }
 
 /// Start the best-effort native network-change listener for this platform.
@@ -60,6 +86,20 @@ pub fn spawn() -> Option<Arc<Notify>> {
     #[cfg(not(any(target_os = "linux", windows)))]
     {
         None
+    }
+}
+
+/// Consume any coalesced native notification and report whether it came from
+/// an interface other than this client's TUN. Linux filters in its listener;
+/// Windows retains row indexes until the session loop can safely compare them.
+pub fn has_foreign_pending_change() -> bool {
+    #[cfg(windows)]
+    {
+        windows_impl::has_foreign_pending_change()
+    }
+    #[cfg(not(windows))]
+    {
+        true
     }
 }
 
@@ -361,41 +401,35 @@ mod linux_impl {
 mod windows_impl {
     use super::*;
     use std::os::raw::c_void;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use windows_sys::Win32::NetworkManagement::IpHelper::MIB_IPINTERFACE_ROW;
+
+    static OWN_TUN_IFINDEX: AtomicU32 = AtomicU32::new(0);
+    static PENDING_IFINDICES: std::sync::Mutex<Vec<Option<u32>>> =
+        std::sync::Mutex::new(Vec::new());
+    const MAX_PENDING_IFINDICES: usize = 64;
+
+    pub fn set_own_tun_ifindex(ifindex: u32) {
+        OWN_TUN_IFINDEX.store(ifindex, Ordering::Relaxed);
+    }
+
+    /// Compare coalesced callback rows after Wintun has exposed its interface
+    /// index. A row can arrive before that index is known during adapter setup.
+    pub fn has_foreign_pending_change() -> bool {
+        let changed = {
+            let mut pending = PENDING_IFINDICES
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            std::mem::take(&mut *pending)
+        };
+        has_foreign_interface_change(&changed, OWN_TUN_IFINDEX.load(Ordering::Relaxed))
+    }
 
     // ── Raw FFI for NotifyIpInterfaceChange (Netioapi.h, exported by
     // Iphlpapi.dll/Iphlpapi.lib) ────────────────────────────────────────────
-    //
-    // NOT available in the vendored `winapi` 0.3.9 crate already used by
-    // this workspace (checked: `winapi::um::netioapi` does not exist in that
-    // version; `winapi::um::iphlpapi` only has the legacy
-    // NotifyAddrChange/NotifyRouteChange overlapped-I/O API). Declared here
-    // by hand against the documented Win32 ABI instead of adding a new
-    // top-level dependency (`windows`/`windows-sys`) that can't be resolved
-    // or compiled in this sandbox for verification.
-    //
-    // Reference signature (Microsoft Learn, netioapi.h — unchanged since
-    // Windows Vista):
-    //   NETIOAPI_API NotifyIpInterfaceChange(
-    //       ADDRESS_FAMILY Family,                       // USHORT
-    //       PIPINTERFACE_CHANGE_CALLBACK Callback,        // extern "system" fn
-    //       PVOID CallerContext,
-    //       BOOLEAN InitialNotification,                  // u8
-    //       HANDLE *NotificationHandle
-    //   ) -> NETIOAPI_API;                                 // DWORD (u32) error code, NO_ERROR=0
-    //
-    //   typedef VOID (*PIPINTERFACE_CHANGE_CALLBACK)(
-    //       PVOID CallerContext,
-    //       PMIB_IPINTERFACE_ROW Row,                      // never dereferenced here —
-    //       MIB_NOTIFICATION_TYPE NotificationType         // declared as an opaque pointer
-    //   );                                                  // and c_int-sized enum below
-    //
-    // RISK NOTE (see task hand-off): this signature could not be verified
-    // against a live Microsoft Learn fetch in this sandbox (network access
-    // to learn.microsoft.com was blocked). It is transcribed from stable,
-    // extensively-documented Win32 API surface unchanged for over a decade,
-    // matching the pattern used by established crates (e.g. `if-watch`,
-    // `network-interface`). Flagged for hand-review before a Windows build,
-    // per the task's own instruction.
+    // The callback uses the SDK MIB_IPINTERFACE_ROW layout from windows-sys so
+    // its InterfaceIndex can be checked before treating the event as a
+    // foreign network change. The FFI signature follows NotifyIpInterfaceChange.
     const AF_UNSPEC: u16 = 0;
 
     #[link(name = "iphlpapi")]
@@ -415,7 +449,7 @@ mod windows_impl {
     // shared mutable state.
     extern "system" fn ip_interface_change_callback(
         caller_context: *mut c_void,
-        _row: *const c_void,
+        row: *const c_void,
         _notification_type: i32,
     ) {
         if caller_context.is_null() {
@@ -429,6 +463,26 @@ mod windows_impl {
         // leaks one `Arc` clone for the process lifetime (never
         // unregistered — see `spawn()`).
         let notify: &Notify = unsafe { &*(caller_context as *const Notify) };
+        let changed_ifindex = if row.is_null() {
+            None
+        } else {
+            // SAFETY: Windows owns the callback row and keeps it valid for this
+            // serialized callback. InterfaceIndex is an identity field in the
+            // SDK's MIB_IPINTERFACE_ROW definition.
+            Some(unsafe { (*(row as *const MIB_IPINTERFACE_ROW)).InterfaceIndex })
+        };
+        let mut pending = PENDING_IFINDICES
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if pending.len() < MAX_PENDING_IFINDICES {
+            pending.push(changed_ifindex);
+        } else {
+            // Keep conservative behavior if OS notifications outpace the
+            // session loop: an unattributed event must still reconnect.
+            pending.clear();
+            pending.push(None);
+        }
+        drop(pending);
         notify.notify_one();
     }
 

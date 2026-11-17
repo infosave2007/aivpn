@@ -868,7 +868,11 @@ impl super::AivpnClient {
                     // A genuine change during the pre-establishment window is
                     // still covered by the handshake-fallback path and the
                     // poll-based carrier-change watchdog below.
-                    if last_rx == connect_instant {
+                    if !crate::net_change::has_foreign_pending_change() {
+                        tracing::debug!(
+                            "Network-change notification belongs to the client TUN; ignoring"
+                        );
+                    } else if last_rx == connect_instant {
                         tracing::debug!(
                             "Network-change event during connection setup — \
                              ignoring self-inflicted tun churn (tunnel not yet established)"
