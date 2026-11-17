@@ -42,6 +42,7 @@ pub fn set_own_tun_ifindex(ifindex: u32) {
     let _ = ifindex;
 }
 
+#[cfg(any(windows, test))]
 fn has_foreign_interface_change(changed_ifindices: &[Option<u32>], own_ifindex: u32) -> bool {
     own_ifindex == 0
         || changed_ifindices
