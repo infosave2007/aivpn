@@ -1,5 +1,15 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+
+- **Windows disconnect right after connecting** - interface-change notifications raised by the client's own Wintun adapter no longer trigger a reconnect. Notifications from other interfaces, unattributed ones and an overflowed queue still reconnect (#96, #98).
+
+### Security
+
+- **Dependency fixes** - `quinn-proto` 0.11.19 and `quinn-udp` 0.5.16 (RUSTSEC-2026-0523, RUSTSEC-2026-0524, RUSTSEC-2026-0538); `russh` 0.65.2 (RUSTSEC-2026-0492, RUSTSEC-2026-0495). The SSH install wizard keeps trust-on-first-use pinning; a certified host key is pinned by the key it certifies.
+
 ## [1.2.0] - 2026-10-27
 
 > **Dual-stack networking, signed distribution and application hardening.** This release extends IPv6 support across the tunnel, adds large management messages and new bootstrap/distribution channels, and fixes session, storage and platform security issues. Inter-server connections now use masked handshake sessions throughout; static legacy sessions and the server mode without a database are removed.
