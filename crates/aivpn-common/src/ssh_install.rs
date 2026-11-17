@@ -202,9 +202,11 @@ impl client::Handler for TofuHandler {
 
     async fn check_server_key(
         &mut self,
-        server_public_key: &ssh_key::PublicKey,
+        server_public_key: &russh::keys::PublicKeyOrCertificate,
     ) -> std::result::Result<bool, Self::Error> {
-        let host_key = host_key_of(server_public_key);
+        // A certified host key is pinned by the key it certifies, which is the
+        // fingerprint `ssh-keygen -l` prints for the server's host key.
+        let host_key = host_key_of(&server_public_key.public_key());
         // `check_server_key` is only ever invoked once per connection (during
         // the initial key exchange), so `take()` always finds `Some` here.
         let verify = self.verify.take();

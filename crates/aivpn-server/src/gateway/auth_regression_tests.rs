@@ -503,6 +503,21 @@ async fn inline_old_data_replay_and_tamper_leave_index_and_replay_unchanged() {
     assert_eq!(inline_primary_bitmap(&state), bitmap);
 }
 
+/// Окно тегов перестраивается при первом промахе после смены 10-секундного окна
+/// времени и законно переносит `tag_window_base`. Перестраиваем его заранее и
+/// оставляем запас времени, чтобы следующие проверки шли в одном окне.
+fn settle_tag_time_window(fixture: &InlineIngressFixture) {
+    let remaining =
+        crypto::DEFAULT_WINDOW_MS - crypto::current_timestamp_ms() % crypto::DEFAULT_WINDOW_MS;
+    if remaining < 2_000 {
+        std::thread::sleep(Duration::from_millis(remaining + 50));
+    }
+    let _ = fixture
+        .gateway
+        .session_manager
+        .refresh_and_find_by_tag(&[0; TAG_SIZE], &fixture.peer.ip());
+}
+
 #[tokio::test]
 async fn inline_long_old_tail_keeps_new_data_on_fast_path() {
     let mut fixture = inline_ingress_fixture_with_base(921);
@@ -527,6 +542,7 @@ async fn inline_long_old_tail_keeps_new_data_on_fast_path() {
     }
     // Один отложенный пакет допускается, но повтор и подделка не двигают окна.
     deliver_inline_data(&mut fixture, 6050, true).await;
+    settle_tag_time_window(&fixture);
     let (base, tags, old_tags, received) = {
         let state = fixture.session.lock();
         (
