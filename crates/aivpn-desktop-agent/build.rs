@@ -49,6 +49,9 @@ fn build_variant(name: &str, snapshot: bool) {
         "-o",
     ]);
     command.arg(output.join(name));
+    if let Some(directory) = multiarch_include() {
+        command.arg("-idirafter").arg(directory);
+    }
     if snapshot {
         command.arg("-DAP_BINDING_SNAPSHOT=1");
     }
@@ -57,6 +60,14 @@ fn build_variant(name: &str, snapshot: bool) {
         .expect("Не удалось запустить clang с поддержкой BPF");
     require_success(result);
     require_object(&output.join(name));
+}
+
+/// Debian и Ubuntu хранят архитектурные заголовки (`asm/`) в каталоге multiarch,
+/// который clang не просматривает для цели BPF.
+fn multiarch_include() -> Option<PathBuf> {
+    let architecture = env::var("CARGO_CFG_TARGET_ARCH").ok()?;
+    let directory = PathBuf::from(format!("/usr/include/{architecture}-linux-gnu"));
+    directory.join("asm").is_dir().then_some(directory)
 }
 
 fn target_architecture() -> &'static str {
