@@ -234,14 +234,30 @@ fn same_file(held: &File, path: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// Нужные поля `struct statx` из UAPI ядра. В libc для musl нет ни структуры,
+/// ни обертки, поэтому вызов идет напрямую и одинаков для glibc и musl.
+#[repr(C)]
+struct Statx {
+    stx_mask: u32,
+    _before_mount_id: [u8; 140],
+    stx_mnt_id: u64,
+    _after_mount_id: [u8; 104],
+}
+
+const _: () =
+    assert!(std::mem::size_of::<Statx>() == 256 && std::mem::offset_of!(Statx, stx_mnt_id) == 144);
+const STATX_MNT_ID: u32 = 0x1000;
+const AT_STATX_DONT_SYNC: libc::c_int = 0x4000;
+
 pub(super) fn mount_id(descriptor: BorrowedFd<'_>) -> io::Result<u64> {
-    let mut metadata = std::mem::MaybeUninit::<libc::statx>::zeroed();
+    let mut metadata = std::mem::MaybeUninit::<Statx>::zeroed();
     let result = unsafe {
-        libc::statx(
+        libc::syscall(
+            libc::SYS_statx,
             descriptor.as_raw_fd(),
             c"".as_ptr(),
-            libc::AT_EMPTY_PATH | libc::AT_STATX_DONT_SYNC,
-            libc::STATX_MNT_ID,
+            libc::AT_EMPTY_PATH | AT_STATX_DONT_SYNC,
+            STATX_MNT_ID,
             metadata.as_mut_ptr(),
         )
     };
@@ -249,7 +265,7 @@ pub(super) fn mount_id(descriptor: BorrowedFd<'_>) -> io::Result<u64> {
         return Err(io::Error::last_os_error());
     }
     let metadata = unsafe { metadata.assume_init() };
-    if metadata.stx_mask & libc::STATX_MNT_ID == 0 || metadata.stx_mnt_id == 0 {
+    if metadata.stx_mask & STATX_MNT_ID == 0 || metadata.stx_mnt_id == 0 {
         return Err(invalid_location());
     }
     Ok(metadata.stx_mnt_id)

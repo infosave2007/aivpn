@@ -299,16 +299,17 @@ fn send_marker(
     message.msg_iovlen = 1;
     if !descriptors.is_empty() {
         message.msg_control = control.as_mut_ptr().cast();
+        // Длины в msghdr и cmsghdr — size_t в glibc и socklen_t в musl.
         message.msg_controllen = unsafe {
             libc::CMSG_SPACE((descriptors.len() * std::mem::size_of::<libc::c_int>()) as u32)
-        } as usize;
+        } as _;
         unsafe {
             let header = libc::CMSG_FIRSTHDR(&message);
             (*header).cmsg_level = libc::SOL_SOCKET;
             (*header).cmsg_type = libc::SCM_RIGHTS;
             (*header).cmsg_len =
                 libc::CMSG_LEN((descriptors.len() * std::mem::size_of::<libc::c_int>()) as u32)
-                    as usize;
+                    as _;
             let target = libc::CMSG_DATA(header).cast::<libc::c_int>();
             for (index, descriptor) in descriptors.iter().enumerate() {
                 target.add(index).write_unaligned(descriptor.as_raw_fd());
@@ -344,7 +345,7 @@ fn receive_chunk(stream: &UnixStream, bytes: &mut [u8]) -> io::Result<(usize, Ve
     message.msg_iov = &mut vector;
     message.msg_iovlen = 1;
     message.msg_control = control.as_mut_ptr().cast();
-    message.msg_controllen = std::mem::size_of_val(&control);
+    message.msg_controllen = std::mem::size_of_val(&control) as _;
     let count = unsafe { libc::recvmsg(stream.as_raw_fd(), &mut message, libc::MSG_CMSG_CLOEXEC) };
     if count < 0 {
         return Err(io::Error::last_os_error());
@@ -383,7 +384,7 @@ unsafe fn take_descriptors(message: &libc::msghdr) -> io::Result<Vec<OwnedFd>> {
 
 unsafe fn take_rights(header: *mut libc::cmsghdr, descriptors: &mut Vec<OwnedFd>) {
     // Формат и номера SCM_RIGHTS проверены ядром; здесь не разбираются байты пользовательского JSON.
-    let size = unsafe { (*header).cmsg_len - libc::CMSG_LEN(0) as usize };
+    let size = unsafe { (*header).cmsg_len as usize - libc::CMSG_LEN(0) as usize };
     let source = unsafe { libc::CMSG_DATA(header).cast::<libc::c_int>() };
     for index in 0..size / std::mem::size_of::<libc::c_int>() {
         let descriptor = unsafe { source.add(index).read_unaligned() };
