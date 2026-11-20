@@ -566,7 +566,11 @@ mod tests {
         assert_eq!(actual.value.attributes, before.value.attributes);
         assert_eq!(actual.value.mtime, before.value.mtime);
         assert_eq!(actual.value.mtime_nsec, before.value.mtime_nsec);
-        assert_ne!(actual.value.inode, before.value.inode);
+        // Восстановление заменяет файл, а не переписывает его на месте. Номер
+        // inode исходного файла освобожден первой заменой, и файловая система
+        // вправе выдать его снова, поэтому сравнивается файл, который
+        // существовал до восстановления.
+        assert_ne!(actual.value.inode, planned.value.inode);
         assert_eq!(std::fs::read_dir(&fixture.0).unwrap().count(), 1);
     }
     #[test]
