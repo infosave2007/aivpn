@@ -9,6 +9,16 @@ fn app(ctx: &egui::Context) -> AivpnApp {
     AivpnApp::new(settings, ctx)
 }
 
+/// Профили и настройки лежат в общем каталоге пользователя, поэтому тесты,
+/// которые их перезаписывают, не должны идти параллельно.
+static PROFILE_FILES: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn profile_files() -> std::sync::MutexGuard<'static, ()> {
+    PROFILE_FILES
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+}
+
 #[test]
 fn layout_and_theme_switch_keep_session_counters_and_unsaved_forms() {
     let ctx = egui::Context::default();
@@ -189,6 +199,7 @@ fn disconnected_view_shows_retained_firewall_and_explicit_clear() {
 
 #[test]
 fn settings_write_failure_leaves_profile_and_dns_unchanged() {
+    let _files = profile_files();
     let ctx = egui::Context::default();
     let mut app = app(&ctx);
     app.settings.dns_proxy = "127.0.0.1:5353".into();
@@ -244,6 +255,7 @@ fn ssh_wizard_stays_inside_compact_minimum_window() {
 
 #[test]
 fn ssh_import_appends_without_replacing_the_active_profile_or_session() {
+    let _files = profile_files();
     let ctx = egui::Context::default();
     let mut app = app(&ctx);
     app.keys = key_storage::KeyStorage {
@@ -297,6 +309,7 @@ fn profile_validation_error_is_fully_visible_at_minimum_size() {
 
 #[test]
 fn profile_write_failure_restores_the_previously_saved_dns() {
+    let _files = profile_files();
     let ctx = egui::Context::default();
     let mut app = app(&ctx);
     app.settings.dns_proxy = "127.0.0.1:5353".into();
