@@ -109,6 +109,75 @@ mod publish_impl {
             })
     }
 
+    async fn read_response(
+        mut response: reqwest::Response,
+        limit: usize,
+    ) -> Result<Vec<u8>, String> {
+        if response
+            .content_length()
+            .is_some_and(|size| size > limit as u64)
+        {
+            return Err("Ответ канала публикации превышает допустимый размер".into());
+        }
+        let mut body = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|error| error.without_url().to_string())?
+        {
+            if chunk.len() > limit.saturating_sub(body.len()) {
+                return Err("Ответ канала публикации превышает допустимый размер".into());
+            }
+            body.extend_from_slice(&chunk);
+        }
+        Ok(body)
+    }
+
+    #[cfg(test)]
+    mod response_tests {
+        use super::*;
+
+        #[tokio::test]
+        async fn oversized_publish_reply_is_rejected_with_or_without_content_length() {
+            for declared in [false, true] {
+                let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                let address = listener.local_addr().unwrap();
+                let server = std::thread::spawn(move || {
+                    use std::io::{Read, Write};
+                    let (mut socket, _) = listener.accept().unwrap();
+                    socket
+                        .set_read_timeout(Some(std::time::Duration::from_secs(3)))
+                        .unwrap();
+                    let mut request = [0; 4096];
+                    let received = socket.read(&mut request).unwrap();
+                    assert!(received > 0);
+                    let length = if declared {
+                        "Content-Length: 1025\r\n"
+                    } else {
+                        ""
+                    };
+                    write!(
+                        socket,
+                        "HTTP/1.1 200 OK\r\nConnection: close\r\n{length}\r\n"
+                    )
+                    .unwrap();
+                    let _ = socket.write_all(&[b'x'; 1025]);
+                });
+                let reply = reqwest::Client::builder()
+                    .no_proxy()
+                    .build()
+                    .unwrap()
+                    .get(format!("http://{address}/"))
+                    .send()
+                    .await
+                    .unwrap();
+                let result = read_response(reply, 1024).await;
+                server.join().unwrap();
+                assert!(result.is_err(), "declared={declared}");
+            }
+        }
+    }
+
     /// Publish `descriptors_json` (the same JSON-array shape produced by
     /// `--export-bootstrap-descriptor` and the management API export
     /// endpoint) to every enabled channel. Channels are independent — one
@@ -244,7 +313,7 @@ mod publish_impl {
 
         if !resp.status().is_success() {
             let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
+            let body = String::from_utf8_lossy(&read_response(resp, 8192).await?).into_owned();
             return Err(format!("S3 PUT returned {status}: {body}"));
         }
         Ok(())
@@ -280,10 +349,9 @@ mod publish_impl {
 
         let (release_id, upload_url_template, existing_asset_id) = if existing.status().is_success()
         {
-            let body: serde_json::Value = existing
-                .json()
-                .await
-                .map_err(|e| format!("GitHub release JSON parse failed: {e}"))?;
+            let body: serde_json::Value =
+                serde_json::from_slice(&read_response(existing, 4 * 1024 * 1024).await?)
+                    .map_err(|e| format!("GitHub release JSON parse failed: {e}"))?;
             let id = body["id"]
                 .as_u64()
                 .ok_or("GitHub release response missing id")?;
@@ -316,13 +384,12 @@ mod publish_impl {
                 .map_err(|e| format!("GitHub create-release failed: {e}"))?;
             if !resp.status().is_success() {
                 let status = resp.status();
-                let body = resp.text().await.unwrap_or_default();
+                let body = String::from_utf8_lossy(&read_response(resp, 8192).await?).into_owned();
                 return Err(format!("GitHub create-release returned {status}: {body}"));
             }
-            let body: serde_json::Value = resp
-                .json()
-                .await
-                .map_err(|e| format!("GitHub create-release JSON parse failed: {e}"))?;
+            let body: serde_json::Value =
+                serde_json::from_slice(&read_response(resp, 4 * 1024 * 1024).await?)
+                    .map_err(|e| format!("GitHub create-release JSON parse failed: {e}"))?;
             let id = body["id"]
                 .as_u64()
                 .ok_or("GitHub create-release response missing id")?;
@@ -365,7 +432,7 @@ mod publish_impl {
 
         if !resp.status().is_success() {
             let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
+            let body = String::from_utf8_lossy(&read_response(resp, 8192).await?).into_owned();
             return Err(format!("GitHub asset upload returned {status}: {body}"));
         }
         Ok(())
@@ -420,7 +487,7 @@ mod publish_impl {
 
         if !resp.status().is_success() {
             let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
+            let body = String::from_utf8_lossy(&read_response(resp, 8192).await?).into_owned();
             return Err(format!("Telegram sendDocument returned {status}: {body}"));
         }
         Ok(())

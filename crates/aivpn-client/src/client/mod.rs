@@ -25,7 +25,6 @@ use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
-use tokio::io::AsyncReadExt;
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, error, info, warn};
@@ -48,6 +47,7 @@ use aivpn_common::upload_pipeline::{self, PacketEncryptor, UploadConfig};
 
 use crate::bootstrap_cache;
 use crate::mask_feedback_log::{MaskFeedbackLog, RegionalHintsStore};
+use crate::packet_endpoint::PacketEndpoint;
 use crate::tunnel::{Tunnel, TunnelConfig};
 #[cfg(target_os = "linux")]
 use aivpn_common::kernel_accel::{
@@ -355,7 +355,7 @@ struct UploadCryptoState {
 pub struct AivpnClient {
     config: ClientConfig,
     state: ClientState,
-    tunnel: Tunnel,
+    tunnel: PacketEndpoint,
     /// The session's datagram carrier. Today always a `UdpTransport` wrapping
     /// the connected `UdpSocket` created in `connect()`; behind the trait so a
     /// non-UDP transport can be swapped in without touching the protocol.
@@ -383,7 +383,12 @@ pub struct AivpnClient {
     /// session, so it can keep pushing payloads (pool DB-sync beacons/
     /// snapshots) through the masked session while `run()` is executing.
     preset_control_rx: Option<mpsc::Receiver<ControlPayload>>,
+    preset_administration: Option<(
+        mpsc::Sender<crate::session_admin::ClientRequest>,
+        mpsc::Receiver<crate::session_admin::ClientRequest>,
+    )>,
     pending_mask: Arc<Mutex<Option<aivpn_common::mask::MaskProfile>>>,
+    mask_receiver: aivpn_common::mask_transition::MaskReceiver,
     session_keys: Option<SessionKeys>,
     upload_state: Option<Arc<Mutex<UploadCryptoState>>>,
     transition_recv_keys: Option<SessionKeys>,
@@ -628,13 +633,79 @@ impl AivpnClient {
 
     pub fn set_admin_listen(&mut self, addr: std::net::SocketAddrV4) {
         self.admin_listen = addr;
-        self.recording_status = crate::record_cmd::RecordingStatusStore::for_endpoint(addr);
+        if !self.tunnel.is_managed() {
+            self.recording_status = crate::record_cmd::RecordingStatusStore::for_endpoint(addr);
+        }
     }
 
     /// Create new client
     pub fn new(config: ClientConfig) -> Result<Self> {
+        let tunnel = PacketEndpoint::Legacy(Tunnel::new(config.tun_config.clone()));
+        Self::with_endpoint(config, tunnel)
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    pub fn new_managed(
+        config: ClientConfig,
+        endpoint: crate::ManagedEndpoint,
+        guard: aivpn_common::transport::SharedGuard,
+    ) -> Result<Self> {
+        Self::managed_with_identity(config, endpoint, guard, None)
+    }
+
+    /// Постоянную идентичность передает пользовательский процесс по каналу службы.
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    pub fn new_managed_with_device_identity(
+        config: ClientConfig,
+        endpoint: crate::ManagedEndpoint,
+        guard: aivpn_common::transport::SharedGuard,
+        device_secret: [u8; 32],
+    ) -> Result<Self> {
+        Self::managed_with_identity(
+            config,
+            endpoint,
+            guard,
+            Some(KeyPair::from_private_key(device_secret)),
+        )
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    fn managed_with_identity(
+        config: ClientConfig,
+        endpoint: crate::ManagedEndpoint,
+        guard: aivpn_common::transport::SharedGuard,
+        identity: Option<KeyPair>,
+    ) -> Result<Self> {
+        if config.proxy_listen.is_some()
+            || config.control_only
+            || config.transport.is_some()
+            || config.tun_config.full_tunnel
+            || config.tun_config.kill_switch
+            || !config.tun_config.include_routes.is_empty()
+            || !config.tun_config.exclude_routes.is_empty()
+            || config.server_addr.parse::<SocketAddr>().is_err()
+            || config.server_signing_key.is_none()
+        {
+            return Err(Error::InvalidPacket(
+                "Некорректный профиль управляемого работника",
+            ));
+        }
+        let mut client =
+            Self::with_endpoint_identity(config, PacketEndpoint::Managed(endpoint), identity)?;
+        client.socket_guard = guard;
+        Ok(client)
+    }
+
+    fn with_endpoint(config: ClientConfig, tunnel: PacketEndpoint) -> Result<Self> {
+        Self::with_endpoint_identity(config, tunnel, None)
+    }
+
+    fn with_endpoint_identity(
+        config: ClientConfig,
+        tunnel: PacketEndpoint,
+        identity: Option<KeyPair>,
+    ) -> Result<Self> {
         let keypair = KeyPair::generate();
-        let tunnel = Tunnel::new(config.tun_config.clone());
         let recv_mdh_len = packet_mdh_len_for_mask(&config.initial_mask);
         let bytes_sent = Arc::new(AtomicU64::new(0));
         let bytes_received = Arc::new(AtomicU64::new(0));
@@ -644,6 +715,8 @@ impl AivpnClient {
         let recv_tag_offsets = vec![config.initial_mask.tag_offset];
         let static_keypair = if config.control_only {
             None
+        } else if identity.is_some() {
+            identity
         } else {
             load_or_generate_static_keypair()?
         };
@@ -655,6 +728,13 @@ impl AivpnClient {
         let initial_adaptive_level = config.initial_adaptive_level;
         let initial_keepalive =
             keepalive_with_nat_cap(Duration::from_secs(initial_adaptive_level.keepalive_secs()));
+        let recording_status = if tunnel.is_managed() {
+            crate::record_cmd::RecordingStatusStore::in_memory()
+        } else {
+            crate::record_cmd::RecordingStatusStore::for_endpoint(
+                crate::record_cmd::DEFAULT_ADMIN_ADDR,
+            )
+        };
 
         Ok(Self {
             config,
@@ -667,7 +747,9 @@ impl AivpnClient {
             control_mask: None,
             control_tx: None,
             preset_control_rx: None,
+            preset_administration: None,
             pending_mask: Arc::new(Mutex::new(None)),
+            mask_receiver: Default::default(),
             session_keys: None,
             #[cfg(target_os = "linux")]
             kernel_accel: None,
@@ -731,9 +813,7 @@ impl AivpnClient {
             proxy_handle: None,
             dns_proxy_gate: None,
             admin_listen: crate::record_cmd::DEFAULT_ADMIN_ADDR,
-            recording_status: crate::record_cmd::RecordingStatusStore::for_endpoint(
-                crate::record_cmd::DEFAULT_ADMIN_ADDR,
-            ),
+            recording_status,
             active_recording_session: None,
             keepalive_interval: initial_keepalive,
             upload_shaping,
@@ -860,8 +940,10 @@ impl AivpnClient {
         // server cannot stall the reconnect loop indefinitely.
         if let Some(cfg) = self.config.transport.clone() {
             if self.config.proxy_listen.is_none() && !self.config.control_only {
-                self.tunnel.create().await?;
-                self.tunnel.set_transport_guard(self.socket_guard.clone())?;
+                if let Some(tunnel) = self.tunnel.legacy_mut() {
+                    tunnel.create().await?;
+                    tunnel.set_transport_guard(self.socket_guard.clone())?;
+                }
             }
             let (host, port) = self
                 .config
@@ -893,18 +975,22 @@ impl AivpnClient {
         let port = port
             .parse()
             .map_err(|_| Error::InvalidPacket("Некорректный порт сервера"))?;
-        let addresses = tokio::time::timeout(
-            Duration::from_secs(10),
-            self.socket_guard
-                .resolve(host.trim_matches(['[', ']']), port),
-        )
-        .await
-        .map_err(|_| {
-            Error::Io(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                format!("DNS lookup timed out for {}", self.config.server_addr),
-            ))
-        })??;
+        let addresses = if let Ok(numeric) = self.config.server_addr.parse::<SocketAddr>() {
+            vec![numeric]
+        } else {
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                self.socket_guard
+                    .resolve(host.trim_matches(['[', ']']), port),
+            )
+            .await
+            .map_err(|_| {
+                Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!("DNS lookup timed out for {}", self.config.server_addr),
+                ))
+            })??
+        };
         let server_addr = aivpn_common::dns_candidates::select(&self.config.server_addr, addresses)
             .ok_or_else(|| {
                 Error::Io(std::io::Error::new(
@@ -923,7 +1009,9 @@ impl AivpnClient {
         // DNS и выбор исходного адреса UDP предшествуют маршрутам TUN:
         // подсеть VPN может совпадать с адресом физического DNS или сервера.
         if self.config.proxy_listen.is_none() && !self.config.control_only {
-            self.tunnel.create().await?;
+            if let Some(tunnel) = self.tunnel.legacy_mut() {
+                tunnel.create().await?;
+            }
         }
         self.finish_connect(server_addr).await
     }
@@ -952,11 +1040,44 @@ impl AivpnClient {
         } else {
             socket2::Domain::IPV6
         };
+        #[cfg(windows)]
+        let supplied = self.socket_guard.create_udp_socket(server_addr)?;
+        #[cfg(windows)]
+        let socket2_sock = match supplied {
+            Some(socket) => socket2::Socket::from(socket),
+            None => {
+                socket2::Socket::new(domain, socket2::Type::DGRAM, Some(socket2::Protocol::UDP))
+                    .map_err(Error::Io)?
+            }
+        };
+        #[cfg(not(windows))]
         let socket2_sock =
             socket2::Socket::new(domain, socket2::Type::DGRAM, Some(socket2::Protocol::UDP))
                 .map_err(Error::Io)?;
 
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::AsRawFd;
+            let fd = socket2_sock.as_raw_fd();
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+            if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0
+            {
+                return Err(Error::Io(std::io::Error::last_os_error()));
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
         socket2_sock.set_nonblocking(true).map_err(Error::Io)?;
+        self.socket_guard.allow_peer(server_addr)?;
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            self.socket_guard.protect(socket2_sock.as_raw_fd())?;
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::AsRawSocket;
+            self.socket_guard.protect(socket2_sock.as_raw_socket())?;
+        }
         let _ = socket2_sock.set_recv_buffer_size(4 * 1024 * 1024);
         let _ = socket2_sock.set_send_buffer_size(4 * 1024 * 1024);
 
@@ -1089,7 +1210,8 @@ impl AivpnClient {
             self.kernel_epoch_key = [0u8; 32];
             self.kernel_installed_tag_offset = u16::MAX;
             self.kernel_installed_mdh_len = 0;
-            if self.config.proxy_listen.is_some()
+            if self.tunnel.is_managed()
+                || self.config.proxy_listen.is_some()
                 || self.config.control_only
                 || self
                     .transport
@@ -1115,21 +1237,25 @@ impl AivpnClient {
             debug_assert!(self.xdp_iface.is_none());
         }
 
-        if self.config.proxy_listen.is_none() && !self.config.control_only {
+        if let Some(tunnel) = self
+            .tunnel
+            .legacy_mut()
+            .filter(|_| self.config.proxy_listen.is_none() && !self.config.control_only)
+        {
             if self.config.transport.is_none() {
-                self.tunnel.set_server_ip(server_addr.ip().to_string());
+                tunnel.set_server_ip(server_addr.ip().to_string());
             }
             // Enable full tunnel only after the server UDP path is established.
             if self.config.tun_config.full_tunnel {
-                self.tunnel.enable_full_tunnel()?;
+                tunnel.enable_full_tunnel()?;
             }
             if !self.config.tun_config.include_routes.is_empty()
                 || !self.config.tun_config.exclude_routes.is_empty()
             {
-                self.tunnel.apply_split_routes()?;
+                tunnel.apply_split_routes()?;
             }
             if self.config.tun_config.kill_switch {
-                self.tunnel.activate_kill_switch()?;
+                tunnel.activate_kill_switch()?;
             }
         }
 
@@ -1178,6 +1304,7 @@ impl AivpnClient {
         // the ServerHello handler, which is real proof of server contact, so §2
         // failure attribution correctly records blocked masks.
         info!("Connected to server at {}", self.config.server_addr);
+        info!("Маска сеанса: {}", self.config.initial_mask.mask_id);
         info!("TUN device: {}", self.tunnel.name());
 
         Ok(())
@@ -1216,10 +1343,15 @@ impl AivpnClient {
 
     async fn apply_server_network_override(
         &mut self,
-        network_config: ClientNetworkConfig,
+        mut network_config: ClientNetworkConfig,
     ) -> Result<()> {
+        // Keepalive уже применен обработчиком CONTROL и не меняет адреса TUN.
+        network_config.keepalive_secs = None;
+        network_config.mtu = network_config
+            .mtu
+            .min(aivpn_common::network_config::MAX_MASK_TUN_MTU);
         let current_config = self.config.tun_config.client_network_config()?;
-        if current_config == network_config {
+        if current_config == network_config && !self.tunnel.is_managed() {
             return Ok(());
         }
 
@@ -1231,8 +1363,6 @@ impl AivpnClient {
             network_config.mtu,
         );
 
-        let tun_name = self.config.tun_config.tun_name.clone();
-        let full_tunnel = self.config.tun_config.full_tunnel;
         if self.config.proxy_listen.is_none() {
             self.tunnel
                 .apply_network_config(network_config.clone())
@@ -1247,11 +1377,10 @@ impl AivpnClient {
                 .await
                 .map_err(Error::Io)?;
         }
-        // Ipv4Addr is Copy — capture before `network_config` moves into
-        // `from_network_config` below.
         let new_client_ip = network_config.client_ip;
-        self.config.tun_config =
-            TunnelConfig::from_network_config(tun_name, network_config, full_tunnel);
+        self.config
+            .tun_config
+            .apply_network_assignment(&network_config)?;
 
         // Обновляем IP в статистике. Событие connected отправляет обработчик
         // ServerHello после успешного ratchet, независимо от смены сети.
@@ -1308,7 +1437,9 @@ impl AivpnClient {
                 Err(_) => warn!("Transport close timed out"),
             }
         }
-        let _ = self.tunnel.set_transport_mark(None);
+        if let Some(tunnel) = self.tunnel.legacy_mut() {
+            let _ = tunnel.set_transport_mark(None);
+        }
 
         // Detach XDP filter (Linux only, best-effort)
         #[cfg(target_os = "linux")]
@@ -1458,8 +1589,32 @@ impl AivpnClient {
         (self.mgmt.clone(), tx)
     }
 
+    /// Только работник службы получает этот канал, обычный клиент сохраняет прежний IPC.
+    pub fn session_administration(
+        &mut self,
+    ) -> Result<crate::session_admin::SessionAdministration> {
+        if !self.tunnel.is_managed() {
+            return Err(Error::InvalidPacket(
+                "Канал предназначен для работника службы",
+            ));
+        }
+        let (mgmt, control) = self.management_handle();
+        let requests = self
+            .preset_administration
+            .get_or_insert_with(|| mpsc::channel(16))
+            .0
+            .clone();
+        Ok(crate::session_admin::SessionAdministration {
+            mgmt,
+            control,
+            requests,
+            status: self.recording_status.clone(),
+        })
+    }
+
     /// Update mask profile
     pub fn update_mask(&mut self, new_mask: MaskProfile) {
+        self.quality_tracker.mask_assessment.reset();
         self.control_mask = Some(new_mask.clone());
         if !self.recv_tag_offsets.contains(&new_mask.tag_offset) {
             self.recv_tag_offsets.push(new_mask.tag_offset);
@@ -1692,11 +1847,25 @@ impl AivpnClient {
         self.bytes_received.load(Ordering::Relaxed)
     }
 
+    fn quality_snapshot(
+        &self,
+        score: u8,
+        rtt_ms: u16,
+        jitter_ms: u16,
+        adaptive_level: u8,
+    ) -> serde_json::Value {
+        serde_json::json!({"quality":score, "rtt_ms":rtt_ms, "jitter_ms":jitter_ms,
+            "adaptive":adaptive_level, "fec_group":self.fec_group.load(Ordering::Relaxed),
+            "mask_assessment":self.quality_tracker.mask_assessment.current(Instant::now())})
+    }
+
     fn write_quality_file(&self, score: u8, rtt_ms: u16, jitter_ms: u16, adaptive_level: u8) {
-        let content = format!(
-            r#"{{"quality":{},"rtt_ms":{},"jitter_ms":{},"adaptive":{}}}"#,
-            score, rtt_ms, jitter_ms, adaptive_level
-        );
+        if self.tunnel.is_managed() {
+            return;
+        }
+        let content = self
+            .quality_snapshot(score, rtt_ms, jitter_ms, adaptive_level)
+            .to_string();
         for path in crate::record_cmd::local_status_paths(self.admin_listen, "quality.json") {
             if !crate::secure_write::write_status_best_effort(&path, content.as_bytes()) {
                 debug!("quality file write failed: {}", path.display());
@@ -1706,11 +1875,13 @@ impl AivpnClient {
 
     /// Deactivate the kill-switch on intentional exit. Do NOT call during reconnects.
     pub fn deactivate_kill_switch(&mut self) {
-        self.tunnel.deactivate_kill_switch();
+        if let Some(tunnel) = self.tunnel.legacy_mut() {
+            tunnel.deactivate_kill_switch();
+        }
     }
 
     pub fn take_kill_switch(&mut self) -> Option<crate::kill_switch::KillSwitch> {
-        self.tunnel.take_kill_switch()
+        self.tunnel.legacy_mut().and_then(Tunnel::take_kill_switch)
     }
 
     pub fn set_dns_proxy_gate(&mut self, gate: crate::dns_proxy::DnsProxyGate) {
@@ -1750,6 +1921,91 @@ mod tests {
     use aivpn_common::mask::preset_masks;
 
     mod management_lifecycle_tests;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn managed_worker_keeps_provided_identity_without_a_home_directory() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "client::tests::managed_identity_without_home_child",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env_remove("HOME")
+            .env_remove("USERPROFILE")
+            .env("AIVPN_TEST_MANAGED_IDENTITY", "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "Запускается родительской проверкой в отдельном окружении"]
+    async fn managed_identity_without_home_child() {
+        assert_eq!(
+            std::env::var("AIVPN_TEST_MANAGED_IDENTITY").as_deref(),
+            Ok("1")
+        );
+        struct Assignment;
+        impl crate::ConfirmedAssignment for Assignment {
+            fn confirmed_assignment(&self, _: &ClientNetworkConfig) -> Result<()> {
+                panic!("Конструктор не должен публиковать назначение");
+            }
+        }
+        let secret = [17; 32];
+        let expected = KeyPair::from_private_key(secret).public_key_bytes();
+        for _ in 0..2 {
+            let (socket, _peer) = std::os::unix::net::UnixStream::pair().unwrap();
+            socket.set_nonblocking(true).unwrap();
+            let endpoint = crate::ManagedEndpoint::new(
+                socket.into(),
+                "managed-test".into(),
+                Arc::new(Assignment),
+            )
+            .unwrap();
+            let mut config = make_test_config();
+            config.server_signing_key = Some([9; 32]);
+            let client = AivpnClient::new_managed_with_device_identity(
+                config,
+                endpoint,
+                aivpn_common::transport::no_socket_guard(),
+                secret,
+            )
+            .unwrap();
+            assert_eq!(
+                client
+                    .static_keypair
+                    .as_ref()
+                    .map(KeyPair::public_key_bytes),
+                Some(expected)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn rejected_certificate_stops_the_session_and_reconnect_loop() {
+        let mut client = AivpnClient::new(make_test_config()).unwrap();
+        client.state = ClientState::Connected;
+        let result = client
+            .handle_server_control(ControlPayload::CertRejected {})
+            .await;
+        assert!(
+            result.is_err(),
+            "Отклоненный сертификат должен завершать сессию"
+        );
+        assert!(
+            client.terminal_rejected(),
+            "Повтор с тем же сертификатом бесполезен"
+        );
+        assert_eq!(client.state, ClientState::Disconnected);
+    }
 
     fn make_test_config() -> ClientConfig {
         let mask = preset_masks::bootstrap_default();
@@ -2033,7 +2289,12 @@ mod tests {
         }
         assert_eq!(
             announced,
-            Some((0, aivpn_common::protocol::CLIENT_PACKET_FEATURES))
+            Some((
+                0,
+                aivpn_common::protocol::CLIENT_PACKET_FEATURES
+                    | aivpn_common::mask_transition::FEATURE
+                    | aivpn_common::mask_assessment::FEATURE
+            ))
         );
         client.disconnect().await;
     }
@@ -2709,6 +2970,28 @@ mod tests {
 
     // ── FIX A: §2 attribution to the correct mask family ─────────────────────
 
+    #[tokio::test]
+    async fn server_network_override_preserves_local_route_policy() {
+        let mut config = make_test_config();
+        config.tun_config.include_routes = vec!["198.18.0.0/15".into()];
+        config.tun_config.exclude_routes = vec!["192.0.2.0/24".into()];
+        config.tun_config.kill_switch = true;
+        let mut client = AivpnClient::new(config).unwrap();
+        let mut network = client.config.tun_config.client_network_config().unwrap();
+        network.client_ip = "10.0.0.9".parse().unwrap();
+        network.keepalive_secs = Some(2);
+        client
+            .apply_server_network_override(network.clone())
+            .await
+            .unwrap();
+        assert_eq!(client.config.tun_config.include_routes, ["198.18.0.0/15"]);
+        assert_eq!(client.config.tun_config.exclude_routes, ["192.0.2.0/24"]);
+        assert!(client.config.tun_config.kill_switch);
+        assert_eq!(client.config.tun_config.tun_addr, "10.0.0.9");
+        client.apply_server_network_override(network).await.unwrap();
+        assert_eq!(client.config.tun_config.include_routes, ["198.18.0.0/15"]);
+    }
+
     #[test]
     fn test_active_feedback_family_prefers_polymorphic_base() {
         // A polymorphic session actually runs a variant of `polymorphic_base`,
@@ -3157,36 +3440,21 @@ mod tests {
     // ── write_quality_file ────────────────────────────────────────────────────
 
     #[test]
-    fn test_write_quality_file_produces_valid_json() {
-        // Override the write path via TMPDIR so this doesn't need /var/run/aivpn.
-        // write_quality_file() uses a hardcoded path on non-Windows; we test the
-        // JSON content by writing to /tmp directly (the function is private, called
-        // via a thin wrapper here).
-        let tmp = std::env::temp_dir().join("aivpn_quality_test.json");
-
-        // Replicate the exact format string from write_quality_file().
-        let content = format!(
-            r#"{{"quality":{},"rtt_ms":{},"jitter_ms":{},"adaptive":{}}}"#,
-            85u8, 32u16, 5u16, 2u8
-        );
-        std::fs::write(&tmp, &content).expect("write must succeed");
-
-        let read_back = std::fs::read_to_string(&tmp).expect("read must succeed");
-        let parsed: serde_json::Value =
-            serde_json::from_str(&read_back).expect("must be valid JSON");
-
-        assert_eq!(parsed["quality"], 85);
-        assert_eq!(parsed["rtt_ms"], 32);
-        assert_eq!(parsed["jitter_ms"], 5);
-        assert_eq!(parsed["adaptive"], 2);
-
-        let _ = std::fs::remove_file(tmp);
+    fn quality_snapshot_reports_actual_fec_independently_of_level() {
+        let client = AivpnClient::new(make_test_config()).unwrap();
+        for (level, fec) in [(0, 16), (2, 0), (1, 8)] {
+            client.fec_group.store(fec, Ordering::Relaxed);
+            let parsed = client.quality_snapshot(85, 32, 5, level);
+            assert_eq!(parsed["quality"], 85);
+            assert_eq!(parsed["adaptive"], level);
+            assert_eq!(parsed["fec_group"], fec);
+        }
     }
 
     // ── dirs_home ─────────────────────────────────────────────────────────────
 
     #[test]
-    fn test_dirs_home_returns_home_env_var() {
+    fn test_dirs_home_returns_platform_home_env_var() {
         // HOME is process-wide, and cargo test runs tests in parallel
         // threads within the same process — without this mutex, another
         // test mutating/reading HOME concurrently races with this one
@@ -3196,14 +3464,15 @@ mod tests {
         let _guard = crate::TEST_HOME_MUTEX
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let old = std::env::var_os("HOME");
-        std::env::set_var("HOME", "/test/home/path");
+        let variable = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+        let old = std::env::var_os(variable);
+        std::env::set_var(variable, "/test/home/path");
         let result = dirs_home();
-        assert_eq!(result, Some(std::path::PathBuf::from("/test/home/path")));
         match old {
-            Some(v) => std::env::set_var("HOME", v),
-            None => std::env::remove_var("HOME"),
+            Some(v) => std::env::set_var(variable, v),
+            None => std::env::remove_var(variable),
         }
+        assert_eq!(result, Some(std::path::PathBuf::from("/test/home/path")));
     }
 
     #[test]
@@ -3211,15 +3480,14 @@ mod tests {
         let _guard = crate::TEST_HOME_MUTEX
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let old = std::env::var_os("HOME");
-        std::env::remove_var("HOME");
-        // On non-Windows with no HOME set, dirs_home() must return None.
-        #[cfg(not(windows))]
-        assert_eq!(dirs_home(), None);
-        match old {
-            Some(v) => std::env::set_var("HOME", v),
-            None => {}
+        let variable = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+        let old = std::env::var_os(variable);
+        std::env::remove_var(variable);
+        let result = dirs_home();
+        if let Some(value) = old {
+            std::env::set_var(variable, value);
         }
+        assert_eq!(result, None);
     }
 
     // ── KeyRotate inline-rekey ordering ───────────────────────────────────────

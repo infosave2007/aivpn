@@ -1,4 +1,4 @@
-//! eBPF observability — polls the XDP drop-stats map and ring-buffer events.
+//! Читает счетчики причин отбрасывания пакетов из карты XDP.
 //!
 //! When xdp_prog.o is absent (maps not pinned) the observer is a no-op; the
 //! server runs fully without it.
@@ -7,9 +7,6 @@
 //! `/sys/fs/bpf/aivpn/drop_stats`  — BPF_MAP_TYPE_ARRAY, 4 u64 slots:
 //!   0 = DROP_TOO_SHORT, 1 = DROP_TAG_EXPIRED, 2 = reserved, 3 = TOTAL
 //!
-//! `/sys/fs/bpf/aivpn/events`  — BPF_MAP_TYPE_RINGBUF:
-//!   struct bpf_event { u32 type; u32 session_id; u64 count; u32 drop_reason; u32 pad; }
-//!   type: 1=xdp_drop  2=session_bytes  3=anomaly_hint
 
 use portable_atomic::AtomicU64;
 use std::sync::atomic::Ordering;
@@ -20,21 +17,11 @@ use tracing::{debug, info, warn};
 
 use aivpn_common::event_log::{AivpnEvent, EventBus, XdpDropReason};
 
-/// Per-session stats readable from BPF maps (best-effort, None when unavailable).
-#[derive(Debug, Default, Clone)]
-pub struct BpfSessionStats {
-    pub packets_rx: u64,
-    pub bytes_rx: u64,
-    pub packets_tx: u64,
-    pub bytes_tx: u64,
-    pub drops: u64,
-}
-
 pub struct EbpfObserver {
     events: EventBus,
     poll_interval: Duration,
-    /// Last reported total drop count — used to compute deltas between polls.
-    prev_drop_total: AtomicU64,
+    /// Предыдущие значения счетчиков причин, отдельно для каждой карты.
+    prev_drop_counts: [AtomicU64; 2],
 }
 
 impl EbpfObserver {
@@ -42,7 +29,7 @@ impl EbpfObserver {
         Self {
             events,
             poll_interval: Duration::from_millis(500),
-            prev_drop_total: AtomicU64::new(0),
+            prev_drop_counts: [AtomicU64::new(0), AtomicU64::new(0)],
         }
     }
 
@@ -53,7 +40,7 @@ impl EbpfObserver {
         });
     }
 
-    async fn run_loop(&self) {
+    pub(crate) async fn run_loop(&self) {
         #[cfg(target_os = "linux")]
         {
             const STATS_PATH: &str = "/sys/fs/bpf/aivpn/drop_stats";
@@ -81,8 +68,12 @@ impl EbpfObserver {
         }
     }
 
-    /// Read the total XDP drop counter from the pinned BPF ARRAY map and emit a
-    /// delta event whenever new drops are observed since the last poll.
+    fn take_drop_delta(&self, index: usize, total: u64) -> u64 {
+        let previous = self.prev_drop_counts[index].swap(total, Ordering::Relaxed);
+        total.checked_sub(previous).unwrap_or(total)
+    }
+
+    /// Событие содержит прирост счетчика своей причины, включая сброс карты.
     #[cfg(target_os = "linux")]
     fn drain_stats(&self) {
         let fd = match bpf_sys::pinned_map_fd("/sys/fs/bpf/aivpn/drop_stats") {
@@ -90,55 +81,28 @@ impl EbpfObserver {
             None => return,
         };
 
-        // key 3 = DROP_TOTAL
-        let total = bpf_sys::map_lookup_u64(fd, 3);
-        // key 1 = DROP_TAG_EXPIRED (for reason classification)
-        let tag_expired = bpf_sys::map_lookup_u64(fd, 1);
+        let counts = [
+            bpf_sys::map_lookup_u64(fd, 0),
+            bpf_sys::map_lookup_u64(fd, 1),
+        ];
         unsafe { libc::close(fd) };
-
-        let total = match total {
-            Some(v) => v,
-            None => {
-                warn!("eBPF observer: map_lookup failed for drop_stats[3]");
-                return;
+        for (index, reason) in [XdpDropReason::TooShort, XdpDropReason::WindowExpired]
+            .into_iter()
+            .enumerate()
+        {
+            let Some(total) = counts[index] else {
+                warn!(index, "Не удалось прочитать счетчик XDP");
+                continue;
+            };
+            let delta = self.take_drop_delta(index, total);
+            if delta != 0 {
+                self.events.emit(AivpnEvent::XdpDrop {
+                    reason,
+                    count: delta,
+                });
             }
-        };
-
-        let prev = self.prev_drop_total.load(Ordering::Relaxed);
-        if total <= prev {
-            return;
         }
-        let delta = total - prev;
-        self.prev_drop_total.store(total, Ordering::Relaxed);
-
-        // Use DROP_TAG_EXPIRED count to pick the dominant drop reason.
-        let reason = match tag_expired {
-            Some(n) if n > 0 => XdpDropReason::WindowExpired,
-            _ => XdpDropReason::WindowExpired,
-        };
-
-        self.events.emit(AivpnEvent::XdpDrop {
-            reason,
-            count: delta,
-        });
     }
-}
-
-/// Read per-session stats from a pinned BPF LRU_HASH map.
-/// Returns None until the kernel module exports a `session_stats` map at
-/// `/sys/fs/bpf/aivpn/session_stats` — planned for a future aivpn-linux-kernel
-/// release.  When the map is present, this will call `bpf_sys::map_lookup_u64`
-/// per counter field keyed by `session_id`.
-pub fn read_session_stats(_session_id: u32) -> Option<BpfSessionStats> {
-    #[cfg(target_os = "linux")]
-    {
-        let fd = bpf_sys::pinned_map_fd("/sys/fs/bpf/aivpn/session_stats")?;
-        // Struct layout mirrors the kernel-side bpf_session_stats:
-        //   u64 packets_rx; u64 bytes_rx; u64 packets_tx; u64 bytes_tx; u64 drops;
-        // Currently returns None because the map is not yet pinned.
-        unsafe { libc::close(fd) };
-    }
-    None
 }
 
 /// Raw BPF syscall helpers using the `libc` crate already in scope.
@@ -150,6 +114,50 @@ mod bpf_sys {
 
     const BPF_MAP_LOOKUP_ELEM: i64 = 1;
     const BPF_OBJ_GET: i64 = 7;
+    const BPF_OBJ_GET_INFO_BY_FD: i64 = 15;
+
+    #[repr(C)]
+    struct BpfAttrInfo {
+        bpf_fd: u32,
+        info_len: u32,
+        info: u64,
+    }
+
+    fn scalar_array(info: &[u32; 6]) -> bool {
+        info[0] == 2 && info[2] == 4 && info[3] == 8
+    }
+
+    fn compatible_map(fd: RawFd) -> bool {
+        // Первые шесть полей bpf_map_info из linux/bpf.h.
+        let mut info = [0u32; 6];
+        let attr = BpfAttrInfo {
+            bpf_fd: fd as u32,
+            info_len: std::mem::size_of_val(&info) as u32,
+            info: info.as_mut_ptr() as u64,
+        };
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_bpf,
+                BPF_OBJ_GET_INFO_BY_FD,
+                &attr as *const BpfAttrInfo as *const libc::c_void,
+                std::mem::size_of::<BpfAttrInfo>() as libc::c_uint,
+            )
+        };
+        result == 0 && scalar_array(&info)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        #[test]
+        fn lookup_requires_exact_scalar_array_layout() {
+            assert!(scalar_array(&[2, 1, 4, 8, 4, 0]));
+            for (kind, key, value) in [(6, 4, 8), (2, 8, 8), (2, 4, 16), (2, 4, 4), (27, 4, 8)] {
+                assert!(!scalar_array(&[kind, 1, key, value, 4, 0]));
+            }
+            assert!(!compatible_map(-1));
+        }
+    }
 
     /// `bpf_attr` layout for `BPF_OBJ_GET`.
     #[repr(C)]
@@ -197,6 +205,10 @@ mod bpf_sys {
 
     /// Look up a single `u64` value from a BPF ARRAY map by `u32` key.
     pub fn map_lookup_u64(fd: RawFd, key: u32) -> Option<u64> {
+        // Ядро пишет value_size байт; неизвестная или per-CPU карта не помещается в u64.
+        if !compatible_map(fd) {
+            return None;
+        }
         let mut value = 0u64;
         let attr = BpfAttrMapElem {
             map_fd: fd as u32,
@@ -218,5 +230,20 @@ mod bpf_sys {
         } else {
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn counter_reset_does_not_hide_new_drops() {
+        let events = EventBus::disabled();
+        let observer = EbpfObserver::new(events);
+        assert_eq!(observer.take_drop_delta(0, 100), 100);
+        assert_eq!(observer.take_drop_delta(0, 105), 5);
+        assert_eq!(observer.take_drop_delta(0, 2), 2);
+        assert_eq!(observer.take_drop_delta(0, 3), 1);
+        assert_eq!(observer.take_drop_delta(0, 3), 0);
     }
 }

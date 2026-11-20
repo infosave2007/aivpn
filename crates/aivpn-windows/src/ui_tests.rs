@@ -111,18 +111,7 @@ fn example_key(server: &str) -> key_storage::ConnectionKey {
     key_storage::ConnectionKey::from_key_string("Пример", &value).unwrap()
 }
 
-#[test]
-fn proxy_session_never_claims_firewall_protection() {
-    let ctx = egui::Context::default();
-    let mut app = app(&ctx);
-    app.vpn = VpnManager::connected_ui_fixture();
-    app.vpn.set_ui_test_kill_switch(true);
-    let mut key = example_key("proxy.example.invalid:443");
-    key.proxy_listen = Some("127.0.0.1:1080".into());
-    app.keys = key_storage::KeyStorage {
-        keys: vec![key],
-        selected: Some(0),
-    };
+fn drawn_shell_text(app: &mut AivpnApp, ctx: &egui::Context) -> String {
     let mut drawn = String::new();
     fn collect(shape: &egui::Shape, out: &mut String) {
         match shape {
@@ -157,9 +146,45 @@ fn proxy_session_never_claims_firewall_protection() {
             collect(&shape.shape, &mut drawn);
         }
     }
+    drawn
+}
+
+#[test]
+fn proxy_session_never_claims_firewall_protection() {
+    let ctx = egui::Context::default();
+    let mut app = app(&ctx);
+    app.vpn = VpnManager::connected_ui_fixture();
+    app.vpn.set_ui_test_kill_switch(true);
+    let mut key = example_key("proxy.example.invalid:443");
+    key.proxy_listen = Some("127.0.0.1:1080".into());
+    app.keys = key_storage::KeyStorage {
+        keys: vec![key],
+        selected: Some(0),
+    };
+    let drawn = drawn_shell_text(&mut app, &ctx);
     app.vpn.set_ui_test_kill_switch(false);
     assert!(!drawn.contains("Включена для этого сеанса"));
     assert!(drawn.contains("не применяется"));
+}
+
+#[test]
+fn disconnected_view_shows_retained_firewall_and_explicit_clear() {
+    let ctx = egui::Context::default();
+    let mut app = app(&ctx);
+    app.vpn.set_ui_test_kill_switch(true);
+    app.settings.kill_switch = false;
+    app.keys = key_storage::KeyStorage {
+        keys: vec![example_key("crashed.example.invalid:443")],
+        selected: Some(0),
+    };
+    let drawn = drawn_shell_text(&mut app, &ctx);
+    app.vpn.set_ui_test_kill_switch(false);
+    assert!(
+        drawn.contains("Блокировка трафика остается активной"),
+        "{drawn}"
+    );
+    assert!(drawn.contains("Снять блокировку"), "{drawn}");
+    assert!(!drawn.contains("Включится при следующем подключении"));
 }
 
 #[test]

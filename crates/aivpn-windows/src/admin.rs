@@ -15,6 +15,37 @@ use std::sync::mpsc::Sender;
 /// subcommands (aivpn-client crate).
 const ADMIN_SOCKET_ADDR: &str = "127.0.0.1:44301";
 
+#[derive(Clone)]
+pub(crate) enum Target {
+    Legacy(Option<String>),
+    #[cfg(windows)]
+    Managed(Result<aivpn_desktop_agent::client::SessionTarget, String>),
+}
+impl Target {
+    pub fn execute(&self, command: &str, timeout: std::time::Duration) -> Result<String, String> {
+        match self {
+            #[cfg(windows)]
+            Self::Managed(session) => session
+                .clone()?
+                .execute(command.to_owned())
+                .map_err(|error| error.to_string()),
+            Self::Legacy(token) => {
+                let token = token
+                    .as_deref()
+                    .ok_or("Нет действующего сеанса управления")?;
+                aivpn_common::local_admin::request(
+                    ADMIN_SOCKET_ADDR
+                        .parse()
+                        .map_err(|error: std::net::AddrParseError| error.to_string())?,
+                    &format!("{token}:{command}"),
+                    timeout,
+                )
+                .map_err(|error| error.to_string())
+            }
+        }
+    }
+}
+
 // ── Curated REST-shaped paths (mgmt_service.rs's in-tunnel allowlist) ──────
 // Role assignment is deliberately absent — `TunnelPatchClientRequest`/
 // `TunnelAddClientRequest` on the server carry no `role` field, so no path
@@ -658,10 +689,9 @@ pub enum AdminResponse {
 /// Run one admin operation on a background thread and send exactly one
 /// `AdminResponse` back over `tx`. Safe to call from the egui update loop —
 /// never blocks the caller.
-pub fn spawn(client_binary: PathBuf, req: AdminRequest, tx: Sender<AdminResponse>) {
-    let token = read_admin_token();
+pub fn spawn(target: Target, client_binary: PathBuf, req: AdminRequest, tx: Sender<AdminResponse>) {
     std::thread::spawn(move || {
-        SESSION_TOKEN.with(|slot| *slot.borrow_mut() = token);
+        SESSION_TARGET.with(|slot| *slot.borrow_mut() = Some(target));
         let resp = match req {
             AdminRequest::Role => AdminResponse::Role(run_role(&client_binary)),
             AdminRequest::ListClients => AdminResponse::Clients(list_clients(&client_binary)),
@@ -725,8 +755,15 @@ fn mgmt_call(
     path: &str,
     body: &[u8],
 ) -> Result<(u16, Vec<u8>), String> {
+    #[cfg(windows)]
+    if let Some(Target::Managed(session)) = pinned_target() {
+        return session?
+            .management(method, path, body)
+            .map_err(|error| error.to_string());
+    }
     let token = pinned_token().ok_or_else(|| "No active admin session".to_string())?;
     let mut cmd = Command::new(client_binary);
+    cmd.arg("cli");
     cmd.env_remove("AIVPN_ADMIN_LISTEN");
     cmd.env("AIVPN_ADMIN_TOKEN", token);
     cmd.args(["mgmt", "--method", method, "--path", path]);
@@ -958,8 +995,18 @@ fn get_audit_log(client_binary: &Path) -> Result<AuditLogView, String> {
 /// Run `aivpn-client role` and parse the bare decimal digit it prints to
 /// stdout on success (0=User, 1=Viewer, 2=Admin).
 fn run_role(client_binary: &Path) -> Result<u8, String> {
+    #[cfg(windows)]
+    if let Some(Target::Managed(session)) = pinned_target() {
+        return session?
+            .execute("role".into())
+            .map_err(|error| error.to_string())?
+            .trim()
+            .parse()
+            .map_err(|_| "Неверный ответ о роли сеанса".into());
+    }
     let token = pinned_token().ok_or_else(|| "No active admin session".to_string())?;
     let mut cmd = Command::new(client_binary);
+    cmd.arg("cli");
     cmd.env_remove("AIVPN_ADMIN_LISTEN");
     cmd.env("AIVPN_ADMIN_TOKEN", token);
     cmd.arg("role");
@@ -1007,20 +1054,12 @@ pub(crate) fn read_admin_token() -> Option<String> {
 
 /// Запрашивает QR-код по локальному TCP IPC с токеном исходной сессии.
 fn qr_png_for(text: &str) -> Result<Vec<u8>, String> {
-    let token = pinned_token().ok_or_else(|| {
-        "No admin token found — is the VPN client running and connected as Admin?".to_string()
-    })?;
     let b64_text = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
-    let line = format!("{token}:qr:{b64_text}");
-
-    let reply = aivpn_common::local_admin::request(
-        ADMIN_SOCKET_ADDR
-            .parse()
-            .map_err(|e: std::net::AddrParseError| e.to_string())?,
-        &line,
+    let target = pinned_target().ok_or("Нет действующего сеанса управления")?;
+    let reply = target.execute(
+        &format!("qr:{b64_text}"),
         std::time::Duration::from_secs(12),
-    )
-    .map_err(|e| format!("No reply from the VPN client: {e}"))?;
+    )?;
     base64::engine::general_purpose::STANDARD
         .decode(reply.trim())
         .map_err(|e| format!("Failed to decode QR image: {e}"))
@@ -1318,7 +1357,14 @@ mod tests {
     }
 }
 
-thread_local! { static SESSION_TOKEN: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) }; }
+thread_local! { static SESSION_TARGET: std::cell::RefCell<Option<Target>> = const { std::cell::RefCell::new(None) }; }
+fn pinned_target() -> Option<Target> {
+    SESSION_TARGET.with(|slot| slot.borrow().clone())
+}
 fn pinned_token() -> Option<String> {
-    SESSION_TOKEN.with(|slot| slot.borrow().clone())
+    match pinned_target()? {
+        Target::Legacy(token) => token,
+        #[cfg(windows)]
+        Target::Managed(_) => None,
+    }
 }

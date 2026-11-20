@@ -41,7 +41,7 @@ crates/aivpn-server/     — Linux-only VPN gateway and management CLI
 crates/aivpn-client/     — cross-platform VPN client (Linux / macOS / Windows)
 crates/aivpn-android-core/ — JNI bridge for Android (Rust → Kotlin via C FFI)
 crates/aivpn-ios-core/   — iOS Rust staticlib (C FFI), linked by PacketTunnelProvider
-crates/aivpn-windows/    — Windows GUI (egui/eframe 0.31, manages aivpn-client.exe subprocess)
+crates/aivpn-windows/    — Windows GUI (egui/eframe 0.31、CLI とサービスモードを内蔵)
 crates/aivpn-linux/      - Linux GUI (Iced 0.14, wraps aivpn-client subprocess)
 platforms/android/       — Android Kotlin app (MVVM: MainViewModel + RecyclerView)
 platforms/ios/           — iOS SwiftUI app + NetworkExtension PacketTunnelProvider
@@ -102,7 +102,7 @@ QUIC マスクは双方向の QUIC v1/TLS 1.3 を実行します。CID とパケ
 
 新しい設定を適用するには、クライアントのプロセスまたはサーバーのサービスを再起動してください。無効な値は設定エラーとなり、黙ってデフォルトモードにフォールバックすることはありません。
 
-Linux では、IPv6 アドレスが割り当てられていないフルトンネルは、IPv4 の MTU が 1280 未満の場合も含め、所有する 2 つのブラックホールルートで IPv6 をブロックします。IPv6 アドレスが割り当てられている場合、インターフェイスの MTU が 1280 を下回ることはありません。明示的に切断すると所有するルートは削除されます。クラッシュ後は、`aivpn-client kill-switch clear` がファイアウォールルールと残っている所有 IPv6 ガードを削除します。残った IPv6 ルートは通常の起動時に自動でクリーンアップされることはなく、オペレーターが明示的にコマンドを実行した場合のみ削除されます。CLI と `aivpn-ip-helper` は同じビルドから更新してください。
+Linux では、IPv6 アドレスが割り当てられていないフルトンネルは、IPv4 の MTU が 1280 未満の場合も含め、所有する 2 つのブラックホールルートで IPv6 をブロックします。IPv6 アドレスが割り当てられている場合、インターフェイスの MTU が 1280 を下回ることはありません。明示的に切断すると所有するルートは削除されます。クラッシュ後は、`aivpn-client kill-switch clear` がファイアウォールルールと残っている所有 IPv6 ガードを削除します。残った IPv6 ルートは通常の起動時に自動でクリーンアップされることはなく、オペレーターが明示的にコマンドを実行した場合のみ削除されます。ネットワークヘルパーは選択した CLI または GUI に内蔵されています。
 
 バンドルされた 10 個のプロファイルはすべて `--preferred-mask` と `--polymorphic-base` で利用でき、不明な ID は拒否されます。この優先指定は、検証済みのブートストラップから、要求されたベースの初期候補を選択します。該当する候補がない場合、クライアントは信頼済みの開始手順を維持し、PFS の後にそのベースを要求します。`--polymorphic-base` が優先され、その後のサーバーによる自動ローテーションは引き続き適用されます。初期交換の再試行では 1 回の試行内のエフェメラル鍵を維持しますが、新しいノンスを使用します。試行全体は 10 秒に制限されます。STUN と QUIC のマスクファミリー間の切り替えに新しいセッションは不要です。外側の QUIC および SRTP パケットは 1380 バイトに制限されます。QUIC は 1200 UDP バイトで開始し、パス MTU を最大 1380 までプローブします。内側のパケットは QUIC で 1140 バイト、ICE/DTLS/SRTP で 1324 バイト、ICE/SRTP で 1358 バイトに制限されます。パディングは、選択されたキャリアのヘッダー、AEAD、アラインメントを考慮します。制御メッセージは暗号化の前にフラグメント化されます。QUIC と RTC は両方向ともユーザー空間で動作し、プレーンな STUN の TX もユーザー空間にとどまります。ABI 7 は変更されていません。ネイティブインストールと systemd は従来どおりです。
 
@@ -354,11 +354,11 @@ Windows GUI には Fluent Desktop とコンパクトな Fluent レイアウト�
 
 **インストーラー (推奨):** `aivpn-windows-installer.exe` をダウンロードして管理者として実行し、スタートメニューから **AIVPN** を起動します。
 
-**ポータブル版:** `aivpn-windows-package.zip` (`aivpn.exe`、`aivpn-client.exe`、`wintun.dll` を含む) を展開し、`aivpn.exe` を管理者として実行します。
+**ポータブル版:** `aivpn-windows-gui.zip` から Wintun を内蔵した `aivpn.exe` を展開して実行します。VPN 接続に必要な場合、GUI が管理者権限を要求します。
 
 CLI (PowerShell、管理者権限):
 ```powershell
-.\aivpn-client.exe -k "aivpn://..."
+.\aivpn.exe cli -k "aivpn://..."
 ```
 
 > Wintun ネットワークアダプターを作成するには管理者権限が必要です。

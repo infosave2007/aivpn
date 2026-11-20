@@ -38,6 +38,7 @@ struct Peer {
 
 struct RtcAdmission {
     session_id: [u8; 16],
+    owner: SessionOwner,
     offer: MaskState,
     answer: MaskState,
     inner_budget: usize,
@@ -85,8 +86,9 @@ impl MaskEngine {
             Self::Rtc(engine) => engine.receive(packet, now),
         }
     }
-    fn send(&mut self, packet: &[u8], now: Instant) -> Result<bool> {
+    fn send(&mut self, packet: &[u8], now: Instant, data: bool) -> Result<bool> {
         match self {
+            Self::Quic(engine) if data => engine.send_data(packet).map(|_| true),
             Self::Quic(engine) => engine.send(packet).map(|_| true),
             Self::Rtc(engine) if !engine.connected() => Ok(false),
             Self::Rtc(engine) => engine.send(packet, now).map(|_| true),
@@ -286,6 +288,129 @@ fn retire_quic_generation(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn downlink_burst_gives_the_carrier_time_to_drain() {
+        use super::super::Gateway;
+        use super::super::ShapingLevel;
+        use aivpn_common::{crypto::KeyPair, mask::preset_masks};
+
+        let directory = tempfile::tempdir().unwrap();
+        let network = aivpn_common::network_config::VpnNetworkConfig::default();
+        let database = Arc::new(
+            crate::client_db::ClientDatabase::load(
+                &directory.path().join("clients.json"),
+                network.clone(),
+            )
+            .unwrap(),
+        );
+        let user = database.add_client("downlink-burst").unwrap();
+        let mask = preset_masks::quic_https_v2();
+        let manager = Arc::new(crate::session::SessionManager::new(
+            KeyPair::generate(),
+            ed25519_dalek::SigningKey::from_bytes(&[41; 32]),
+            mask.clone(),
+        ));
+        let address = "127.0.0.1:30000".parse().unwrap();
+        let session = manager
+            .create_session(
+                address,
+                KeyPair::generate().public_key_bytes(),
+                Some(user.psk),
+                Some(user.vpn_ip),
+            )
+            .unwrap();
+        {
+            let mut session = session.lock();
+            session.client_id = Some(user.id.clone());
+            session.client_admitted = true;
+            session.complete_ratchet();
+            assert!(!session.keys.packet_cipher.is_initial());
+        }
+        let raw = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let socket = MaskSocket::new(raw);
+        let (incoming, _incoming_rx) = mpsc::channel(QUEUE);
+        let (outgoing, mut outgoing_rx) = mpsc::channel(QUIC_QUEUE);
+        socket.peers.insert(
+            address,
+            Peer {
+                ready: Arc::new(AtomicBool::new(true)),
+                quic: None,
+                rtc: None,
+                incoming,
+                outgoing,
+            },
+        );
+        let (tx, rx) = mpsc::channel(4096);
+        let mut packet = vec![0; 100];
+        packet[0] = 0x45;
+        packet[2..4].copy_from_slice(&100u16.to_be_bytes());
+        packet[9] = 17;
+        packet[12..16].copy_from_slice(&network.server_vpn_ip.octets());
+        packet[16..20].copy_from_slice(&user.vpn_ip.octets());
+        for _ in 0..4096 {
+            tx.try_send(packet.clone()).unwrap();
+        }
+        drop(tx);
+        let consumer = tokio::spawn(async move {
+            let mut received = 0;
+            while let Some((packet, data)) = outgoing_rx.recv().await {
+                assert!(data && !packet.is_empty());
+                received += 1;
+            }
+            received
+        });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            Gateway::downlink_worker(
+                rx,
+                0,
+                manager,
+                socket.clone(),
+                Arc::new(DashMap::new()),
+                mask,
+                None,
+                Some(database),
+                Arc::new(crate::qos::QosEnforcer::new()),
+                ShapingLevel::Off,
+                network,
+                None,
+            ),
+        )
+        .await
+        .unwrap();
+        drop(socket);
+        let received = tokio::time::timeout(std::time::Duration::from_secs(1), consumer)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            received, 4096,
+            "Готовая очередь TUN вытеснила обработчик маски"
+        );
+    }
+
+    #[tokio::test]
+    async fn dropping_mask_socket_stops_pending_transports() {
+        let raw = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let address = raw.local_addr().unwrap();
+        let released = Arc::downgrade(&raw);
+        let socket = MaskSocket::new(raw);
+        let peer = "127.0.0.1:43210".parse().unwrap();
+        let mut client = QuicMask::client(b"test", address, "localhost", Instant::now()).unwrap();
+        let initial = client.poll(Instant::now()).unwrap().wire.remove(0);
+        socket.start_initial(peer, &initial).unwrap();
+        tokio::task::yield_now().await;
+        drop(socket);
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while released.upgrade().is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("Транспорт продолжает удерживать закрытый UDP-сокет");
+        assert!(UdpSocket::bind(address).await.is_ok());
+    }
+
     use super::*;
 
     #[tokio::test]
@@ -1559,6 +1684,7 @@ pub(crate) struct MaskSocket {
     received: Mutex<mpsc::Receiver<DecodedPacket>>,
     permits: Arc<Semaphore>,
     wire_observer: Option<WireObserver>,
+    tasks: parking_lot::Mutex<tokio::task::JoinSet<()>>,
 }
 
 impl std::ops::Deref for MaskSocket {
@@ -1569,6 +1695,12 @@ impl std::ops::Deref for MaskSocket {
 }
 
 impl MaskSocket {
+    fn spawn_transport(&self, future: impl std::future::Future<Output = ()> + Send + 'static) {
+        let mut tasks = self.tasks.lock();
+        while tasks.try_join_next().is_some() {}
+        tasks.spawn(future);
+    }
+
     pub fn accept_rtc_offer(
         &self,
         offer: &MaskState,
@@ -1586,13 +1718,7 @@ impl MaskSocket {
                 return Err(Error::InvalidPacket("Сессия RTC уже удалена"));
             }
             let mask = session
-                .mask
-                .as_ref()
-                .filter(|mask| {
-                    aivpn_common::mask_io::uses_rtc(mask)
-                        && mask.mask_id == offer.mask_id
-                        && mask.version == offer.mask_version
-                })
+                .rtc_offer_mask(&offer.mask_id, offer.mask_version)
                 .ok_or(Error::InvalidPacket(
                     "Предложение RTC не соответствует маске сессии",
                 ))?;
@@ -1677,6 +1803,7 @@ impl MaskSocket {
             outgoing,
             rtc: Some(Arc::new(RtcAdmission {
                 session_id,
+                owner: owner.clone(),
                 offer: offer.clone(),
                 answer: answer.clone(),
                 inner_budget,
@@ -1696,11 +1823,9 @@ impl MaskSocket {
             let mut latest_session = session.lock();
             if latest_session.is_removed()
                 || latest_session.rtc_retired_offers.contains(&offer.offer_id)
-                || !latest_session.mask.as_ref().is_some_and(|mask| {
-                    aivpn_common::mask_io::uses_rtc(mask)
-                        && mask.mask_id == offer.mask_id
-                        && mask.version == offer.mask_version
-                })
+                || latest_session
+                    .rtc_offer_mask(&offer.mask_id, offer.mask_version)
+                    .is_none()
             {
                 return Err(Error::InvalidPacket(
                     "Сессия или предложение RTC уже изменились",
@@ -1756,7 +1881,7 @@ impl MaskSocket {
         let peers = self.peers.clone();
         let decoded = self.decoded.clone();
         let observer = self.wire_observer.clone();
-        tokio::spawn(async move {
+        self.spawn_transport(async move {
             let _permit = permit;
             if let Err(error) = drive(
                 MaskEngine::Rtc(engine),
@@ -1815,6 +1940,7 @@ impl MaskSocket {
             received: Mutex::new(received),
             permits: Arc::new(Semaphore::new(PEERS)),
             wire_observer,
+            tasks: parking_lot::Mutex::new(tokio::task::JoinSet::new()),
         })
     }
 
@@ -2115,7 +2241,7 @@ impl MaskSocket {
         let transports = self.quic_transports.clone();
         let decoded = self.decoded.clone();
         let observer = self.wire_observer.clone();
-        tokio::spawn(async move {
+        self.spawn_transport(async move {
             let _permit = permit;
             if let Err(error) = drive(
                 MaskEngine::Quic(engine),
@@ -2287,7 +2413,33 @@ impl MaskSocket {
         stateful: bool,
         data: bool,
     ) -> io::Result<usize> {
-        let sender = self.peers.get(&peer).map(|entry| entry.clone());
+        let mut sender = self.peers.get(&peer).map(|entry| entry.clone());
+        if let Some(previous) = sender.as_ref().filter(|sender| sender.rtc.is_some()) {
+            let owner = previous
+                .rtc
+                .as_ref()
+                .and_then(|rtc| rtc.owner.upgrade())
+                .ok_or_else(|| io::Error::from(io::ErrorKind::WouldBlock))?;
+            let session = owner.lock();
+            if !previous.rtc.as_ref().is_some_and(|rtc| {
+                session
+                    .rtc_offer_mask(&rtc.offer.mask_id, rtc.offer.mask_version)
+                    .is_some()
+            }) {
+                // После смены маски downlink не должен ждать следующего
+                // keepalive клиента, чтобы перестать оборачивать пакеты в SRTP.
+                if self
+                    .peers
+                    .remove_if(&peer, |_, current| {
+                        current.outgoing.same_channel(&previous.outgoing)
+                    })
+                    .is_none()
+                {
+                    return Err(io::ErrorKind::WouldBlock.into());
+                }
+                sender = None;
+            }
+        }
         if let Some(sender) = sender {
             let maximum = if let Some(rtc) = &sender.rtc {
                 rtc.inner_budget
@@ -2369,7 +2521,7 @@ async fn drive(
         engine.observe_verified_wire();
     }
     for reply in replies {
-        if !engine.send(&reply, Instant::now())? {
+        if !engine.send(&reply, Instant::now(), false)? {
             crate::udp_source::send_to(&raw, &reply_sources, &reply, peer).await?;
         }
     }
@@ -2491,7 +2643,7 @@ async fn drive(
             },
             packet = outgoing.recv() => match packet {
                 Some((packet, data)) => {
-                    match engine.send(&packet, Instant::now()) {
+                    match engine.send(&packet, Instant::now(), data) {
                         Ok(false) if !data => { let _ = crate::udp_source::send_to(&raw, &reply_sources, &packet, peer).await; }
                         Ok(false) => {},
                         Ok(true) => {},

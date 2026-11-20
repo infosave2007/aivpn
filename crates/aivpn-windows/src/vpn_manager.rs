@@ -6,16 +6,45 @@
 //! SECURITY NOTE: The device public key (X25519) must NEVER be shown in the UI.
 //! Exposing it would allow correlation attacks linking the user's device to VPN sessions.
 
+#[cfg(windows)]
+use aivpn_client::classic_windows::ClientProcess as Child;
 use base64::Engine as _;
 use std::path::PathBuf;
-use std::process::{Child, Command};
+#[cfg(not(windows))]
+use std::process::Child;
+use std::process::Command;
 use std::time::{Duration, Instant};
 
+#[cfg(any(not(windows), test))]
 const FIREWALL_CLEAR_TIMEOUT: Duration = Duration::from_secs(15);
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod connection_status_tests {
     use super::*;
+
+    fn waiting_child() -> Child {
+        #[cfg(windows)]
+        let mut command = {
+            let mut c = Command::new("powershell.exe");
+            c.args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "Start-Sleep -Seconds 5",
+            ]);
+            c
+        };
+        #[cfg(not(windows))]
+        let mut command = {
+            let mut c = Command::new("sleep");
+            c.arg("5");
+            c
+        };
+        #[cfg(windows)]
+        return Child::spawn(&mut command, false).unwrap();
+        #[cfg(not(windows))]
+        command.spawn().unwrap()
+    }
 
     #[test]
     fn live_child_without_server_confirmation_remains_connecting() {
@@ -25,7 +54,7 @@ mod connection_status_tests {
         manager
             .recording_refresh_in_flight
             .store(true, std::sync::atomic::Ordering::SeqCst);
-        manager.child = Some(Command::new("sleep").arg("5").spawn().unwrap());
+        manager.child = Some(waiting_child());
         manager.state = ConnectionState::Connecting;
         manager.poll_status();
         assert_eq!(manager.state, ConnectionState::Connecting);
@@ -35,7 +64,7 @@ mod connection_status_tests {
     fn machine_status_reconnect_and_terminal_refusal_are_authoritative() {
         let mut manager = VpnManager::new();
         manager.kill_switch_active = false;
-        manager.child = Some(Command::new("sleep").arg("5").spawn().unwrap());
+        manager.child = Some(waiting_child());
         manager.apply_status_line("AIVPN-STATUS connected 10.0.0.3");
         assert_eq!(manager.state, ConnectionState::Connected);
         assert_eq!(manager.stats.vpn_ip.as_deref(), Some("10.0.0.3"));
@@ -46,6 +75,20 @@ mod connection_status_tests {
         assert!(manager.last_error.as_deref().unwrap().contains("expired"));
         manager.apply_status_line("AIVPN-STATUS disconnected");
         assert!(manager.last_error.as_deref().unwrap().contains("expired"));
+    }
+
+    #[test]
+    fn confirmed_idle_tunnel_is_not_reported_as_failed() {
+        let mut manager = VpnManager::new();
+        manager.kill_switch_active = false;
+        manager.child = Some(waiting_child());
+        manager.apply_status_line("AIVPN-STATUS connected 10.0.0.3");
+        manager.poll_status_with(|manager| {
+            manager.stats.bytes_sent = 0;
+            manager.stats.bytes_received = 0;
+        });
+        assert_eq!(manager.state, ConnectionState::Connected);
+        assert!(manager.last_error.is_none(), "{:?}", manager.last_error);
     }
 }
 
@@ -62,6 +105,7 @@ pub struct TrafficStats {
     pub bytes_received: u64,
     pub quality_score: u8,
     pub server_adaptive_level: u8,
+    pub fec_group: Option<u8>,
     /// Client's currently-effective VPN IP, from the `ip:` key the client's
     /// stats writer adds to traffic.stats. Unlike the connection key's own
     /// (static, one-time-parsed) `vpn_ip`, this reflects a server-assigned IP
@@ -95,6 +139,10 @@ pub struct RecordingResult {
 /// Benchmark result parsed from `aivpn-client bench --json` output.
 #[derive(Debug, Clone, Default, serde::Deserialize)]
 pub struct BenchResult {
+    #[serde(default)]
+    pub throughput_method: String,
+    #[serde(default)]
+    pub throughput_limited: bool,
     pub throughput_up_kbps: f64,
     pub throughput_down_kbps: f64,
     pub latency_p50_ms: f64,
@@ -126,6 +174,9 @@ pub fn is_acceptable_mask_id(id: &str) -> bool {
 
 pub struct VpnManager {
     state: ConnectionState,
+    managed_profile: Option<String>,
+    #[cfg(windows)]
+    managed_administration: Option<aivpn_desktop_agent::client::SessionTarget>,
     child: Option<Child>,
     status_rx: Option<std::sync::mpsc::Receiver<String>>,
     terminal_status_error: bool,
@@ -145,7 +196,6 @@ pub struct VpnManager {
     recording_refresh_in_flight: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Timestamp when we entered Connected state — used to detect a stalled tunnel
     /// (process alive but Wintun failing in its reconnect loop).
-    connected_since: Option<Instant>,
     /// Session epoch (unix ms) from the stats file's `since:` key — stamped by
     /// the client child once per session. A CHANGE here means the child
     /// silently reconnected (new session): counters legitimately reset to
@@ -217,6 +267,9 @@ impl VpnManager {
         let client_binary = Self::find_client_binary();
         Self {
             state: ConnectionState::Disconnected,
+            managed_profile: None,
+            #[cfg(windows)]
+            managed_administration: None,
             child: None,
             status_rx: None,
             terminal_status_error: false,
@@ -225,6 +278,7 @@ impl VpnManager {
                 bytes_received: 0,
                 quality_score: 0,
                 server_adaptive_level: 0,
+                fec_group: None,
                 // Pre-existing field (`vpn_ip`) was missing from this
                 // literal in the working tree before this change — a latent
                 // compile error this crate can't be built to catch on a
@@ -246,7 +300,6 @@ impl VpnManager {
             recording_refresh_in_flight: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
                 false,
             )),
-            connected_since: None,
             session_since_ms: None,
             kill_switch_active: Self::kill_switch_marker_path().exists(),
             #[cfg(windows)]
@@ -268,8 +321,129 @@ impl VpnManager {
         self.state
     }
 
+    #[cfg(windows)]
+    pub(crate) fn managed_profile(&self) -> Option<&str> {
+        self.managed_profile.as_deref()
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn prepare_desktop_request(&mut self) {
+        self.managed_administration = None;
+        self.state = ConnectionState::Connecting;
+        self.last_error = None;
+        self.stats.bytes_sent = 0;
+        self.stats.bytes_received = 0;
+        self.stats.vpn_ip = None;
+        self.stats.fallback = false;
+        self.session_since_ms = None;
+        self.recording_state = RecordingState::Idle;
+        self.can_record_masks = false;
+        self.recording_capability_known = false;
+        self.last_recording_result = None;
+        self.minimum_recording_ts = 0;
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn adopt_managed_profile(&mut self, profile: String, connection_key: &str) {
+        self.managed_profile = Some(profile);
+        self.server_addr = extract_server_addr(connection_key);
+        self.prepare_desktop_request();
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn apply_managed_snapshot(
+        &mut self,
+        snapshot: &aivpn_desktop_agent::client::editor::Snapshot,
+    ) -> Result<(), String> {
+        use aivpn_desktop_agent::client::session::SessionStatus;
+        let profile = self
+            .managed_profile
+            .as_deref()
+            .ok_or("Нет профиля службы")?;
+        self.state = match snapshot
+            .session_status(profile)
+            .map_err(|error| error.to_string())?
+        {
+            SessionStatus::Stopped => ConnectionState::Disconnected,
+            SessionStatus::Connecting => ConnectionState::Connecting,
+            SessionStatus::Connected => ConnectionState::Connected,
+        };
+        self.stats.vpn_ip = snapshot
+            .profiles
+            .iter()
+            .find(|candidate| candidate.id == profile)
+            .and_then(|profile| {
+                profile
+                    .ipv4
+                    .map(|ip| ip.to_string())
+                    .or_else(|| profile.ipv6.map(|ip| ip.to_string()))
+            });
+        self.managed_administration = snapshot.administration_target(profile).ok();
+        self.last_error = None;
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn release_managed_profile(&mut self) {
+        self.managed_profile = None;
+        self.managed_administration = None;
+        self.state = ConnectionState::Disconnected;
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn desktop_request_failed(&mut self, error: String) {
+        self.managed_administration = None;
+        self.state = if self.managed_profile.is_some() {
+            ConnectionState::Disconnecting
+        } else {
+            ConnectionState::Disconnected
+        };
+        self.last_error = Some(error);
+    }
+
     pub fn kill_switch_enabled(&self) -> bool {
         self.kill_switch_active
+    }
+
+    pub(crate) fn administration_target(&self) -> crate::admin::Target {
+        #[cfg(windows)]
+        if self.managed_profile.is_some() {
+            return crate::admin::Target::Managed(
+                self.managed_administration
+                    .clone()
+                    .ok_or("Нет подтвержденной сессии службы".to_owned()),
+            );
+        }
+        crate::admin::Target::Legacy(crate::admin::read_admin_token())
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn apply_managed_statistics(
+        &mut self,
+        statistics: aivpn_common::local_admin::SessionStatistics,
+    ) -> bool {
+        let replaced = self
+            .session_since_ms
+            .is_some_and(|since| since != statistics.since);
+        if replaced {
+            self.recording_state = RecordingState::Idle;
+            self.can_record_masks = false;
+            self.recording_capability_known = false;
+            self.last_recording_result = None;
+            self.minimum_recording_ts = 0;
+        }
+        self.session_since_ms = Some(statistics.since);
+        self.stats.bytes_sent = statistics.sent;
+        self.stats.bytes_received = statistics.received;
+        self.stats.quality_score = statistics.quality;
+        self.stats.server_adaptive_level = statistics.adaptive;
+        self.stats.fec_group = (statistics.fec_group != 0).then_some(statistics.fec_group);
+        self.stats.vpn_ip = Some(statistics.ip);
+        self.stats.fallback = statistics.fallback;
+        if let Some(recording) = statistics.recording {
+            self.apply_recording_info(&recording);
+        }
+        replaced
     }
 
     pub fn stats(&self) -> &TrafficStats {
@@ -292,6 +466,7 @@ impl VpnManager {
         &mut self,
         connection_key: &str,
         full_tunnel: bool,
+        split_enabled: bool,
         proxy_listen: Option<&str>,
         mtls_cert_path: Option<&str>,
         exclude_routes: &[String],
@@ -382,6 +557,7 @@ impl VpnManager {
         let _ = std::fs::remove_file(std::env::temp_dir().join("aivpn-quality.json"));
 
         let mut cmd = Command::new(&self.client_binary);
+        cmd.arg("cli");
         cmd.env_remove("AIVPN_ADMIN_LISTEN");
         cmd.env("AIVPN_CONNECTION_KEY", connection_key);
         // An extension may have selected an alternative transport. Pass it
@@ -408,6 +584,7 @@ impl VpnManager {
             cmd.arg("--mtls-cert").arg(cert);
         }
 
+        cmd.arg(format!("--split-enabled={split_enabled}"));
         for route in exclude_routes {
             if !route.trim().is_empty() {
                 cmd.arg("--exclude-routes").arg(route.trim());
@@ -519,7 +696,12 @@ impl VpnManager {
             cmd.creation_flags(CREATE_NO_WINDOW);
         }
 
-        match cmd.spawn() {
+        #[cfg(windows)]
+        let spawned =
+            aivpn_client::classic_windows::ClientProcess::spawn(&mut cmd, proxy_listen.is_none());
+        #[cfg(not(windows))]
+        let spawned = cmd.spawn();
+        match spawned {
             Ok(mut child) => {
                 let child_pid = child.id();
                 self.terminal_status_error = false;
@@ -544,11 +726,10 @@ impl VpnManager {
                         }
                     });
                 }
-                // Assign the client to the kill-on-close Job Object so it dies with the
-                // GUI even on an abnormal exit that skips Drop. Best-effort — on failure
-                // the child still runs, just without the crash-cleanup guarantee.
+                // Повышенный процесс завершает сеть через канал владельца. Job нужен
+                // только обычному дочернему процессу, иначе он прервет эту очистку.
                 #[cfg(windows)]
-                if let Some(job) = self.job_handle {
+                if let Some(job) = self.job_handle.filter(|_| !child.is_elevated_child()) {
                     use std::os::windows::io::AsRawHandle;
                     use winapi::um::jobapi2::AssignProcessToJobObject;
                     let h = child.as_raw_handle();
@@ -590,10 +771,25 @@ impl VpnManager {
 
     /// Очистка идет в фоне, чтобы не блокировать интерфейс. Маркер сохраняется
     /// до успешного завершения команды для повторной попытки после сбоя.
+    #[cfg(windows)]
+    fn run_kill_switch_clear(binary: &std::path::Path) -> bool {
+        match aivpn_client::classic_windows::clear(binary) {
+            Ok(()) => {
+                let _ = std::fs::remove_file(Self::kill_switch_marker_path());
+                true
+            }
+            Err(error) => {
+                gui_log(&format!("kill-switch clear failed: {error}"));
+                false
+            }
+        }
+    }
+
+    #[cfg(not(windows))]
     fn run_kill_switch_clear(binary: &std::path::Path) -> bool {
         let mut cmd = std::process::Command::new(binary);
         cmd.env_remove("AIVPN_ADMIN_LISTEN");
-        cmd.args(["kill-switch", "clear"]);
+        cmd.args(["cli", "kill-switch", "clear"]);
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
@@ -678,6 +874,21 @@ impl VpnManager {
 
     /// Disconnect — kill the client process
     pub fn disconnect(&mut self) {
+        #[cfg(windows)]
+        if let Some(profile) = &self.managed_profile {
+            use aivpn_desktop_agent::{
+                client::call,
+                protocol::{Command, Reply},
+            };
+            match call(Command::StopProfile {
+                profile: profile.clone(),
+            }) {
+                Ok(Reply::Done {}) => self.state = ConnectionState::Disconnected,
+                Ok(_) => self.last_error = Some("Неожиданный ответ службы маршрутизации".into()),
+                Err(error) => self.last_error = Some(error.to_string()),
+            }
+            return;
+        }
         self.state = ConnectionState::Disconnecting;
 
         // Intentional kill — signal the supervision thread BEFORE killing so
@@ -688,8 +899,21 @@ impl VpnManager {
         }
 
         if let Some(ref mut child) = self.child {
-            let _ = child.kill();
-            let _ = child.wait();
+            if let Err(error) = child.kill() {
+                self.last_error = Some(format!("Не подтверждена остановка клиента: {error}"));
+                return;
+            }
+            match child.wait() {
+                Ok(status) if status.success() => {
+                    self.kill_switch_active = false;
+                    let _ = std::fs::remove_file(Self::kill_switch_marker_path());
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    self.last_error = Some(format!("Не подтверждена остановка клиента: {error}"));
+                    return;
+                }
+            }
         }
         self.child = None;
         self.status_rx = None;
@@ -711,7 +935,6 @@ impl VpnManager {
         self.stats.vpn_ip = None;
         self.stats.fallback = false;
         self.session_since_ms = None;
-        self.connected_since = None;
         self.last_error = self
             .kill_switch_active
             .then(|| "Kill-switch cleanup failed; protection remains active".into());
@@ -724,15 +947,11 @@ impl VpnManager {
     }
 
     /// Диагностика текущей сессии с реквизитами, сохраненными до запуска потока.
-    pub fn run_bench_blocking(token: Option<String>) -> Option<BenchResult> {
-        let token = token?;
-        let reply = aivpn_common::local_admin::request(
-            "127.0.0.1:44301".parse().ok()?,
-            &format!("{token}:bench:10"),
-            Duration::from_secs(18),
-        )
-        .map_err(|error| gui_log(&format!("bench: {error}")))
-        .ok()?;
+    pub fn run_bench_blocking(target: crate::admin::Target) -> Option<BenchResult> {
+        let reply = target
+            .execute("bench:10", Duration::from_secs(26))
+            .map_err(|error| gui_log(&format!("bench: {error}")))
+            .ok()?;
         serde_json::from_str(&reply)
             .map_err(|error| gui_log(&format!("bench: {error}")))
             .ok()
@@ -745,6 +964,16 @@ impl VpnManager {
 
     /// Poll process status and read traffic stats
     pub fn poll_status(&mut self) {
+        if self.managed_profile.is_some() {
+            return;
+        }
+        self.poll_status_with(|manager| {
+            manager.read_traffic_stats();
+            manager.poll_recording_status();
+        });
+    }
+
+    fn poll_status_with(&mut self, refresh_stats: impl FnOnce(&mut Self)) {
         // Only poll every 500ms
         if let Some(last) = self.last_poll {
             if last.elapsed() < std::time::Duration::from_millis(500) {
@@ -768,7 +997,7 @@ impl VpnManager {
                     // All exits seen by poll_status() are unexpected — intentional disconnects
                     // go through disconnect() which kills and waits before returning, so child
                     // is already None by the time poll_status() runs.
-                    let detail = Self::read_last_log_line()
+                    let detail = Self::read_last_log_line(status.code() == Some(101))
                         .map(|l| format!(": {l}"))
                         .unwrap_or_default();
                     if self.terminal_status_error {
@@ -785,7 +1014,6 @@ impl VpnManager {
                         s.shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
                     }
                     self.state = ConnectionState::Disconnected;
-                    self.connected_since = None;
                     self.stats.bytes_sent = 0;
                     self.stats.bytes_received = 0;
                     self.stats.vpn_ip = None;
@@ -802,7 +1030,6 @@ impl VpnManager {
                         s.shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
                     }
                     self.state = ConnectionState::Disconnected;
-                    self.connected_since = None;
                     // LOW-4: mirror the Ok(Some) reset — otherwise stale
                     // counters and a stale session epoch survive into the
                     // next session's display.
@@ -818,34 +1045,11 @@ impl VpnManager {
 
         // Read traffic stats from file
         if self.state == ConnectionState::Connected {
-            self.read_traffic_stats();
-            self.poll_recording_status();
+            refresh_stats(self);
 
             // Once traffic is flowing, a previous stall error is no longer relevant.
             if self.stats.bytes_sent > 0 || self.stats.bytes_received > 0 {
                 self.last_error = None;
-            }
-
-            // If the tunnel has been "Connected" for >2s but traffic is still zero,
-            // the client process is alive but stuck in its Wintun reconnect loop.
-            // Surface the last log line unconditionally (no keyword filter) so the user
-            // sees the real cause (e.g. "WintunCreateAdapter failed: Access Denied")
-            // even when the log line doesn't contain "warn"/"error"/"failed".
-            if self.last_error.is_none()
-                && self.stats.bytes_sent == 0
-                && self.stats.bytes_received == 0
-            {
-                let stalled = self
-                    .connected_since
-                    .map(|t| t.elapsed().as_secs() >= 2)
-                    .unwrap_or(false);
-                if stalled {
-                    if let Some(line) = Self::read_last_log_line() {
-                        self.last_error = Some(line);
-                    } else {
-                        self.last_error = Some("No tunnel traffic after 2s".to_string());
-                    }
-                }
             }
         }
     }
@@ -861,7 +1065,6 @@ impl VpnManager {
                     return;
                 }
                 self.state = ConnectionState::Connected;
-                self.connected_since = Some(Instant::now());
                 self.stats.vpn_ip = parts
                     .next()
                     .filter(|ip| ip.parse::<std::net::Ipv4Addr>().is_ok())
@@ -873,7 +1076,6 @@ impl VpnManager {
                     return;
                 }
                 self.state = ConnectionState::Connecting;
-                self.connected_since = None;
                 self.session_since_ms = None;
                 self.stats.bytes_sent = 0;
                 self.stats.bytes_received = 0;
@@ -889,6 +1091,7 @@ impl VpnManager {
                         Some("one_time_used") => "Server: one-time key already used",
                         Some("expired") => "Server: client expired",
                         Some("disabled") => "Server: client disabled",
+                        Some("certificate") => "Server: mTLS certificate rejected",
                         _ => "Server: connection refused",
                     }
                     .to_owned(),
@@ -953,10 +1156,26 @@ impl VpnManager {
 
     /// Run a subcommand via the client binary in the background
     fn run_client_subcommand(&self, args: &[&str]) {
+        #[cfg(windows)]
+        if self.managed_profile.is_some() {
+            let command = match args {
+                ["record", "start", "--service", service] => format!("record_start:{service}"),
+                ["record", "stop"] => "record_stop".into(),
+                _ => return,
+            };
+            let target = self.administration_target();
+            std::thread::spawn(move || {
+                if let Err(error) = target.execute(&command, Duration::from_secs(12)) {
+                    gui_log(&format!("Запись маски не запущена: {error}"));
+                }
+            });
+            return;
+        }
         let binary = self.client_binary.clone();
         let args_owned: Vec<String> = args.iter().map(|s| s.to_string()).collect();
         std::thread::spawn(move || {
             let mut cmd = Command::new(&binary);
+            cmd.arg("cli");
             cmd.env_remove("AIVPN_ADMIN_LISTEN");
             for arg in &args_owned {
                 cmd.arg(arg);
@@ -997,6 +1216,7 @@ impl VpnManager {
         let binary = self.client_binary.clone();
         std::thread::spawn(move || {
             let mut cmd = std::process::Command::new(&binary);
+            cmd.arg("cli");
             cmd.env_remove("AIVPN_ADMIN_LISTEN");
             cmd.args(["record", "status"]);
             #[cfg(windows)]
@@ -1154,13 +1374,6 @@ impl VpnManager {
                             self.session_since_ms = Some(s);
                             self.stats.bytes_sent = sent;
                             self.stats.bytes_received = recv;
-                            // Re-arm the stall heuristic: the new session's
-                            // counters start at zero, which must not count as
-                            // "stalled since the ORIGINAL connect" — give the
-                            // fresh tunnel its own 2 s window.
-                            if self.state == ConnectionState::Connected {
-                                self.connected_since = Some(Instant::now());
-                            }
                         }
                         _ => {
                             // Same session — or an old-format file with no
@@ -1175,9 +1388,10 @@ impl VpnManager {
                             }
                         }
                     }
-                    let (qs, sal) = Self::read_quality_json();
+                    let (qs, sal, fec) = Self::read_quality_json();
                     self.stats.quality_score = qs;
                     self.stats.server_adaptive_level = sal;
+                    self.stats.fec_group = fec;
                     return;
                 }
             }
@@ -1192,22 +1406,28 @@ impl VpnManager {
         self.session_since_ms
     }
 
-    fn read_quality_json() -> (u8, u8) {
+    fn read_quality_json() -> (u8, u8, Option<u8>) {
         let path = std::env::temp_dir().join("aivpn-quality.json");
         let content = match std::fs::read_to_string(&path) {
             Ok(s) => s,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (0, 0),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (0, 0, None),
             Err(e) => {
                 gui_log(&format!("read_quality_json: {e}"));
-                return (0, 0);
+                return (0, 0, None);
             }
         };
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&content) {
             let quality = v["quality"].as_u64().unwrap_or(0) as u8;
             let adaptive = v["adaptive"].as_u64().unwrap_or(0) as u8;
-            return (quality, adaptive);
+            return (
+                quality,
+                adaptive,
+                v["fec_group"]
+                    .as_u64()
+                    .and_then(|value| u8::try_from(value).ok()),
+            );
         }
-        (0, 0)
+        (0, 0, None)
     }
 
     fn parse_stats(content: &str) -> Option<(u64, u64, Option<u64>, Option<String>, bool)> {
@@ -1254,19 +1474,9 @@ impl VpnManager {
             .join("client.log")
     }
 
-    /// Read the last non-empty line of the client log (for error surfacing).
-    fn read_last_log_line() -> Option<String> {
-        use std::io::{Read, Seek, SeekFrom};
-        const TAIL: u64 = 65536;
-        let mut f = std::fs::File::open(Self::client_log_path()).ok()?;
-        let len = f.seek(SeekFrom::End(0)).ok()?;
-        f.seek(SeekFrom::Start(len.saturating_sub(TAIL))).ok()?;
-        let mut buf = String::new();
-        f.read_to_string(&mut buf).ok()?;
-        buf.lines()
-            .filter(|l| !l.trim().is_empty())
-            .last()
-            .map(|l| l.trim().to_string())
+    /// Причина panic важнее последующей очистки адаптера.
+    fn read_last_log_line(panicked: bool) -> Option<String> {
+        crate::client_log::read_failure(&Self::client_log_path(), panicked)
     }
 
     fn stats_file_path() -> PathBuf {
@@ -1281,60 +1491,19 @@ impl VpnManager {
     }
 
     fn find_client_binary() -> PathBuf {
-        // 1. Next to this executable
-        if let Ok(exe) = std::env::current_exe() {
-            let dir = exe.parent().unwrap_or(std::path::Path::new("."));
-            let candidate = dir.join("aivpn-client.exe");
-            if candidate.exists() {
-                return candidate;
+        std::env::current_exe().unwrap_or_else(|_| {
+            if cfg!(windows) {
+                PathBuf::from(r"C:\Program Files\AIVPN\aivpn.exe")
+            } else {
+                PathBuf::from("/nonexistent/aivpn")
             }
-            // Also check without .exe for non-windows dev
-            let candidate = dir.join("aivpn-client");
-            if candidate.exists() {
-                return candidate;
-            }
-        }
-
-        // 2. Program Files
-        if cfg!(windows) {
-            let pf = PathBuf::from(r"C:\Program Files\AIVPN\aivpn-client.exe");
-            if pf.exists() {
-                return pf;
-            }
-        }
-
-        // 3. Fallback — a TRUSTED ABSOLUTE path, never a bare relative name.
-        // The GUI runs elevated (requireAdministrator manifest); returning
-        // "aivpn-client.exe" would let Windows search the current directory and
-        // PATH, so an attacker-planted binary in an writable CWD/PATH entry
-        // would run as admin (binary planting → EoP). An absolute path that
-        // doesn't exist simply fails to spawn — safe.
-        if cfg!(windows) {
-            PathBuf::from(r"C:\Program Files\AIVPN\aivpn-client.exe")
-        } else {
-            // Dev/non-windows: resolve next to our own exe, absolute, or a
-            // clearly-invalid absolute path (never a bare relative name).
-            std::env::current_exe()
-                .ok()
-                .and_then(|e| e.parent().map(|d| d.join("aivpn-client")))
-                .unwrap_or_else(|| PathBuf::from("/nonexistent/aivpn-client"))
-        }
+        })
     }
 }
 
 // ── Recording status file format (matches aivpn-client record_cmd.rs) ───
 
-#[derive(Debug, serde::Deserialize)]
-struct RecordingSnapshot {
-    can_record: Option<bool>,
-    state: String,
-    service: Option<String>,
-    message: Option<String>,
-    mask_id: Option<String>,
-    #[allow(dead_code)]
-    confidence: Option<f32>,
-    updated_at_ms: u64,
-}
+type RecordingSnapshot = aivpn_common::local_admin::RecordingStatus;
 
 /// Extract the server address from an `aivpn://` connection key.
 /// Connection key format: `aivpn://` + base64url(JSON) where JSON["s"] = "host:port".
@@ -1438,6 +1607,7 @@ pub fn format_bytes(bytes: u64) -> String {
 }
 
 /// Удаляем маркер только после подтвержденной очистки. Таймаут сохраняет его для восстановления.
+#[cfg(any(not(windows), test))]
 fn clear_firewall_and_marker(
     command: &mut Command,
     marker: &std::path::Path,

@@ -2,15 +2,12 @@
 use super::SocketGuard;
 use crate::error::{Error, Result};
 use hickory_proto::{
-    op::{Message, MessageType, Query, ResponseCode},
+    op::{Message, Query, ResponseCode},
     rr::{Name, RData, RecordType},
 };
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
-use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    net::{TcpSocket, UdpSocket},
-};
+use tokio::net::{TcpSocket, UdpSocket};
 
 pub(super) fn system_servers() -> Vec<SocketAddr> {
     if let Ok(value) = std::env::var("AIVPN_TRANSPORT_DNS") {
@@ -59,6 +56,16 @@ pub(super) async fn resolve(
     host: &str,
     port: u16,
 ) -> Result<Vec<SocketAddr>> {
+    resolve_with_route(&GuardedRoute(guard), servers, host, port).await
+}
+
+/// Служба регистрирует точный peer и право сокета через существующий обмен DNS.
+pub async fn resolve_with_route<R: crate::dns_exchange::DnsSocketRoute>(
+    route: &R,
+    servers: &[SocketAddr],
+    host: &str,
+    port: u16,
+) -> Result<Vec<SocketAddr>> {
     if let Ok(ip) = host.trim_matches(['[', ']']).parse() {
         return Ok(vec![SocketAddr::new(ip, port)]);
     }
@@ -85,8 +92,8 @@ pub(super) async fn resolve(
     let mut name = Name::from_ascii(host).map_err(|_| Error::InvalidPacket("Неверное имя DNS"))?;
     name.set_fqdn(true);
     let (v4, v6) = tokio::join!(
-        lookup(guard, servers, name.clone(), RecordType::A),
-        lookup(guard, servers, name, RecordType::AAAA)
+        lookup(route, servers, name.clone(), RecordType::A),
+        lookup(route, servers, name, RecordType::AAAA)
     );
     let mut result = Vec::new();
     let mut last_error = None;
@@ -104,8 +111,8 @@ pub(super) async fn resolve(
     Ok(result)
 }
 
-async fn lookup(
-    guard: &dyn SocketGuard,
+async fn lookup<R: crate::dns_exchange::DnsSocketRoute>(
+    route: &R,
     servers: &[SocketAddr],
     mut name: Name,
     kind: RecordType,
@@ -117,7 +124,7 @@ async fn lookup(
         let mut response = None;
         let mut last_error = None;
         for server in servers {
-            match tokio::time::timeout(Duration::from_secs(2), exchange(guard, *server, &query))
+            match tokio::time::timeout(Duration::from_secs(2), exchange(route, *server, &query))
                 .await
             {
                 Ok(Ok(answer)) => {
@@ -164,14 +171,7 @@ async fn lookup(
 }
 
 fn validate(bytes: &[u8], query: &Message) -> Result<Message> {
-    let answer =
-        Message::from_vec(bytes).map_err(|_| Error::InvalidPacket("Неверный ответ DNS"))?;
-    if answer.metadata.id != query.metadata.id
-        || answer.metadata.message_type != MessageType::Response
-        || answer.queries != query.queries
-    {
-        return Err(Error::InvalidPacket("Ответ DNS не соответствует запросу"));
-    }
+    let answer = crate::dns_exchange::response(bytes, query)?;
     if !matches!(
         answer.metadata.response_code,
         ResponseCode::NoError | ResponseCode::NXDomain
@@ -181,66 +181,80 @@ fn validate(bytes: &[u8], query: &Message) -> Result<Message> {
     Ok(answer)
 }
 
-async fn exchange(guard: &dyn SocketGuard, server: SocketAddr, query: &Message) -> Result<Message> {
-    guard.allow_peer(server)?;
+struct GuardedRoute<'a>(&'a dyn SocketGuard);
+impl crate::dns_exchange::DnsSocketRoute for GuardedRoute<'_> {
+    type Lease = ();
+    async fn udp(
+        &self,
+        peer: SocketAddr,
+    ) -> std::io::Result<crate::dns_exchange::RoutedSocket<UdpSocket, ()>> {
+        self.0.allow_peer(peer).map_err(std::io::Error::other)?;
+        let socket = UdpSocket::bind(if peer.is_ipv4() {
+            "0.0.0.0:0"
+        } else {
+            "[::]:0"
+        })
+        .await?;
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            self.0
+                .protect(socket.as_raw_fd())
+                .map_err(std::io::Error::other)?;
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::AsRawSocket;
+            self.0
+                .protect(socket.as_raw_socket())
+                .map_err(std::io::Error::other)?;
+        }
+        Ok(crate::dns_exchange::RoutedSocket { socket, lease: () })
+    }
+    async fn tcp(
+        &self,
+        peer: SocketAddr,
+    ) -> std::io::Result<crate::dns_exchange::RoutedSocket<TcpSocket, ()>> {
+        self.0.allow_peer(peer).map_err(std::io::Error::other)?;
+        let socket = if peer.is_ipv4() {
+            TcpSocket::new_v4()?
+        } else {
+            TcpSocket::new_v6()?
+        };
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            self.0
+                .protect(socket.as_raw_fd())
+                .map_err(std::io::Error::other)?;
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::AsRawSocket;
+            self.0
+                .protect(socket.as_raw_socket())
+                .map_err(std::io::Error::other)?;
+        }
+        Ok(crate::dns_exchange::RoutedSocket { socket, lease: () })
+    }
+}
+
+async fn exchange<R: crate::dns_exchange::DnsSocketRoute>(
+    route: &R,
+    server: SocketAddr,
+    query: &Message,
+) -> Result<Message> {
     let wire = query
         .to_vec()
         .map_err(|_| Error::InvalidPacket("Ошибка кодирования DNS"))?;
-    let udp = UdpSocket::bind(if server.is_ipv4() {
-        "0.0.0.0:0"
-    } else {
-        "[::]:0"
-    })
-    .await?;
-    #[cfg(unix)]
-    {
-        use std::os::fd::AsRawFd;
-        guard.protect(udp.as_raw_fd())?;
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::io::AsRawSocket;
-        guard.protect(udp.as_raw_socket())?;
-    }
-    udp.connect(server).await?;
-    udp.send(&wire).await?;
-    let mut bytes = vec![0; u16::MAX as usize];
-    let size = udp.recv(&mut bytes).await?;
-    let answer = validate(&bytes[..size], query)?;
-    if !answer.metadata.truncation {
-        return Ok(answer);
-    }
-    let socket = if server.is_ipv4() {
-        TcpSocket::new_v4()?
-    } else {
-        TcpSocket::new_v6()?
-    };
-    #[cfg(unix)]
-    {
-        use std::os::fd::AsRawFd;
-        guard.protect(socket.as_raw_fd())?;
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::io::AsRawSocket;
-        guard.protect(socket.as_raw_socket())?;
-    }
-    let mut tcp = socket.connect(server).await?;
-    tcp.write_u16(wire.len() as u16).await?;
-    tcp.write_all(&wire).await?;
-    let size = tcp.read_u16().await? as usize;
-    bytes.resize(size, 0);
-    tcp.read_exact(&mut bytes).await?;
-    let answer = validate(&bytes, query)?;
-    if answer.metadata.truncation {
-        return Err(Error::InvalidPacket("Обрезанный ответ DNS по TCP"));
-    }
-    Ok(answer)
+    let bytes = crate::dns_exchange::exchange(route, server, &wire).await?;
+    validate(&bytes, query)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hickory_proto::op::MessageType;
     use hickory_proto::rr::{
         rdata::{A, CNAME},
         Record,
@@ -249,6 +263,7 @@ mod tests {
         atomic::{AtomicUsize, Ordering},
         Arc,
     };
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     struct Count(Arc<AtomicUsize>);
     impl SocketGuard for Count {

@@ -444,6 +444,26 @@ object SecureStorage {
 
     // ──────────── Split tunneling ────────────
 
+    private const val KEY_SPLIT_ENABLED = "split_tunnel_enabled"
+
+    private val splitStateLock = Any()
+
+    fun loadSplitEnabled(context: Context): Boolean = synchronized(splitStateLock) {
+        when (loadString(context, KEY_SPLIT_ENABLED)) {
+            "true" -> true
+            "false" -> false
+            else -> {
+                val enabled = loadAllowedApps(context).isNotEmpty() || loadExcludedDomains(context).isNotEmpty()
+                saveString(context, KEY_SPLIT_ENABLED, enabled.toString())
+                enabled
+            }
+        }
+    }
+
+    fun saveSplitEnabled(context: Context, enabled: Boolean) = synchronized(splitStateLock) {
+        saveString(context, KEY_SPLIT_ENABLED, enabled.toString())
+    }
+
     private const val KEY_ALLOWED_APPS = "split_tunnel_allowed_apps"
 
     fun saveAllowedApps(context: Context, packages: Set<String>) {

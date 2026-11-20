@@ -1,13 +1,14 @@
+param([string]$RoutingDriver, [string]$RoutingAltitude)
 $ErrorActionPreference = 'Stop'
 
-$repoRoot = Split-Path -Parent $PSScriptRoot
-$packageDir = Join-Path $repoRoot 'releases\aivpn-windows-package'
+$repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..\..\..')).Path
+$packageDir = Join-Path $repoRoot 'releases\aivpn-windows-gui'
 $finalOutputExe = Join-Path $repoRoot 'releases\aivpn-windows-installer.exe'
 $nsisScript = Join-Path $PSScriptRoot 'aivpn-installer.nsi'
-$iconFile = Join-Path $repoRoot 'aivpn-windows\assets\aivpn.ico'
+$iconFile = Join-Path $repoRoot 'assets\brand\win\aivpn.ico'
 
 # Build entirely under an ASCII-only root to avoid Windows toolchain path issues.
-$buildRoot = 'C:\AIVPNBUILD'
+$buildRoot = 'C:\AIVPNBUILD-' + [Guid]::NewGuid().ToString('N')
 $stageDir = Join-Path $buildRoot 'stage'
 $intermediateOutputExe = Join-Path $buildRoot 'aivpn-windows-installer.exe'
 $makensis = 'C:\Program Files (x86)\NSIS\makensis.exe'
@@ -38,29 +39,35 @@ if (-not (Test-Path $makensis)) {
     throw 'NSIS is not installed at C:\Program Files (x86)\NSIS\makensis.exe.'
 }
 
-if (Test-Path $buildRoot) {
-    Remove-Item $buildRoot -Recurse -Force
-}
-
-New-Item -ItemType Directory -Path $stageDir | Out-Null
-Copy-Item (Join-Path $packageDir 'aivpn.exe') $stageDir
-Copy-Item (Join-Path $packageDir 'aivpn-client.exe') $stageDir
-Copy-Item (Join-Path $packageDir 'wintun.dll') $stageDir
-Copy-Item $iconFile $stageDir
-
-& $makensis /V2 /DAPP_VERSION=$appVersion /DSTAGE_DIR=$stageDir /DOUTPUT_EXE=$intermediateOutputExe $nsisScript
-
-if (-not (Test-Path $intermediateOutputExe)) {
-    throw 'NSIS did not create the installer executable.'
-}
-
-$publishedOutputExe = $finalOutputExe
+New-Item -ItemType Directory -Path $buildRoot | Out-Null
 try {
-    Copy-Item $intermediateOutputExe $finalOutputExe -Force
-} catch {
-    $timestamp = Get-Date -Format 'yyyyMMdd-HHmmss'
-    $publishedOutputExe = Join-Path $repoRoot ("releases\aivpn-windows-installer-{0}.exe" -f $timestamp)
-    Copy-Item $intermediateOutputExe $publishedOutputExe -Force
-}
+    New-Item -ItemType Directory -Path $stageDir | Out-Null
+    # Ресурсы DLL/SYS уже включены в EXE во время сборки.
+    if ($RoutingDriver -or $RoutingAltitude) {
+        throw 'Задайте AIVPN_ROUTING_DRIVER и AIVPN_ROUTING_ALTITUDE перед сборкой EXE, затем подготовьте routing-bootstrap.nsh.'
+    }
+    Copy-Item (Join-Path $packageDir 'aivpn.exe') $stageDir
+    $capabilities = (& (Join-Path $packageDir 'aivpn.exe') --capabilities) | ConvertFrom-Json
+    if ($LASTEXITCODE -ne 0) { throw 'Не удалось проверить ресурсы общего образа.' }
+    $routingEnabled = if ($capabilities.app_routing.compiled -and $capabilities.resources.routing_driver) { 1 } else { 0 }
+    [IO.File]::WriteAllText((Join-Path $stageDir 'routing-bootstrap.nsh'),("!define ROUTING_ENABLED " + $routingEnabled))
+    Copy-Item $iconFile $stageDir
 
-Get-Item $publishedOutputExe | Select-Object FullName, Length, LastWriteTime
+    & $makensis /V2 /DAPP_VERSION=$appVersion /DSTAGE_DIR=$stageDir /DOUTPUT_EXE=$intermediateOutputExe $nsisScript
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path $intermediateOutputExe)) {
+        throw 'NSIS did not create the installer executable.'
+    }
+
+    $publishedOutputExe = $finalOutputExe
+    try {
+        Copy-Item $intermediateOutputExe $finalOutputExe -Force
+    } catch {
+        $timestamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+        $publishedOutputExe = Join-Path $repoRoot ("releases\aivpn-windows-installer-{0}.exe" -f $timestamp)
+        Copy-Item $intermediateOutputExe $publishedOutputExe -Force
+    }
+    Get-Item $publishedOutputExe | Select-Object FullName, Length, LastWriteTime
+} finally {
+    # Удаляется только созданный этим запуском каталог с непредсказуемым именем.
+    Remove-Item -LiteralPath $buildRoot -Recurse -Force
+}

@@ -7,6 +7,7 @@ impl eframe::App for super::AivpnApp {
         use std::sync::atomic::Ordering::Relaxed;
 
         self.tick();
+        self.app_routing.poll();
 
         // Sync window_visible from background tray thread (tray_show_flag set by bg thread
         // so window restore works even when SW_HIDE pauses the eframe update loop).
@@ -19,6 +20,7 @@ impl eframe::App for super::AivpnApp {
         if self.quit_requested.swap(false, Relaxed) {
             self.tray_thread_shutdown.store(true, Relaxed);
             self.tray = None;
+            self.closing_desktop_session();
             self.vpn.disconnect();
             if let Err(error) = self.settings.save() {
                 self.show_error(error);
@@ -91,6 +93,7 @@ impl eframe::App for super::AivpnApp {
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         if !self.quitting {
+            self.closing_desktop_session();
             self.vpn.disconnect();
             if let Err(error) = self.settings.save() {
                 crate::vpn_manager::gui_log(&error);

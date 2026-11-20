@@ -1,100 +1,4 @@
-// ── On-demand UAC elevation for full-tunnel mode ────────────────────────────
-//
-// aivpn-windows.exe itself launches without any elevation manifest — the
-// user can run it as a normal user, and proxy-mode connections never need
-// admin rights at all (Wintun is the only thing that does). Only when the
-// user selects a full-tunnel key and the process isn't already elevated do
-// we self-relaunch elevated, rather than forcing UAC at every launch.
-//
-// ShellExecuteEx (the API that actually shows the UAC consent prompt) has
-// no equivalent of CreateProcess's lpEnvironment — there is no way to pass
-// environment variables to the child it launches. The connection key is
-// deliberately passed via an env var today (AIVPN_CONNECTION_KEY), not a
-// CLI arg, specifically so it never appears in Task Manager's command-line
-// column. Relaunching aivpn-client.exe directly through ShellExecuteEx with
-// the key in its command line would reintroduce exactly that exposure.
-//
-// Instead, this relaunches aivpn-windows.exe ITSELF elevated, passing only
-// a non-secret key index via --elevated-connect. The freshly-elevated GUI
-// instance decrypts its own copy of the connection key from KeyStorage
-// (DPAPI, CurrentUser scope — decryptable by any process running as this
-// same user, elevated or not) and spawns aivpn-client.exe the normal way
-// (Command::spawn + env, unchanged from the existing proxy-mode path). The
-// original, non-elevated instance exits once the elevated one is launched.
-
-#[cfg(windows)]
-pub(crate) fn is_elevated() -> bool {
-    use std::mem;
-    use std::ptr;
-    use winapi::um::processthreadsapi::{GetCurrentProcess, OpenProcessToken};
-    use winapi::um::securitybaseapi::GetTokenInformation;
-    use winapi::um::winnt::{TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY};
-
-    unsafe {
-        let mut token = ptr::null_mut();
-        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
-            return false;
-        }
-        let mut elevation: TOKEN_ELEVATION = mem::zeroed();
-        let mut ret_size: u32 = 0;
-        let ok = GetTokenInformation(
-            token,
-            TokenElevation,
-            &mut elevation as *mut _ as *mut winapi::ctypes::c_void,
-            mem::size_of::<TOKEN_ELEVATION>() as u32,
-            &mut ret_size,
-        );
-        winapi::um::handleapi::CloseHandle(token);
-        ok != 0 && elevation.TokenIsElevated != 0
-    }
-}
-
-/// Relaunch this exe elevated via ShellExecuteEx's "runas" verb (the API
-/// that shows the native UAC consent dialog), passing only the non-secret
-/// key index. Returns Err if the user cancels the prompt or ShellExecuteEx
-/// itself fails; never returns Ok (the caller is expected to exit the
-/// current process immediately after a successful launch, so there is
-/// nothing meaningful to return to).
-#[cfg(windows)]
-pub(crate) fn relaunch_elevated(key_index: usize) -> Result<(), String> {
-    use std::ffi::OsStr;
-    use std::os::windows::ffi::OsStrExt;
-    use winapi::um::shellapi::{ShellExecuteExW, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW};
-    use winapi::um::winuser::SW_SHOWNORMAL;
-
-    let exe = std::env::current_exe()
-        .map_err(|e| format!("Could not determine current executable path: {e}"))?;
-
-    let wide = |s: &OsStr| -> Vec<u16> { s.encode_wide().chain(std::iter::once(0)).collect() };
-    let verb = wide(OsStr::new("runas"));
-    let file = wide(exe.as_os_str());
-    let params_str = format!("--elevated-connect {key_index}");
-    let params = wide(OsStr::new(&params_str));
-    let dir = exe.parent().map(|d| wide(d.as_os_str()));
-
-    let mut sei: SHELLEXECUTEINFOW = unsafe { std::mem::zeroed() };
-    sei.cbSize = std::mem::size_of::<SHELLEXECUTEINFOW>() as u32;
-    sei.fMask = SEE_MASK_NOCLOSEPROCESS;
-    sei.lpVerb = verb.as_ptr();
-    sei.lpFile = file.as_ptr();
-    sei.lpParameters = params.as_ptr();
-    sei.lpDirectory = dir.as_ref().map(|d| d.as_ptr()).unwrap_or(std::ptr::null());
-    sei.nShow = SW_SHOWNORMAL;
-
-    let ok = unsafe { ShellExecuteExW(&mut sei) };
-    if ok == 0 || sei.hProcess.is_null() {
-        return Err(
-            "Elevation was cancelled or failed. Full-tunnel mode requires Administrator \
-             rights on Windows to create the network adapter — either allow the elevation \
-             prompt, or switch this key to proxy mode (no admin rights needed)."
-                .to_string(),
-        );
-    }
-    // We don't need the handle — the elevated instance is now fully
-    // independent and manages its own lifecycle.
-    unsafe { winapi::um::handleapi::CloseHandle(sei.hProcess) };
-    Ok(())
-}
+//! Вспомогательные операции окон и единственного экземпляра GUI.
 
 // ── Win32 helpers ──────────────────────────────────────────────────────────
 
@@ -226,18 +130,26 @@ pub(crate) fn set_autostart(enable: bool) {
 pub(crate) fn set_autostart(_enable: bool) {}
 
 pub(crate) fn choose_mtls_file(lang: crate::localization::Lang) -> Option<String> {
+    choose_file(
+        crate::appearance::text(lang, "Выбрать сертификат mTLS", "Select mTLS certificate"),
+        "PEM / CRT\0*.pem;*.crt;*.cer\0All files\0*.*\0\0",
+    )
+}
+
+pub(crate) fn choose_application(lang: crate::localization::Lang) -> Option<String> {
+    choose_file(
+        crate::appearance::text(lang, "Выбрать приложение", "Select application"),
+        "EXE\0*.exe\0All files\0*.*\0\0",
+    )
+}
+
+fn choose_file(title: &str, filter: &str) -> Option<String> {
     use winapi::um::commdlg::{
         GetOpenFileNameW, OFN_EXPLORER, OFN_FILEMUSTEXIST, OFN_NOCHANGEDIR, OFN_PATHMUSTEXIST,
         OPENFILENAMEW,
     };
-    let title: Vec<u16> =
-        crate::appearance::text(lang, "Выбрать сертификат mTLS", "Select mTLS certificate")
-            .encode_utf16()
-            .chain(Some(0))
-            .collect();
-    let filter: Vec<u16> = "PEM / CRT\0*.pem;*.crt;*.cer\0All files\0*.*\0\0"
-        .encode_utf16()
-        .collect();
+    let title: Vec<u16> = title.encode_utf16().chain(Some(0)).collect();
+    let filter: Vec<u16> = filter.encode_utf16().collect();
     let mut path = vec![0u16; 32768];
     let mut dialog: OPENFILENAMEW = unsafe { std::mem::zeroed() };
     dialog.lStructSize = std::mem::size_of::<OPENFILENAMEW>() as u32;

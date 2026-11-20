@@ -1,5 +1,9 @@
 pub mod device;
+mod dns_cache;
 pub mod socks5;
+
+#[cfg(test)]
+mod udp_regression_tests;
 
 use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -175,9 +179,7 @@ struct UdpPacketCommand {
     payload: Vec<u8>,
 }
 
-#[allow(dead_code)]
 struct UdpRelayResponse {
-    relay_port: u16,
     remote: IpEndpoint,
     payload: Vec<u8>,
 }
@@ -445,6 +447,21 @@ fn run_stack(
                     );
                 }
                 Ok(UdpStackCommand::SendPacket(pkt)) => {
+                    // Проверяем адреса в том же потоке, который меняет интерфейс.
+                    let has_source = iface.ip_addrs().iter().any(|cidr| {
+                        matches!(
+                            (cidr.address(), pkt.target.addr),
+                            (IpAddress::Ipv4(_), IpAddress::Ipv4(_))
+                                | (IpAddress::Ipv6(_), IpAddress::Ipv6(_))
+                        )
+                    });
+                    if !has_source {
+                        warn!(
+                            "SOCKS5 UDP: у стека нет исходящего адреса нужного семейства для {}",
+                            pkt.target
+                        );
+                        continue;
+                    }
                     if let Some(assoc) = udp_assocs.get_mut(&pkt.relay_port) {
                         assoc.last_seen = Instant::now();
                         let socket = sockets.get_mut::<UdpSocket>(assoc.handle);
@@ -711,7 +728,6 @@ fn service_udp_assoc(assoc: &mut ManagedUdpAssoc, sockets: &mut SocketSet) -> bo
         }
 
         let response = UdpRelayResponse {
-            relay_port: assoc.relay_port,
             remote: remote_meta.endpoint,
             payload: tmp[..len].to_vec(),
         };
@@ -1068,7 +1084,7 @@ async fn handle_udp_associate(
     let mut tasks = tokio::task::JoinSet::new();
     tasks.spawn(async move {
         let mut buf = vec![0u8; 65535];
-        let mut dns_cache: HashMap<(String, u16), SocketAddr> = HashMap::new();
+        let mut dns_cache = dns_cache::UdpDnsCache::default();
         loop {
             if close_flag_rd.load(Ordering::Relaxed) {
                 break;
@@ -1111,8 +1127,8 @@ async fn handle_udp_associate(
                 Socks5UdpTarget::Ip(a) => *a,
                 Socks5UdpTarget::Domain(host, port) => {
                     let key = (host.clone(), *port);
-                    if let Some(a) = dns_cache.get(&key) {
-                        *a
+                    if let Some(a) = dns_cache.get(&key, Instant::now()) {
+                        a
                     } else {
                         match resolve_via_tunnel(
                             &udp_tx,
@@ -1124,7 +1140,7 @@ async fn handle_udp_associate(
                         .await
                         {
                             Ok(a) => {
-                                dns_cache.insert(key, a);
+                                dns_cache.insert(key, a, Instant::now());
                                 a
                             }
                             Err(tunnel_err) => {
@@ -1143,6 +1159,12 @@ async fn handle_udp_associate(
                     }
                 }
             };
+
+            // ProxyConfig задает только IPv4 для пользовательского стека.
+            if target_sock.is_ipv6() {
+                warn!("SOCKS5 UDP: IPv6-назначение {} не поддерживается", target_sock);
+                continue;
+            }
 
             match udp_tx.try_send(UdpStackCommand::SendPacket(UdpPacketCommand {
                 relay_port,
@@ -1488,14 +1510,22 @@ mod tests {
         peer.read_exact(&mut reply).await.unwrap();
         task.abort();
         let _ = task.await;
-        for _ in 0..100 {
-            tokio::task::yield_now().await;
-        }
-        let rebound = UdpSocket::bind((Ipv4Addr::LOCALHOST, assoc.relay_port)).await;
-        assert!(
-            rebound.is_ok(),
-            "cancelled association kept its relay socket open"
-        );
+        assert!(assoc.close_flag.load(Ordering::Relaxed));
+        // Drop JoinSet запрашивает отмену дочерних задач; ждем освобождения
+        // сокета, а не условного числа проходов планировщика.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                match UdpSocket::bind((Ipv4Addr::LOCALHOST, assoc.relay_port)).await {
+                    Ok(socket) => break socket,
+                    Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                    Err(error) => panic!("Не удалось проверить освобождение сокета: {error}"),
+                }
+            }
+        })
+        .await
+        .expect("Отмененная ассоциация удерживает UDP-сокет");
     }
 
     #[tokio::test]

@@ -26,11 +26,12 @@ EOF
 }
 
 start_service() {
-    local enabled kill_switch connection_key server server_key preshared_key server_signing_key mask_operator_pubkey
+    local enabled kill_switch split_enabled connection_key server server_key preshared_key server_signing_key mask_operator_pubkey
 
     config_load aivpn
     config_get_bool enabled main enabled 0
     config_get_bool kill_switch main kill_switch 0
+    config_get_bool split_enabled main split_enabled 1
     config_get connection_key main connection_key ""
     config_get server main server ""
     config_get server_key main server_key ""
@@ -63,6 +64,11 @@ start_service() {
     [ -z "$mask_operator_pubkey" ] || procd_append_param command --mask-operator-pubkey "$mask_operator_pubkey"
 
     procd_append_param command --tun-name aivpn0 --full-tunnel
+    if [ "$split_enabled" = 1 ]; then
+        procd_append_param command --split-enabled=true
+    else
+        procd_append_param command --split-enabled=false
+    fi
     [ "$kill_switch" = 0 ] || procd_append_param command --kill-switch
     procd_set_param file "$CONFIG"
     procd_set_param stdout 1

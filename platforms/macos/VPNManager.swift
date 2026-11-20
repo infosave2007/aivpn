@@ -8,6 +8,7 @@ import Network
 struct HelperRequest: Codable {
     let action: String
     let key: String?
+    let splitEnabled: Bool?
     let fullTunnel: Bool?
     let binaryPath: String?
     let service: String?
@@ -45,9 +46,10 @@ struct HelperRequest: Codable {
          bootstrapCdnUrl: String? = nil, bootstrapTelegramToken: String? = nil,
          bootstrapTelegramChat: String? = nil,
          bootstrapGithub: String? = nil,
-         serverSigningKey: String? = nil) {
+         serverSigningKey: String? = nil, splitEnabled: Bool? = nil) {
         self.action = action
         self.key = key
+        self.splitEnabled = splitEnabled
         self.fullTunnel = fullTunnel
         self.binaryPath = binaryPath
         self.service = service
@@ -176,6 +178,11 @@ class VPNManager: ObservableObject {
     private var lastConnectShareMaskFeedback: Bool = false
     private var lastConnectReceiveMaskHints: Bool = false
     private var lastConnectCountryCode: String?
+    private var lastConnectBootstrapCdnUrl: String?
+    private var lastConnectBootstrapTelegramToken: String?
+    private var lastConnectBootstrapTelegramChat: String?
+    private var lastConnectBootstrapGithub: String?
+    private var lastConnectServerSigningKey: String?
     private var lastConnectProxyPort: Int?
 
     private var proxyProcess: Process?
@@ -645,6 +652,11 @@ class VPNManager: ObservableObject {
         lastConnectShareMaskFeedback = shareMaskFeedback
         lastConnectReceiveMaskHints = receiveMaskHints
         lastConnectCountryCode = countryCode
+        lastConnectBootstrapCdnUrl = bootstrapCdnUrl
+        lastConnectBootstrapTelegramToken = bootstrapTelegramToken
+        lastConnectBootstrapTelegramChat = bootstrapTelegramChat
+        lastConnectBootstrapGithub = bootstrapGithub
+        lastConnectServerSigningKey = serverSigningKey
 
         connectGeneration += 1
         AdminApi.invalidateSession()
@@ -683,7 +695,8 @@ class VPNManager: ObservableObject {
             bootstrapTelegramToken: bootstrapTelegramToken.flatMap { $0.isEmpty ? nil : $0 },
             bootstrapTelegramChat: bootstrapTelegramChat.flatMap { $0.isEmpty ? nil : $0 },
             bootstrapGithub: bootstrapGithub.flatMap { $0.isEmpty ? nil : $0 },
-            serverSigningKey: serverSigningKey.flatMap { $0.isEmpty ? nil : $0 }
+            serverSigningKey: serverSigningKey.flatMap { $0.isEmpty ? nil : $0 },
+            splitEnabled: UserDefaults.standard.object(forKey: "splitEnabled") as? Bool ?? true
         )
 
         sendToHelper(request) { [weak self] response in
@@ -904,6 +917,7 @@ class VPNManager: ObservableObject {
             DispatchQueue.main.async {
                 guard AdminApi.isCurrent(binding), let json, json["error"] == nil else { completion(nil); return }
                 completion(BenchDisplayResult(
+                    throughputLimited: (json["throughput_limited"] as? Bool ?? true) || (json["throughput_method"] as? String != "data"),
                     uploadKbps: json["throughput_up_kbps"] as? Double ?? 0,
                     downloadKbps: json["throughput_down_kbps"] as? Double ?? 0,
                     p50: json["latency_p50_ms"] as? Double ?? 0,
@@ -1436,6 +1450,11 @@ class VPNManager: ObservableObject {
             let shareMaskFeedback = lastConnectShareMaskFeedback
             let receiveMaskHints = lastConnectReceiveMaskHints
             let countryCode = lastConnectCountryCode
+            let bootstrapCdnUrl = lastConnectBootstrapCdnUrl
+            let bootstrapTelegramToken = lastConnectBootstrapTelegramToken
+            let bootstrapTelegramChat = lastConnectBootstrapTelegramChat
+            let bootstrapGithub = lastConnectBootstrapGithub
+            let serverSigningKey = lastConnectServerSigningKey
             // Wait for disconnect's helper round-trip to actually flip isConnected/isConnecting
             // before reconnecting — connect() no-ops while isConnected is still true.
             disconnect { [weak self] in
@@ -1443,7 +1462,10 @@ class VPNManager: ObservableObject {
                                excludeRoutes: excludeRoutes, adaptiveLevel: adaptiveLevel,
                                dnsProxy: dnsProxy, killSwitch: killSwitch, preferredMask: preferredMask,
                                polymorphicBase: polymorphicBase, shareMaskFeedback: shareMaskFeedback,
-                               receiveMaskHints: receiveMaskHints, countryCode: countryCode)
+                               receiveMaskHints: receiveMaskHints, countryCode: countryCode,
+                               bootstrapCdnUrl: bootstrapCdnUrl, bootstrapTelegramToken: bootstrapTelegramToken,
+                               bootstrapTelegramChat: bootstrapTelegramChat, bootstrapGithub: bootstrapGithub,
+                               serverSigningKey: serverSigningKey)
             }
         }
     }

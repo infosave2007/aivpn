@@ -17,6 +17,7 @@ impl App {
     pub(super) fn profiles_locked(&self) -> bool {
         self.pending_connect
             || self.adopted_reap_in_flight
+            || (self.has_desktop_session() && matches!(self.status, VpnStatus::Error(_)))
             || matches!(
                 self.status,
                 VpnStatus::Connecting | VpnStatus::Connected { .. }
@@ -199,6 +200,7 @@ mod tests {
             Message::DnsProxyChanged("1.2.3.4:53".into()),
             Message::MaskOptionChanged("youtube".into()),
             Message::IncludeRoutesChanged("10.0.0.0/8".into()),
+            Message::SplitEnabledChanged(false),
             Message::ToggleSocks5(true),
         ] {
             let task = app.update(message);

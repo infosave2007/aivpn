@@ -14,6 +14,8 @@ WORKDIR /app
 # Install dependencies for Windows cross-compilation with GNU toolchain
 RUN apt-get update && apt-get install -y \
     pkg-config \
+    curl \
+    unzip \
     libssl-dev \
     clang \
     llvm \
@@ -33,12 +35,17 @@ COPY Cargo.toml Cargo.lock ./
 COPY crates crates/
 COPY vendor vendor/
 COPY assets assets/
+COPY deploy/install-client-image.ps1 deploy/install-client-image.ps1
+COPY deploy/install-app-routing.ps1 deploy/install-app-routing.ps1
+COPY deploy/windows-setup-common.ps1 deploy/windows-setup-common.ps1
+COPY deploy/ci/fetch-wintun.sh /tmp/fetch-wintun.sh
 
 # Build Windows client in release mode (GNU ABI)
-RUN cargo build --locked --release --target x86_64-pc-windows-gnu --bin aivpn-client
+RUN sh /tmp/fetch-wintun.sh /tmp/wintun.dll \
+    && AIVPN_WINTUN_DLL=/tmp/wintun.dll cargo build --locked --release --target x86_64-pc-windows-gnu -p aivpn-windows --features app-routing
 
 # Stage 2: Extract binary
 # Pinned to match the version already used by platforms/mikrotik/Dockerfile.
 # TODO(security): pin with @sha256:<digest> once a digest is chosen to track.
 FROM alpine:3.24
-COPY --from=builder /app/target/x86_64-pc-windows-gnu/release/aivpn-client.exe /aivpn-client.exe
+COPY --from=builder /app/target/x86_64-pc-windows-gnu/release/aivpn.exe /aivpn.exe

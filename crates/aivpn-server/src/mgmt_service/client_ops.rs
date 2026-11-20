@@ -128,16 +128,7 @@ pub fn update_client(
 /// Tombstone a client (revoke). Never hard-deletes — see
 /// `ClientDatabase::remove_client`'s doc for why (pool-sync convergence).
 pub fn remove_client(ctx: &MgmtCtx, id: &str) -> Result<(), MgmtError> {
-    match ctx.db.remove_client(id) {
-        Ok(()) => {
-            audit(ctx, "ClientRemove", id, "ok");
-            Ok(())
-        }
-        Err(e) => {
-            audit(ctx, "ClientRemove", id, &format!("failed: {}", e));
-            Err(MgmtError::NotFound)
-        }
-    }
+    tombstone(ctx, id, "ClientRemove")
 }
 
 /// Admin "revoke" (P1.3) — tombstones `id` exactly like [`remove_client`]
@@ -171,13 +162,17 @@ pub fn remove_client(ctx: &MgmtCtx, id: &str) -> Result<(), MgmtError> {
 ///     beacon/tick for peer convergence. Both still happen, just not
 ///     synchronously with the REST call returning.
 pub fn revoke(ctx: &MgmtCtx, id: &str) -> Result<(), MgmtError> {
+    tombstone(ctx, id, "ClientRevoke")
+}
+
+fn tombstone(ctx: &MgmtCtx, id: &str, action: &str) -> Result<(), MgmtError> {
     match ctx.db.remove_client(id) {
         Ok(()) => {
-            audit(ctx, "ClientRevoke", id, "ok");
+            audit(ctx, action, id, "ok");
             Ok(())
         }
         Err(e) => {
-            audit(ctx, "ClientRevoke", id, &format!("failed: {}", e));
+            audit(ctx, action, id, &format!("failed: {}", e));
             Err(MgmtError::NotFound)
         }
     }

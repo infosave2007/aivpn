@@ -33,7 +33,6 @@ pub mod management_api;
 // self-gate); re-export it here so `crate::dpi_gate::…` keeps resolving.
 #[cfg(feature = "neural")]
 pub use aivpn_common::dpi_gate;
-pub mod key_rotation;
 pub mod mask_feedback;
 pub mod metrics;
 pub mod neural;
@@ -79,7 +78,6 @@ pub use server::ServerArgs;
 pub use session::SessionManager;
 
 // Phase 3-5 exports
-pub use key_rotation::{KeyRotationConfig, KeyRotator};
 pub use mask_feedback::MaskFeedbackStore;
 pub use metrics::MetricsCollector;
 pub use neural::{NeuralConfig, NeuralResonanceModule, ResonanceResult, ResonanceStatus};

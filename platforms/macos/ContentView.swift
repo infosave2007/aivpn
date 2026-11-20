@@ -41,6 +41,7 @@ struct ContentView: View {
     @State private var keyName: String = ""
     @State private var showKeyInput: Bool = false
     @State private var showConnectionKey: Bool = false
+    @AppStorage("splitEnabled") private var splitEnabled: Bool = true
     @AppStorage("fullTunnel") private var fullTunnel: Bool = false
     @AppStorage("excludeRoutes") private var excludeRoutes: String = ""
     @AppStorage("proxyMode") private var proxyMode: Bool = false
@@ -359,6 +360,10 @@ struct ContentView: View {
                         .buttonStyle(.plain)
                     }
 
+                    Toggle(loc.t("split_enabled"), isOn: $splitEnabled)
+                        .toggleStyle(.checkbox).font(.caption)
+                        .disabled(vpn.isConnected || vpn.isConnecting)
+                    Text(loc.t("split_switch_note")).font(.caption2).foregroundColor(.secondary)
                     HStack {
                         Toggle(loc.t("full_tunnel"), isOn: $fullTunnel)
                             .toggleStyle(.checkbox)
@@ -770,6 +775,9 @@ struct ContentView: View {
                                 }
                                 Text("↑ \(Int(result.uploadKbps))  ↓ \(Int(result.downloadKbps)) kbps")
                                     .font(.caption).foregroundColor(.secondary)
+                                if result.throughputLimited {
+                                    Text(loc.t("bench_limited")).font(.caption).foregroundColor(.secondary)
+                                }
                                 Text("P50: \(Int(result.p50))ms  P95: \(Int(result.p95))ms  P99: \(Int(result.p99))ms")
                                     .font(.caption)
                                     .foregroundColor(.secondary)
@@ -914,9 +922,9 @@ struct ContentView: View {
                                          receiveMaskHints: receiveMaskHints,
                                          countryCode: maskCountryCode.count == 2 ? maskCountryCode : nil)
                     } else {
-                        vpn.connect(key: selectedKey.keyValue, fullTunnel: fullTunnel,
+                        vpn.connect(key: selectedKey.keyValue, fullTunnel: !splitEnabled || fullTunnel,
                                     mtlsCertPath: selectedKey.mtlsCertPath,
-                                    excludeRoutes: excludeRoutes.isEmpty ? nil : excludeRoutes,
+                                    excludeRoutes: splitEnabled && !excludeRoutes.isEmpty ? excludeRoutes : nil,
                                     adaptiveLevel: adaptiveLevel,
                                     dnsProxy: dnsProxyAddr.isEmpty ? nil : dnsProxyAddr,
                                     killSwitch: killSwitch,
@@ -1221,6 +1229,7 @@ func serverAddrFromConnectionKey(_ key: String) -> String? {
 }
 
 struct BenchDisplayResult {
+    let throughputLimited: Bool
     let uploadKbps: Double
     let downloadKbps: Double
     let p50: Double

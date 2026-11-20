@@ -263,6 +263,7 @@ impl super::AivpnApp {
                                         self.admin_qr_error = None;
                                         self.admin_qr_saved_msg = None;
                                         admin::spawn(
+                                            self.vpn.administration_target(),
                                             self.vpn.client_binary.clone(),
                                             AdminRequest::ConnectionKey { id: c.id.clone() },
                                             self.admin_tx.clone(),
@@ -292,6 +293,7 @@ impl super::AivpnApp {
                                     {
                                         self.admin_busy_ids.insert(c.id.clone());
                                         admin::spawn(
+                                            self.vpn.administration_target(),
                                             self.vpn.client_binary.clone(),
                                             AdminRequest::ResetDevice { id: c.id.clone() },
                                             self.admin_tx.clone(),
@@ -356,6 +358,7 @@ impl super::AivpnApp {
                         exit_node: self.admin_add_exit_node.trim().to_string(),
                     };
                     admin::spawn(
+                        self.vpn.administration_target(),
                         self.vpn.client_binary.clone(),
                         AdminRequest::AddClient(form),
                         self.admin_tx.clone(),
@@ -423,6 +426,7 @@ impl super::AivpnApp {
                             exit_node: self.admin_edit_exit_node.trim().to_string(),
                         };
                         admin::spawn(
+                            self.vpn.administration_target(),
                             self.vpn.client_binary.clone(),
                             AdminRequest::EditClient(form),
                             self.admin_tx.clone(),
@@ -446,6 +450,7 @@ impl super::AivpnApp {
         egui::CollapsingHeader::new(t(lang, "admin_status_header")).show(ui, |ui| {
             if ui.button(t(lang, "admin_refresh")).clicked() {
                 admin::spawn(
+                    self.vpn.administration_target(),
                     self.vpn.client_binary.clone(),
                     AdminRequest::Status,
                     self.admin_tx.clone(),
@@ -807,6 +812,7 @@ impl super::AivpnApp {
                         if confirm_clicked {
                             self.admin_settings_mask_confirm_busy = true;
                             admin::spawn(
+                                self.vpn.administration_target(),
                                 self.vpn.client_binary.clone(),
                                 AdminRequest::ConfirmConfig {
                                     setting: admin::ConfigSetting::ActiveMask,
@@ -830,6 +836,7 @@ impl super::AivpnApp {
                             self.admin_settings_mask_error = None;
                             self.admin_settings_mask_rolled_back = false;
                             admin::spawn(
+                                self.vpn.administration_target(),
                                 self.vpn.client_binary.clone(),
                                 AdminRequest::ApplyActiveMask {
                                     client_id: self.admin_settings_mask_client.clone(),
@@ -877,6 +884,7 @@ impl super::AivpnApp {
                     if confirm_clicked {
                         self.admin_settings_exit_confirm_busy = true;
                         admin::spawn(
+                            self.vpn.administration_target(),
                             self.vpn.client_binary.clone(),
                             AdminRequest::ConfirmConfig {
                                 setting: admin::ConfigSetting::ExitNode,
@@ -902,6 +910,7 @@ impl super::AivpnApp {
                         Some(trimmed.to_string())
                     };
                     admin::spawn(
+                        self.vpn.administration_target(),
                         self.vpn.client_binary.clone(),
                         AdminRequest::ApplyExitNode { addr },
                         self.admin_tx.clone(),
@@ -1076,6 +1085,7 @@ impl super::AivpnApp {
                                     self.admin_qr_error = None;
                                     let id = self.admin_key_id.clone().unwrap_or_default();
                                     admin::spawn(
+                                        self.vpn.administration_target(),
                                         self.vpn.client_binary.clone(),
                                         AdminRequest::Qr {
                                             id,
@@ -1178,6 +1188,7 @@ impl super::AivpnApp {
                     if ui.add_enabled(!busy, revoke_btn).clicked() {
                         self.admin_busy_ids.insert(id.clone());
                         admin::spawn(
+                            self.vpn.administration_target(),
                             self.vpn.client_binary.clone(),
                             AdminRequest::RevokeClient { id: id.clone() },
                             self.admin_tx.clone(),

@@ -2,31 +2,8 @@
 <!DOCTYPE policyconfig PUBLIC
  "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
  "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
-<!--
-  AIVPN polkit action: authorize the aivpn-ip-helper binary to configure the
-  TUN interface (address, routes) that aivpn-client needs CAP_NET_ADMIN for.
-
-  This file is installed to /usr/share/polkit-1/actions/ by aivpn-linux's
-  one-time privileged setup (see `ensure_capable_binary` in
-  crates/aivpn-linux/src/app.rs), in the SAME pkexec prompt that already
-  grants CAP_NET_ADMIN via setcap — so registering this policy costs no
-  extra prompt beyond what aivpn-linux already asked for.
-
-  The `org.freedesktop.policykit.exec.path` annotation below is a FIXED,
-  hardcoded path — /usr/local/libexec/aivpn/aivpn-ip-helper, a root-owned
-  system directory shared by every user on the machine — not a per-user
-  path. pkexec matches that annotation against the *resolved* path of the
-  program it is asked to run, so this only takes effect for
-  `pkexec /usr/local/libexec/aivpn/aivpn-ip-helper` invocations. Any other
-  use of pkexec is unaffected and continues to require the generic
-  org.freedesktop.policykit.exec action (auth_admin, not cached).
-
-  The helper binary itself validates every command it is asked to run
-  against a small, fully-enumerated whitelist before executing anything —
-  see crates/aivpn-client/src/bin/aivpn-ip-helper.rs — so caching this
-  action's authorization (auth_admin_keep, below) does not widen what an
-  authorized caller can make root do beyond that fixed command grammar.
--->
+<!-- Разрешение привязано к защищенному образу и точной внутренней роли.
+     Установщик, GUI и CLI не получают кешированное повышение прав. -->
 <policyconfig>
 
   <vendor>AIVPN</vendor>
@@ -54,8 +31,8 @@
       <allow_inactive>auth_admin</allow_inactive>
       <allow_any>auth_admin</allow_any>
     </defaults>
-    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/libexec/aivpn/aivpn-ip-helper</annotate>
-    <annotate key="org.freedesktop.policykit.exec.allow_gui">true</annotate>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/libexec/aivpn/aivpn</annotate>
+    <annotate key="org.freedesktop.policykit.exec.argv1">__network-helper</annotate>
   </action>
 
 </policyconfig>

@@ -392,6 +392,7 @@ pub async fn fetch_script() -> Result<(String, String), String> {
     let binary = find_client_binary()?;
 
     let sha_out = tokio::process::Command::new(&binary)
+        .arg("cli")
         .args(["ssh-install", "script", "--sha256-only"])
         .output()
         .await
@@ -405,6 +406,7 @@ pub async fn fetch_script() -> Result<(String, String), String> {
     let sha256 = String::from_utf8_lossy(&sha_out.stdout).trim().to_string();
 
     let script_out = tokio::process::Command::new(&binary)
+        .arg("cli")
         .args(["ssh-install", "script"])
         .output()
         .await
@@ -424,6 +426,7 @@ pub async fn fetch_script() -> Result<(String, String), String> {
 pub async fn probe(host: String, port: u16, user: String) -> Result<String, String> {
     let binary = find_client_binary()?;
     let out = tokio::process::Command::new(&binary)
+        .arg("cli")
         .args([
             "ssh-install",
             "probe",
@@ -474,6 +477,7 @@ pub fn install_subscription(target: InstallTarget) -> Subscription<Message> {
             };
 
             let mut cmd = tokio::process::Command::new(&binary);
+            cmd.arg("cli");
             // Don't leave an install running detached if the GUI exits mid-run.
             cmd.kill_on_drop(true);
             cmd.arg("ssh-install").arg("run");

@@ -42,6 +42,7 @@ const SAFE_DOWNLINK_BUDGET: usize = 1380;
 const LIGHT_SHAPING_MAX_PAD: u16 = 96;
 
 mod config;
+mod diagnostics;
 pub use config::{
     GatewayConfig, ShapingLevel, DEFAULT_FEEDBACK_FAILURE_THRESHOLD,
     DEFAULT_FEEDBACK_REPORT_INTERVAL_SECS,
@@ -107,6 +108,7 @@ mod control_dispatch;
 
 mod packet_ingress;
 
+mod mask_overrides;
 mod mask_socket;
 use mask_socket::MaskSocket;
 
@@ -115,6 +117,7 @@ mod packet_demux;
 mod data_plane;
 
 mod downlink_pacing;
+mod tcp_mss;
 
 mod run_loop;
 
@@ -236,7 +239,6 @@ pub struct Gateway {
     /// Recording manager for auto mask recording
     recording_manager: Option<Arc<RecordingManager>>,
     /// Mask store for auto-generated masks
-    #[allow(dead_code)]
     mask_store: Option<Arc<MaskStore>>,
     /// Active bootstrap descriptors for previous/current/next epochs. Shared
     /// with the periodic rotation task (see `run()`), which rebuilds and
@@ -688,6 +690,16 @@ impl Gateway {
         teardown_unused_exit_dials_for(&self.masked_exit_addr, self.pool_dialer.as_ref(), &clients);
     }
 
+    fn remove_session_and_state(&self, session_id: &[u8; 16]) {
+        self.session_manager.remove_session(session_id);
+        self.neural_module.lock().cleanup_stats(*session_id);
+        #[cfg(feature = "neural")]
+        self.dpi_gate.cleanup(session_id);
+        if let Some(ref ka) = self.kernel_accel {
+            kernel_clear_offload(ka, session_id);
+        }
+    }
+
     /// P1.3 (admin revoke): force-disconnect any live session(s) for
     /// `client_id` on THIS node — sends `ControlPayload::Shutdown{reason:
     /// 4 /* revoked */}` to each, then immediately `remove_session`s it.
@@ -742,10 +754,7 @@ impl Gateway {
                 );
             }
             self.flush_session_traffic(&session);
-            if let Some(ref ka) = self.kernel_accel {
-                kernel_clear_offload(ka, &session_id);
-            }
-            self.session_manager.remove_session(&session_id);
+            self.remove_session_and_state(&session_id);
             warn!(
                 "Force-disconnected session {:02x}{:02x}{:02x}{:02x} — client {} revoked",
                 session_id[0], session_id[1], session_id[2], session_id[3], client_id
@@ -2858,6 +2867,75 @@ mod tests {
         let mut s = Session::new([9u8; 16], addr, keys, [0u8; 32]);
         s.client_id = client_id;
         Arc::new(parking_lot::Mutex::new(s))
+    }
+
+    #[tokio::test]
+    async fn diagnostic_data_budget_survives_restarted_phases() {
+        use aivpn_common::diagnostics::{self as diag, data};
+        use std::time::Instant;
+        let mut gateway = Gateway::new(make_test_gateway_config("diagnostic-budget")).unwrap();
+        let mut packets = gateway.chain_reverse_rx.take().unwrap();
+        let session = make_bare_session(None);
+        session.lock().vpn_ip = Some("10.0.0.2".parse().unwrap());
+        let started = Instant::now();
+        let mut generated = 0usize;
+        for phase in 0..5 {
+            let request = data::Start {
+                id: [phase; 16],
+                seed: [5; 32],
+                direction: data::Direction::Download,
+                response_id: 1,
+                duration_ms: 1000,
+            };
+            assert_eq!(
+                gateway
+                    .diagnostic_request(
+                        &session,
+                        1,
+                        diag::START,
+                        &serde_json::to_vec(&request).unwrap()
+                    )
+                    .await
+                    .0,
+                200
+            );
+            let pull = serde_json::to_vec(&data::Pull {
+                id: request.id,
+                count: data::BATCH,
+            })
+            .unwrap();
+            for _ in 0..8 {
+                assert_eq!(
+                    gateway
+                        .diagnostic_request(&session, 1, diag::PULL, &pull)
+                        .await
+                        .0,
+                    200
+                );
+                while packets.try_recv().is_ok() {
+                    generated += 1;
+                }
+            }
+            assert_eq!(
+                gateway
+                    .diagnostic_request(&session, 1, diag::STOP, &request.id)
+                    .await
+                    .0,
+                200
+            );
+        }
+        let bound = data::WINDOW as usize
+            + (diag::PACKETS_PER_SECOND as f64 * started.elapsed().as_secs_f64()).ceil() as usize;
+        assert!(
+            generated <= bound,
+            "Сгенерировано {generated} блоков при бюджете {bound}"
+        );
+        assert!(generated > 0);
+        // DATA не расходует резерв управляющих запросов завершения теста.
+        for _ in 0..256 {
+            assert!(session.lock().diagnostic_budget.take(Instant::now()));
+        }
+        std::fs::remove_dir_all(&gateway.config.mask_dir).unwrap();
     }
 
     /// `Gateway::session_role` (used by both the `Capabilities` push and

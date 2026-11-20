@@ -34,10 +34,11 @@ impl super::Gateway {
         // process_packets_concurrent.
         let worker_count = Self::receive_worker_count();
         let mut worker_txs = Vec::with_capacity(worker_count);
+        let mut workers = tokio::task::JoinSet::new();
         for worker_id in 0..worker_count {
             let (tx, rx) = mpsc::channel::<Vec<u8>>(4096);
             worker_txs.push(tx);
-            tokio::spawn(Self::downlink_worker(
+            workers.spawn(Self::downlink_worker(
                 rx,
                 worker_id,
                 sessions.clone(),
@@ -70,7 +71,7 @@ impl super::Gateway {
         if let Some(mut rx) = chain_reverse_rx {
             let reverse_worker_txs = worker_txs.clone();
             let reverse_worker_count = worker_count;
-            tokio::spawn(async move {
+            workers.spawn(async move {
                 while let Some(packet) = rx.recv().await {
                     let Some(header) = aivpn_common::ip_packet::IpPacket::parse(&packet) else {
                         continue;
@@ -91,7 +92,7 @@ impl super::Gateway {
         // SiteData принимается в локальный TUN. Это не ответ клиенту и не NAT.
         if let Some(mut rx) = site_data_rx {
             let tun_inject = tun_writer.clone();
-            tokio::spawn(async move {
+            workers.spawn(async move {
                 while let Some(packet) = rx.recv().await {
                     if tun_inject.send(packet).await.is_err() {
                         break;
@@ -187,7 +188,7 @@ impl super::Gateway {
     /// Per-worker downlink processing (A1): session lookup, QoS, encryption
     /// and UDP send for every packet whose dst VPN IP shards to this worker.
     #[allow(clippy::too_many_arguments)]
-    async fn downlink_worker(
+    pub(super) async fn downlink_worker(
         mut rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
         worker_id: usize,
         sessions: Arc<SessionManager>,
@@ -276,8 +277,11 @@ impl super::Gateway {
                 }
             }
 
+            // Отправка в очередь маски готова сразу. При постоянно готовом
+            // TUN даем ее обработчику разобрать предыдущую пачку.
+            tokio::task::yield_now().await;
             sends.clear();
-            for (packet_vec, planned) in drained.drain(..) {
+            for (mut packet_vec, planned) in drained.drain(..) {
                 let packet = packet_vec.as_slice();
                 let n = packet.len();
                 let Some(header) = aivpn_common::ip_packet::IpPacket::parse(packet) else {
@@ -345,6 +349,13 @@ impl super::Gateway {
                     }
                 };
 
+                if let Some(mask) = session.lock().mask.as_ref() {
+                    super::tcp_mss::clamp(
+                        &mut packet_vec,
+                        aivpn_common::mimicry::data_payload_limit(mask, SAFE_DOWNLINK_BUDGET),
+                    );
+                }
+                let packet = packet_vec.as_slice();
                 // Общий qos_charge до шифрования. PassCharged уже списан ядром.
                 let (qos_cid, session_id) = {
                     let mut session = session.lock();
@@ -357,6 +368,22 @@ impl super::Gateway {
                         continue;
                     }
                     session.commit_pending_mask();
+                    if let Some(probe) = aivpn_common::diagnostics::data::parse(packet) {
+                        if probe.source == network.server_vpn_ip
+                            && !session.diagnostic_state.as_ref().is_some_and(|state| {
+                                state.active(&probe.id, Instant::now())
+                                    && state.request.direction
+                                        == aivpn_common::diagnostics::data::Direction::Download
+                            })
+                        {
+                            pacer.discard_diagnostic(
+                                session.session_id,
+                                probe.id,
+                                tokio::time::Instant::now(),
+                            );
+                            continue;
+                        }
+                    }
                     if planned.as_ref().is_some_and(|plan| {
                         plan.session_id != session.session_id
                             || !plan.matches_profile(session.mask.as_ref().unwrap_or(&mask))
@@ -430,11 +457,26 @@ impl super::Gateway {
                     let mut sess = session.lock();
                     sess.commit_pending_mask();
                     let active = sess.mask.as_ref().unwrap_or(&mask);
+                    if planned
+                        .as_ref()
+                        .is_some_and(|plan| !plan.matches_profile(active))
+                    {
+                        continue;
+                    }
                     (n > aivpn_common::mimicry::data_payload_limit(active, SAFE_DOWNLINK_BUDGET))
                         .then(|| packet_mdh_bytes_for_mask(active))
                 };
                 if let Some(mdh) = fragment_mdh {
-                    let frames = Self::build_inner_packets(&mdh, InnerType::Data, packet, &session);
+                    let frames = Self::build_inner_packets(
+                        &mdh,
+                        InnerType::Data,
+                        packet,
+                        &session,
+                        Some(super::downlink_pacing::DataPadding {
+                            level: downlink_shaping,
+                            plan: planned.as_ref(),
+                        }),
+                    );
                     match frames {
                         Ok((address, stateful, frames)) => {
                             for frame in frames {
@@ -524,77 +566,11 @@ impl super::Gateway {
                         .mask
                         .as_ref()
                         .is_some_and(aivpn_common::mask_io::requires_userspace);
-                    let packet_budget = if sess
-                        .mask
-                        .as_ref()
-                        .is_some_and(aivpn_common::mask_io::needs_state)
-                    {
-                        aivpn_common::mask_io::MAX_QUIC_INNER
-                    } else if sess
-                        .mask
-                        .as_ref()
-                        .is_some_and(aivpn_common::mask_io::uses_rtc)
-                    {
-                        aivpn_common::mask_io::rtc_inner_budget(sess.mask.as_ref().unwrap())
-                    } else {
-                        SAFE_DOWNLINK_BUDGET
-                    };
-
-                    // A7/1c: size downlink padding from the SESSION mask's own
-                    // size distribution — the same distribution + padding
-                    // strategy the client applies to uplink — so both
-                    // directions share one size signature on the 5-tuple.
-                    // Computed under the lock while the mask is borrowed; the
-                    // filler bytes are written after the lock is dropped.
-                    // Legacy downlink framing: base overhead carries the
-                    // TAG_SIZE prefix, the 2-byte pad_len field, and the AEAD
-                    // tag. `ShapingLevel::Light` uses the same sampling but
-                    // caps the result to a small fixed budget, trading most of
-                    // the covertness back for throughput; `Off` skips it
-                    // entirely.
-                    let pad_len: u16 = match downlink_shaping {
-                        ShapingLevel::Off => 0,
-                        ShapingLevel::Adaptive | ShapingLevel::Full | ShapingLevel::Light => {
-                            {
-                                let profile = sess.mask.as_ref().unwrap_or(&mask);
-                                let m = profile.reverse_profile.as_deref().unwrap_or(profile);
-                                // `+ 4` accounts for the InnerHeader
-                                // (`InnerHeader::encode` — [u8; 4]) that is
-                                // part of the encrypted plaintext below (see
-                                // the `plaintext_buf` assembly) but was missing
-                                // here: without it a max-padded packet ran
-                                // SAFE_DOWNLINK_BUDGET + 4 on the wire, and
-                                // every shaped packet sat 4 bytes above its
-                                // mask's target size.
-                                let target = planned
-                                    .as_ref()
-                                    .map(|plan| plan.target_size)
-                                    .unwrap_or_else(|| m.size_distribution.sample(&mut rng));
-                                let strategy = planned
-                                    .as_ref()
-                                    .and_then(|plan| plan.padding_override.as_ref())
-                                    .unwrap_or(&m.padding_strategy);
-                                let requested = strategy.calc_padding(
-                                    base_overhead
-                                        + aivpn_common::mask_io::carrier_overhead(profile),
-                                    target,
-                                    &mut rng,
-                                );
-                                let max_pad = packet_budget.saturating_sub(base_overhead) as u16;
-                                let capped = requested.min(max_pad);
-                                if downlink_shaping == ShapingLevel::Light {
-                                    capped.min(LIGHT_SHAPING_MAX_PAD)
-                                } else {
-                                    capped
-                                }
-                            }
-                        }
-                    };
-                    let Ok(pad_len) = framing.padding(
-                        base_overhead,
-                        pad_len,
-                        packet_budget.saturating_sub(base_overhead) as u16,
-                    ) else {
+                    let Ok(pad_len) = (super::downlink_pacing::DataPadding {
+                        level: downlink_shaping,
+                        plan: planned.as_ref(),
+                    })
+                    .calculate(sess.mask.as_ref().unwrap_or(&mask), base_overhead) else {
                         continue;
                     };
                     // Полный UDP payload: тег, заголовок маски, padding и AEAD.

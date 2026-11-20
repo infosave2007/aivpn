@@ -67,16 +67,18 @@ pub enum Page {
     Home,
     Profiles,
     Routes,
+    Applications,
     Masks,
     Service,
     Settings,
 }
 
 impl Page {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::Home,
         Self::Profiles,
         Self::Routes,
+        Self::Applications,
         Self::Masks,
         Self::Service,
         Self::Settings,
@@ -87,6 +89,7 @@ impl Page {
             Self::Home => text(lang, "Подключение", "Connection"),
             Self::Profiles => text(lang, "Профили", "Profiles"),
             Self::Routes => text(lang, "Маршруты", "Routes"),
+            Self::Applications => text(lang, "Приложения", "Applications"),
             Self::Masks => text(lang, "Маски", "Masks"),
             Self::Service => text(lang, "Сервис", "Service"),
             Self::Settings => text(lang, "Настройки", "Settings"),

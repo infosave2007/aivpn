@@ -20,10 +20,12 @@ enum DomainExclusions {
         func read() -> [String] { lock.lock(); defer { lock.unlock() }; return Array(values).sorted() }
     }
 
-    static func validDomain(_ value: String) -> Bool {
+    static func validDomain(_ value: String) -> Bool { validHostname(value, minimumLabels: 2) }
+
+    private static func validHostname(_ value: String, minimumLabels: Int = 1) -> Bool {
         guard value.utf8.count <= 253 else { return false }
         let labels = value.split(separator: ".", omittingEmptySubsequences: false)
-        return labels.count >= 2 && labels.allSatisfy { label in
+        return labels.count >= minimumLabels && labels.allSatisfy { label in
             !label.isEmpty && label.utf8.count <= 63 && label.first != "-" && label.last != "-" &&
                 label.utf8.allSatisfy { (48...57).contains($0) || (97...122).contains($0) || $0 == 45 }
         }
@@ -31,24 +33,43 @@ enum DomainExclusions {
 
     static func routes(_ domains: [String], timeout: TimeInterval = 5,
                        resolver: @escaping @Sendable (String) -> [String] = { resolve($0) }) -> [String] {
+        let names = Set(domains.map { $0.lowercased() }).sorted().prefix(64).filter { validDomain($0) }
+        return addresses(names, timeout: timeout, resolver: resolver).compactMap { address in
+            let cidr = "\(address)/\(address.contains(":") ? 128 : 32)"
+            return CIDRRoute(cidr) == nil ? nil : cidr
+        }
+    }
+
+    private static func addresses(_ names: [String], timeout: TimeInterval,
+                                  resolver: @escaping @Sendable (String) -> [String]) -> [String] {
         let results = Addresses()
         let group = DispatchGroup()
         let deadline = DispatchTime.now() + max(0, timeout)
-        for domain in Set(domains.map { $0.lowercased() }).sorted().prefix(64) where validDomain(domain) {
+        for name in names {
             group.enter()
             queue.addOperation {
                 defer { group.leave() }
                 guard DispatchTime.now() < deadline else { return }
-                let addresses = resolver(domain)
+                let addresses = resolver(name)
                 guard DispatchTime.now() < deadline else { return }
                 results.add(addresses)
             }
         }
         _ = group.wait(timeout: deadline)
-        return results.read().compactMap { address in
-            let cidr = "\(address)/\(address.contains(":") ? 128 : 32)"
-            return CIDRRoute(cidr) == nil ? nil : cidr
-        }
+        return results.read()
+    }
+
+    /// NetworkExtension requires a numeric remote address, even when the
+    /// transport's endpoint is a hostname. Keep DNS bounded like exclusions.
+    static func remoteAddress(_ host: String, timeout: TimeInterval = 5,
+                              resolver: @escaping @Sendable (String) -> [String] = { resolve($0) }) -> String? {
+        let literal = CIDRRoute("\(host)/\(host.contains(":") ? 128 : 32)")
+        if let literal = literal { return literal.address }
+        let name = host.hasSuffix(".") ? String(host.dropLast()) : host
+        guard validHostname(name) else { return nil }
+        return addresses([host], timeout: timeout, resolver: resolver).compactMap { address in
+            CIDRRoute("\(address)/\(address.contains(":") ? 128 : 32)")?.address
+        }.first
     }
 
     private static func resolve(_ domain: String) -> [String] {

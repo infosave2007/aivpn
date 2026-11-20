@@ -1,5 +1,7 @@
 #![cfg(all(feature = "mobile-tunnel", unix))]
 
+mod support;
+
 use aivpn_common::mobile_tunnel::{run_tunnel_generic, PlatformIo, RecordingFeedback};
 use aivpn_common::{
     error::{Error, Result},
@@ -48,6 +50,7 @@ async fn alternative_mobile_transport_needs_neither_server_dns_nor_direct_udp() 
     let reached = Arc::new(AtomicBool::new(false));
     let (tun, _peer) = std::os::unix::net::UnixDatagram::pair().unwrap();
     let server = aivpn_common::crypto::KeyPair::generate();
+    let (signing_key, descriptors) = support::signed_bootstrap();
     let outcome = run_tunnel_generic(
         Platform(direct.clone()),
         tun.as_raw_fd(),
@@ -60,15 +63,15 @@ async fn alternative_mobile_transport_needs_neither_server_dns_nor_direct_udp() 
         0,
         None,
         Some("webrtc_zoom_v3".into()),
-        Some([7; 32]),
-        Some([9; 32]),
+        Some(signing_key),
+        Some(signing_key),
         aivpn_common::mask::MaskVerifyMode::Enforce,
         None,
         false,
         false,
         None,
         None,
-        None,
+        Some(descriptors.clone()),
         Some(Arc::new(Carrier(reached.clone()))),
     )
     .await;

@@ -1537,6 +1537,15 @@ mod tag_layout_tests {
         assert_ne!(keys.session_key, keys.session_key_s2c);
     }
 
+    fn assert_generated_tag(keys: &SessionKeys, tag: &[u8], before: u64) {
+        // Генерация пакета может пересечь границу окна, особенно под нагрузкой CI.
+        let first = compute_time_window(before, DEFAULT_WINDOW_MS);
+        let last = compute_time_window(current_timestamp_ms(), DEFAULT_WINDOW_MS);
+        assert!((first..=last).any(|window| {
+            generate_resonance_tag(&keys.tag_secret, 0, window).as_slice() == tag
+        }));
+    }
+
     #[test]
     fn embedded_layout_roundtrip_recovers_tag_and_payload() {
         let keys = test_keys();
@@ -1544,6 +1553,7 @@ mod tag_layout_tests {
         let tag_offset: u16 = 8;
         let inner = build_inner_packet(InnerType::Data, 3, b"embedded-payload");
 
+        let before = current_timestamp_ms();
         let mut counter = 0u64;
         let pkt = build_random_mdh_packet_with_tag_offset(
             &keys,
@@ -1556,11 +1566,10 @@ mod tag_layout_tests {
         .unwrap();
 
         // (c) tag sits at packet offset tag_offset, NOT at offset 0.
-        let tw = compute_time_window(current_timestamp_ms(), DEFAULT_WINDOW_MS);
-        let expected = generate_resonance_tag(&keys.tag_secret, 0, tw);
-        assert_eq!(
+        assert_generated_tag(
+            &keys,
             &pkt[tag_offset as usize..tag_offset as usize + TAG_SIZE],
-            &expected
+            before,
         );
 
         // (a) decode with the same layout recovers the SAME inner payload.
@@ -1578,6 +1587,7 @@ mod tag_layout_tests {
         let inner = build_inner_packet(InnerType::Data, 1, b"legacy-payload");
 
         // Explicit legacy sentinel.
+        let before = current_timestamp_ms();
         let mut counter = 0u64;
         let pkt = build_random_mdh_packet_with_tag_offset(
             &keys,
@@ -1590,9 +1600,7 @@ mod tag_layout_tests {
         .unwrap();
 
         // (d) legacy layout: tag is the prefix at packet offset 0.
-        let tw = compute_time_window(current_timestamp_ms(), DEFAULT_WINDOW_MS);
-        let expected = generate_resonance_tag(&keys.tag_secret, 0, tw);
-        assert_eq!(&pkt[0..TAG_SIZE], &expected);
+        assert_generated_tag(&keys, &pkt[0..TAG_SIZE], before);
 
         // The legacy public wrapper must delegate to exactly this layout — its
         // output decodes with the original legacy decoder.
@@ -1616,6 +1624,7 @@ mod tag_layout_tests {
 
         let inner = build_inner_packet(InnerType::Control, 0, b"handshake");
         let eph = [0xABu8; 32];
+        let before = current_timestamp_ms();
         let mut counter = 0u64;
         let pkt = build_shaped_mdh_packet(&keys, &mut counter, &inner, Some(&eph), mdh_len, &mask)
             .unwrap();
@@ -1630,11 +1639,10 @@ mod tag_layout_tests {
         );
 
         // Resonance tag embedded at tag_offset (inside the transaction id).
-        let tw = compute_time_window(current_timestamp_ms(), DEFAULT_WINDOW_MS);
-        let expected = generate_resonance_tag(&keys.tag_secret, 0, tw);
-        assert_eq!(
+        assert_generated_tag(
+            &keys,
             &pkt[mask.tag_offset as usize..mask.tag_offset as usize + TAG_SIZE],
-            &expected
+            before,
         );
 
         // Ephemeral key appended immediately after the mdh_len-byte MDH (==
@@ -1651,11 +1659,10 @@ mod tag_layout_tests {
         // build_random_mdh_packet (no tag_offset) must stay legacy: tag at [0..8].
         let keys = test_keys();
         let inner = build_inner_packet(InnerType::Data, 0, b"x");
+        let before = current_timestamp_ms();
         let mut counter = 0u64;
         let pkt = build_random_mdh_packet(&keys, &mut counter, &inner, None, 20).unwrap();
-        let tw = compute_time_window(current_timestamp_ms(), DEFAULT_WINDOW_MS);
-        let expected = generate_resonance_tag(&keys.tag_secret, 0, tw);
-        assert_eq!(&pkt[0..TAG_SIZE], &expected);
+        assert_generated_tag(&keys, &pkt[0..TAG_SIZE], before);
     }
 
     #[test]

@@ -1,6 +1,6 @@
 //! Connection quality scoring and RTT tracking (0.9.0)
 //!
-//! Computes a 0–100 quality score from RTT, jitter, packet loss, and neural MSE.
+//! Оценка доставки по RTT, jitter и потерям. Измерения модели хранятся отдельно.
 
 const EWMA_ALPHA_INV: u64 = 8;
 
@@ -189,8 +189,7 @@ pub struct QualityTracker {
     sent: u64,
     /// Lost packet count estimate (gaps in seq_num)
     lost: u64,
-    /// Latest neural MSE [0.0, 1.0]
-    pub neural_mse: f32,
+    pub mask_assessment: crate::mask_assessment::AssessmentTracker,
 }
 
 impl QualityTracker {
@@ -246,7 +245,7 @@ impl QualityTracker {
 
     /// Compute 0–100 quality score.
     ///
-    /// RTT 40pts (0ms=40, ≥300ms=0) + Jitter 20pts + Loss 30pts + Neural 10pts.
+    /// Веса RTT:jitter:потери равны 40:20:30, результат нормирован на 100.
     pub fn score(&self) -> u8 {
         let rtt_pts = {
             let rtt = self.rtt_ms() as u32;
@@ -272,15 +271,7 @@ impl QualityTracker {
                 30 * (50_000 - l) / 50_000
             }
         };
-        let neural_pts = {
-            let mse = self.neural_mse;
-            if mse >= 0.35 {
-                0
-            } else {
-                (10.0 * (0.35 - mse) / 0.35) as u32
-            }
-        };
-        (rtt_pts + jitter_pts + loss_pts + neural_pts).min(100) as u8
+        ((rtt_pts + jitter_pts + loss_pts) * 100 / 90).min(100) as u8
     }
 
     /// Reset loss counters (call on reconnect).

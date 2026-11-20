@@ -20,7 +20,57 @@ impl super::AivpnClient {
         control: ControlPayload,
         received_counter: Option<u64>,
     ) -> Result<()> {
+        let (control, receipt) = match control {
+            ControlPayload::MaskApplied { generation, digest } => {
+                self.mask_receiver
+                    .confirm(aivpn_common::mask_transition::MaskReceipt { generation, digest });
+                return Ok(());
+            }
+            ControlPayload::MaskUpdateV2 {
+                generation,
+                mask_data,
+                signature,
+            } => {
+                let receipt =
+                    aivpn_common::mask_transition::MaskReceipt::for_payload(generation, &mask_data);
+                if self.mask_receiver.duplicate(receipt) {
+                    self.send_control(&receipt.control()).await?;
+                    return Ok(());
+                }
+                if !self.mask_receiver.accepts(receipt) {
+                    return Ok(());
+                }
+                (
+                    ControlPayload::MaskUpdate {
+                        mask_data,
+                        signature,
+                    },
+                    Some(receipt),
+                )
+            }
+            ControlPayload::MaskUpdate { .. } if self.mask_receiver.current().is_some() => {
+                return Ok(())
+            }
+            other => (other, None),
+        };
         match control {
+            ControlPayload::MaskApplied { .. } | ControlPayload::MaskUpdateV2 { .. } => {
+                unreachable!()
+            }
+            ControlPayload::MaskAssessment(value) => {
+                if let Some(mask) = self.control_mask.as_ref() {
+                    let generation = self
+                        .mask_receiver
+                        .current()
+                        .map_or(0, |receipt| receipt.generation);
+                    self.quality_tracker.mask_assessment.record(
+                        value,
+                        aivpn_common::mask_assessment::identity(mask),
+                        generation,
+                        Instant::now(),
+                    );
+                }
+            }
             ControlPayload::MaskState(state) => {
                 if self.ratcheted_server_eph_pub.is_none() {
                     return Err(Error::InvalidPacket("Согласование RTC до PFS"));
@@ -119,6 +169,10 @@ impl super::AivpnClient {
                             self.polymorphic_confirmed.store(true, Ordering::Relaxed);
                         }
                         self.update_mask(new_mask);
+                        if let Some(receipt) = receipt {
+                            self.mask_receiver.applied(receipt);
+                            self.send_control(&receipt.control()).await?;
+                        }
                         self.send_mask_state_offer().await?;
                         // Idle-клиент тоже подтверждает новую раскладку,
                         // не дожидаясь данных или следующего keepalive.
@@ -495,16 +549,6 @@ impl super::AivpnClient {
                     return Ok(());
                 }
 
-                if let Some(network_config) = network_config {
-                    if let Some(ka) = network_config.keepalive_secs.filter(|&s| s > 0) {
-                        // NAT-safe cap (A4, Satellite exempt) + propagation to
-                        // the already-running upload task via the shared atomic
-                        // (previously the override never reached it).
-                        self.set_keepalive_interval(Duration::from_secs(ka as u64));
-                    }
-                    self.apply_server_network_override(network_config).await?;
-                }
-
                 // The server resends ServerHello whenever it sees a
                 // non-ratcheted Keepalive while it still believes the client
                 // hasn't switched (its own reliability measure for a lost
@@ -593,12 +637,24 @@ impl super::AivpnClient {
                     self.kernel_install_session();
                 }
 
+                if let Some(network_config) = network_config {
+                    if let Some(ka) = network_config.keepalive_secs.filter(|&s| s > 0) {
+                        // NAT-safe cap (A4, Satellite exempt) + propagation to
+                        // the already-running upload task via the shared atomic
+                        // (previously the override never reached it).
+                        self.set_keepalive_interval(Duration::from_secs(ka as u64));
+                    }
+                    self.apply_server_network_override(network_config).await?;
+                }
+
                 // Initial-пакеты не меняют состояние сервера. Возможности
                 // объявляются только под установленными PFS ключами.
                 let _ = self
                     .send_control(&ControlPayload::Capabilities {
                         role: 0,
                         features: aivpn_common::protocol::CLIENT_PACKET_FEATURES
+                            | aivpn_common::mask_transition::FEATURE
+                            | aivpn_common::mask_assessment::FEATURE
                             | if self.adaptive_level.fec_n() > 0 {
                                 aivpn_common::protocol::CLIENT_FEC_ACTIVE
                             } else {
@@ -909,9 +965,6 @@ impl super::AivpnClient {
                 self.recording_status
                     .handle_recording_status(can_record, active_service.as_deref());
             }
-            ControlPayload::CertRejected {} => {
-                warn!("mTLS: server rejected the certificate — re-provision your mTLS cert");
-            }
             ControlPayload::QualityReport { loss_ppm, .. } => {
                 let now = Instant::now();
                 if self.ratcheted_server_eph_pub.is_some() {
@@ -1031,7 +1084,12 @@ impl super::AivpnClient {
                 info!("MaskCatalog from server: {} masks", masks.len());
                 crate::mask_catalog::write_mask_catalog(&masks);
             }
-            ControlPayload::HandshakeReject { reason } => {
+            rejection @ (ControlPayload::HandshakeReject { .. }
+            | ControlPayload::CertRejected {}) => {
+                let reason = match rejection {
+                    ControlPayload::HandshakeReject { reason } => reason,
+                    _ => aivpn_common::protocol::CERTIFICATE_REJECT_REASON,
+                };
                 // Authenticated (PSK-proven) terminal refusal — see the
                 // doc comment on `ControlPayload::HandshakeReject` in
                 // aivpn-common. Log the reason, surface it on stdout as a
@@ -1092,6 +1150,22 @@ impl super::AivpnClient {
                     "Capabilities from server: role={} features={}",
                     role, features
                 );
+                if features & aivpn_common::mask_transition::FEATURE != 0
+                    && features & aivpn_common::protocol::CLIENT_PACKET_FEATURES == 0
+                {
+                    self.send_control(&ControlPayload::Capabilities {
+                        role: 0,
+                        features: aivpn_common::protocol::CLIENT_PACKET_FEATURES
+                            | aivpn_common::mask_transition::FEATURE
+                            | aivpn_common::mask_assessment::FEATURE
+                            | if self.adaptive_level.fec_n() > 0 {
+                                aivpn_common::protocol::CLIENT_FEC_ACTIVE
+                            } else {
+                                0
+                            },
+                    })
+                    .await?;
+                }
                 self.mgmt.on_capabilities(role);
             }
             ControlPayload::MgmtResponse {

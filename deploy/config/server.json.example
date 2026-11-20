@@ -42,19 +42,8 @@
   "mask_signing_key": null,
   "mask_operator_pubkey": null,
 
-  "pool": {
-    "node_id": "",
-    "peers": [],
-    "sync_key": "",
-    "exit_node": null,
-    "exit_node_enabled": false
-  },
-
-  "site_to_site": {
-    "local_subnets": [],
-    "peers": [
-    ]
-  },
+  "pool": null,
+  "site_to_site": null,
 
   "mtls": {
     "ca_public_key_hex": "",

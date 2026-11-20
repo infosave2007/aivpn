@@ -29,18 +29,27 @@ pub fn create_udp_socket(
     // `Sync` — a promise nothing in the call graph needs or can honour.
     protect: &dyn Fn(RawFd) -> Result<()>,
 ) -> Result<RawFd> {
-    let port_hint = LAST_LOCAL_PORT.load(Ordering::Relaxed);
+    let previous_port = LAST_LOCAL_PORT.load(Ordering::Relaxed);
+    let retrying = super::state::HANDSHAKE_FAIL_STREAK.load(Ordering::Relaxed)
+        >= crate::mask::HANDSHAKE_FALLBACK_THRESHOLD;
+    let port_hint = if retrying { 0 } else { previous_port };
     let bind_address = |port| match dest {
         SocketAddr::V4(_) => SocketAddr::from(([0, 0, 0, 0], port)),
         SocketAddr::V6(_) => SocketAddr::from(([0u16; 8], port)),
     };
-    let socket = std::net::UdpSocket::bind(bind_address(port_hint)).or_else(|error| {
+    let mut socket = std::net::UdpSocket::bind(bind_address(port_hint)).or_else(|error| {
         if port_hint != 0 {
             std::net::UdpSocket::bind(bind_address(0))
         } else {
             Err(error)
         }
     })?;
+    // Новый протокол должен получить новый поток в DPI. Старый порт сохраняется
+    // при обычном переподключении ради NAT, но не после серии отказов.
+    if retrying && socket.local_addr()?.port() == previous_port {
+        // Первый сокет удерживает старый порт до завершения второго bind.
+        socket = std::net::UdpSocket::bind(bind_address(0))?;
+    }
     // Защита применяется до отправки первого пакета; RAII закрывает fd при ошибке.
     let fd = socket.as_raw_fd();
     protect(fd)?;
@@ -389,6 +398,24 @@ mod fd_lifecycle_tests {
     use std::os::unix::net::UnixDatagram;
     use std::sync::atomic::AtomicUsize;
     use std::task::Wake;
+
+    #[test]
+    fn failed_handshakes_leave_the_blocked_udp_flow() {
+        if isolated("failed_handshakes_leave_the_blocked_udp_flow") {
+            return;
+        }
+        let server = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let previous = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
+        let previous_port = previous.local_addr().unwrap().port();
+        drop(previous);
+        LAST_LOCAL_PORT.store(previous_port, Ordering::Relaxed);
+        super::super::state::HANDSHAKE_FAIL_STREAK
+            .store(crate::mask::HANDSHAKE_FALLBACK_THRESHOLD, Ordering::Relaxed);
+        let session = Arc::new(SessionRuntime::new());
+        let fd = create_udp_socket(server.local_addr().unwrap(), &session, &|_| Ok(())).unwrap();
+        let socket = unsafe { std::net::UdpSocket::from_raw_fd(fd) };
+        assert_ne!(socket.local_addr().unwrap().port(), previous_port);
+    }
 
     fn isolated(name: &str) -> bool {
         let module = module_path!().split_once("::").unwrap().1;

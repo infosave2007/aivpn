@@ -131,6 +131,15 @@ async fn main() {
     });
     let mut path_args = args;
     config_resolve::apply_restore_env(&mut path_args, &matches);
+    // Журнал рядом с config закрывается до первого разбора JSON.
+    if let Some(config_path) = config_resolve::resolve_config_path(&path_args) {
+        if let Err(error) =
+            aivpn_server::backup::recover_config_sidecar(std::path::Path::new(&config_path))
+        {
+            eprintln!("Не удалось завершить прерванное восстановление: {error}");
+            std::process::exit(1);
+        }
+    }
     if path_args.clients_db.trim().is_empty() {
         eprintln!("clients_db: пустое значение");
         std::process::exit(1);
@@ -156,7 +165,7 @@ async fn main() {
         return;
     }
     // Явный путь DB известен без чтения config, поэтому restore ожидается первым.
-    let _known_db_owner = (matches.value_source("clients_db")
+    let mut known_db_owner = (matches.value_source("clients_db")
         == Some(clap::parser::ValueSource::CommandLine)
         || std::env::var_os("AIVPN_CLIENTS_DB").is_some())
     .then(|| aivpn_server::client_db::LiveDbGuard::shared(Path::new(&path_args.clients_db)))
@@ -167,25 +176,116 @@ async fn main() {
     });
     let mut effective = load_effective();
     let mut attempts = 0;
-    let (args, file_config, config_path, _runtime_owner) = loop {
+    let (args, file_config, config_path, _runtime_owner, config_lock, mask_lock) = loop {
         let database_path = effective.0.clients_db.clone();
         let guard = aivpn_server::client_db::LiveDbGuard::shared(Path::new(&database_path))
             .unwrap_or_else(|error| {
                 eprintln!("Не удалось получить блокировку серверных файлов: {error}");
                 std::process::exit(1);
             });
-        // Путь из config требует первого чтения для поиска DB. Под guard читаем заново.
+        let config_for_lock = config_resolve::resolve_config_path(&path_args);
+        let config_lock = match config_for_lock
+            .as_deref()
+            .map(|path| aivpn_server::backup::lock_shared_restore(Some(Path::new(path)), None))
+            .transpose()
+        {
+            Ok(lock) => lock,
+            Err(error) => {
+                eprintln!("Не удалось получить блокировку серверных файлов: {error}");
+                std::process::exit(1);
+            }
+        };
+        let pending = match config_lock
+            .as_ref()
+            .map(|lock| lock.journal_pending())
+            .transpose()
+        {
+            Ok(pending) => pending.unwrap_or(false),
+            Err(error) => {
+                eprintln!("Не удалось завершить прерванное восстановление: {error}");
+                std::process::exit(1);
+            }
+        };
+        if pending {
+            drop(config_lock);
+            drop(guard);
+            drop(known_db_owner.take());
+            if let Some(path) = config_for_lock.as_deref() {
+                if let Err(error) = aivpn_server::backup::recover_config_sidecar(Path::new(path)) {
+                    eprintln!("Не удалось завершить прерванное восстановление: {error}");
+                    std::process::exit(1);
+                }
+            }
+            attempts += 1;
+            if attempts >= 4 {
+                eprintln!("clients_db: конфигурация меняется во время запуска");
+                std::process::exit(1);
+            }
+            effective = load_effective();
+            continue;
+        }
+        // Повторное чтение под DB guard и config shared. Это и есть снимок.
         let refreshed = load_effective();
-        if refreshed.0.clients_db == database_path {
-            break (refreshed.0, refreshed.1, refreshed.2, guard);
+        if refreshed.0.clients_db != database_path {
+            drop(config_lock);
+            drop(guard);
+            effective = refreshed;
+            attempts += 1;
+            if attempts >= 4 {
+                eprintln!("clients_db: конфигурация меняется во время запуска");
+                std::process::exit(1);
+            }
+            continue;
         }
-        drop(guard);
-        effective = refreshed;
-        attempts += 1;
-        if attempts >= 4 {
-            eprintln!("clients_db: конфигурация меняется во время запуска");
-            std::process::exit(1);
+        let mask_dir = config_resolve::resolve_mask_dir(&refreshed.0, refreshed.1.as_ref());
+        // Недоступный необязательный каталог не участвует в снимке: загрузчик
+        // масок использует встроенный корпус, как и до поддержки recovery.
+        let readable_masks = std::fs::read_dir(&mask_dir)
+            .ok()
+            .map(|_| mask_dir.as_path());
+        let mask_lock = match aivpn_server::backup::lock_shared_restore(None, readable_masks) {
+            Ok(lock) => lock,
+            Err(error) => {
+                eprintln!("Не удалось получить блокировку серверных файлов: {error}");
+                std::process::exit(1);
+            }
+        };
+        match mask_lock.journal_pending() {
+            Ok(false) => {}
+            Ok(true) => {
+                drop(mask_lock);
+                drop(config_lock);
+                drop(guard);
+                drop(known_db_owner.take());
+                if let Some(path) = config_for_lock.as_deref() {
+                    if let Err(error) =
+                        aivpn_server::backup::recover_config_sidecar(Path::new(path))
+                    {
+                        eprintln!("Не удалось завершить прерванное восстановление: {error}");
+                        std::process::exit(1);
+                    }
+                }
+                attempts += 1;
+                if attempts >= 4 {
+                    eprintln!("clients_db: конфигурация меняется во время запуска");
+                    std::process::exit(1);
+                }
+                effective = load_effective();
+                continue;
+            }
+            Err(error) => {
+                eprintln!("Не удалось завершить прерванное восстановление: {error}");
+                std::process::exit(1);
+            }
         }
+        break (
+            refreshed.0,
+            refreshed.1,
+            refreshed.2,
+            guard,
+            config_lock,
+            mask_lock,
+        );
     };
 
     let effective_tun_mtu: u16 = match file_config.as_ref().and_then(|c| c.tun_mtu.as_ref()) {
@@ -231,6 +331,9 @@ async fn main() {
             std::process::exit(1);
         }
     };
+    // Общие config и маски остаются защищены до выхода, в том числе при
+    // использовании того же каталога другим сервером с отдельной DB.
+    let _component_owners = (config_lock, mask_lock);
 
     // Handle CLI management commands (no logging needed)
     if let Some(ref name) = args.add_client {

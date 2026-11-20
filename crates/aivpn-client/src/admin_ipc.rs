@@ -14,15 +14,28 @@ async fn command(
     token: &str,
     mgmt: &MgmtClient,
     control: &mpsc::Sender<ControlPayload>,
-    recording: &mpsc::Sender<String>,
+    recording: &mpsc::Sender<crate::session_admin::ClientRequest>,
 ) -> Option<String> {
     let (candidate, rest) = raw.split_once(':')?;
     if !record_cmd::tokens_match(candidate, token) {
         return None;
     }
+    execute(rest, mgmt, control, recording).await
+}
+
+pub(crate) async fn execute(
+    rest: &str,
+    mgmt: &MgmtClient,
+    control: &mpsc::Sender<ControlPayload>,
+    recording: &mpsc::Sender<crate::session_admin::ClientRequest>,
+) -> Option<String> {
     match record_cmd::parse_admin_command(rest)? {
         AdminCommand::RecordStart(_) | AdminCommand::RecordStop | AdminCommand::RecordStatus => {
-            recording.send(rest.to_string()).await.ok()?;
+            recording
+                .try_send(crate::session_admin::ClientRequest::Recording(
+                    rest.to_string(),
+                ))
+                .ok()?;
             Some("ok".into())
         }
         AdminCommand::Role => Some(mgmt.cached_role().to_string()),
@@ -75,7 +88,7 @@ pub async fn serve(
     token: String,
     mgmt: MgmtClient,
     control: mpsc::Sender<ControlPayload>,
-    recording: mpsc::Sender<String>,
+    recording: mpsc::Sender<crate::session_admin::ClientRequest>,
 ) {
     let udp = std::sync::Arc::new(udp);
     let mut jobs = tokio::task::JoinSet::new();
@@ -139,7 +152,9 @@ mod tests {
         let query = tokio::task::spawn_blocking(move || {
             aivpn_common::local_admin::request(addr, &line, Duration::from_secs(5))
         });
-        assert_eq!(record_rx.recv().await.unwrap(), "record_start:fixture");
+        assert!(
+            matches!(record_rx.recv().await.unwrap(), crate::session_admin::ClientRequest::Recording(command) if command == "record_start:fixture")
+        );
         assert_eq!(query.await.unwrap().unwrap(), "ok");
         let line = format!(
             "{token}:mgmt:1:/api/v1/fixture:{}",

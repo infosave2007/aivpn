@@ -177,7 +177,7 @@ struct ServerSettingsView: View {
     @State private var exitPending: ServerSettingsPendingApply?
 
     var body: some View {
-        NavigationStack {
+        CompatibleNavigationView {
             Group {
                 if !isAdmin {
                     VStack {
@@ -330,7 +330,7 @@ struct ServerSettingsView: View {
             }
             if exitChoice == .custom {
                 TextField(loc.t("admin_exit_node"), text: $customExitAddr)
-                    .autocorrectionDisabled()
+                    .disableAutocorrection(true)
                     .autocapitalization(.none)
                     .keyboardType(.asciiCapable)
             }

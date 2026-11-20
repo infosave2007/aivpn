@@ -23,6 +23,7 @@ pub struct TrafficStats {
     pub bytes_received: u64,
     pub quality_score: u8,
     pub server_adaptive_level: u8,
+    pub fec_group: Option<u8>,
     /// Session epoch (unix ms) stamped by the client's stats writer once per
     /// session (`since:` key). Changes on a silent in-process reconnect, so a
     /// reader can detect a session restart (counters reset together with the
@@ -31,43 +32,9 @@ pub struct TrafficStats {
     pub connected_since: Option<u64>,
 }
 
-/// Locate a binary named `name` either next to the currently-running
-/// `aivpn-linux` executable (the AppImage/release-tarball layout, where all
-/// bundled binaries sit side by side in `usr/bin/`) or on `PATH`.
-fn find_sibling_binary(name: &str) -> Result<PathBuf, String> {
-    // Resolve ONLY next to the running executable (an absolute, canonicalized
-    // path). The PATH fallback was removed deliberately: `aivpn-ip-helper` is
-    // copied to a root-owned system path and run as root, and aivpn-client is
-    // launched for privileged networking, so accepting a binary from an
-    // attacker-writable PATH entry (or a bare relative name) is a
-    // binary-planting → privilege-escalation vector. Release layouts always
-    // co-locate these binaries next to the GUI.
-    let exe = std::env::current_exe().map_err(|e| format!("cannot locate own exe: {e}"))?;
-    let dir = exe
-        .parent()
-        .ok_or_else(|| "own exe has no parent dir".to_string())?;
-    let candidate = dir.join(name);
-    // Canonicalize so the returned path is absolute and symlink-resolved.
-    match candidate.canonicalize() {
-        Ok(p) if p.is_file() => Ok(p),
-        _ => Err(format!(
-            "'{name}' not found next to the aivpn-linux binary ({})",
-            candidate.display()
-        )),
-    }
-}
-
+/// Все режимы клиента встроены в текущий образ, включая AppImage.
 pub fn find_client_binary() -> Result<PathBuf, String> {
-    find_sibling_binary("aivpn-client")
-}
-
-/// Locate the `aivpn-ip-helper` binary built alongside `aivpn-client` (see
-/// the `[[bin]]` entry in `crates/aivpn-client/Cargo.toml`) — used by
-/// `ensure_capable_binary` in `app.rs` to install it to its fixed system
-/// path (`/usr/local/libexec/aivpn/aivpn-ip-helper`) during the one-time
-/// privileged setup.
-pub fn find_ip_helper_binary() -> Result<PathBuf, String> {
-    find_sibling_binary("aivpn-ip-helper")
+    std::env::current_exe().map_err(|error| error.to_string())
 }
 
 /// Only trust status files owned by us or by root. Some fallback paths live
@@ -198,6 +165,10 @@ pub fn read_traffic_stats() -> TrafficStats {
             stats.quality_score = v.get("quality").and_then(|x| x.as_u64()).unwrap_or(0) as u8;
             stats.server_adaptive_level =
                 v.get("adaptive").and_then(|x| x.as_u64()).unwrap_or(0) as u8;
+            stats.fec_group = v
+                .get("fec_group")
+                .and_then(|value| value.as_u64())
+                .and_then(|value| u8::try_from(value).ok());
             break;
         }
     }
@@ -229,22 +200,19 @@ fn parse_traffic_stats(content: &str) -> Option<TrafficStats> {
 /// Read the recording status file written by `aivpn-client record status`.
 /// Returns None if the file is missing or unparseable.
 pub fn read_recording_status() -> Option<RecordingSnapshot> {
-    let candidates: Vec<PathBuf> = vec![
-        dirs::cache_dir()
-            .map(|d| d.join("aivpn").join("recording.status"))
-            .unwrap_or_default(),
+    let primary = crate::admin::admin_token_path().with_file_name("recording.status");
+    let legacy = [
+        PathBuf::from("/var/run/aivpn/recording.status"),
         PathBuf::from("/tmp/aivpn-recording.status"),
     ];
-    for path in &candidates {
-        if let Some((_, content)) = read_trusted_stats_file(path) {
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&content) {
-                return Some(RecordingSnapshot {
-                    state: v["state"].as_str().unwrap_or("idle").to_string(),
-                    service: v["service"].as_str().unwrap_or("").to_string(),
-                    mask_id: v["mask_id"].as_str().map(|s| s.to_string()),
-                    message: v["message"].as_str().map(|s| s.to_string()),
-                });
-            }
+    for content in status_candidates(&primary, &legacy) {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&content) {
+            return Some(RecordingSnapshot {
+                state: v["state"].as_str().unwrap_or("idle").to_string(),
+                service: v["service"].as_str().unwrap_or("").to_string(),
+                mask_id: v["mask_id"].as_str().map(|s| s.to_string()),
+                message: v["message"].as_str().map(|s| s.to_string()),
+            });
         }
     }
     None
@@ -272,6 +240,7 @@ pub fn extract_server_addr(key: &str) -> Option<String> {
 /// named function/method in this same module rather than inlined in the
 /// event loop — see `aivpn-windows/src/vpn_manager.rs::connect`).
 pub struct ClientLaunchParams {
+    pub split_enabled: bool,
     pub full_tunnel: bool,
     pub mtls_cert: Option<String>,
     pub kill_switch: bool,
@@ -304,6 +273,7 @@ pub fn build_client_command(
     params: &ClientLaunchParams,
 ) -> tokio::process::Command {
     let mut cmd = tokio::process::Command::new(binary);
+    cmd.arg("cli");
     cmd.env_remove("AIVPN_ADMIN_LISTEN");
     // Ensure the VPN client is killed if this GUI process exits
     // (e.g. Quit from the tray). Without this, dropping the Child
@@ -316,6 +286,7 @@ pub fn build_client_command(
     // reads AIVPN_CONNECTION_KEY then immediately removes it from
     // its own environment. Matches the Windows GUI.
     cmd.env("AIVPN_CONNECTION_KEY", key);
+    cmd.arg(format!("--split-enabled={}", params.split_enabled));
     if params.full_tunnel {
         cmd.arg("--full-tunnel");
     }
@@ -410,6 +381,7 @@ pub fn parse_status_line(l: &str) -> Option<VpnStatus> {
                 "one_time_used" => "server: one-time key already used",
                 "expired" => "server: client expired",
                 "disabled" => "server: client disabled",
+                "certificate" => "server: mTLS certificate rejected",
                 _ => "server: connection refused",
             };
             Some(VpnStatus::Error(msg.to_string()))
@@ -461,6 +433,40 @@ pub fn format_bytes(bytes: u64) -> String {
 #[cfg(test)]
 mod private_status_tests {
     use super::*;
+    #[test]
+    fn recording_reads_private_runtime_file() {
+        if std::env::var_os("AIVPN_RECORDING_TEST_CHILD").is_some() {
+            let snapshot = read_recording_status().expect("статус в частном runtime-каталоге");
+            assert_eq!(snapshot.state, "recording");
+            assert_eq!(snapshot.service, "private-status");
+            return;
+        }
+        let directory =
+            std::env::temp_dir().join(format!("aivpn-recording-test-{}", std::process::id()));
+        std::fs::create_dir_all(directory.join("aivpn")).unwrap();
+        std::fs::write(
+            directory.join("aivpn/recording.status"),
+            r#"{"state":"recording","service":"private-status"}"#,
+        )
+        .unwrap();
+        let result = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "vpn_manager::private_status_tests::recording_reads_private_runtime_file",
+                "--nocapture",
+            ])
+            .env("AIVPN_RECORDING_TEST_CHILD", "1")
+            .env("XDG_RUNTIME_DIR", &directory)
+            .output()
+            .unwrap();
+        std::fs::remove_dir_all(directory).unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stdout)
+        );
+    }
+
     #[test]
     fn another_sessions_newer_legacy_file_cannot_shadow_our_status() {
         let dir = std::env::temp_dir().join(format!(

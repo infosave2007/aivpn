@@ -541,6 +541,16 @@ pub extern "system" fn Java_com_aivpn_client_AivpnJni_getQualityScore(
 }
 
 #[no_mangle]
+pub extern "system" fn Java_com_aivpn_client_AivpnJni_getMaskAssessment(
+    mut env: JNIEnv,
+    _class: JClass,
+) -> jstring {
+    let value = aivpn_common::mobile_tunnel::get_active_mask_assessment();
+    let json = serde_json::to_string(&value).unwrap_or_else(|_| "null".into());
+    make_str(&mut env, &json)
+}
+
+#[no_mangle]
 pub extern "system" fn Java_com_aivpn_client_AivpnJni_getUploadBytes(
     _env: JNIEnv,
     _class: JClass,
@@ -591,13 +601,8 @@ pub extern "system" fn Java_com_aivpn_client_AivpnJni_getAssignedVpnIp(
     make_str(&mut env, &s)
 }
 
-/// Returns `true` (and atomically clears the flag) if the server sent
-/// `CertRejected` (mTLS client certificate rejected) at any point since the
-/// last call — poll this live during a session (like `getAssignedVpnIp`), not
-/// just after `runTunnel` returns, since the server keeps the tunnel up while
-/// rejecting the cert rather than tearing it down. A `true` result means the
-/// current certificate will never be accepted by this server; the caller
-/// should prompt the user to re-provision instead of waiting for a timeout.
+/// Одноразовое уведомление об отклоненном сертификате для интерфейса.
+/// Ядро также завершает сессию; handshakeRejectReason останавливает повторы.
 #[no_mangle]
 pub extern "system" fn Java_com_aivpn_client_AivpnJni_certRejected(
     _env: JNIEnv,
@@ -606,16 +611,9 @@ pub extern "system" fn Java_com_aivpn_client_AivpnJni_certRejected(
     CERT_REJECTED.swap(false, Ordering::Relaxed) as jni::sys::jboolean
 }
 
-/// Returns the `HandshakeReject` reason code (0=unspecified, 1=one-time key
-/// already used, 2=client expired, 3=client disabled) and atomically clears
-/// the pending flag, or `-1` if no `HandshakeReject` has been observed since
-/// the last call (mirrors the `-1` = "nothing yet" sentinel used by
-/// `getAdaptiveLevelHint`). Unlike `certRejected`, this is TERMINAL: the
-/// server only ever sends `HandshakeReject` to a peer that already proved
-/// PSK knowledge during the handshake, so retrying under the same credential
-/// can never succeed. The caller (`AivpnService.kt`) must stop its reconnect
-/// loop instead of backing off and retrying — see the `HANDSHAKE_REJECTED`
-/// doc comment in `android_tunnel.rs`.
+/// Терминальная причина: 0 - общий отказ, 1 - использованный разовый ключ,
+/// 2 - истекший клиент, 3 - отключенный клиент, 4 - отклоненный сертификат.
+/// Чтение сбрасывает флаг; -1 означает отсутствие нового отказа.
 #[no_mangle]
 pub extern "system" fn Java_com_aivpn_client_AivpnJni_handshakeRejectReason(
     _env: JNIEnv,
@@ -701,17 +699,7 @@ pub extern "system" fn Java_com_aivpn_client_AivpnJni_getAttemptedMaskFamily(
     mut env: JNIEnv,
     _class: JClass,
 ) -> jstring {
-    // catch_unwind so a future panic in the lock/clone can never abort the whole
-    // app process across the FFI boundary (LOW-2); degrade to "" on panic.
-    let family = std::panic::catch_unwind(|| {
-        ATTEMPTED_MASK_FAMILY
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
-            .unwrap_or_default()
-    })
-    .unwrap_or_default();
-    make_str(&mut env, &family)
+    cached_string(&mut env, &ATTEMPTED_MASK_FAMILY)
 }
 
 /// Monotonically increasing counter, bumped each time a new
@@ -737,16 +725,7 @@ pub extern "system" fn Java_com_aivpn_client_AivpnJni_getRegionalHintsJson(
     mut env: JNIEnv,
     _class: JClass,
 ) -> jstring {
-    // catch_unwind so a panic never aborts the app process across FFI (LOW-2).
-    let json = std::panic::catch_unwind(|| {
-        ACTIVE_REGIONAL_HINTS_JSON
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
-            .unwrap_or_default()
-    })
-    .unwrap_or_default();
-    make_str(&mut env, &json)
+    cached_string(&mut env, &ACTIVE_REGIONAL_HINTS_JSON)
 }
 
 /// Monotonic counter bumped each time a fresh `MaskCatalog` is received from the
@@ -769,16 +748,7 @@ pub extern "system" fn Java_com_aivpn_client_AivpnJni_getMaskCatalogJson(
     mut env: JNIEnv,
     _class: JClass,
 ) -> jstring {
-    // catch_unwind so a panic never aborts the app process across FFI (LOW-2).
-    let json = std::panic::catch_unwind(|| {
-        ACTIVE_MASK_CATALOG_JSON
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
-            .unwrap_or_default()
-    })
-    .unwrap_or_default();
-    make_str(&mut env, &json)
+    cached_string(&mut env, &ACTIVE_MASK_CATALOG_JSON)
 }
 
 /// Send a RecordingStart control message to the server. Returns 1 if queued, 0 if no session.
@@ -1410,6 +1380,19 @@ pub extern "system" fn Java_com_aivpn_client_AivpnJni_sshInstallFree(
 // ──────────────────────────────────────────────────────────
 // Helpers
 // ──────────────────────────────────────────────────────────
+
+fn cached_string(env: &mut JNIEnv, source: &std::sync::Mutex<Option<String>>) -> jstring {
+    // Паника при чтении кеша не пересекает границу JNI.
+    let value = std::panic::catch_unwind(|| {
+        source
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+            .unwrap_or_default()
+    })
+    .unwrap_or_default();
+    make_str(env, &value)
+}
 
 fn make_str(env: &mut JNIEnv, s: &str) -> jstring {
     if let Ok(js) = env.new_string(s) {

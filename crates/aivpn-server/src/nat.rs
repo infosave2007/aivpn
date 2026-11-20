@@ -153,9 +153,6 @@ pub fn assign_ipv6_to_tun(
 /// comment tag for easy identification/removal.
 #[cfg(target_os = "linux")]
 pub fn setup_nat66(tun_name: &str, prefix: &str) -> std::result::Result<(), String> {
-    use std::io::Write as _;
-    use std::process::{Command, Stdio};
-
     NatForwarder::validate_tun_name(tun_name).map_err(|e| e.to_string())?;
     let (address, length) = prefix.split_once('/').ok_or("invalid IPv6 prefix")?;
     let address: std::net::Ipv6Addr = address.parse().map_err(|_| "invalid IPv6 address")?;
@@ -166,13 +163,22 @@ pub fn setup_nat66(tun_name: &str, prefix: &str) -> std::result::Result<(), Stri
     let prefix = format!("{address}/{length}");
     let prefix = prefix.as_str();
 
-    // Ошибка настройки forwarding должна остановить запуск IPv6.
-
+    // Не включаем пересылку, пока правила NAT не установлены.
+    apply_nat66_rules(tun_name, prefix)?;
     let fwd = std::fs::read_to_string("/proc/sys/net/ipv6/conf/all/forwarding").unwrap_or_default();
     if fwd.trim() != "1" {
-        std::fs::write("/proc/sys/net/ipv6/conf/all/forwarding", "1")
-            .map_err(|e| format!("enable IPv6 forwarding: {e}"))?;
+        if let Err(error) = std::fs::write("/proc/sys/net/ipv6/conf/all/forwarding", "1") {
+            let _ = teardown_nat66(tun_name, prefix);
+            return Err(format!("enable IPv6 forwarding: {error}"));
+        }
     }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn apply_nat66_rules(tun_name: &str, prefix: &str) -> std::result::Result<(), String> {
+    use std::io::Write as _;
+    use std::process::{Command, Stdio};
 
     let use_nft = Command::new("nft")
         .arg("--version")
@@ -181,13 +187,14 @@ pub fn setup_nat66(tun_name: &str, prefix: &str) -> std::result::Result<(), Stri
         .unwrap_or(false);
 
     if use_nft {
-        // Remove stale table from a previous run.
-        let _ = Command::new("nft")
-            .args(["delete", "table", "ip6", "aivpn6"])
-            .output();
+        let result = (|| -> std::result::Result<(), String> {
+            // Remove stale table from a previous run.
+            let _ = Command::new("nft")
+                .args(["delete", "table", "ip6", "aivpn6"])
+                .output();
 
-        let ruleset = format!(
-            "table ip6 aivpn6 {{\n\
+            let ruleset = format!(
+                "table ip6 aivpn6 {{\n\
              \tchain nat_out {{\n\
              \t\ttype nat hook postrouting priority srcnat;\n\
              \t\tip6 saddr {prefix} masquerade\n\
@@ -198,38 +205,45 @@ pub fn setup_nat66(tun_name: &str, prefix: &str) -> std::result::Result<(), Stri
              \t\toifname \"{tun_name}\" ct state related,established accept\n\
              \t}}\n\
              }}\n"
-        );
+            );
 
-        let mut child = Command::new("nft")
-            .args(["-f", "-"])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| format!("nft spawn (nat66): {e}"))?;
+            let mut child = Command::new("nft")
+                .args(["-f", "-"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .map_err(|e| format!("nft spawn (nat66): {e}"))?;
 
-        let written = child
-            .stdin
-            .take()
-            .ok_or_else(|| "nft stdin недоступен".to_string())
-            .and_then(|mut stdin| {
-                stdin
-                    .write_all(ruleset.as_bytes())
-                    .map_err(|error| format!("write NAT66 rules: {error}"))
-            });
-        let out = child
-            .wait_with_output()
-            .map_err(|e| format!("nft wait (nat66): {e}"))?;
-        written?;
-        if !out.status.success() {
-            return Err(format!(
-                "nftables nat66 setup failed: {}",
-                String::from_utf8_lossy(&out.stderr)
-            ));
+            let written = child
+                .stdin
+                .take()
+                .ok_or_else(|| "nft stdin недоступен".to_string())
+                .and_then(|mut stdin| {
+                    stdin
+                        .write_all(ruleset.as_bytes())
+                        .map_err(|error| format!("write NAT66 rules: {error}"))
+                });
+            let out = child
+                .wait_with_output()
+                .map_err(|e| format!("nft wait (nat66): {e}"))?;
+            written?;
+            if !out.status.success() {
+                return Err(format!(
+                    "nftables nat66 setup failed: {}",
+                    String::from_utf8_lossy(&out.stderr)
+                ));
+            }
+            info!("nftables: aivpn6 table installed (NAT66 + forward)");
+            Ok(())
+        })();
+        match result {
+            Ok(()) => return Ok(()),
+            Err(error) => warn!("NAT66 через nft не настроен, пробуем ip6tables: {error}"),
         }
-        info!("nftables: aivpn6 table installed (NAT66 + forward)");
-    } else {
-        // ip6tables fallback.
+    }
+    {
+        // Ошибка второго backend остается ошибкой запуска.
         let c = "aivpn";
         ip6t_ensure(
             "nat",
@@ -304,7 +318,9 @@ pub fn teardown_nat66(tun_name: &str, prefix: &str) -> std::result::Result<(), S
             .args(["delete", "table", "ip6", "aivpn6"])
             .output();
         info!("nftables: aivpn6 table removed");
-    } else {
+    }
+    // Наличие nft не означает, что именно он смог установить правила.
+    {
         let c = "aivpn";
         ip6t_delete(
             "nat",
@@ -474,7 +490,6 @@ impl NatForwarder {
 
         #[cfg(target_os = "linux")]
         {
-            self.enable_ip_forwarding()?;
             let backend = detect_fw_backend();
             info!("Firewall backend: {:?}", backend);
             match backend {
@@ -537,6 +552,8 @@ impl NatForwarder {
                     self.fw_backend = Some(FwBackend::Iptables);
                 }
             }
+            // Ошибка firewall не должна менять глобальную пересылку хоста.
+            self.enable_ip_forwarding()?;
         }
 
         Ok(())
@@ -974,5 +991,124 @@ mod firewall_tests {
                 String::from_utf8_lossy(&output.stderr)
             );
         }
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod nat66_fallback_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[tokio::test]
+    async fn failed_firewall_setup_does_not_enable_forwarding() {
+        const CHILD: &str = "AIVPN_FORWARDING_TEST_CHILD";
+        if let Ok(family) = std::env::var(CHILD) {
+            let path = if family == "4" {
+                "/proc/sys/net/ipv4/ip_forward"
+            } else {
+                "/proc/sys/net/ipv6/conf/all/forwarding"
+            };
+            std::fs::write(path, "0").unwrap();
+            if family == "4" {
+                let mut nat = NatForwarder::new(
+                    "testnat",
+                    "10.77.0.1",
+                    "255.255.255.0",
+                    1280,
+                    VpnNetworkConfig::default(),
+                )
+                .unwrap();
+                let error = nat.create().unwrap_err();
+                assert!(error.to_string().contains("firewall"), "{error}");
+            } else {
+                assert!(setup_nat66("testnat", "fd10:cafe::/48").is_err());
+            }
+            assert_eq!(std::fs::read_to_string(path).unwrap().trim(), "0");
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        for tool in ["nft", "iptables", "ip6tables"] {
+            let path = directory.path().join(tool);
+            std::fs::write(&path, "#!/bin/sh\nif [ \"$1\" = --version ]; then exit 0; fi\nif [ \"$1\" = -f ]; then cat >/dev/null; fi\nexit 1\n").unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        for family in ["4", "6"] {
+            let output = std::process::Command::new("unshare")
+                .args(["--user", "--map-root-user", "--net", "--mount"])
+                .arg(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "nat::nat66_fallback_tests::failed_firewall_setup_does_not_enable_forwarding",
+                    "--nocapture",
+                ])
+                .env(CHILD, family)
+                .env(
+                    "PATH",
+                    format!(
+                        "{}:{}",
+                        directory.path().display(),
+                        std::env::var("PATH").unwrap()
+                    ),
+                )
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "IPv{family}: {} {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
+    #[test]
+    fn nft_failure_uses_ip6tables_and_cleans_both_backends() {
+        if std::env::var_os("AIVPN_NAT66_TEST_CHILD").is_some() {
+            apply_nat66_rules("testtun", "fd10:cafe::/48").unwrap();
+            teardown_nat66("testtun", "fd10:cafe::/48").unwrap();
+            let log =
+                std::fs::read_to_string(std::env::var("AIVPN_NAT66_TEST_LOG").unwrap()).unwrap();
+            assert_eq!(log.lines().filter(|line| line.contains(" -A ")).count(), 3);
+            assert_eq!(log.lines().filter(|line| line.contains(" -D ")).count(), 3);
+            std::env::set_var("AIVPN_NAT66_TEST_FAIL", "1");
+            assert!(apply_nat66_rules("testtun", "fd10:cafe::/48").is_err());
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let nft = directory.path().join("nft");
+        std::fs::write(
+            &nft,
+            "#!/bin/sh\nif [ \"$1\" = -f ]; then cat >/dev/null; exit 1; fi\nexit 0\n",
+        )
+        .unwrap();
+        let ip6tables = directory.path().join("ip6tables");
+        std::fs::write(&ip6tables, "#!/bin/sh\necho \"$*\" >> \"$AIVPN_NAT66_TEST_LOG\"\ncase \"$*\" in *' -C '*) exit 1;; esac\n[ -z \"$AIVPN_NAT66_TEST_FAIL\" ]\n").unwrap();
+        for path in [&nft, &ip6tables] {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let result = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "nat::nat66_fallback_tests::nft_failure_uses_ip6tables_and_cleans_both_backends",
+                "--nocapture",
+            ])
+            .env("AIVPN_NAT66_TEST_CHILD", "1")
+            .env("AIVPN_NAT66_TEST_LOG", directory.path().join("commands"))
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    directory.path().display(),
+                    std::env::var("PATH").unwrap()
+                ),
+            )
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{} {}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
     }
 }

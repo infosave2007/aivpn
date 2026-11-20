@@ -55,11 +55,12 @@ impl Gateway {
             .map(|_| ())
     }
 
-    pub(crate) fn build_inner_packets(
+    pub(super) fn build_inner_packets(
         mdh: &[u8],
         kind: InnerType,
         payload: &[u8],
         session: &Arc<parking_lot::Mutex<Session>>,
+        padding: Option<super::downlink_pacing::DataPadding<'_>>,
     ) -> Result<(std::net::SocketAddr, bool, Vec<Vec<u8>>)> {
         let (kind, pieces) = if payload.len() > aivpn_common::fragment::FRAGMENT_DATA_SIZE {
             (
@@ -101,14 +102,19 @@ impl Gateway {
                 )
             };
             inner_payload.extend_from_slice(&encoded);
-            let base = mdh.len()
+            let base = mask
+                .as_ref()
+                .map(|mask| mask.packet_framing(mdh.len()).prefix_len())
+                .unwrap_or(TAG_SIZE)
+                + mdh.len()
                 + crypto::session_payload_overhead(&keys)
                 + 2
                 + inner_payload.len()
                 + crypto::POLY1305_TAG_SIZE;
-            let pad_len = match mask.as_ref() {
-                Some(mask) => mask.wire_padding(base, 16, 19)?,
-                None => 16,
+            let pad_len = match (mask.as_ref(), padding.as_ref()) {
+                (Some(mask), Some(padding)) => padding.calculate(mask, base)?,
+                (Some(mask), None) => mask.wire_padding(base, 16, 19)?,
+                (None, _) => 16,
             };
             let mut padded = Vec::with_capacity(2 + inner_payload.len() + pad_len as usize);
             padded.extend_from_slice(&pad_len.to_le_bytes());
@@ -152,7 +158,8 @@ impl Gateway {
         payload: &[u8],
         session: &Arc<parking_lot::Mutex<Session>>,
     ) -> Result<usize> {
-        let (address, stateful, packets) = Self::build_inner_packets(mdh, kind, payload, session)?;
+        let (address, stateful, packets) =
+            Self::build_inner_packets(mdh, kind, payload, session, None)?;
         let mut sent = 0;
         for (index, packet) in packets.into_iter().enumerate() {
             if index > 0 && index % 16 == 0 {
@@ -436,10 +443,56 @@ mod fragment_tests {
 #[cfg(test)]
 mod full_mtu_tests {
     use super::*;
+    use crate::gateway::ShapingLevel;
     use aivpn_common::client_wire::{decode_packet_with_layout, RecvWindow};
     use aivpn_common::fragment::Reassembler;
     use aivpn_common::mask::preset_masks;
     use std::time::Instant;
+
+    #[test]
+    fn fragmented_data_uses_the_downlink_padding_profile() {
+        let keys = crypto::derive_session_keys(&[1; 32], Some(&[2; 32]), &[3; 32]);
+        let mut mask = preset_masks::quic_https_v2();
+        let mut reverse = mask.clone();
+        reverse.padding_strategy = aivpn_common::mask::PaddingStrategy::Fixed { size: 128 };
+        mask.padding_strategy = aivpn_common::mask::PaddingStrategy::Fixed { size: 32 };
+        mask.reverse_profile = Some(Box::new(reverse));
+        let mut session = Session::new([7; 16], "127.0.0.1:9".parse().unwrap(), keys, [3; 32]);
+        session.mask = Some(mask.clone());
+        let session = Arc::new(parking_lot::Mutex::new(session));
+        let mdh = packet_mdh_bytes_for_mask(&mask);
+        let payload = vec![7; 1500];
+        let pieces = aivpn_common::fragment::split(InnerType::Data, &payload).unwrap();
+        for (level, expected_padding) in [
+            (ShapingLevel::Off, 0),
+            (ShapingLevel::Light, 96),
+            (ShapingLevel::Full, 128),
+            (ShapingLevel::Adaptive, 128),
+            (ShapingLevel::Strict, 128),
+        ] {
+            let (_, _, packets) = Gateway::build_inner_packets(
+                &mdh,
+                InnerType::Data,
+                &payload,
+                &session,
+                Some(super::super::downlink_pacing::DataPadding { level, plan: None }),
+            )
+            .unwrap();
+            for (packet, piece) in packets.iter().zip(&pieces) {
+                let base = mask.packet_framing(mdh.len()).prefix_len()
+                    + mdh.len()
+                    + 2
+                    + 4
+                    + piece.len()
+                    + crypto::POLY1305_TAG_SIZE;
+                assert_eq!(
+                    packet.len() - base,
+                    expected_padding,
+                    "Фрагмент потерял padding обратного профиля"
+                );
+            }
+        }
+    }
 
     #[test]
     fn full_mtu_downlink_reassembles_for_every_mask() {
@@ -454,14 +507,30 @@ mod full_mtu_tests {
             session.mask = Some(mask.clone());
             let session = Arc::new(parking_lot::Mutex::new(session));
             let mdh = packet_mdh_bytes_for_mask(&mask);
-            for length in [1280, 1346, 1500] {
+            for (level, length) in [
+                ShapingLevel::Off,
+                ShapingLevel::Light,
+                ShapingLevel::Full,
+                ShapingLevel::Adaptive,
+                ShapingLevel::Strict,
+            ]
+            .into_iter()
+            .flat_map(|level| [1280, 1346, 1500].map(|length| (level, length)))
+            {
                 let payload: Vec<_> = (0..length).map(|n| (n % 251) as u8).collect();
-                let (_, stateful, packets) =
-                    Gateway::build_inner_packets(&mdh, InnerType::Data, &payload, &session)
-                        .unwrap();
+                let (_, stateful, packets) = Gateway::build_inner_packets(
+                    &mdh,
+                    InnerType::Data,
+                    &payload,
+                    &session,
+                    Some(super::super::downlink_pacing::DataPadding { level, plan: None }),
+                )
+                .unwrap();
                 assert_eq!(stateful, aivpn_common::mask_io::needs_state(&mask));
                 let budget = if stateful {
                     aivpn_common::mask_io::MAX_QUIC_INNER
+                } else if aivpn_common::mask_io::uses_rtc(&mask) {
+                    aivpn_common::mask_io::rtc_inner_budget(&mask)
                 } else {
                     1380
                 };

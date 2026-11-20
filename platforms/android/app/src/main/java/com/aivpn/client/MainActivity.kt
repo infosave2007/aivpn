@@ -726,8 +726,10 @@ class MainActivity : AppCompatActivity() {
                 SecureStorage.loadAllowedApps(this@MainActivity).size to
                     SecureStorage.loadExcludedDomains(this@MainActivity).size
             }
+            val enabled = withContext(Dispatchers.IO) { SecureStorage.loadSplitEnabled(this@MainActivity) }
             val (appCount, siteCount) = counts
             binding.textSplitTunnelHint.text = when {
+                !enabled -> getString(R.string.split_tunnel_disabled)
                 appCount > 0 && siteCount > 0 -> getString(R.string.split_tunnel_hint_combined,
                     getString(R.string.split_tunnel_hint_apps, appCount),
                     getString(R.string.split_tunnel_hint_sites, siteCount))
@@ -1391,6 +1393,22 @@ class MainActivity : AppCompatActivity() {
                 add(getString(R.string.ui_session_received, binding.sessionStats.receivedText()))
                 add(getString(R.string.ui_session_sent, binding.sessionStats.sentText()))
                 add(quality)
+                val assessment = runCatching {
+                    org.json.JSONObject(AivpnJni.getMaskAssessment())
+                }.getOrNull()
+                if (assessment == null) {
+                    add(getString(R.string.mask_model_unknown))
+                } else {
+                    val mse = assessment.getDouble("mse")
+                    val status = when {
+                        mse > assessment.getDouble("compromised") -> R.string.mask_model_deviation_high
+                        mse > assessment.getDouble("warning") -> R.string.mask_model_deviation
+                        else -> R.string.mask_model_in_range
+                    }
+                    val kind = if (assessment.optInt("model_kind") == 1) R.string.mask_model_trained else R.string.mask_model_projection
+                    add(getString(R.string.mask_model_measurement, getString(status), mse,
+                        assessment.getInt("samples"), getString(kind)))
+                }
                 if (adaptiveLevel() >= 2) add(getString(R.string.fec_badge))
             }
         }.joinToString("\n")
@@ -1417,7 +1435,8 @@ class MainActivity : AppCompatActivity() {
             } else {
                 getString(R.string.bench_result, result.optDouble("latency_p50_ms").toInt(),
                     result.optDouble("latency_p95_ms").toInt(), result.optDouble("packet_loss_pct"), result.optInt("quality_score")) +
-                    "\n" + getString(R.string.bench_speed, result.optDouble("throughput_up_kbps"), result.optDouble("throughput_down_kbps"))
+                    "\n" + getString(R.string.bench_speed, result.optDouble("throughput_up_kbps"), result.optDouble("throughput_down_kbps")) +
+                    if (result.optBoolean("throughput_limited", true) || result.optString("throughput_method") != "data") "\n" + getString(R.string.bench_limited) else ""
             }
             MaterialAlertDialogBuilder(this@MainActivity).setTitle(R.string.diagnostics)
                 .setMessage(message).setPositiveButton(android.R.string.ok, null).show()
@@ -1522,6 +1541,11 @@ class MainActivity : AppCompatActivity() {
             "webrtc_yandex_telemost_v1",
             "webrtc_vk_teams_v1",
             "webrtc_sberjazz_v1",
+            "avito_api_v1",
+            "sber_salute_v1",
+            "telegram_calls_v1",
+            "vk_video_v1",
+            "whatsapp_voip_v1",
         )
     }
 }

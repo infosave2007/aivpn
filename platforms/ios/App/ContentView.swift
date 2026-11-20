@@ -105,28 +105,25 @@ private struct KeyEditSheet: View {
     }
 
     var body: some View {
-        NavigationStack {
+        CompatibleNavigationView {
             Form {
                 Section {
                     TextField(loc.t("key_name"), text: $name)
-                        .autocorrectionDisabled()
-                    TextField(loc.t("enter_key"), text: $value, axis: .vertical)
-                        .autocorrectionDisabled()
+                        .disableAutocorrection(true)
+                    CompatibleMultilineTextField(loc.t("enter_key"), text: $value, lines: 3...6)
+                        .disableAutocorrection(true)
                         .textInputAutocapitalization(.never)
-                        .lineLimit(3...6)
                 }
                 Section(header: Text("mTLS")) {
-                    TextField(loc.t("mtls_cert_hint"), text: $mtlsCert, axis: .vertical)
-                        .autocorrectionDisabled()
+                    CompatibleMultilineTextField(loc.t("mtls_cert_hint"), text: $mtlsCert, lines: 1...4)
+                        .disableAutocorrection(true)
                         .textInputAutocapitalization(.never)
-                        .lineLimit(1...4)
                         .font(.system(size: 12, design: .monospaced))
                 }
                 Section(header: Text(loc.t("server_signing_key"))) {
-                    TextField(loc.t("server_signing_key_hint"), text: $serverSigningKey, axis: .vertical)
-                        .autocorrectionDisabled()
+                    CompatibleMultilineTextField(loc.t("server_signing_key_hint"), text: $serverSigningKey, lines: 1...3)
+                        .disableAutocorrection(true)
                         .textInputAutocapitalization(.never)
-                        .lineLimit(1...3)
                         .font(.system(size: 12, design: .monospaced))
                 }
                 if let e = error {
@@ -211,7 +208,7 @@ private struct RecordingSection: View {
                 HStack {
                     TextField(loc.t("record_service_name"), text: $serviceName)
                         .textFieldStyle(.roundedBorder)
-                        .autocorrectionDisabled()
+                        .disableAutocorrection(true)
                     Button(loc.t("record_new_mask")) {
                         vpn.startMaskRecording(serviceName: serviceName)
                     }
@@ -327,7 +324,7 @@ struct ContentView: View {
     @State private var showInstallWizard: Bool = false
 
     var body: some View {
-        NavigationStack {
+        CompatibleNavigationView {
             VStack(spacing: 0) {
                 // Fixed header — status ring stays visible even when user scrolls
                 statusCard
@@ -404,8 +401,7 @@ struct ContentView: View {
                     }
                 }
             }
-            .toolbarBackground(Color(.secondarySystemBackground), for: .navigationBar)
-            .toolbarBackground(.visible, for: .navigationBar)
+            .compatibleNavigationBarBackground(Color(.secondarySystemBackground))
         }
         .sheet(isPresented: $showAddKey) {
             KeyEditSheet(existingKey: nil,
@@ -486,7 +482,7 @@ struct ContentView: View {
                 .environmentObject(loc)
         }
         .sheet(isPresented: $showDiagnostics) {
-            NavigationStack {
+            CompatibleNavigationView {
                 VStack(spacing: 20) {
                     if vpn.isBenchRunning {
                         ProgressView(loc.t("bench_running"))
@@ -501,6 +497,9 @@ struct ContentView: View {
                                 .font(.subheadline).foregroundColor(.secondary)
                             Text("↑ \(String(format: "%.0f", result.uploadKbps))  ↓ \(String(format: "%.0f", result.downloadKbps)) \(loc.t("bench_kbps"))")
                                 .font(.subheadline).foregroundColor(.secondary)
+                            if result.throughputLimited {
+                                Text(loc.t("bench_limited")).font(.caption).foregroundColor(.secondary)
+                            }
                             Text(result.serverAddr)
                                 .font(.caption2).foregroundColor(.secondary)
                         }

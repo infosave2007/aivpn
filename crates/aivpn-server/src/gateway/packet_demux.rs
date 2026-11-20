@@ -155,13 +155,14 @@ impl super::Gateway {
         let worker_count = Self::receive_worker_count();
         let queue_depth = 4096;
         let mut worker_txs = Vec::with_capacity(worker_count);
+        let mut workers = tokio::task::JoinSet::new();
 
         for worker_id in 0..worker_count {
             let (tx, mut rx) = mpsc::channel::<QueuedPacket>(queue_depth);
             worker_txs.push(tx);
 
             let gw = gateway.clone();
-            tokio::spawn(async move {
+            workers.spawn(async move {
                 while let Some(packet) = rx.recv().await {
                     let result = if packet.masked {
                         gw.handle_decoded_packet(super::mask_socket::DecodedPacket {

@@ -6,6 +6,93 @@
 
 use super::*;
 
+fn prepare_mask_rotation(
+    catalog: &MaskCatalog,
+    neural: &NeuralResonanceModule,
+    mask_id: &str,
+) -> Option<MaskProfile> {
+    let replacement = catalog.mark_compromised_with_fallback(mask_id)?;
+    neural.record_rotation(mask_id);
+    Some(replacement)
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+
+    #[test]
+    fn missing_fallback_does_not_start_rotation_cooldown() {
+        let catalog = MaskCatalog::new();
+        let neural = NeuralResonanceModule::new(Default::default()).unwrap();
+        let first = aivpn_common::mask::preset_masks::quic_https_v2();
+        catalog.register_mask(first.clone());
+        assert!(prepare_mask_rotation(&catalog, &neural, &first.mask_id).is_none());
+        assert!(neural.can_rotate(&first.mask_id));
+        catalog.register_mask(aivpn_common::mask::preset_masks::webrtc_zoom_v3());
+        assert!(prepare_mask_rotation(&catalog, &neural, &first.mask_id).is_some());
+        assert!(!neural.can_rotate(&first.mask_id));
+    }
+
+    #[tokio::test]
+    async fn cancelled_gateway_releases_socket_and_session_state() {
+        let directory = tempfile::tempdir().unwrap();
+        let mask_dir = directory.path().join("masks");
+        std::fs::create_dir(&mask_dir).unwrap();
+        let mut mask = aivpn_common::mask::preset_masks::webrtc_zoom_v3();
+        crate::test_masks::sign(&mut mask, &ed25519_dalek::SigningKey::from_bytes(&[71; 32]));
+        std::fs::write(
+            mask_dir.join(format!("{}.json", mask.mask_id)),
+            serde_json::to_vec(&mask).unwrap(),
+        )
+        .unwrap();
+        let database = Arc::new(
+            ClientDatabase::load(
+                &directory.path().join("clients.json"),
+                aivpn_common::network_config::VpnNetworkConfig::default(),
+            )
+            .unwrap(),
+        );
+        let reserved = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let address = reserved.local_addr().unwrap();
+        drop(reserved);
+        for _ in 0..32 {
+            let gateway = Gateway::new(GatewayConfig {
+                listen_addr: address.to_string(),
+                mask_dir: mask_dir.clone(),
+                mask_signing_key: Some([71; 32]),
+                client_db: Some(database.clone()),
+                enable_nat: false,
+                enable_neural: true,
+                ..Default::default()
+            })
+            .unwrap();
+            let sessions = Arc::downgrade(&gateway.session_manager);
+            let task = tokio::spawn(gateway.run());
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    assert!(!task.is_finished(), "Шлюз завершился до открытия UDP");
+                    if UdpSocket::bind(address).await.is_err() {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            task.abort();
+            assert!(task.await.unwrap_err().is_cancelled());
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while sessions.upgrade().is_some() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("Задачи удерживают состояние остановленного шлюза");
+            assert!(UdpSocket::bind(address).await.is_ok(), "UDP не освобожден");
+        }
+    }
+}
+
 // Cadences and entry TTLs for the periodic background loops spawned by `run`
 // below. Named here so each interval's intent is visible at a glance — several
 // share a numeric value (the two 5-minute sweeps) yet are independent knobs.
@@ -27,6 +114,7 @@ const BOOTSTRAP_EPOCH_CHECK_INTERVAL: Duration = Duration::from_secs(3600);
 impl super::Gateway {
     /// Start the gateway
     pub async fn run(mut self) -> Result<()> {
+        let mut background = tokio::task::JoinSet::new();
         info!("Starting AIVPN Gateway on {}", self.config.listen_addr);
         info!(
             "Лимиты UDP на IP: до admission {} pps, активный QUIC {} pps",
@@ -34,7 +122,8 @@ impl super::Gateway {
         );
 
         // Start eBPF observer (no-op when xdp_prog.o is absent)
-        Arc::new(EbpfObserver::new(self.event_bus.clone())).start();
+        let observer = EbpfObserver::new(self.event_bus.clone());
+        background.spawn(async move { observer.run_loop().await });
 
         // Create NAT forwarder (requires root — deferred from constructor for testability)
         if self.config.enable_nat {
@@ -184,7 +273,7 @@ impl super::Gateway {
             #[cfg(feature = "neural")]
             let dpi_gate = self.dpi_gate.clone();
 
-            tokio::spawn(async move {
+            background.spawn(async move {
                 Self::resonance_check_loop(
                     neural,
                     sessions,
@@ -227,7 +316,7 @@ impl super::Gateway {
 
                 // Spawn dedicated TUN writer task — owns the DeviceWriter, no Mutex needed
                 if let Some(tun_writer) = nat.take_writer().await {
-                    tokio::spawn(async move {
+                    background.spawn(async move {
                         Self::tun_write_loop(tun_writer, tun_rx).await;
                     });
                     info!("TUN write loop spawned (channel-based, no Mutex)");
@@ -251,7 +340,7 @@ impl super::Gateway {
                 let site_data_rx = self.site_data_rx.take();
                 let network = self.config.network_config.clone();
                 let kernel_accel = self.kernel_accel.clone();
-                tokio::spawn(async move {
+                background.spawn(async move {
                     Self::tun_read_loop(
                         tun_reader,
                         tun_tx,
@@ -312,7 +401,7 @@ impl super::Gateway {
             let masked_exit_addr_cleanup = self.masked_exit_addr.clone();
             let pool_dialer_cleanup = self.pool_dialer.clone();
             let server_config_path_cleanup = self.config.server_config_path.clone();
-            tokio::spawn(async move {
+            background.spawn(async move {
                 loop {
                     tokio::time::sleep(RECORDING_FLUSH_INTERVAL).await;
                     if let Some(ref rec) = recorder {
@@ -459,6 +548,11 @@ impl super::Gateway {
                             let recording = recorder.as_ref().is_some_and(|r| r.is_recording(&sid));
                             input.userspace_rx |= neural_enabled_cleanup || recording;
                             input.userspace_tx |= recording || shaping_cleanup != ShapingLevel::Off;
+                            let diagnostic = sess.diagnostic_state.as_ref().is_some_and(|state| {
+                                state.active(&state.request.id, Instant::now())
+                            });
+                            input.userspace_rx |= diagnostic;
+                            input.userspace_tx |= diagnostic;
                             let _ =
                                 kernel_maintain(ka, &mut sess, tag_offset, mdh_len, &input, false);
                             let (rx, tx) = harvest_kernel_counters(ka, &mut sess);
@@ -540,6 +634,11 @@ impl super::Gateway {
                             kernel_clear_offload(ka, session_id);
                         }
                     }
+                    // Переподключение может удалить прежнюю сессию внутри
+                    // SessionManager. Проверяем владельцев, а не только этот список.
+                    neural.lock().retain_sessions(|id| sessions.get_session(id).is_some());
+                    #[cfg(feature = "neural")]
+                    dpi_gate_cleanup.retain_sessions(|id| sessions.get_session(id).is_some());
                     // Stop active recordings for removed sessions
                     if let Some(ref rec) = recorder {
                         let store = rec.store();
@@ -642,7 +741,7 @@ impl super::Gateway {
             let mask_feedback = self.mask_feedback.clone();
             let metrics_sweep = self.metrics.clone();
             let sessions_sweep = self.session_manager.clone();
-            tokio::spawn(async move {
+            background.spawn(async move {
                 loop {
                     tokio::time::sleep(BACKGROUND_SWEEP_INTERVAL).await;
                     let now_hour = current_unix_secs() / 3600;
@@ -686,7 +785,7 @@ impl super::Gateway {
             // client's multi-length decode fallback — permanently stranded the
             // tunnel on the first rekey.
             let fallback_mdh = self.mask_catalog.packet_mdh_bytes();
-            tokio::spawn(async move {
+            background.spawn(async move {
                 // Two cadences share one task: rekey INITIATION every 30 s
                 // (15 × 2 s ticks), and a fast retransmit sweep for pending
                 // rekeys every 2 s tick. KeyRotate is one-shot UDP; if it (or
@@ -736,7 +835,7 @@ impl super::Gateway {
         // Spawn client DB stats flush task (persist traffic stats every 5 min)
         if let Some(ref db) = self.client_db {
             let db = db.clone();
-            tokio::spawn(async move {
+            background.spawn(async move {
                 loop {
                     tokio::time::sleep(CLIENT_DB_STATS_FLUSH_INTERVAL).await;
                     db.flush_stats();
@@ -754,7 +853,7 @@ impl super::Gateway {
             // sibling process wrote it) — see `exit_route_cache`'s doc
             // comment for the full invalidation policy.
             let exit_route_cache = self.exit_route_cache.clone();
-            tokio::spawn(async move {
+            background.spawn(async move {
                 loop {
                     tokio::time::sleep(CLIENT_DB_RELOAD_INTERVAL).await;
                     if db.reload_if_changed() {
@@ -777,7 +876,7 @@ impl super::Gateway {
             let bootstrap_masks = self.config.bootstrap_masks.clone();
             let bootstrap_publish = self.config.bootstrap_publish.clone();
             let mut last_epoch = bootstrap_epoch(current_unix_secs());
-            tokio::spawn(async move {
+            background.spawn(async move {
                 let signing_key = derive_server_signing_key(&server_private_key);
                 loop {
                     tokio::time::sleep(BOOTSTRAP_EPOCH_CHECK_INTERVAL).await;
@@ -812,9 +911,52 @@ impl super::Gateway {
         // Use session-aware receive sharding: preserve ordering within one
         // session, but allow different sessions to make progress in parallel.
         let gateway = Arc::new(self);
+        background.spawn(gateway.clone().watch_mask_overrides());
+        background.spawn(gateway.clone().retry_mask_updates());
         Self::process_packets_concurrent(gateway).await?;
 
         Ok(())
+    }
+
+    pub(super) async fn retry_mask_updates(self: Arc<Self>) {
+        let mut tick = tokio::time::interval(Duration::from_millis(250));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tick.tick().await;
+            let sessions: Vec<_> = self
+                .session_manager
+                .iter_sessions()
+                .map(|entry| entry.value().clone())
+                .collect();
+            for session in sessions {
+                let expired = session
+                    .lock()
+                    .mask_update_expired(std::time::Instant::now());
+                if expired {
+                    let _ = self
+                        .send_control_message(&ControlPayload::Shutdown { reason: 0 }, &session)
+                        .await;
+                    let id = session.lock().session_id;
+                    self.session_manager.remove_session(&id);
+                    warn!("Сессия закрыта: смена маски не подтверждена за 60 секунд");
+                    continue;
+                }
+                match self
+                    .session_manager
+                    .retry_mask_update(&session, std::time::Instant::now())
+                {
+                    Ok(Some((packets, address))) => {
+                        if let Some(socket) = self.udp_socket.as_ref() {
+                            if let Err(error) = socket.send_packets_to(&packets, address).await {
+                                debug!("Повтор обновления маски: {}", error);
+                            }
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(error) => warn!("Не удалось подготовить повтор маски: {}", error),
+                }
+            }
+        }
     }
 
     /// Background task: periodic neural resonance checks (Patent 1)
@@ -839,11 +981,21 @@ impl super::Gateway {
             // full profile (not just the id) lets the loop bake an encoder
             // on-demand for per-session bootstrap/polymorphic masks whose dynamic
             // mask_id is absent from the static startup-baked encoders.
-            let session_checks: Vec<([u8; 16], MaskProfile)> = sessions
+            let session_checks: Vec<([u8; 16], MaskProfile, u64, u64)> = sessions
                 .iter_sessions()
                 .filter_map(|entry| {
                     let sess = entry.value().lock();
-                    sess.mask.as_ref().map(|m| (sess.session_id, m.clone()))
+                    sess.mask
+                        .as_ref()
+                        .filter(|_| sess.pending_mask.is_none())
+                        .map(|m| {
+                            (
+                                sess.session_id,
+                                m.clone(),
+                                sess.mask_receipt.map_or(0, |receipt| receipt.generation),
+                                sess.mask_revision,
+                            )
+                        })
                 })
                 .collect();
 
@@ -860,10 +1012,11 @@ impl super::Gateway {
                 MaskProfile,
             )> = Vec::new();
 
+            let mut assessments = Vec::new();
             {
                 let mut neural_guard = neural.lock();
 
-                for (session_id, mask) in &session_checks {
+                for (session_id, mask, generation, revision) in &session_checks {
                     let mask_id = &mask.mask_id;
                     // Bake an encoder for this session's active mask if the static
                     // startup set didn't cover it (bootstrap/polymorphic variants).
@@ -871,8 +1024,16 @@ impl super::Gateway {
                     // (neural inactive for that mask) — ignore that error.
                     let _ = neural_guard.ensure_encoder(mask);
                     // Check neural resonance (Patent 1: Signal Reconstruction Resonance)
-                    match neural_guard.check_resonance(*session_id, mask_id) {
+                    match neural_guard.check_mask_resonance(
+                        *session_id,
+                        mask,
+                        *generation,
+                        *revision,
+                    ) {
                         Ok(result) => {
+                            if let Some(value) = result.assessment.clone() {
+                                assessments.push((*session_id, value));
+                            }
                             debug!(
                                 "neural check: mask='{}' status={:?} mse={:.6} msg={:?}",
                                 mask_id, result.status, result.mse, result.message
@@ -894,12 +1055,10 @@ impl super::Gateway {
                                         mask_id, result.mse
                                     );
 
-                                    neural_guard.record_rotation(mask_id);
-
                                     // H1: atomically check-then-mark so a
                                     // single-mask catalog is never emptied.
                                     if let Some(new_mask) =
-                                        catalog.mark_compromised_with_fallback(mask_id)
+                                        prepare_mask_rotation(&catalog, &neural_guard, mask_id)
                                     {
                                         info!(
                                             "Auto-rotating to mask '{}' ({} masks remaining)",
@@ -988,10 +1147,10 @@ impl super::Gateway {
                                 "ML-DPI gate: mask '{}' reads as tunnel (p={:.3}) — triggering rotation (R2 Phase D)",
                                 mask_id, verdict.tunnel_prob
                             );
-                            neural_guard.record_rotation(mask_id);
                             // H1: atomically check-then-mark so a
                             // single-mask catalog is never emptied.
-                            if let Some(new_mask) = catalog.mark_compromised_with_fallback(mask_id)
+                            if let Some(new_mask) =
+                                prepare_mask_rotation(&catalog, &neural_guard, mask_id)
                             {
                                 info!(
                                     "ML-DPI-triggered rotation to mask '{}' ({} masks remaining)",
@@ -1030,8 +1189,9 @@ impl super::Gateway {
                         metrics.record_dpi_attack();
                         // H1: atomically check-then-mark so a single-mask
                         // catalog is never emptied.
-                        if let Some(new_mask) = catalog.mark_compromised_with_fallback(mask_id) {
-                            neural_guard.record_rotation(mask_id);
+                        if let Some(new_mask) =
+                            prepare_mask_rotation(&catalog, &neural_guard, mask_id)
+                        {
                             neural_guard.clear_mask_anomaly(mask_id);
                             info!("Anomaly-triggered rotation to mask '{}'", new_mask.mask_id);
                             if let Some(session) = sessions.get_session(session_id) {
@@ -1052,6 +1212,34 @@ impl super::Gateway {
                     }
                 }
             } // neural_guard dropped here
+
+            for (id, value) in assessments {
+                if let Some(session) = sessions.get_session(&id) {
+                    let mdh = {
+                        let state = session.lock();
+                        if !state.client_packet_features.is_some_and(|features| {
+                            features & aivpn_common::mask_assessment::FEATURE != 0
+                        }) || state.mask_receipt.map_or(0, |receipt| receipt.generation)
+                            != value.generation
+                        {
+                            continue;
+                        }
+                        state
+                            .mask
+                            .as_ref()
+                            .map(super::mask_catalog::packet_mdh_bytes_for_mask)
+                    };
+                    if let Some(mdh) = mdh {
+                        let _ = Self::send_control_message_via(
+                            &socket,
+                            &mdh,
+                            &ControlPayload::MaskAssessment(value),
+                            &session,
+                        )
+                        .await;
+                    }
+                }
+            }
 
             // Send collected MaskUpdate packets (async, safe now)
             for (packet, client_addr, session_id, new_mask) in pending_sends {

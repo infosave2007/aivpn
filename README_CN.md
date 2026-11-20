@@ -35,7 +35,7 @@ crates/aivpn-server/     — 仅 Linux VPN 网关和管理 CLI
 crates/aivpn-client/     — 跨平台 VPN 客户端（Linux / macOS / Windows）
 crates/aivpn-android-core/ — Android JNI 桥接（Rust → Kotlin via C FFI）
 crates/aivpn-ios-core/   — iOS Rust 静态库（C FFI），链接至 PacketTunnelProvider
-crates/aivpn-windows/    — Windows GUI（egui/eframe 0.31，管理 aivpn-client.exe 子进程）
+crates/aivpn-windows/    — Windows GUI（egui/eframe 0.31，包含命令行和服务模式）
 crates/aivpn-linux/      — Linux GUI（iced 0.13，封装 aivpn-client 子进程）
 platforms/android/       — Android Kotlin 应用（MVVM：MainViewModel + RecyclerView）
 platforms/ios/           — iOS SwiftUI 应用 + NetworkExtension PacketTunnelProvider
@@ -291,11 +291,11 @@ sudo ./aivpn-client -k "aivpn://..."
 
 **安装程序（推荐）：** 下载 `aivpn-windows-installer.exe`，以管理员身份运行，从开始菜单启动 **AIVPN**。
 
-**便携版：** 解压 `aivpn-windows-package.zip`（包含 `aivpn.exe`、`aivpn-client.exe`、`wintun.dll`），以管理员身份运行 `aivpn.exe`。
+**便携版：** 从 `aivpn-windows-gui.zip` 解压并运行内置 Wintun 的 `aivpn.exe`。连接 VPN 时，GUI 会按需请求管理员权限。
 
 命令行（PowerShell，管理员权限）：
 ```
-.\aivpn-client.exe -k "aivpn://..."
+.\aivpn.exe cli -k "aivpn://..."
 ```
 
 > 创建 Wintun 网络适配器需要管理员权限。

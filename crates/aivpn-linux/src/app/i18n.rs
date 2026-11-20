@@ -19,6 +19,9 @@ pub(super) fn t<'a>(lang: &str, key: &'a str) -> &'a str {
         // 3c: bootstrap-fallback indicator (client fell back to the
         // built-in default mask after repeated dead handshakes).
         "Using built-in mask (fallback)" => "Встроенная маска (аварийный режим)",
+        "Speed is limited by the test method; link capacity may be higher." => {
+            "Скорость ограничена методом теста; пропускная способность канала может быть выше."
+        }
         "Running diagnostics..." => "Диагностика...",
         "Adaptive mode" => "Адаптивный режим",
         "Mask profile" => "Маска трафика",
@@ -30,6 +33,17 @@ pub(super) fn t<'a>(lang: &str, key: &'a str) -> &'a str {
         "Receive mask hints for my region" => "Получать подсказки масок для моего региона",
         "Country code" => "Код страны",
         "Kill switch" => "Блокировать трафик при потере VPN",
+        "Kill switch stayed on after the client exited unexpectedly. Traffic stays blocked until you remove it." => {
+            "Блокировка осталась после неожиданного выхода клиента. Трафик закрыт, пока вы сами ее не снимите."
+        }
+        "Remove kill switch" => "Снять блокировку",
+        "Removing kill switch..." => "Снимаем блокировку...",
+        "Kill switch is still on. Removal did not finish." => {
+            "Блокировка все еще включена. Снятие не завершилось."
+        }
+        "Cannot remove the kill switch while another client is running." => {
+            "Нельзя снять блокировку, пока запущен другой клиент."
+        }
         "Start on login" => "Автозапуск",
         "DNS proxy" => "DNS прокси",
         "Exclude routes" => "Исключить маршруты",

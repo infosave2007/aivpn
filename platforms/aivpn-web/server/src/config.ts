@@ -1,4 +1,5 @@
 import { z } from 'zod'
+import { validIssuer } from './auth/oidc-discovery'
 
 const envSchema = z.object({
   DATABASE_URL: z.string().default('file:./data/aivpn-web.db'),
@@ -22,7 +23,7 @@ const envSchema = z.object({
   DEV_MODE: z
     .string()
     .transform((v) => v === 'true' || v === '1')
-    .default('false'),
+    .default(false),
   SVELTEKIT_DEV_PORT: z.coerce.number().int().default(5173),
   // Path to built SvelteKit client, relative to the dist/ bundle directory
   CLIENT_BUILD_DIR: z.string().default('client/build'),
@@ -40,7 +41,7 @@ const envSchema = z.object({
   // When absent, a random password is generated and printed once to the console.
   AIVPN_WEB_ADMIN_PASSWORD: z.string().min(8).optional(),
   // OIDC/SSO — optional; mode 'disabled' (default) means no SSO button
-  OIDC_ISSUER: z.string().optional(),
+  OIDC_ISSUER: z.string().refine(validIssuer, 'OIDC_ISSUER must be an HTTPS URL without credentials, query or fragment').optional(),
   OIDC_CLIENT_ID: z.string().optional(),
   OIDC_CLIENT_SECRET: z.string().optional(),
   OIDC_MODE: z.enum(['disabled', 'enabled', 'exclusive']).default('disabled'),
@@ -57,7 +58,7 @@ const envSchema = z.object({
   AIVPN_WEB_TRUST_PROXY: z
     .string()
     .transform((v) => v === 'true' || v === '1')
-    .default('false'),
+    .default(false),
   // Rate limit windows (ms)
   AUTH_RATE_WINDOW_MS: z.coerce.number().default(60_000),
   AUTH_RATE_MAX: z.coerce.number().default(10),

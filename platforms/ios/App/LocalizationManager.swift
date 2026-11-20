@@ -89,6 +89,7 @@ class LocalizationManager: ObservableObject {
         "diagnostics":         ["en": "Diagnostics",            "ru": "Диагностика"],
         "run_benchmark":       ["en": "Run Benchmark",          "ru": "Запустить тест"],
         "bench_running":       ["en": "Running benchmark…",     "ru": "Тест запущен…"],
+        "bench_limited": ["en": "Speed is limited by the test method; link capacity may be higher.", "ru": "Скорость ограничена методом теста; пропускная способность канала может быть выше."],
         "bench_idle":          ["en": "Tap to measure latency and connection quality.",
                                 "ru": "Нажмите для измерения задержки и качества соединения."],
         "mtls_cert_hint":      ["en": "mTLS cert (base64, leave empty to disable)",
@@ -105,7 +106,9 @@ class LocalizationManager: ObservableObject {
         "split_domains": ["en": "Excluded domains", "ru": "Исключенные домены"],
         "split_domain_invalid": ["en": "Invalid or duplicate domain, or the 64-domain limit was reached", "ru": "Неверный или повторный домен либо достигнут предел в 64 домена"],
         "split_domain_note": ["en": "Addresses are resolved when connecting. CDN addresses may change; reconnect to refresh them.", "ru": "Адреса определяются при подключении. Адреса CDN могут меняться; для обновления переподключитесь."],
-        "split_tunnel_title":  ["en": "Split Tunnel",   "ru": "Split Tunnel"],
+        "split_enabled": ["en": "Enable split tunneling", "ru": "Включить split"],
+            "split_switch_note": ["en": "Off - all traffic uses VPN. Lists are retained; change while disconnected.", "ru": "Выключено - весь трафик через VPN. Списки сохраняются; изменение при отключенном VPN."],
+            "split_tunnel_title":  ["en": "Split Tunnel",   "ru": "Split Tunnel"],
         "open_settings":       ["en": "Open Settings",  "ru": "Открыть Настройки"],
         "error_permission_denied": [
             "en": "VPN permission denied. Tap Retry or open Settings → VPN to allow.",

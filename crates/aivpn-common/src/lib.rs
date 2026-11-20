@@ -7,6 +7,8 @@ pub mod client_wire;
 pub mod crypto;
 pub mod diagnostics;
 pub mod dns_candidates;
+#[cfg(feature = "transport")]
+pub mod dns_exchange;
 pub mod error;
 pub mod event_log;
 pub mod fec;
@@ -15,7 +17,9 @@ pub mod handshake_retry;
 pub mod identity_file;
 pub mod local_admin;
 pub mod mask;
+pub mod mask_assessment;
 pub mod mask_state;
+pub mod mask_transition;
 pub mod mimic_protocol;
 pub mod network_config;
 pub mod protocol;

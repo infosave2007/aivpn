@@ -1,13 +1,18 @@
-#![cfg_attr(windows, windows_subsystem = "windows")]
+#![cfg_attr(all(windows, not(test)), windows_subsystem = "windows")]
 
 mod admin;
 #[cfg(windows)]
 mod admin_ops;
 #[cfg(windows)]
+mod app_routing;
+#[cfg(windows)]
 mod app_update;
 mod appearance;
 #[cfg(any(windows, test))]
 mod assets;
+mod client_log;
+#[cfg(windows)]
+mod desktop_session;
 mod install_wizard;
 mod key_storage;
 mod localization;
@@ -30,18 +35,21 @@ mod vpn_manager;
 fn main() {}
 
 #[cfg(windows)]
-fn main() {
+fn main() -> std::process::ExitCode {
+    if let Some(code) = aivpn_client::entry::dispatch(aivpn_client::entry::DefaultMode::Gui) {
+        return code;
+    }
+    run_gui()
+}
+
+#[cfg(windows)]
+fn run_gui() -> std::process::ExitCode {
     use eframe::egui;
     use localization::AppSettings;
 
-    // LOW-2: single-instance guard. The --elevated-connect hop must ignore
-    // the "already running" answer — its non-elevated parent is still alive
-    // for a moment during the handoff — but it still claims a mutex handle so
-    // the guard stays armed after the parent exits.
-    let is_elevated_hop = std::env::args().any(|a| a == "--elevated-connect");
-    if claim_single_instance_mutex() && !is_elevated_hop {
+    if claim_single_instance_mutex() {
         focus_existing_instance();
-        return;
+        return std::process::ExitCode::SUCCESS;
     }
 
     let settings = AppSettings::load();
@@ -86,7 +94,9 @@ fn main() {
         if let Some(p) = startup_log {
             let _ = std::fs::write(p, format!("startup error: {e}\n"));
         }
+        return std::process::ExitCode::FAILURE;
     }
+    std::process::ExitCode::SUCCESS
 }
 
 // ── Tray handles ───────────────────────────────────────────────────────────
@@ -110,10 +120,7 @@ use key_storage::KeyStorage;
 #[cfg(windows)]
 use localization::{t, AppSettings};
 #[cfg(windows)]
-use platform_win::{
-    bring_window_to_front, claim_single_instance_mutex, focus_existing_instance, is_elevated,
-    relaunch_elevated,
-};
+use platform_win::{bring_window_to_front, claim_single_instance_mutex, focus_existing_instance};
 #[cfg(windows)]
 use std::time::Instant;
 #[cfg(windows)]
@@ -133,6 +140,8 @@ const ADMIN_SETTINGS_CONFIRM_TIMEOUT: std::time::Duration = std::time::Duration:
 
 #[cfg(windows)]
 struct AivpnApp {
+    app_routing: app_routing::Panel,
+    desktop_session: desktop_session::Session,
     settings: AppSettings,
     page: appearance::Page,
     applied_dark: Option<bool>,
@@ -184,7 +193,6 @@ struct AivpnApp {
     /// True when this instance was launched via --elevated-connect (the
     /// self-relaunch-elevated hop): new() already started the connection, so
     /// the connect_on_startup hook must not fire on top of it (HIGH-1).
-    elevated_connect_hop: bool,
     tray_connected: Option<bool>,
     tray: Option<TrayHandles>,
     tray_show_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -411,6 +419,8 @@ impl AivpnApp {
     fn new(settings: AppSettings, ctx: &eframe::egui::Context) -> Self {
         let (admin_tx, admin_rx) = std::sync::mpsc::channel();
         let mut app = Self {
+            app_routing: app_routing::Panel::default(),
+            desktop_session: desktop_session::Session::default(),
             settings,
             page: appearance::Page::Home,
             applied_dark: None,
@@ -547,7 +557,6 @@ impl AivpnApp {
             ext_descriptor: aivpn_common::ui_ext::load_default(),
             ext_values: Vec::new(),
             ext_transport: None,
-            elevated_connect_hop: false,
             tray_connected: None,
             tray: None,
             tray_show_flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -564,23 +573,6 @@ impl AivpnApp {
         app.vpn
             .set_wake_callback(move || repaint_ctx.request_repaint());
 
-        // Continuation of a self-relaunch-elevated hop (see relaunch_elevated
-        // in do_connect()): this instance IS the elevated one now, launched
-        // solely to complete the full-tunnel connect the non-elevated
-        // instance couldn't. Select the same key by index and connect
-        // immediately — no user interaction needed, the original click
-        // already happened in the process that's now exited.
-        let args: Vec<String> = std::env::args().collect();
-        if let Some(pos) = args.iter().position(|a| a == "--elevated-connect") {
-            app.elevated_connect_hop = true;
-            if let Some(idx) = args.get(pos + 1).and_then(|s| s.parse::<usize>().ok()) {
-                if idx < app.keys.keys.len() {
-                    app.keys.selected = Some(idx);
-                    app.do_connect();
-                }
-            }
-        }
-
         app
     }
 
@@ -589,9 +581,6 @@ impl AivpnApp {
     /// already connecting (HIGH-1: the --elevated-connect session started in
     /// new() is in exactly that state when the startup hook runs).
     fn startup_auto_connect(&mut self) {
-        if self.elevated_connect_hop {
-            return;
-        }
         if !self.vpn.is_connected() && !self.vpn.is_busy() {
             self.do_connect();
         }
@@ -692,6 +681,7 @@ impl AivpnApp {
     }
 
     fn tick(&mut self) {
+        self.poll_desktop_session();
         self.vpn.poll_status();
 
         // Poll benchmark result channel
@@ -725,6 +715,7 @@ impl AivpnApp {
                 self.admin_role = None;
                 self.admin_clients_loaded = false;
                 admin::spawn(
+                    self.vpn.administration_target(),
                     self.vpn.client_binary.clone(),
                     AdminRequest::Role,
                     self.admin_tx.clone(),
@@ -774,6 +765,9 @@ impl AivpnApp {
     }
 
     fn do_connect(&mut self) {
+        if self.begin_desktop_connect() {
+            return;
+        }
         if self.vpn.is_connected() || self.vpn.is_busy() {
             self.vpn.disconnect();
             return;
@@ -785,29 +779,6 @@ impl AivpnApp {
         };
         let key = ck.key.clone();
         let full_tunnel = ck.full_tunnel;
-
-        #[cfg(windows)]
-        if full_tunnel && !is_elevated() {
-            let Some(idx) = self.keys.selected else {
-                self.show_error(t(lang, "no_key_selected").to_string());
-                return;
-            };
-            match relaunch_elevated(idx) {
-                Ok(()) => {
-                    // Hand off entirely to the elevated instance — save
-                    // settings first since this process is about to exit
-                    // and never reach its normal on-exit save path.
-                    if let Err(error) = self.settings.save() {
-                        self.show_error(error);
-                    }
-                    std::process::exit(0);
-                }
-                Err(e) => {
-                    self.show_error(e);
-                    return;
-                }
-            }
-        }
 
         let proxy_listen = ck.proxy_listen.clone();
         let mtls_cert_path = ck.mtls_cert_path.clone();
@@ -834,6 +805,7 @@ impl AivpnApp {
         if let Err(e) = self.vpn.connect(
             &key,
             full_tunnel,
+            ck.split_enabled,
             proxy_listen.as_deref(),
             mtls_cert_path.as_deref(),
             &exclude_routes,

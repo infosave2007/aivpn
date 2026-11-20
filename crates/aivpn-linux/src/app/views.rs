@@ -3,8 +3,16 @@ use iced::widget::{column, row};
 
 impl super::App {
     pub fn view(&self) -> Element<'_, Message> {
+        let main = if self.kill_switch_retained {
+            column![self.kill_switch_hold_banner(), self.view_main()]
+                .spacing(0)
+                .height(Length::Fill)
+                .into()
+        } else {
+            self.view_main()
+        };
         let base = super::modal::underlay(
-            self.view_main(),
+            main,
             self.pending_remove.is_some() || self.dialog != DialogMode::None,
         );
         if self.pending_remove.is_some() {
@@ -16,13 +24,52 @@ impl super::App {
         base
     }
 
+    fn kill_switch_hold_banner(&self) -> Element<'_, Message> {
+        let lang = self.settings.lang.as_str();
+        let body = if let Some(error) = &self.ks_clear_error {
+            error.clone()
+        } else if self.ks_clear_in_flight {
+            t(lang, "Removing kill switch...").to_string()
+        } else {
+            t(
+                lang,
+                "Kill switch stayed on after the client exited unexpectedly. Traffic stays blocked until you remove it.",
+            )
+            .to_string()
+        };
+        let action: Element<Message> = if self.ks_clear_in_flight {
+            text(t(lang, "Removing kill switch...")).size(13).into()
+        } else if !self.profiles_locked() {
+            button(text(t(lang, "Remove kill switch")).size(13))
+                .on_press(Message::ClearRetainedKillSwitch)
+                .style(button::danger)
+                .into()
+        } else {
+            Space::new().width(0).into()
+        };
+        container(
+            row![
+                text(body).size(13),
+                Space::new().width(Length::Fill),
+                action
+            ]
+            .align_y(Alignment::Center)
+            .spacing(12),
+        )
+        .padding(10)
+        .width(Length::Fill)
+        .into()
+    }
+
     pub(super) fn view_sections(&self, page: UiPage) -> Element<'_, Message> {
         let lang = self.settings.lang.as_str();
         let muted = self.theme().extended_palette().background.strong.text;
         let is_connected = matches!(self.status, VpnStatus::Connected { .. });
         // ── Recording (visible when connected) ────────────────────────────────
         let recording_section: Element<Message> =
-            if matches!(self.status, VpnStatus::Connected { .. }) {
+            if matches!(self.status, VpnStatus::Connected { .. })
+                && (!self.has_desktop_session() || self.recording_allowed == Some(true))
+            {
                 match &self.recording_state {
                     RecordingState::Done { succeeded, details } => {
                         let color = if *succeeded {
@@ -115,15 +162,11 @@ impl super::App {
         };
 
         let adaptive_opt = AdaptiveOption::from_level(self.settings.adaptive_level);
-        // The FEC badge reflects the LIVE level the server actually runs the
-        // session at (quality.json) when connected — not merely the requested
-        // preference, which the adaptive controller may have overridden.
-        let live_level = if is_connected {
-            self.stats.server_adaptive_level
+        let fec_text = if is_connected && self.stats.fec_group.is_some_and(|group| group > 0) {
+            " [FEC]"
         } else {
-            self.settings.adaptive_level
+            ""
         };
-        let fec_text = if live_level >= 2 { " [FEC]" } else { "" };
         let fec_badge = text(fec_text)
             .color(Color::from_rgb(0.3, 0.8, 0.5))
             .size(12);
@@ -151,15 +194,25 @@ impl super::App {
         // Dynamic picker: prefer the server-pushed catalog (which marks
         // auto-generated masks "(авто)"); fall back to the built-in presets
         // until a catalog has been received.
-        let mask_choices: Vec<MaskChoice> = mask_choices_from_catalog(lang).unwrap_or_else(|| {
-            MaskOption::all()
-                .iter()
-                .map(|m| MaskChoice {
-                    id: m.as_str().to_string(),
-                    display: m.label().to_string(),
-                })
-                .collect()
-        });
+        let mut mask_choices: Vec<MaskChoice> =
+            mask_choices_from_catalog(lang).unwrap_or_else(|| {
+                MaskOption::all()
+                    .iter()
+                    .map(|m| MaskChoice {
+                        id: m.as_str().to_string(),
+                        display: m.label().to_string(),
+                    })
+                    .collect()
+            });
+        if !mask_choices
+            .iter()
+            .any(|choice| choice.id == self.settings.preferred_mask)
+        {
+            mask_choices.push(MaskChoice {
+                id: self.settings.preferred_mask.clone(),
+                display: self.settings.preferred_mask.clone(),
+            });
+        }
         let selected_choice = mask_choices
             .iter()
             .find(|c| c.id == self.settings.preferred_mask)
@@ -500,7 +553,13 @@ impl super::App {
             UiPage::Routes => column![
                 self.section_title(self.tr("Маршруты", "Routes")),
                 text(self.tr("Общие параметры клиента", "Shared client settings")).size(14).color(muted),
-                locked_notice, dns_row, include_routes_row, routes_row,
+                locked_notice, dns_row,
+                text(if self.uses_application_routing() {
+                    self.tr("Этот профиль управляется в разделе Приложения. Переключатель split расположен там.", "This profile is managed on the Applications page. Use its split switch there.")
+                } else { "" }).size(12).color(muted),
+                checkbox(self.settings.split_enabled).label(self.tr("Split по сетям", "Network split tunneling"))
+                    .on_toggle_maybe((!self.profiles_locked() && !self.uses_application_routing()).then_some(Message::SplitEnabledChanged)),
+                include_routes_row, routes_row,
                 text(self.route_summary()).size(14),
                 text(self.tr("Полный туннель и mTLS задаются в профиле.", "Full tunnel and mTLS belong to the profile.")).size(14),
                 self.edit_profile_button(),

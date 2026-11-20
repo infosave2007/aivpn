@@ -110,12 +110,14 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
 
     override func startTunnel(options: [String: NSObject]?,
                               completionHandler: @escaping (Error?) -> Void) {
+        os_log(.default, "AIVPN startup: entered")
         // A stop that raced a previous (aborted) setup can leave the Rust core's
         // STOP_PENDING flag set; activate_session() would propagate it into this
         // fresh session and kill it immediately. This start is an intentional new
         // connection, so clear the stale flag first (mirrors Android's
         // clearPendingStop-on-connect).
         aivpn_clear_pending_stop()
+        os_log(.default, "AIVPN startup: cleared stop flag")
 
         guard let proto = protocolConfiguration as? NETunnelProviderProtocol,
               let cfg   = proto.providerConfiguration else {
@@ -161,7 +163,9 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             return
         }
 
-        let fullTunnel = cfg["fullTunnel"] as? Bool ?? true
+        let split = SplitTunnelConfiguration(cfg, defaults: appGroupDefaults)
+        let fullTunnel = split.fullTunnel
+        os_log(.default, "AIVPN startup: resolved connection credential")
         let adaptiveLevel = cfg["adaptiveLevel"] as? Int ?? 0
         let killSwitch = cfg["killSwitch"] as? Bool ?? false
         self.preferredMask = cfg["preferred_mask"] as? String ?? "auto"
@@ -171,20 +175,15 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         self.countryCode = cfg["country_code"] as? String ?? ""
 
         // Split-tunnel lists forwarded by VPNManager from App Group UserDefaults.
-        let excludedRoutes = (cfg["excluded_routes"] as? String ?? "")
-            .split(separator: ",")
-            .map { $0.trimmingCharacters(in: .whitespaces) }
-            .filter { !$0.isEmpty }
-        let excludedDomains = (cfg["excluded_domains"] as? String ?? "")
-            .split(separator: ",")
-            .map { $0.trimmingCharacters(in: .whitespaces) }
-            .filter { !$0.isEmpty }
+        let excludedRoutes = split.excludedRoutes
+        let excludedDomains = split.excludedDomains
 
         guard let key = TunnelConnectionKey(rawKey: keyStr) else {
             completionHandler(makeError("invalid connection key"))
             return
         }
         self.canRecord = key.canRecord ?? false
+        os_log(.default, "AIVPN startup: parsed connection credential")
 
         // M1: scope the persisted descriptor blob to THIS server so a profile switch
         // never loads another server's descriptors.
@@ -245,6 +244,11 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         // one-line addition rather than a new FFI parameter.
         let maskVerifyMode = cfg["mask_verify_mode"] as? String ?? ""
 
+        guard let remoteAddress = DomainExclusions.remoteAddress(key.serverHost) else {
+            completionHandler(makeError("Cannot resolve the VPN server address"))
+            return
+        }
+
         // Create socketpair: sp[0] = Swift side, sp[1] = Rust side
         var fds: [Int32] = [-1, -1]
         guard socketpair(AF_UNIX, SOCK_DGRAM, 0, &fds) == 0 else {
@@ -253,6 +257,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         }
         sp = fds
         isStopped = false
+        os_log(.default, "AIVPN startup: bridge socket created")
 
         var bufSize: Int32 = 65536
         if setsockopt(sp[0], SOL_SOCKET, SO_SNDBUF, &bufSize, socklen_t(MemoryLayout<Int32>.size)) != 0 {
@@ -272,8 +277,10 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         // event handler in startBridge) returns EAGAIN once the socket buffer is
         // empty instead of blocking bridgeQueue.
         let flags = fcntl(sp[0], F_GETFL)
-        guard fcntl(sp[0], F_SETFL, flags | O_NONBLOCK) >= 0 else {
-            completionHandler(makeError("fcntl F_SETFL failed: \(errno)"))
+        guard flags >= 0, fcntl(sp[0], F_SETFL, flags | O_NONBLOCK) >= 0 else {
+            let error = makeError("fcntl failed: \(errno)")
+            closeBridgeResources()
+            completionHandler(error)
             return
         }
 
@@ -286,30 +293,43 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         appliedNetwork = nil
         applyingNetwork = false
         appliedVpnIP           = vpnIP
-        settingsServerHost     = key.serverHost
+        // Only the system tunnel settings need the numeric address. Keep the
+        // original hostname for the transport and its reconnect/DNS behavior.
+        settingsServerHost     = remoteAddress
         settingsFullTunnel     = fullTunnel
         let resolvedExclusions = fullTunnel ? DomainExclusions.routes(excludedDomains) : []
-        guard !isStopped else { completionHandler(makeError("Tunnel stopped")); return }
+        guard !isStopped else {
+            closeBridgeResources()
+            completionHandler(makeError("Tunnel stopped"))
+            return
+        }
         settingsExcludedRoutes = excludedRoutes + resolvedExclusions
         settingsAdaptiveLevel  = adaptiveLevel
         settingsKillSwitch     = killSwitch
-        let settings = buildSettings(vpnIP: vpnIP, serverHost: key.serverHost,
+        let settings = buildSettings(vpnIP: vpnIP, serverHost: remoteAddress,
                                      fullTunnel: fullTunnel,
                                      excludedRoutes: settingsExcludedRoutes,
                                      adaptiveLevel: adaptiveLevel,
                                      killSwitch: killSwitch)
 
+        os_log(.default, "AIVPN startup: applying tunnel settings")
         setTunnelNetworkSettings(settings) { [weak self] error in
             guard let self = self else { return }
             if let error = error {
+                let failure = error as NSError
+                os_log(.error, "AIVPN startup: settings failed %{public}@ %ld: %{public}@",
+                       failure.domain, failure.code, failure.localizedDescription)
+                self.closeBridgeResources()
                 completionHandler(error)
                 return
             }
+            os_log(.default, "AIVPN startup: tunnel settings applied")
 
             let deviceKey: [UInt8]
             do {
                 deviceKey = try self.loadOrCreateDeviceKey()
             } catch {
+                self.closeBridgeResources()
                 completionHandler(error)
                 return
             }
@@ -623,6 +643,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             thread.qualityOfService = .userInitiated
             self.rustThread = thread
             thread.start()
+            os_log(.default, "AIVPN startup: transport thread started")
 
             self.startBridge()
         }
@@ -648,8 +669,16 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
 
     override func stopTunnel(with reason: NEProviderStopReason,
                              completionHandler: @escaping () -> Void) {
+        os_log(.default, "AIVPN stop: system reason %ld", reason.rawValue)
         isStopped = true
         aivpn_stop_tunnel()
+        closeBridgeResources()
+        completionHandler()
+    }
+
+    // Закрываем дескрипторы и при ошибке запуска: stopTunnel после нее не гарантирован.
+    private func closeBridgeResources() {
+        isStopped = true
         bridgeQueue.sync {
             pathMonitor?.cancel()
             pathMonitor = nil
@@ -664,7 +693,6 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             }
             if sp[1] >= 0 { Darwin.close(sp[1]); sp[1] = -1 }
         }
-        completionHandler()
     }
 
     // MARK: - IPC from main app
@@ -1510,7 +1538,8 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     // MARK: - Helpers
 
     private func makeError(_ msg: String) -> NSError {
-        NSError(domain: "com.aivpn.tunnel", code: -1,
+        os_log(.error, "AIVPN startup failure: %{public}@", msg)
+        return NSError(domain: "com.aivpn.tunnel", code: -1,
                 userInfo: [NSLocalizedDescriptionKey: msg])
     }
 }

@@ -28,6 +28,11 @@
 //! separately. Only the pure, IO-free helpers ([`parse_marker_line`], the
 //! fingerprint formatter, the embedded bundle contents, and
 //! [`build_install_argv`]'s shell-quoting) are unit-tested in this module.
+//!
+//! [`job_registry`] ограничивает очередь событий установки для Android и iOS.
+//! Сам реестр не открывает SSH-соединения.
+
+pub mod job_registry;
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};

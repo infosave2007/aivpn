@@ -7,6 +7,7 @@ pub fn handshake_reject_message(reason: u8) -> &'static str {
         1 => "one-time key already used",
         2 => "client expired",
         3 => "client disabled",
+        aivpn_common::protocol::CERTIFICATE_REJECT_REASON => "mTLS certificate rejected",
         _ => "refused",
     }
 }
@@ -20,6 +21,7 @@ pub(super) fn handshake_reject_token(reason: u8) -> &'static str {
         1 => "one_time_used",
         2 => "expired",
         3 => "disabled",
+        aivpn_common::protocol::CERTIFICATE_REJECT_REASON => "certificate",
         _ => "unspecified",
     }
 }

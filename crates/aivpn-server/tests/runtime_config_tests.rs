@@ -240,3 +240,53 @@ fn startup_ignores_unrelated_non_utf8_env_and_explains_relevant_value() {
     assert!(stderr.contains("AIVPN_LOG_LEVEL"));
     assert!(!stderr.contains("panicked"));
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires an isolated user/mount namespace"]
+fn config_on_readonly_filesystem_does_not_require_writable_sidecar() {
+    assert_eq!(
+        std::env::var("AIVPN_TEST_PRIVATE_MOUNT_NS").as_deref(),
+        Ok("1")
+    );
+    let root = tempfile::tempdir().unwrap();
+    let (_, signing) = key_files(root.path());
+    let mount = root.path().join("readonly");
+    std::fs::create_dir(&mount).unwrap();
+    std::fs::write(mount.join("server.json"), b"{}").unwrap();
+    assert!(Command::new("mount")
+        .arg("--bind")
+        .arg(&mount)
+        .arg(&mount)
+        .status()
+        .unwrap()
+        .success());
+    struct Unmount(std::path::PathBuf);
+    impl Drop for Unmount {
+        fn drop(&mut self) {
+            let _ = Command::new("umount").arg(&self.0).status();
+        }
+    }
+    let _unmount = Unmount(mount.clone());
+    assert!(Command::new("mount")
+        .args(["-o", "remount,bind,ro"])
+        .arg(&mount)
+        .status()
+        .unwrap()
+        .success());
+    let output = command()
+        .arg("--config")
+        .arg(mount.join("server.json"))
+        .arg("--clients-db")
+        .arg(root.path().join("clients.json"))
+        .env("AIVPN_MASK_SIGNING_KEY", signing)
+        .arg("--list-clients")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!mount.join("server.json.aivpn-restore.lock").exists());
+}

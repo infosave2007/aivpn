@@ -129,6 +129,21 @@ impl KillSwitch {
 
     /// Remove kill-switch rules (called on graceful disconnect).
     pub fn deactivate(&mut self) {
+        #[cfg(target_os = "linux")]
+        if crate::network_session::needed() {
+            if let Some(session) = crate::network_session::current() {
+                if let Err(error) =
+                    session.request(crate::network_session::Request::ClearFirewall {})
+                {
+                    warn!("Защитные правила могли сохраниться: {error}");
+                    return;
+                }
+                self.active = false;
+                self.cleanup_needed = false;
+                return;
+            }
+        }
+
         if !self.active && !self.cleanup_needed {
             return;
         }
@@ -151,9 +166,36 @@ impl KillSwitch {
 
     /// Явное восстановление сети оператором после аварийного завершения.
     pub fn clear_for_operator() -> Result<()> {
+        #[cfg(target_os = "linux")]
+        if crate::network_session::needed() {
+            let image = std::path::Path::new(crate::network_session::IMAGE);
+            crate::network_session::validate_image(image, false)?;
+            let status = std::process::Command::new("/usr/bin/pkexec")
+                .args([
+                    "--disable-internal-agent",
+                    crate::network_session::IMAGE,
+                    "cli",
+                    "kill-switch",
+                    "clear",
+                ])
+                .status()?;
+            if !status.success() {
+                return Err(Error::Io(io::Error::other(
+                    "Административная очистка отменена или не завершена",
+                )));
+            }
+            return Ok(());
+        }
+        #[cfg(target_os = "linux")]
+        let _lease = crate::network_helper::acquire_firewall(None)?;
         Self::clear_stale()?;
         #[cfg(target_os = "linux")]
-        crate::tunnel::Tunnel::clear_crashed_ipv6_guards()?;
+        {
+            crate::tunnel::Tunnel::clear_crashed_ipv6_guards()?;
+            crate::network_helper::clear_owned_routes()?;
+            _lease.set_len(0)?;
+            _lease.sync_all()?;
+        }
         Ok(())
     }
 
@@ -161,6 +203,20 @@ impl KillSwitch {
 
     #[cfg(target_os = "linux")]
     fn activate_impl(&self) -> Result<()> {
+        if crate::network_session::needed() {
+            if let Some(session) = crate::network_session::current() {
+                let peer = self
+                    .server_ip
+                    .parse()
+                    .map_err(|_| io::Error::other("Некорректный адрес сервера firewall"))?;
+                session.request(crate::network_session::Request::Firewall {
+                    name: self.tun_name.clone(),
+                    peer,
+                    mark: self.mark,
+                })?;
+                return Ok(());
+            }
+        }
         // Try nftables first
         if crate::tunnel::Tunnel::net_admin_command("nft")
             .arg("--version")
@@ -685,6 +741,12 @@ mod tests {
         let namespace = std::fs::read_link("/proc/self/ns/net").unwrap();
         if let Ok(parent) = std::env::var(CHILD) {
             assert_ne!(namespace.to_string_lossy(), parent);
+            // Отдельный /run хранит owner/lock этого стенда, не рабочей системы.
+            assert!(Command::new("mount")
+                .args(["-t", "tmpfs", "-o", "mode=755", "tmpfs", "/run"])
+                .status()
+                .unwrap()
+                .success());
             let ip = |args: &[&str]| {
                 let output = Command::new("ip").args(args).output().unwrap();
                 assert!(
@@ -811,7 +873,7 @@ mod tests {
             assert_eq!(ip(&["-j", "-6", "route", "show"]), foreign);
             return;
         }
-        let output = Command::new("unshare").args(["-Urn"])
+        let output = Command::new("unshare").args(["-Urnm", "--propagation", "private"])
             .arg(std::env::current_exe().unwrap())
             .args(["--exact", "kill_switch::tests::explicit_clear_recovers_ipv6_after_sigkill_and_preserves_foreign_routes", "--nocapture"])
             .env(CHILD, namespace).output().unwrap();

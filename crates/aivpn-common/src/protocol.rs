@@ -2,6 +2,10 @@
 //!
 //! Implements packet format, inner payload encoding, and control messages
 
+/// Локальная причина терминального отказа для CertRejected.
+/// Не меняет формат сообщения или коды HandshakeReject на проводе.
+pub const CERTIFICATE_REJECT_REASON: u8 = 4;
+
 use bytes::{BufMut, BytesMut};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
@@ -151,6 +155,9 @@ pub enum ControlSubtype {
     ClientHello = 0x29,
     /// Согласование ICE и отпечатка DTLS только внутри сессии после PFS.
     MaskState = 0x2A,
+    MaskUpdateV2 = 0x2B,
+    MaskApplied = 0x2C,
+    MaskAssessment = 0x2D,
 }
 
 impl ControlSubtype {
@@ -198,6 +205,9 @@ impl ControlSubtype {
             0x28 => Some(Self::SiteData),
             0x29 => Some(Self::ClientHello),
             0x2A => Some(Self::MaskState),
+            0x2B => Some(Self::MaskUpdateV2),
+            0x2C => Some(Self::MaskApplied),
+            0x2D => Some(Self::MaskAssessment),
             _ => None,
         }
     }
@@ -353,6 +363,17 @@ impl AivpnPacket {
 /// Control message payload
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ControlPayload {
+    MaskAssessment(crate::mask_assessment::MaskAssessment),
+    MaskUpdateV2 {
+        generation: u64,
+        mask_data: Vec<u8>,
+        #[serde(with = "serde_bytes")]
+        signature: [u8; 64],
+    },
+    MaskApplied {
+        generation: u64,
+        digest: [u8; 32],
+    },
     KeyRotate {
         new_eph_pub: [u8; 32],
     },
@@ -646,6 +667,33 @@ impl ControlPayload {
         let mut buf = Vec::new();
 
         match self {
+            Self::MaskAssessment(value) => return value.encode(),
+            Self::MaskUpdateV2 {
+                generation,
+                mask_data,
+                signature,
+            } => {
+                if *generation == 0 {
+                    return Err(Error::InvalidPacket("Нулевое поколение маски"));
+                }
+                buf.push(ControlSubtype::MaskUpdateV2 as u8);
+                buf.extend_from_slice(&generation.to_le_bytes());
+                buf.extend_from_slice(
+                    &u16::try_from(mask_data.len())
+                        .map_err(|_| Error::InvalidPacket("Маска длиннее u16"))?
+                        .to_le_bytes(),
+                );
+                buf.extend_from_slice(mask_data);
+                buf.extend_from_slice(signature);
+            }
+            Self::MaskApplied { generation, digest } => {
+                if *generation == 0 {
+                    return Err(Error::InvalidPacket("Нулевое поколение маски"));
+                }
+                buf.push(ControlSubtype::MaskApplied as u8);
+                buf.extend_from_slice(&generation.to_le_bytes());
+                buf.extend_from_slice(digest);
+            }
             Self::MaskState(state) => return state.encode_control(),
             Self::KeyRotate { new_eph_pub } => {
                 buf.push(ControlSubtype::KeyRotate as u8);
@@ -1074,6 +1122,37 @@ impl ControlPayload {
             .ok_or(Error::InvalidPacket("Unknown control subtype"))?;
 
         match subtype {
+            ControlSubtype::MaskAssessment => {
+                crate::mask_assessment::MaskAssessment::decode(data).map(Self::MaskAssessment)
+            }
+            ControlSubtype::MaskUpdateV2 => {
+                if data.len() < 75 {
+                    return Err(Error::InvalidPacket("Обрезанное обновление маски"));
+                }
+                let generation = u64::from_le_bytes(data[1..9].try_into().unwrap());
+                let length = u16::from_le_bytes(data[9..11].try_into().unwrap()) as usize;
+                if generation == 0 || data.len() != 75 + length {
+                    return Err(Error::InvalidPacket("Неверная длина или поколение маски"));
+                }
+                Ok(Self::MaskUpdateV2 {
+                    generation,
+                    mask_data: data[11..11 + length].to_vec(),
+                    signature: data[11 + length..].try_into().unwrap(),
+                })
+            }
+            ControlSubtype::MaskApplied => {
+                if data.len() != 41 {
+                    return Err(Error::InvalidPacket("Неверная длина подтверждения маски"));
+                }
+                let generation = u64::from_le_bytes(data[1..9].try_into().unwrap());
+                if generation == 0 {
+                    return Err(Error::InvalidPacket("Нулевое поколение маски"));
+                }
+                Ok(Self::MaskApplied {
+                    generation,
+                    digest: data[9..].try_into().unwrap(),
+                })
+            }
             ControlSubtype::MaskState => {
                 crate::mask_state::MaskState::decode_control(data).map(Self::MaskState)
             }
@@ -1946,7 +2025,19 @@ mod tests {
             ControlSubtype::from_u8(0x2a),
             Some(ControlSubtype::MaskState)
         );
-        assert_eq!(ControlSubtype::from_u8(0x2b), None);
+        assert_eq!(
+            ControlSubtype::from_u8(0x2b),
+            Some(ControlSubtype::MaskUpdateV2)
+        );
+        assert_eq!(
+            ControlSubtype::from_u8(0x2c),
+            Some(ControlSubtype::MaskApplied)
+        );
+        assert_eq!(
+            ControlSubtype::from_u8(0x2d),
+            Some(ControlSubtype::MaskAssessment)
+        );
+        assert_eq!(ControlSubtype::from_u8(0x2e), None);
     }
 
     // -----------------------------------------------------------------------

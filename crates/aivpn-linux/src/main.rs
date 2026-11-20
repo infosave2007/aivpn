@@ -10,7 +10,20 @@ mod vpn_manager;
 use app::App;
 use iced::{Settings, Size};
 
-fn main() -> iced::Result {
+fn main() -> std::process::ExitCode {
+    if let Some(code) = aivpn_client::entry::dispatch(aivpn_client::entry::DefaultMode::Gui) {
+        return code;
+    }
+    match run_gui() {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("Интерфейс завершился: {error}");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+fn run_gui() -> iced::Result {
     // Single-instance guard: a second GUI (e.g. relaunched after a crash
     // while the first is still alive) would spawn a second aivpn-client over
     // the same TUN/routes. The lock is held for the whole process lifetime.

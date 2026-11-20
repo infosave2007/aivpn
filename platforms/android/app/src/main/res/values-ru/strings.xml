@@ -401,4 +401,16 @@
     <string name="install_marker_container_not_running">Контейнер aivpn-server не сообщил о запуске</string>
     <string name="bench_speed">Отдача: %1$.0f кбит/с  Загрузка: %2$.0f кбит/с</string>
     <string name="bench_failed">Не удалось выполнить тест активной сессии</string>
+    <string name="bench_limited">Скорость ограничена методом теста; пропускная способность канала может быть выше.</string>
+    <string name="mask_model_unknown">Модель исходящего потока: нет актуальных данных</string>
+    <string name="mask_model_deviation_high">существенное отклонение</string>
+    <string name="mask_model_deviation">отклонение</string>
+    <string name="mask_model_in_range">в пределах модели</string>
+    <string name="mask_model_trained">обученная модель</string>
+    <string name="mask_model_projection">резервная проекция</string>
+    <string name="mask_model_measurement">Исходящий поток: %1$s
+MSE %2$.4f, выборок %3$d, %4$s</string>
+    <string name="split_tunnel_enabled">Включить split</string>
+    <string name="split_tunnel_disabled">Выключено - все приложения и сайты через VPN</string>
+    <string name="split_tunnel_switch_note">Настройки сохраняются. Для изменения переключателя отключите VPN.</string>
 </resources>

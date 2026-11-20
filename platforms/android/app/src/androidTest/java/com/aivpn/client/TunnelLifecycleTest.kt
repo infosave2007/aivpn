@@ -18,6 +18,117 @@ import org.junit.runner.RunWith
 /** Нажатия в Activity проверяются вместе с состоянием настоящего VpnService. */
 @RunWith(AndroidJUnit4::class)
 class TunnelLifecycleTest {
+    private fun nativeTunnelCalls(): Int = Thread.getAllStackTraces().values.count { stack ->
+        stack.any { it.className == AivpnJni::class.java.name && it.methodName == "runTunnel" }
+    }
+
+    @Test
+    fun rejectedCertificateStopsTheServiceWithoutRetrying() {
+        val instrumentation = InstrumentationRegistry.getInstrumentation()
+        val args = InstrumentationRegistry.getArguments()
+        val key = args.getString("connectionKey").orEmpty()
+        val certificate = args.getString("rejectedCertificate").orEmpty()
+        assumeTrue("Нужны тестовый сервер с mTLS и отклоняемый сертификат", key.isNotBlank() && certificate.isNotBlank())
+        val context = instrumentation.targetContext
+        val oldProfiles = SecureStorage.loadProfiles(context)
+        val oldActive = SecureStorage.loadActiveProfileId(context)
+        val profile = SecureStorage.ConnectionProfile(
+            id = "rejected-certificate-test", name = "Rejected certificate", key = key,
+            maskProfile = "quic_https_v2", mtlsCertBase64 = certificate,
+        )
+        try {
+            SecureStorage.saveProfiles(context, oldProfiles.filter { it.id != profile.id } + profile)
+            SecureStorage.saveActiveProfileId(context, profile.id)
+            context.startForegroundService(Intent(context, AivpnService::class.java).apply {
+                action = AivpnService.ACTION_CONNECT
+                putExtra("profile_id", profile.id)
+            })
+            val expected = context.getString(R.string.status_cert_rejected)
+            val deadline = SystemClock.elapsedRealtime() + 12_000
+            while (SystemClock.elapsedRealtime() < deadline &&
+                (AivpnService.lastStatusText != expected || AivpnService.isServiceActive)) {
+                SystemClock.sleep(25)
+            }
+            assertEquals("Причина отказа потерялась", expected, AivpnService.lastStatusText)
+            repeat(40) {
+                assertFalse("Служба повторяет подключение с отклоненным сертификатом", AivpnService.isServiceActive)
+                assertFalse("После отказа остался статус Connected", AivpnService.isEstablished)
+                assertEquals("Остался вызов JNI", 0, nativeTunnelCalls())
+                SystemClock.sleep(100)
+            }
+        } finally {
+            context.startService(Intent(context, AivpnService::class.java).setAction(AivpnService.ACTION_DISCONNECT))
+            val deadline = SystemClock.elapsedRealtime() + 5_000
+            while (AivpnService.isServiceActive && SystemClock.elapsedRealtime() < deadline) SystemClock.sleep(25)
+            SecureStorage.saveProfiles(context, oldProfiles)
+            SecureStorage.saveActiveProfileId(context, oldActive)
+        }
+    }
+
+    @Test
+    fun savedProfileStopsNativeSessionsAcrossReconnects() {
+        val instrumentation = InstrumentationRegistry.getInstrumentation()
+        val arguments = InstrumentationRegistry.getArguments()
+        val key = arguments.getString("connectionKey").orEmpty()
+        assumeTrue("Нужен тестовый ключ или явное разрешение использовать сохраненный профиль",
+            key.isNotBlank() || arguments.getString("useSavedProfile") == "true")
+        val context = instrumentation.targetContext
+        val oldProfiles = SecureStorage.loadProfiles(context)
+        val oldActive = SecureStorage.loadActiveProfileId(context)
+        val profile = key.takeIf { it.isNotBlank() }?.let {
+            SecureStorage.ConnectionProfile(id = "native-stop-test", name = "Native stop test", key = it,
+                maskProfile = arguments.getString("maskProfile") ?: "quic_https_v2")
+        }
+        val profileId = profile?.id ?: oldActive
+        assumeTrue("Нужен сохраненный активный профиль", profile != null || oldProfiles.any { it.id == profileId })
+        val settleMs = arguments.getString("settleMs")?.toLong() ?: 0L
+        fun waitUntil(message: String, timeout: Long = 8_000, condition: () -> Boolean) {
+            val deadline = SystemClock.elapsedRealtime() + timeout
+            while (!condition() && SystemClock.elapsedRealtime() < deadline) SystemClock.sleep(20)
+            assertTrue("$message; state=${AivpnService.uiState} native=${nativeTunnelCalls()}", condition())
+        }
+        fun stop() {
+            context.startService(Intent(context, AivpnService::class.java).setAction(AivpnService.ACTION_DISCONNECT))
+            waitUntil("Служба не остановилась") { AivpnService.instance == null }
+            waitUntil("JNI продолжает работать после отключения VPN", 2_000) { nativeTunnelCalls() == 0 }
+        }
+        try {
+            stop()
+            if (profile != null) {
+                SecureStorage.saveProfiles(context, oldProfiles.filter { it.id != profile.id } + profile)
+                SecureStorage.saveActiveProfileId(context, profile.id)
+            }
+            repeat(arguments.getString("cycles")?.toInt() ?: 4) {
+                context.startForegroundService(Intent(context, AivpnService::class.java).apply {
+                    action = AivpnService.ACTION_CONNECT
+                    putExtra("profile_id", profileId)
+                })
+                waitUntil("VPN не подключился") { AivpnService.isEstablished }
+                assertEquals("Остались нативные вызовы от прежних попыток", 1, nativeTunnelCalls())
+                SystemClock.sleep(settleMs)
+                val service = AivpnService.instance!!
+                val previousEpoch = AivpnService.connectedAtMillis
+                AivpnService::class.java.getDeclaredMethod("restartAfterNetworkChange")
+                    .apply { isAccessible = true }.invoke(service)
+                waitUntil("VPN не восстановился после события потери сети") {
+                    AivpnService.isEstablished && AivpnService.connectedAtMillis > previousEpoch
+                }
+                assertEquals("Переподключение оставило старый JNI-вызов", 1, nativeTunnelCalls())
+                SystemClock.sleep(settleMs)
+                stop()
+            }
+        } finally {
+            try {
+                stop()
+            } finally {
+                if (profile != null) {
+                    SecureStorage.saveProfiles(context, oldProfiles)
+                    SecureStorage.saveActiveProfileId(context, oldActive)
+                }
+            }
+        }
+    }
+
     @Test
     fun unvalidatedPhysicalNetworkCanCarryTheVpn() {
         val context = InstrumentationRegistry.getInstrumentation().targetContext
@@ -71,6 +182,7 @@ class TunnelLifecycleTest {
         fun stop() {
             context.startService(Intent(context, AivpnService::class.java).setAction(AivpnService.ACTION_DISCONNECT))
             waitUntil("Служба не остановилась") { AivpnService.instance == null }
+            waitUntil("JNI продолжает работать после отключения VPN", 2_000) { nativeTunnelCalls() == 0 }
         }
         fun shell(command: String) {
                 android.os.ParcelFileDescriptor.AutoCloseInputStream(
@@ -120,7 +232,12 @@ class TunnelLifecycleTest {
                     waitUntil("Статус $cycle не обновился", 1_000) {
                         var rendered = false
                         activity.onActivity {
-                            rendered = it.findViewById<TextView>(R.id.textStatus).text.toString() == AivpnService.localizedStatus(it)
+                            // Готовность JNI публикуется раньше callback на главном потоке.
+                            // Совпадение прежнего текста Connecting еще не означает готовый UI.
+                            rendered = AivpnService.isEstablished &&
+                                AivpnService.uiState == AivpnService.UiState.CONNECTED &&
+                                it.findViewById<TextView>(R.id.textStatus).text.toString() == AivpnService.localizedStatus(it) &&
+                                it.findViewById<Button>(R.id.btnConnect).text == it.getString(R.string.btn_disconnect)
                         }
                         rendered
                     }
@@ -220,7 +337,7 @@ class TunnelLifecycleTest {
                             received = try {
                                 java.net.Socket().use { socket ->
                                     socket.soTimeout = 1_000
-                                    socket.connect(java.net.InetSocketAddress("203.0.113.2", 8000), 1_000)
+                                    socket.connect(java.net.InetSocketAddress(probeHost, port), 1_000)
                                     socket.getOutputStream().write("GET / HTTP/1.0\r\nHost: runtime-test\r\n\r\n".toByteArray())
                                     socket.getInputStream().readBytes().toString(Charsets.US_ASCII).endsWith("aivpn-local-lab-ok\n")
                                 }
@@ -235,11 +352,21 @@ class TunnelLifecycleTest {
                         // Ждем возврата Wi-Fi перед следующим ручным переподключением.
                         // Первый трафик уже мог восстановиться через мобильную сеть.
                         val manager = context.getSystemService(Context.CONNECTIVITY_SERVICE) as android.net.ConnectivityManager
-                        waitUntil("Wi-Fi не вернулся после включения", 10_000) {
-                            manager.allNetworks.any { manager.getNetworkCapabilities(it)
-                                ?.hasTransport(android.net.NetworkCapabilities.TRANSPORT_WIFI) == true }
+                        waitUntil("Wi-Fi не вернулся после включения",
+                            arguments.getString("wifiReadyTimeoutMs")?.toLong() ?: 30_000) {
+                            manager.allNetworks.any { network ->
+                                manager.getNetworkCapabilities(network)?.let { caps ->
+                                    !caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_VPN) &&
+                                        caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_WIFI) &&
+                                        caps.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                                } == true
+                            }
                         }
                         SystemClock.sleep(750)
+                        waitUntil("VPN не подключился после возврата Wi-Fi") { AivpnService.isEstablished }
+                        assertEquals("После возврата Wi-Fi передача не восстановилась", "aivpn-local-lab-ok\n",
+                            http(probeHost, port, "GET / HTTP/1.0\r\nHost: runtime-test\r\n\r\n".toByteArray())
+                                .toString(Charsets.US_ASCII))
                     }
                     if (arguments.getString("serverOutage") == "true") {
                         instrumentation.sendStatus(2, android.os.Bundle().apply {
@@ -287,6 +414,7 @@ class TunnelLifecycleTest {
                     previousService = AivpnService.instance
                     activity.onActivity { it.findViewById<Button>(R.id.btnConnect).performClick() }
                     waitUntil("Отключение $cycle не выполнено") { !AivpnService.isServiceActive }
+                    waitUntil("Отключение оставило работающий JNI-вызов", 2_000) { nativeTunnelCalls() == 0 }
                     SystemClock.sleep(arguments.getString("reconnectDelayMs")?.toLong() ?: 0)
                 }
             }

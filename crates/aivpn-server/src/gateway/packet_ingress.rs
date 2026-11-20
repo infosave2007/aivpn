@@ -185,6 +185,12 @@ impl super::Gateway {
             .as_ref()
             .is_some_and(|r| r.is_recording(&sess.session_id));
         input.userspace_rx |= self.config.enable_neural || recording;
+        let diagnostic = sess
+            .diagnostic_state
+            .as_ref()
+            .is_some_and(|state| state.active(&state.request.id, Instant::now()));
+        input.userspace_rx |= diagnostic;
+        input.userspace_tx |= diagnostic;
         input.userspace_tx |= recording || self.config.downlink_shaping != ShapingLevel::Off;
         // В ABI ядра нет срока сертификата, поэтому его проверяет userspace.
         input.userspace_rx |= mtls_required;
@@ -221,6 +227,12 @@ impl super::Gateway {
             )
         };
         let mut packet = payload.to_vec();
+        if let Some(mask) = session.lock().mask.as_ref() {
+            super::tcp_mss::clamp(
+                &mut packet,
+                aivpn_common::mimicry::data_payload_limit(mask, SAFE_DOWNLINK_BUDGET),
+            );
+        }
         let nbytes = u32::try_from(packet.len()).unwrap_or(u32::MAX);
         // Общее списание с fallback. Если ядро уже списало ведро, userspace его не трогает.
         match kernel_qos_decide(
@@ -241,6 +253,9 @@ impl super::Gateway {
                     }
                 }
             }
+        }
+        if self.diagnostic_upload(session, &packet).await? {
+            return Ok(());
         }
         if let Some(ref client_id) = client_id {
             if let Some(dscp) = self.qos_enforcer.get_dscp(client_id) {
@@ -1158,23 +1173,13 @@ impl super::Gateway {
                         self.refresh_kernel_session(&mut sess);
                     }
                 }
-                if quic_context.is_none()
-                    && session
-                        .lock()
-                        .mask
-                        .as_ref()
-                        .is_some_and(aivpn_common::mask_io::uses_rtc)
-                {
+                if quic_context.is_none() && session.lock().has_active_or_pending_rtc_mask() {
                     let current = session.lock();
                     if current.is_ratcheted {
                         socket.retire_other_rtc_session(client_addr, current.session_id);
                     }
                 } else if quic_context.is_none()
-                    && session
-                        .lock()
-                        .mask
-                        .as_ref()
-                        .is_some_and(|mask| !aivpn_common::mask_io::requires_userspace(mask))
+                    && !session.lock().has_active_or_pending_userspace_mask()
                 {
                     socket.use_plain_mask(client_addr);
                 }
@@ -1460,10 +1465,22 @@ impl super::Gateway {
             // Neural model update is expensive under lock. Sampling every 16th packet
             // preserves trends while reducing lock contention in the receive hot path.
             if counter & 0x0f == 0 {
-                self.neural_module
-                    .lock()
-                    // is_rx=true: packet from client → server (uplink direction)
-                    .record_traffic(session_id, packet_size, iat_ms, entropy, true);
+                let epoch = {
+                    let state = session.lock();
+                    state
+                        .mask
+                        .as_ref()
+                        .map(|mask| (state.mask_revision, mask.signature))
+                };
+                if let Some(epoch) = epoch {
+                    self.neural_module.lock().record_masked_traffic(
+                        session_id,
+                        epoch,
+                        packet_size,
+                        iat_ms,
+                        entropy,
+                    );
+                }
             }
             // Для STUN здесь еще доступны внешние байты. QUIC и RTC
             // передают проверенные внешние кадры из движка маски,

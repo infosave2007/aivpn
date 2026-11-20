@@ -37,6 +37,57 @@ impl PacedData {
     }
 }
 
+/// Одинаковое правило padding для целого DATA и каждого его фрагмента.
+pub(super) struct DataPadding<'a> {
+    pub level: ShapingLevel,
+    pub plan: Option<&'a PacedData>,
+}
+
+impl DataPadding<'_> {
+    pub fn calculate(&self, mask: &MaskProfile, base: usize) -> aivpn_common::Result<u16> {
+        let budget = if aivpn_common::mask_io::needs_state(mask) {
+            aivpn_common::mask_io::MAX_QUIC_INNER
+        } else if aivpn_common::mask_io::uses_rtc(mask) {
+            aivpn_common::mask_io::rtc_inner_budget(mask)
+        } else {
+            super::SAFE_DOWNLINK_BUDGET
+        };
+        let maximum = budget
+            .checked_sub(base)
+            .ok_or(aivpn_common::Error::InvalidPacket(
+                "DATA превышает бюджет маски",
+            ))? as u16;
+        let requested = if self.level == ShapingLevel::Off {
+            0
+        } else {
+            let profile = mask.reverse_profile.as_deref().unwrap_or(mask);
+            let mut rng = rand::thread_rng();
+            let target = self
+                .plan
+                .map(|plan| plan.target_size)
+                .unwrap_or_else(|| profile.size_distribution.sample(&mut rng));
+            let strategy = self
+                .plan
+                .and_then(|plan| plan.padding_override.as_ref())
+                .unwrap_or(&profile.padding_strategy);
+            let padding = strategy
+                .calc_padding(
+                    base + aivpn_common::mask_io::carrier_overhead(mask),
+                    target,
+                    &mut rng,
+                )
+                .min(maximum);
+            if self.level == ShapingLevel::Light {
+                padding.min(super::LIGHT_SHAPING_MAX_PAD)
+            } else {
+                padding
+            }
+        };
+        // Даже off сохраняет обязательное выравнивание внешнего протокола.
+        mask.wire_padding(base, requested, maximum)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ProfileKey {
     mask_id: String,
@@ -203,7 +254,8 @@ impl DownlinkPacer {
         let mode = match level {
             ShapingLevel::Adaptive if aivpn_common::mask_io::needs_state(mask) => DelayMode::Native,
             ShapingLevel::Adaptive => DelayMode::Adaptive,
-            ShapingLevel::Full => DelayMode::Profile,
+            ShapingLevel::Strict => DelayMode::Profile,
+            ShapingLevel::Full => DelayMode::Immediate,
             ShapingLevel::Light => DelayMode::Light,
             ShapingLevel::Off => DelayMode::Immediate,
         };
@@ -369,6 +421,46 @@ impl DownlinkPacer {
             stream.last_sent = None;
             stream.profile_key = ProfileKey::new(mask);
         }
+    }
+
+    /// Отмена теста сохраняет обычные потоки и не оставляет паузы на каждый блок.
+    pub fn discard_diagnostic(&mut self, session_id: [u8; 16], id: [u8; 16], now: Instant) {
+        let Some(stream) = self.streams.get_mut(&session_id) else {
+            return;
+        };
+        let keep = |packet: &[u8]| {
+            aivpn_common::diagnostics::data::parse(packet).is_none_or(|packet| packet.id != id)
+        };
+        let before = stream.len_packets();
+        stream.fifo.retain(|pending| keep(&pending.packet));
+        if stream.head.as_ref().is_some_and(|head| !keep(&head.packet)) {
+            let head = stream.head.take().unwrap();
+            self.ready.remove(&(head.deadline, session_id));
+            let queue_wait = stream
+                .fifo
+                .oldest(|pending| pending.queued_at)
+                .map(|at| now.saturating_duration_since(at))
+                .unwrap_or_default();
+            if let Some(pending) = stream.fifo.pop() {
+                let (target_size, deadline, padding_override) = sample_shape(
+                    &mut stream.engine,
+                    &mut stream.pacer,
+                    pending.mode,
+                    queue_wait,
+                    now,
+                    stream.last_sent,
+                );
+                stream.head = Some(Head {
+                    packet: pending.packet,
+                    target_size,
+                    deadline,
+                    padding_override,
+                });
+                self.ready.insert((deadline, session_id), ());
+            }
+        }
+        self.total -= before - stream.len_packets();
+        self.debug_check();
     }
 
     fn drop_queued(&mut self, session_id: [u8; 16]) {
@@ -549,6 +641,160 @@ fn max_instant(left: Instant, right: Instant) -> Instant {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn full_preserves_padding_without_extra_ip_pauses() {
+        let now = Instant::now();
+        for protocol in [
+            SpoofProtocol::WebRTC_STUN,
+            SpoofProtocol::QUIC,
+            SpoofProtocol::WebRTC_DTLS_SRTP,
+        ] {
+            let mut mask = profile("legacy-full", 1, 1, 400, 50.0);
+            mask.spoof_protocol = protocol;
+            let mut pacer = DownlinkPacer::new();
+            for sequence in 0..MAX_PACKETS_PER_SESSION {
+                assert!(pacer.enqueue_shaped(
+                    sid_at(1),
+                    &mask,
+                    vec![sequence as u8],
+                    now,
+                    ShapingLevel::Full
+                ));
+            }
+            assert_eq!(
+                pacer.next_deadline(),
+                Some(now),
+                "full не должен добавлять IP-паузу"
+            );
+            for sequence in 0..MAX_PACKETS_PER_SESSION {
+                let planned = pacer
+                    .pop_ready(now)
+                    .expect("Ожидание full ограничено только готовностью транспорта");
+                assert_eq!(planned.packet, vec![sequence as u8]);
+                assert_eq!(planned.target_size, 400, "Размер профиля нужен для padding");
+            }
+            assert!(pacer.is_empty());
+        }
+    }
+
+    #[test]
+    fn cancelled_diagnostics_leave_other_data_in_the_pacer() {
+        use aivpn_common::diagnostics::data;
+        let now = Instant::now();
+        let mask = profile("cancel", 1, 1, 1200, 30.0);
+        let session = sid_at(1);
+        let id = [7; 16];
+        let mut pacer = DownlinkPacer::new();
+        for sequence in 0..60 {
+            let packet = data::packet(
+                "10.0.0.1".parse().unwrap(),
+                "10.0.0.2".parse().unwrap(),
+                id,
+                &[1; 32],
+                data::Direction::Download,
+                sequence,
+            );
+            assert!(pacer.enqueue(session, &mask, packet, now, false));
+        }
+        assert!(pacer.enqueue(session, &mask, vec![99], now, false));
+        pacer.discard_diagnostic(session, id, now);
+        assert_eq!(
+            pacer.pop_ready(now + sampled_delay(30.0)).unwrap().packet,
+            vec![99]
+        );
+        assert!(pacer.is_empty());
+    }
+
+    #[test]
+    fn diagnostic_cancellation_keeps_oldest_flow_pressure() {
+        use aivpn_common::diagnostics::data;
+        let now = Instant::now();
+        let mask = profile("cancel-age", 1, 1, 400, 30.0);
+        let sid = sid_at(1);
+        let id = [7; 16];
+        let probe = data::packet(
+            "10.0.0.1".parse().unwrap(),
+            "10.0.0.2".parse().unwrap(),
+            id,
+            &[1; 32],
+            data::Direction::Download,
+            0,
+        );
+        let mut queue = DownlinkPacer::new();
+        assert!(queue.enqueue_shaped(sid, &mask, probe, now, ShapingLevel::Adaptive));
+        for (port, age) in [(53u16, 0), (443, 1000)] {
+            let mut packet = vec![0; 28];
+            packet[0] = 0x45;
+            packet[3] = 28;
+            packet[9] = 17;
+            packet[20..22].copy_from_slice(&port.to_be_bytes());
+            assert!(queue.enqueue_shaped(
+                sid,
+                &mask,
+                packet,
+                now - Duration::from_millis(age),
+                ShapingLevel::Adaptive
+            ));
+        }
+        let stream = queue.streams.get_mut(&sid).unwrap();
+        stream.pacer = AdaptivePacer::new(PacingMode::Adaptive);
+        stream.pacer.delay(
+            sampled_delay(30.0),
+            Duration::from_millis(100),
+            (now - Duration::from_millis(101)).into_std(),
+        );
+        queue.discard_diagnostic(sid, id, now);
+        assert!(
+            queue.next_deadline().unwrap() < now + sampled_delay(30.0),
+            "Молодой DNS впереди не отменяет давление старого bulk-потока"
+        );
+    }
+
+    #[test]
+    fn cancelled_diagnostics_preserve_each_shaping_mode_and_other_sessions() {
+        use aivpn_common::diagnostics::data;
+        let now = Instant::now();
+        let mask = profile("cancel-modes", 1, 1, 1200, 30.0);
+        for level in [
+            ShapingLevel::Full,
+            ShapingLevel::Adaptive,
+            ShapingLevel::Strict,
+        ] {
+            let mut pacer = DownlinkPacer::new();
+            let id = [7; 16];
+            let probe = data::packet(
+                "10.0.0.1".parse().unwrap(),
+                "10.0.0.2".parse().unwrap(),
+                id,
+                &[1; 32],
+                data::Direction::Download,
+                0,
+            );
+            assert!(pacer.enqueue_shaped(sid_at(1), &mask, probe.clone(), now, level));
+            assert!(pacer.enqueue_shaped(sid_at(1), &mask, vec![99], now, level));
+            assert!(pacer.enqueue_shaped(sid_at(2), &mask, probe.clone(), now, level));
+            pacer.discard_diagnostic(sid_at(1), id, now);
+            let due = if level == ShapingLevel::Full {
+                now
+            } else {
+                now + sampled_delay(30.0)
+            };
+            if due > now {
+                assert!(pacer.pop_ready(now).is_none());
+            }
+            let mut delivered = Vec::new();
+            while let Some(plan) = pacer.pop_ready(due) {
+                assert_eq!(plan.target_size, 1200);
+                delivered.push((plan.session_id, plan.packet));
+            }
+            assert_eq!(
+                delivered,
+                vec![(sid_at(1), vec![99]), (sid_at(2), probe)],
+                "{level:?}"
+            );
+            assert!(pacer.is_empty());
+        }
+    }
     use super::*;
 
     #[test]
@@ -635,7 +881,7 @@ mod tests {
         let start = Instant::now();
         let mask = profile("adaptive", 1, 1, 400, 30.0);
         let mut elapsed = Vec::new();
-        for level in [ShapingLevel::Full, ShapingLevel::Adaptive] {
+        for level in [ShapingLevel::Strict, ShapingLevel::Adaptive] {
             let mut pacer = DownlinkPacer::new();
             for n in 0..MAX_PACKETS_PER_SESSION {
                 assert!(pacer.enqueue_shaped(sid_at(1), &mask, vec![n as u8], start, level));
@@ -810,7 +1056,7 @@ mod tests {
                 &mask,
                 vec![sequence as u8],
                 now,
-                ShapingLevel::Full
+                ShapingLevel::Strict
             ));
         }
         assert_eq!(strict.next_deadline(), Some(now + sampled_delay(50.0)));

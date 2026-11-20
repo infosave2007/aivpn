@@ -9,6 +9,7 @@ pub struct RouteDraft {
     pub index: usize,
     key_identity: String,
     pub full_tunnel: bool,
+    pub split_enabled: bool,
     pub proxy: bool,
     pub proxy_addr: String,
     pub include: String,
@@ -22,6 +23,7 @@ impl RouteDraft {
             index,
             key_identity: key.key.clone(),
             full_tunnel: key.full_tunnel,
+            split_enabled: key.split_enabled,
             proxy: key.proxy_listen.is_some(),
             proxy_addr: key
                 .proxy_listen
@@ -56,6 +58,26 @@ mod tests {
         let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .encode(format!(r#"{{"s":"{server}"}}"#));
         ConnectionKey::from_key_string("Пример", &raw).unwrap()
+    }
+
+    #[test]
+    fn disabled_profile_and_route_draft_keep_saved_networks() {
+        let mut profile = key("split.example.invalid:443");
+        profile.split_enabled = false;
+        profile.include_routes = vec!["203.0.113.0/24".into()];
+        profile.exclude_routes = vec!["192.0.2.0/24".into()];
+        let mut value = serde_json::to_value(&profile).unwrap();
+        let restored: ConnectionKey = serde_json::from_value(value.clone()).unwrap();
+        let draft = RouteDraft::new(0, &restored, "");
+        assert!(!draft.split_enabled);
+        assert_eq!(draft.include, "203.0.113.0/24");
+        assert_eq!(draft.exclude, "192.0.2.0/24");
+        value.as_object_mut().unwrap().remove("split_enabled");
+        assert!(
+            serde_json::from_value::<ConnectionKey>(value)
+                .unwrap()
+                .split_enabled
+        );
     }
 
     #[test]

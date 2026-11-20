@@ -46,7 +46,6 @@ const GMM_MIN_COMPONENT_WEIGHT: f64 = 0.02;
 // ─── Analysis Result ─────────────────────────────────────────────────────────
 
 /// Result of traffic analysis
-#[allow(dead_code)]
 struct AnalysisResult {
     uplink: DirectionalAnalysis,
     downlink: DirectionalAnalysis,
@@ -61,14 +60,10 @@ struct AnalysisResult {
     confidence: f32,
 }
 
-#[allow(dead_code)]
 struct DirectionalAnalysis {
-    size_modes: Vec<Mode>,
     size_mean: f32,
-    size_std: f32,
     iat_mean_ms: f32,
     iat_std_ms: f32,
-    periods: Vec<Period>,
     packet_count: usize,
     /// Raw sorted sizes for empirical quantile-based distribution building
     raw_sizes_sorted: Vec<u16>,
@@ -76,29 +71,11 @@ struct DirectionalAnalysis {
     raw_iats_sorted: Vec<f64>,
 }
 
-#[allow(dead_code)]
 struct HeaderObservation {
     template: Vec<u8>,
-    randomize_indices: Vec<usize>,
     header_spec: Option<HeaderSpec>,
     match_rate: f32,
     spec_confidence: f32,
-}
-
-/// Statistical mode (peak in distribution)
-#[allow(dead_code)]
-struct Mode {
-    center: f32,
-    std_dev: f32,
-    weight: f32,
-}
-
-/// Periodic IAT pattern
-#[allow(dead_code)]
-struct Period {
-    period_ms: f32,
-    jitter_ms: f32,
-    weight: f32,
 }
 
 /// Self-test result
@@ -332,130 +309,12 @@ fn analyze_direction(packets: &[&PacketMetadata]) -> DirectionalAnalysis {
     raw_iats_sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 
     DirectionalAnalysis {
-        size_modes: find_modes_histogram(&sizes, 32),
         size_mean: mean_u16(&sizes),
-        size_std: std_dev_u16(&sizes),
         iat_mean_ms: mean_f64(&iats) as f32,
         iat_std_ms: std_dev_f64(&iats) as f32,
-        periods: find_periods(&iats),
         packet_count: packets.len(),
         raw_sizes_sorted,
         raw_iats_sorted,
-    }
-}
-
-// ─── Mode Detection (Histogram) ─────────────────────────────────────────────
-
-fn find_modes_histogram(sizes: &[u16], num_bins: usize) -> Vec<Mode> {
-    if sizes.is_empty() {
-        return vec![Mode {
-            center: 64.0,
-            std_dev: 32.0,
-            weight: 1.0,
-        }];
-    }
-
-    let min = *sizes.iter().min().unwrap_or(&0);
-    let max = *sizes.iter().max().unwrap_or(&1500);
-    let bin_width = ((max - min) as f32 / num_bins as f32).max(1.0);
-
-    let mut bins = vec![0usize; num_bins];
-    for &size in sizes {
-        let bin = ((size as f32 - min as f32) / bin_width).min(num_bins as f32 - 1.0) as usize;
-        bins[bin] += 1;
-    }
-
-    let total = sizes.len() as f32;
-    let mut modes = Vec::new();
-
-    for i in 1..bins.len().saturating_sub(1) {
-        if bins[i] > bins[i - 1] && bins[i] > bins[i + 1] && bins[i] > total as usize / 20 {
-            let center = min as f32 + (i as f32 + 0.5) * bin_width;
-            let weight = bins[i] as f32 / total;
-
-            // Compute local std dev around this mode
-            let mut sum_sq = 0.0f32;
-            let mut count = 0usize;
-            for (j, &bin_count) in bins.iter().enumerate() {
-                if bin_count > 0 {
-                    let bc = min as f32 + (j as f32 + 0.5) * bin_width;
-                    sum_sq += (bin_count as f32) * (bc - center).powi(2);
-                    count += bin_count;
-                }
-            }
-            let std_dev = if count > 0 {
-                (sum_sq / count as f32).sqrt()
-            } else {
-                bin_width
-            };
-            modes.push(Mode {
-                center,
-                std_dev,
-                weight,
-            });
-        }
-    }
-
-    // Fallback: single mode from mean/std
-    if modes.is_empty() {
-        let mean = mean_u16(sizes);
-        let std = std_dev_u16(sizes);
-        modes.push(Mode {
-            center: mean,
-            std_dev: std,
-            weight: 1.0,
-        });
-    }
-
-    modes
-}
-
-// ─── Period Detection (IAT) ─────────────────────────────────────────────────
-
-fn find_periods(iats: &[f64]) -> Vec<Period> {
-    if iats.len() < 10 {
-        return vec![];
-    }
-
-    let mean_iat = mean_f64(iats);
-    let std_iat = std_dev_f64(iats);
-
-    if mean_iat < 1e-9 {
-        return vec![];
-    }
-
-    if std_iat / mean_iat < 0.3 {
-        // Stable single period
-        vec![Period {
-            period_ms: mean_iat as f32,
-            jitter_ms: std_iat as f32,
-            weight: 1.0,
-        }]
-    } else {
-        // Bimodal — split by median
-        let mut sorted = iats.to_vec();
-        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        let median = sorted[sorted.len() / 2];
-
-        let low: Vec<f64> = iats.iter().filter(|&&x| x <= median).copied().collect();
-        let high: Vec<f64> = iats.iter().filter(|&&x| x > median).copied().collect();
-
-        let mut periods = Vec::new();
-        if !low.is_empty() {
-            periods.push(Period {
-                period_ms: mean_f64(&low) as f32,
-                jitter_ms: std_dev_f64(&low) as f32,
-                weight: low.len() as f32 / iats.len() as f32,
-            });
-        }
-        if !high.is_empty() {
-            periods.push(Period {
-                period_ms: mean_f64(&high) as f32,
-                jitter_ms: std_dev_f64(&high) as f32,
-                weight: high.len() as f32 / iats.len() as f32,
-            });
-        }
-        periods
     }
 }
 
@@ -806,7 +665,6 @@ fn analyze_headers(headers: &[Vec<u8>]) -> HeaderObservation {
 
     HeaderObservation {
         template,
-        randomize_indices,
         header_spec,
         match_rate,
         spec_confidence,
@@ -1982,7 +1840,7 @@ mod tests {
     use super::{
         analyze_traffic, build_iat_distribution, build_mask_profile, detect_mimic_protocol,
         entropy_penalty, header_consensus, header_match_rate, infer_header_spec, ks_test,
-        sanitize_service_slug, self_test_passes, DirectionalAnalysis, Period,
+        sanitize_service_slug, self_test_passes, DirectionalAnalysis,
     };
     use aivpn_common::mask::{HeaderSpec, IATDistType, SpoofProtocol};
     use aivpn_common::mimic_protocol::MimicProtocol;
@@ -2030,23 +1888,9 @@ mod tests {
         raw_iats.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 
         let direction = DirectionalAnalysis {
-            size_modes: vec![],
             size_mean: 900.0,
-            size_std: 120.0,
             iat_mean_ms: 52.0,
             iat_std_ms: 28.0,
-            periods: vec![
-                Period {
-                    period_ms: 20.0,
-                    jitter_ms: 5.0,
-                    weight: 0.6,
-                },
-                Period {
-                    period_ms: 100.0,
-                    jitter_ms: 30.0,
-                    weight: 0.4,
-                },
-            ],
             packet_count: 400,
             raw_sizes_sorted: vec![],
             raw_iats_sorted: raw_iats,
@@ -2184,12 +2028,9 @@ mod tests {
         }
         raw_iats.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         let direction = DirectionalAnalysis {
-            size_modes: vec![],
             size_mean: 800.0,
-            size_std: 100.0,
             iat_mean_ms: 45.0,
             iat_std_ms: 30.0,
-            periods: vec![],
             packet_count: 20,
             raw_sizes_sorted: vec![],
             raw_iats_sorted: raw_iats,

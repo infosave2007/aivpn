@@ -1,4 +1,6 @@
+mod app_routing;
 mod appearance;
+mod desktop_session;
 mod i18n;
 mod messages;
 mod modal;
@@ -77,7 +79,7 @@ fn strip_ansi(s: &str) -> String {
 
 /// Best-effort path to a client binary able to run `kill-switch clear`
 /// without prompting: prefer the persisted CAP_NET_ADMIN copy installed by
-/// `ensure_capable_binary()`, falling back to the sibling build output.
+/// `ensure_installed_image()`, falling back to the sibling build output.
 fn capable_client_binary() -> Option<std::path::PathBuf> {
     if let Some(persisted) = dirs::data_local_dir().map(|d| d.join("aivpn").join("aivpn-client")) {
         if persisted.is_file() {
@@ -87,80 +89,74 @@ fn capable_client_binary() -> Option<std::path::PathBuf> {
     find_client_binary().ok()
 }
 
-/// Spawn `aivpn-client kill-switch clear` detached (never waited on by the
-/// UI thread). Used when the client had to be SIGKILLed while the kill-switch
-/// was active: SIGKILL bypasses the client's own firewall cleanup, which
-/// would otherwise leave the user with all non-VPN traffic blocked. Matches
-/// the Windows GUI's run_kill_switch_clear-after-TerminateProcess behavior.
-fn spawn_kill_switch_clear() {
-    if let Some(binary) = capable_client_binary() {
-        let _ = std::process::Command::new(binary)
-            .args(["kill-switch", "clear"])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn();
-    }
-}
-
-/// Gracefully terminate the aivpn-client child: SIGTERM first so the
-/// client's signal handler deactivates the kill-switch and restores routes
-/// (the client does NOT clear firewall rules on SIGKILL — it can't, SIGKILL
-/// is uncatchable), then SIGKILL only if it is still alive after a grace
-/// period.
-///
-/// `clear_inline` selects how a needed `kill-switch clear` runs after a
-/// forced SIGKILL: `false` (Disconnect / app teardown) spawns it detached so
-/// the GUI never waits on it; `true` (reconnect) runs it to completion
-/// *inside* this future, so by the time the caller proceeds to spawn a NEW
-/// client no stray detached clear can fire seconds later and silently wipe
-/// the new session's firewall rules (fail-open while the UI shows protected).
+/// Завершаем процесс до очистки правил. Новый сеанс ждет обе операции.
 async fn terminate_child_wait(
     mut child: tokio::process::Child,
     kill_switch_active: bool,
-    clear_inline: bool,
-) {
+) -> Result<(), String> {
     if let Some(pid) = child.id() {
         unsafe {
             libc::kill(pid as libc::pid_t, libc::SIGTERM);
         }
     }
-    if tokio::time::timeout(std::time::Duration::from_secs(3), child.wait())
-        .await
-        .is_err()
-    {
-        // Still alive after the grace period — force-kill, reap, and
-        // clear any firewall rules the client never got to remove.
-        let _ = child.start_kill();
-        let _ = child.wait().await;
-        if kill_switch_active {
-            if clear_inline {
-                // kill_on_drop: if the clear itself hangs past the timeout it
-                // is killed, not left running where it could later remove the
-                // NEW session's rules.
-                if let Some(binary) = capable_client_binary() {
-                    let mut cmd = tokio::process::Command::new(binary);
-                    cmd.args(["kill-switch", "clear"])
-                        .stdout(std::process::Stdio::null())
-                        .stderr(std::process::Stdio::null())
-                        .kill_on_drop(true);
-                    if let Ok(mut clear) = cmd.spawn() {
-                        let _ =
-                            tokio::time::timeout(std::time::Duration::from_secs(5), clear.wait())
-                                .await;
-                    }
-                }
-            } else {
-                spawn_kill_switch_clear();
-            }
+    let grace = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    let deadline = grace + std::time::Duration::from_secs(1);
+    let mut killed = false;
+    loop {
+        if child.try_wait().map_err(|e| e.to_string())?.is_some() {
+            break;
         }
+        if std::time::Instant::now() >= deadline {
+            return Err("client did not exit after SIGKILL".into());
+        }
+        if !killed && std::time::Instant::now() >= grace {
+            child.start_kill().map_err(|e| e.to_string())?;
+            killed = true;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
     remove_client_pidfile();
+    // Даже exit(0) не подтверждает успешное удаление правил брандмауэра.
+    if kill_switch_active {
+        finish_verified_clear(None).await?;
+    }
+    remove_ks_marker();
+    Ok(())
+}
+
+async fn terminate_child_preserving_rules(mut child: tokio::process::Child) -> Message {
+    // Ошибка подключения не является намеренным снятием защиты.
+    // SIGTERM запустил бы штатную очистку клиента; здесь сохраняем правила.
+    let result = match child.try_wait() {
+        Ok(Some(_)) => Ok(()),
+        Ok(None) => match child.start_kill() {
+            Ok(()) => child.wait().await.map(|_| ()),
+            Err(error) => Err(error),
+        },
+        Err(error) => Err(error),
+    };
+    match result {
+        Ok(()) => {
+            remove_client_pidfile();
+            Message::UnexpectedClientReaped
+        }
+        Err(error) => Message::ClientReapFailed(error.to_string()),
+    }
 }
 
 /// Detached variant for Disconnect / teardown paths: the reap happens on a
 /// background task so the UI never blocks.
 fn terminate_child_graceful(child: tokio::process::Child, kill_switch_active: bool) {
-    tokio::spawn(terminate_child_wait(child, kill_switch_active, false));
+    tokio::spawn(async move {
+        let _ = terminate_child_wait(child, kill_switch_active).await;
+    });
+}
+
+fn reap_to_message(result: Result<(), String>) -> Message {
+    match result {
+        Ok(()) => Message::OldClientReaped,
+        Err(error) => Message::ClientReapFailed(error),
+    }
 }
 
 fn is_root() -> bool {
@@ -198,6 +194,10 @@ fn proc_starttime(pid: u32) -> Option<u64> {
 }
 
 fn client_pidfile_path() -> std::path::PathBuf {
+    #[cfg(test)]
+    if let Some(dir) = KS_MARKER_DIR.with(|slot| slot.borrow().clone()) {
+        return dir.join("client.pid");
+    }
     aivpn_runtime_dir().join("client.pid")
 }
 
@@ -216,6 +216,203 @@ fn write_client_pidfile(pid: u32) {
 
 fn remove_client_pidfile() {
     let _ = std::fs::remove_file(client_pidfile_path());
+}
+
+#[cfg(test)]
+thread_local! {
+    static KS_MARKER_DIR: std::cell::RefCell<Option<std::path::PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Приватная пометка: этот GUI запускал клиент с kill-switch.
+/// После аварии файл остается, обычный pidfile к тому моменту уже снят.
+fn ks_marker_path() -> std::path::PathBuf {
+    #[cfg(test)]
+    if let Some(dir) = KS_MARKER_DIR.with(|slot| slot.borrow().clone()) {
+        return dir.join("kill-switch.held");
+    }
+    aivpn_runtime_dir().join("kill-switch.held")
+}
+
+fn parse_ks_marker(text: &str) -> Option<(u32, u64)> {
+    let mut parts = text.split_whitespace();
+    let pid = parts.next()?.parse().ok()?;
+    let starttime = parts.next()?.parse().ok()?;
+    Some((pid, starttime))
+}
+
+fn read_ks_marker() -> Option<(u32, u64)> {
+    let text = std::fs::read_to_string(ks_marker_path()).ok()?;
+    parse_ks_marker(&text)
+}
+
+fn write_ks_marker_for(pid: u32) {
+    let Some(starttime) = proc_starttime(pid) else {
+        return;
+    };
+    let path = ks_marker_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(path, format!("{pid} {starttime}\n"));
+}
+
+fn remove_ks_marker() {
+    let _ = std::fs::remove_file(ks_marker_path());
+}
+
+fn remove_matching_ks_marker(pid: u32, starttime: u64) {
+    if read_ks_marker() == Some((pid, starttime)) {
+        remove_ks_marker();
+    }
+}
+
+fn list_live_aivpn_clients() -> Vec<(u32, u64)> {
+    let mut live = Vec::new();
+    let own_network = std::fs::read_link("/proc/self/ns/net").ok();
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return live;
+    };
+    for entry in entries.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|s| s.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let Ok(comm) = std::fs::read_to_string(format!("/proc/{pid}/comm")) else {
+            continue;
+        };
+        if comm.trim() != "aivpn-client" {
+            continue;
+        }
+        if let (Some(ours), Ok(theirs)) = (
+            &own_network,
+            std::fs::read_link(format!("/proc/{pid}/ns/net")),
+        ) {
+            if *ours != theirs {
+                continue;
+            }
+        }
+        if let Some(starttime) = proc_starttime(pid) {
+            live.push((pid, starttime));
+        }
+    }
+    live
+}
+
+fn ks_clear_blocked_by(live: &[(u32, u64)]) -> bool {
+    !live.is_empty()
+}
+
+struct KsRecovery {
+    retained: bool,
+    adopt: Option<(u32, u64)>,
+    note_launched_ks: bool,
+}
+
+/// Что делать с пометкой своего запуска при старте GUI.
+/// Чужой живой клиент не усыновляем и не чистим.
+fn assess_ks_recovery(
+    marker: Option<(u32, u64)>,
+    marker_alive: bool,
+    adopted: Option<(u32, u64)>,
+    live: &[(u32, u64)],
+) -> KsRecovery {
+    let Some(marker) = marker else {
+        return KsRecovery {
+            retained: false,
+            adopt: None,
+            note_launched_ks: false,
+        };
+    };
+    if adopted == Some(marker) {
+        return KsRecovery {
+            retained: false,
+            adopt: None,
+            note_launched_ks: true,
+        };
+    }
+    if adopted.is_some() {
+        return KsRecovery {
+            retained: false,
+            adopt: None,
+            note_launched_ks: false,
+        };
+    }
+    if marker_alive {
+        return KsRecovery {
+            retained: false,
+            adopt: Some(marker),
+            note_launched_ks: true,
+        };
+    }
+    let _ = live;
+    KsRecovery {
+        retained: true,
+        adopt: None,
+        note_launched_ks: true,
+    }
+}
+
+async fn verified_kill_switch_clear_with(
+    binary: &std::path::Path,
+    timeout: std::time::Duration,
+) -> Result<(), String> {
+    let mut cmd = tokio::process::Command::new(binary);
+    cmd.args(["cli", "kill-switch", "clear"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .process_group(0)
+        .kill_on_drop(true);
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("kill-switch clear failed to start: {e}"))?;
+    // Помощники ip/nft не должны пережить таймаут и снять уже новые правила.
+    struct ClearGroup(Option<u32>);
+    impl ClearGroup {
+        fn stop(&mut self) {
+            if let Some(pid) = self.0.take() {
+                unsafe { libc::kill(-(pid as libc::pid_t), libc::SIGKILL) };
+            }
+        }
+    }
+    impl Drop for ClearGroup {
+        fn drop(&mut self) {
+            self.stop();
+        }
+    }
+    let mut group = ClearGroup(child.id());
+    let result = tokio::time::timeout(timeout, child.wait()).await;
+    group.stop();
+    if result.is_err() {
+        let _ = child.wait().await;
+    }
+    match result {
+        Ok(Ok(status)) if status.success() => Ok(()),
+        Ok(Ok(status)) => Err(format!("kill-switch clear exited with {status}")),
+        Ok(Err(e)) => Err(format!("kill-switch clear wait failed: {e}")),
+        Err(_) => Err("kill-switch clear timed out".into()),
+    }
+}
+
+async fn verified_kill_switch_clear() -> Result<(), String> {
+    let Some(binary) = capable_client_binary() else {
+        return Err("no capable client binary for kill-switch clear".into());
+    };
+    verified_kill_switch_clear_with(&binary, std::time::Duration::from_secs(5)).await
+}
+
+async fn finish_verified_clear(except: Option<(u32, u64)>) -> Result<(), String> {
+    let others: Vec<(u32, u64)> = list_live_aivpn_clients()
+        .into_iter()
+        .filter(|id| Some(*id) != except)
+        .collect();
+    if ks_clear_blocked_by(&others) {
+        return Err("another aivpn-client is still running".into());
+    }
+    verified_kill_switch_clear().await
 }
 
 /// Startup recovery: if the pidfile left by a previous (crashed) GUI run
@@ -262,27 +459,79 @@ pub fn acquire_single_instance_lock() -> Result<Option<std::fs::File>, ()> {
     }
 }
 
-/// SIGTERM an ADOPTED (recovered from a previous GUI run — not our child, so
-/// it cannot be wait()ed) client and poll for its exit; after the grace
-/// period SIGKILL it and clear any firewall rules its kill-switch may have
-/// left. The recovered session's launch flags are unknown, so the clear is
-/// unconditional — a spurious clear is harmless.
-async fn terminate_adopted_wait(pid: u32, starttime: u64) {
-    unsafe {
-        libc::kill(pid as libc::pid_t, libc::SIGTERM);
+/// Дескриптор привязан к одному процессу, повторное использование PID безопасно.
+fn adopted_process(pid: u32, starttime: u64) -> Result<Option<std::os::fd::OwnedFd>, String> {
+    use std::os::fd::FromRawFd;
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+    if fd < 0 {
+        let error = std::io::Error::last_os_error();
+        return if error.raw_os_error() == Some(libc::ESRCH) {
+            Ok(None)
+        } else {
+            Err(format!("pidfd_open: {error}"))
+        };
     }
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-    while proc_starttime(pid) == Some(starttime) {
-        if std::time::Instant::now() >= deadline {
-            unsafe {
-                libc::kill(pid as libc::pid_t, libc::SIGKILL);
-            }
-            spawn_kill_switch_clear();
-            break;
+    let fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd as i32) };
+    Ok((proc_starttime(pid) == Some(starttime)).then_some(fd))
+}
+
+fn signal_adopted(fd: &std::os::fd::OwnedFd, signal: i32) -> Result<(), String> {
+    use std::os::fd::AsRawFd;
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_pidfd_send_signal,
+            fd.as_raw_fd(),
+            signal,
+            std::ptr::null::<libc::siginfo_t>(),
+            0,
+        )
+    };
+    if result < 0 {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::ESRCH) {
+            return Err(format!("pidfd_send_signal: {error}"));
         }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    Ok(())
+}
+
+async fn terminate_adopted_wait(pid: u32, starttime: u64) -> Result<(), String> {
+    use std::os::fd::AsRawFd;
+    let had_rules = read_ks_marker() == Some((pid, starttime));
+    if let Some(fd) = adopted_process(pid, starttime)? {
+        signal_adopted(&fd, libc::SIGTERM)?;
+        let grace = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let deadline = grace + std::time::Duration::from_secs(1);
+        let mut killed = false;
+        loop {
+            let mut poll = libc::pollfd {
+                fd: fd.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let result = unsafe { libc::poll(&mut poll, 1, 0) };
+            if result > 0 {
+                break;
+            }
+            if result < 0 {
+                return Err(std::io::Error::last_os_error().to_string());
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err("adopted client did not exit after SIGKILL".into());
+            }
+            if !killed && std::time::Instant::now() >= grace {
+                signal_adopted(&fd, libc::SIGKILL)?;
+                killed = true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
     }
     remove_client_pidfile();
+    if had_rules {
+        finish_verified_clear(Some((pid, starttime))).await?;
+    }
+    remove_matching_ks_marker(pid, starttime);
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -334,19 +583,31 @@ impl AdaptiveOption {
     fn desc(&self, lang: &str) -> &'static str {
         if lang == "ru" {
             match self {
-                AdaptiveOption::Auto => "Только шифрование. Без маскировки трафика.",
-                AdaptiveOption::Low => "Базовая маскировка. Keepalive каждые 15 с.",
-                AdaptiveOption::Medium => "Имитация HTTPS/QUIC. Keepalive каждые 8 с.",
+                AdaptiveOption::Auto => {
+                    "Начальный уровень: keepalive 8 с, FEC выключена. Маска остается активной."
+                }
+                AdaptiveOption::Low => {
+                    "Начальный уровень: keepalive 6 с, FEC 1/16. Далее учитываются потери."
+                }
+                AdaptiveOption::Medium => {
+                    "Начальный уровень: keepalive 4 с, FEC 1/8. Далее учитываются потери."
+                }
                 AdaptiveOption::High => {
-                    "Оптимизация для высокой задержки (>300 мс). Максимальная маскировка."
+                    "Начальный уровень: keepalive 15 с, FEC 1/4. Для высокой задержки."
                 }
             }
         } else {
             match self {
-                AdaptiveOption::Auto => "Encryption only. No traffic mimicry.",
-                AdaptiveOption::Low => "Basic mimicry. Keepalive every 15 s.",
-                AdaptiveOption::Medium => "HTTPS/QUIC mimicry. Keepalive every 8 s.",
-                AdaptiveOption::High => "Optimized for high latency (>300 ms). Maximum mimicry.",
+                AdaptiveOption::Auto => {
+                    "Initial level: 8s keepalive, FEC off. The mask remains active."
+                }
+                AdaptiveOption::Low => {
+                    "Initial level: 6s keepalive, FEC 1/16. Later adjusted to measured loss."
+                }
+                AdaptiveOption::Medium => {
+                    "Initial level: 4s keepalive, FEC 1/8. Later adjusted to measured loss."
+                }
+                AdaptiveOption::High => "Initial level: 15s keepalive, FEC 1/4. For high latency.",
             }
         }
     }
@@ -368,8 +629,8 @@ impl std::fmt::Display for AdaptiveOption {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let s = match self {
             AdaptiveOption::Auto => "Off",
-            AdaptiveOption::Low => "Light (keepalive 15s)",
-            AdaptiveOption::Medium => "Aggressive (keepalive 8s)",
+            AdaptiveOption::Low => "Light (keepalive 6s)",
+            AdaptiveOption::Medium => "Aggressive (keepalive 4s)",
             AdaptiveOption::High => "Satellite (high latency)",
         };
         write!(f, "{s}")
@@ -384,21 +645,17 @@ pub enum MaskOption {
     WebrtcYandexTelemostV1,
     WebrtcVkTeamsV1,
     WebrtcSberjazzV1,
+    Named(String),
 }
 
 impl MaskOption {
-    pub fn all() -> &'static [MaskOption] {
-        &[
-            MaskOption::Auto,
-            MaskOption::WebrtcZoomV3,
-            MaskOption::QuicHttpsV2,
-            MaskOption::WebrtcYandexTelemostV1,
-            MaskOption::WebrtcVkTeamsV1,
-            MaskOption::WebrtcSberjazzV1,
-        ]
+    pub fn all() -> Vec<MaskOption> {
+        std::iter::once(Self::Auto)
+            .chain(aivpn_common::mask::preset_masks::ids().map(Self::from_str))
+            .collect()
     }
 
-    pub fn as_str(&self) -> &'static str {
+    pub fn as_str(&self) -> &str {
         match self {
             MaskOption::Auto => "auto",
             MaskOption::WebrtcZoomV3 => "webrtc_zoom_v3",
@@ -406,6 +663,7 @@ impl MaskOption {
             MaskOption::WebrtcYandexTelemostV1 => "webrtc_yandex_telemost_v1",
             MaskOption::WebrtcVkTeamsV1 => "webrtc_vk_teams_v1",
             MaskOption::WebrtcSberjazzV1 => "webrtc_sberjazz_v1",
+            MaskOption::Named(id) => id,
         }
     }
 
@@ -416,13 +674,14 @@ impl MaskOption {
             "webrtc_yandex_telemost_v1" => MaskOption::WebrtcYandexTelemostV1,
             "webrtc_vk_teams_v1" => MaskOption::WebrtcVkTeamsV1,
             "webrtc_sberjazz_v1" => MaskOption::WebrtcSberjazzV1,
-            _ => MaskOption::Auto,
+            "" | "auto" => MaskOption::Auto,
+            _ => MaskOption::Named(s.to_owned()),
         }
     }
 }
 
 impl MaskOption {
-    fn label(&self) -> &'static str {
+    fn label(&self) -> &str {
         match self {
             MaskOption::Auto => "Auto (server default)",
             MaskOption::WebrtcZoomV3 => "Zoom WebRTC v3",
@@ -430,6 +689,7 @@ impl MaskOption {
             MaskOption::WebrtcYandexTelemostV1 => "Yandex Telemost",
             MaskOption::WebrtcVkTeamsV1 => "VK Teams",
             MaskOption::WebrtcSberjazzV1 => "SberJazz",
+            MaskOption::Named(id) => id,
         }
     }
 
@@ -442,6 +702,7 @@ impl MaskOption {
                 MaskOption::WebrtcYandexTelemostV1 => "Имитация Yandex Telemost видеозвонков.",
                 MaskOption::WebrtcVkTeamsV1 => "Имитация VK Teams корпоративного мессенджера.",
                 MaskOption::WebrtcSberjazzV1 => "Имитация трафика SberJazz конференций.",
+                MaskOption::Named(_) => "Профиль маски из встроенного набора или каталога сервера.",
             }
         } else {
             match self {
@@ -451,6 +712,7 @@ impl MaskOption {
                 MaskOption::WebrtcYandexTelemostV1 => "Mimics Yandex Telemost video calls.",
                 MaskOption::WebrtcVkTeamsV1 => "Mimics VK Teams corporate messenger traffic.",
                 MaskOption::WebrtcSberjazzV1 => "Mimics SberJazz conference traffic.",
+                MaskOption::Named(_) => "Mask profile from the bundled set or server catalog.",
             }
         }
     }
@@ -763,12 +1025,15 @@ pub enum UiPage {
     Overview,
     Profiles,
     Routes,
+    Applications,
     Masks,
     Settings,
     Service,
 }
 
 pub struct App {
+    app_routing: app_routing::Panel,
+    desktop_session: desktop_session::Session,
     page: UiPage,
     system_theme: iced::theme::Mode,
     dlg_key_visible: bool,
@@ -785,6 +1050,20 @@ pub struct App {
     /// consult this, not live settings — toggling the checkbox while
     /// connected must not skip (or invent) a needed `kill-switch clear`.
     launched_kill_switch: bool,
+    /// Правила остались после непреднамеренного выхода. Сами не снимаются.
+    kill_switch_retained: bool,
+    /// Одна проверенная очистка. Пока она не закончилась, новый клиент не стартует.
+    ks_clear_in_flight: bool,
+    /// Номер текущей очистки. Ответ с другим номером не меняет состояние.
+    ks_clear_generation: u64,
+    /// Текст неудачного снятия для баннера. Пусто, если ошибки нет.
+    ks_clear_error: Option<String>,
+    /// Явный Disconnect уже запрошен. Следующий Disconnected от worker не авария.
+    disconnect_requested: bool,
+    /// Ждем завершения своего дочернего клиента, чтобы поздняя очистка не задела новый сеанс.
+    child_reap_in_flight: bool,
+    #[cfg(test)]
+    ks_block_clear_override: Option<bool>,
     /// Orphaned aivpn-client adopted at startup from a crashed previous GUI
     /// run: (pid, /proc starttime). Not our child — torn down via
     /// `terminate_adopted_wait`, never wait()ed.
@@ -816,6 +1095,7 @@ pub struct App {
     // Recording
     recording_service: String,
     recording_state: RecordingState,
+    recording_allowed: Option<bool>,
     // Diagnostics / Bench
     bench_running: bool,
     bench_result: Option<String>,
@@ -984,10 +1264,15 @@ impl App {
     pub fn new() -> (Self, Task<Message>) {
         let settings = AppSettings::load();
         let storage = KeyStorage::load();
-        let (app, task) = Self::from_state(settings, storage, recover_orphaned_client());
+        let (mut app, task) = Self::from_state(settings, storage, recover_orphaned_client());
+        let recovery = app.apply_ks_marker_recovery();
         (
             app,
-            Task::batch([task, iced::system::theme().map(Message::SystemThemeChanged)]),
+            Task::batch([
+                task,
+                recovery,
+                iced::system::theme().map(Message::SystemThemeChanged),
+            ]),
         )
     }
 
@@ -1013,6 +1298,8 @@ impl App {
         };
         (
             Self {
+                app_routing: app_routing::Panel::default(),
+                desktop_session: desktop_session::Session::default(),
                 page: UiPage::Overview,
                 system_theme: iced::theme::Mode::None,
                 dlg_key_visible: false,
@@ -1024,6 +1311,14 @@ impl App {
                 connection_key: None,
                 pending_connect: false,
                 launched_kill_switch: false,
+                kill_switch_retained: false,
+                ks_clear_in_flight: false,
+                ks_clear_generation: 0,
+                ks_clear_error: None,
+                disconnect_requested: false,
+                child_reap_in_flight: false,
+                #[cfg(test)]
+                ks_block_clear_override: None,
                 adopted_client,
                 adopted_reap_in_flight: false,
                 child_handle: Arc::new(Mutex::new(None)),
@@ -1046,6 +1341,7 @@ impl App {
                 stats: TrafficStats::default(),
                 recording_service: String::new(),
                 recording_state: RecordingState::Idle,
+                recording_allowed: None,
                 bench_running: false,
                 bench_result: None,
                 logs_open: false,
@@ -1134,66 +1430,142 @@ impl App {
         )
     }
 
-    /// Blocking graceful teardown for app exit (tray Quit). Async tasks are
-    /// dropped when the runtime shuts down, so wait here on the UI thread
-    /// (bounded) for the client's SIGTERM cleanup — kill-switch firewall
-    /// rules, routes — to finish before kill_on_drop's SIGKILL fires.
+    /// При выходе ждем ту же ограниченную очистку, что и при Disconnect.
+    /// Отдельный runtime не зависит от остановленного цикла интерфейса.
     fn shutdown_child_blocking(&mut self) {
-        // Adopted (recovered, non-child) client: same SIGTERM + grace +
-        // SIGKILL sequence, but polled via /proc since it can't be wait()ed.
-        if let Some((pid, starttime)) = self.adopted_client.take() {
-            unsafe {
-                libc::kill(pid as libc::pid_t, libc::SIGTERM);
+        let managed_profile = self.closing_desktop_profile();
+        let adopted = self.adopted_client.take();
+        let child = self
+            .child_handle
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        let kill_switch = self.launched_kill_switch;
+        let result = std::thread::spawn(move || -> Result<(), String> {
+            if let Some(profile) = managed_profile {
+                aivpn_desktop_agent::client::editor::Operation::Stop(profile).execute()?;
             }
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-            while proc_starttime(pid) == Some(starttime) {
-                if std::time::Instant::now() >= deadline {
-                    unsafe {
-                        libc::kill(pid as libc::pid_t, libc::SIGKILL);
-                    }
-                    spawn_kill_switch_clear();
-                    break;
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| e.to_string())?;
+            runtime.block_on(async move {
+                if let Some((pid, starttime)) = adopted {
+                    terminate_adopted_wait(pid, starttime).await?;
                 }
-                std::thread::sleep(std::time::Duration::from_millis(50));
-            }
-            remove_client_pidfile();
-            return;
-        }
-        let mut guard = match self.child_handle.lock() {
-            Ok(g) => g,
-            Err(e) => e.into_inner(),
-        };
-        let Some(mut child) = guard.take() else {
-            return;
-        };
-        drop(guard);
-        if let Some(pid) = child.id() {
-            unsafe {
-                libc::kill(pid as libc::pid_t, libc::SIGTERM);
-            }
-        }
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-        loop {
-            match child.try_wait() {
-                Ok(Some(_)) => {
-                    remove_client_pidfile();
-                    return;
+                if let Some(child) = child {
+                    terminate_child_wait(child, kill_switch).await?;
                 }
-                Ok(None) if std::time::Instant::now() < deadline => {
-                    std::thread::sleep(std::time::Duration::from_millis(50));
-                }
-                _ => break,
+                Ok(())
+            })
+        })
+        .join();
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => self.push_log(error),
+            Err(_) => self.push_log("client shutdown worker failed".into()),
+        }
+    }
+
+    fn apply_ks_marker_recovery(&mut self) -> Task<Message> {
+        let marker = read_ks_marker();
+        let live = list_live_aivpn_clients();
+        let marker_alive = marker
+            .map(|id| live.iter().any(|live_id| *live_id == id))
+            .unwrap_or(false);
+        let decision = assess_ks_recovery(marker, marker_alive, self.adopted_client, &live);
+        if decision.note_launched_ks {
+            self.launched_kill_switch = true;
+        }
+        if let Some(adopt) = decision.adopt {
+            if self.adopted_client.is_none() {
+                self.adopted_client = Some(adopt);
+                self.status = VpnStatus::Connected {
+                    vpn_ip: "recovered".to_string(),
+                };
+                self.push_log(format!(
+                    "Recovered running aivpn-client (pid {}) from kill-switch marker",
+                    adopt.0
+                ));
+                return self.session_task(admin::get_role(), |role| {
+                    Message::SessionReply(0, Box::new(Message::AdminRoleLoaded(role)))
+                });
             }
         }
-        // Grace period expired (or wait failed) — force-kill and clear any
-        // firewall rules the client never got to remove. The clear process
-        // is detached, so it survives this GUI exiting right after.
-        let _ = child.start_kill();
-        let _ = child.try_wait();
-        if self.launched_kill_switch {
-            spawn_kill_switch_clear();
+        self.kill_switch_retained = decision.retained;
+        if decision.retained {
+            self.push_log("Kill switch stayed on after the client exited unexpectedly".to_string());
         }
-        remove_client_pidfile();
+        Task::none()
+    }
+
+    fn clear_blocked_by_live_client(&self) -> bool {
+        #[cfg(test)]
+        if let Some(blocked) = self.ks_block_clear_override {
+            return blocked;
+        }
+        ks_clear_blocked_by(&list_live_aivpn_clients())
+    }
+
+    fn ks_failure_text(&self) -> String {
+        t(
+            &self.settings.lang,
+            "Kill switch is still on. Removal did not finish.",
+        )
+        .to_string()
+    }
+
+    fn requested_kill_switch(&self) -> bool {
+        self.settings.kill_switch && !self.settings.socks5_enabled
+    }
+
+    fn begin_verified_clear(&mut self) -> Task<Message> {
+        if self.ks_clear_in_flight {
+            return Task::none();
+        }
+        if self.clear_blocked_by_live_client() {
+            self.pending_connect = false;
+            self.connection_key = None;
+            self.kill_switch_retained = true;
+            self.status = VpnStatus::Disconnected;
+            let text = t(
+                &self.settings.lang,
+                "Cannot remove the kill switch while another client is running.",
+            )
+            .to_string();
+            self.ks_clear_error = Some(text.clone());
+            self.push_log(text);
+            return Task::none();
+        }
+        self.ks_clear_in_flight = true;
+        self.ks_clear_error = None;
+        self.ks_clear_generation = self.ks_clear_generation.wrapping_add(1);
+        let generation = self.ks_clear_generation;
+        self.session_task(
+            async move { finish_verified_clear(None).await },
+            move |result| Message::KillSwitchClearFinished(generation, result),
+        )
+    }
+
+    fn start_client_now(&mut self) -> Task<Message> {
+        self.pending_connect = false;
+        self.child_reap_in_flight = false;
+        self.adopted_reap_in_flight = false;
+        if let Some(task) = self.begin_desktop_connect() {
+            return task;
+        }
+        if let Some(k) = self.storage.selected_key() {
+            self.launched_kill_switch = self.requested_kill_switch();
+            if !self.launched_kill_switch {
+                self.kill_switch_retained = false;
+                self.ks_clear_error = None;
+            }
+            self.connection_key = Some(k.key.clone());
+            self.status = VpnStatus::Connecting;
+        } else {
+            self.status = VpnStatus::Disconnected;
+        }
+        Task::none()
     }
 
     pub fn update(&mut self, msg: Message) -> Task<Message> {
@@ -1218,6 +1590,8 @@ impl App {
     }
 
     fn invalidate_session_views(&mut self) {
+        self.recording_state = RecordingState::Idle;
+        self.recording_allowed = None;
         self.admin_generation = self.admin_generation.wrapping_add(1);
         self.admin_role = None;
         self.admin_open = false;
@@ -1267,6 +1641,7 @@ impl App {
                     | Message::DnsProxyChanged(_)
                     | Message::ExcludeRoutesChanged(_)
                     | Message::IncludeRoutesChanged(_)
+                    | Message::SplitEnabledChanged(_)
                     | Message::ToggleSocks5(_)
                     | Message::Socks5AddrChanged(_)
                     | Message::MaskOptionChanged(_)
@@ -1288,7 +1663,19 @@ impl App {
             return Task::none();
         }
         match msg {
-            Message::PageSelected(page) => self.page = page,
+            Message::DesktopSession(event) => return self.update_desktop_session(event),
+            Message::AppRouting(event) => return self.update_app_routing(event),
+            Message::PageSelected(page) => {
+                self.page = page;
+                if page == UiPage::Applications
+                    && self.app_routing.snapshot.is_none()
+                    && !self.app_routing.busy
+                {
+                    return self.update_app_routing(app_routing::Event::Run(
+                        aivpn_desktop_agent::client::editor::Operation::Refresh,
+                    ));
+                }
+            }
             Message::LayoutChanged(layout) => {
                 self.set_layout(layout);
                 self.settings.save();
@@ -1358,10 +1745,14 @@ impl App {
             }
             Message::SessionReply(..) => return Task::none(),
             Message::Connect => {
+                if let Some(task) = self.begin_desktop_connect() {
+                    return task;
+                }
                 // 3c: a new connection attempt starts clean — any fallback
                 // badge from a previous session must not persist into this
                 // one until (if) the new child re-emits the status line.
                 self.bootstrap_fallback = false;
+                self.disconnect_requested = false;
                 if let Some(k) = self.storage.selected_key() {
                     let key = k.key.clone();
                     self.invalidate_session_views();
@@ -1380,9 +1771,9 @@ impl App {
                         // reconnect path below.
                         self.pending_connect = true;
                         self.connection_key = None;
-                        return session_task(terminate_adopted_wait(pid, starttime), |_| {
-                            Message::OldClientReaped
-                        });
+                        self.adopted_reap_in_flight = true;
+                        return self
+                            .session_task(terminate_adopted_wait(pid, starttime), reap_to_message);
                     }
                     if let Some(child) = old_child {
                         // Reconnect: the old client's SIGTERM cleanup (route
@@ -1395,74 +1786,177 @@ impl App {
                         // Task — the UI thread is never blocked.
                         self.pending_connect = true;
                         self.connection_key = None;
-                        return session_task(
-                            terminate_child_wait(child, self.launched_kill_switch, true),
-                            |_| Message::OldClientReaped,
-                        );
+                        self.child_reap_in_flight = true;
+                        let ks = self.launched_kill_switch;
+                        return self.session_task(terminate_child_wait(child, ks), reap_to_message);
                     }
-                    if self.pending_connect || self.adopted_reap_in_flight {
-                        // A reap from a previous reconnect — or an adopted
-                        // client's teardown kicked off by Disconnect — is
-                        // still in flight; OldClientReaped will spawn the
-                        // client with the currently selected profile when it
-                        // lands.
+                    if self.pending_connect
+                        || self.adopted_reap_in_flight
+                        || self.child_reap_in_flight
+                        || self.ks_clear_in_flight
+                    {
+                        // Очистка или reap уже идут. Второй Connect не запускает
+                        // еще одну очистку и не стартует клиент раньше времени.
                         self.pending_connect = true;
+                        self.connection_key = None;
                         return Task::none();
                     }
-                    self.launched_kill_switch = self.settings.kill_switch;
+                    if self.kill_switch_retained && !self.requested_kill_switch() {
+                        self.pending_connect = true;
+                        self.connection_key = None;
+                        return self.begin_verified_clear();
+                    }
+                    self.launched_kill_switch = self.requested_kill_switch();
+                    if !self.requested_kill_switch() {
+                        self.kill_switch_retained = false;
+                    }
                     self.connection_key = Some(key);
                 } else {
                     self.push_log("No profile selected".to_string());
                 }
             }
             Message::OldClientReaped => {
-                // Old client fully exited and any inline kill-switch clear has
-                // completed — safe to start the new client now.
                 self.adopted_reap_in_flight = false;
+                self.child_reap_in_flight = false;
+                if self.ks_clear_in_flight {
+                    return Task::none();
+                }
+                if self.launched_kill_switch {
+                    // Клиент сам снял правила или очистка уже проверена.
+                    self.kill_switch_retained = false;
+                    self.ks_clear_error = None;
+                }
+                if self.pending_connect
+                    && self.kill_switch_retained
+                    && !self.requested_kill_switch()
+                {
+                    self.connection_key = None;
+                    return self.begin_verified_clear();
+                }
                 if self.pending_connect {
-                    self.pending_connect = false;
-                    if let Some(k) = self.storage.selected_key() {
-                        self.launched_kill_switch = self.settings.kill_switch;
-                        self.connection_key = Some(k.key.clone());
-                    } else {
+                    return self.start_client_now();
+                }
+            }
+            Message::UnexpectedClientReaped => {
+                self.child_reap_in_flight = false;
+                if self.disconnect_requested
+                    || (self.pending_connect && !self.requested_kill_switch())
+                {
+                    return self.begin_verified_clear();
+                }
+                if self.pending_connect {
+                    return self.start_client_now();
+                }
+            }
+            Message::ClientReapFailed(error) => {
+                self.adopted_reap_in_flight = false;
+                self.child_reap_in_flight = false;
+                self.pending_connect = false;
+                self.connection_key = None;
+                self.kill_switch_retained = true;
+                self.status = VpnStatus::Disconnected;
+                self.ks_clear_error = Some(self.ks_failure_text());
+                self.push_log(error);
+            }
+            Message::ClearRetainedKillSwitch => {
+                if !self.kill_switch_retained || self.ks_clear_in_flight || self.profiles_locked() {
+                    return Task::none();
+                }
+                self.pending_connect = false;
+                self.connection_key = None;
+                return self.begin_verified_clear();
+            }
+            Message::KillSwitchClearFinished(generation, result) => {
+                if generation != self.ks_clear_generation || !self.ks_clear_in_flight {
+                    return Task::none();
+                }
+                self.ks_clear_in_flight = false;
+                match result {
+                    Ok(()) => {
+                        remove_ks_marker();
+                        self.kill_switch_retained = false;
+                        self.launched_kill_switch = false;
+                        self.ks_clear_error = None;
+                        if self.pending_connect {
+                            return self.start_client_now();
+                        } else if !matches!(self.status, VpnStatus::Connected { .. }) {
+                            self.status = VpnStatus::Disconnected;
+                        }
+                    }
+                    Err(error) => {
+                        self.pending_connect = false;
+                        self.connection_key = None;
+                        self.kill_switch_retained = true;
                         self.status = VpnStatus::Disconnected;
+                        self.ks_clear_error = Some(self.ks_failure_text());
+                        self.push_log(error);
                     }
                 }
             }
             Message::Disconnect => {
+                if let Some(task) = self.disconnect_desktop_session() {
+                    return task;
+                }
                 self.invalidate_session_views();
+                self.disconnect_requested = true;
                 self.pending_connect = false;
                 self.connection_key = None;
-                let reap_task = if let Some((pid, starttime)) = self.adopted_client.take() {
+                self.bootstrap_fallback = false;
+                if self.ks_clear_in_flight {
+                    // Очистка уже одна. Disconnect только отменяет запуск,
+                    // чтобы ее завершение не стартовало клиент.
+                    self.status = VpnStatus::Disconnected;
+                    self.push_log("Disconnected".to_string());
+                    return Task::none();
+                }
+                if self.child_reap_in_flight {
+                    self.status = VpnStatus::Disconnected;
+                    return Task::none();
+                }
+                if let Some((pid, starttime)) = self.adopted_client.take() {
                     // Sequenced, not fire-and-forget: a Connect pressed
                     // during the ~3 s SIGTERM grace must defer its spawn to
                     // OldClientReaped (see `adopted_reap_in_flight`), or the
                     // old client's late route restore / kill-switch clear
                     // would tear down the new session.
                     self.adopted_reap_in_flight = true;
-                    session_task(terminate_adopted_wait(pid, starttime), |_| {
-                        Message::OldClientReaped
-                    })
-                } else {
-                    Task::none()
-                };
+                    self.status = VpnStatus::Disconnected;
+                    self.push_log("Disconnected".to_string());
+                    let mut guard = match self.child_handle.lock() {
+                        Ok(g) => g,
+                        Err(e) => e.into_inner(),
+                    };
+                    if let Some(child) = guard.take() {
+                        terminate_child_graceful(child, self.launched_kill_switch);
+                    }
+                    return self
+                        .session_task(terminate_adopted_wait(pid, starttime), reap_to_message);
+                }
                 // Recover from a poisoned mutex so the kill() always executes.
                 let mut guard = match self.child_handle.lock() {
                     Ok(g) => g,
                     Err(e) => e.into_inner(),
                 };
                 if let Some(child) = guard.take() {
-                    // SIGTERM (not SIGKILL) so the client clears its
-                    // kill-switch firewall rules; reaped on a background task.
-                    terminate_child_graceful(child, self.launched_kill_switch);
+                    drop(guard);
+                    // SIGTERM, затем при необходимости проверенная очистка до нового запуска.
+                    self.child_reap_in_flight = true;
+                    self.status = VpnStatus::Disconnected;
+                    self.push_log("Disconnected".to_string());
+                    let ks = self.launched_kill_switch;
+                    return self.session_task(terminate_child_wait(child, ks), reap_to_message);
                 }
                 drop(guard);
                 self.status = VpnStatus::Disconnected;
-                self.bootstrap_fallback = false;
                 self.push_log("Disconnected".to_string());
-                return reap_task;
+                if self.kill_switch_retained {
+                    return self.begin_verified_clear();
+                }
             }
             Message::StatusReceived(s) => {
+                if self.has_desktop_session() {
+                    return Task::none();
+                }
                 if matches!(s, VpnStatus::Disconnected)
                     && matches!(self.status, VpnStatus::Error(_))
                 {
@@ -1496,11 +1990,22 @@ impl App {
                 {
                     notification::connection_changed(false);
                 }
+                let previous_live = matches!(
+                    self.status,
+                    VpnStatus::Connected { .. } | VpnStatus::Connecting
+                );
+                let intentional = self.disconnect_requested;
+                self.disconnect_requested = false;
                 self.status = s;
+                if matches!(self.status, VpnStatus::Connected { .. }) {
+                    self.kill_switch_retained = false;
+                    self.ks_clear_error = None;
+                }
                 // A terminal status means the worker stream has ended. Clear the
                 // connection key so its subscription id is dropped from the set;
                 // otherwise iced keeps the finished id and never respawns the worker
                 // on the next Connect, hanging forever on "Connecting...".
+                let mut reap_task = Task::none();
                 if matches!(self.status, VpnStatus::Disconnected | VpnStatus::Error(_)) {
                     self.connection_key = None;
                     // A terminal status can now also arrive from an
@@ -1513,7 +2018,22 @@ impl App {
                         Err(e) => e.into_inner(),
                     };
                     if let Some(child) = guard.take() {
-                        terminate_child_graceful(child, self.launched_kill_switch);
+                        if self.launched_kill_switch {
+                            self.child_reap_in_flight = true;
+                            self.kill_switch_retained = true;
+                            reap_task =
+                                self.session_task(terminate_child_preserving_rules(child), |m| m);
+                        } else {
+                            terminate_child_graceful(child, false);
+                        }
+                    } else if self.launched_kill_switch
+                        && !intentional
+                        && previous_live
+                        && !self.child_reap_in_flight
+                        && !self.adopted_reap_in_flight
+                    {
+                        // Worker уже забрал процесс. Правила после аварии остаются.
+                        self.kill_switch_retained = true;
                     }
                 }
                 if became_disconnected {
@@ -1542,8 +2062,9 @@ impl App {
                     self.admin_clients.clear();
                     self.admin_clients_loading = false;
                     self.admin_error = None;
-                    return session_task(admin::get_role(), Message::AdminRoleLoaded);
+                    return self.session_task(admin::get_role(), Message::AdminRoleLoaded);
                 }
+                return reap_task;
             }
             Message::BootstrapFallbackDetected => {
                 self.bootstrap_fallback = true;
@@ -1558,7 +2079,7 @@ impl App {
                 self.logs_open = !self.logs_open;
             }
             Message::SaveLog => {
-                return session_task(
+                return self.session_task(
                     async {
                         rfd::AsyncFileDialog::new()
                             .set_file_name("aivpn-debug.log")
@@ -1692,6 +2213,10 @@ impl App {
             }
             Message::ExcludeRoutesChanged(s) => {
                 self.settings.exclude_routes = s;
+                self.settings.save();
+            }
+            Message::SplitEnabledChanged(value) => {
+                self.settings.split_enabled = value;
                 self.settings.save();
             }
             Message::IncludeRoutesChanged(s) => {
@@ -1829,6 +2354,9 @@ impl App {
                 self.settings.save();
             }
             Message::StatsRefresh(s) => {
+                if self.has_desktop_session() {
+                    return self.poll_desktop_session().unwrap_or_else(Task::none);
+                }
                 // `since` is the client's per-session epoch: a change while
                 // Connected means the client silently reconnected in-process
                 // (its counters and timer reset together) — surface it.
@@ -1843,6 +2371,15 @@ impl App {
                     }
                 }
                 self.stats = s;
+                if self.page == UiPage::Applications
+                    && self.app_routing.snapshot.is_some()
+                    && !self.app_routing.busy
+                    && self.app_routing.error.is_none()
+                {
+                    return self.update_app_routing(app_routing::Event::Run(
+                        aivpn_desktop_agent::client::editor::Operation::Inspect,
+                    ));
+                }
             }
             Message::TrayEvent(action) => match action {
                 crate::tray::TrayAction::Quit => {
@@ -1897,35 +2434,36 @@ impl App {
                     svc
                 };
                 self.recording_state = RecordingState::Active(svc.clone());
-                let binary = find_client_binary().ok();
-                return session_task(
+                return self.session_task(
                     async move {
-                        if let Some(bin) = binary {
-                            let _ = tokio::process::Command::new(&bin)
-                                .env_remove("AIVPN_ADMIN_LISTEN")
-                                .args(["record", "start", "--service", &svc])
-                                .output()
-                                .await;
-                        }
+                        admin::command(
+                            format!("record_start:{svc}"),
+                            std::time::Duration::from_secs(12),
+                        )
+                        .await
+                        .map(|_| ())
                     },
-                    |_| Message::Noop,
+                    Message::RecordingCommandResult,
                 );
             }
             Message::StopRecording => {
                 self.recording_state = RecordingState::Stopping;
-                let binary = find_client_binary().ok();
-                return session_task(
-                    async move {
-                        if let Some(bin) = binary {
-                            let _ = tokio::process::Command::new(&bin)
-                                .env_remove("AIVPN_ADMIN_LISTEN")
-                                .args(["record", "stop"])
-                                .output()
-                                .await;
-                        }
+                return self.session_task(
+                    async {
+                        admin::command("record_stop".into(), std::time::Duration::from_secs(12))
+                            .await
+                            .map(|_| ())
                     },
-                    |_| Message::Noop,
+                    Message::RecordingCommandResult,
                 );
+            }
+            Message::RecordingCommandResult(result) => {
+                if let Err(details) = result {
+                    self.recording_state = RecordingState::Done {
+                        succeeded: false,
+                        details,
+                    };
+                }
             }
             Message::RecordingPoll(snapshot) => {
                 if let Some(snap) = snapshot {
@@ -1971,54 +2509,39 @@ impl App {
                 }
                 self.bench_running = true;
                 self.bench_result = None;
+                let limited_note = t(
+                    &self.settings.lang,
+                    "Speed is limited by the test method; link capacity may be higher.",
+                )
+                .to_owned();
                 let key = self
                     .storage
                     .selected_key()
                     .map(|k| k.key.clone())
                     .unwrap_or_default();
-                let binary = find_client_binary().ok();
-                return session_task(
+                return self.session_task(
                     async move {
-                        let bin = binary?;
-                        if key.is_empty() {
-                            return Some("No profile selected".to_string());
+                        let reply = match admin::command("bench:5".into(), std::time::Duration::from_secs(22)).await {
+                            Ok(reply) => reply,
+                            Err(error) => return Some(format!("Тест сессии не выполнен: {error}")),
+                        };
+                        let v: serde_json::Value = serde_json::from_str(&reply).ok()?;
+                        if let Some(error) = v.get("error").and_then(|value| value.as_str()) {
+                            return Some(format!("Тест сессии не выполнен: {error}"));
                         }
-                        // Pass the key via env, not argv: argv is world-readable
-                        // via /proc/<pid>/cmdline, so `--connection-key <key>`
-                        // leaked the embedded PSK to any local user for the
-                        // duration of the bench. The client reads
-                        // AIVPN_CONNECTION_KEY when -k is absent (main.rs) and
-                        // scrubs it from its own env right after parsing.
-                        let out = tokio::process::Command::new(&bin)
-                            .env("AIVPN_CONNECTION_KEY", &key)
-                            .env("AIVPN_ADMIN_TOKEN", admin::pinned_token()?)
-                            .env_remove("AIVPN_ADMIN_LISTEN")
-                            .kill_on_drop(true)
-                            .args(["bench", "--duration", "5", "--json"])
-                            .output()
-                            .await
-                            .ok()?;
-                        if out.status.success() {
-                            let v: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
-                            // extract_server_addr handles IPv6 addresses like [::1]:443 correctly
-                            let srv =
-                                extract_server_addr(&key).unwrap_or_else(|| "unknown".to_string());
-                            Some(format!(
-                                "{srv}  P50: {:.0}ms  P95: {:.0}ms  Loss: {:.1}%  Q: {}%  ↑ {:.0} ↓ {:.0} kbps",
-                                v["latency_p50_ms"].as_f64().unwrap_or(0.0),
-                                v["latency_p95_ms"].as_f64().unwrap_or(0.0),
-                                v["packet_loss_pct"].as_f64().unwrap_or(0.0),
-                                v["quality_score"].as_u64().unwrap_or(0),
-                                v["throughput_up_kbps"].as_f64().unwrap_or(0.0),
-                                v["throughput_down_kbps"].as_f64().unwrap_or(0.0),
-                            ))
-                        } else {
-                            let stderr = String::from_utf8_lossy(&out.stderr).to_string();
-                            Some(format!(
-                                "bench failed: {}",
-                                stderr.lines().next().unwrap_or("unknown error")
-                            ))
-                        }
+                        let srv = extract_server_addr(&key).unwrap_or_else(|| "unknown".to_string());
+                        Some(format!(
+                            "{srv}  P50: {:.0}ms  P95: {:.0}ms  Loss: {:.1}%  Q: {}%  ↑ {:.0} ↓ {:.0} kbps{}",
+                            v["latency_p50_ms"].as_f64().unwrap_or(0.0),
+                            v["latency_p95_ms"].as_f64().unwrap_or(0.0),
+                            v["packet_loss_pct"].as_f64().unwrap_or(0.0),
+                            v["quality_score"].as_u64().unwrap_or(0),
+                            v["throughput_up_kbps"].as_f64().unwrap_or(0.0),
+                            v["throughput_down_kbps"].as_f64().unwrap_or(0.0),
+                            if v["throughput_limited"].as_bool().unwrap_or(true) || v["throughput_method"].as_str() != Some("data") {
+                                format!("\n{limited_note}")
+                            } else { String::new() },
+                        ))
                     },
                     Message::DiagnosticsResult,
                 );
@@ -2044,10 +2567,9 @@ impl App {
                 {
                     self.admin_clients_loading = true;
                     self.admin_error = None;
-                    tasks.push(session_task(
-                        admin::list_clients(),
-                        Message::AdminClientsLoaded,
-                    ));
+                    tasks.push(
+                        self.session_task(admin::list_clients(), Message::AdminClientsLoaded),
+                    );
                 }
                 // G-B1: the exit-node `pick_list` (Admin-only mutating
                 // control) is sourced from `GET /api/v1/pool/nodes` — load
@@ -2062,7 +2584,7 @@ impl App {
                     && !self.pool_loading
                 {
                     self.pool_loading = true;
-                    tasks.push(session_task(admin::pool_nodes(), Message::PoolNodesLoaded));
+                    tasks.push(self.session_task(admin::pool_nodes(), Message::PoolNodesLoaded));
                 }
                 return Task::batch(tasks);
             }
@@ -2076,10 +2598,9 @@ impl App {
                         && !self.admin_clients_loading
                     {
                         self.admin_clients_loading = true;
-                        tasks.push(session_task(
-                            admin::list_clients(),
-                            Message::AdminClientsLoaded,
-                        ));
+                        tasks.push(
+                            self.session_task(admin::list_clients(), Message::AdminClientsLoaded),
+                        );
                     }
                     // G-B1: role wasn't known yet when `ToggleAdminPanel`
                     // ran (it's fetched fresh on every Connected — see the
@@ -2091,7 +2612,8 @@ impl App {
                         && !self.pool_loading
                     {
                         self.pool_loading = true;
-                        tasks.push(session_task(admin::pool_nodes(), Message::PoolNodesLoaded));
+                        tasks
+                            .push(self.session_task(admin::pool_nodes(), Message::PoolNodesLoaded));
                     }
                     return Task::batch(tasks);
                 }
@@ -2110,7 +2632,7 @@ impl App {
             Message::AdminRefreshClients => {
                 self.admin_clients_loading = true;
                 self.admin_error = None;
-                return session_task(admin::list_clients(), Message::AdminClientsLoaded);
+                return self.session_task(admin::list_clients(), Message::AdminClientsLoaded);
             }
             Message::AdminClientsLoaded(result) => {
                 self.admin_clients_loading = false;
@@ -2144,7 +2666,7 @@ impl App {
                     expires_at: self.admin_new_expires.trim().to_string(),
                     exit_node: self.admin_new_exit_node.trim().to_string(),
                 };
-                return session_task(admin::add_client(args), Message::AdminAddClientResult);
+                return self.session_task(admin::add_client(args), Message::AdminAddClientResult);
             }
             Message::AdminAddClientResult(result) => {
                 self.admin_busy_id = None;
@@ -2170,7 +2692,7 @@ impl App {
                     enabled: Some(enabled),
                     ..Default::default()
                 };
-                return session_task(
+                return self.session_task(
                     async move { admin::update_client(&id, args).await },
                     Message::AdminToggleEnabledResult,
                 );
@@ -2232,7 +2754,7 @@ impl App {
                             Some(exit_node)
                         }),
                     };
-                    return session_task(
+                    return self.session_task(
                         async move { admin::update_client(&id, args).await },
                         Message::AdminEditResult,
                     );
@@ -2260,7 +2782,7 @@ impl App {
                     return Task::none();
                 }
                 self.admin_busy_id = Some(id.clone());
-                return session_task(
+                return self.session_task(
                     async move {
                         let r = admin::reset_device(&id).await;
                         (id, r)
@@ -2275,7 +2797,8 @@ impl App {
                         self.admin_error = None;
                         self.push_log(format!("[admin] Device binding reset for {id}"));
                         self.admin_clients_loading = true;
-                        return session_task(admin::list_clients(), Message::AdminClientsLoaded);
+                        return self
+                            .session_task(admin::list_clients(), Message::AdminClientsLoaded);
                     }
                     Err(e) => self.admin_error = Some(e),
                 }
@@ -2292,7 +2815,7 @@ impl App {
                     return Task::none();
                 }
                 self.admin_busy_id = Some(id.clone());
-                return session_task(
+                return self.session_task(
                     async move {
                         let r = admin::revoke_client(&id).await;
                         (id, r)
@@ -2320,7 +2843,7 @@ impl App {
                     return Task::none();
                 }
                 self.admin_busy_id = Some(id.clone());
-                return session_task(
+                return self.session_task(
                     async move {
                         let r = admin::connection_key(&id).await;
                         (id, r)
@@ -2347,7 +2870,7 @@ impl App {
                 return iced::clipboard::write(text);
             }
             Message::AdminSaveKeyToFile => {
-                return session_task(
+                return self.session_task(
                     async {
                         rfd::AsyncFileDialog::new()
                             .set_file_name("aivpn-connection-key.txt")
@@ -2375,7 +2898,7 @@ impl App {
                     return Task::none();
                 };
                 self.admin_qr_loading = Some(id.clone());
-                return session_task(
+                return self.session_task(
                     async move {
                         let r = admin::qr_png(text).await;
                         (id, r)
@@ -2394,7 +2917,7 @@ impl App {
                 }
             }
             Message::AdminSaveQrToFile => {
-                return session_task(
+                return self.session_task(
                     async {
                         rfd::AsyncFileDialog::new()
                             .set_file_name("aivpn-connection-qr.png")
@@ -2420,8 +2943,8 @@ impl App {
                     self.pool_loading = true;
                     self.pool_error = None;
                     return Task::batch([
-                        session_task(admin::pool_nodes(), Message::PoolNodesLoaded),
-                        session_task(admin::pool_health(), Message::PoolHealthLoaded),
+                        self.session_task(admin::pool_nodes(), Message::PoolNodesLoaded),
+                        self.session_task(admin::pool_health(), Message::PoolHealthLoaded),
                     ]);
                 }
             }
@@ -2429,8 +2952,8 @@ impl App {
                 self.pool_loading = true;
                 self.pool_error = None;
                 return Task::batch([
-                    session_task(admin::pool_nodes(), Message::PoolNodesLoaded),
-                    session_task(admin::pool_health(), Message::PoolHealthLoaded),
+                    self.session_task(admin::pool_nodes(), Message::PoolNodesLoaded),
+                    self.session_task(admin::pool_health(), Message::PoolHealthLoaded),
                 ]);
             }
             Message::PoolNodesLoaded(result) => {
@@ -2457,13 +2980,13 @@ impl App {
                 if self.audit_open && self.audit_entries.is_empty() && !self.audit_loading {
                     self.audit_loading = true;
                     self.audit_error = None;
-                    return session_task(admin::audit_log(), Message::AuditLogLoaded);
+                    return self.session_task(admin::audit_log(), Message::AuditLogLoaded);
                 }
             }
             Message::AuditRefresh => {
                 self.audit_loading = true;
                 self.audit_error = None;
-                return session_task(admin::audit_log(), Message::AuditLogLoaded);
+                return self.session_task(admin::audit_log(), Message::AuditLogLoaded);
             }
             Message::AuditLogLoaded(result) => {
                 self.audit_loading = false;
@@ -2491,14 +3014,14 @@ impl App {
                     if self.admin_clients.is_empty() && !self.admin_clients_loading {
                         self.admin_clients_loading = true;
                         self.admin_error = None;
-                        tasks.push(session_task(
-                            admin::list_clients(),
-                            Message::AdminClientsLoaded,
-                        ));
+                        tasks.push(
+                            self.session_task(admin::list_clients(), Message::AdminClientsLoaded),
+                        );
                     }
                     if self.pool_nodes.is_empty() && !self.pool_loading {
                         self.pool_loading = true;
-                        tasks.push(session_task(admin::pool_nodes(), Message::PoolNodesLoaded));
+                        tasks
+                            .push(self.session_task(admin::pool_nodes(), Message::PoolNodesLoaded));
                     }
                 }
                 return Task::batch(tasks);
@@ -2518,7 +3041,7 @@ impl App {
                         self.server_settings_busy = true;
                         self.server_settings_error = None;
                         self.server_settings_rolled_back = false;
-                        return session_task(
+                        return self.session_task(
                             admin::apply_config(ConfigSetting::ActiveMask { client, mask }),
                             |result| {
                                 Message::ServerSettingsApplyResult(
@@ -2559,7 +3082,7 @@ impl App {
                     } else {
                         Some(trimmed.to_string())
                     };
-                    return session_task(
+                    return self.session_task(
                         admin::apply_config(ConfigSetting::ExitNode(addr)),
                         |result| {
                             Message::ServerSettingsApplyResult(
@@ -2596,7 +3119,7 @@ impl App {
                     if let Some((token, _)) = self.server_settings_pending.clone() {
                         self.server_settings_busy = true;
                         self.server_settings_error = None;
-                        return session_task(
+                        return self.session_task(
                             admin::confirm_config(token),
                             Message::ServerSettingsConfirmResult,
                         );
@@ -2672,7 +3195,7 @@ impl App {
             Message::InstallBinaryUrlChanged(s) => self.install_binary_url = s,
             Message::InstallBinaryFileChanged(s) => self.install_binary_file = s,
             Message::InstallBinaryFileBrowse => {
-                return session_task(
+                return self.session_task(
                     async {
                         rfd::AsyncFileDialog::new()
                             .pick_file()
@@ -2694,7 +3217,7 @@ impl App {
             Message::InstallShowScript => {
                 self.install_script_open = true;
                 if self.install_script.is_none() {
-                    return session_task(
+                    return self.session_task(
                         install_wizard::fetch_script(),
                         Message::InstallScriptLoaded,
                     );
@@ -2723,7 +3246,7 @@ impl App {
                 };
                 self.install_probing = true;
                 self.install_error = None;
-                return session_task(
+                return self.session_task(
                     install_wizard::probe(host, port, user),
                     Message::InstallProbeResult,
                 );
@@ -2922,8 +3445,6 @@ impl App {
                     self.import_installed_key(key);
                 }
             }
-
-            Message::Noop => {}
         }
         Task::none()
     }
@@ -2957,6 +3478,7 @@ impl App {
                 let key = key.clone();
                 let child_handle = self.child_handle.clone();
                 let ext_transport = self.ext_transport.clone();
+                let split_enabled = self.settings.split_enabled;
                 let kill_switch = self.launched_kill_switch;
                 let adaptive_level = self.settings.adaptive_level;
                 let dns_proxy = self.settings.dns_proxy.clone();
@@ -3008,10 +3530,10 @@ impl App {
                             }
                         };
 
-                        let binary = if is_root() {
+                        let binary = if is_root() || socks5_enabled {
                             binary
                         } else {
-                            match privilege::ensure_capable_binary(
+                            match privilege::ensure_installed_image(
                                 &binary,
                                 &lang_clone,
                                 &mut sender,
@@ -3020,12 +3542,14 @@ impl App {
                             {
                                 Ok(p) => p,
                                 Err(hint) => {
-                                    let _ = sender.try_send(Message::LogLine(hint));
-                                    binary
+                                    let _ = sender
+                                        .try_send(Message::StatusReceived(VpnStatus::Error(hint)));
+                                    return;
                                 }
                             }
                         };
                         let launch_params = vpn_manager::ClientLaunchParams {
+                            split_enabled,
                             full_tunnel,
                             mtls_cert,
                             kill_switch,
@@ -3084,6 +3608,10 @@ impl App {
                         }
                         if let Some(pid) = child_pid {
                             write_client_pidfile(pid);
+                            if kill_switch {
+                                // Пометка переживает аварию: pidfile снимается при reap, она нет.
+                                write_ks_marker_for(pid);
+                            }
                         }
                         let (Some(stdout), Some(stderr)) = (stdout, stderr) else {
                             // Should be impossible with piped stdio - terminate
@@ -3182,6 +3710,7 @@ impl App {
                         if let Some(mut c) = reaped {
                             let _ = c.wait().await;
                         }
+                        // Авария не снимает kill-switch. Маркер своего запуска оставляем.
                         remove_client_pidfile();
                         // send().await, not try_send: this terminal status is what
                         // lets the UI leave Connected/Connecting - if it were
@@ -3205,26 +3734,39 @@ impl App {
             None => Subscription::none(),
         };
 
+        let managed_session = self.has_desktop_session();
         let stats_stream = iced::stream::channel(
             4,
-            |mut sender: iced::futures::channel::mpsc::Sender<Message>| async move {
+            move |mut sender: iced::futures::channel::mpsc::Sender<Message>| async move {
                 loop {
                     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                    let stats = read_traffic_stats();
+                    let stats = if managed_session {
+                        TrafficStats::default()
+                    } else {
+                        read_traffic_stats()
+                    };
                     let _ = sender.try_send(Message::StatsRefresh(stats));
                 }
             },
         );
-        let stats_sub = crate::subscription::from_stream("stats_poll", stats_stream);
+        let stats_sub = crate::subscription::from_stream(
+            if managed_session {
+                "managed_stats_poll"
+            } else {
+                "stats_poll"
+            },
+            stats_stream,
+        );
 
         let tray_sub = Self::tray_subscription();
         let close_sub = Self::close_subscription();
 
         // Recording status poll — only when connected and recording or stopping
-        let recording_sub = if matches!(
-            self.recording_state,
-            RecordingState::Active(_) | RecordingState::Stopping
-        ) {
+        let recording_sub = if !managed_session
+            && matches!(
+                self.recording_state,
+                RecordingState::Active(_) | RecordingState::Stopping
+            ) {
             let stream = iced::stream::channel(
                 4,
                 |mut sender: iced::futures::channel::mpsc::Sender<Message>| async move {
@@ -3326,6 +3868,17 @@ impl App {
         self.appearance_theme()
     }
 
+    fn session_task<A: Send + 'static>(
+        &self,
+        future: impl std::future::Future<Output = A> + Send + 'static,
+        mapper: impl FnOnce(A) -> Message + Send + 'static,
+    ) -> Task<Message> {
+        Task::perform(
+            admin::pin_target(self.desktop_administration_target(), future),
+            mapper,
+        )
+    }
+
     fn push_log(&mut self, line: String) {
         self.log_lines.push(line);
         if self.log_lines.len() > MAX_LOG_LINES {
@@ -3340,4 +3893,381 @@ fn session_task<A: Send + 'static>(
     mapper: impl FnOnce(A) -> Message + Send + 'static,
 ) -> Task<Message> {
     Task::perform(admin::pin_session(future), mapper)
+}
+
+#[cfg(test)]
+mod kill_switch_lifecycle_tests {
+    use super::*;
+    use crate::key_storage::{ConnectionKey, KeyStorage};
+    use crate::settings::AppSettings;
+    use crate::vpn_manager::VpnStatus;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::{Path, PathBuf};
+    use std::time::{Duration, Instant};
+
+    struct MarkerDir(PathBuf);
+
+    impl MarkerDir {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "aivpn-ks-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(&path).unwrap();
+            KS_MARKER_DIR.with(|slot| *slot.borrow_mut() = Some(path.clone()));
+            Self(path)
+        }
+    }
+
+    impl Drop for MarkerDir {
+        fn drop(&mut self) {
+            KS_MARKER_DIR.with(|slot| *slot.borrow_mut() = None);
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn app_with_profile() -> App {
+        let (mut app, _) = App::from_state(AppSettings::default(), KeyStorage::default(), None);
+        app.storage.keys = vec![ConnectionKey {
+            name: "t".into(),
+            key: "k".into(),
+            server_addr: "127.0.0.1:443".into(),
+            ..ConnectionKey::default()
+        }];
+        app.storage.selected = Some(0);
+        app.ks_block_clear_override = Some(false);
+        app
+    }
+
+    fn crash_with_rules(app: &mut App) {
+        app.launched_kill_switch = true;
+        app.settings.kill_switch = false;
+        app.status = VpnStatus::Connecting;
+        app.connection_key = Some("k".into());
+        let _ = app.update(Message::StatusReceived(VpnStatus::Disconnected));
+    }
+
+    #[test]
+    fn unexpected_exit_keeps_kill_switch_until_verified_clear() {
+        let _marker = MarkerDir::new();
+        let mut app = app_with_profile();
+        crash_with_rules(&mut app);
+        assert!(app.kill_switch_retained);
+        assert!(app.launched_kill_switch);
+        assert!(app.connection_key.is_none());
+        assert!(!matches!(app.status, VpnStatus::Connected { .. }));
+        let _ = app.view();
+
+        let _ = app.update(Message::Connect);
+        let generation = app.ks_clear_generation;
+        assert_eq!(generation, 1);
+        assert!(app.ks_clear_in_flight);
+        assert!(app.pending_connect);
+        assert!(app.connection_key.is_none());
+        assert!(app.launched_kill_switch);
+        assert!(app.kill_switch_retained);
+
+        let _ = app.update(Message::Connect);
+        assert_eq!(app.ks_clear_generation, generation);
+        assert!(app.ks_clear_in_flight);
+        assert!(app.connection_key.is_none());
+
+        let _ = app.update(Message::Disconnect);
+        assert!(!app.pending_connect);
+        assert!(app.ks_clear_in_flight);
+        assert!(app.connection_key.is_none());
+        assert!(app.kill_switch_retained);
+        let _ = app.update(Message::StatusReceived(VpnStatus::Disconnected));
+        assert!(app.kill_switch_retained);
+
+        let _ = app.update(Message::KillSwitchClearFinished(0, Ok(())));
+        assert!(app.ks_clear_in_flight);
+        assert!(app.kill_switch_retained);
+        assert!(app.connection_key.is_none());
+
+        let _ = app.update(Message::KillSwitchClearFinished(generation, Ok(())));
+        assert!(!app.ks_clear_in_flight);
+        assert!(!app.kill_switch_retained);
+        assert!(!app.launched_kill_switch);
+        assert!(app.connection_key.is_none());
+
+        crash_with_rules(&mut app);
+        assert!(app.kill_switch_retained);
+        let _ = app.update(Message::Connect);
+        let second = app.ks_clear_generation;
+        assert_ne!(second, generation);
+        assert!(app.connection_key.is_none());
+        assert!(app.launched_kill_switch);
+        let _ = app.update(Message::KillSwitchClearFinished(generation, Ok(())));
+        assert!(app.ks_clear_in_flight);
+        assert!(app.kill_switch_retained);
+        assert!(app.connection_key.is_none());
+        assert!(app.launched_kill_switch);
+
+        let _ = app.update(Message::KillSwitchClearFinished(
+            second,
+            Err("kill-switch clear timed out".into()),
+        ));
+        assert!(!app.ks_clear_in_flight);
+        assert!(!app.pending_connect);
+        assert!(app.kill_switch_retained);
+        assert!(app.launched_kill_switch);
+        assert!(app.connection_key.is_none());
+        assert!(matches!(app.status, VpnStatus::Disconnected));
+        assert!(app.ks_clear_error.is_some());
+
+        app.ks_block_clear_override = Some(true);
+        let _ = app.update(Message::Connect);
+        assert!(app.connection_key.is_none());
+        assert!(app.kill_switch_retained);
+        assert!(!app.ks_clear_in_flight);
+        assert!(app.launched_kill_switch);
+
+        app.ks_block_clear_override = Some(false);
+        let _ = app.update(Message::ClearRetainedKillSwitch);
+        let explicit = app.ks_clear_generation;
+        assert!(app.ks_clear_in_flight);
+        assert!(!app.pending_connect);
+        let _ = app.update(Message::KillSwitchClearFinished(
+            explicit,
+            Err("kill-switch clear exited with 1".into()),
+        ));
+        assert!(app.kill_switch_retained);
+        assert!(app.connection_key.is_none());
+        assert!(app.launched_kill_switch);
+
+        let _ = app.update(Message::ClearRetainedKillSwitch);
+        let done = app.ks_clear_generation;
+        let _ = app.update(Message::KillSwitchClearFinished(done, Ok(())));
+        assert!(!app.kill_switch_retained);
+        assert!(!app.launched_kill_switch);
+        assert!(app.connection_key.is_none());
+
+        crash_with_rules(&mut app);
+        let _ = app.update(Message::Connect);
+        let launch = app.ks_clear_generation;
+        assert!(app.connection_key.is_none());
+        let _ = app.update(Message::KillSwitchClearFinished(launch, Ok(())));
+        assert!(app.connection_key.is_none());
+        let _ = app.update(Message::DesktopSession(desktop_session::Event::Route(Ok(
+            aivpn_desktop_agent::client::session::ConnectionRoute::Legacy,
+        ))));
+        assert_eq!(app.connection_key.as_deref(), Some("k"));
+        assert!(!app.kill_switch_retained);
+        assert!(!app.launched_kill_switch);
+        assert!(!app.ks_clear_in_flight);
+    }
+
+    #[test]
+    fn marker_recovery_keeps_dead_rules_and_skips_a_live_client() {
+        assert_eq!(parse_ks_marker("15 99\n"), Some((15, 99)));
+        assert_eq!(parse_ks_marker("nope"), None);
+
+        let dead = assess_ks_recovery(Some((10, 100)), false, None, &[]);
+        assert!(dead.retained);
+        assert!(dead.adopt.is_none());
+        assert!(dead.note_launched_ks);
+
+        let foreign = assess_ks_recovery(Some((10, 100)), false, None, &[(20, 200)]);
+        assert!(foreign.retained);
+        assert!(foreign.adopt.is_none());
+        assert!(ks_clear_blocked_by(&[(20, 200)]));
+        assert!(!ks_clear_blocked_by(&[]));
+
+        let alive = assess_ks_recovery(Some((10, 100)), true, None, &[(10, 100)]);
+        assert!(!alive.retained);
+        assert_eq!(alive.adopt, Some((10, 100)));
+
+        let adopted = assess_ks_recovery(Some((10, 100)), true, Some((10, 100)), &[(10, 100)]);
+        assert!(!adopted.retained);
+        assert!(adopted.adopt.is_none());
+        assert!(adopted.note_launched_ks);
+
+        assert!(!assess_ks_recovery(None, false, None, &[]).retained);
+
+        let dir = MarkerDir::new();
+        std::fs::write(dir.0.join("kill-switch.held"), "10 100\n").unwrap();
+        let mut app = app_with_profile();
+        let _ = app.apply_ks_marker_recovery();
+        assert!(app.kill_switch_retained);
+        assert!(app.launched_kill_switch);
+        assert!(app.adopted_client.is_none());
+        assert!(app.connection_key.is_none());
+    }
+
+    fn fake_client(dir: &Path, name: &str, body: &str) -> PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, body).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    #[test]
+    fn kill_switch_clear_command_failure_is_not_success() {
+        let dir = MarkerDir::new();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let ok_bin = fake_client(&dir.0, "ok-client", "#!/bin/sh\nexit 0\n");
+        assert!(runtime
+            .block_on(verified_kill_switch_clear_with(
+                &ok_bin,
+                Duration::from_secs(2),
+            ))
+            .is_ok());
+
+        let bad_bin = fake_client(&dir.0, "bad-client", "#!/bin/sh\nexit 3\n");
+        assert!(runtime
+            .block_on(verified_kill_switch_clear_with(
+                &bad_bin,
+                Duration::from_secs(2),
+            ))
+            .is_err());
+
+        let slow_bin = fake_client(&dir.0, "slow-client", "#!/bin/sh\nsleep 30\n");
+        let started = Instant::now();
+        let result = runtime.block_on(verified_kill_switch_clear_with(
+            &slow_bin,
+            Duration::from_millis(200),
+        ));
+        assert!(result.is_err());
+        assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
+    #[test]
+    fn terminal_error_keeps_protection_and_its_reason() {
+        let _marker = MarkerDir::new();
+        let mut app = app_with_profile();
+        app.launched_kill_switch = true;
+        app.status = VpnStatus::Connecting;
+        let _ = app.update(Message::StatusReceived(VpnStatus::Error("rejected".into())));
+        assert!(app.kill_switch_retained);
+        let _ = app.update(Message::StatusReceived(VpnStatus::Disconnected));
+        assert!(app.kill_switch_retained);
+        assert!(matches!(&app.status, VpnStatus::Error(reason) if reason == "rejected"));
+    }
+
+    #[test]
+    fn proxy_reconnect_clears_retained_rules_before_start() {
+        let _marker = MarkerDir::new();
+        let mut app = app_with_profile();
+        crash_with_rules(&mut app);
+        app.settings.kill_switch = true;
+        app.settings.socks5_enabled = true;
+        let _ = app.update(Message::Connect);
+        assert!(app.ks_clear_in_flight);
+        assert!(app.connection_key.is_none());
+        let generation = app.ks_clear_generation;
+        let _ = app.update(Message::KillSwitchClearFinished(generation, Ok(())));
+        assert!(app.connection_key.is_none());
+        let _ = app.update(Message::DesktopSession(desktop_session::Event::Route(Ok(
+            aivpn_desktop_agent::client::session::ConnectionRoute::Legacy,
+        ))));
+        assert!(app.connection_key.is_some());
+        assert!(!app.launched_kill_switch);
+        assert!(!app.kill_switch_retained);
+    }
+
+    #[test]
+    fn unexpected_child_exit_waits_before_explicit_clear() {
+        let _marker = MarkerDir::new();
+        let mut app = app_with_profile();
+        crash_with_rules(&mut app);
+        app.child_reap_in_flight = true;
+        let _ = app.update(Message::Disconnect);
+        assert!(!app.ks_clear_in_flight);
+        assert!(app.kill_switch_retained);
+        let _ = app.update(Message::UnexpectedClientReaped);
+        assert!(!app.child_reap_in_flight);
+        assert!(app.ks_clear_in_flight);
+        assert!(app.kill_switch_retained);
+    }
+
+    #[test]
+    fn adopted_client_does_not_signal_a_reused_pid() {
+        let _marker = MarkerDir::new();
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let starttime = proc_starttime(pid).unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let result = runtime.block_on(terminate_adopted_wait(pid, starttime + 1));
+        std::thread::sleep(Duration::from_millis(100));
+        let survived = child.try_wait().unwrap().is_none();
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(result.is_ok());
+        assert!(survived, "сигнал отправлен другому поколению процесса");
+    }
+
+    #[test]
+    fn adopted_client_exit_is_observed_before_reaping() {
+        let _marker = MarkerDir::new();
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let starttime = proc_starttime(pid).unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime
+            .block_on(terminate_adopted_wait(pid, starttime))
+            .unwrap();
+        assert!(child.try_wait().unwrap().is_some());
+    }
+
+    #[test]
+    fn quit_reaps_child_while_ui_runtime_is_blocked() {
+        let _marker = MarkerDir::new();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut app = app_with_profile();
+        runtime.block_on(async {
+            let child = tokio::process::Command::new("sleep")
+                .arg("30")
+                .kill_on_drop(true)
+                .spawn()
+                .unwrap();
+            let pid = child.id().unwrap();
+            *app.child_handle.lock().unwrap() = Some(child);
+            app.shutdown_child_blocking();
+            assert!(proc_starttime(pid).is_none());
+            assert!(app.child_handle.lock().unwrap().is_none());
+        });
+    }
+
+    #[test]
+    fn timed_out_clear_cannot_finish_later_in_a_descendant() {
+        let dir = MarkerDir::new();
+        let late = dir.0.join("late-clear");
+        let script = format!("#!/bin/sh\n(sleep 1; touch '{}') &\nwait\n", late.display());
+        let binary = fake_client(&dir.0, "forking-client", &script);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        assert!(runtime
+            .block_on(verified_kill_switch_clear_with(
+                &binary,
+                Duration::from_millis(200)
+            ))
+            .is_err());
+        std::thread::sleep(Duration::from_millis(1200));
+        assert!(!late.exists(), "потомок продолжил очистку после таймаута");
+    }
 }

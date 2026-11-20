@@ -1,10 +1,4 @@
-//! Публичный бинарь клиента.
-//!
-//! Регистрирует ноль дополнительных транспортов: единственный путь датаграмм —
-//! прямой UDP-сокет, как было всегда. Всё поведение живёт в
-//! [`aivpn_client::run`]; здесь только выбор того, что в него передать.
-
-#[tokio::main]
-async fn main() {
-    aivpn_client::run(Vec::new(), aivpn_common::transport::no_socket_guard()).await
+fn main() -> std::process::ExitCode {
+    aivpn_client::entry::dispatch(aivpn_client::entry::DefaultMode::Cli)
+        .unwrap_or(std::process::ExitCode::FAILURE)
 }

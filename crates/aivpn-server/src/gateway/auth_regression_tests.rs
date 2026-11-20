@@ -664,3 +664,71 @@ async fn fec_receiver_observes_accepted_inline_epochs_and_reports_only_ordinary_
         state.is_ratcheted = true;
     }
 }
+
+#[tokio::test]
+async fn revocation_releases_neural_and_dpi_state() {
+    let directory = tempfile::tempdir().unwrap();
+    let mask_dir = directory.path().join("masks");
+    std::fs::create_dir(&mask_dir).unwrap();
+    let mut mask = preset_masks::quic_https_v2();
+    crate::test_masks::sign(&mut mask, &ed25519_dalek::SigningKey::from_bytes(&[71; 32]));
+    std::fs::write(
+        mask_dir.join("quic_https_v2.json"),
+        serde_json::to_vec(&mask).unwrap(),
+    )
+    .unwrap();
+    let mut gateway = Gateway::new(GatewayConfig {
+        mask_dir,
+        mask_signing_key: Some([71; 32]),
+        client_db: Some(Arc::new(
+            crate::client_db::ClientDatabase::load(
+                &directory.path().join("clients.json"),
+                aivpn_common::network_config::VpnNetworkConfig::default(),
+            )
+            .unwrap(),
+        )),
+        enable_nat: false,
+        enable_neural: false,
+        ..Default::default()
+    })
+    .unwrap();
+    let socket = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    gateway.udp_socket = Some(super::MaskSocket::new(socket));
+    let peer = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let session = gateway
+        .session_manager
+        .create_session(peer.local_addr().unwrap(), [7; 32], None, None)
+        .unwrap();
+    let sid = session.lock().session_id;
+    session.lock().client_id = Some("resource-test".into());
+    gateway
+        .neural_module
+        .lock()
+        .record_traffic(sid, 512, 10.0, 7.0, true);
+    #[cfg(feature = "neural")]
+    for _ in 0..64 {
+        gateway.dpi_gate.record_wire(sid, &[0; 64]);
+    }
+    assert_eq!(
+        gateway
+            .neural_module
+            .lock()
+            .get_or_create_stats(sid)
+            .rx_packets,
+        1
+    );
+    #[cfg(feature = "neural")]
+    assert!(gateway.dpi_gate.verdict(&sid).is_some());
+    gateway.force_disconnect_client("resource-test").await;
+    assert!(gateway.session_manager.get_session(&sid).is_none());
+    assert_eq!(
+        gateway
+            .neural_module
+            .lock()
+            .get_or_create_stats(sid)
+            .rx_packets,
+        0
+    );
+    #[cfg(feature = "neural")]
+    assert!(gateway.dpi_gate.verdict(&sid).is_none());
+}

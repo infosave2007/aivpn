@@ -19,6 +19,11 @@ WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
 COPY crates crates/
 COPY vendor vendor/
+COPY deploy/install-client-image.sh deploy/install-client-image.sh
+COPY deploy/install-app-routing.sh deploy/install-app-routing.sh
+COPY deploy/systemd/aivpn-app-routing.service deploy/systemd/aivpn-app-routing.service
+COPY deploy/systemd/aivpn-app-routing.socket deploy/systemd/aivpn-app-routing.socket
+COPY platforms/linux/polkit/com.aivpn.client.policy platforms/linux/polkit/com.aivpn.client.policy
 COPY assets/masks assets/masks/
 
 RUN cargo build --locked --release --target "${TARGET_TRIPLE}" -p aivpn-client --bin aivpn-client \

@@ -4,6 +4,9 @@ use std::io::{self, Read, Write};
 use std::net::{SocketAddrV4, TcpStream};
 use std::time::Duration;
 
+mod status;
+pub use status::{RecordingStatus, SessionStatistics};
+
 pub const MAX_FRAME: usize = 1024 * 1024;
 
 pub fn request(addr: SocketAddrV4, line: &str, timeout: Duration) -> io::Result<String> {

@@ -690,7 +690,14 @@ pub fn resolve_handshake_mask_resilient(
     #[cfg(not(feature = "production-secure"))]
     {
         if fail_streak >= HANDSHAKE_FALLBACK_THRESHOLD {
-            resolve_handshake_mask(preferred, &[], preshared_key)
+            if preferred
+                .map(str::trim)
+                .is_none_or(|name| name.is_empty() || name == "auto")
+            {
+                preset_masks::fallback_for_attempt(preshared_key, fail_streak)
+            } else {
+                resolve_handshake_mask(preferred, &[], preshared_key)
+            }
         } else {
             resolve_handshake_mask(preferred, descriptors, preshared_key)
         }
@@ -2387,6 +2394,44 @@ pub mod preset_masks {
         catalog()[index].clone()
     }
 
+    /// Первая попытка сохраняет прежний PSK-выбор. После порога ошибок AUTO
+    /// обходит весь каталог, чтобы не закреплять заблокированный протокол.
+    pub fn fallback_for_attempt(psk: Option<&[u8; 32]>, fail_streak: u32) -> MaskProfile {
+        let initial = bootstrap_for_psk(psk);
+        let masks = catalog();
+        let index = masks
+            .iter()
+            .position(|mask| mask.mask_id == initial.mask_id)
+            .unwrap();
+        let mut order = Vec::with_capacity(masks.len());
+        let family = |protocol: SpoofProtocol| {
+            if protocol.is_stun() {
+                SpoofProtocol::WebRTC_STUN
+            } else {
+                protocol
+            }
+        };
+        let mut protocols = vec![family(initial.spoof_protocol)];
+        // Сначала меняем внешний протокол: несколько соседних STUN-масок
+        // одинаково блокируются DPI, хотя имеют разные имена.
+        for offset in 1..=masks.len() {
+            let candidate = (index + offset) % masks.len();
+            let protocol = family(masks[candidate].spoof_protocol);
+            if !protocols.contains(&protocol) {
+                protocols.push(protocol);
+                order.push(candidate);
+            }
+        }
+        for offset in 1..=masks.len() {
+            let candidate = (index + offset) % masks.len();
+            if !order.contains(&candidate) {
+                order.push(candidate);
+            }
+        }
+        let attempt = fail_streak.saturating_sub(super::HANDSHAKE_FALLBACK_THRESHOLD);
+        masks[order[attempt as usize % order.len()]].clone()
+    }
+
     pub fn by_id(mask_id: &str) -> Option<MaskProfile> {
         catalog()
             .iter()
@@ -3038,6 +3083,41 @@ mod tests {
         assert_eq!(chosen.mask_id, "webrtc_zoom_v3");
         #[cfg(feature = "production-secure")]
         assert!(chosen.mask_id.starts_with("bootstrap:epoch-77:"));
+    }
+
+    #[cfg(not(feature = "production-secure"))]
+    #[test]
+    fn automatic_fallback_explores_masks_after_repeated_failures() {
+        let psk = [6; 32];
+        let mut attempted = std::collections::HashSet::new();
+        for failure in HANDSHAKE_FALLBACK_THRESHOLD
+            ..HANDSHAKE_FALLBACK_THRESHOLD + preset_masks::all().len() as u32
+        {
+            let mask = resolve_handshake_mask_resilient(None, &[], Some(&psk), failure);
+            attempted.insert(mask.mask_id);
+            assert_eq!(
+                resolve_handshake_mask_resilient(Some("quic_https_v2"), &[], Some(&psk), failure)
+                    .mask_id,
+                "quic_https_v2",
+                "Явный выбор маски не заменяется автоматическим перебором"
+            );
+        }
+        assert_eq!(
+            attempted.len(),
+            preset_masks::all().len(),
+            "Блокировка одного протокола не должна навсегда закреплять его в AUTO"
+        );
+    }
+
+    #[test]
+    fn first_automatic_fallback_changes_protocol_for_every_initial_preset() {
+        for seed in 0..=255 {
+            let psk = [seed; 32];
+            let initial = preset_masks::bootstrap_for_psk(Some(&psk));
+            let next = preset_masks::fallback_for_attempt(Some(&psk), HANDSHAKE_FALLBACK_THRESHOLD);
+            assert_ne!(initial.spoof_protocol, next.spoof_protocol);
+            assert!(!(initial.spoof_protocol.is_stun() && next.spoof_protocol.is_stun()));
+        }
     }
 
     #[test]

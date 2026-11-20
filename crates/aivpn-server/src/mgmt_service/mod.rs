@@ -206,10 +206,8 @@ pub struct StatusView {
     pub kernel_module: bool,
 }
 
-/// Bounded tail-read of the append-only audit log (most recent `limit`
-/// entries, oldest first) — logic moved verbatim from the pre-refactor
-/// `get_audit_log` handler so behavior (bounded-byte-window read, dropping
-/// a possibly-truncated first line) is unchanged.
+/// Читает последние записи в пределах 4 МиБ. Частичная первая строка
+/// отбрасывается, поврежденная полная запись возвращает ошибку.
 pub fn audit_tail(ctx: &MgmtCtx, limit: usize) -> Result<Vec<AuditEntry>, MgmtError> {
     use std::io::{Read as _, Seek, SeekFrom};
 
@@ -219,7 +217,19 @@ pub fn audit_tail(ctx: &MgmtCtx, limit: usize) -> Result<Vec<AuditEntry>, MgmtEr
     // "audit log not configured" and any `std::io::Error`.
     let log_path = ctx.audit_log_path.ok_or(MgmtError::NotFound)?;
 
-    let mut file = std::fs::File::open(log_path).map_err(|_| MgmtError::NotFound)?;
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let mut file = options.open(log_path).map_err(|_| MgmtError::NotFound)?;
+    if !file.metadata().map_err(|_| MgmtError::NotFound)?.is_file() {
+        return Err(MgmtError::NotFound);
+    }
+    // Писатель держит исключительную блокировку до конца строки.
+    file.lock_shared().map_err(|_| MgmtError::NotFound)?;
     let file_len = file.metadata().map_err(|_| MgmtError::NotFound)?.len();
     let max_bytes = (limit as u64)
         .saturating_mul(1024)
@@ -228,21 +238,28 @@ pub fn audit_tail(ctx: &MgmtCtx, limit: usize) -> Result<Vec<AuditEntry>, MgmtEr
     file.seek(SeekFrom::Start(start))
         .map_err(|_| MgmtError::NotFound)?;
     let mut buf = Vec::with_capacity((file_len - start) as usize);
-    file.read_to_end(&mut buf)
+    file.take(file_len - start)
+        .read_to_end(&mut buf)
         .map_err(|_| MgmtError::NotFound)?;
-    let text = String::from_utf8_lossy(&buf);
-    let mut lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
-    if start > 0 && !lines.is_empty() {
-        lines.remove(0);
-    }
-    let entries: Vec<AuditEntry> = lines
+    let complete = if start > 0 {
+        let newline = buf.iter().position(|byte| *byte == b'\n').ok_or_else(|| {
+            MgmtError::Internal("Запись журнала аудита превышает окно чтения".into())
+        })?;
+        &buf[newline + 1..]
+    } else {
+        &buf[..]
+    };
+    let text = std::str::from_utf8(complete)
+        .map_err(|_| MgmtError::Internal("Неверная кодировка журнала аудита".into()))?;
+    let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+    let entries: Result<Vec<AuditEntry>, _> = lines
         .iter()
         .rev()
         .take(limit)
         .rev()
-        .filter_map(|l| serde_json::from_str(l).ok())
+        .map(|l| serde_json::from_str(l))
         .collect();
-    Ok(entries)
+    entries.map_err(|_| MgmtError::Internal("Повреждена запись журнала аудита".into()))
 }
 
 /// Response shape for `GET /api/v1/audit-log?verify=1` — shared by the REST
@@ -271,6 +288,49 @@ pub fn audit_verify(ctx: &MgmtCtx, limit: usize) -> Result<AuditVerifyView, Mgmt
         entries,
         broken_at,
     })
+}
+
+#[cfg(test)]
+mod audit_read_tests {
+    use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn malformed_last_record_cannot_report_a_verified_audit() {
+        let (directory, database) = test_support::test_db();
+        let path = directory.path().join("audit.jsonl");
+        let logger = AuditLogger::new(&path);
+        logger.log(AuditActor::Cli, "test", "client", "ok");
+        let mut context = test_support::ctx(&database, directory.path());
+        context.audit_log_path = Some(&path);
+        assert!(audit_verify(&context, 100).unwrap().verified);
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        file.write_all(b"{broken-record}\n").unwrap();
+        assert!(audit_verify(&context, 100).is_err());
+    }
+
+    #[test]
+    fn invalid_utf8_inside_legacy_record_is_not_silently_replaced() {
+        let (directory, database) = test_support::test_db();
+        let path = directory.path().join("audit.jsonl");
+        std::fs::write(&path, b"{\"ts\":\"t\",\"actor\":\"cli\",\"action\":\"x\",\"target\":\"\xff\",\"result\":\"ok\"}\n").unwrap();
+        let mut context = test_support::ctx(&database, directory.path());
+        context.audit_log_path = Some(&path);
+        assert!(audit_tail(&context, 100).is_err());
+    }
+
+    #[test]
+    fn malformed_only_record_is_not_a_verified_empty_log() {
+        let (directory, database) = test_support::test_db();
+        let path = directory.path().join("audit.jsonl");
+        std::fs::write(&path, b"\xff\xfe\n").unwrap();
+        let mut context = test_support::ctx(&database, directory.path());
+        context.audit_log_path = Some(&path);
+        assert!(audit_verify(&context, 100).is_err());
+    }
 }
 
 #[cfg(test)]
