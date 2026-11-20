@@ -25,36 +25,35 @@
 //!    free, wrong handle) is visible to Rust-side tests/logs even though
 //!    Kotlin can't tell it apart from `Done` on the wire.
 
-use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicI64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::OnceLock;
 
-/// Outcome of a single [`poll`] call. See the module doc for the exact
-/// Kotlin-visible semantics each variant maps to.
+use aivpn_common::ssh_install::job_registry::JobRegistry as SharedRegistry;
+use aivpn_common::ssh_install::job_registry::PollOutcome as SharedPoll;
+
+/// Outcome of a single [`JobRegistry::poll`] call. See the module doc for the
+/// exact Kotlin-visible semantics each variant maps to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PollOutcome {
     /// One queued event, in FIFO order.
     Event(String),
     /// Queue is empty, job still running.
     Pending,
-    /// Queue is empty, job finished ([`mark_done`] was called).
+    /// Queue is empty, job finished ([`JobRegistry::mark_done`] was called).
     Done,
     /// No job registered under this handle (never created, or already freed).
     NotFound,
-}
-
-struct Job {
-    queue: VecDeque<String>,
-    done: bool,
 }
 
 /// The handle-keyed job store. Exists as a plain struct (rather than only
 /// free functions over a single process-global instance) so the unit tests
 /// below can each construct their own isolated registry instead of sharing
 /// process-global state across `#[test]` threads.
+///
+/// Хранение и ограничения очереди находятся в
+/// [`aivpn_common::ssh_install::job_registry`]. Здесь сохранены имена методов
+/// JNI: `push_event` и `poll` без ограничения буфера.
 pub struct JobRegistry {
-    next_handle: AtomicI64,
-    jobs: Mutex<HashMap<i64, Job>>,
+    inner: SharedRegistry,
 }
 
 impl JobRegistry {
@@ -62,22 +61,13 @@ impl JobRegistry {
     /// freshly-zeroed Kotlin `Long` field with a real handle).
     pub fn new() -> Self {
         Self {
-            next_handle: AtomicI64::new(1),
-            jobs: Mutex::new(HashMap::new()),
+            inner: SharedRegistry::new(),
         }
     }
 
     /// Registers a new empty, not-done job and returns its handle.
     pub fn create(&self) -> i64 {
-        let handle = self.next_handle.fetch_add(1, Ordering::Relaxed);
-        self.jobs.lock().unwrap_or_else(|e| e.into_inner()).insert(
-            handle,
-            Job {
-                queue: VecDeque::new(),
-                done: false,
-            },
-        );
-        handle
+        self.inner.create()
     }
 
     /// Appends `event_json` to `handle`'s queue. A no-op if `handle` is
@@ -85,57 +75,39 @@ impl JobRegistry {
     /// has no way to observe a `sshInstallFree` race and must not panic on
     /// one.
     pub fn push_event(&self, handle: i64, event_json: String) {
-        if let Some(job) = self
-            .jobs
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get_mut(&handle)
-        {
-            job.queue.push_back(event_json);
-        }
+        self.inner.push(handle, event_json);
     }
 
-    /// Marks `handle`'s job as finished — once its queue drains, [`poll`]
+    /// Marks `handle`'s job as finished — once its queue drains, [`Self::poll`]
     /// starts returning [`PollOutcome::Done`] instead of
     /// [`PollOutcome::Pending`]. A no-op if `handle` is unknown.
     pub fn mark_done(&self, handle: i64) {
-        if let Some(job) = self
-            .jobs
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get_mut(&handle)
-        {
-            job.done = true;
-        }
+        self.inner.mark_done(handle);
     }
 
     /// Pops and returns the next queued event for `handle`, or reports
-    /// pending/done/not-found per the module doc.
+    /// pending/done/not-found per the module doc. JNI delivers the whole
+    /// string, so there is no byte cap and no peek.
     pub fn poll(&self, handle: i64) -> PollOutcome {
-        let mut jobs = self.jobs.lock().unwrap_or_else(|e| e.into_inner());
-        match jobs.get_mut(&handle) {
-            None => PollOutcome::NotFound,
-            Some(job) => match job.queue.pop_front() {
-                Some(event) => PollOutcome::Event(event),
-                None if job.done => PollOutcome::Done,
-                None => PollOutcome::Pending,
-            },
+        match self.inner.poll_next(handle) {
+            SharedPoll::Event(event) => PollOutcome::Event(event),
+            SharedPoll::Pending => PollOutcome::Pending,
+            SharedPoll::Done => PollOutcome::Done,
+            SharedPoll::NotFound => PollOutcome::NotFound,
+            // `poll_next` читает событие целиком и не возвращает этот вариант.
+            SharedPoll::NeedsCapacity(_) => PollOutcome::Pending,
         }
     }
 
     /// Removes `handle`'s job entirely. Returns `true` if a job was actually
     /// removed, `false` if `handle` was already unknown. The background job
     /// thread (if the caller freed a handle before the thread finished) is
-    /// unaffected — it only ever calls [`push_event`]/[`mark_done`], both
-    /// no-ops against a missing handle; per the caller-facing contract there
-    /// is no cancellation, the SSH/install work simply runs to completion in
-    /// the background with its output now discarded.
+    /// unaffected — it only ever calls [`Self::push_event`]/[`Self::mark_done`],
+    /// both no-ops against a missing handle; per the caller-facing contract
+    /// there is no cancellation, the SSH/install work simply runs to
+    /// completion in the background with its output now discarded.
     pub fn free(&self, handle: i64) -> bool {
-        self.jobs
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(&handle)
-            .is_some()
+        self.inner.free(handle)
     }
 }
 
@@ -240,5 +212,101 @@ mod tests {
         assert_eq!(registry().poll(h1), PollOutcome::Event("x".to_string()));
         registry().free(h1);
         registry().free(h2);
+    }
+
+    #[test]
+    fn overflow_bounds_old_lines_and_keeps_finished_connection_key() {
+        let reg = JobRegistry::new();
+        let handle = reg.create();
+        let line = format!("{{\"line\":\"{}\",\"type\":\"line\"}}", "x".repeat(4096));
+        for _ in 0..1000 {
+            reg.push_event(handle, line.clone());
+        }
+        let key = format!("aivpn://{}", "k".repeat(300_000));
+        let finished = serde_json::json!({
+            "connection_key": &key,
+            "exit_code": 0,
+            "type": "finished"
+        })
+        .to_string();
+        reg.push_event(handle, finished);
+
+        let mut events = Vec::new();
+        loop {
+            match reg.poll(handle) {
+                PollOutcome::Event(event) => events.push(event),
+                PollOutcome::Pending => break,
+                other => panic!("неожиданный исход опроса: {other:?}"),
+            }
+        }
+
+        let discarded_bytes: usize = events
+            .iter()
+            .filter(|event| !event.contains(&key))
+            .map(String::len)
+            .sum();
+        assert!(
+            events.len() <= 256,
+            "очередь событий не ограничена по количеству: {}",
+            events.len()
+        );
+        assert!(
+            discarded_bytes <= 256 * 1024,
+            "очередь событий не ограничена по байтам: {discarded_bytes}"
+        );
+        let finished = events.iter().find(|event| {
+            serde_json::from_str::<serde_json::Value>(event)
+                .ok()
+                .is_some_and(|value| {
+                    value.get("type").and_then(|kind| kind.as_str()) == Some("finished")
+                        && value.get("connection_key").and_then(|item| item.as_str())
+                            == Some(key.as_str())
+                })
+        });
+        assert!(
+            finished.is_some(),
+            "финальное Finished вместе с connection_key потеряно"
+        );
+        let notices = events
+            .iter()
+            .filter(|event| event.contains("журнал установки сокращен"))
+            .count();
+        assert_eq!(
+            notices, 1,
+            "о потере старых строк должно остаться одно событие журнала, получено {notices}"
+        );
+        for event in &events {
+            serde_json::from_str::<serde_json::Value>(event)
+                .unwrap_or_else(|err| panic!("событие перестало быть JSON: {err}: {event}"));
+        }
+    }
+
+    #[test]
+    fn oversized_line_is_cut_without_breaking_json() {
+        let reg = JobRegistry::new();
+        let handle = reg.create();
+        let original = serde_json::json!({
+            "line": "ж".repeat(20_000),
+            "type": "line"
+        })
+        .to_string();
+        assert!(original.len() > 16 * 1024);
+        reg.push_event(handle, original.clone());
+        let PollOutcome::Event(event) = reg.poll(handle) else {
+            panic!("обрезанная строка не вернулась из очереди");
+        };
+        assert!(
+            event.len() <= 16 * 1024,
+            "длинная строка не обрезана: {} байт",
+            event.len()
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&event)
+            .unwrap_or_else(|err| panic!("обрезание сломало JSON: {err}: {event}"));
+        assert_eq!(parsed["type"], "line");
+        let mut end = 16 * 1024;
+        while !original.is_char_boundary(end) {
+            end -= 1;
+        }
+        assert!(serde_json::from_str::<serde_json::Value>(&original[..end]).is_err());
     }
 }

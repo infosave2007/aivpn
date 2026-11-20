@@ -3,7 +3,6 @@
 //! Handles `aivpn record start/stop/status` and `aivpn masks list/delete/retrain`
 //! by sending appropriate ControlPayload messages to the server.
 
-use serde::{Deserialize, Serialize};
 use std::net::{Ipv4Addr, SocketAddrV4};
 use tracing::info;
 
@@ -185,44 +184,42 @@ pub fn tokens_match(a: &str, b: &str) -> bool {
     diff == 0
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RecordingLocalStatus {
-    pub can_record: Option<bool>,
-    pub state: String,
-    pub service: Option<String>,
-    pub message: Option<String>,
-    pub mask_id: Option<String>,
-    pub confidence: Option<f32>,
-    pub updated_at_ms: u64,
-}
+pub use aivpn_common::local_admin::RecordingStatus as RecordingLocalStatus;
 
-impl Default for RecordingLocalStatus {
-    fn default() -> Self {
-        Self {
-            can_record: None,
-            state: "idle".into(),
-            service: None,
-            message: Some("Recording access not checked yet".into()),
-            mask_id: None,
-            confidence: None,
-            updated_at_ms: current_timestamp_ms(),
-        }
-    }
-}
-
-/// Файлы записи принадлежат конкретному локальному admin-адресу.
+/// Обычный клиент использует свои файлы, работник службы хранит состояние в памяти.
 #[derive(Clone)]
 pub struct RecordingStatusStore {
-    paths: Vec<std::path::PathBuf>,
+    storage: RecordingStorage,
+}
+#[derive(Clone)]
+enum RecordingStorage {
+    Files(Vec<std::path::PathBuf>),
+    Memory(std::sync::Arc<std::sync::Mutex<RecordingLocalStatus>>),
 }
 impl RecordingStatusStore {
+    pub fn in_memory() -> Self {
+        Self {
+            storage: RecordingStorage::Memory(std::sync::Arc::new(std::sync::Mutex::new(
+                RecordingLocalStatus::default(),
+            ))),
+        }
+    }
     pub fn for_endpoint(addr: SocketAddrV4) -> Self {
         let paths = local_status_paths(addr, "recording.status");
-        Self { paths }
+        Self {
+            storage: RecordingStorage::Files(paths),
+        }
     }
     fn write_status(&self, status: &RecordingLocalStatus) {
+        let paths = match &self.storage {
+            RecordingStorage::Memory(current) => {
+                *current.lock().unwrap_or_else(|error| error.into_inner()) = status.clone();
+                return;
+            }
+            RecordingStorage::Files(paths) => paths,
+        };
         if let Ok(json) = serde_json::to_vec(status) {
-            for path in &self.paths {
+            for path in paths {
                 // Atomic temp+rename (not plain std::fs::write, which
                 // open+truncate+writes in place) so a CLI `record status` poll
                 // landing mid-write never sees a 0-byte/partial file — and
@@ -236,12 +233,34 @@ impl RecordingStatusStore {
         self.write_status(&RecordingLocalStatus::default());
     }
     pub fn read_local_status(&self) -> Option<RecordingLocalStatus> {
-        self.paths.iter().find_map(|path| {
+        let paths = match &self.storage {
+            RecordingStorage::Memory(current) => {
+                return Some(
+                    current
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .clone(),
+                );
+            }
+            RecordingStorage::Files(paths) => paths,
+        };
+        paths.iter().find_map(|path| {
             let data = std::fs::read(path).ok()?;
             serde_json::from_slice::<RecordingLocalStatus>(&data).ok()
         })
     }
     pub fn handle_recording_status(&self, can_record: bool, active_service: Option<&str>) {
+        // Ответ о доступности записи не отменяет анализ или его результат.
+        if active_service.is_none() {
+            if let Some(mut status) = self.read_local_status().filter(|status| {
+                matches!(status.state.as_str(), "analyzing" | "success" | "failed")
+            }) {
+                status.can_record = Some(can_record);
+                status.updated_at_ms = current_timestamp_ms();
+                self.write_status(&status);
+                return;
+            }
+        }
         let message = if can_record {
             if let Some(service) = active_service {
                 format!("Recording is active for '{}'", service)
@@ -555,6 +574,26 @@ pub fn handle_recording_failed(reason: &str) {
 #[cfg(test)]
 mod admin_command_tests {
     use super::*;
+    #[test]
+    fn memory_recording_status_survives_polling_and_is_isolated_per_session() {
+        let first = RecordingStatusStore::in_memory();
+        let observer = first.clone();
+        let second = RecordingStatusStore::in_memory();
+        first.handle_recording_status(true, Some("test-call"));
+        first.handle_recording_ack(&[1; 16], "analyzing");
+        let status = observer
+            .read_local_status()
+            .expect("Состояние записи должно оставаться доступным без файла");
+        assert_eq!(status.state, "analyzing");
+        first.handle_recording_failed("Too few packets");
+        first.handle_recording_status(true, None);
+        let status = observer.read_local_status().unwrap();
+        assert_eq!(status.state, "failed");
+        assert_eq!(status.message.as_deref(), Some("Too few packets"));
+        second.reset_local_status();
+        assert_eq!(second.read_local_status().unwrap().state, "idle");
+        assert_eq!(observer.read_local_status().unwrap().state, "failed");
+    }
 
     #[tokio::test]
     async fn conflicting_admin_bind_preserves_owner_token() {
@@ -591,15 +630,47 @@ mod admin_command_tests {
     }
 
     #[test]
+    fn status_poll_keeps_recording_results_until_the_next_recording() {
+        let dir = std::env::temp_dir().join(format!(
+            "aivpn-record-result-{:032x}",
+            rand::random::<u128>()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let store = RecordingStatusStore {
+            storage: RecordingStorage::Files(vec![dir.join("status")]),
+        };
+        store.handle_recording_status(true, Some("test-call"));
+        store.handle_recording_failed("Too few packets");
+        store.handle_recording_status(true, None);
+        let status = store.read_local_status().unwrap();
+        assert_eq!(status.state, "failed");
+        assert_eq!(status.message.as_deref(), Some("Too few packets"));
+        store.handle_recording_ack(&[1; 16], "analyzing");
+        store.handle_recording_status(true, None);
+        assert_eq!(store.read_local_status().unwrap().state, "analyzing");
+        store.handle_recording_complete("test-call", "generated-mask", 0.9);
+        store.handle_recording_status(true, None);
+        assert_eq!(
+            store.read_local_status().unwrap().mask_id.as_deref(),
+            Some("generated-mask")
+        );
+        store.handle_recording_status(true, Some("next-call"));
+        let next = store.read_local_status().unwrap();
+        assert_eq!(next.state, "recording");
+        assert!(next.mask_id.is_none());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn recording_instances_do_not_overwrite_each_other() {
         let dir =
             std::env::temp_dir().join(format!("aivpn-record-test-{:032x}", rand::random::<u128>()));
         std::fs::create_dir(&dir).unwrap();
         let first = RecordingStatusStore {
-            paths: vec![dir.join("first")],
+            storage: RecordingStorage::Files(vec![dir.join("first")]),
         };
         let second = RecordingStatusStore {
-            paths: vec![dir.join("second")],
+            storage: RecordingStorage::Files(vec![dir.join("second")]),
         };
         first.handle_recording_status(true, Some("first-service"));
         second.reset_local_status();

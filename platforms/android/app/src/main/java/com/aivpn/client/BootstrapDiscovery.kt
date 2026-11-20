@@ -143,7 +143,8 @@ object BootstrapDiscovery {
                     continue
                 }
                 if (code !in 200..299) return null
-                return conn.inputStream.bufferedReader().readText()
+                if (conn.contentLengthLong > BootstrapResponse.MAX_BYTES) return null
+                return conn.inputStream.use { BootstrapResponse.read(it) }
             } catch (_: Exception) {
                 return null
             } finally {

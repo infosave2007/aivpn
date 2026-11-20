@@ -770,8 +770,46 @@ impl LiveDbGuard {
 
     /// Ждет окончания offline restore и сохраняет блокировку на все время владения.
     pub fn shared(path: &Path) -> Result<Self> {
-        Self::lock(path, false)
+        let guard = Self::lock(path, false)?;
+        if crate::backup::has_clients_journal(path)? {
+            guard.upgrade_exclusive()?;
+            let recovered = crate::backup::recover_clients_journal(path);
+            guard.downgrade_shared();
+            recovered?;
+        }
+        Ok(guard)
     }
+
+    #[cfg(unix)]
+    fn upgrade_exclusive(&self) -> Result<()> {
+        use std::os::fd::AsRawFd;
+        if unsafe { libc::flock(self._file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            return Ok(());
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::WouldBlock {
+            return Err(Error::Session(
+                "незавершенное восстановление: остановите процессы, использующие эту базу".into(),
+            ));
+        }
+        Err(Error::Io(error))
+    }
+
+    #[cfg(not(unix))]
+    fn upgrade_exclusive(&self) -> Result<()> {
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn downgrade_shared(&self) {
+        use std::os::fd::AsRawFd;
+        unsafe {
+            libc::flock(self._file.as_raw_fd(), libc::LOCK_SH);
+        }
+    }
+
+    #[cfg(not(unix))]
+    fn downgrade_shared(&self) {}
 }
 
 impl Drop for LiveDbGuard {

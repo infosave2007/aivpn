@@ -171,6 +171,7 @@ impl crate::AivpnApp {
                 self.dlg_name.trim(),
                 &self.dlg_key,
                 self.dlg_full_tunnel,
+                self.keys.keys[index].split_enabled,
                 proxy,
                 mtls,
                 args.0,
@@ -463,8 +464,19 @@ impl crate::AivpnApp {
                 "Settings are read-only. Disconnect VPN to change them.",
             )
         });
+        let managed = self.uses_application_routing();
+        if managed {
+            ui.weak(text(lang, "Этот профиль управляется в разделе Приложения. Переключатель split расположен там.", "This profile is managed on the Applications page. Use its split switch there."));
+        }
         let draft = self.route_draft.as_mut().unwrap();
         ui.add_enabled_ui(editable, |ui| {
+            ui.add_enabled(
+                !managed,
+                egui::Checkbox::new(
+                    &mut draft.split_enabled,
+                    text(lang, "Split по сетям", "Network split tunneling"),
+                ),
+            );
             let mut mode = if draft.proxy {
                 2
             } else {
@@ -572,6 +584,7 @@ impl crate::AivpnApp {
             &key.name.clone(),
             &key.key.clone(),
             draft.full_tunnel,
+            draft.split_enabled,
             proxy,
             key.mtls_cert_path.clone(),
             route_lines(&draft.exclude),

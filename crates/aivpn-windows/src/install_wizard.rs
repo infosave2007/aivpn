@@ -304,6 +304,7 @@ fn no_console_window(_cmd: &mut Command) {}
 
 fn run_capture(client_binary: &Path, args: &[&str]) -> Result<(bool, String, String), String> {
     let mut cmd = Command::new(client_binary);
+    cmd.arg("cli");
     cmd.args(args);
     no_console_window(&mut cmd);
     let out = cmd
@@ -397,6 +398,7 @@ pub fn spawn_install(
         let args = build_run_args(&target);
 
         let mut cmd = Command::new(&client_binary);
+        cmd.arg("cli");
         cmd.args(&args);
         cmd.stdin(Stdio::null());
         cmd.stdout(Stdio::piped());

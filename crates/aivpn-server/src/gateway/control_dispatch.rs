@@ -1164,7 +1164,7 @@ impl super::Gateway {
                 .send_control_message(&ControlPayload::Shutdown { reason: 3 }, session)
                 .await;
             let sid = session.lock().session_id;
-            self.session_manager.remove_session(&sid);
+            self.remove_session_and_state(&sid);
             return Ok(());
         }
         if retry {
@@ -1196,7 +1196,13 @@ impl super::Gateway {
         let role = self.session_role(session);
         let caps = ControlPayload::Capabilities {
             role: role.as_u8(),
-            features: 0,
+            features: aivpn_common::mask_transition::FEATURE
+                | aivpn_common::mask_assessment::FEATURE
+                | if session.lock().client_packet_features.is_some() {
+                    aivpn_common::protocol::CLIENT_PACKET_FEATURES
+                } else {
+                    0
+                },
         };
         match self.send_control_message(&caps, session).await {
             Ok(()) => session.lock().capabilities_sent = true,
@@ -1261,7 +1267,7 @@ impl super::Gateway {
                 let shutdown = ControlPayload::Shutdown { reason: 3 };
                 let _ = self.send_control_message(&shutdown, session).await;
                 let session_id = session.lock().session_id;
-                self.session_manager.remove_session(&session_id);
+                self.remove_session_and_state(&session_id);
                 return Ok(());
             }
             if session
@@ -1270,7 +1276,7 @@ impl super::Gateway {
                 .is_some_and(|key| key != static_pub)
             {
                 let session_id = session.lock().session_id;
-                self.session_manager.remove_session(&session_id);
+                self.remove_session_and_state(&session_id);
                 return Ok(());
             }
             if let (Some(db), Some(cid)) = (&self.client_db, &client_id) {
@@ -1308,7 +1314,7 @@ impl super::Gateway {
                         };
                         let _ = self.send_control_message(&reject, session).await;
                         let session_id = session.lock().session_id;
-                        self.session_manager.remove_session(&session_id);
+                        self.remove_session_and_state(&session_id);
                         return Ok(());
                     }
                 }
@@ -1317,7 +1323,7 @@ impl super::Gateway {
             if !sess.record_verified_device(static_pub) {
                 let session_id = sess.session_id;
                 drop(sess);
-                self.session_manager.remove_session(&session_id);
+                self.remove_session_and_state(&session_id);
                 return Ok(());
             }
             self.refresh_mtls_gate(&mut sess);
@@ -1362,7 +1368,7 @@ impl super::Gateway {
                 }
             };
             let (status, body) = if status == 200 {
-                aivpn_common::diagnostics::response(method, &path, &body)
+                self.diagnostic_request(session, method, &path, &body).await
             } else {
                 (
                     status,
@@ -1373,6 +1379,7 @@ impl super::Gateway {
                     },
                 )
             };
+            debug!(req_id, path = %path, status, "Диагностический ответ");
             if status >= 400 {
                 debug!(
                     req_id,
@@ -1554,6 +1561,25 @@ impl super::Gateway {
             return Ok(());
         }
         match control {
+            ControlPayload::MaskApplied { generation, digest } => {
+                let receipt = aivpn_common::mask_transition::MaskReceipt { generation, digest };
+                let accepted = {
+                    let mut current = session.lock();
+                    if !current.client_admitted || !current.is_ratcheted {
+                        return Ok(());
+                    }
+                    let accepted = current.confirm_mask_receipt(receipt);
+                    if accepted {
+                        self.refresh_kernel_session(&mut current);
+                    }
+                    accepted
+                };
+                if accepted {
+                    self.send_control_message(&receipt.control(), session)
+                        .await?;
+                }
+            }
+            ControlPayload::MaskUpdateV2 { .. } | ControlPayload::MaskAssessment(_) => {}
             ControlPayload::MaskState(state) => {
                 {
                     let current = session.lock();
@@ -1561,11 +1587,9 @@ impl super::Gateway {
                         || !current.is_ratcheted
                         || !current.client_admitted
                         || state.answer
-                        || !current.mask.as_ref().is_some_and(|mask| {
-                            aivpn_common::mask_io::uses_rtc(mask)
-                                && mask.mask_id == state.mask_id
-                                && mask.version == state.mask_version
-                        })
+                        || current
+                            .rtc_offer_mask(&state.mask_id, state.mask_version)
+                            .is_none()
                     {
                         return Err(Error::InvalidPacket(
                             "Согласование RTC не соответствует установленной сессии",
@@ -1649,13 +1673,7 @@ impl super::Gateway {
                 self.flush_session_traffic(session);
                 // Close session and stop active recording if any
                 let session_id = session.lock().session_id;
-                self.session_manager.remove_session(&session_id);
-                self.neural_module.lock().cleanup_stats(session_id);
-                #[cfg(feature = "neural")]
-                self.dpi_gate.cleanup(&session_id);
-                if let Some(ref ka) = self.kernel_accel {
-                    let _ = ka.session_remove(&session_id);
-                }
+                self.remove_session_and_state(&session_id);
                 if let Some(ref recorder) = self.recording_manager {
                     let socket = self.udp_socket.as_ref().unwrap().clone();
                     let store = recorder.store();
@@ -2020,10 +2038,43 @@ impl super::Gateway {
             }
             ControlPayload::Capabilities { features, .. } => {
                 if features & aivpn_common::protocol::CLIENT_PACKET_FEATURES != 0 {
-                    let mut current = session.lock();
-                    // FEC задается при запуске потока и не меняется до reconnect.
-                    // Поле role из клиентского сообщения не используется.
-                    current.client_packet_features.get_or_insert(features);
+                    let promote = {
+                        let mut current = session.lock();
+                        // Первое объявление фиксирует формат FEC. role не дает прав.
+                        let first = current.client_packet_features.is_none();
+                        current.client_packet_features.get_or_insert(features);
+                        if first && current.reliable_mask_updates() {
+                            current
+                                .pending_mask
+                                .as_ref()
+                                .map(|(mask, _)| mask.clone())
+                                .or_else(|| {
+                                    current
+                                        .legacy_mask_changed
+                                        .then(|| current.mask.clone())
+                                        .flatten()
+                                })
+                        } else {
+                            None
+                        }
+                    };
+                    if let Some(mask) = promote {
+                        let packets = self
+                            .session_manager
+                            .build_mask_update_packets(session, &mask)?;
+                        if let Some(socket) = self.udp_socket.as_ref() {
+                            socket.send_packets_to(&packets, client_addr).await?;
+                        }
+                    }
+                    if features & aivpn_common::mask_transition::FEATURE != 0 {
+                        let reply = ControlPayload::Capabilities {
+                            role: self.session_role(session).as_u8(),
+                            features: aivpn_common::protocol::CLIENT_PACKET_FEATURES
+                                | aivpn_common::mask_transition::FEATURE
+                                | aivpn_common::mask_assessment::FEATURE,
+                        };
+                        self.send_control_message(&reply, session).await?;
+                    }
                 }
             }
             ControlPayload::MgmtResponse { .. } => {

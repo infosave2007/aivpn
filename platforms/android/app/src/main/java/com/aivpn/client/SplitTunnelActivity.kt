@@ -19,6 +19,7 @@ import androidx.appcompat.app.AppCompatActivity
 import androidx.lifecycle.lifecycleScope
 import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -66,6 +67,21 @@ class SplitTunnelActivity : AppCompatActivity() {
             val stored = withContext(Dispatchers.IO) {
                 SecureStorage.loadAllowedApps(this@SplitTunnelActivity) to
                     SecureStorage.loadExcludedDomains(this@SplitTunnelActivity)
+            }
+            val enabled = withContext(Dispatchers.IO) { SecureStorage.loadSplitEnabled(this@SplitTunnelActivity) }
+            binding.switchSplitEnabled.isChecked = enabled
+            binding.switchSplitEnabled.isEnabled = !AivpnService.isServiceActive
+            binding.switchSplitEnabled.setOnClickListener {
+                val checked = binding.switchSplitEnabled.isChecked
+                binding.switchSplitEnabled.isEnabled = false
+                lifecycleScope.launch {
+                    val saved = withContext(Dispatchers.IO + NonCancellable) {
+                        SecureStorage.saveSplitEnabled(this@SplitTunnelActivity, checked)
+                        SecureStorage.loadSplitEnabled(this@SplitTunnelActivity)
+                    }
+                    binding.switchSplitEnabled.isChecked = saved
+                    binding.switchSplitEnabled.isEnabled = !AivpnService.isServiceActive
+                }
             }
             allowedPackages.addAll(stored.first)
             excludedDomains.addAll(stored.second)

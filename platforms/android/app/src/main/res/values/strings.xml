@@ -401,4 +401,16 @@
     <string name="install_marker_container_not_running">aivpn-server container did not report as running</string>
     <string name="bench_speed">Upload: %1$.0f kbps  Download: %2$.0f kbps</string>
     <string name="bench_failed">Active-session benchmark failed</string>
+    <string name="bench_limited">Speed is limited by the test method; link capacity may be higher.</string>
+    <string name="mask_model_unknown">Uplink model: no current measurement</string>
+    <string name="mask_model_deviation_high">large deviation</string>
+    <string name="mask_model_deviation">deviation</string>
+    <string name="mask_model_in_range">within model range</string>
+    <string name="mask_model_trained">trained model</string>
+    <string name="mask_model_projection">fallback projection</string>
+    <string name="mask_model_measurement">Uplink: %1$s
+MSE %2$.4f, samples %3$d, %4$s</string>
+    <string name="split_tunnel_enabled">Enable split tunneling</string>
+    <string name="split_tunnel_disabled">Off - all applications and sites use VPN</string>
+    <string name="split_tunnel_switch_note">Settings are retained. Disconnect VPN before changing the switch.</string>
 </resources>

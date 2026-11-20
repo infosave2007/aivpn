@@ -10,7 +10,12 @@ repository.workspace = true
 name = "aivpn-linux"
 path = "src/main.rs"
 
+[features]
+app-routing = ["aivpn-client/app-routing"]
+
 [dependencies]
+aivpn-client = { path = "../aivpn-client", features = ["ssh-install"] }
+aivpn-desktop-agent = { path = "../aivpn-desktop-agent", features = ["local-profile"] }
 iced = { version = "0.14", features = ["tokio", "image", "advanced"] }
 # Neutral descriptor for extra settings sections. The GUI reads an optional
 # file and renders whatever it declares; with no file it renders nothing.

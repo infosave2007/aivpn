@@ -140,7 +140,7 @@ fn vpn_protect(vm: &JavaVM, vpn_service: &GlobalRef, fd: RawFd) -> Result<()> {
     let protect_result = guard
         .call_method(
             vpn_service,
-            "protect",
+            "protectTransportSocket",
             "(I)Z",
             &[jni::objects::JValue::Int(fd)],
         )
@@ -151,7 +151,9 @@ fn vpn_protect(vm: &JavaVM, vpn_service: &GlobalRef, fd: RawFd) -> Result<()> {
     }
 
     if !protect_result.unwrap_or(false) {
-        return Err(Error::Session("VpnService.protect() returned false".into()));
+        return Err(Error::Session(
+            "VPN socket protection or network binding failed".into(),
+        ));
     }
     Ok(())
 }

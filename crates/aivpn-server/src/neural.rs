@@ -97,6 +97,10 @@ pub struct TrafficStats {
     pub rx_packets: u64,
     /// Packets sent to client (downlink direction)
     pub tx_packets: u64,
+    pub mask_epoch: Option<(u64, [u8; 64])>,
+    pub last_sample: Option<Instant>,
+    pub last_checked_sample: u64,
+    pub sample_times: VecDeque<Instant>,
 }
 
 impl TrafficStats {
@@ -109,11 +113,18 @@ impl TrafficStats {
             bps: 0.0,
             rx_packets: 0,
             tx_packets: 0,
+            mask_epoch: None,
+            last_sample: None,
+            last_checked_sample: 0,
+            sample_times: VecDeque::with_capacity(256),
         }
     }
 
     /// Add packet sample. `is_rx` = true for client→server (uplink), false for server→client.
     pub fn add_packet(&mut self, size: u16, iat_ms: f64, entropy: f64, is_rx: bool) {
+        let now = Instant::now();
+        self.last_sample = Some(now);
+        self.sample_times.push_back(now);
         self.packet_sizes.push_back(size);
         self.inter_arrivals.push_back(iat_ms);
         self.entropy_samples.push_back(entropy);
@@ -127,6 +138,7 @@ impl TrafficStats {
             self.packet_sizes.pop_front();
             self.inter_arrivals.pop_front();
             self.entropy_samples.pop_front();
+            self.sample_times.pop_front();
         }
         let elapsed_ms: f64 = self.inter_arrivals.iter().copied().sum();
         if elapsed_ms.is_finite() && elapsed_ms > 0.0 {
@@ -153,6 +165,9 @@ impl TrafficStats {
         self.bps = 0.0;
         self.rx_packets = 0;
         self.tx_packets = 0;
+        self.last_sample = None;
+        self.last_checked_sample = 0;
+        self.sample_times.clear();
     }
 }
 
@@ -179,6 +194,7 @@ pub struct BakedMaskEncoder {
     hidden: usize,
     trained: bool,
     signature_hash: String,
+    model_id: std::sync::OnceLock<[u8; 32]>,
 }
 
 #[cfg(test)]
@@ -221,6 +237,20 @@ mod trained_reference_tests {
             },
             NeuralConfig {
                 compromised_threshold: -0.1,
+                ..Default::default()
+            },
+            NeuralConfig {
+                warning_threshold: 0.0,
+                ..Default::default()
+            },
+            NeuralConfig {
+                warning_threshold: 0.7,
+                compromised_threshold: 0.5,
+                ..Default::default()
+            },
+            NeuralConfig {
+                warning_threshold: 0.5,
+                compromised_threshold: 0.5,
                 ..Default::default()
             },
             NeuralConfig {
@@ -376,6 +406,7 @@ impl BakedMaskEncoder {
             b2,
             hidden,
             trained: false,
+            model_id: std::sync::OnceLock::new(),
             signature_hash: blake3::hash(&sig_bytes).to_hex().to_string(),
         }
     }
@@ -389,6 +420,7 @@ impl BakedMaskEncoder {
             b2: model.b2.clone(),
             hidden: model.hidden,
             trained: true,
+            model_id: std::sync::OnceLock::new(),
             signature_hash: model.signature_hash.clone(),
         })
     }
@@ -1056,6 +1088,7 @@ pub struct ResonanceResult {
     pub mse: f32,
     pub status: ResonanceStatus,
     pub message: Option<String>,
+    pub assessment: Option<aivpn_common::mask_assessment::MaskAssessment>,
 }
 
 impl ResonanceResult {
@@ -1064,6 +1097,7 @@ impl ResonanceResult {
             mse: 0.0,
             status: ResonanceStatus::Skip,
             message: Some(msg.to_string()),
+            assessment: None,
         }
     }
 }
@@ -1090,7 +1124,8 @@ impl NeuralResonanceModule {
         }
         if [config.warning_threshold, config.compromised_threshold]
             .iter()
-            .any(|value| !value.is_finite() || *value < 0.0)
+            .any(|value| !value.is_finite() || *value <= 0.0)
+            || config.compromised_threshold <= config.warning_threshold
             || !config.dpi_gate_threshold.is_finite()
             || !(0.0..=1.0).contains(&config.dpi_gate_threshold)
         {
@@ -1221,6 +1256,50 @@ impl NeuralResonanceModule {
         }
     }
 
+    /// При смене поколения старые выборки больше не описывают активную маску.
+    pub fn record_masked_traffic(
+        &self,
+        session_id: [u8; 16],
+        epoch: (u64, [u8; 64]),
+        packet_size: u16,
+        iat_ms: f64,
+        entropy: f64,
+    ) {
+        let mut stats = self
+            .session_stats
+            .entry(session_id)
+            .or_insert_with(TrafficStats::new);
+        if stats.mask_epoch != Some(epoch) {
+            stats.clear();
+            stats.mask_epoch = Some(epoch);
+        }
+        stats.add_packet(packet_size, iat_ms, entropy, true);
+    }
+
+    pub fn check_mask_resonance(
+        &self,
+        session_id: [u8; 16],
+        mask: &MaskProfile,
+        generation: u64,
+        revision: u64,
+    ) -> Result<ResonanceResult, String> {
+        let matching = self
+            .session_stats
+            .get(&session_id)
+            .is_some_and(|stats| stats.mask_epoch == Some((revision, mask.signature)));
+        if !matching {
+            return Ok(ResonanceResult::skip(
+                "Нет выборки текущего поколения маски",
+            ));
+        }
+        let mut result = self.check_resonance(session_id, &mask.mask_id)?;
+        if let Some(value) = result.assessment.as_mut() {
+            value.mask_digest = aivpn_common::mask_assessment::identity(mask);
+            value.generation = generation;
+        }
+        Ok(result)
+    }
+
     /// Returns true if enough time has passed since the last rotation for this mask.
     pub fn can_rotate(&self, mask_id: &str) -> bool {
         let cooldown = Duration::from_secs(self.config.rotation_cooldown_secs);
@@ -1252,7 +1331,7 @@ impl NeuralResonanceModule {
             return Ok(ResonanceResult::skip("Model not loaded"));
         }
 
-        let Some(stats) = self.session_stats.get(&session_id) else {
+        let Some(mut stats) = self.session_stats.get_mut(&session_id) else {
             return Ok(ResonanceResult::skip("No traffic stats"));
         };
 
@@ -1269,11 +1348,24 @@ impl NeuralResonanceModule {
             ));
         }
 
+        let age = stats
+            .last_sample
+            .map(|at| at.elapsed())
+            .unwrap_or(aivpn_common::mask_assessment::MAX_AGE);
+        if age >= aivpn_common::mask_assessment::MAX_AGE {
+            return Ok(ResonanceResult::skip("Выборка трафика устарела"));
+        }
+        let window = stats.rx_packets.saturating_add(stats.tx_packets);
+        if stats.last_checked_sample >= window {
+            return Ok(ResonanceResult::skip("Нет новых выборок трафика"));
+        }
         let features = encode_features(&stats);
         let mse = encoder.reconstruction_error(&features);
         if !mse.is_finite() {
             return Err("Неконечная ошибка реконструкции модели".into());
         }
+
+        stats.last_checked_sample = window;
 
         // Update per-mask calibration and log when it first completes.
         {
@@ -1310,10 +1402,48 @@ impl NeuralResonanceModule {
             ResonanceStatus::Healthy
         };
 
+        let model_id = *encoder.model_id.get_or_init(|| {
+            let mut model_hash = blake3::Hasher::new();
+            model_hash.update(b"aivpn-neural-weights-v1");
+            for weight in encoder
+                .w1
+                .iter()
+                .chain(&encoder.b1)
+                .chain(&encoder.w2)
+                .chain(&encoder.b2)
+            {
+                model_hash.update(&weight.to_le_bytes());
+            }
+            *model_hash.finalize().as_bytes()
+        });
+        let assessment = aivpn_common::mask_assessment::MaskAssessment {
+            generation: stats.mask_epoch.map_or(0, |(generation, _)| generation),
+            mask_digest: [0; 32],
+            model_id,
+            model_kind: u8::from(encoder.is_trained()),
+            direction: 1,
+            window,
+            samples: stats.packet_sizes.len() as u16,
+            span_ms: stats
+                .sample_times
+                .front()
+                .zip(stats.sample_times.back())
+                .map(|(first, last)| {
+                    last.saturating_duration_since(*first)
+                        .as_millis()
+                        .clamp(1, u32::MAX as u128) as u32
+                })
+                .unwrap_or(1),
+            age_ms: age.as_millis().min(u32::MAX as u128) as u32,
+            mse,
+            warning: warn_thresh,
+            compromised: comp_thresh,
+        };
         Ok(ResonanceResult {
             mse,
             status,
             message: None,
+            assessment: assessment.validate().is_ok().then_some(assessment),
         })
     }
 
@@ -1354,6 +1484,11 @@ impl NeuralResonanceModule {
     /// Cleanup old session stats
     pub fn cleanup_stats(&self, session_id: [u8; 16]) {
         self.session_stats.remove(&session_id);
+    }
+
+    /// Удалить статистику сессий, завершенных в обход обработчика Shutdown.
+    pub(crate) fn retain_sessions(&self, mut live: impl FnMut(&[u8; 16]) -> bool) {
+        self.session_stats.retain(|id, _| live(id));
     }
 
     /// Total memory usage for all baked encoders
@@ -1638,5 +1773,102 @@ mod anomaly_tests {
         assert!(det.is_anomalous("m"));
         det.clear_mask("m");
         assert!(!det.is_anomalous("m"));
+    }
+}
+
+#[cfg(test)]
+mod assessment_epoch_tests {
+    use super::*;
+
+    #[test]
+    fn unsigned_legacy_masks_do_not_reuse_another_local_revision() {
+        let mut module = NeuralResonanceModule::new(NeuralConfig::default()).unwrap();
+        module.load_model().unwrap();
+        let mask = aivpn_common::mask::preset_masks::quic_https_v2();
+        module.ensure_encoder(&mask).unwrap();
+        let id = [22; 16];
+        for _ in 0..64 {
+            module.record_masked_traffic(id, (7, mask.signature), 1100, 8.0, 7.6);
+        }
+        assert!(module
+            .check_mask_resonance(id, &mask, 0, 8)
+            .unwrap()
+            .assessment
+            .is_none());
+        for _ in 0..32 {
+            module.record_masked_traffic(id, (8, mask.signature), 1100, 8.0, 7.6);
+        }
+        let value = module
+            .check_mask_resonance(id, &mask, 0, 8)
+            .unwrap()
+            .assessment
+            .unwrap();
+        assert_eq!(value.samples, 32);
+        assert_eq!(value.generation, 0);
+    }
+
+    #[test]
+    fn live_assessment_requires_fresh_samples_of_the_active_mask_epoch() {
+        let mut module = NeuralResonanceModule::new(NeuralConfig::default()).unwrap();
+        module.load_model().unwrap();
+        let mask = aivpn_common::mask::preset_masks::quic_https_v2();
+        module.ensure_encoder(&mask).unwrap();
+        let id = [21; 16];
+        assert!(module
+            .check_mask_resonance(id, &mask, 1, 1)
+            .unwrap()
+            .assessment
+            .is_none());
+        for _ in 0..64 {
+            module.record_masked_traffic(id, (1, mask.signature), 1100, 8.0, 7.6);
+        }
+        let result = module.check_mask_resonance(id, &mask, 1, 1).unwrap();
+        let value = result
+            .assessment
+            .expect("Живая выборка должна дать измерение");
+        assert_eq!(value.generation, 1);
+        assert_eq!(
+            value.mask_digest,
+            aivpn_common::mask_assessment::identity(&mask)
+        );
+        assert_eq!(value.samples, 64);
+        assert_eq!(value.window, 64);
+        assert_eq!(value.direction, 1);
+        assert_eq!(value.mse, result.mse);
+        assert_ne!(value.model_id, [0; 32]);
+        assert!(module
+            .check_mask_resonance(id, &mask, 1, 1)
+            .unwrap()
+            .assessment
+            .is_none());
+        assert!(module
+            .check_mask_resonance(id, &mask, 2, 2)
+            .unwrap()
+            .assessment
+            .is_none());
+        module.record_masked_traffic(id, (2, mask.signature), 1100, 8.0, 7.6);
+        assert!(module
+            .check_mask_resonance(id, &mask, 2, 2)
+            .unwrap()
+            .assessment
+            .is_none());
+        for _ in 0..32 {
+            module.record_masked_traffic(id, (2, mask.signature), 1100, 8.0, 7.6);
+        }
+        module.session_stats.get_mut(&id).unwrap().last_sample =
+            Some(Instant::now() - aivpn_common::mask_assessment::MAX_AGE);
+        assert!(module
+            .check_mask_resonance(id, &mask, 2, 2)
+            .unwrap()
+            .assessment
+            .is_none());
+        module.record_masked_traffic(id, (2, mask.signature), 1100, 8.0, 7.6);
+        let next = module
+            .check_mask_resonance(id, &mask, 2, 2)
+            .unwrap()
+            .assessment
+            .unwrap();
+        assert_eq!(next.window, 34);
+        assert_eq!(next.model_id, value.model_id);
     }
 }

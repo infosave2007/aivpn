@@ -24,6 +24,7 @@ struct RecordingResultSummary: Equatable {
 }
 
 struct BenchResult {
+    let throughputLimited: Bool
     let p50ms: Int
     let p95ms: Int
     let lossPct: Double
@@ -156,7 +157,23 @@ class VPNManager: ObservableObject {
     private var coreConnectedSince: Date?
     private let bundleId = "com.aivpn.client.tunnel"
 
+    private static let dataUseNoticeKey = "dataUseNoticeAccepted"
+
+    /// False until the user has read the data use notice. Nothing asks for
+    /// the VPN configuration or for notifications before that.
+    @Published private(set) var dataUseNoticeAccepted: Bool =
+        UserDefaults.standard.bool(forKey: VPNManager.dataUseNoticeKey)
+
     init() {
+        guard dataUseNoticeAccepted else { return }
+        loadManager()
+        requestNotificationPermission()
+    }
+
+    func acceptDataUseNotice() {
+        guard !dataUseNoticeAccepted else { return }
+        UserDefaults.standard.set(true, forKey: Self.dataUseNoticeKey)
+        dataUseNoticeAccepted = true
         loadManager()
         requestNotificationPermission()
     }
@@ -420,6 +437,7 @@ class VPNManager: ObservableObject {
         // The tunnel reads these from providerConfiguration because the extension
         // process cannot share in-memory state with the app process.
         let splitDefaults = UserDefaults(suiteName: "group.com.aivpn.client")
+        providerConfig["split_enabled"] = SplitTunnelManager.shared.isEnabled
         if let routes = splitDefaults?.stringArray(forKey: "excluded_routes"), !routes.isEmpty {
             providerConfig["excluded_routes"] = routes.joined(separator: ",")
         }
@@ -510,7 +528,7 @@ class VPNManager: ObservableObject {
         let alreadyShown = handshakeRejected && handshakeRejectReason == reason
         handshakeRejected = true
         handshakeRejectReason = reason
-        let key = (1...3).contains(reason) ? "handshake_reject_reason_\(reason)" : "handshake_reject_reason_0"
+        let key = reason == 4 ? "cert_rejected_body" : ((1...3).contains(reason) ? "handshake_reject_reason_\(reason)" : "handshake_reject_reason_0")
         lastError = LocalizationManager.shared.t(key)
         if !alreadyShown {
             postNotification(title: LocalizationManager.shared.t("handshake_rejected_title"), body: lastError ?? "")
@@ -527,6 +545,7 @@ class VPNManager: ObservableObject {
     func retryManagerSetup() {
         // Do NOT clear lastError here — the user must explicitly dismiss errors.
         // Clearing it here races with connect()'s error path and can hide failures.
+        guard dataUseNoticeAccepted else { return }
         loadManager()
     }
 
@@ -817,6 +836,7 @@ class VPNManager: ObservableObject {
                 return
             }
             self.benchResult = BenchResult(
+                throughputLimited: (response["throughput_limited"] as? Bool ?? true) || (response["throughput_method"] as? String != "data"),
                 p50ms: Int(p50), p95ms: Int(response["latency_p95_ms"] as? Double ?? 0),
                 lossPct: response["packet_loss_pct"] as? Double ?? 0,
                 uploadKbps: response["throughput_up_kbps"] as? Double ?? 0,

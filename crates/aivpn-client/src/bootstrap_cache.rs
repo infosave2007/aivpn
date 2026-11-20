@@ -27,6 +27,10 @@ pub(crate) static STICKY_MASK_TEST_LOCK: Mutex<()> = Mutex::new(());
 /// AUTO explores a different one, instead of looping on it forever.
 static DATA_STALL_STREAK: AtomicU32 = AtomicU32::new(0);
 static DATA_EXPLORATION_ROUND: AtomicU32 = AtomicU32::new(0);
+
+pub fn data_exploration_round() -> u32 {
+    DATA_EXPLORATION_ROUND.load(Ordering::Relaxed)
+}
 /// A session that stayed up at least this long is a working mask; a later stall
 /// is a transient hiccup, so the streak resets and the mask stays sticky.
 const HEALTHY_SESSION_MIN: Duration = Duration::from_secs(45);
@@ -123,7 +127,7 @@ pub fn select_initial_mask_with_preference(
     trusted_key: Option<&[u8; 32]>,
     preferred: Option<&str>,
 ) -> Option<MaskProfile> {
-    select_cached_candidate_with_preference(
+    select_descriptor_candidate(
         &load_descriptors(),
         preshared_key,
         fail_streak,
@@ -140,7 +144,7 @@ fn select_cached_candidate(
     trusted_key: Option<&[u8; 32]>,
     exploration_round: u32,
 ) -> Option<MaskProfile> {
-    select_cached_candidate_with_preference(
+    select_descriptor_candidate(
         descriptors,
         preshared_key,
         fail_streak,
@@ -150,7 +154,8 @@ fn select_cached_candidate(
     )
 }
 
-fn select_cached_candidate_with_preference(
+/// Выбирает маску из переданных дескрипторов, не читая файлы.
+pub fn select_descriptor_candidate(
     descriptors: &[BootstrapDescriptor],
     preshared_key: Option<&[u8; 32]>,
     fail_streak: u32,
@@ -164,11 +169,16 @@ fn select_cached_candidate_with_preference(
     }
     // Общий файл может содержать профили разных серверов. Проверка при
     // записи не заменяет проверку при чтении с ключом текущего подключения.
-    let trusted: Vec<_> = descriptors
+    let now = current_unix_secs();
+    let mut trusted: Vec<_> = descriptors
         .iter()
+        .filter(|descriptor| descriptor.is_valid_at(now))
         .filter(|descriptor| validate_descriptor_signature(descriptor, trusted_key).is_ok())
         .cloned()
         .collect();
+    trusted.sort_by(|left, right| right.created_at.cmp(&left.created_at));
+    let mut ids = std::collections::HashSet::new();
+    trusted.retain(|descriptor| ids.insert(descriptor.descriptor_id.clone()));
     let attempt = fail_streak.saturating_add(
         exploration_round.saturating_mul(aivpn_common::mask::HANDSHAKE_FALLBACK_THRESHOLD),
     );
@@ -242,7 +252,21 @@ impl CacheFileLock {
     }
 }
 
-pub fn store_descriptor(descriptor: BootstrapDescriptor) -> Result<()> {
+/// Возвращает сетевые обновления без обращения к файловой системе.
+pub fn memory_descriptors() -> Vec<BootstrapDescriptor> {
+    let directory = cache_dir();
+    let memory = VOLATILE_CACHE
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    if memory.directory.as_ref() == Some(&directory) {
+        memory.descriptors.clone()
+    } else {
+        Vec::new()
+    }
+}
+
+/// Подпись проверяется при приеме и повторно при выборе для текущего сервера.
+pub fn remember_descriptor(descriptor: BootstrapDescriptor) {
     let directory = cache_dir();
     // Проверенный сетевой дескриптор остается доступен, даже если диск занят.
     let mut memory = VOLATILE_CACHE
@@ -255,9 +279,13 @@ pub fn store_descriptor(descriptor: BootstrapDescriptor) -> Result<()> {
     memory
         .descriptors
         .retain(|saved| saved.descriptor_id != descriptor.descriptor_id);
-    memory.descriptors.insert(0, descriptor.clone());
+    memory.descriptors.insert(0, descriptor);
     memory.descriptors.truncate(MAX_CACHED_DESCRIPTORS);
-    drop(memory);
+}
+
+pub fn store_descriptor(descriptor: BootstrapDescriptor) -> Result<()> {
+    let directory = cache_dir();
+    remember_descriptor(descriptor.clone());
     store_descriptor_at(descriptor, &directory)
 }
 
@@ -664,7 +692,7 @@ mod preferred_reconnect_tests {
         let key = owner.verifying_key().to_bytes();
         let pool = aivpn_common::mask::derive_bootstrap_candidates(&quic, Some(&psk));
         for attempt in [0, 3, 6, u32::MAX] {
-            let mask = select_cached_candidate_with_preference(
+            let mask = select_descriptor_candidate(
                 &descriptors,
                 Some(&psk),
                 attempt,
@@ -690,7 +718,7 @@ mod preferred_reconnect_tests {
         let mut tampered = quic;
         tampered.kdf_salt[0] ^= 1;
         let untrusted = [other, rtc, tampered];
-        let opening = select_cached_candidate_with_preference(
+        let opening = select_descriptor_candidate(
             &untrusted,
             Some(&psk),
             0,

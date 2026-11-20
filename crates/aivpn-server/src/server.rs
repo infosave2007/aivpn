@@ -280,7 +280,8 @@ pub struct ServerArgs {
     #[arg(long, value_name = "PATH")]
     pub bootstrap_output: Option<String>,
 
-    /// Паузы и padding нисходящих данных: adaptive | full | light | off.
+    /// Паузы и padding нисходящих данных: adaptive | full | strict | light | off.
+    /// full сохраняет padding без IP-пауз; strict добавляет интервалы профиля.
     /// По умолчанию adaptive. Переопределяет downlink_shaping из server.json.
     #[arg(long, value_name = "LEVEL")]
     pub shaping_level: Option<String>,

@@ -25,7 +25,7 @@
 //!   dropped before the loop appends a failure, and the next client is created
 //!   after), so no cross-process locking is required.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use aivpn_common::mask::current_unix_secs;
 use aivpn_common::protocol::MaskOutcome;
@@ -253,23 +253,7 @@ impl MaskFeedbackLog {
     /// Persist to disk (best-effort). Creates the parent dir (0700 on unix).
     /// No-op when `path` is `None` (HOME unset → in-memory only).
     pub fn save(&self) {
-        let Some(path) = &self.path else {
-            return;
-        };
-        if let Some(dir) = path.parent() {
-            if std::fs::create_dir_all(dir).is_err() {
-                return;
-            }
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
-            }
-        }
-        let Ok(json) = serde_json::to_vec(self) else {
-            return;
-        };
-        crate::secure_write::write_status_best_effort(path, &json);
+        save_private_json(self.path.as_deref(), self);
     }
 }
 
@@ -341,24 +325,28 @@ impl RegionalHintsStore {
     }
 
     pub fn save(&self) {
-        let Some(path) = &self.path else {
-            return;
-        };
-        if let Some(dir) = path.parent() {
-            if std::fs::create_dir_all(dir).is_err() {
-                return;
-            }
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
-            }
-        }
-        let Ok(json) = serde_json::to_vec(self) else {
-            return;
-        };
-        crate::secure_write::write_status_best_effort(path, &json);
+        save_private_json(self.path.as_deref(), self);
     }
+}
+
+fn save_private_json(path: Option<&Path>, value: &impl Serialize) {
+    let Some(path) = path else {
+        return;
+    };
+    if let Some(dir) = path.parent() {
+        if std::fs::create_dir_all(dir).is_err() {
+            return;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+        }
+    }
+    let Ok(json) = serde_json::to_vec(value) else {
+        return;
+    };
+    crate::secure_write::write_status_best_effort(path, &json);
 }
 
 #[cfg(test)]

@@ -105,28 +105,28 @@ private struct KeyEditSheet: View {
     }
 
     var body: some View {
-        NavigationStack {
+        CompatibleNavigationView {
             Form {
                 Section {
                     TextField(loc.t("key_name"), text: $name)
-                        .autocorrectionDisabled()
-                    TextField(loc.t("enter_key"), text: $value, axis: .vertical)
-                        .autocorrectionDisabled()
+                        .disableAutocorrection(true)
+                    CompatibleMultilineTextField(loc.t("enter_key"), text: $value, lines: 3...6)
+                        .disableAutocorrection(true)
                         .textInputAutocapitalization(.never)
-                        .lineLimit(3...6)
                 }
-                Section(header: Text("mTLS")) {
-                    TextField(loc.t("mtls_cert_hint"), text: $mtlsCert, axis: .vertical)
-                        .autocorrectionDisabled()
+                // The explanation is a footer: a placeholder is a single line
+                // and truncated the long hints.
+                Section(header: Text("mTLS"), footer: Text(loc.t("mtls_cert_hint"))) {
+                    CompatibleMultilineTextField(loc.t("mtls_cert_placeholder"), text: $mtlsCert, lines: 1...4)
+                        .disableAutocorrection(true)
                         .textInputAutocapitalization(.never)
-                        .lineLimit(1...4)
                         .font(.system(size: 12, design: .monospaced))
                 }
-                Section(header: Text(loc.t("server_signing_key"))) {
-                    TextField(loc.t("server_signing_key_hint"), text: $serverSigningKey, axis: .vertical)
-                        .autocorrectionDisabled()
+                Section(header: Text(loc.t("server_signing_key")),
+                        footer: Text(loc.t("server_signing_key_hint"))) {
+                    CompatibleMultilineTextField(loc.t("server_signing_key_placeholder"), text: $serverSigningKey, lines: 1...3)
+                        .disableAutocorrection(true)
                         .textInputAutocapitalization(.never)
-                        .lineLimit(1...3)
                         .font(.system(size: 12, design: .monospaced))
                 }
                 if let e = error {
@@ -211,7 +211,7 @@ private struct RecordingSection: View {
                 HStack {
                     TextField(loc.t("record_service_name"), text: $serviceName)
                         .textFieldStyle(.roundedBorder)
-                        .autocorrectionDisabled()
+                        .disableAutocorrection(true)
                     Button(loc.t("record_new_mask")) {
                         vpn.startMaskRecording(serviceName: serviceName)
                     }
@@ -325,12 +325,22 @@ struct ContentView: View {
     // yet at that point (see the "Advanced" DisclosureGroup in keysCard,
     // where the ungated button lives). See InstallServerView.swift.
     @State private var showInstallWizard: Bool = false
+    @State private var showDataUseNotice: Bool = false
+
+    /// Keeps the cards readable on iPad; an iPhone is narrower than this.
+    private let contentMaxWidth: CGFloat = 700
+
+    /// Presents the data use notice until it has been accepted once.
+    private var firstLaunchNotice: Binding<Bool> {
+        Binding(get: { !vpn.dataUseNoticeAccepted }, set: { _ in })
+    }
 
     var body: some View {
-        NavigationStack {
+        CompatibleNavigationView {
             VStack(spacing: 0) {
                 // Fixed header — status ring stays visible even when user scrolls
                 statusCard
+                    .frame(maxWidth: contentMaxWidth)
                     .padding(.horizontal, 16)
                     .padding(.top, 8)
                     .padding(.bottom, 4)
@@ -346,7 +356,8 @@ struct ContentView: View {
                             CardView {
                                 maskPicker
                                 Text(loc.t("mask_next_connection"))
-                                    .font(.caption2).foregroundColor(.secondary).padding(.bottom, 12)
+                                    .font(.caption2).foregroundColor(.secondary)
+                                    .padding(.horizontal, 16).padding(.bottom, 12)
                             }
                         }
                         if vpn.isConnected && vpn.recordingCapabilityKnown && vpn.canRecordMasks {
@@ -356,16 +367,20 @@ struct ContentView: View {
                         }
                         footerView
                     }
+                    .frame(maxWidth: contentMaxWidth)
                     .padding(.horizontal, 16)
                     .padding(.top, 8)
                     .padding(.bottom, 16)
+                    .frame(maxWidth: .infinity)
                 }
             }
             .safeAreaInset(edge: .bottom, spacing: 0) {
                 connectCard
+                    .frame(maxWidth: contentMaxWidth)
                     .padding(.horizontal, 16)
                     .padding(.top, 12)
                     .padding(.bottom, 8)
+                    .frame(maxWidth: .infinity)
                     .background(.ultraThinMaterial, ignoresSafeAreaEdges: .bottom)
             }
             .navigationTitle("AIVPN")
@@ -396,16 +411,17 @@ struct ContentView: View {
                 // AdminApi.swift's header) and is @Published, so this
                 // toolbar re-evaluates the moment the post-handshake
                 // Capabilities role lands, with no extra polling here.
-                if vpn.isConnected && vpn.adminRole >= 1 {
-                    ToolbarItem(placement: .navigationBarTrailing) {
+                // The condition lives inside the item: a conditional
+                // toolbar item itself needs iOS 16.
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    if vpn.isConnected && vpn.adminRole >= 1 {
                         Button { showAdmin = true } label: {
                             Image(systemName: "person.badge.key.fill")
                         }
                     }
                 }
             }
-            .toolbarBackground(Color(.secondarySystemBackground), for: .navigationBar)
-            .toolbarBackground(.visible, for: .navigationBar)
+            .compatibleNavigationBarBackground(Color(.secondarySystemBackground))
         }
         .sheet(isPresented: $showAddKey) {
             KeyEditSheet(existingKey: nil,
@@ -485,8 +501,16 @@ struct ContentView: View {
                 .environmentObject(vpn)
                 .environmentObject(loc)
         }
+        .sheet(isPresented: $showDataUseNotice) {
+            DataUseNoticeView(isFirstLaunch: false) { showDataUseNotice = false }
+                .environmentObject(loc)
+        }
+        .fullScreenCover(isPresented: firstLaunchNotice) {
+            DataUseNoticeView(isFirstLaunch: true) { vpn.acceptDataUseNotice() }
+                .environmentObject(loc)
+        }
         .sheet(isPresented: $showDiagnostics) {
-            NavigationStack {
+            CompatibleNavigationView {
                 VStack(spacing: 20) {
                     if vpn.isBenchRunning {
                         ProgressView(loc.t("bench_running"))
@@ -501,6 +525,9 @@ struct ContentView: View {
                                 .font(.subheadline).foregroundColor(.secondary)
                             Text("↑ \(String(format: "%.0f", result.uploadKbps))  ↓ \(String(format: "%.0f", result.downloadKbps)) \(loc.t("bench_kbps"))")
                                 .font(.subheadline).foregroundColor(.secondary)
+                            if result.throughputLimited {
+                                Text(loc.t("bench_limited")).font(.caption).foregroundColor(.secondary)
+                            }
                             Text(result.serverAddr)
                                 .font(.caption2).foregroundColor(.secondary)
                         }
@@ -683,7 +710,7 @@ struct ContentView: View {
             // server without an existing aivpn:// key, via signed rotating
             // bootstrap descriptors (CDN/GitHub/Telegram). See
             // BootstrapDiscovery.swift for the fetch/verify implementation.
-            DisclosureGroup(loc.t("advanced_section")) {
+            DisclosureGroup {
                 VStack(alignment: .leading, spacing: 8) {
                     Text(loc.t("advanced_hint"))
                         .font(.caption2)
@@ -715,6 +742,10 @@ struct ContentView: View {
                     .buttonStyle(.bordered)
                 }
                 .padding(.top, 4)
+            } label: {
+                Text(loc.t("advanced_section"))
+                    .font(.subheadline)
+                    .fontWeight(.semibold)
             }
             .padding(.horizontal, 16)
             .padding(.bottom, 12)
@@ -885,11 +916,15 @@ struct ContentView: View {
     // MARK: - Footer
 
     private var footerView: some View {
-        Text(loc.t("version_footer"))
-            .font(.caption2)
-            .foregroundColor(.secondary)
-            .frame(maxWidth: .infinity, alignment: .center)
-            .padding(.top, 8)
+        VStack(spacing: 6) {
+            Text(loc.t("version_footer"))
+                .font(.caption2)
+                .foregroundColor(.secondary)
+            Button(loc.t("notice_title")) { showDataUseNotice = true }
+                .font(.caption2)
+        }
+        .frame(maxWidth: .infinity, alignment: .center)
+        .padding(.top, 8)
     }
 
     // MARK: - Computed helpers

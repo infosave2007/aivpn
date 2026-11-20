@@ -6,7 +6,7 @@
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
 
@@ -17,7 +17,7 @@ fn traffic_adaptation_default() -> bool {
 }
 
 /// Глобальные локальные настройки. Поле адаптации по умолчанию включено.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeConfig {
     #[serde(default = "traffic_adaptation_default")]
     pub traffic_adaptation: bool,

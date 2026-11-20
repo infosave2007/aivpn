@@ -5,6 +5,8 @@ use super::*;
 
 #[derive(Debug, Clone)]
 pub enum Message {
+    AppRouting(super::app_routing::Event),
+    DesktopSession(super::desktop_session::Event),
     SessionReply(u64, Box<Message>),
     /// Extra settings section (see `aivpn_common::ui_ext`): open/close the
     /// panel, edit one field, apply. The GUI treats these generically — it
@@ -19,7 +21,16 @@ pub enum Message {
     /// its SIGTERM cleanup — route restore, kill-switch removal — is done,
     /// so it is now safe to spawn the new client.
     OldClientReaped,
+    UnexpectedClientReaped,
+    /// Старый клиент убит, а проверенная очистка kill-switch не удалась.
+    /// Новый клиент из этого ответа не запускается.
+    ClientReapFailed(String),
     Disconnect,
+    /// Пользователь явно снимает kill-switch, оставшийся после аварии.
+    ClearRetainedKillSwitch,
+    /// Очистка с этим номером поколения закончилась. Чужой номер игнорируется,
+    /// чтобы поздний ответ не стер уже новую сессию.
+    KillSwitchClearFinished(u64, Result<(), String>),
     StatusReceived(VpnStatus),
     /// 3c: the client printed "AIVPN-STATUS bootstrap-fallback" — it gave up
     /// on the descriptor-derived mask after repeated dead handshakes and is
@@ -55,6 +66,7 @@ pub enum Message {
     DnsProxyChanged(String),
     ExcludeRoutesChanged(String),
     IncludeRoutesChanged(String),
+    SplitEnabledChanged(bool),
     ToggleSocks5(bool),
     Socks5AddrChanged(String),
     StatsRefresh(TrafficStats),
@@ -77,6 +89,7 @@ pub enum Message {
     RecordServiceChanged(String),
     StartRecording,
     StopRecording,
+    RecordingCommandResult(Result<(), String>),
     RecordingPoll(Option<RecordingSnapshot>),
     DismissRecordingResult,
     // Bench / Diagnostics
@@ -187,7 +200,6 @@ pub enum Message {
     InstallReset,
     InstallImportProfile,
     // Misc
-    Noop,
 }
 
 impl Message {
@@ -210,6 +222,7 @@ impl Message {
                 | Self::ServerSettingsConfirmResult(_)
                 | Self::DiagnosticsResult(_)
                 | Self::RecordingPoll(_)
+                | Self::RecordingCommandResult(_)
                 | Self::AdminSaveKeyPathChosen(_)
                 | Self::AdminSaveQrPathChosen(_)
         )

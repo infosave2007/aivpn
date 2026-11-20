@@ -327,8 +327,8 @@ pub fn t(lang: Lang, key: &str) -> &'static str {
         // Adaptive / diagnostics
         (Lang::En, "adaptive_mode") => "Adaptive Mode",
         (Lang::Ru, "adaptive_mode") => "Адаптивный режим",
-        (Lang::En, "adaptive_hint") => "Auto: server picks best. Light: basic mimicry, 15s keepalive. Aggressive: HTTPS/QUIC mimicry, 8s keepalive. Satellite: max mimicry, high-latency optimized.",
-        (Lang::Ru, "adaptive_hint") => "Auto: сервер выбирает. Light: базовая маскировка, 15с. Aggressive: HTTPS/QUIC, 8с. Satellite: максимум, для высоких задержек.",
+        (Lang::En, "adaptive_hint") => "Initial keepalive/FEC: Off 8s/off, Light 6s/1:16, Aggressive 4s/1:8, Satellite 15s/1:4. Then adjusted to link quality; masking stays active.",
+        (Lang::Ru, "adaptive_hint") => "Начальные keepalive/FEC: Off 8с/выкл., Light 6с/1:16, Aggressive 4с/1:8, Satellite 15с/1:4. Далее по качеству канала; маска остается активной.",
         (Lang::En, "mask_hint") => "Traffic camouflage — auto picks the best profile",
         (Lang::Ru, "mask_hint") => "Маскировка трафика — auto выбирает лучший профиль",
         (Lang::En, "dns_hint") => "Route DNS through the tunnel to prevent leaks",
@@ -380,6 +380,8 @@ pub fn t(lang: Lang, key: &str) -> &'static str {
         // Diagnostics / benchmark
         (Lang::En, "run_benchmark") => "Run Benchmark",
         (Lang::Ru, "run_benchmark") => "Тест скорости",
+        (Lang::En, "bench_limited") => "Speed is limited by the test method; link capacity may be higher.",
+        (Lang::Ru, "bench_limited") => "Скорость ограничена методом теста; пропускная способность канала может быть выше.",
         (Lang::En, "bench_running") => "Running...",
         (Lang::Ru, "bench_running") => "Выполняется...",
 

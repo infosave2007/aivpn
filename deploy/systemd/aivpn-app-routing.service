@@ -1,0 +1,27 @@
+[Unit]
+Description=AIVPN application routing service
+Requires=aivpn-app-routing.socket
+After=aivpn-app-routing.socket network.target
+Before=systemd-user-sessions.service display-manager.service
+
+[Service]
+Type=notify
+NotifyAccess=main
+User=root
+Group=root
+ExecStartPre=/sbin/modprobe nf_conntrack
+ExecStart=/usr/libexec/aivpn/aivpn __routing-service
+StateDirectory=aivpn-app-routing
+StateDirectoryMode=0700
+RuntimeDirectory=aivpn-app-routing/state
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=yes
+UMask=0077
+Restart=on-failure
+RestartSec=2
+TimeoutStopSec=20
+KillMode=control-group
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=multi-user.target

@@ -34,7 +34,7 @@ endif
 REMOTE ?= /opt/aivpn
 
 .PHONY: help setup check test clippy fmt mask-gate hygiene-gate version-gate selfcontained swift-parse \
-        linux \
+        linux desktop-routing \
         server server-tiny client server-docker \
         server-arm64 client-arm64 \
         server-musl-armv7 server-musl-mipsel server-musl-aarch64 server-musl-aarch64-full \
@@ -85,6 +85,7 @@ help:
 	@printf "    %-40s %s\n" "make ios [TEAM_ID=XX]"    "iOS IPA            (macOS + Xcode only)"
 	@printf "    %-40s %s\n" "make macos"               "macOS .app + .pkg + .dmg (macOS only)"
 	@printf "    %-40s %s\n" "make linux-appimage"      "Linux AppImage"
+	@printf "    %-40s %s\n" "make desktop-routing"     "Клиент со встроенным split по приложениям"
 	@printf "\n  Kernel module (совместимые Rust-for-Linux API и headers)\n"
 	@printf "    %-40s %s\n" "make kernel"              "Build aivpn-linux-kernel .ko (+ XDP BPF if clang)"
 	@printf "    %-40s %s\n" "make kernel-install"      "Install kernel module + depmod (root)"
@@ -175,9 +176,8 @@ server: releases/
 	chmod +x releases/aivpn-server-linux-x86_64
 	@echo "→ releases/aivpn-server-linux-x86_64  [management-api,metrics,neural]  ($$(du -h releases/aivpn-server-linux-x86_64 | cut -f1))"
 
-# Minimal server: default features only (no management-api/metrics/neural) — a
-# lean pure VPN gateway. The web panel and metrics dashboard will NOT work
-# against this build; use `make server` for those.
+# Минимальный сервер без management-api, metrics и GBDT (фича neural).
+# Для веб-панели и метрик нужна полная сборка `make server`.
 server-tiny: releases/
 	cargo build --release --bin aivpn-server -p aivpn-server
 	cp target/release/aivpn-server releases/aivpn-server-linux-x86_64-tiny
@@ -185,8 +185,9 @@ server-tiny: releases/
 	@echo "→ releases/aivpn-server-linux-x86_64-tiny  [minimal]  ($$(du -h releases/aivpn-server-linux-x86_64-tiny | cut -f1))"
 
 client: releases/
-	cargo build --release -p aivpn-client --features ssh-install
+	cargo build --release -p aivpn-client --features ssh-install,app-routing --bin aivpn-client
 	cp target/release/aivpn-client releases/aivpn-client-linux-x86_64
+	cp licenses/libbpf-BSD-2-Clause releases/libbpf-BSD-2-Clause
 	chmod +x releases/aivpn-client-linux-x86_64
 	@echo "→ releases/aivpn-client-linux-x86_64  ($$(du -h releases/aivpn-client-linux-x86_64 | cut -f1))"
 
@@ -269,6 +270,11 @@ define _musl
 	  printf 'COPY Cargo.toml Cargo.lock ./\n'; \
 	  printf 'COPY crates crates/\n'; \
 	  printf 'COPY vendor vendor/\n'; \
+	  printf 'COPY deploy/install-client-image.sh deploy/install-client-image.sh\n'; \
+	  printf 'COPY deploy/install-app-routing.sh deploy/install-app-routing.sh\n'; \
+	  printf 'COPY deploy/systemd/aivpn-app-routing.service deploy/systemd/aivpn-app-routing.service\n'; \
+	  printf 'COPY deploy/systemd/aivpn-app-routing.socket deploy/systemd/aivpn-app-routing.socket\n'; \
+	  printf 'COPY platforms/linux/polkit/com.aivpn.client.policy platforms/linux/polkit/com.aivpn.client.policy\n'; \
 	  printf 'COPY assets assets/\n'; \
 	  printf 'RUN if [ -n "$$BUILD_FEATURES" ]; then cargo build --locked --release --target "$$TARGET_TRIPLE" -p "$$CRATE_NAME" --bin "$$BINARY_NAME" --features "$$BUILD_FEATURES"; else cargo build --locked --release --target "$$TARGET_TRIPLE" -p "$$CRATE_NAME" --bin "$$BINARY_NAME"; fi\n'; \
 	} > "$$TMPDF"; \
@@ -336,47 +342,30 @@ windows: releases/
 	RELEASE_DIR="target/$$TARGET/release"; \
 	PACKAGE_DIR=releases/aivpn-windows-gui; \
 	ZIP_NAME=releases/aivpn-windows-gui.zip; \
-	if ! rustup target list --installed | grep -q "$$TARGET"; then \
-	    echo "Installing target $$TARGET..."; \
-	    rustup target add "$$TARGET"; \
-	fi; \
-	echo "Building aivpn-client.exe..."; \
-	cargo build --release --target "$$TARGET" -p aivpn-client --features ssh-install; \
-	echo "Building aivpn.exe (GUI)..."; \
-	cargo build --release --target "$$TARGET" -p aivpn-windows; \
+	if ! rustup target list --installed | grep -q "$$TARGET"; then rustup target add "$$TARGET"; fi; \
 	rm -rf "$$PACKAGE_DIR"; \
-	mkdir -p "$$PACKAGE_DIR"; \
+	mkdir -p "$$PACKAGE_DIR/.build-inputs"; \
+	sh deploy/ci/fetch-wintun.sh "$$PACKAGE_DIR/.build-inputs/wintun.dll"; \
+	python3 deploy/ci/prepare-windows-routing.py "$$PACKAGE_DIR" \
+	  --driver "$(AIVPN_ROUTING_DRIVER)" --altitude "$(AIVPN_ROUTING_ALTITUDE)"; \
+	DRIVER_INPUT=; \
+	if [ -n "$(AIVPN_ROUTING_DRIVER)" ]; then DRIVER_INPUT="$$(pwd)/$$PACKAGE_DIR/.build-inputs/routing-driver.sys"; fi; \
+	AIVPN_WINTUN_DLL="$$(pwd)/$$PACKAGE_DIR/.build-inputs/wintun.dll" \
+	AIVPN_ROUTING_DRIVER="$$DRIVER_INPUT" AIVPN_ROUTING_ALTITUDE="$(AIVPN_ROUTING_ALTITUDE)" \
+	  cargo build --release --target "$$TARGET" -p aivpn-windows --features app-routing; \
 	cp "$$RELEASE_DIR/aivpn.exe" "$$PACKAGE_DIR/"; \
-	cp "$$RELEASE_DIR/aivpn-client.exe" "$$PACKAGE_DIR/"; \
-	WINTUN_DLL="$$PACKAGE_DIR/wintun.dll"; \
-	if [ ! -f "$$WINTUN_DLL" ]; then \
-	    echo "Downloading wintun.dll..."; \
-	    sh deploy/ci/fetch-wintun.sh "$$WINTUN_DLL"; \
-	fi; \
 	cp assets/brand/win/aivpn.ico "$$PACKAGE_DIR/aivpn.ico"; \
-	if command -v zip >/dev/null 2>&1; then \
-	    rm -f "$$ZIP_NAME"; \
-	    (cd "$$PACKAGE_DIR" && zip -r "../aivpn-windows-gui.zip" ./*); \
-	else \
-	    python3 -c "import zipfile,pathlib; pkg=pathlib.Path('$$PACKAGE_DIR'); \
-z=zipfile.ZipFile('$$ZIP_NAME','w',zipfile.ZIP_DEFLATED); \
-[z.write(f,f.name) for f in pkg.iterdir()]; z.close()"; \
-	fi; \
+	rm -f "$$ZIP_NAME"; \
+	python3 -c "import zipfile; z=zipfile.ZipFile('$$ZIP_NAME','w',zipfile.ZIP_DEFLATED); z.write('$$PACKAGE_DIR/aivpn.exe','aivpn.exe'); z.close()"; \
 	NSI=crates/aivpn-windows/installer/aivpn-installer.nsi; \
 	INSTALLER_EXE=releases/aivpn-windows-installer.exe; \
-	if command -v makensis >/dev/null 2>&1 && [ -f "$$NSI" ]; then \
-	    echo "Building NSIS installer..."; \
-	    makensis -V2 \
-	      "-DAPP_VERSION=$(APP_VERSION)" \
-	      "-DSTAGE_DIR=$$(pwd)/$$PACKAGE_DIR" \
-	      "-DOUTPUT_EXE=$$(pwd)/$$INSTALLER_EXE" \
-	      "$$NSI"; \
-	    echo "→ $$INSTALLER_EXE  ($$(du -h $$INSTALLER_EXE | cut -f1))"; \
-	    rm -rf "$$PACKAGE_DIR"; \
-	else \
-	    echo "makensis not found — keeping zip: $$ZIP_NAME"; \
-	    echo "→ $$ZIP_NAME  ($$(du -h $$ZIP_NAME | cut -f1))"; \
-	fi
+	if command -v makensis >/dev/null 2>&1; then \
+	  makensis -V2 "-DAPP_VERSION=$(APP_VERSION)" "-DSTAGE_DIR=$$(pwd)/$$PACKAGE_DIR" \
+	    "-DOUTPUT_EXE=$$(pwd)/$$INSTALLER_EXE" "$$NSI"; \
+	  echo "→ $$INSTALLER_EXE"; \
+	else echo "→ $$ZIP_NAME"; fi; \
+	rm -rf "$$PACKAGE_DIR/.build-inputs"; \
+	rm -f "$$PACKAGE_DIR/routing-bootstrap.nsh" "$$PACKAGE_DIR/aivpn.ico" "$$PACKAGE_DIR/routing-inputs.json"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # iOS IPA (macOS + Xcode 15+ required)
@@ -398,6 +387,10 @@ ios:
 	TARGET_DIR="$$REPO_ROOT/target"; \
 	LIB_DIR="$$CORE_DIR/lib"; \
 	CONFIGURATION="$${CONFIGURATION:-Release}"; \
+	IPHONEOS_DEPLOYMENT_TARGET="$$(awk -F'"' '/IPHONEOS_DEPLOYMENT_TARGET:/{print $$2; exit}' "$$IOS_DIR/project.yml")"; \
+	[ -n "$$IPHONEOS_DEPLOYMENT_TARGET" ] || { echo "ERROR: iOS deployment target not found in project.yml" >&2; exit 1; }; \
+	export IPHONEOS_DEPLOYMENT_TARGET; \
+	echo "==> iOS deployment target: $$IPHONEOS_DEPLOYMENT_TARGET"; \
 	echo "==> Building Rust core for aarch64-apple-ios (device) ..."; \
 	"$$CARGO" build --release -p aivpn-ios-core --target aarch64-apple-ios; \
 	echo "==> Building Rust core for aarch64-apple-ios-sim ..."; \
@@ -484,34 +477,34 @@ macos:
 # ─────────────────────────────────────────────────────────────────────────────
 # Linux GUI binary (no extra tools required)
 # ─────────────────────────────────────────────────────────────────────────────
-linux: releases/
-	cargo build --release -p aivpn-linux
-	cargo build --release -p aivpn-client --features ssh-install --bin aivpn-client --bin aivpn-ip-helper
-	cp target/release/aivpn-linux      releases/aivpn-linux-x86_64
-	cp target/release/aivpn-client     releases/aivpn-client-linux-x86_64
-	cp target/release/aivpn-ip-helper  releases/aivpn-ip-helper-linux-x86_64
-	chmod +x releases/aivpn-linux-x86_64 releases/aivpn-client-linux-x86_64 releases/aivpn-ip-helper-linux-x86_64
-	@echo "→ releases/aivpn-linux-x86_64  ($$(du -h releases/aivpn-linux-x86_64 | cut -f1))"
+# Привилегированные компоненты устанавливаются отдельно в системный каталог.
+desktop-routing: client
+	@echo "Управление split встроено: aivpn-client app-routing --help"
+
+linux: client releases/
+	cargo build --release -p aivpn-linux --features app-routing
+	cp target/release/aivpn-linux releases/aivpn-linux-x86_64
+	cp licenses/libbpf-BSD-2-Clause releases/libbpf-BSD-2-Clause
+	chmod +x releases/aivpn-linux-x86_64
+	@echo "→ releases/aivpn-linux-x86_64"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Linux AppImage
 # Requires: appimagetool (https://github.com/AppImage/AppImageKit/releases)
 # ─────────────────────────────────────────────────────────────────────────────
-linux-appimage:
+linux-appimage: releases/
 	@set -e; \
 	ARCH=$${ARCH:-x86_64}; \
 	APPDIR=AppDir-aivpn-linux; \
 	echo "==> Building aivpn-linux release binary..."; \
-	cargo build --release -p aivpn-linux; \
-	echo "==> Building aivpn-client + aivpn-ip-helper release binaries..."; \
-	cargo build --release -p aivpn-client --features ssh-install --bin aivpn-client --bin aivpn-ip-helper; \
+	cargo build --release -p aivpn-linux --features app-routing; \
 	echo "==> Setting up AppDir..."; \
 	rm -rf "$$APPDIR"; \
 	mkdir -p "$$APPDIR/usr/bin" "$$APPDIR/usr/share/applications" \
 	         "$$APPDIR/usr/share/icons/hicolor/256x256/apps"; \
 	cp target/release/aivpn-linux     "$$APPDIR/usr/bin/"; \
-	cp target/release/aivpn-client    "$$APPDIR/usr/bin/"; \
-	cp target/release/aivpn-ip-helper "$$APPDIR/usr/bin/"; \
+	mkdir -p "$$APPDIR/usr/share/licenses/aivpn"; \
+	cp licenses/libbpf-BSD-2-Clause "$$APPDIR/usr/share/licenses/aivpn/"; \
 	printf '[Desktop Entry]\nName=AIVPN\nComment=AI-powered VPN\nExec=aivpn-linux\nIcon=aivpn\nType=Application\nCategories=Network;\n' \
 	    > "$$APPDIR/usr/share/applications/aivpn.desktop"; \
 	cp "$$APPDIR/usr/share/applications/aivpn.desktop" "$$APPDIR/"; \
@@ -711,7 +704,7 @@ server-deploy:
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Windows GUI via Docker — no local mingw-w64 required
-# Extracts aivpn-client.exe from Docker image into releases/
+# Извлекает тот же единый aivpn.exe и ZIP, без отдельного CLI.
 # ─────────────────────────────────────────────────────────────────────────────
 windows-docker: releases/
 	@set -e; \
@@ -720,8 +713,10 @@ windows-docker: releases/
 	docker build -t $$IMAGE -f deploy/docker/Dockerfile.windows-client .; \
 	docker create --name $$CTR $$IMAGE >/dev/null; \
 	trap "docker rm -f $$CTR >/dev/null 2>&1 || true" EXIT; \
-	docker cp $$CTR:/aivpn-client.exe releases/aivpn-client.exe; \
-	echo "→ releases/aivpn-client.exe  ($$(du -h releases/aivpn-client.exe | cut -f1))"
+	mkdir -p releases/aivpn-windows-gui; \
+	docker cp $$CTR:/aivpn.exe releases/aivpn-windows-gui/aivpn.exe; \
+	python3 -c "import zipfile; z=zipfile.ZipFile('releases/aivpn-windows-gui.zip','w',zipfile.ZIP_DEFLATED); z.write('releases/aivpn-windows-gui/aivpn.exe','aivpn.exe'); z.close()"; \
+	echo "→ releases/aivpn-windows-gui.zip"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Integration test: server + client in Docker bridge network

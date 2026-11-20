@@ -24,7 +24,8 @@ docs/
 research/
 deploy/monitoring/
 # CI gates: invoked by the Makefile, no business in an image
-deploy/ci/
+deploy/ci/*
+!deploy/ci/fetch-wintun.sh
 .qoder/
 .venv/
 *.log

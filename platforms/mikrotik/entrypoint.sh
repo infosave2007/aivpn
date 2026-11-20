@@ -41,6 +41,8 @@ iptables -C FORWARD -i "$TUN_IF" -o "${LAN_IF}" -m state --state RELATED,ESTABLI
     iptables -A FORWARD -i "$TUN_IF" -o "${LAN_IF}" -m state --state RELATED,ESTABLISHED -j ACCEPT
 
 # RouterOS направляет пакет в контейнер, а контейнер должен направить его в TUN.
+SPLIT_ENABLED="${AIVPN_SPLIT_ENABLED:-true}"
+case "$SPLIT_ENABLED" in true|false) ;; *) echo '[aivpn-mikrotik] Ожидается true или false для split' >&2; exit 1 ;; esac
 FULL_TUNNEL="${AIVPN_FULL_TUNNEL:-true}"
 case "$FULL_TUNNEL" in true|false) ;; *) echo '[aivpn-mikrotik] Ожидается true или false' >&2; exit 1 ;; esac
 
@@ -58,7 +60,7 @@ stop_service() {
 }
 trap stop_service TERM INT
 while [ "$stopping" = 0 ]; do
-    set -- --tun-name "$TUN_IF"
+    set -- --tun-name "$TUN_IF" "--split-enabled=$SPLIT_ENABLED"
     [ "$FULL_TUNNEL" = false ] || set -- "$@" --full-tunnel
     [ "$KILL_SWITCH" = false ] || set -- "$@" --kill-switch
     /usr/local/bin/aivpn-client "$@" &

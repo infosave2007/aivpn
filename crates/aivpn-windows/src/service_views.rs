@@ -80,7 +80,7 @@ impl crate::AivpnApp {
                                 .add_enabled(!self.bench_running, egui::Button::new(bench_lbl))
                                 .clicked()
                             {
-                                let token = crate::admin::read_admin_token();
+                                let target = self.vpn.administration_target();
                                 let server = self.vpn.server_addr().unwrap_or("").to_string();
                                 if server.is_empty() {
                                     self.show_error(
@@ -93,12 +93,15 @@ impl crate::AivpnApp {
                                     self.bench_rx = Some(rx);
                                     std::thread::spawn(move || {
                                         let result =
-                                            VpnManager::run_bench_blocking(token);
+                                            VpnManager::run_bench_blocking(target);
                                         let _ = tx.send(result);
                                     });
                                 }
                             }
                             if let Some(ref r) = self.bench_result {
+                                if r.throughput_limited || r.throughput_method != "data" {
+                                    ui.label(t(lang, "bench_limited"));
+                                }
                                 let qc = if r.quality_score >= 70 {
                                     crate::assets::fluent_colors(ui.visuals().dark_mode).success
                                 } else if r.quality_score >= 40 {

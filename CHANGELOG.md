@@ -1,14 +1,95 @@
 # Changelog
 
-## [Unreleased]
+## [1.3.0] - 2026-11-20
+
+### Added
+
+- **Unified desktop image** - Linux CLI/GUI and Windows embed the ordinary client, application routing controls, service and restricted worker. Built-in setup and app-routing install commands replace separate helper packages. Standard desktop builds explicitly enable the optional app-routing feature; plain Cargo builds leave it disabled.
+
+- **Explicit split controls** - Linux CLI/GUI, Windows, Android, iOS and macOS can disable split tunneling without deleting saved applications, networks or domain exceptions. Disabled application policies use their selected DNS VPN profile for all traffic and remain fail-closed. Older saved configurations retain their behavior. OpenWrt and MikroTik launchers pass the explicit client setting.
+- **iOS 15 compatibility** - compatible navigation, form and share controls, preserved plist/entitlement files, shared Keychain access and a numeric NetworkExtension remote address. Build 11 fixes are integrated with the current tunnel resource cleanup.
+- **iOS data use notice and privacy manifest** - on first launch the app explains what it sends and stores before it asks for the VPN configuration or notifications. The notice stays available from the main screen and links to the privacy policy in `PRIVACY.md`. The app and the tunnel extension ship privacy manifests.
 
 ### Fixed
 
+- **Linux system utilities** - privileged network roles locate trusted utilities in both bin and sbin and preserve multicall command names.
+
+- **Unified client installation** - Linux updates detect an existing routing service after elevation and retain registrations. Windows preserves executable read permissions, quotes service commands correctly and restores the previous image, receipt and service after a failed update, including migration from separate helpers. Ordinary Linux clients no longer require a separate libbpf runtime package.
+- **Local server routes** - full-tunnel Linux connections choose the actual route to a server on a directly connected network instead of assuming the default gateway.
+
 - **Windows disconnect right after connecting** - interface-change notifications raised by the client's own Wintun adapter no longer trigger a reconnect. Notifications from other interfaces, unattributed ones and an overflowed queue still reconnect (#96, #98).
+
+- **Shared DNS on Windows** - replying to a client that has already closed its UDP port no longer terminates the DNS listener and application routing service. Actual listener failures retain their original error in the service log.
+
+- **Windows app-split ICMP** - direct ICMP sockets carry IPv4 and IPv6 echo requests and replies through the selected profile, including translated network errors. The process cache now includes the existing `System` process; reused system ICMP IDs no longer block new requests while an older flow is retained. Conflicts with a protected route remain blocked.
+
+- **Windows client crash diagnostics** - client panics are saved with their source location and backtrace before tunnel cleanup. The GUI shows the panic instead of the last adapter cleanup message; cutting the log tail inside a UTF-8 character no longer hides the error.
+
+- **Selected Windows applications** - the service verifies the local volume before opening a file and refuses junctions and symbolic links. Redirected paths can no longer steer privileged file opens to another object; updater renames remain supported.
+
+- **Linux application routing under load** - concurrent send and receive no longer discard valid packets because route readers contend with each other. Confirmed snapshots are reused without republishing unchanged state on every packet; socket, generation, and interface checks remain enforced.
+
+- **Shared DNS discovery** - mDNS and LLMNR from system resolvers no longer bypass the desktop DNS guard. IPv4 and IPv6 network discovery is restricted while shared VPN DNS is enabled; local loopback traffic and the previous resolver settings are preserved.
+- **Desktop routing startup** - Windows captures process history before service startup and attaches provenance filters automatically on supported NTFS volumes. Inherited rules no longer block unrelated SYSTEM traffic after a reboot. Desktop launch notices explain the restart required after first installing the service.
+- **Windows worker logs** - long-running workers keep bounded logs, and new sessions retain only the latest completed journals. Active files and unrelated data are preserved; unsafe links stop cleanup before deletion.
+- **SOCKS5 UDP on IPv4-only stacks** - IPv6 destinations are rejected before reaching smoltcp. An unsupported UDP request no longer terminates the network thread or breaks subsequent IPv4 and tunnel DNS requests.
+- **Web dependencies** - security updates for the HTTP adapter, schema validation, system metrics, Vite and selector parsing. Boolean configuration defaults remain false after the validator update.
+- **Bounded bootstrap replies** - Android, iOS and server publication channels reject oversized HTTP bodies before they exhaust memory, including responses without Content-Length. Requests retain their existing timeouts.
+- **Audit verification** - malformed records and invalid UTF-8 now produce an error instead of disappearing from the verified tail. Reads share the writer's lock and stay within a fixed byte window.
+- **Web login limits** - filling the limiter table no longer evicts active bans. Pending attempts count toward the limit and survive cleanup; a full table rejects new keys with bounded cleanup work.
+- **Network assignments** - the shared core rejects unsupported MTU values and VPN subnets that include loopback, link-local, multicast or reserved IPv4 ranges before configuring a client interface.
+- **Protected mobile tests** - transport failure and cancellation tests now supply a valid signed descriptor and exercise the same behavior with `production-secure` enabled. Compatible dependency updates remove yanked async-executor and clipboard-win releases.
+
+- **Reliable live mask changes** - capable peers acknowledge the exact mask generation and payload digest. Lost updates and acknowledgements are retried without reusing encryption nonces. Pending RTC and QUIC transports survive plain control packets during negotiation; older peers retain their negotiated format.
+- **Measured mask diagnostics** - clients receive authenticated, expiring model measurements tied to the active mask and sample window. Network quality no longer includes a constant synthetic neural bonus. Model fit is reported separately from latency, jitter and loss and does not claim DPI indistinguishability.
+- **Interrupted backup restoration** - a durable journal recovers the complete file set before config or client data is read. Restore respects live owners and shared components, rejects overlapping destinations and recovers from interrupted writes and full disks without accepting mixed generations.
+
+- **Mask changes and recovery** - retiring an RTC mask releases its old downlink peer. Automatic recovery tries a different outer protocol family first, then explores the full preset catalog after repeated failures, including early transport errors; mobile clients also change the UDP port after a series of failed handshakes. Explicit mask selection remains unchanged. Certificate rejection is terminal on desktop and mobile. A confirmed handshake clears the failure counter before local tunnel setup.
+- **Live mask management** - signed masks uploaded after server startup can be applied immediately. Local mask overrides are reconciled with the actual session, reapplied after automatic rotation and reverted when removed. Failed rotations no longer consume their cooldown.
+- **Diagnostics under loss** - idempotent requests have bounded retries, lost pull responses cannot recreate an entire transfer window, and latency uses at least three independent probes. QUIC reserves queue space for control traffic under sustained DATA load.
+- **Fair queues** - IPv6 extension headers no longer merge unrelated DNS and bulk flows. Canceling diagnostic traffic preserves the age of the oldest queued data and the corresponding pacing pressure.
+- **Desktop status and routes** - an idle Windows tunnel no longer becomes an error after two seconds without data. Reassigned Windows addresses update Wintun and owned routes while preserving local routing policy. Linux recording status uses the private administration path; macOS fast reconnect retains authenticated bootstrap parameters.
+- **Windows kill switch** - DHCP exceptions are limited to local discovery and the DHCP server of each physical interface. Arbitrary traffic using DHCP ports no longer bypasses the firewall. The GUI exposes retained protection after a client crash and an explicit action to clear it.
+- **Desktop connection lifecycle** - server-assigned Windows tunnel addresses are ready for traffic immediately, without duplicate-address detection on the point-to-point adapter. Linux GUI retains protection after a client crash and across GUI restarts, verifies explicit cleanup before reconnecting, and stops cleanup descendants on timeout. Recovered processes are terminated through a process descriptor, protecting against PID reuse.
+- **Displayed transport policy** - desktop FEC indicators use the active group size instead of inferring it from the adaptive level. Built-in mask selectors include all ten profiles; Linux also preserves a selected custom profile. Keepalive and adaptive descriptions match the implemented policy.
+- **Session cleanup** - client removal releases associated Neural, DPI and kernel state. Obsolete UDP probes and an unused key-rotation prototype were removed. iOS error paths release both bridge descriptors; server IPv6 NAT falls back to ip6tables when nft setup fails. Failed firewall setup does not enable IP forwarding.
+- **OIDC and event streams** - discovery requires the configured issuer and HTTPS endpoints, rejects redirects during discovery and token exchange, and preserves authorization endpoint query parameters. Discovery expires after five minutes so endpoint changes become visible without restarting the panel. Token errors do not log response bodies. Outstanding SSE tickets are bounded per user and globally.
+- **BPF observation** - map type and key/value sizes are checked before copying counters into userspace. Counter resets and separate drop reasons are reported correctly.
+- **Default server example** - unused pool and site-to-site settings are null, allowing the supplied standalone configuration to start. Pool examples include the required node identifier.
+
+- **Downlink under continuous load** - each batch yields to the mask transport worker. A ready TUN queue can no longer monopolize the runtime and overflow the bounded outgoing queue before its consumer runs.
+- **TCP segment size** - the server limits an existing MSS option in SYN/SYN-ACK packets to the active mask budget. New TCP connections avoid unnecessary tunnel fragmentation and its repeated padding while preserving the profile. Smaller MSS values, fragmented IP packets and authenticated TCP options remain unchanged.
+- **Fragmented downlink padding** - large IP packets now use the same reverse-profile and FSM padding policy as ordinary packets, including transport size limits and the selected shaping mode. The original datagram still consumes one pacing slot.
+- **Upload bursts** - the shared flow queue keeps accepted packets in the input channel until there is room, instead of silently dropping part of a burst while transferring it between queues.
+- **Server and transport shutdown** - background workers and pending QUIC/RTC tasks stop with their owner, releasing session state and UDP sockets after cancellation or startup failure.
+- **Bounded resource use** - slow web event-stream readers now apply backpressure. SOCKS5 UDP DNS answers expire and have a size limit. Kernel QoS history is bounded, and revoking a client releases its retained budget.
+- **Mobile SSH installation logs** - event queues are bounded by count and bytes. Long messages are shortened without breaking JSON; the install result, connection key and an event waiting for a larger iOS buffer are retained. A shared registry replaces the duplicate implementations.
+- **Mask generation cleanup** - removed unused statistical calculations and fields without changing the distributions used to generate masks.
+- **Legacy downlink shaping compatibility** - server `full` and legacy `true` preserve profile padding without extra per-IP-packet pauses again. The former strict profile intervals remain available as explicit `strict`; `adaptive` remains the default. CLI, configuration validation and the web panel accept the new mode. Client `upload_shaping` behavior is unchanged.
+- **Active-session speed measurements** - verified DATA probes now pass through ordinary encryption, mask framing, padding, FEC, QoS and pacing queues. Batched receipts remove the former 64-by-768-byte RPC ceiling. The server enforces the advertised DATA generation budget across repeated test phases; results near that limit are marked as limited. Tests stop on session changes and have bounded duration and byte budgets. The DATA measurement runs on QUIC masks, whose carrier has its own flow control; other masks and older servers retain an explicitly marked limited RPC measurement.
+- **Rapid reconnect admission** - a canceled attempt that completed PFS but did not finish device authentication no longer blocks the next authenticated handshake. The server preserves the admitted session while replacing an unfinished attempt; replay protection and connection limits remain enforced.
+- **Mobile session shutdown** - stopping a tunnel no longer shuts down a UDP socket still registered with the mask driver. This prevents a receive loop from surviving disconnects, blocking reconnection and consuming a CPU core. Pending handshake and control operations also stop without waiting for the transport; Android lifecycle tests check that native sessions actually finish.
+- **Android network handover** - DNS and protected sockets use the same physical network for each connection attempt. Network changes also interrupt an unfinished handshake; capability callbacks and registration checks prevent missed switches and stale events. The VPN reports its actual underlying network to Android.
+- **iOS interface** - VPN configuration and key storage errors tell the user what to do instead of naming provisioning profiles and entitlements. The key form explains the mTLS certificate and the server signing key under the fields; the long placeholders were cut off. The mask note in the connected view is aligned with the card. On iPad the content keeps a readable width and every orientation is supported.
+- **iOS app icon** - the icons are opaque squares. They had transparent corners, and App Store Connect rejects a build whose icon has an alpha channel. The packaging gate now checks this.
 
 ### Security
 
+- **Privileged desktop boundaries** - the cached Linux helper controls only its own TUN, routes and assigned socket mark; it cannot clear another user's firewall or interpret arbitrary command batches. Windows restricts initial DLL loading to the system directory and opens log files relative to verified directory handles, rejecting reparse points and hard links before truncation. An interrupted GUI lets its elevated client clean up while retaining the kill switch. Updated rustix to 1.1.6 for its extended-attribute memory safety fix.
+
+- **Desktop privileges** - Linux GUI no longer needs file capabilities: a constrained process of the same image transfers TUN over an authenticated local channel and handles network operations. Windows GUI stays unelevated; UAC raises a separate process with SID, PID and image verification. Installation migration verifies hashes, preserves policies and refuses a silent protection downgrade by a build without app-routing.
+
 - **Dependency fixes** - `quinn-proto` 0.11.19 and `quinn-udp` 0.5.16 (RUSTSEC-2026-0523, RUSTSEC-2026-0524, RUSTSEC-2026-0538); `russh` 0.65.2 (RUSTSEC-2026-0492, RUSTSEC-2026-0495). The SSH install wizard keeps trust-on-first-use pinning; a certified host key is pinned by the key it certifies.
+
+### Testing
+
+- **Runtime regression coverage** - added early mobile transport failure, interrupted stop, live mask override, session cleanup, IPv6 flow separation, diagnostic cancellation and retry tests. Windows GUI unit tests run on a Windows runner; OIDC integration tests use a local HTTPS provider with verified signing keys.
+- **Desktop lifecycle regressions** - tests cover retained protection, cleanup failure and timeout, SOCKS reconnect, process reuse and GUI shutdown. An opt-in native Windows test verifies immediate IPv4 and IPv6 readiness on an isolated Wintun adapter.
+- **Traffic and queue regressions** - authenticated DATA exchange covers every built-in mask. A 4096-packet test checks four flows under transport backpressure in all client pacing modes. Tests also cover IPv6 extension and fragment ordering, queue age reset, diagnostic cancellation, mask changes after congestion and full-MTU reassembly across server shaping modes.
+
+### Changed
+
+- **Project notice** - both READMEs clarify the experimental nature of the protocol, its intended lawful use and the absence of guarantees against blocking or detection.
 
 ## [1.2.0] - 2026-10-27
 

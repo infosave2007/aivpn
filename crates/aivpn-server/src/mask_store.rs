@@ -23,6 +23,8 @@ const DEACTIVATION_THRESHOLD: f32 = 0.80;
 /// Minimum usages before deactivation can trigger
 const MIN_USAGES_FOR_DEACTIVATION: u64 = 100;
 
+pub(crate) const MAX_PROFILE_BYTES: usize = 5 * 1024 * 1024;
+
 /// Mask statistics for rating system
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MaskStats {
@@ -71,6 +73,38 @@ pub struct MaskStore {
 }
 
 impl MaskStore {
+    /// Читает актуальный файл после загрузки через API с прежней проверкой подписи.
+    pub(crate) async fn read_verified_profile(&self, name: &str) -> Result<Option<MaskProfile>> {
+        use tokio::io::AsyncReadExt;
+        if name.is_empty()
+            || !name
+                .chars()
+                .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
+        {
+            return Err(Error::InvalidPacket("Недопустимое имя маски"));
+        }
+        let file = match tokio::fs::File::open(self.storage_dir.join(format!("{name}.json"))).await
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        let mut bytes = Vec::new();
+        file.take((MAX_PROFILE_BYTES + 1) as u64)
+            .read_to_end(&mut bytes)
+            .await?;
+        if bytes.len() > MAX_PROFILE_BYTES {
+            return Err(Error::InvalidPacket("Файл маски превышает 5 МБ"));
+        }
+        let profile: MaskProfile =
+            serde_json::from_slice(&bytes).map_err(|error| Error::Mask(error.to_string()))?;
+        if profile.mask_id != name {
+            return Err(Error::InvalidPacket("Имя файла не совпадает с ID маски"));
+        }
+        self.ensure_profile_allowed(&profile)?;
+        Ok(Some(profile))
+    }
+
     /// Создает хранилище и сразу читает маски с диска.
     ///
     /// `signing_key` подписывает новые маски. `operator_pubkey` проверяет

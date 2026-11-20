@@ -54,15 +54,20 @@ class PackagingTest(unittest.TestCase):
             path.write_text(STUB)
             path.chmod(0o700)
         shutil.copy2(REPO / 'Cargo.toml', self.root)
+        shutil.copytree(REPO / 'licenses', self.root / 'licenses')
         for folder in ('target/release', 'releases', 'deploy/docker',
-                       'deploy/config', 'assets/masks'):
+                       'deploy/config', 'assets/masks', 'deploy/systemd'):
             (self.root / folder).mkdir(parents=True)
-        for name in ('aivpn-linux', 'aivpn-client', 'aivpn-ip-helper'):
+        for name in ('aivpn-linux', 'aivpn-client', 'aivpn-ip-helper',
+                     'aivpn-routing-service', 'aivpn-packet-worker', 'aivpn-app-control'):
             path = self.root / 'target/release' / name
             path.write_text('#!/bin/sh\nprintf "bundled:%s\\n" "$*"\n')
             path.chmod(0o700)
+        for name in ('aivpn-app-routing.service', 'aivpn-app-routing.socket'):
+            shutil.copy2(REPO / 'deploy/systemd' / name, self.root / 'deploy/systemd')
+        shutil.copy2(REPO / 'deploy/install-app-routing.sh', self.root / 'deploy')
         (self.root / 'releases/aivpn-server-linux-x86_64').write_bytes(b'server fixture')
-        for name in ('Dockerfile.prebuilt', 'docker-entrypoint.sh'):
+        for name in ('Dockerfile.prebuilt', 'Dockerfile.windows-client', 'docker-entrypoint.sh'):
             shutil.copy2(REPO / 'deploy/docker' / name, self.root / 'deploy/docker')
         shutil.copy2(REPO / 'docker-compose.yml', self.root)
         shutil.copy2(REPO / 'deploy/config/server.json.example', self.root / 'deploy/config')
@@ -80,12 +85,38 @@ class PackagingTest(unittest.TestCase):
         dockerfile = (self.root / 'Dockerfile.generated').read_text()
         self.assertIn('COPY vendor vendor/', dockerfile)
 
+    def test_client_build_contexts_contain_embedded_setup_resources(self):
+        self.make('client-musl-aarch64')
+        contexts = [
+            (self.root / 'Dockerfile.generated', ['deploy/install-client-image.sh', 'deploy/install-app-routing.sh', 'deploy/systemd/aivpn-app-routing.service', 'platforms/linux/polkit/com.aivpn.client.policy']),
+            (REPO / 'deploy/docker/Dockerfile.client', ['deploy/install-client-image.sh', 'deploy/install-app-routing.sh', 'deploy/systemd/aivpn-app-routing.service', 'platforms/linux/polkit/com.aivpn.client.policy']),
+            (REPO / 'Dockerfile', ['deploy/install-client-image.sh', 'deploy/install-app-routing.sh', 'deploy/systemd/aivpn-app-routing.service', 'platforms/linux/polkit/com.aivpn.client.policy']),
+            (REPO / 'platforms/mikrotik/Dockerfile', ['deploy/install-client-image.sh', 'deploy/install-app-routing.sh', 'deploy/systemd/aivpn-app-routing.service', 'platforms/linux/polkit/com.aivpn.client.policy']),
+            (REPO / 'deploy/docker/Dockerfile.windows-client', ['deploy/install-client-image.ps1', 'deploy/install-app-routing.ps1', 'deploy/windows-setup-common.ps1']),
+        ]
+        for dockerfile, required in contexts:
+            sources = [line.split()[1] for line in dockerfile.read_text().splitlines()
+                       if line.startswith('COPY ') and not line.startswith('COPY --from=')]
+            for resource in required:
+                self.assertTrue(any(resource == source or resource.startswith(source.rstrip('/') + '/')
+                                    for source in sources), f'{dockerfile.name}: {resource}')
+
+    def test_docker_windows_packages_one_gui_image(self):
+        self.make('windows-docker')
+        import zipfile
+        with zipfile.ZipFile(self.root / 'releases/aivpn-windows-gui.zip') as archive:
+            self.assertEqual(archive.namelist(), ['aivpn.exe'])
+        self.assertFalse((self.root / 'releases/aivpn-client.exe').exists())
+
     def test_apprun_executes_bundled_binary_with_spaces(self):
         self.make('linux-appimage')
         output = subprocess.check_output(
             [str(self.root / 'AppDir-aivpn-linux/AppRun'), 'argument with spaces'],
             text=True, timeout=5)
         self.assertEqual(output, 'bundled:argument with spaces\n')
+        binaries = self.root / 'AppDir-aivpn-linux/usr/bin'
+        self.assertEqual(sorted(path.name for path in binaries.iterdir()), ['aivpn-linux'])
+        self.assertFalse((self.root / 'AppDir-aivpn-linux/usr/share/aivpn/app-routing').exists())
 
     def test_server_deploy_transfers_every_copy_source(self):
         remote = self.root / 'remote'
@@ -124,6 +155,22 @@ class PackagingTest(unittest.TestCase):
             self.assertIn('ref:', options)
             self.assertIn('github.event.release.tag_name', options)
             self.assertIn('github.event.inputs.tag', options)
+
+    def test_ios_app_icons_are_opaque(self):
+        # App Store Connect отклоняет сборку, если у иконки есть альфа-канал.
+        icons = sorted((REPO / 'assets/brand/ios/Assets.xcassets/AppIcon.appiconset').glob('*.png'))
+        self.assertTrue(icons)
+        for icon in icons:
+            data = icon.read_bytes()
+            self.assertEqual(data[:8], b'\x89PNG\r\n\x1a\n', icon.name)
+            chunks, offset = [], 8
+            while offset < len(data):
+                length = int.from_bytes(data[offset:offset + 4], 'big')
+                chunks.append(data[offset + 4:offset + 8])
+                offset += 12 + length
+            self.assertEqual(chunks[0], b'IHDR', icon.name)
+            self.assertIn(data[25], (0, 2, 3), icon.name)
+            self.assertNotIn(b'tRNS', chunks, icon.name)
 
     def test_wintun_rejects_unverified_download_without_changing_target(self):
         curl = self.bin / 'curl'

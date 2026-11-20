@@ -135,7 +135,7 @@ private func adminExitNodePickerRows(
     }
     if choice.wrappedValue == .custom {
         TextField(loc.t("admin_exit_node"), text: exitNode)
-            .autocorrectionDisabled()
+            .disableAutocorrection(true)
             .autocapitalization(.none)
             .keyboardType(.asciiCapable)
     }
@@ -165,7 +165,7 @@ struct AdminView: View {
     private var canMutate: Bool { AdminApi.role() == 2 }
 
     var body: some View {
-        NavigationStack {
+        CompatibleNavigationView {
             Group {
                 if isLoading && clients.isEmpty {
                     ProgressView(loc.t("admin_loading"))
@@ -224,8 +224,10 @@ struct AdminView: View {
             .navigationTitle(loc.t("admin_title"))
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                if canMutate {
-                    ToolbarItem(placement: .navigationBarLeading) {
+                // Conditions live inside each item: conditional toolbar
+                // items themselves need iOS 16.
+                ToolbarItem(placement: .navigationBarLeading) {
+                    if canMutate {
                         Button {
                             showAddClient = true
                         } label: {
@@ -253,8 +255,8 @@ struct AdminView: View {
                 // same gate as the "add client" button above, since every
                 // control on that screen mutates (see
                 // ServerSettingsView.swift's header comment).
-                if canMutate {
-                    ToolbarItem(placement: .navigationBarTrailing) {
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    if canMutate {
                         Button {
                             showServerSettings = true
                         } label: {
@@ -427,11 +429,11 @@ private struct AdminAddClientView: View {
     @State private var errorMessage: String?
 
     var body: some View {
-        NavigationStack {
+        CompatibleNavigationView {
             Form {
                 Section {
                     TextField(loc.t("admin_client_name"), text: $name)
-                        .autocorrectionDisabled()
+                        .disableAutocorrection(true)
                 }
                 Section {
                     Toggle(loc.t("admin_one_time"), isOn: $oneTime)
@@ -562,12 +564,12 @@ private struct AdminClientDetailView: View {
     private var canMutate: Bool { AdminApi.role() == 2 }
 
     var body: some View {
-        NavigationStack {
+        CompatibleNavigationView {
             Form {
                 if canMutate {
                     Section(header: Text(loc.t("admin_edit_section"))) {
                         TextField(loc.t("admin_client_name"), text: $editedName)
-                            .autocorrectionDisabled()
+                            .disableAutocorrection(true)
                         Toggle(loc.t("admin_enabled"), isOn: $editedEnabled)
                         Toggle(loc.t("admin_one_time"), isOn: $editedOneTime)
                         Toggle(loc.t("admin_has_expiry"), isOn: $editedHasExpiry.animation())
@@ -599,13 +601,13 @@ private struct AdminClientDetailView: View {
                 }
 
                 Section(header: Text(loc.t("admin_info"))) {
-                    LabeledContent(loc.t("admin_vpn_ip"), value: client.vpn_ip)
-                    LabeledContent(loc.t("admin_role"), value: roleLabel)
-                    LabeledContent(loc.t("admin_device_bound"), value: client.device_bound ? loc.t("admin_yes") : loc.t("admin_no"))
-                    LabeledContent(loc.t("admin_created_at"), value: adminDisplayDate(client.created_at))
-                    LabeledContent(loc.t("admin_traffic_in"), value: adminFormatBytes(client.stats.bytes_in))
-                    LabeledContent(loc.t("admin_traffic_out"), value: adminFormatBytes(client.stats.bytes_out))
-                    LabeledContent(loc.t("admin_exit_node"), value: exitNodeDisplayValue)
+                    CompatibleValueRow(loc.t("admin_vpn_ip"), value: client.vpn_ip)
+                    CompatibleValueRow(loc.t("admin_role"), value: roleLabel)
+                    CompatibleValueRow(loc.t("admin_device_bound"), value: client.device_bound ? loc.t("admin_yes") : loc.t("admin_no"))
+                    CompatibleValueRow(loc.t("admin_created_at"), value: adminDisplayDate(client.created_at))
+                    CompatibleValueRow(loc.t("admin_traffic_in"), value: adminFormatBytes(client.stats.bytes_in))
+                    CompatibleValueRow(loc.t("admin_traffic_out"), value: adminFormatBytes(client.stats.bytes_out))
+                    CompatibleValueRow(loc.t("admin_exit_node"), value: exitNodeDisplayValue)
                 }
 
                 if canMutate {
@@ -643,7 +645,7 @@ private struct AdminClientDetailView: View {
                                     Label(loc.t("admin_copy"), systemImage: "doc.on.doc")
                                 }
                                 Spacer()
-                                ShareLink(item: connectionKey) {
+                                CompatibleShareLink(item: connectionKey) {
                                     Label(loc.t("admin_share"), systemImage: "square.and.arrow.up")
                                 }
                             }

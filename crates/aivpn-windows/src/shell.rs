@@ -177,6 +177,7 @@ impl crate::AivpnApp {
                             Page::Home => self.draw_connection(ui),
                             Page::Profiles => self.draw_profiles(ui),
                             Page::Routes => self.draw_routes(ui),
+                            Page::Applications => self.draw_app_routing(ui),
                             Page::Masks => self.draw_masks(ui),
                             Page::Service => self.draw_service(ui),
                             Page::Settings => self.draw_preferences(ui),
@@ -227,7 +228,7 @@ impl crate::AivpnApp {
         if let Some(proxy) = &key.proxy_listen {
             return format!("SOCKS5: {proxy}");
         }
-        let mode = if key.full_tunnel {
+        let mode = if !key.split_enabled || key.full_tunnel {
             text(lang, "Весь трафик через VPN", "All traffic through VPN")
         } else if key.include_routes.is_empty() {
             text(lang, "Маршруты сервера", "Server routes")
@@ -238,7 +239,7 @@ impl crate::AivpnApp {
                 "Profile networks and server routes",
             )
         };
-        if key.exclude_routes.is_empty() {
+        if !key.split_enabled || key.exclude_routes.is_empty() {
             mode.into()
         } else {
             format!(
@@ -254,6 +255,25 @@ impl crate::AivpnApp {
         let connected = self.vpn.is_connected();
         let busy = self.vpn.is_busy();
         let palette = fluent_colors(ui.visuals().dark_mode);
+        if !connected && self.vpn.kill_switch_enabled() {
+            ui.colored_label(
+                ui.visuals().warn_fg_color,
+                text(
+                    lang,
+                    "Блокировка трафика остается активной",
+                    "Traffic blocking remains active",
+                ),
+            );
+            if ui
+                .add_enabled(
+                    !busy,
+                    egui::Button::new(text(lang, "Снять блокировку", "Remove traffic blocking")),
+                )
+                .clicked()
+            {
+                self.vpn.disconnect();
+            }
+        }
         if self.keys.keys.is_empty() {
             ui.label(
                 RichText::new(text(
@@ -355,18 +375,35 @@ impl crate::AivpnApp {
                 t(lang, "bootstrap_fallback_label"),
             );
         }
-        let route = self
-            .keys
-            .selected_key()
-            .map(|key| Self::profile_route_summary(key, lang))
-            .unwrap_or_default();
+        let applications = self.uses_application_routing();
+        let route = if applications {
+            if self.app_routing.split_enabled() {
+                text(lang, "Правила приложений", "Application rules").to_owned()
+            } else {
+                text(
+                    lang,
+                    "Весь трафик через VPN (split выключен)",
+                    "All traffic through VPN (split off)",
+                )
+                .to_owned()
+            }
+        } else {
+            self.keys
+                .selected_key()
+                .map(|key| Self::profile_route_summary(key, lang))
+                .unwrap_or_default()
+        };
         ui.label(text(lang, "Маршрутизация", "Routing"));
         ui.weak(route);
         if ui
             .small_button(text(lang, "Изменить маршруты", "Change routes"))
             .clicked()
         {
-            self.page = Page::Routes;
+            self.page = if applications {
+                Page::Applications
+            } else {
+                Page::Routes
+            };
         }
         ui.separator();
         ui.label(text(
@@ -374,7 +411,14 @@ impl crate::AivpnApp {
             "Блокировка вне VPN",
             "Traffic blocking outside VPN",
         ));
-        if connected
+        if applications {
+            ui.weak(text(
+                lang,
+                "Приложения с VPN не выходят напрямую.",
+                "Applications assigned to VPN cannot fall back to a direct connection.",
+            ));
+            ui.weak(text(lang, "DNS общий для системы и работает через VPN. При отключении разрешение имен может перестать работать во всех приложениях.", "System DNS uses VPN for all applications. Disconnecting may interrupt name resolution system-wide."));
+        } else if connected
             && self
                 .keys
                 .selected_key()
@@ -399,6 +443,12 @@ impl crate::AivpnApp {
                     "Disabled for this session",
                 )
             });
+        } else if self.vpn.kill_switch_enabled() {
+            ui.weak(text(
+                lang,
+                "Сохраняется после отключения",
+                "Retained after disconnection",
+            ));
         } else {
             ui.weak(if self.settings.kill_switch {
                 text(
@@ -426,7 +476,7 @@ impl crate::AivpnApp {
                 ui.small(format!(
                     "{}: {quality}%{}",
                     text(lang, "Качество канала", "Channel quality"),
-                    if self.vpn.stats().server_adaptive_level >= 2 {
+                    if self.vpn.stats().fec_group.is_some_and(|group| group > 0) {
                         " · FEC"
                     } else {
                         ""
@@ -577,17 +627,10 @@ impl crate::AivpnApp {
             );
             ui.label(t(lang, "mask_profile"));
             let choices = mask_choices_from_catalog(lang).unwrap_or_else(|| {
-                [
-                    "auto",
-                    "webrtc_zoom_v3",
-                    "quic_https_v2",
-                    "webrtc_yandex_telemost_v1",
-                    "webrtc_vk_teams_v1",
-                    "webrtc_sberjazz_v1",
-                ]
-                .iter()
-                .map(|s| (s.to_string(), s.to_string()))
-                .collect()
+                std::iter::once("auto")
+                    .chain(aivpn_common::mask::preset_masks::ids())
+                    .map(|s| (s.to_string(), s.to_string()))
+                    .collect()
             });
             let current = choices
                 .iter()

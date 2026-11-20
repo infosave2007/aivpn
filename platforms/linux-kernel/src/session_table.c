@@ -46,6 +46,8 @@ static atomic_t aivpn_session_count = ATOMIC_INIT(0);
 
 /* Общее ведро на client_key. Слот живет дольше сессии: reinstall не наполняет бюджет заново. */
 #define AIVPN_QOS_HASH_BITS 8
+/* Запас для переподключений без неограниченного роста истории клиентов. */
+#define AIVPN_QOS_MAX_SLOTS (MAX_SESSIONS * 8)
 
 struct aivpn_qos_slot {
 	struct hlist_node node;
@@ -56,6 +58,7 @@ struct aivpn_qos_slot {
 
 static DEFINE_HASHTABLE(aivpn_qos_htable, AIVPN_QOS_HASH_BITS);
 static DEFINE_SPINLOCK(aivpn_qos_lock);
+static unsigned int aivpn_qos_count;
 
 static struct aivpn_kern_session *aivpn_session_detach(const u8 *session_id);
 static void aivpn_qos_flush(void);
@@ -497,12 +500,15 @@ static struct aivpn_qos_slot *aivpn_qos_create(const u8 key[16])
 {
 	struct aivpn_qos_slot *slot;
 
+	if (aivpn_qos_count >= AIVPN_QOS_MAX_SLOTS)
+		return NULL;
 	slot = kzalloc(sizeof(*slot), GFP_ATOMIC);
 	if (!slot)
 		return NULL;
 	memcpy(slot->client_key, key, 16);
 	spin_lock_init(&slot->lock);
 	hash_add(aivpn_qos_htable, &slot->node, jhash(key, 16, 0));
+	aivpn_qos_count++;
 	return slot;
 }
 
@@ -526,6 +532,24 @@ static int aivpn_qos_reconfigure(const struct aivpn_session_policy *in)
 	return slot ? 0 : -ENOMEM;
 }
 
+/* Отозванный клиент больше не использует общий бюджет. Дожидаемся читателя,
+ * который уже отпустил qos_lock, но еще держит lock самого слота. */
+static void aivpn_qos_forget(const u8 key[16])
+{
+	struct aivpn_qos_slot *slot;
+
+	spin_lock_bh(&aivpn_qos_lock);
+	slot = aivpn_qos_lookup(key);
+	if (slot) {
+		spin_lock(&slot->lock);
+		hash_del(&slot->node);
+		aivpn_qos_count--;
+		spin_unlock(&slot->lock);
+		kfree(slot);
+	}
+	spin_unlock_bh(&aivpn_qos_lock);
+}
+
 static void aivpn_qos_flush(void)
 {
 	struct aivpn_qos_slot *slot;
@@ -537,6 +561,7 @@ static void aivpn_qos_flush(void)
 		hash_del(&slot->node);
 		kfree(slot);
 	}
+	aivpn_qos_count = 0;
 	spin_unlock_bh(&aivpn_qos_lock);
 }
 
@@ -957,6 +982,7 @@ int aivpn_client_revoke(const struct aivpn_client_revoke *rv)
 		s->pol.flags |= AIVPN_POL_REVOKED;
 		spin_unlock_bh(&s->lock);
 	}
+	aivpn_qos_forget(rv->client_key);
 	spin_unlock_bh(&aivpn_table_lock);
 	return 0;
 }

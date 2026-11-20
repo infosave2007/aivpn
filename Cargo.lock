@@ -120,7 +120,7 @@ dependencies = [
 
 [[package]]
 name = "aivpn-android-core"
-version = "1.2.0"
+version = "1.3.0"
 dependencies = [
  "aivpn-common",
  "android_logger",
@@ -133,13 +133,16 @@ dependencies = [
 
 [[package]]
 name = "aivpn-client"
-version = "1.2.0"
+version = "1.3.0"
 dependencies = [
  "aivpn-common",
+ "aivpn-desktop-agent",
+ "aivpn-desktop-policy",
  "async-trait",
  "base64",
  "blake3",
  "bytes",
+ "cc",
  "clap",
  "ed25519-dalek 2.2.0",
  "libc",
@@ -157,12 +160,11 @@ dependencies = [
  "tun",
  "winapi",
  "windows-sys 0.61.2",
- "winres",
 ]
 
 [[package]]
 name = "aivpn-common"
-version = "1.2.0"
+version = "1.3.0"
 dependencies = [
  "aes 0.8.4",
  "aes-gcm 0.10.3",
@@ -211,8 +213,39 @@ dependencies = [
 ]
 
 [[package]]
+name = "aivpn-desktop-agent"
+version = "1.3.0"
+dependencies = [
+ "aivpn-common",
+ "aivpn-desktop-policy",
+ "base64",
+ "cc",
+ "clap",
+ "futures-core",
+ "libbpf-sys",
+ "libc",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 1.0.69",
+ "tokio",
+ "windows-sys 0.61.2",
+ "zbus",
+]
+
+[[package]]
+name = "aivpn-desktop-policy"
+version = "1.3.0"
+dependencies = [
+ "rand 0.8.7",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "aivpn-ios-core"
-version = "1.2.0"
+version = "1.3.0"
 dependencies = [
  "aivpn-common",
  "base64",
@@ -223,9 +256,11 @@ dependencies = [
 
 [[package]]
 name = "aivpn-linux"
-version = "1.2.0"
+version = "1.3.0"
 dependencies = [
+ "aivpn-client",
  "aivpn-common",
+ "aivpn-desktop-agent",
  "base64",
  "dirs 6.0.0",
  "iced",
@@ -243,7 +278,7 @@ dependencies = [
 
 [[package]]
 name = "aivpn-server"
-version = "1.2.0"
+version = "1.3.0"
 dependencies = [
  "aivpn-client",
  "aivpn-common",
@@ -292,9 +327,11 @@ dependencies = [
 
 [[package]]
 name = "aivpn-windows"
-version = "1.2.0"
+version = "1.3.0"
 dependencies = [
+ "aivpn-client",
  "aivpn-common",
+ "aivpn-desktop-agent",
  "base64",
  "dirs 6.0.0",
  "eframe",
@@ -591,9 +628,9 @@ dependencies = [
 
 [[package]]
 name = "async-executor"
-version = "1.14.0"
+version = "1.14.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c96bf972d85afc50bf5ab8fe2d54d1586b4e0b46c97c50a0c9e71e2f7bcd812a"
+checksum = "f426a31126c735126297bc5ea7a521263c9faff4f63ca415267ee625651c4f37"
 dependencies = [
  "async-task",
  "concurrent-queue",
@@ -616,7 +653,7 @@ dependencies = [
  "futures-lite",
  "parking",
  "polling",
- "rustix 1.1.4",
+ "rustix 1.1.6",
  "slab",
  "windows-sys 0.61.2",
 ]
@@ -647,7 +684,7 @@ dependencies = [
  "cfg-if",
  "event-listener",
  "futures-lite",
- "rustix 1.1.4",
+ "rustix 1.1.6",
 ]
 
 [[package]]
@@ -673,7 +710,7 @@ dependencies = [
  "cfg-if",
  "futures-core",
  "futures-io",
- "rustix 1.1.4",
+ "rustix 1.1.6",
  "signal-hook-registry",
  "slab",
  "windows-sys 0.61.2",
@@ -1137,7 +1174,7 @@ checksum = "4dbf9978365bac10f54d1d4b04f7ce4427e51f71d61f2fe15e3fed5166474df7"
 dependencies = [
  "bitflags 2.13.1",
  "polling",
- "rustix 1.1.4",
+ "rustix 1.1.6",
  "slab",
  "tracing",
 ]
@@ -1161,7 +1198,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "138efcf0940a02ebf0cc8d1eff41a1682a46b431630f4c52450d6265876021fa"
 dependencies = [
  "calloop 0.14.4",
- "rustix 1.1.4",
+ "rustix 1.1.6",
  "wayland-backend",
  "wayland-client",
 ]
@@ -1352,9 +1389,9 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
 name = "clipboard-win"
-version = "5.4.1"
+version = "5.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bde03770d3df201d4fb868f2c9c59e66a3e4e2bd06692a0fe701e7103c7e84d4"
+checksum = "052af7878466feccda12ba7a6a67d019d712f296809559b47c12c8cc196d3a9a"
 dependencies = [
  "error-code",
 ]
@@ -2850,7 +2887,7 @@ version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1bd49230192a3797a9a4d6abe9b3eed6f7fa4c8a8a4947977c6f80025f92cbd8"
 dependencies = [
- "rustix 1.1.4",
+ "rustix 1.1.6",
  "windows-link 0.2.1",
 ]
 
@@ -4195,6 +4232,17 @@ dependencies = [
  "gtk-sys",
  "libloading 0.7.4",
  "once_cell",
+]
+
+[[package]]
+name = "libbpf-sys"
+version = "1.7.1+v1.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "222dd409cbd4db5e9d40410d17a168e1f80446386ae7bafbefa9bd0c1183ff64"
+dependencies = [
+ "cc",
+ "nix 0.31.3",
+ "pkg-config",
 ]
 
 [[package]]
@@ -5644,7 +5692,7 @@ dependencies = [
  "concurrent-queue",
  "hermit-abi",
  "pin-project-lite",
- "rustix 1.1.4",
+ "rustix 1.1.6",
  "windows-sys 0.61.2",
 ]
 
@@ -6643,9 +6691,9 @@ dependencies = [
 
 [[package]]
 name = "rustix"
-version = "1.1.4"
+version = "1.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b6fe4565b9518b83ef4f91bb47ce29620ca828bd32cb7e408f0062e9930ba190"
+checksum = "e5e76742e5294153d4dde1207dbec5bdd81eef6fabdc0d2118babadabfd858aa"
 dependencies = [
  "bitflags 2.13.1",
  "errno",
@@ -7177,7 +7225,7 @@ dependencies = [
  "libc",
  "log",
  "memmap2",
- "rustix 1.1.4",
+ "rustix 1.1.6",
  "thiserror 2.0.19",
  "wayland-backend",
  "wayland-client",
@@ -7264,7 +7312,7 @@ dependencies = [
  "objc2-quartz-core 0.3.2",
  "raw-window-handle",
  "redox_syscall 0.5.18",
- "rustix 1.1.4",
+ "rustix 1.1.6",
  "tiny-xlib",
  "tracing",
  "wasm-bindgen",
@@ -7572,7 +7620,7 @@ dependencies = [
  "cfg-expr",
  "heck 0.5.0",
  "pkg-config",
- "toml 0.8.2",
+ "toml",
  "version-compare",
 ]
 
@@ -7613,7 +7661,7 @@ dependencies = [
  "fastrand",
  "getrandom 0.4.3",
  "once_cell",
- "rustix 1.1.4",
+ "rustix 1.1.6",
  "windows-sys 0.61.2",
 ]
 
@@ -7855,15 +7903,6 @@ dependencies = [
  "libc",
  "pin-project-lite",
  "tokio",
-]
-
-[[package]]
-name = "toml"
-version = "0.5.11"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f4f7f0dd8d50a853a531c426359045b1998f04219d88799810762cd4ad314234"
-dependencies = [
- "serde",
 ]
 
 [[package]]
@@ -8407,7 +8446,7 @@ checksum = "016ccf01d1c58b6f8999612813e17c9b2390f7d70671428869913310f83f54b8"
 dependencies = [
  "cc",
  "downcast-rs",
- "rustix 1.1.4",
+ "rustix 1.1.6",
  "scoped-tls",
  "smallvec",
  "wayland-sys",
@@ -8420,7 +8459,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e3c36a0f861ad76d0901f2800b46321410d9f73f2ea88aac0650d86c32688073"
 dependencies = [
  "bitflags 2.13.1",
- "rustix 1.1.4",
+ "rustix 1.1.6",
  "wayland-backend",
  "wayland-scanner",
 ]
@@ -8442,7 +8481,7 @@ version = "0.31.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4a52d18780be9b1314328a3de5f930b73d2200112e3849ca6cb11822793fb34d"
 dependencies = [
- "rustix 1.1.4",
+ "rustix 1.1.6",
  "wayland-client",
  "xcursor",
 ]
@@ -9485,15 +9524,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "winres"
-version = "0.1.12"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b68db261ef59e9e52806f688020631e987592bd83619edccda9c47d42cde4f6c"
-dependencies = [
- "toml 0.5.11",
-]
-
-[[package]]
 name = "wintun-bindings"
 version = "0.7.39"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9553,7 +9583,7 @@ dependencies = [
  "libc",
  "libloading 0.8.9",
  "once_cell",
- "rustix 1.1.4",
+ "rustix 1.1.6",
  "x11rb-protocol",
 ]
 
@@ -9612,7 +9642,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32e45ad4206f6d2479085147f02bc2ef834ac85886624a23575ae137c8aa8156"
 dependencies = [
  "libc",
- "rustix 1.1.4",
+ "rustix 1.1.6",
 ]
 
 [[package]]
@@ -9713,7 +9743,7 @@ dependencies = [
  "hex",
  "libc",
  "ordered-stream",
- "rustix 1.1.4",
+ "rustix 1.1.6",
  "serde",
  "serde_repr",
  "tokio",

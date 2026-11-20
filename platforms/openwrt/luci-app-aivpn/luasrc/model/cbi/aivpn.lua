@@ -10,6 +10,11 @@ s.addremove = false
 o = s:option(Flag, "enabled", translate("Enabled"))
 o.rmempty = false
 
+o = s:option(Flag, "split_enabled", translate("Split tunneling"),
+    translate("Keep saved split routes; disabling uses the full VPN tunnel"))
+o.default = "1"
+o.rmempty = false
+
 o = s:option(Flag, "kill_switch", translate("Kill switch"),
     translate("Block forwarded traffic outside the VPN while the service is enabled"))
 o.default = "0"

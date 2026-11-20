@@ -36,7 +36,7 @@ struct AuditLogView: View {
     @State private var errorMessage: String?
 
     var body: some View {
-        NavigationStack {
+        CompatibleNavigationView {
             Group {
                 if isLoading && entries.isEmpty {
                     ProgressView(loc.t("admin_loading"))

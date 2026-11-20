@@ -28,7 +28,7 @@ import { verifyAccessToken } from './auth/jwt'
 // Simple in-process sliding window rate limiter (no Redis required).
 // For multi-instance deployments, swap this for a Redis-backed limiter.
 
-scheduleRateLimitCleaner(Math.max(config.AUTH_RATE_WINDOW_MS, config.API_RATE_WINDOW_MS))
+scheduleRateLimitCleaner()
 
 // ─── App setup ────────────────────────────────────────────────────────────────
 
@@ -120,7 +120,7 @@ app.use('/web/auth/*', async (c, next) => {
     await next()
   } finally {
     if (attempt) attempt.finish(c.res.status >= 400)
-    else if (c.res.status >= 400) recordRateLimitEvent(key, config.AUTH_RATE_MAX)
+    else if (c.res.status >= 400) recordRateLimitEvent(key, config.AUTH_RATE_MAX, config.AUTH_RATE_WINDOW_MS)
   }
 })
 

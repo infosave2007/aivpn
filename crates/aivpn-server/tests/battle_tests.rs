@@ -1568,62 +1568,6 @@ fn test_metrics_collector() {
 }
 
 // ============================================================================
-// Key Rotation Tests
-// ============================================================================
-
-use aivpn_server::key_rotation::{KeyRotationConfig, KeyRotator};
-
-#[test]
-fn test_key_rotator_init() {
-    let config = KeyRotationConfig::default();
-    let rotator = KeyRotator::new(config);
-    assert!(rotator.is_ok());
-}
-
-#[test]
-fn test_key_rotator_needs_rotation_data() {
-    let config = KeyRotationConfig {
-        time_interval_secs: 3600, // Large time window
-        data_interval_bytes: 100, // Small data threshold
-        enable_auto_rotation: true,
-    };
-    let mut rotator = KeyRotator::new(config).unwrap();
-    assert!(
-        !rotator.needs_rotation(),
-        "Should not need rotation initially"
-    );
-
-    rotator.record_bytes(50);
-    assert!(!rotator.needs_rotation(), "50 < 100 threshold");
-
-    rotator.record_bytes(60);
-    assert!(
-        rotator.needs_rotation(),
-        "110 >= 100 threshold — rotation needed"
-    );
-}
-
-#[test]
-fn test_key_rotator_rotate() {
-    let config = KeyRotationConfig::default();
-    let mut rotator = KeyRotator::new(config).unwrap();
-    let old_pub = rotator.current_public_key();
-
-    let event = rotator.rotate_keys().unwrap();
-    // Since old_eph_pub was removed, we should probably check what the event contains or simply remove the assert if old_eph_pub is no longer part of KeyRotationEvent.
-    // Wait, let me check the actual code first before applying blind replacements.
-    assert_ne!(event.new_eph_pub, old_pub, "New key must differ from old");
-
-    // Commit rotation
-    rotator.commit_rotation();
-    assert_eq!(
-        rotator.current_public_key(),
-        event.new_eph_pub,
-        "Current key must be the new key after commit"
-    );
-}
-
-// ============================================================================
 // Passive Mask Distribution Tests
 // ============================================================================
 
@@ -1793,7 +1737,7 @@ fn reconnect_at_nat_limit_preserves_other_clients_and_bounds_reserve() {
 fn reconnect_at_subnet_limit_requires_a_valid_handshake() {
     let (manager, server) = make_session_manager();
     for i in 0..10 {
-        authenticated_session(
+        let session = authenticated_session(
             &manager,
             &server,
             &format!("203.0.113.{}:10000", i + 1),
@@ -1801,9 +1745,10 @@ fn reconnect_at_subnet_limit_requires_a_valid_handshake() {
             &format!("client-{i}"),
             [i as u8; 32],
         )
-        .unwrap()
-        .lock()
-        .is_ratcheted = true;
+        .unwrap();
+        let mut state = session.lock();
+        state.is_ratcheted = true;
+        state.client_admitted = true;
     }
     let key = KeyPair::generate();
     assert!(manager
@@ -1856,6 +1801,7 @@ fn global_reserve_accepts_reconnect_but_not_a_new_client() {
         let mut state = session.lock();
         state.client_id = Some(format!("client-{i}"));
         state.is_ratcheted = true;
+        state.client_admitted = true;
     }
     assert!(authenticated_session(
         &manager,

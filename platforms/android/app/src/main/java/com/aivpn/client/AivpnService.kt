@@ -15,7 +15,6 @@ import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.os.ParcelFileDescriptor
-import android.os.SystemClock
 import android.util.Base64
 import android.util.Log
 import kotlinx.coroutines.*
@@ -229,13 +228,10 @@ class AivpnService : VpnService() {
 
     // Network change detection
     @Volatile private var networkTrigger: Boolean   = false
-    private var networkCallback: ConnectivityManager.NetworkCallback? = null
+    @Volatile private var networkCallback: ConnectivityManager.NetworkCallback? = null
     @Volatile private var currentUnderlyingNetwork: Network? = null
-    @Volatile private var lastNetworkEventAtMs: Long = 0L
-    private val NETWORK_EVENT_DEBOUNCE_MS = 1_000L
-    // Android reshuffles underlying network IDs when VPN comes up; ignore churn for this window.
-    @Volatile private var postConnectUntilMs: Long = 0L
-    private val POST_CONNECT_COOLDOWN_MS = 15_000L
+    @Volatile private var transportUnderlyingNetwork: Network? = null
+    private val networkChangeLock = Any()
 
     private val mainHandler = Handler(Looper.getMainLooper())
 
@@ -764,17 +760,12 @@ class AivpnService : VpnService() {
      */
     private class FatalConfigException(message: String) : Exception(message)
 
-    /**
-     * User-facing text for an authenticated `HandshakeReject` reason code (see
-     * `ControlPayload::HandshakeReject` in aivpn-common/protocol.rs and
-     * `AivpnJni.handshakeRejectReason()`). 1=one-time key already used,
-     * 2=client expired, 3=client disabled; anything else (including the
-     * `0` "unspecified" code) falls back to a generic refusal message.
-     */
+    /** Причина терминального отказа: 1 - разовый ключ, 2 - срок, 3 - отключение, 4 - сертификат. */
     private fun handshakeRejectMessage(reason: Int): String = when (reason) {
         1 -> getString(R.string.status_handshake_reject_one_time_used)
         2 -> getString(R.string.status_handshake_reject_expired)
         3 -> getString(R.string.status_handshake_reject_disabled)
+        4 -> getString(R.string.status_cert_rejected)
         else -> getString(R.string.status_handshake_reject_unspecified)
     }
 
@@ -792,7 +783,7 @@ class AivpnService : VpnService() {
         latestRunTunnelSessionId = mySessionId
 
         // Wait for any usable network before starting (avoids immediate DNS/handshake failure).
-        waitForConnectivity()
+        val underlyingNetwork = waitForConnectivity()
 
         // Snapshot the saved config into locals up front: stopVpn() nulls these
         // fields non-atomically with this coroutine. A field that vanished because a
@@ -836,10 +827,8 @@ class AivpnService : VpnService() {
 
         ensureVpnInterface()
         val activeTun = vpnInterface ?: throw Exception("VPN interface is not available")
-        // WireGuard approach: let Android OS choose the best underlying network.
-        // Setting null allows automatic network selection and seamless WiFi↔cellular switching.
-        // The socket is protected via VpnService.protect() in Rust so it bypasses VPN routing.
-        setUnderlyingNetworks(null)
+        // DNS, сокеты и сведения для Android относятся к одной физической сети.
+        setUnderlyingNetworks(arrayOf(underlyingNetwork))
 
         // Keep the original ParcelFileDescriptor open in the service so Android keeps the
         // device VPN active across reconnects. Rust receives only the borrowed fd number
@@ -849,7 +838,6 @@ class AivpnService : VpnService() {
         sessionEstablished = false
         isEstablished      = false
         connectedAtMillis  = 0L
-        isRunning          = true
         lastStatusText = getString(R.string.status_connecting)
         uiState = UiState.CONNECTING
         postStatusCallback(false, lastStatusText)
@@ -1081,10 +1069,6 @@ class AivpnService : VpnService() {
             Log.d(TAG, "Ignoring onTunnelReady after disconnect (manual=$manualDisconnect active=$isServiceActive)")
             return
         }
-        // postConnectUntilMs must be written BEFORE sessionEstablished — network callbacks
-        // check sessionEstablished first and then read postConnectUntilMs; if the order were
-        // reversed a callback could see sessionEstablished=true while postConnectUntilMs=0.
-        postConnectUntilMs = SystemClock.elapsedRealtime() + POST_CONNECT_COOLDOWN_MS
         sessionEstablished = true
         isEstablished = true
         // New session ⇒ new timer epoch, in lockstep with the Rust per-session
@@ -1115,15 +1099,7 @@ class AivpnService : VpnService() {
 
     // ──────────── Network callbacks ────────────
 
-    /**
-     * WireGuard-style approach: we do NOT manually select networks or bind sockets
-     * to specific interfaces.  Instead:
-     *   - setUnderlyingNetworks(null) lets Android route through the best available network
-     *   - VpnService.protect(fd) ensures the UDP socket bypasses VPN routing
-    *   - We detect default-network switches/loss and trigger a fast tunnel restart (which will
-     *     get a fresh DNS resolution and handshake on whatever network is available)
-    *   - The Rust side has an aggressive RX silence detector as backup
-     */
+    /** Смена выбранной физической сети требует нового DNS и сокетов. */
     private fun restartAfterNetworkChange() {
         networkTrigger = true
         isEstablished = false
@@ -1138,110 +1114,63 @@ class AivpnService : VpnService() {
 
     private fun registerNetworkCallback() {
         val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+        val knownCapabilities = cm.allNetworks.mapNotNull { network ->
+            cm.getNetworkCapabilities(network)?.let { network to it }
+        }.toMap().toMutableMap()
         currentUnderlyingNetwork = findUsableUnderlyingNetwork(cm)
 
         val callback = object : ConnectivityManager.NetworkCallback() {
-
-            override fun onAvailable(network: Network) {
-                if (instance !== this@AivpnService || manualDisconnect) return
-                val caps = cm.getNetworkCapabilities(network) ?: return
-                if (!isUsableUnderlyingNetwork(caps)) return
-
-                val previous = currentUnderlyingNetwork
-                if (previous == null || previous == network) {
-                    currentUnderlyingNetwork = network
-                    return
-                }
-
-                Log.d(TAG, "Underlying network available: $network (previous=$previous)")
-
-                // onAvailable fires for EVERY network matching the request, not
-                // just the default one: on dual-SIM devices the standby SIM's
-                // data network (and a re-validating Wi-Fi) periodically announce
-                // themselves while the network the tunnel is riding stays
-                // perfectly healthy. Blindly adopting each announcement made
-                // consecutive events alternate previous/next between two live
-                // networks — an endless restart ping-pong every 5-10 s that only
-                // a manual reconnect (which re-initialises
-                // currentUnderlyingNetwork) could break. A switch is real only
-                // when the network we ride is no longer usable, or when Wi-Fi
-                // appears while riding cellular (the one upgrade users expect).
-                val prevCaps = cm.getNetworkCapabilities(previous)
-                val prevAlive = prevCaps != null && isUsableUnderlyingNetwork(prevCaps)
-                val wifiUpgrade = prevAlive &&
-                    prevCaps!!.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) &&
-                    caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)
-                if (prevAlive && !wifiUpgrade) {
-                    Log.d(TAG, "Ignoring additional usable network $network — current $previous still healthy")
-                    return
-                }
-
-                if (!isRunning || !sessionEstablished) {
-                    currentUnderlyingNetwork = network
-                    return
-                }
-
-                // Seamless roaming with a protected UDP socket is not reliable across
-                // all Android vendors/radios. If the network we ride actually changed
-                // under an established session, restart immediately on the new path.
-                val now = SystemClock.elapsedRealtime()
-                if (!prevAlive || (now >= postConnectUntilMs &&
-                        now - lastNetworkEventAtMs >= NETWORK_EVENT_DEBOUNCE_MS)) {
-                    if (networkTrigger) return
-                    lastNetworkEventAtMs = now
-                    currentUnderlyingNetwork = network
-                    Log.d(TAG, "Underlying network switched: $previous -> $network; restarting tunnel")
-                    restartAfterNetworkChange()
-                }
-            }
-
             override fun onCapabilitiesChanged(network: Network, caps: NetworkCapabilities) {
-                if (instance !== this@AivpnService || manualDisconnect) return
-                if (!isUsableUnderlyingNetwork(caps)) return
-                if (currentUnderlyingNetwork == null) {
+                synchronized(networkChangeLock) {
+                    if (instance !== this@AivpnService || manualDisconnect || networkCallback !== this) return
+                    knownCapabilities[network] = caps
+                    if (!isUsableUnderlyingNetwork(caps)) return
+                    val previous = currentUnderlyingNetwork
+                    if (previous == null || previous == network) {
+                        currentUnderlyingNetwork = network
+                        return
+                    }
+                    val previousCaps = knownCapabilities[previous]
+                    val previousAlive = previousCaps?.let(::isUsableUnderlyingNetwork) == true
+                    val wifiUpgrade = previousCaps?.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) == true &&
+                        caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)
+                    // Дополнительная SIM или другая живая сеть не меняет выбранный путь.
+                    if (previousAlive && !wifiUpgrade) return
                     currentUnderlyingNetwork = network
-                    Log.d(TAG, "Underlying network became usable: $network")
+                    if (isRunning && !networkTrigger) {
+                        Log.d(TAG, "Underlying network switched: $previous -> $network; restarting tunnel")
+                        restartAfterNetworkChange()
+                    }
                 }
             }
 
             override fun onLost(network: Network) {
-                if (instance !== this@AivpnService || manualDisconnect) return
-                Log.d(TAG, "Underlying network lost: $network")
-
-                // Only the loss of the network the tunnel actually RIDES may
-                // trigger a restart. onLost also fires for secondary networks
-                // (standby SIM, a passing Wi-Fi) whose loss doesn't touch the
-                // carrier — reacting to those restarted the tunnel every time a
-                // secondary dropped: the same ping-pong the onAvailable guard
-                // fixed (82aee70), which onLost never got.
-                if (network != currentUnderlyingNetwork) return
-
-                currentUnderlyingNetwork = findUsableUnderlyingNetwork(cm)
-
-                val replacement = currentUnderlyingNetwork
-                val hasUsableDefault = replacement?.let { net ->
-                    val caps = cm.getNetworkCapabilities(net)
-                    caps != null && isUsableUnderlyingNetwork(caps)
-                } == true
-
-                // Потеря выбранной сети требует нового сокета даже сразу после подключения.
-                // Период стабилизации относится к появлению дополнительных сетей, а не к обрыву.
-                if (isRunning && sessionEstablished && !networkTrigger) {
-                    lastNetworkEventAtMs = SystemClock.elapsedRealtime()
-                    Log.d(TAG, "Underlying network lost; reconnecting via $replacement (available=$hasUsableDefault)")
-                    restartAfterNetworkChange()
+                synchronized(networkChangeLock) {
+                    if (instance !== this@AivpnService || manualDisconnect || networkCallback !== this) return
+                    knownCapabilities.remove(network)
+                    Log.d(TAG, "Underlying network lost: $network")
+                    if (network != currentUnderlyingNetwork && network != transportUnderlyingNetwork) return
+                    currentUnderlyingNetwork = findUsableUnderlyingNetwork(cm)
+                    // Потеря сети прерывает также DNS и незавершенный handshake.
+                    if (isRunning && !networkTrigger) {
+                        Log.d(TAG, "Underlying network lost; reconnecting via $currentUnderlyingNetwork")
+                        restartAfterNetworkChange()
+                    }
                 }
             }
         }
 
+        networkCallback = callback
         try {
             val request = NetworkRequest.Builder()
                 .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
                 .addCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)
                 .build()
+            // onAvailable еще не гарантирует актуальные capabilities. Решение
+            // принимается в следующем onCapabilitiesChanged с данными события.
             cm.registerNetworkCallback(request, callback)
-            networkCallback = callback
         } catch (e: Exception) {
+            networkCallback = null
             Log.e(TAG, "Failed to register NetworkCallback: ${e.message}", e)
         }
     }
@@ -1435,14 +1364,18 @@ class AivpnService : VpnService() {
     }
 
     private fun unregisterNetworkCallback() {
-        networkCallback?.let {
-            try {
-                (getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager)
-                    .unregisterNetworkCallback(it)
-            } catch (e: Exception) { Log.w(TAG, "Failed to unregister network callback: ${e.message}") }
+        val callback = synchronized(networkChangeLock) {
+            val previous = networkCallback
             networkCallback = null
+            currentUnderlyingNetwork = null
+            transportUnderlyingNetwork = null
+            previous
         }
-        currentUnderlyingNetwork = null
+        callback?.let {
+            try {
+                getSystemService(ConnectivityManager::class.java).unregisterNetworkCallback(it)
+            } catch (e: Exception) { Log.w(TAG, "Failed to unregister network callback: ${e.message}") }
+        }
     }
 
     // ──────────── Stop ────────────
@@ -1658,15 +1591,23 @@ class AivpnService : VpnService() {
         }
     }
 
-    /** JNI использует DNS физической сети, даже когда полный маршрут уже направлен в VPN. */
+    /** Защищает сокет и закрепляет его за сетью текущей попытки до connect(). */
+    @Suppress("unused")
+    fun protectTransportSocket(fd: Int): Boolean {
+        if (instance !== this || manualDisconnect || !isServiceActive || !protect(fd)) return false
+        val network = transportUnderlyingNetwork ?: return false
+        return try {
+            ParcelFileDescriptor.fromFd(fd).use { network.bindSocket(it.fileDescriptor) }
+            true
+        } catch (e: Exception) {
+            Log.w(TAG, "Socket binding to underlying network $network failed: ${e.message}")
+            false
+        }
+    }
+
+    /** DNS использует ту же физическую сеть, что и защищенные сокеты. */
     fun resolveTransportHost(host: String): Array<String> {
-        val cm = getSystemService(ConnectivityManager::class.java)
-        fun physical(network: Network): Boolean = cm.getNetworkCapabilities(network)?.let {
-            it.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN) &&
-                it.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
-        } ?: false
-        val network = currentUnderlyingNetwork?.takeIf(::physical)
-            ?: cm.allNetworks.firstOrNull(::physical)
+        val network = transportUnderlyingNetwork
             ?: throw java.net.UnknownHostException("Физическая сеть недоступна")
         return network.getAllByName(host).mapNotNull { it.hostAddress }.toTypedArray()
     }
@@ -1703,10 +1644,11 @@ class AivpnService : VpnService() {
         val tunMtu = TunnelMtu.effective(savedVpnMtu, isAdaptiveEnabled(), savedIpv6 != null)
         val tunAddress4 = savedVpnIp ?: "10.0.0.2"
         val tunPrefixLen = savedVpnPrefixLen.coerceIn(1, 30)
-        val excludedIPs = resolveDomainExclusions()
+        val splitEnabled = SecureStorage.loadSplitEnabled(this)
+        val excludedIPs = if (splitEnabled) resolveDomainExclusions() else emptyList()
         currentCoroutineContext().ensureActive()
         val excludedNames = excludedIPs.map { it.hostAddress ?: "" }.toSet()
-        val allowedApps = SecureStorage.loadAllowedApps(this).toSet()
+        val allowedApps = if (splitEnabled) SecureStorage.loadAllowedApps(this).toSet() else emptySet()
         synchronized(tunLock) {
             if (manualDisconnect || !isServiceActive || instance !== this) {
                 throw CancellationException("Настройка завершенного VPN отменена")
@@ -1758,6 +1700,7 @@ class AivpnService : VpnService() {
                     .addAddress(tunAddress4, tunPrefixLen)
                     .setMtu(tunMtu)
                     .setBlocking(false)
+                transportUnderlyingNetwork?.let { b.setUnderlyingNetworks(arrayOf(it)) }
                 if (includeIpv6) {
                     b.addAddress(requireNotNull(savedIpv6), savedIpv6Prefix)
                 }
@@ -1835,10 +1778,20 @@ class AivpnService : VpnService() {
      * Block until at least one non-VPN network with internet capability exists.
      * This prevents wasting time on DNS lookups / handshakes when there's no connectivity.
      */
-    private suspend fun waitForConnectivity() {
+    private suspend fun waitForConnectivity(): Network {
         val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
         while (currentCoroutineContext().isActive) {
-            if (findUsableUnderlyingNetwork(cm) != null) return
+            synchronized(networkChangeLock) {
+                val network = currentUnderlyingNetwork?.takeIf {
+                    cm.getNetworkCapabilities(it)?.let(::isUsableUnderlyingNetwork) == true
+                } ?: findUsableUnderlyingNetwork(cm)
+                if (network != null) {
+                    currentUnderlyingNetwork = network
+                    transportUnderlyingNetwork = network
+                    isRunning = true
+                    return network
+                }
+            }
             delay(300L)
         }
         throw CancellationException("Cancelled while waiting for network")
@@ -1848,11 +1801,20 @@ class AivpnService : VpnService() {
         fun usable(network: Network): Boolean =
             cm.getNetworkCapabilities(network)?.let(::isUsableUnderlyingNetwork) == true
         cm.activeNetwork?.takeIf(::usable)?.let { return it }
-        val networks = cm.allNetworks.filter(::usable)
-        return networks.firstOrNull { network ->
-            cm.getNetworkCapabilities(network)
-                ?.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED) == true
-        } ?: networks.firstOrNull()
+        val networks = cm.allNetworks.mapNotNull { network ->
+            cm.getNetworkCapabilities(network)?.takeIf(::isUsableUnderlyingNetwork)?.let { network to it }
+        }
+        // При активном VPN activeNetwork указывает на него. Порядок allNetworks
+        // не задает приоритет: иначе новая попытка случайно выбирает SIM вместо Wi-Fi.
+        return networks.sortedWith(
+            compareByDescending<Pair<Network, NetworkCapabilities>> {
+                it.second.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
+            }.thenByDescending {
+                it.second.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET)
+            }.thenByDescending {
+                it.second.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)
+            }
+        ).firstOrNull()?.first
     }
 
     private fun isUsableUnderlyingNetwork(caps: NetworkCapabilities): Boolean {

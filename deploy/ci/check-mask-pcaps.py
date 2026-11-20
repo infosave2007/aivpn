@@ -329,7 +329,8 @@ def main():
             name = f"{mask['mask_id']}-init{a}-hello{b}-rtt{rtt}-dup{duplicate}.pcap"
             assert (captures / name).is_file(), (mask["mask_id"], "Нет сценария", name)
         for path in paths:
-            if path.stem.endswith("-switch"):
+            # Захват смены маски содержит кадры двух протоколов.
+            if path.stem.endswith("-switch") or "-switch-to-" in path.stem:
                 continue
             check(path, expected, str(ndpi))
             checked += 1

@@ -161,6 +161,12 @@ pub struct Session {
     /// Pending mask awaiting grace period before activation.
     /// Stored as (new_mask, timestamp_when_MaskUpdate_was_sent).
     pub pending_mask: Option<(MaskProfile, Instant)>,
+    /// Подтвержденное поколение и единственное незавершенное обновление.
+    pub mask_revision: u64,
+    pub mask_receipt: Option<aivpn_common::mask_transition::MaskReceipt>,
+    pub(crate) legacy_mask_changed: bool,
+    pending_mask_exchange: Option<PendingMaskExchange>,
+    next_mask_generation: u64,
     /// Current FSM state
     pub fsm_state: u16,
     /// Packets in current FSM state
@@ -289,6 +295,8 @@ pub struct Session {
     /// Допуск клиента к адресу после PFS и обязательных доказательств личности.
     pub client_admitted: bool,
     pub diagnostic_budget: aivpn_common::diagnostics::DiagnosticBudget,
+    pub diagnostic_data_budget: aivpn_common::diagnostics::DiagnosticBudget,
+    pub diagnostic_state: Option<aivpn_common::diagnostics::data::ServerState>,
 
     /// Повтор запроса proof/cert ограничен одной отправкой в секунду.
     pub authentication_retry_at: Option<Instant>,
@@ -626,6 +634,11 @@ impl Session {
             last_server_send: now,
             mask: None,
             pending_mask: None,
+            mask_receipt: None,
+            mask_revision: 0,
+            legacy_mask_changed: false,
+            pending_mask_exchange: None,
+            next_mask_generation: 1,
             fsm_state: 0,
             fsm_packets: 0,
             fsm_state_start: now,
@@ -667,6 +680,8 @@ impl Session {
             bootstrap_descriptors_sent: false,
             client_admitted: false,
             diagnostic_budget: Default::default(),
+            diagnostic_data_budget: aivpn_common::diagnostics::DiagnosticBudget::for_data(),
+            diagnostic_state: None,
             authentication_retry_at: None,
             pending_rekey_keypair: None,
             pending_rekey_attempts: 0,
@@ -1207,6 +1222,9 @@ impl Session {
     /// Returns true if a mask was committed.
     /// Grace period = 500ms — enough for the MaskUpdate packet to reach the client.
     pub fn commit_pending_mask(&mut self) -> bool {
+        if self.reliable_mask_updates() {
+            return false;
+        }
         const MASK_GRACE_PERIOD: Duration = Duration::from_millis(500);
         if let Some((_, sent_at)) = &self.pending_mask {
             if sent_at.elapsed() >= MASK_GRACE_PERIOD {
@@ -1218,6 +1236,9 @@ impl Session {
 
     /// AEAD-пакет в новом внешнем протоколе подтверждает доставку MaskUpdate.
     pub fn confirm_mask_protocol(&mut self, stateful: bool) -> bool {
+        if self.reliable_mask_updates() {
+            return false;
+        }
         let current = self
             .mask
             .as_ref()
@@ -1233,18 +1254,91 @@ impl Session {
         }
     }
 
+    pub fn reliable_mask_updates(&self) -> bool {
+        self.client_packet_features
+            .is_some_and(|features| features & aivpn_common::mask_transition::FEATURE != 0)
+    }
+
+    pub(crate) fn mask_update_expired(&self, now: Instant) -> bool {
+        self.pending_mask_exchange.is_some()
+            && self.pending_mask.as_ref().is_some_and(|(_, started)| {
+                now.saturating_duration_since(*started) >= Duration::from_secs(60)
+            })
+    }
+
+    pub(crate) fn has_active_or_pending_userspace_mask(&self) -> bool {
+        self.mask
+            .as_ref()
+            .into_iter()
+            .chain(self.pending_mask.as_ref().map(|(mask, _)| mask))
+            .any(aivpn_common::mask_io::requires_userspace)
+    }
+
+    pub(crate) fn has_active_or_pending_rtc_mask(&self) -> bool {
+        self.mask
+            .as_ref()
+            .into_iter()
+            .chain(self.pending_mask.as_ref().map(|(mask, _)| mask))
+            .any(aivpn_common::mask_io::uses_rtc)
+    }
+
+    pub(crate) fn rtc_offer_mask(&self, id: &str, version: u16) -> Option<&MaskProfile> {
+        self.pending_mask
+            .as_ref()
+            .map(|(mask, _)| mask)
+            .into_iter()
+            .chain(self.mask.as_ref())
+            .find(|mask| {
+                aivpn_common::mask_io::uses_rtc(mask)
+                    && mask.mask_id == id
+                    && mask.version == version
+            })
+    }
+
+    pub fn confirm_mask_receipt(
+        &mut self,
+        receipt: aivpn_common::mask_transition::MaskReceipt,
+    ) -> bool {
+        if self.mask_receipt == Some(receipt) {
+            return true;
+        }
+        if !self
+            .pending_mask_exchange
+            .as_ref()
+            .is_some_and(|pending| pending.receipt == receipt)
+        {
+            return false;
+        }
+        if !self.activate_pending_mask() {
+            return false;
+        }
+        self.mask_receipt = Some(receipt);
+        self.legacy_mask_changed = false;
+        self.pending_mask_exchange = None;
+        true
+    }
+
     fn activate_pending_mask(&mut self) -> bool {
         let Some((new_mask, _)) = self.pending_mask.take() else {
             return false;
         };
         info!("Committing deferred mask switch to '{}'", new_mask.mask_id);
+        self.legacy_mask_changed = self.pending_mask_exchange.is_none();
         self.mask = Some(new_mask);
+        self.mask_revision = self.mask_revision.saturating_add(1);
         self.rebuild_mdh_pool();
         self.fsm_state = 0;
         self.fsm_packets = 0;
         self.fsm_state_start = Instant::now();
         true
     }
+}
+
+struct PendingMaskExchange {
+    receipt: aivpn_common::mask_transition::MaskReceipt,
+    kind: InnerType,
+    pieces: Vec<Vec<u8>>,
+    retry_at: Instant,
 }
 
 #[derive(Clone, Copy)]
@@ -1463,7 +1557,10 @@ impl SessionManager {
             for entry in self.sessions.iter() {
                 let session = entry.value().lock();
                 if session.client_id.as_deref() == Some(client_id) {
-                    if !session.is_ratcheted && !session.client_admitted {
+                    // PFS еще не означает допуск: отмененный клиент мог не успеть
+                    // отправить proof. Новый handshake с проверенным PSK заменяет
+                    // такую попытку, сохраняя прежний допущенный сеанс.
+                    if !session.client_admitted {
                         abandoned.push((session.session_id, session.client_addr.ip()));
                     } else {
                         if previous.is_some() {
@@ -2407,8 +2504,11 @@ impl SessionManager {
                         .unwrap_or("default"),
                     new_mask.mask_id
                 );
-                // Don't switch immediately — store as pending
-                sess.pending_mask = Some((new_mask, Instant::now()));
+                // Надежный обмен подготовлен до отправки: быстрый receipt уже
+                // мог завершить его, поэтому здесь нельзя откатывать состояние.
+                if !sess.reliable_mask_updates() {
+                    sess.pending_mask = Some((new_mask, Instant::now()));
+                }
                 sess.state = SessionState::Active;
                 client_addr = sess.client_addr;
             }
@@ -2451,9 +2551,28 @@ impl SessionManager {
         let mask_data =
             rmp_serde::to_vec(new_mask).map_err(|error| Error::Session(error.to_string()))?;
         let signature = self.sign_mask(&mask_data);
-        let encoded = ControlPayload::MaskUpdate {
-            mask_data,
-            signature,
+        let mut sess = session.lock();
+        let reliable = sess.reliable_mask_updates();
+        if reliable && sess.pending_mask_exchange.is_some() {
+            return Err(Error::Session(
+                "Смена маски уже ожидает подтверждения".into(),
+            ));
+        }
+        let receipt = aivpn_common::mask_transition::MaskReceipt::for_payload(
+            sess.next_mask_generation,
+            &mask_data,
+        );
+        let encoded = if reliable {
+            ControlPayload::MaskUpdateV2 {
+                generation: receipt.generation,
+                mask_data,
+                signature,
+            }
+        } else {
+            ControlPayload::MaskUpdate {
+                mask_data,
+                signature,
+            }
         }
         .encode()?;
         let (kind, pieces) = if encoded.len() > aivpn_common::fragment::FRAGMENT_DATA_SIZE {
@@ -2464,7 +2583,19 @@ impl SessionManager {
         } else {
             (InnerType::Control, vec![encoded])
         };
-        let mut sess = session.lock();
+        if reliable {
+            sess.next_mask_generation = sess
+                .next_mask_generation
+                .checked_add(1)
+                .ok_or_else(|| Error::Session("Исчерпаны поколения масок".into()))?;
+            sess.pending_mask = Some((new_mask.clone(), Instant::now()));
+            sess.pending_mask_exchange = Some(PendingMaskExchange {
+                receipt,
+                kind,
+                pieces: pieces.clone(),
+                retry_at: Instant::now() + Duration::from_secs(1),
+            });
+        }
         let stateful =
             aivpn_common::mask_io::needs_state(sess.mask.as_ref().unwrap_or(&self.default_mask));
         let packets = pieces
@@ -2472,6 +2603,31 @@ impl SessionManager {
             .map(|piece| self.encrypt_mask_update_piece(&mut sess, piece, kind))
             .collect::<Result<Vec<_>>>()?;
         Ok((packets, stateful))
+    }
+
+    /// Повторы используют тот же id сборки, но новые AEAD nonce из общей сессии.
+    pub(crate) fn retry_mask_update(
+        &self,
+        session: &Arc<Mutex<Session>>,
+        now: Instant,
+    ) -> Result<Option<((Vec<Vec<u8>>, bool), SocketAddr)>> {
+        let mut sess = session.lock();
+        let Some(pending) = sess.pending_mask_exchange.as_mut() else {
+            return Ok(None);
+        };
+        if now < pending.retry_at {
+            return Ok(None);
+        }
+        pending.retry_at = now + Duration::from_secs(1);
+        let kind = pending.kind;
+        let pieces = pending.pieces.clone();
+        let stateful =
+            aivpn_common::mask_io::needs_state(sess.mask.as_ref().unwrap_or(&self.default_mask));
+        let packets = pieces
+            .iter()
+            .map(|piece| self.encrypt_mask_update_piece(&mut sess, piece, kind))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Some(((packets, stateful), sess.client_addr)))
     }
 
     fn encrypt_mask_update_piece(
@@ -3333,6 +3489,35 @@ mod tests {
         manager.bind_vpn_ip(&vip, &live_id);
         let abandoned = pending_authenticated_client(&manager, 2000);
         let abandoned_id = abandoned.lock().session_id;
+        let replacement = pending_authenticated_client(&manager, 3000);
+        assert_eq!(manager.session_count(), 2);
+        assert!(manager.get_session(&abandoned_id).is_none());
+        assert!(abandoned.lock().is_removed());
+        assert!(!replacement.lock().is_removed());
+        assert_eq!(
+            manager
+                .get_session_by_vpn_ip(&vip)
+                .unwrap()
+                .lock()
+                .session_id,
+            live_id
+        );
+    }
+
+    #[test]
+    fn ratcheted_unadmitted_replacement_does_not_block_the_next_handshake() {
+        let manager = make_manager();
+        let live = pending_authenticated_client(&manager, 1000);
+        let live_id = live.lock().session_id;
+        manager.complete_session_ratchet(&live_id);
+        live.lock().client_admitted = true;
+        let vip = "10.0.0.8".parse().unwrap();
+        manager.bind_vpn_ip(&vip, &live_id);
+
+        let abandoned = pending_authenticated_client(&manager, 2000);
+        let abandoned_id = abandoned.lock().session_id;
+        manager.complete_session_ratchet(&abandoned_id);
+        assert!(!abandoned.lock().client_admitted);
         let replacement = pending_authenticated_client(&manager, 3000);
         assert_eq!(manager.session_count(), 2);
         assert!(manager.get_session(&abandoned_id).is_none());
@@ -4553,5 +4738,33 @@ mod tests {
             ca_signature: [0; 64],
         });
         assert!(!session.refresh_mtls_gate(true));
+    }
+
+    #[test]
+    fn pending_transport_survives_plain_control_until_receipt_or_legacy_commit() {
+        let mut session = make_session();
+        session.mask = Some(aivpn_common::mask::preset_masks::webrtc_vk_teams_v1());
+        assert!(!session.has_active_or_pending_userspace_mask());
+        for mask in [
+            aivpn_common::mask::preset_masks::quic_https_v2(),
+            aivpn_common::mask::preset_masks::webrtc_yandex_telemost_v1(),
+        ] {
+            let rtc = aivpn_common::mask_io::uses_rtc(&mask);
+            session.pending_mask = Some((mask, Instant::now()));
+            assert!(session.has_active_or_pending_userspace_mask());
+            assert_eq!(session.has_active_or_pending_rtc_mask(), rtc);
+        }
+        session.pending_mask = None;
+        assert!(!session.has_active_or_pending_userspace_mask());
+    }
+
+    #[test]
+    fn reliable_mask_update_cannot_commit_on_elapsed_time_or_protocol_class() {
+        let mut session = make_session();
+        session.client_packet_features = Some((1 << 31) | (1 << 29));
+        let mask = aivpn_common::mask::preset_masks::quic_https_v2();
+        session.pending_mask = Some((mask, Instant::now() - Duration::from_secs(2)));
+        assert!(!session.commit_pending_mask());
+        assert!(session.pending_mask.is_some());
     }
 }

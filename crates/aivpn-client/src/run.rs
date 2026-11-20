@@ -21,7 +21,9 @@ use aivpn_common::mask::preset_masks;
 #[cfg(not(feature = "production-secure"))]
 use aivpn_common::mask::preset_masks::bootstrap_default;
 use aivpn_common::mask::BootstrapDescriptor;
-use aivpn_common::network_config::{ClientNetworkConfig, DEFAULT_VPN_MTU, LEGACY_SERVER_VPN_IP};
+use aivpn_common::network_config::ClientNetworkConfig;
+#[cfg(test)]
+use aivpn_common::network_config::DEFAULT_VPN_MTU;
 use aivpn_common::quality::AdaptiveLevel;
 use base64::Engine;
 use clap::Parser;
@@ -32,30 +34,20 @@ use std::sync::Arc;
 use std::time::Duration;
 use tracing::{error, info, warn};
 
+#[cfg(target_os = "windows")]
+#[path = "panic_report.rs"]
+mod panic_report;
+
 /// §2 L3 - minimum server-reported success score for a regional hint to be
 /// allowed to bias initial mask selection. Below this the bootstrap-selected
 /// mask is kept, so a weak/noisy hint never displaces the default choice.
 const HINT_BIAS_MIN_SCORE: f32 = 0.5;
 
-/// Initial reconnect backoff, also the value a healthy session resets to.
-const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
-/// Upper bound on the reconnect backoff.
-const MAX_BACKOFF: Duration = Duration::from_secs(60);
-/// A session that stayed connected at least this long is considered healthy;
-/// its reconnect backoff resets to `INITIAL_BACKOFF` instead of continuing to
-/// grow. The threshold comfortably exceeds normal handshake time so that only
-/// genuinely established sessions (well past connect) trigger a reset.
-const HEALTHY_CONNECTION_THRESHOLD: Duration = Duration::from_secs(30);
-
-async fn wait_reconnect_backoff(backoff: Duration, shutdown: &AtomicBool) {
-    let deadline = tokio::time::Instant::now() + backoff;
-    while !shutdown.load(Ordering::SeqCst) && tokio::time::Instant::now() < deadline {
-        tokio::time::sleep_until(
-            deadline.min(tokio::time::Instant::now() + Duration::from_millis(100)),
-        )
-        .await;
-    }
-}
+#[cfg(test)]
+use aivpn_client::reconnect::HEALTHY_CONNECTION_THRESHOLD;
+use aivpn_client::reconnect::{
+    should_reset_backoff, wait_reconnect_backoff, INITIAL_BACKOFF, MAX_BACKOFF,
+};
 
 /// AIVPN Client - Censorship-resistant VPN client
 fn parse_preset_mask(value: &str) -> std::result::Result<String, String> {
@@ -115,6 +107,10 @@ pub struct ClientArgs {
     /// Route all traffic through VPN tunnel
     #[arg(long, default_value_t = false)]
     pub full_tunnel: bool,
+
+    /// Применять сохраненные split-маршруты; false включает полный туннель.
+    #[arg(long, env = "AIVPN_SPLIT_ENABLED", num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set)]
+    pub split_enabled: Option<bool>,
 
     /// Config file path (JSON)
     #[arg(long)]
@@ -239,6 +235,13 @@ pub struct ClientArgs {
 
 #[derive(clap::Subcommand, Debug)]
 pub enum ClientCommand {
+    /// Локальная служба split по приложениям. Аргументы передаются без shell.
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[command(disable_help_flag = true)]
+    App {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        arguments: Vec<std::ffi::OsString>,
+    },
     /// Recording CLI commands
     Record {
         #[command(subcommand)]
@@ -362,6 +365,7 @@ pub enum RecordAction {
 }
 
 // Global shutdown flag
+#[cfg(feature = "cli-runtime")]
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -377,12 +381,61 @@ struct ClientFileConfig {
     tun_name: Option<String>,
     tun_addr: Option<String>,
     full_tunnel: Option<bool>,
+    split_enabled: Option<bool>,
     network_config: Option<ClientNetworkConfig>,
     bootstrap_descriptor_urls: Option<Vec<String>>,
     bootstrap_descriptors: Option<Vec<BootstrapDescriptor>>,
     include_routes: Option<Vec<String>>,
     exclude_routes: Option<Vec<String>>,
     kill_switch: Option<bool>,
+}
+
+fn configured_split_enabled(args: &ClientArgs, config: Option<&ClientFileConfig>) -> bool {
+    args.split_enabled
+        .or_else(|| config.and_then(|config| config.split_enabled))
+        .unwrap_or(true)
+}
+
+fn apply_split_routes(
+    tunnel: &mut TunnelConfig,
+    args: &ClientArgs,
+    file_config: Option<&ClientFileConfig>,
+) {
+    if !configured_split_enabled(args, file_config) {
+        tunnel.full_tunnel = true;
+        tunnel.include_routes.clear();
+        tunnel.exclude_routes.clear();
+        return;
+    }
+    let mut include_routes: Vec<String> = if !args.include_routes.is_empty() {
+        args.include_routes.clone()
+    } else {
+        file_config
+            .and_then(|c| c.include_routes.clone())
+            .unwrap_or_default()
+    };
+    // DNS-прокси использует отдельный системный сокет. Маршрут к резолверу
+    // направляет его в VPN даже при включенном split без полного туннеля.
+    if args.dns_proxy.is_some() {
+        if let Ok(upstream) = args.dns_upstream.parse::<std::net::SocketAddr>() {
+            let cidr = match upstream.ip() {
+                std::net::IpAddr::V4(ip) => format!("{ip}/32"),
+                std::net::IpAddr::V6(ip) => format!("{ip}/128"),
+            };
+            if !include_routes.iter().any(|r| r == &cidr) {
+                include_routes.push(cidr);
+            }
+        }
+    }
+    let exclude_routes: Vec<String> = if !args.exclude_routes.is_empty() {
+        args.exclude_routes.clone()
+    } else {
+        file_config
+            .and_then(|c| c.exclude_routes.clone())
+            .unwrap_or_default()
+    };
+    tunnel.include_routes = include_routes;
+    tunnel.exclude_routes = exclude_routes;
 }
 
 fn load_client_file_config(path: Option<&str>) -> Result<Option<ClientFileConfig>, String> {
@@ -411,11 +464,7 @@ fn decode_base64_key(label: &str, encoded: &str) -> [u8; 32] {
 // In development mode, derive a deterministic bootstrap mask from the PSK when no cached descriptors are available.
 #[cfg(not(feature = "production-secure"))]
 fn bootstrap_mask_for_psk(psk: &[u8; 32]) -> aivpn_common::mask::MaskProfile {
-    use blake3;
-    let presets = preset_masks::all();
-    let hash = blake3::derive_key("aivpn-bootstrap-mask-v1", psk);
-    let idx = hash[0] as usize % presets.len();
-    presets[idx].clone()
+    preset_masks::bootstrap_for_psk(Some(psk))
 }
 
 /// Режим проверки масок.
@@ -487,10 +536,42 @@ pub async fn run(
     extra: Vec<std::sync::Arc<dyn aivpn_common::transport::TransportFactory>>,
     guard: aivpn_common::transport::SharedGuard,
 ) {
-    // Собирается один раз на процесс: реестр неизменен после старта, а каждая
-    // итерация переподключения получает тот же Arc.
+    run_with_args(extra, guard, std::env::args_os().collect()).await;
+}
+
+/// Явные аргументы позволяют одному образу обслуживать CLI и GUI без изменения окружения.
+pub async fn run_with_args(
+    extra: Vec<std::sync::Arc<dyn aivpn_common::transport::TransportFactory>>,
+    guard: aivpn_common::transport::SharedGuard,
+    arguments: Vec<std::ffi::OsString>,
+) {
+    run_with_context(extra, guard, arguments, RunContext::default()).await;
+}
+
+#[derive(Default)]
+pub struct RunContext {
+    pub shutdown: Option<Arc<AtomicBool>>,
+    pub retain_firewall: Option<Arc<AtomicBool>>,
+    pub mtls_certificate: Option<Vec<u8>>,
+}
+
+/// Контекст внутреннего headless запуска не меняет публичный run API.
+pub async fn run_with_context(
+    extra: Vec<std::sync::Arc<dyn aivpn_common::transport::TransportFactory>>,
+    guard: aivpn_common::transport::SharedGuard,
+    arguments: Vec<std::ffi::OsString>,
+    context: RunContext,
+) {
+    #[cfg(target_os = "linux")]
+    let guard = match crate::network_session::delegated_guard(guard) {
+        Ok(guard) => guard,
+        Err(error) => {
+            eprintln!("Не удалось подготовить защиту транспорта: {error}");
+            std::process::exit(1);
+        }
+    };
     let registry = std::sync::Arc::new(transport_registry(extra));
-    let mut args = ClientArgs::parse();
+    let mut args = ClientArgs::parse_from(&arguments);
 
     // On Windows, stderr inheritance via Stdio::from(File) is unreliable for
     // cross-compiled (MinGW) binaries with CREATE_NO_WINDOW. Write the log
@@ -498,30 +579,8 @@ pub async fn run(
     #[cfg(target_os = "windows")]
     let _log_guard = {
         let admin_addr = args.admin_listen;
-        let args: Vec<String> = std::env::args().collect();
-        // Only write to the persistent log file for the main VPN connection mode.
-        // Subcommands (record, kill-switch, bench, mgmt, role, ssh-install) are
-        // short-lived one-off CLI invocations that must not truncate the VPN
-        // connection log. Must match the real `ClientCommand` variants exactly:
-        // `Record`("record"),
-        // `KillSwitch`("kill-switch" — clap's `#[command(name = "kill-switch")]`),
-        // `Bench`("bench"), `Mgmt`("mgmt"), `Role`("role"),
-        // `SshInstall`("ssh-install"). The P2.3-desktop bridge commands matter
-        // most here: the Windows GUI shells out `aivpn-client.exe mgmt ...`
-        // repeatedly WHILE the VPN daemon is running — before they were listed,
-        // every such call fell into the main-mode branch below and truncated
-        // %LOCALAPPDATA%\AIVPN\client.log mid-session. There is no top-level "status"/"key" subcommand, so
-        // those never matched anything; "kill-switch" was missing entirely,
-        // which meant e.g. `aivpn-client.exe kill-switch clear` — a genuine
-        // one-off admin action — fell through to the main-mode branch below and
-        // truncated %LOCALAPPDATA%\AIVPN\client.log, destroying diagnostic
-        // history from the last real VPN session.
-        let is_subcommand = args.iter().skip(1).any(|a| {
-            matches!(
-                a.as_str(),
-                "record" | "kill-switch" | "bench" | "mgmt" | "role" | "ssh-install"
-            )
-        });
+        // Решение берет уже разобранную команду, чтобы новый CLI не стирал журнал VPN.
+        let is_subcommand = args.command.is_some();
 
         let log_path = if is_subcommand {
             None
@@ -537,16 +596,22 @@ pub async fn run(
             })
         };
 
-        if let Some(ref path) = log_path {
-            let _ = std::fs::create_dir_all(path.parent().unwrap());
+        let mut log_file = log_path
+            .as_ref()
+            .and_then(|path| crate::windows_log::open(path).ok());
+        if let Some(file) = log_file.as_mut() {
+            let raw_arguments: Vec<String> = arguments
+                .iter()
+                .map(|value| value.to_string_lossy().into_owned())
+                .collect();
             // Redact the connection key before logging: the value of
             // --connection-key/-k (or any bare aivpn:// token) embeds the PSK
             // and server keys — a reusable secret that must never land in a
             // persistent plaintext log.
             let redacted_args: Vec<String> = {
-                let mut out = Vec::with_capacity(args.len());
+                let mut out = Vec::with_capacity(raw_arguments.len());
                 let mut redact_next = false;
-                for a in &args {
+                for a in &raw_arguments {
                     if redact_next {
                         redact_next = false;
                         out.push("<redacted>".to_string());
@@ -566,28 +631,23 @@ pub async fn run(
                 out
             };
             // Truncate and write startup header so each connect starts fresh.
-            let _ = std::fs::write(
-                path,
+            let _ = std::io::Write::write_all(
+                file,
                 format!(
                     "=== aivpn-client started ===\nargs: {:?}\nfull_tunnel: {}\n",
-                    redacted_args,
-                    args.contains(&"--full-tunnel".to_string())
-                ),
+                    redacted_args, args.full_tunnel
+                )
+                .as_bytes(),
             );
         }
 
         let filter = tracing_subscriber::EnvFilter::try_from_default_env()
             .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
 
-        let file = log_path.as_ref().and_then(|p| {
-            std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(p)
-                .ok()
-        });
-
-        if let Some(f) = file {
+        if let Some(f) = log_file {
+            if let Ok(panic_file) = f.try_clone() {
+                panic_report::install(panic_file);
+            }
             tracing_subscriber::fmt()
                 .with_env_filter(filter)
                 .with_writer(std::sync::Mutex::new(f))
@@ -645,21 +705,35 @@ pub async fn run(
     }
 
     // Setup Ctrl+C handler in a separate task
-    let shutdown = Arc::new(AtomicBool::new(false));
+    #[cfg(feature = "cli-runtime")]
+    let managed_shutdown = context.shutdown.is_some();
+    let retain_firewall = context
+        .retain_firewall
+        .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
+    let shutdown = context
+        .shutdown
+        .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
+    #[cfg(feature = "cli-runtime")]
     let shutdown_clone = shutdown.clone();
-    tokio::spawn(async move {
-        match tokio::signal::ctrl_c().await {
-            Ok(()) => {}
-            Err(e) => warn!("Ctrl+C handler error: {e}"),
-        }
-        info!("Received Ctrl+C, shutting down...");
-        shutdown_clone.store(true, Ordering::SeqCst);
-        SHUTDOWN.store(true, Ordering::SeqCst);
-    });
+    #[cfg(feature = "cli-runtime")]
+    if !managed_shutdown {
+        tokio::spawn(async move {
+            match tokio::signal::ctrl_c().await {
+                Ok(()) => {}
+                Err(e) => {
+                    warn!("Ctrl+C handler error: {e}");
+                    return;
+                }
+            }
+            info!("Received Ctrl+C, shutting down...");
+            shutdown_clone.store(true, Ordering::SeqCst);
+            SHUTDOWN.store(true, Ordering::SeqCst);
+        });
+    }
 
     // Handle SIGTERM (sent by systemd, docker stop, kill) so the tunnel routes
     // and kill-switch firewall rules are cleaned up on graceful service stop.
-    #[cfg(unix)]
+    #[cfg(all(unix, feature = "cli-runtime"))]
     {
         let shutdown_sigterm = shutdown.clone();
         tokio::spawn(async move {
@@ -690,6 +764,27 @@ pub async fn run(
     // Handle subcommands
     if let Some(command) = args.command {
         match command {
+            #[cfg(any(target_os = "linux", target_os = "windows"))]
+            ClientCommand::App { arguments } => {
+                #[cfg(feature = "desktop-service")]
+                {
+                    let args = std::iter::once(std::ffi::OsString::from("aivpn app-routing"))
+                        .chain(arguments.into_iter().map(std::ffi::OsString::from))
+                        .collect();
+                    let code = aivpn_desktop_agent::app_control::run_from(args);
+                    if code != std::process::ExitCode::SUCCESS {
+                        std::process::exit(1);
+                    }
+                    return;
+                }
+                #[cfg(not(feature = "desktop-service"))]
+                {
+                    let _ = arguments;
+                    eprintln!("Split по приложениям не включен в эту сборку");
+                    std::process::exit(69);
+                }
+            }
+
             ClientCommand::KillSwitch { action } => match action {
                 KillSwitchAction::Clear => {
                     if let Err(error) = aivpn_client::kill_switch::KillSwitch::clear_for_operator()
@@ -733,6 +828,12 @@ pub async fn run(
                     println!("Packet loss: {:.1}%", result.packet_loss_pct);
                     println!("Upload:      {:.0} kbps", result.throughput_up_kbps);
                     println!("Download:    {:.0} kbps", result.throughput_down_kbps);
+                    if result.throughput_limited
+                        || result.throughput_method
+                            != aivpn_common::diagnostics::MeasurementMethod::Data
+                    {
+                        println!("Скорость ограничена методом теста; пропускная способность канала может быть выше.");
+                    }
                     println!(
                         "Quality:     {} ({})",
                         result.quality_score, result.quality_label
@@ -928,7 +1029,7 @@ pub async fn run(
         inline_descriptors,
         bootstrap_descriptor_urls,
         tun_name_fixed,
-        full_tunnel,
+        mut full_tunnel,
     ) = if let Some(ref conn_key) = args.connection_key {
         let payload = conn_key
             .trim()
@@ -969,16 +1070,7 @@ pub async fn run(
                 json["i"].as_str().and_then(|ip| {
                     ip.parse::<Ipv4Addr>()
                         .ok()
-                        .map(|client_ip| ClientNetworkConfig {
-                            client_ip,
-                            server_vpn_ip: LEGACY_SERVER_VPN_IP,
-                            prefix_len: 24,
-                            mtu: DEFAULT_VPN_MTU,
-                            mdh_len: 20,
-                            keepalive_secs: None,
-                            ipv6_address: None,
-                            ipv6_prefix_len: None,
-                        })
+                        .map(ClientNetworkConfig::from_legacy_address)
                 })
             })
             .unwrap_or_else(|| fallback_network_config(&args.tun_addr));
@@ -1074,6 +1166,11 @@ pub async fn run(
                     .unwrap_or(false),
         )
     };
+
+    let split_enabled = configured_split_enabled(&args, file_config.as_ref());
+    if !split_enabled {
+        full_tunnel = true;
+    }
 
     // Build server pool from optional "pool" array in the connection key.
     // Hostname endpoints are resolved here (async) via the system resolver —
@@ -1293,28 +1390,34 @@ pub async fn run(
         }
         addr
     });
-    let mtls_cert: Option<Vec<u8>> = args.mtls_cert.as_ref().map(|path| {
-        let raw = std::fs::read(path).unwrap_or_else(|e| {
-            error!("Cannot read --mtls-cert '{}': {}", path.display(), e);
-            std::process::exit(1);
-        });
-        // Accept raw 104-byte binary or base64-encoded text.
-        if raw.len() == 104 {
-            raw
-        } else {
-            let s = String::from_utf8_lossy(&raw);
-            use base64::Engine as _;
-            base64::engine::general_purpose::STANDARD
-                .decode(s.trim())
-                .unwrap_or_else(|e| {
-                    error!(
-                        "--mtls-cert is neither 104-byte binary nor valid base64: {}",
-                        e
-                    );
+    let mtls_cert: Option<Vec<u8>> = context
+        .mtls_certificate
+        .or_else(|| {
+            args.mtls_cert.as_ref().map(|path| {
+                std::fs::read(path).unwrap_or_else(|e| {
+                    error!("Cannot read --mtls-cert '{}': {}", path.display(), e);
                     std::process::exit(1);
                 })
-        }
-    });
+            })
+        })
+        .map(|raw| {
+            // Accept raw 104-byte binary or base64-encoded text.
+            if raw.len() == 104 {
+                raw
+            } else {
+                let s = String::from_utf8_lossy(&raw);
+                use base64::Engine as _;
+                base64::engine::general_purpose::STANDARD
+                    .decode(s.trim())
+                    .unwrap_or_else(|e| {
+                        error!(
+                            "--mtls-cert is neither 104-byte binary nor valid base64: {}",
+                            e
+                        );
+                        std::process::exit(1);
+                    })
+            }
+        });
     let mut backoff = INITIAL_BACKOFF;
     let max_backoff = MAX_BACKOFF;
 
@@ -1349,6 +1452,29 @@ pub async fn run(
     // server matches via its builtin candidate set. Reset on any real connect.
     const HANDSHAKE_FALLBACK_THRESHOLD: u32 = 3;
     let mut handshake_fail_streak: u32 = 0;
+    #[cfg(target_os = "linux")]
+    let _network_session = if (proxy_listen.is_none() || guard.routing_mark().is_some())
+        && crate::network_session::needed()
+    {
+        let owner = crate::network_session::keep_alive().unwrap_or_else(|error| {
+            error!("Не удалось закрепить владельца сети: {error}");
+            std::process::exit(1)
+        });
+        match tokio::task::spawn_blocking(crate::network_session::prepare).await {
+            Ok(Ok(_session)) => Some(owner),
+            Ok(Err(error)) => {
+                error!("Не удалось подготовить разрешение настройки сети: {error}");
+                std::process::exit(1);
+            }
+            Err(error) => {
+                error!("Задача подготовки сетевого разрешения завершилась: {error}");
+                std::process::exit(1);
+            }
+        }
+    } else {
+        None
+    };
+
     // 3b: native OS network-change listener, spawned ONCE for the whole
     // process lifetime (see net_change.rs) — best-effort, `None` when
     // unsupported/unavailable, in which case the client falls back to the
@@ -1562,7 +1688,7 @@ pub async fn run(
             && !(preferred_bootstrap.is_some() && initial_mask.mask_id.starts_with("bootstrap:"))
         {
             warn!(
-                "{} consecutive handshakes never connected — falling back to the built-in default mask (a cached bootstrap descriptor may be unmatchable by this server, e.g. after a server-key change)",
+                "После {} неудачных handshake пробуем следующую встроенную резервную маску",
                 handshake_fail_streak
             );
             // 3c: machine-readable status line (mirrors "AIVPN-STATUS
@@ -1570,7 +1696,10 @@ pub async fn run(
             // can show a "using built-in mask (fallback)" indicator.
             println!("AIVPN-STATUS bootstrap-fallback");
             is_bootstrap_fallback = true;
-            bootstrap_default()
+            aivpn_common::mask::preset_masks::fallback_for_attempt(
+                preshared_key.as_ref(),
+                handshake_fail_streak,
+            )
         } else {
             initial_mask
         };
@@ -1734,45 +1863,12 @@ pub async fn run(
             None => base_mask_family(&initial_mask.mask_id),
         };
 
-        let mut include_routes: Vec<String> = if !args.include_routes.is_empty() {
-            args.include_routes.clone()
-        } else {
-            file_config
-                .as_ref()
-                .and_then(|c| c.include_routes.clone())
-                .unwrap_or_default()
-        };
-        // DNS proxy forwards queries from a fresh OS socket bound to 0.0.0.0, so
-        // without an explicit route the upstream resolver is only reachable via the
-        // tunnel when --full-tunnel is set — split-tunnel users would silently leak
-        // every DNS query out the physical interface. Add a host route for the
-        // upstream resolver so --dns-proxy actually tunnels regardless of mode.
-        if args.dns_proxy.is_some() {
-            if let Ok(upstream) = args.dns_upstream.parse::<std::net::SocketAddr>() {
-                let cidr = match upstream.ip() {
-                    std::net::IpAddr::V4(ip) => format!("{ip}/32"),
-                    std::net::IpAddr::V6(ip) => format!("{ip}/128"),
-                };
-                if !include_routes.iter().any(|r| r == &cidr) {
-                    include_routes.push(cidr);
-                }
-            }
-        }
-        let exclude_routes: Vec<String> = if !args.exclude_routes.is_empty() {
-            args.exclude_routes.clone()
-        } else {
-            file_config
-                .as_ref()
-                .and_then(|c| c.exclude_routes.clone())
-                .unwrap_or_default()
-        };
         let mut tun_config = TunnelConfig::from_network_config(
             tun_name.clone(),
             network_config.clone(),
             full_tunnel,
         );
-        tun_config.include_routes = include_routes;
-        tun_config.exclude_routes = exclude_routes;
+        apply_split_routes(&mut tun_config, &args, file_config.as_ref());
         tun_config.kill_switch = args.kill_switch
             || file_config
                 .as_ref()
@@ -1891,7 +1987,9 @@ pub async fn run(
                 match run_result {
                     Ok(()) => {
                         // Clean shutdown — deactivate kill-switch before exiting
-                        client.deactivate_kill_switch();
+                        if !retain_firewall.load(Ordering::SeqCst) {
+                            client.deactivate_kill_switch();
+                        }
                         break;
                     }
                     Err(e) => {
@@ -1907,9 +2005,13 @@ pub async fn run(
                                 "Handshake rejected by server: {} — not retrying",
                                 handshake_reject_message(client.reject_reason())
                             );
-                            client.deactivate_kill_switch();
+                            if !retain_firewall.load(Ordering::SeqCst) {
+                                client.deactivate_kill_switch();
+                            }
                             if let Some(ks) = &mut reconnect_kill_switch {
-                                ks.deactivate();
+                                if !retain_firewall.load(Ordering::SeqCst) {
+                                    ks.deactivate();
+                                }
                             }
                             // Сохраняем rejected последним статусом для читателя stdout.
                             return;
@@ -1955,7 +2057,9 @@ pub async fn run(
         backoff = std::cmp::min(backoff * 2, max_backoff);
     }
     if let Some(ks) = &mut reconnect_kill_switch {
-        ks.deactivate();
+        if !retain_firewall.load(Ordering::SeqCst) {
+            ks.deactivate();
+        }
     }
     println!("AIVPN-STATUS disconnected");
 }
@@ -1976,27 +2080,13 @@ fn parse_connection_key(conn_key: &str) -> Result<serde_json::Value, String> {
     serde_json::from_slice(&json_bytes).map_err(|e| format!("Malformed connection key JSON: {}", e))
 }
 
-/// Whether a session with the given uptime should reset the reconnect backoff.
-fn should_reset_backoff(uptime: Duration) -> bool {
-    uptime >= HEALTHY_CONNECTION_THRESHOLD
-}
-
 fn fallback_network_config(tun_addr: &str) -> ClientNetworkConfig {
     let client_ip = tun_addr.parse::<Ipv4Addr>().unwrap_or_else(|_| {
         error!("Invalid TUN address '{}': expected IPv4 address", tun_addr);
         std::process::exit(1);
     });
 
-    ClientNetworkConfig {
-        client_ip,
-        server_vpn_ip: LEGACY_SERVER_VPN_IP,
-        prefix_len: 24,
-        mtu: DEFAULT_VPN_MTU,
-        mdh_len: 20,
-        keepalive_secs: None,
-        ipv6_address: None,
-        ipv6_prefix_len: None,
-    }
+    ClientNetworkConfig::from_legacy_address(client_ip)
 }
 
 /// Which datagram transport this run should open, if configuration names one.
@@ -2073,6 +2163,58 @@ fn transport_registry(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn split_switch_preserves_saved_routes_and_cli_overrides_file() {
+        let config: ClientFileConfig = serde_json::from_str(r#"{"split_enabled":false,"full_tunnel":false,"include_routes":["203.0.113.0/24"],"exclude_routes":["192.0.2.0/24"]}"#).unwrap();
+        for (flag, enabled) in [
+            (None, false),
+            (Some("--split-enabled=false"), false),
+            (Some("--split-enabled=true"), true),
+        ] {
+            let mut argv = vec!["aivpn-client", "--dns-proxy", "127.0.0.1:5300"];
+            argv.extend(flag);
+            let args = ClientArgs::try_parse_from(argv).unwrap();
+            let mut tunnel = TunnelConfig::default();
+            apply_split_routes(&mut tunnel, &args, Some(&config));
+            if enabled {
+                assert!(tunnel.include_routes.contains(&"203.0.113.0/24".into()));
+                assert_eq!(tunnel.exclude_routes, vec!["192.0.2.0/24"]);
+            } else {
+                assert!(tunnel.full_tunnel);
+                assert!(tunnel.include_routes.is_empty());
+                assert!(tunnel.exclude_routes.is_empty());
+            }
+            assert_eq!(
+                config.include_routes.as_ref().unwrap(),
+                &vec!["203.0.113.0/24"]
+            );
+            assert_eq!(
+                config.exclude_routes.as_ref().unwrap(),
+                &vec!["192.0.2.0/24"]
+            );
+        }
+        let legacy: ClientFileConfig =
+            serde_json::from_str(r#"{"include_routes":["203.0.113.0/24"]}"#).unwrap();
+        let args = ClientArgs::try_parse_from(["aivpn-client"]).unwrap();
+        let mut tunnel = TunnelConfig::default();
+        apply_split_routes(&mut tunnel, &args, Some(&legacy));
+        assert_eq!(tunnel.include_routes, vec!["203.0.113.0/24"]);
+        assert!(!tunnel.full_tunnel);
+    }
+
+    #[cfg(not(feature = "production-secure"))]
+    #[test]
+    fn first_cli_mask_keeps_the_shared_bootstrap_mapping_when_catalog_grows() {
+        for seed in 0..=255u8 {
+            let psk = [seed; 32];
+            assert_eq!(
+                bootstrap_mask_for_psk(&psk).mask_id,
+                aivpn_common::mask::preset_masks::bootstrap_for_psk(Some(&psk)).mask_id,
+                "PSK seed {seed}"
+            );
+        }
+    }
     #[test]
     fn malformed_transport_parameters_are_not_an_empty_profile() {
         assert!(decode_transport_params("private-invalid-%").is_err());

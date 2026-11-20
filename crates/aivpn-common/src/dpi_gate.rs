@@ -356,6 +356,11 @@ impl DpiGate {
     pub fn cleanup(&self, session_id: &[u8; 16]) {
         self.windows.remove(session_id);
     }
+
+    /// Удалить окна сессий, уже отсутствующих у владельца.
+    pub fn retain_sessions(&self, mut live: impl FnMut(&[u8; 16]) -> bool) {
+        self.windows.retain(|id, _| live(id));
+    }
 }
 
 // ──────────────────── Client-side self-detection gate ───────────────────────

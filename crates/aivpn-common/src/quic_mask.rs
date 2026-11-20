@@ -37,6 +37,7 @@ const RECV_BUDGET: usize = 128 * 1024;
 // Штатный предел Quinn для DATAGRAM вмещает полет широкополосного канала.
 // Очередь до TLS и потоковые окна сохраняют отдельный малый предел.
 const DATAGRAM_SEND_BUDGET: usize = 1024 * 1024;
+const CONTROL_SEND_RESERVE: usize = 16 * MAX_LOGICAL;
 const IDLE: Duration = Duration::from_secs(30);
 const MAX_SEGMENTS: usize = 16;
 const ALPN_H3: &[u8] = b"h3";
@@ -240,6 +241,25 @@ impl QuicMask {
         }
         mask.drain_events(&mut Vec::new())?;
         Ok(mask)
+    }
+
+    pub fn send_data(&mut self, payload: &[u8]) -> Result<()> {
+        if self.connected && self.application.ready() {
+            if let Some((_, conn)) = self.conn.as_mut() {
+                // Буфер растет вместе с каналом, но не копит десятки полетов
+                // перед keepalive, rekey и ответами диагностики на медленном пути.
+                let budget = conn.congestion_state().window().clamp(
+                    (4 * MAX_LOGICAL) as u64,
+                    (DATAGRAM_SEND_BUDGET - CONTROL_SEND_RESERVE) as u64,
+                ) as usize;
+                let queued =
+                    DATAGRAM_SEND_BUDGET.saturating_sub(conn.datagrams().send_buffer_space());
+                if queued.saturating_add(payload.len() + 2) > budget {
+                    return Err(Error::Io(std::io::ErrorKind::WouldBlock.into()));
+                }
+            }
+        }
+        self.send(payload)
     }
 
     pub fn send(&mut self, payload: &[u8]) -> Result<()> {
@@ -1295,6 +1315,29 @@ mod tests {
         }
         assert!(sent >= 1);
         assert!(sent <= DATAGRAM_SEND_BUDGET / MAX_LOGICAL + 1);
+    }
+
+    #[test]
+    fn data_queue_tracks_the_path_window_and_leaves_room_for_control() {
+        let mut pipe = Pipe::connect(&[0x7e; 40]).unwrap();
+        let window = pipe.client.conn.as_ref().unwrap().1.stats().path.cwnd as usize;
+        let payload = vec![0x3c; MAX_LOGICAL];
+        let mut queued = 0;
+        while pipe.client.send_data(&payload).is_ok() {
+            queued += payload.len();
+            assert!(queued <= DATAGRAM_SEND_BUDGET);
+        }
+        assert!(queued > 0);
+        assert!(
+            queued <= window + MAX_LOGICAL,
+            "DATA заняли {queued} байт при окне {window}: control будет ждать лишние RTT"
+        );
+        pipe.client.send(b"priority-control").unwrap();
+        pipe.drive(200).unwrap();
+        assert!(pipe
+            .server_payloads
+            .iter()
+            .any(|payload| payload == b"priority-control"));
     }
 
     #[test]

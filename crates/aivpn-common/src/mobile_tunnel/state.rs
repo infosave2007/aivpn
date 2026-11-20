@@ -178,6 +178,7 @@ pub struct SessionRuntime {
     // can never desync from them (the app's self-rolled Date() reset on every
     // relaunch/jetsam while the counters kept running).
     pub connected_at_unix_ms: AtomicU64,
+    pub mask_assessment: Mutex<crate::mask_assessment::AssessmentTracker>,
     // Set by stop_active_tunnel() before eventfd/socket are ready so that early
     // init phases (DNS, socket creation) can check and bail out immediately.
     pub stop_requested: AtomicBool,
@@ -198,6 +199,7 @@ impl SessionRuntime {
             upload_bytes: AtomicU64::new(0),
             download_bytes: AtomicU64::new(0),
             connected_at_unix_ms: AtomicU64::new(0),
+            mask_assessment: Mutex::new(Default::default()),
             stop_requested: AtomicBool::new(false),
         }
     }
@@ -506,12 +508,8 @@ pub static ACTIVE_FEEDBACK_INTERVAL: AtomicU32 = AtomicU32::new(0);
 /// (share entries or a hints-only probe). The platform uses this to decide
 /// whether to clear its persisted outcome buffer and bump `last_report_unix`.
 pub static MASK_FEEDBACK_SENT: AtomicBool = AtomicBool::new(false);
-/// Set when the server sends `CertRejected` (mTLS client certificate
-/// rejected) during this session. Previously this control message fell
-/// through the mid-session dispatch wildcard and was silently dropped — the
-/// tunnel kept retrying forever under a certificate the server will never
-/// accept, with no signal to the user. The platform polls and clears this
-/// (see `AivpnJni.certRejected()`/`AivpnService.kt`) to prompt re-provisioning.
+/// Одноразовое уведомление интерфейсу об отказе сертификата.
+/// Терминальный выход из ядра отдельно фиксируется в HANDSHAKE_REJECTED.
 pub static CERT_REJECTED: AtomicBool = AtomicBool::new(false);
 /// Set when the server sends `HandshakeReject` — an AUTHENTICATED refusal
 /// (the peer already proved PSK knowledge during the handshake; see the doc
@@ -850,8 +848,11 @@ pub fn stop_active_tunnel() {
     }
 
     if udp_fd >= 0 {
+        // Это только управляющий dup. Shutdown оставляет зарегистрированный
+        // сокет в READ_CLOSED: recv может крутиться на WouldBlock внутри Tokio
+        // и не отдавать runtime управление для обработки stop-сигнала.
+        // Сам сокет закрывает владелец после остановки задач через eventfd/pipe.
         unsafe {
-            libc::shutdown(udp_fd, libc::SHUT_RDWR);
             libc::close(udp_fd);
         };
     }
@@ -902,9 +903,76 @@ pub fn get_active_connected_since_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// Отсутствующие и устаревшие данные остаются null в диагностике платформы.
+pub fn get_active_mask_assessment() -> Option<crate::mask_assessment::MaskAssessment> {
+    let session = ACTIVE_SESSION.lock().ok()?.clone()?;
+    let tracker = session.mask_assessment.lock().ok()?;
+    tracker.current(std::time::Instant::now()).cloned()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stop_wakes_owner_without_closing_udp_readiness() {
+        const CHILD: &str = "AIVPN_STOP_UDP_READINESS_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "mobile_tunnel::state::tests::stop_wakes_owner_without_closing_udp_readiness",
+                    "--test-threads=1",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            use std::os::fd::{FromRawFd, OwnedFd};
+            let session = Arc::new(SessionRuntime::new());
+            let _active = activate_session(session.clone()).unwrap();
+            let stop = super::super::io::create_stop_signal(&session).unwrap();
+            let peer = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            let fd =
+                super::super::io::create_udp_socket(peer.local_addr().unwrap(), &session, &|_| {
+                    Ok(())
+                })
+                .unwrap();
+            let owned = unsafe { OwnedFd::from_raw_fd(fd) };
+            let socket = std::net::UdpSocket::from(owned);
+            socket.set_nonblocking(true).unwrap();
+            let socket = tokio::net::UdpSocket::from_std(socket).unwrap();
+            stop_active_tunnel();
+            tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                super::super::io::wait_for_stop(&stop),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            let readiness = tokio::time::timeout(
+                std::time::Duration::from_millis(20),
+                socket.ready(tokio::io::Interest::READABLE),
+            )
+            .await;
+            assert!(
+                readiness.is_err(),
+                "Stop не должен оставлять UDP в постоянной готовности: {readiness:?}"
+            );
+        });
+    }
 
     #[test]
     fn stop_releases_tun_fd_without_runtime_progress() {

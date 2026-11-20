@@ -11,6 +11,7 @@ import SwiftUI
 class SplitTunnelManager: ObservableObject {
     static let shared = SplitTunnelManager()
 
+    @Published var isEnabled = false { didSet { defaults.set(isEnabled, forKey: "split_enabled") } }
     @Published var excludedDomains: [String] = []
     @Published var excludedRoutes: [String] = []
 
@@ -27,6 +28,8 @@ class SplitTunnelManager: ObservableObject {
     func load() {
         excludedDomains = defaults.stringArray(forKey: domainsKey) ?? []
         excludedRoutes  = defaults.stringArray(forKey: routesKey)  ?? []
+        isEnabled = SplitTunnelConfiguration.enabled(in: defaults,
+            legacyFullTunnel: UserDefaults.standard.object(forKey: "fullTunnel") as? Bool)
     }
 
     // MARK: - Domain management
@@ -76,6 +79,7 @@ class SplitTunnelManager: ObservableObject {
 
 struct SplitTunnelView: View {
     @ObservedObject private var mgr = SplitTunnelManager.shared
+    @ObservedObject private var vpn = VPNManager.shared
     @EnvironmentObject private var loc: LocalizationManager
     @Environment(\.dismiss) private var dismiss
 
@@ -85,14 +89,19 @@ struct SplitTunnelView: View {
     @State private var domainError = false
 
     var body: some View {
-        NavigationStack {
+        CompatibleNavigationView {
             List {
+                Section {
+                    Toggle(loc.t("split_enabled"), isOn: $mgr.isEnabled)
+                        .disabled(vpn.isConnected || vpn.isConnecting || vpn.isDisconnecting)
+                    Text(loc.t("split_switch_note")).font(.caption).foregroundColor(.secondary)
+                }
                 Section(header: Text(loc.t("split_domains"))) {
                     ForEach(mgr.excludedDomains, id: \.self) { Text($0) }
                         .onDelete { mgr.removeDomain(at: $0) }
                     HStack {
                         TextField("example.com", text: $newDomain)
-                            .autocorrectionDisabled().textInputAutocapitalization(.never)
+                            .disableAutocorrection(true).textInputAutocapitalization(.never)
                             .onChange(of: newDomain) { _ in domainError = false }
                         Button {
                             if mgr.addDomain(newDomain) { newDomain = ""; domainError = false } else { domainError = true }
@@ -117,7 +126,7 @@ struct SplitTunnelView: View {
                     }
                     HStack {
                         TextField("192.168.1.0/24", text: $newRoute)
-                            .autocorrectionDisabled()
+                            .disableAutocorrection(true)
                             .textInputAutocapitalization(.never)
                             .keyboardType(.numbersAndPunctuation)
                             .onChange(of: newRoute) { _ in routeError = nil }

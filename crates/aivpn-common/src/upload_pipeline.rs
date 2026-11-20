@@ -84,6 +84,10 @@ impl Default for UploadConfig {
 /// traffic-shaped padding, FSM updates). Android implements it via
 /// [`ZeroMdhEncryptor`] (random MDH, random padding).
 pub trait PacketEncryptor: Send {
+    /// Отмененные диагностические пакеты не должны занимать очередь шейпинга.
+    fn data_active(&self, _payload: &[u8]) -> bool {
+        true
+    }
     /// Интервал перед следующим пакетом данных. Управление его не ожидает.
     fn data_send_delay(&mut self) -> Duration {
         Duration::ZERO
@@ -578,6 +582,8 @@ pub async fn run_upload_loop(
                     None => return Err(Error::Channel("TUN->UDP channel closed".into())),
                 };
 
+                if !enc.data_active(&pkt_data) { continue; }
+
                 if !enc.data_ready() || !transport.mask_data_ready() {
                     pending_data = Some((pkt_data, time::Instant::now()));
                     drain_pending_control(&mut control_rx, transport, enc).await?;
@@ -589,6 +595,7 @@ pub async fn run_upload_loop(
 
             _ = crate::pacing::wait_until(pending_data.as_ref().map(|(_, deadline)| *deadline).unwrap_or_else(time::Instant::now)), if pending_data.is_some() && enc.data_ready() && transport.mask_data_ready() => {
                 let (pkt_data, deadline) = pending_data.take().unwrap();
+                if !enc.data_active(&pkt_data) { continue; }
                 if !enc.data_ready() || !transport.mask_data_ready() {
                     pending_data = Some((pkt_data, deadline));
                     continue;
@@ -621,6 +628,7 @@ pub async fn run_upload_loop(
                     if !enc.data_ready() || !transport.mask_data_ready() { break; }
                     match data_queue.try_next(rx) {
                         Ok(pkt) => {
+                            if !enc.data_active(&pkt) { continue; }
                             if !enc.data_ready() || !transport.mask_data_ready() {
                                 pending_data = Some((pkt, time::Instant::now()));
                                 break;
@@ -693,6 +701,7 @@ pub async fn run_upload_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pacing::PacingMode;
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use tokio::net::UdpSocket;
 
@@ -1280,6 +1289,82 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn mask_generation_change_resets_uplink_pacing_after_congestion() {
+        for quic in [false, true] {
+            for mode in [PacingMode::Adaptive, PacingMode::Full] {
+                for change in 0..3 {
+                    let mut mask = if quic {
+                        crate::mask::preset_masks::quic_https_v2()
+                    } else {
+                        crate::mask::preset_masks::webrtc_zoom_v3()
+                    };
+                    mask.size_iat_joint = None;
+                    mask.fsm_states.clear();
+                    mask.iat_distribution = crate::mask::IATDistribution {
+                        dist_type: crate::mask::IATDistType::Empirical,
+                        params: vec![40.0],
+                        jitter_range_ms: (0.0, 0.0),
+                    };
+                    let pending = Arc::new(std::sync::Mutex::new(None));
+                    let keys = crate::crypto::derive_session_keys(&[1; 32], None, &[2; 32]);
+                    let mut enc = crate::mimicry::MimicryEncryptor::new(
+                        keys,
+                        0,
+                        0,
+                        mask.clone(),
+                        pending.clone(),
+                    );
+                    let mut pacer = crate::pacing::AdaptivePacer::new(mode);
+                    let mut generation = None;
+                    let mut last_delay = Duration::ZERO;
+                    for _ in 0..20 {
+                        time::advance(Duration::from_millis(100)).await;
+                        let now = time::Instant::now();
+                        let deadline = paced_deadline(
+                            &mut enc,
+                            &mut pacer,
+                            &mut generation,
+                            Duration::from_millis(100),
+                            Some(now),
+                        );
+                        last_delay = deadline - now;
+                        enc.encrypt_data(&[1; 32]).unwrap();
+                        pacer.sent(deadline.into_std());
+                    }
+                    if mode == PacingMode::Adaptive && !quic {
+                        assert!(last_delay < Duration::from_millis(40));
+                    }
+                    match change {
+                        0 => mask.mask_id.push_str("-next"),
+                        1 => mask.version += 1,
+                        _ => mask.signature[0] ^= 1,
+                    }
+                    mask.iat_distribution.params = vec![70.0];
+                    *pending.lock().unwrap() = Some(mask);
+                    let now = time::Instant::now();
+                    let deadline = paced_deadline(
+                        &mut enc,
+                        &mut pacer,
+                        &mut generation,
+                        Duration::from_millis(100),
+                        Some(now),
+                    );
+                    let expected = if quic && mode == PacingMode::Adaptive {
+                        Duration::ZERO
+                    } else {
+                        Duration::from_millis(70)
+                    };
+                    assert_eq!(
+                        deadline - now,
+                        expected,
+                        "quic={quic} mode={mode:?} change={change}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn fresh_dns_flow_is_not_starved_by_paced_bulk_backlog() {
         struct PlainPackets;
         impl PacketEncryptor for PlainPackets {
@@ -1356,6 +1441,100 @@ mod tests {
                 .is_some_and(|index| index < 4),
             "DNS остался за фоновой очередью: {ports:?}"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn accepted_multiflow_burst_survives_queue_and_transport_backpressure() {
+        struct Packets;
+        impl PacketEncryptor for Packets {
+            fn data_send_delay(&mut self) -> Duration {
+                Duration::from_millis(2)
+            }
+            fn encrypt_data(&mut self, packet: &[u8]) -> Result<Vec<u8>> {
+                Ok(packet.to_vec())
+            }
+            fn encrypt_control(&mut self, _: &ControlPayload) -> Result<Vec<u8>> {
+                Ok(Vec::new())
+            }
+            fn encrypt_keepalive(&mut self) -> Result<Vec<u8>> {
+                Ok(Vec::new())
+            }
+            fn on_data_sent(&mut self, _: usize) {}
+        }
+        #[derive(Default)]
+        struct Sink(std::sync::Mutex<Vec<Vec<u8>>>);
+        #[async_trait::async_trait]
+        impl DatagramTransport for Sink {
+            async fn send(&self, packet: &[u8]) -> std::io::Result<usize> {
+                Ok(packet.len())
+            }
+            async fn send_data(&self, packet: &[u8]) -> std::io::Result<usize> {
+                // Медленная несущая: отправитель должен дождаться приема.
+                time::sleep(Duration::from_micros(50)).await;
+                self.0.lock().unwrap().push(packet.to_vec());
+                Ok(packet.len())
+            }
+            async fn recv(&self, _: &mut [u8]) -> std::io::Result<usize> {
+                std::future::pending().await
+            }
+            fn kind(&self) -> crate::transport::TransportKind {
+                crate::transport::TransportKind::Udp
+            }
+            fn max_datagram(&self) -> usize {
+                65507
+            }
+        }
+        for mode in [PacingMode::Full, PacingMode::Adaptive, PacingMode::Off] {
+            let (tx, mut rx) = mpsc::channel(4096);
+            let mut expected = vec![Vec::new(); 4];
+            for sequence in 0..4096u32 {
+                let lane = (sequence % 4) as usize;
+                let mut packet = vec![0; 32];
+                packet[0] = 0x45;
+                packet[3] = 32;
+                packet[9] = 17;
+                packet[20..22].copy_from_slice(&(5000 + lane as u16).to_be_bytes());
+                packet[22..24].copy_from_slice(&443u16.to_be_bytes());
+                packet[28..].copy_from_slice(&sequence.to_be_bytes());
+                expected[lane].push(packet.clone());
+                tx.try_send(packet).unwrap();
+            }
+            drop(tx);
+            let sink = Arc::new(Sink::default());
+            let transport: Arc<dyn DatagramTransport> = sink.clone();
+            let result = time::timeout(
+                Duration::from_secs(30),
+                run_upload_loop(
+                    &mut rx,
+                    None,
+                    &transport,
+                    &mut Packets,
+                    &UploadConfig {
+                        pacing: mode,
+                        ..Default::default()
+                    },
+                    None,
+                ),
+            )
+            .await
+            .expect("Очередь должна полностью завершиться");
+            assert!(matches!(result, Err(Error::Channel(_))));
+            let records = sink.0.lock().unwrap();
+            assert_eq!(records.len(), 4096, "Потеря принятой пачки: {mode:?}");
+            for (lane, expected) in expected.iter().enumerate() {
+                let actual: Vec<_> = records
+                    .iter()
+                    .filter(|packet| {
+                        u16::from_be_bytes([packet[20], packet[21]]) == 5000 + lane as u16
+                    })
+                    .collect();
+                assert_eq!(
+                    actual,
+                    expected.iter().collect::<Vec<_>>(),
+                    "Порядок потока {lane}, {mode:?}"
+                );
+            }
+        }
     }
 
     struct ShapedWire {

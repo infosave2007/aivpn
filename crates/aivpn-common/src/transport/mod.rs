@@ -39,6 +39,8 @@
 //! `io::Error` keeps that classification byte-identical instead of flattening
 //! it into a stringly-typed crate error.
 
+pub mod server_pool;
+
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -49,6 +51,8 @@ use crate::error::{Error, Result};
 
 #[cfg(any(target_os = "linux", target_os = "macos", windows, test))]
 mod guarded_dns;
+#[cfg(any(target_os = "linux", target_os = "macos", windows, test))]
+pub use guarded_dns::resolve_with_route as resolve_dns_with_route;
 #[cfg(windows)]
 mod windows_guard;
 #[cfg(windows)]
@@ -289,7 +293,26 @@ pub type ResolveFuture<'a> =
 /// cannot be reused here. Platforms construct a small guard alongside it.
 pub type FirewallPeerHandler = Arc<dyn Fn(SocketAddr) -> Result<()> + Send + Sync>;
 
+#[cfg(target_os = "linux")]
+pub type SocketProtector = Arc<dyn Fn(RawFd, u32) -> Result<()> + Send + Sync>;
+
 pub trait SocketGuard: Send + Sync {
+    /// Явная поддержка ограниченного помощника обычного Linux-клиента.
+    #[cfg(target_os = "linux")]
+    fn with_socket_protector(&self, _protector: SocketProtector) -> Option<SharedGuard> {
+        None
+    }
+
+    /// Отдельный вход принимает метку, назначенную сетевым помощником по UID.
+    #[cfg(target_os = "linux")]
+    fn with_assigned_socket_protector(
+        &self,
+        _mark: u32,
+        _protector: SocketProtector,
+    ) -> Option<SharedGuard> {
+        None
+    }
+
     /// Подключить платформенный фильтр к уже известным и новым служебным адресам.
     fn set_firewall_peer_handler(&self, _handler: Option<FirewallPeerHandler>) -> Result<()> {
         Ok(())
@@ -327,6 +350,13 @@ pub trait SocketGuard: Send + Sync {
     #[cfg(unix)]
     fn protect(&self, _fd: RawFd) -> Result<()> {
         Ok(())
+    }
+
+    /// Служба может создать и удержать точный UDP endpoint до первого send.
+    /// None сохраняет обычное создание сокета внутри клиента.
+    #[cfg(windows)]
+    fn create_udp_socket(&self, _peer: SocketAddr) -> Result<Option<std::net::UdpSocket>> {
+        Ok(None)
     }
 
     /// Windows counterpart. Split by `cfg` rather than unified behind a newtype
@@ -375,9 +405,19 @@ pub fn desktop_socket_guard() -> SharedGuard {
 /// the mark is inert and the sockets route normally — which is why the tunnel
 /// installs the rule before a marked transport is opened.
 #[cfg(target_os = "linux")]
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct MarkGuard {
     mark: u32,
+    protector: Option<SocketProtector>,
+}
+
+#[cfg(target_os = "linux")]
+impl std::fmt::Debug for MarkGuard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MarkGuard")
+            .field("mark", &self.mark)
+            .finish_non_exhaustive()
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -386,7 +426,10 @@ impl MarkGuard {
     /// indistinguishable from no guard at all — callers should pass a real
     /// value.
     pub fn new(mark: u32) -> Self {
-        Self { mark }
+        Self {
+            mark,
+            protector: None,
+        }
     }
 
     /// The mark this guard applies, so the routing and firewall layers can be
@@ -398,6 +441,21 @@ impl MarkGuard {
 
 #[cfg(target_os = "linux")]
 impl SocketGuard for MarkGuard {
+    fn with_socket_protector(&self, protector: SocketProtector) -> Option<SharedGuard> {
+        self.with_assigned_socket_protector(self.mark, protector)
+    }
+
+    fn with_assigned_socket_protector(
+        &self,
+        mark: u32,
+        protector: SocketProtector,
+    ) -> Option<SharedGuard> {
+        Some(Arc::new(Self {
+            mark,
+            protector: Some(protector),
+        }))
+    }
+
     fn resolve<'a>(
         &'a self,
         host: &'a str,
@@ -415,6 +473,9 @@ impl SocketGuard for MarkGuard {
     }
 
     fn protect(&self, fd: RawFd) -> Result<()> {
+        if let Some(protector) = &self.protector {
+            return protector(fd, self.mark);
+        }
         let mark = self.mark;
         // SAFETY: `fd` is a socket the caller has just created and still owns;
         // `SO_MARK` takes a `u32` by pointer, and the size is passed exactly.
@@ -691,6 +752,27 @@ mod tests {
             self.closes.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn protector_keeps_legacy_mark_and_supports_uid_assignment() {
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = calls.clone();
+        let protector: SocketProtector = Arc::new(move |descriptor, mark| {
+            recorded.lock().unwrap().push((descriptor, mark));
+            Ok(())
+        });
+        let original = MarkGuard::new(17);
+        let legacy = original.with_socket_protector(protector.clone()).unwrap();
+        let assigned = original
+            .with_assigned_socket_protector(0x800003e8, protector)
+            .unwrap();
+        assert_eq!(legacy.routing_mark(), Some(17));
+        assert_eq!(assigned.routing_mark(), Some(0x800003e8));
+        legacy.protect(-1).unwrap();
+        assigned.protect(-2).unwrap();
+        assert_eq!(*calls.lock().unwrap(), [(-1, 17), (-2, 0x800003e8)]);
     }
 
     /// Factory over the double, so the registry path is exercised too.

@@ -1,25 +1,13 @@
 //! Постоянная идентичность клиента хранится в закрытом каталоге.
 
 use aivpn_common::crypto::KeyPair;
+#[cfg(test)]
 use std::fs;
 use std::io;
 use std::path::Path;
 
 pub(super) fn load_or_create(dir: &Path) -> io::Result<KeyPair> {
-    fs::create_dir_all(dir)?;
-    if fs::symlink_metadata(dir)?.file_type().is_symlink() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "Каталог ключа устройства не может быть ссылкой",
-        ));
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
-    }
-    aivpn_common::identity_file::load_or_create_secret(&dir.join("device.key"))
-        .map(KeyPair::from_private_key)
+    aivpn_common::identity_file::load_or_create_device_secret(dir).map(KeyPair::from_private_key)
 }
 
 #[cfg(test)]

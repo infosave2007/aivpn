@@ -147,12 +147,18 @@ fn retry_quic_send(
     pending: &mut Option<PendingQuicSend>,
     engine: &mut QuicMask,
     generation: u64,
+    data: bool,
 ) -> bool {
     discard_stale_quic_send(pending, generation);
     let Some(waiting) = pending.as_ref() else {
         return false;
     };
-    match engine.send(&waiting.payload) {
+    let result = if data {
+        engine.send_data(&waiting.payload)
+    } else {
+        engine.send(&waiting.payload)
+    };
+    match result {
         Ok(()) => {
             let waiting = pending.take().unwrap();
             let _ = waiting.response.send(Ok(waiting.payload.len()));
@@ -357,7 +363,7 @@ async fn drive_client(
                         engine = None;
                         raw.send(&payload).await.map(|_| samples.record(&payload)).map_err(Error::Io)
                     } else if let Some(engine) = engine.as_mut() {
-                        engine.send(&payload)
+                        if data { engine.send_data(&payload) } else { engine.send(&payload) }
                     } else {
                         rtc = None;
                         offer = None;
@@ -491,11 +497,11 @@ async fn drive_client(
             // ACK и штатный pacer освобождают буфер в poll. Сначала даем место
             // управлению; DATA не удерживает драйвер и не блокирует receive.
             let generation = mask_generation.load(Ordering::Acquire);
-            let control_queued = retry_quic_send(&mut pending_control, engine, generation);
+            let control_queued = retry_quic_send(&mut pending_control, engine, generation, false);
             // Меньший DATA не должен занимать место, которого пока не хватает
             // большему control. Отмена и смена поколения снимают этот запрет.
-            let data_queued =
-                pending_control.is_none() && retry_quic_send(&mut pending_data, engine, generation);
+            let data_queued = pending_control.is_none()
+                && retry_quic_send(&mut pending_data, engine, generation, true);
             if control_queued || data_queued {
                 let next = engine.poll(quic_now!())?;
                 output.wire.extend(next.wire);
@@ -916,25 +922,39 @@ mod tests {
             masked: &Arc<ClientMaskIo>,
             size: usize,
         ) -> (Vec<u8>, tokio::task::JoinHandle<io::Result<usize>>) {
+            self.fill_until_waiting_kind(masked, size, true).await
+        }
+
+        async fn fill_until_waiting_kind(
+            &self,
+            masked: &Arc<ClientMaskIo>,
+            size: usize,
+            data: bool,
+        ) -> (Vec<u8>, tokio::task::JoinHandle<io::Result<usize>>) {
             self.hold.store(true, Ordering::Release);
             assert!(quic_test_state(masked, Some(true)).await.frozen);
             for sequence in 0u64..4096 {
                 let mut payload = vec![0x5a; size];
                 payload[..8].copy_from_slice(&sequence.to_le_bytes());
-                let send = start_quic_send(masked, payload.clone(), true).await;
+                let send = start_quic_send(masked, payload.clone(), data).await;
                 // Первый poll поставил Send в очередь; следующий FIFO-запрос
                 // видит слот после обработки Send и протокольного poll.
                 let state = quic_test_state(masked, None).await;
                 assert!(state.frozen);
-                if state.data.as_ref() == Some(&payload) {
+                let pending = if data {
+                    state.data.as_ref()
+                } else {
+                    state.control.as_ref()
+                };
+                if pending == Some(&payload) {
                     assert!(
-                        sequence >= 256,
-                        "Ожидание началось до заполнения широкополосного полета"
+                        sequence >= if data { 1 } else { 256 },
+                        "Ожидание началось до заполнения доступного окна"
                     );
                     assert!(!send.is_finished());
                     return (payload, send);
                 }
-                assert!(state.data.is_none());
+                assert!(pending.is_none());
                 assert_eq!(
                     send.await
                         .unwrap()
@@ -1028,18 +1048,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn quic_fixture_observes_full_buffer_with_room_for_smaller_data() {
+    async fn quic_data_backpressure_leaves_room_for_control() {
         let peer = QuicPeerTransport::new();
         let masked = peer.connected().await;
         let (_payload, waiting) = peer.fill_until_waiting_size(&masked, 1096).await;
         waiting.abort();
         assert!(waiting.await.unwrap_err().is_cancelled());
-        // Отдельный контроль фикстуры: настоящий буфер отказал пакету 1096,
-        // но меньший DATA 1000 помещается без ACK и продвижения времени QUIC.
-        let smaller = start_quic_send(&masked, vec![0xd8; 1000], true).await;
+        // Даже после заполнения окна DATA управление принимается без ACK.
+        let smaller = start_quic_send(&masked, vec![0xd8; 1000], false).await;
         let state = quic_test_state(&masked, None).await;
         assert!(state.frozen);
-        assert!(state.data.is_none());
+        assert!(state.control.is_none());
         assert_eq!(smaller.await.unwrap().unwrap(), 1000);
         peer.finish(&masked).await;
     }
@@ -1135,21 +1154,19 @@ mod tests {
         let (data, send) = peer.fill_until_waiting(&masked).await;
         let control = start_quic_send(&masked, vec![0xc3; 1000], false).await;
         let state = quic_test_state(&masked, None).await;
-        assert_eq!(state.control, Some(vec![0xc3; 1000]));
+        assert!(state.control.is_none());
         assert_eq!(state.data, Some(data.clone()));
-        assert!(!control.is_finished());
+        assert_eq!(control.await.unwrap().unwrap(), 1000);
         assert!(!quic_test_state(&masked, Some(false)).await.frozen);
         peer.release();
-        for send in [control, send] {
-            assert_eq!(
-                tokio::time::timeout(std::time::Duration::from_secs(3), send)
-                    .await
-                    .unwrap()
-                    .unwrap()
-                    .unwrap(),
-                1000
-            );
-        }
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(3), send)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap(),
+            1000
+        );
         peer.wait_for(&data).await;
         peer.wait_for(&vec![0xc3; 1000]).await;
         let positions = {
@@ -1178,10 +1195,9 @@ mod tests {
     async fn quic_larger_pending_control_reserves_space_from_new_and_pending_data() {
         let peer = QuicPeerTransport::new();
         let masked = peer.connected().await;
-        // Пакеты 1096 байт заполняют буфер так, что оставшегося места хватает
-        // для DATA 1000, но не для control 1140. Пока время QUIC заморожено,
-        // удержанные ACK не заменяются разрешенной отправкой после PTO.
-        let (_cancelled, filled) = peer.fill_until_waiting_size(&masked, 1096).await;
+        // Заполняем и резерв управления. При полном общем буфере его
+        // ожидающий пакет должен сохранить приоритет после получения ACK.
+        let (_cancelled, filled) = peer.fill_until_waiting_kind(&masked, 1096, false).await;
         filled.abort();
         assert!(filled.await.unwrap_err().is_cancelled());
         let control_payload = vec![0xc7; 1140];
@@ -1244,11 +1260,11 @@ mod tests {
     async fn quic_close_finishes_both_blocked_slots_without_waiting_for_ack() {
         let peer = QuicPeerTransport::new();
         let masked = peer.connected().await;
-        let (_data, send) = peer.fill_until_waiting(&masked).await;
-        let control = start_quic_send(&masked, vec![0xc3; 1000], false).await;
+        let (control_payload, control) = peer.fill_until_waiting_kind(&masked, 1000, false).await;
+        let send = start_quic_send(&masked, vec![0xc3; 1000], true).await;
         assert_eq!(
             quic_test_state(&masked, None).await.control,
-            Some(vec![0xc3; 1000])
+            Some(control_payload)
         );
         let (response, closed) = oneshot::channel();
         masked

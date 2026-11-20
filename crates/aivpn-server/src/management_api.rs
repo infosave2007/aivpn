@@ -33,7 +33,7 @@ use crate::mgmt_service::{self, ClientView as ClientResponse, HeavySetting, Mgmt
 use crate::mgmt_wire_common::{deserialize_opt_opt, kernel_loaded};
 use crate::pending_config::PendingConfigManager;
 
-const MAX_MASK_SIZE: usize = 5 * 1024 * 1024;
+const MAX_MASK_SIZE: usize = crate::mask_store::MAX_PROFILE_BYTES;
 const MAX_BACKUP_SIZE: usize = 50 * 1024 * 1024;
 
 #[derive(Debug)]

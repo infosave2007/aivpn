@@ -223,6 +223,19 @@ pub(crate) fn apply_restore_env(args: &mut ServerArgs, matches: &clap::ArgMatche
     }
 }
 
+fn read_import_config(config_path: &str) -> Option<serde_json::Value> {
+    let absent = matches!(std::fs::symlink_metadata(config_path), Err(error)
+        if error.kind() == std::io::ErrorKind::NotFound);
+    if absent {
+        Some(serde_json::json!({}))
+    } else {
+        std::fs::read(config_path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+            .filter(serde_json::Value::is_object)
+    }
+}
+
 /// Выбирает только пути назначения recovery. Остальные настройки, ключи и DB
 /// могут быть повреждены и не нужны для восстановления из проверенного архива.
 pub(crate) fn resolve_import_paths(
@@ -289,15 +302,36 @@ pub(crate) fn resolve_import_paths(
             .unwrap_or(DEFAULT_SERVER_CONFIG_PATH)
             .to_string()
     });
-    let absent = matches!(std::fs::symlink_metadata(&config_path), Err(error)
-        if error.kind() == std::io::ErrorKind::NotFound);
-    let file = if absent {
-        Some(serde_json::json!({}))
+    let file = if args.dry_run {
+        read_import_config(&config_path)
     } else {
-        std::fs::read(&config_path)
-            .ok()
-            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
-            .filter(serde_json::Value::is_object)
+        // Shared lock только на время чтения. До захвата DB его уже нет:
+        // import ниже берет DB, затем exclusive config.
+        let mut attempts = 0;
+        loop {
+            aivpn_server::backup::recover_config_sidecar(std::path::Path::new(&config_path))
+                .map_err(|error| {
+                    format!("Не удалось завершить прерванное восстановление: {error}")
+                })?;
+            let guard = aivpn_server::backup::lock_shared_restore(
+                Some(std::path::Path::new(&config_path)),
+                None,
+            )
+            .map_err(|error| format!("Не удалось получить блокировку серверных файлов: {error}"))?;
+            if guard.journal_pending().map_err(|error| {
+                format!("Не удалось завершить прерванное восстановление: {error}")
+            })? {
+                drop(guard);
+                attempts += 1;
+                if attempts >= 4 {
+                    return Err("журнал восстановления не закрывается до чтения config".to_string());
+                }
+                continue;
+            }
+            let file = read_import_config(&config_path);
+            drop(guard);
+            break file;
+        }
     };
     let explicit_path = |value: &Option<Option<String>>| {
         value

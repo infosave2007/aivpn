@@ -706,7 +706,16 @@ fn cli_rereads_config_after_waiting_for_its_database_restore() {
     )
     .unwrap();
     assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_UN) }, 0);
-    assert!(process.0.wait().unwrap().success());
+    let status = process.0.wait().unwrap();
+    let mut stderr = String::new();
+    process
+        .0
+        .stderr
+        .as_mut()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .unwrap();
+    assert!(status.success(), "{status}: {stderr}");
     let mut stdout = String::new();
     process
         .0
@@ -716,4 +725,389 @@ fn cli_rereads_config_after_waiting_for_its_database_restore() {
         .read_to_string(&mut stdout)
         .unwrap();
     assert!(stdout.contains("restored-db-client"));
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct Generation {
+    config: Vec<u8>,
+    clients: Vec<u8>,
+}
+
+fn generation(opts: &ImportOptions) -> Generation {
+    Generation {
+        config: std::fs::read(&opts.config_path).unwrap_or_default(),
+        clients: std::fs::read(&opts.clients_db).unwrap_or_default(),
+    }
+}
+
+fn crash_restore_fixture(root: &Path) -> (PathBuf, ImportOptions, Generation, Generation) {
+    let source = root.join("source");
+    let target = root.join("target");
+    std::fs::create_dir_all(&source).unwrap();
+    std::fs::create_dir_all(&target).unwrap();
+    let source_config = source.join("server.json");
+    let source_db = source.join("clients.json");
+    std::fs::write(&source_config, b"{}").unwrap();
+    let db = ClientDatabase::load(&source_db, Default::default()).unwrap();
+    db.add_client("archived-only-client").unwrap();
+    drop(db);
+    let archive = root.join("restore.tar.gz");
+    export_server(
+        &ExportOptions {
+            include_config: true,
+            include_clients: true,
+            config_path: Some(source_config),
+            clients_db: Some(source_db),
+            ..Default::default()
+        },
+        &archive,
+    )
+    .unwrap();
+    std::fs::copy(
+        source.join("backup_integrity.key"),
+        target.join("backup_integrity.key"),
+    )
+    .unwrap();
+    let opts = ImportOptions {
+        config_path: target.join("server.json"),
+        clients_db: target.join("clients.json"),
+        mask_dir: target.join("masks"),
+    };
+    let old_config = serde_json::to_vec(&serde_json::json!({
+        "clients_db":opts.clients_db,"mask_dir":opts.mask_dir,"log_level":"warn",
+    }))
+    .unwrap();
+    std::fs::write(&opts.config_path, &old_config).unwrap();
+    let live = ClientDatabase::load(&opts.clients_db, Default::default()).unwrap();
+    live.add_client("live-old-client").unwrap();
+    drop(live);
+    let old = generation(&opts);
+    import_server_with_options(&archive, &opts, false).unwrap();
+    let new = generation(&opts);
+    std::fs::write(&opts.config_path, &old.config).unwrap();
+    std::fs::write(&opts.clients_db, &old.clients).unwrap();
+    (archive, opts, old, new)
+}
+
+fn classify(current: &Generation, old: &Generation, new: &Generation) -> &'static str {
+    if current == old {
+        "old"
+    } else if current == new {
+        "new"
+    } else {
+        "mixed"
+    }
+}
+
+fn list_clients_cli(opts: &ImportOptions, signing: &Path) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_aivpn-server"))
+        .env_clear()
+        .env("PATH", "/nonexistent-aivpn-test-path")
+        .env("AIVPN_MASK_SIGNING_KEY", signing)
+        .arg("--config")
+        .arg(&opts.config_path)
+        .arg("--clients-db")
+        .arg(&opts.clients_db)
+        .arg("--mask-dir")
+        .arg(&opts.mask_dir)
+        .arg("--list-clients")
+        .output()
+        .unwrap()
+}
+
+#[test]
+fn restore_crash_fixture() {
+    let Ok(root) = std::env::var("AIVPN_OFFLINE_TEST_ROOT") else {
+        return;
+    };
+    let root = Path::new(&root);
+    let opts = ImportOptions {
+        config_path: root.join("target/server.json"),
+        clients_db: root.join("target/clients.json"),
+        mask_dir: root.join("target/masks"),
+    };
+    let archive = root.join("restore.tar.gz");
+    let _ = import_server_with_options(&archive, &opts, false);
+}
+
+fn spawn_crashed_restore(root: &Path, step: &str) -> std::process::ExitStatus {
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "restore_crash_fixture", "--nocapture"])
+        .env("AIVPN_OFFLINE_TEST_ROOT", root)
+        .env("AIVPN_RESTORE_CRASH", step)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    child.wait().unwrap()
+}
+
+#[test]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "Точки отказа через окружение включены только в debug-сборке"
+)]
+fn sigkill_after_each_durable_step_recovers_consistent_generation() {
+    let _process_gate = PROCESS_TEST_GATE.lock().unwrap();
+    for step in [
+        "journal-preparing",
+        "backup-0",
+        "stage-0",
+        "journal-prepared-config",
+        "prepared",
+        "commit-0",
+        "committed",
+        "cleanup-file-0",
+        "cleanup-journal-0",
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let (archive, opts, old, new) = crash_restore_fixture(root.path());
+        let _ = archive;
+        let status = spawn_crashed_restore(root.path(), step);
+        if step == "committed" {
+            assert!(
+                status.success() || status.code().is_none(),
+                "{step}: {status:?}"
+            );
+        } else {
+            assert!(
+                !status.success(),
+                "{step} должен убить restore, status={status:?}"
+            );
+        }
+        let signing = root.path().join("signing.key");
+        std::fs::write(&signing, [18u8; 32]).unwrap();
+        let listed = list_clients_cli(&opts, &signing);
+        assert!(
+            listed.status.success(),
+            "{step}: {}",
+            String::from_utf8_lossy(&listed.stderr)
+        );
+        let current = generation(&opts);
+        let kind = classify(&current, &old, &new);
+        assert_ne!(kind, "mixed", "{step}");
+        let stdout = String::from_utf8_lossy(&listed.stdout);
+        match kind {
+            "old" => assert!(stdout.contains("live-old-client"), "{step}: {stdout}"),
+            "new" => {
+                assert!(stdout.contains("archived-only-client"), "{step}: {stdout}");
+                assert!(!stdout.contains("live-old-client"), "{step}: {stdout}");
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[test]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "Точки отказа через окружение включены только в debug-сборке"
+)]
+fn cli_import_sigkill_then_startup_never_serves_mixed() {
+    let _process_gate = PROCESS_TEST_GATE.lock().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let (archive, opts, old, new) = crash_restore_fixture(root.path());
+    let mut child = Command::new(env!("CARGO_BIN_EXE_aivpn-server"))
+        .env_clear()
+        .env("PATH", "/nonexistent-aivpn-test-path")
+        .env("AIVPN_RESTORE_CRASH", "commit-0")
+        .arg("--import")
+        .arg(&archive)
+        .arg("--config")
+        .arg(&opts.config_path)
+        .arg("--clients-db")
+        .arg(&opts.clients_db)
+        .arg("--mask-dir")
+        .arg(&opts.mask_dir)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let status = child.wait().unwrap();
+    assert!(
+        !status.success(),
+        "ожидался SIGKILL на commit-0: {status:?}"
+    );
+    assert_eq!(classify(&generation(&opts), &old, &new), "mixed");
+    let signing = root.path().join("signing.key");
+    std::fs::write(&signing, [18u8; 32]).unwrap();
+    let listed = list_clients_cli(&opts, &signing);
+    assert!(
+        listed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&listed.stderr)
+    );
+    assert_eq!(classify(&generation(&opts), &old, &new), "new");
+    let stdout = String::from_utf8_lossy(&listed.stdout);
+    assert!(stdout.contains("archived-only-client"));
+    let exported = root.path().join("after-recover.tar.gz");
+    let exported_ok = Command::new(env!("CARGO_BIN_EXE_aivpn-server"))
+        .env_clear()
+        .env("PATH", "/nonexistent-aivpn-test-path")
+        .env("AIVPN_MASK_SIGNING_KEY", &signing)
+        .arg("--export")
+        .arg(&exported)
+        .arg("--config")
+        .arg(&opts.config_path)
+        .arg("--clients-db")
+        .arg(&opts.clients_db)
+        .arg("--mask-dir")
+        .arg(&opts.mask_dir)
+        .output()
+        .unwrap();
+    assert!(
+        exported_ok.status.success(),
+        "{}",
+        String::from_utf8_lossy(&exported_ok.stderr)
+    );
+    let inspect = root.path().join("inspect");
+    std::fs::create_dir(&inspect).unwrap();
+    std::fs::copy(
+        root.path().join("source/backup_integrity.key"),
+        inspect.join("backup_integrity.key"),
+    )
+    .unwrap();
+    import_server_with_options(
+        &exported,
+        &ImportOptions {
+            config_path: inspect.join("server.json"),
+            clients_db: inspect.join("clients.json"),
+            mask_dir: inspect.join("masks"),
+        },
+        false,
+    )
+    .unwrap();
+    let db = ClientDatabase::load(&inspect.join("clients.json"), Default::default()).unwrap();
+    let names: Vec<_> = db.list_clients().into_iter().map(|c| c.name).collect();
+    assert!(names.iter().any(|n| n == "archived-only-client"));
+    assert!(!names.iter().any(|n| n == "live-old-client"));
+}
+
+#[test]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "Точки отказа через окружение включены только в debug-сборке"
+)]
+fn cli_import_write_error_does_not_return_success() {
+    let _process_gate = PROCESS_TEST_GATE.lock().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let (archive, opts, old, new) = crash_restore_fixture(root.path());
+    let output = Command::new(env!("CARGO_BIN_EXE_aivpn-server"))
+        .env_clear()
+        .env("PATH", "/nonexistent-aivpn-test-path")
+        .env("AIVPN_RESTORE_FAIL", "stage-0")
+        .arg("--import")
+        .arg(&archive)
+        .arg("--config")
+        .arg(&opts.config_path)
+        .arg("--clients-db")
+        .arg(&opts.clients_db)
+        .arg("--mask-dir")
+        .arg(&opts.mask_dir)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("прервано"));
+    aivpn_server::backup::recover_pending_restore(&opts).unwrap();
+    assert_eq!(classify(&generation(&opts), &old, &new), "old");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires an isolated user/mount namespace and mount command"]
+fn restore_across_mounts_and_real_enospc_keeps_a_complete_generation() {
+    assert_eq!(
+        std::env::var("AIVPN_TEST_PRIVATE_MOUNT_NS").as_deref(),
+        Ok("1")
+    );
+    use std::os::unix::fs::MetadataExt;
+    let root = tempfile::tempdir().unwrap();
+    let volume = root.path().join("volume");
+    std::fs::create_dir(&volume).unwrap();
+    assert!(Command::new("mount")
+        .args(["-t", "tmpfs", "-o", "size=4m", "tmpfs"])
+        .arg(&volume)
+        .status()
+        .unwrap()
+        .success());
+    struct Unmount(PathBuf);
+    impl Drop for Unmount {
+        fn drop(&mut self) {
+            let _ = Command::new("umount").arg(&self.0).status();
+        }
+    }
+    let _unmount = Unmount(volume.clone());
+    assert_ne!(
+        std::fs::metadata(&volume).unwrap().dev(),
+        std::fs::metadata(root.path()).unwrap().dev()
+    );
+    let source = root.path().join("source");
+    std::fs::create_dir(&source).unwrap();
+    let config = source.join("server.json");
+    let db = source.join("clients.json");
+    std::fs::write(
+        &config,
+        serde_json::to_vec(
+            &serde_json::json!({"log_level":"debug", "fixture": "x".repeat(512*1024)}),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    std::fs::write(&db, b"{\"clients\":[]}").unwrap();
+    let archive = root.path().join("cross-volume.tar.gz");
+    export_server(
+        &ExportOptions {
+            include_config: true,
+            include_clients: true,
+            config_path: Some(config),
+            clients_db: Some(db),
+            ..Default::default()
+        },
+        &archive,
+    )
+    .unwrap();
+    let opts = ImportOptions {
+        config_path: volume.join("server.json"),
+        clients_db: root.path().join("clients.json"),
+        mask_dir: root.path().join("masks"),
+    };
+    std::fs::copy(
+        source.join("backup_integrity.key"),
+        volume.join("backup_integrity.key"),
+    )
+    .unwrap();
+    let old_config = b"{\"log_level\":\"warn\"}";
+    let old_db = b"{\"clients\":[]}";
+    std::fs::write(&opts.config_path, old_config).unwrap();
+    std::fs::write(&opts.clients_db, old_db).unwrap();
+    import_server_with_options(&archive, &opts, false).unwrap();
+    let new = generation(&opts);
+    assert!(new.config.len() > 512 * 1024);
+    std::fs::write(&opts.config_path, old_config).unwrap();
+    std::fs::write(&opts.clients_db, old_db).unwrap();
+    let old = generation(&opts);
+    let filler = volume.join("filler");
+    let mut file = std::fs::File::create(&filler).unwrap();
+    let path = std::ffi::CString::new(volume.as_os_str().as_encoded_bytes()).unwrap();
+    loop {
+        let mut stat = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+        assert_eq!(
+            unsafe { libc::statvfs(path.as_ptr(), stat.as_mut_ptr()) },
+            0
+        );
+        let stat = unsafe { stat.assume_init() };
+        if stat.f_bavail * stat.f_frsize < 128 * 1024 {
+            break;
+        }
+        file.write_all(&[0; 4096]).unwrap();
+    }
+    let error = import_server_with_options(&archive, &opts, false).unwrap_err();
+    assert!(error.to_string().contains("нет места"), "{error}");
+    drop(file);
+    std::fs::remove_file(filler).unwrap();
+    aivpn_server::backup::recover_pending_restore(&opts).unwrap();
+    assert_eq!(generation(&opts), old);
+    import_server_with_options(&archive, &opts, false).unwrap();
+    assert_eq!(generation(&opts), new);
 }

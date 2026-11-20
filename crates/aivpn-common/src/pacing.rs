@@ -2,7 +2,7 @@
 
 use std::time::{Duration, Instant};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 const CONTROL_INTERVAL: Duration = Duration::from_millis(100);
 const HIGH_WAIT: Duration = Duration::from_millis(5);
@@ -22,7 +22,7 @@ pub async fn wait_until(deadline: tokio::time::Instant) {
 }
 
 /// Локальная политика пауз. Размеры, маска и шифрование от нее не зависят.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum PacingMode {
     #[default]

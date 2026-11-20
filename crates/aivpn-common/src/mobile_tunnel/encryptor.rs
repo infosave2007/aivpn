@@ -74,6 +74,9 @@ impl MobileEncryptor {
 }
 
 impl PacketEncryptor for MobileEncryptor {
+    fn data_active(&self, payload: &[u8]) -> bool {
+        super::active_mgmt().diagnostic_packet_active(payload)
+    }
     fn data_send_delay(&mut self) -> Duration {
         self.inner.data_send_delay()
     }

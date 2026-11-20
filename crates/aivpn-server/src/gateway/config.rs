@@ -17,13 +17,15 @@ use crate::qos::QosEnforcer;
 
 /// Локальная политика нисходящих данных: server.json или --shaping-level.
 /// Adaptive сохраняет padding профиля и регулирует IAT по ожиданию в очереди.
-/// Full оставляет исходные интервалы; Light ограничивает IAT и padding.
+/// Full сохраняет padding без дополнительных пауз; Strict сохраняет IAT профиля.
+/// Light ограничивает IAT и padding.
 /// Off отключает оба механизма. Старые bool true/false означают Full/Off.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ShapingLevel {
     Off,
     Light,
     Full,
+    Strict,
     #[default]
     Adaptive,
 }
@@ -36,8 +38,9 @@ impl std::str::FromStr for ShapingLevel {
             "adaptive" => Ok(ShapingLevel::Adaptive),
             "light" => Ok(ShapingLevel::Light),
             "full" | "true" => Ok(ShapingLevel::Full),
+            "strict" => Ok(ShapingLevel::Strict),
             other => Err(format!(
-                "invalid shaping level {:?}: expected \"adaptive\", \"off\", \"light\", or \"full\"",
+                "invalid shaping level {:?}: expected \"adaptive\", \"off\", \"light\", \"full\", or \"strict\"",
                 other
             )),
         }
@@ -45,7 +48,7 @@ impl std::str::FromStr for ShapingLevel {
 }
 
 impl<'de> Deserialize<'de> for ShapingLevel {
-    /// Bool сохраняет прежнее значение; строки дополнительно принимают adaptive.
+    /// Bool сохраняет прежнее значение; strict включается только явно строкой.
     fn deserialize<D: Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
         use serde::de::Error as _;
         let v = serde_json::Value::deserialize(d)?;
@@ -54,7 +57,7 @@ impl<'de> Deserialize<'de> for ShapingLevel {
             serde_json::Value::Bool(false) => Ok(ShapingLevel::Off),
             serde_json::Value::String(ref s) => s.parse().map_err(D::Error::custom),
             other => Err(D::Error::custom(format!(
-                "downlink_shaping must be a bool or one of \"adaptive\"/\"off\"/\"light\"/\"full\", got: {}",
+                "downlink_shaping must be a bool or one of \"adaptive\"/\"off\"/\"light\"/\"full\"/\"strict\", got: {}",
                 other
             ))),
         }
@@ -268,6 +271,22 @@ impl Default for GatewayConfig {
 #[cfg(test)]
 mod shaping_tests {
     use super::ShapingLevel;
+
+    #[test]
+    fn strict_is_an_explicit_server_setting() {
+        assert_eq!(
+            "strict".parse::<ShapingLevel>().unwrap(),
+            ShapingLevel::Strict
+        );
+        assert_eq!(
+            "STRICT".parse::<ShapingLevel>().unwrap(),
+            ShapingLevel::Strict
+        );
+        assert_eq!(
+            serde_json::from_str::<ShapingLevel>("\"strict\"").unwrap(),
+            ShapingLevel::Strict
+        );
+    }
 
     #[test]
     fn adaptive_default_does_not_reinterpret_explicit_legacy_settings() {

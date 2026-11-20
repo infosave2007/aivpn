@@ -25,7 +25,7 @@ pub async fn run_bench_with_token(
     let duration = duration.as_secs().clamp(3, 30);
     let line = format!("{token}:bench:{duration}");
     let reply = tokio::task::spawn_blocking(move || {
-        aivpn_common::local_admin::request(admin_addr, &line, Duration::from_secs(duration + 8))
+        aivpn_common::local_admin::request(admin_addr, &line, Duration::from_secs(duration + 16))
     })
     .await
     .map_err(|e| aivpn_common::Error::Session(e.to_string()))??;

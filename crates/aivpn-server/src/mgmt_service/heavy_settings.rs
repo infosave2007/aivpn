@@ -25,24 +25,9 @@ use super::*;
 // session, the gateway's periodic sweep (see `gateway.rs`'s cleanup task)
 // restores the prior value.
 //
-// **v1 scope boundary (deliberately narrow):** the one heavy op wired
-// through this mechanism today is the active-mask override — the same
-// `<mask_dir>/.overrides/<client-id>.mask` file `management_api.rs`'s
-// pre-existing `set_active_mask` REST handler and `main.rs`'s
-// `--set-mask` CLI path already write. That file is a **persisted
-// setting**, not something this server continuously re-reads into a live
-// in-memory structure on every packet (grep confirms no `gateway.rs` code
-// path reads `.overrides/*.mask` today) — exactly the same "file-only"
-// characteristic `server.json` has (this module's doc / the P1.5 plan
-// explicitly permits scoping to settings that are "safe as
-// file-only-until-restart" when they don't already hot-reload). Wrapping
-// this SAME write in a rollback timer neither improves nor regresses that
-// pre-existing behavior; it only adds the safety net. `PriorSnapshot`/
-// `PendingConfig` (see `pending_config.rs`) are written generically
-// (`target_path` + raw prior bytes), so a future heavy op — exit-node
-// selection in Phase B, say — reuses `apply_heavy`/`confirm_config`
-// unchanged by adding a new `HeavySetting` variant and a new
-// `resolve_heavy_setting` arm below, without touching the rollback engine.
+// Gateway читает active-mask отдельно от обработки пакетов и отправляет
+// подписанный MaskUpdate. Удаление override при откате возвращает маску,
+// действовавшую в этой сессии до первого изменения настройки.
 
 /// One heavy, rollback-guarded setting `apply_heavy` knows how to apply.
 pub enum HeavySetting {

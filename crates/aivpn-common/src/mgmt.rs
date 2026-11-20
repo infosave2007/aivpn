@@ -21,6 +21,11 @@ use crate::protocol::ControlPayload;
 const REQUEST_INTERVAL: Duration = Duration::from_millis(210);
 const MAX_GET_RETRIES: usize = 2;
 const MAX_ACTIVE_REQUESTS: usize = 64;
+const RESPONSE_TIMEOUT: &str = "mgmt_call: timed out awaiting request queue or MgmtResponse";
+
+pub(crate) fn request_timed_out(error: &Error) -> bool {
+    matches!(error, Error::Session(message) if message == RESPONSE_TIMEOUT)
+}
 
 type PendingRequests = Arc<Mutex<HashMap<u32, oneshot::Sender<(u16, Vec<u8>)>>>>;
 
@@ -47,6 +52,53 @@ pub struct MgmtClient {
     diagnostic_slots: Arc<Semaphore>,
     /// Смена поколения прерывает ожидание очереди, канала, ответа и повтора.
     session_epoch: watch::Sender<u64>,
+    diagnostic_sender: Arc<Mutex<Option<mpsc::Sender<Vec<u8>>>>>,
+    diagnostic_receiver: Arc<Mutex<Option<Arc<crate::diagnostics::data::Receiver>>>>,
+    diagnostic_network: Arc<Mutex<Option<crate::diagnostics::data::Capabilities>>>,
+}
+
+pub struct DiagnosticSenderGuard {
+    owner: MgmtClient,
+    sender: mpsc::Sender<Vec<u8>>,
+}
+
+impl Drop for DiagnosticSenderGuard {
+    fn drop(&mut self) {
+        let mut current = self
+            .owner
+            .diagnostic_sender
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if current
+            .as_ref()
+            .is_some_and(|s| s.same_channel(&self.sender))
+        {
+            *current = None;
+            self.owner
+                .diagnostic_receiver
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take();
+        }
+    }
+}
+
+pub(crate) struct DiagnosticReceiverGuard {
+    slot: Arc<Mutex<Option<Arc<crate::diagnostics::data::Receiver>>>>,
+    receiver: Arc<crate::diagnostics::data::Receiver>,
+}
+
+impl Drop for DiagnosticReceiverGuard {
+    fn drop(&mut self) {
+        let mut slot = self.slot.lock().unwrap_or_else(|e| e.into_inner());
+        if slot
+            .as_ref()
+            .is_some_and(|r| Arc::ptr_eq(r, &self.receiver))
+        {
+            *slot = None;
+        }
+        self.receiver.wake.notify_waiters();
+    }
 }
 
 impl Default for MgmtClient {
@@ -65,6 +117,9 @@ impl MgmtClient {
             request_slots: Arc::new(Semaphore::new(MAX_ACTIVE_REQUESTS)),
             diagnostic_slots: Arc::new(Semaphore::new(MAX_ACTIVE_REQUESTS)),
             session_epoch: watch::channel(0).0,
+            diagnostic_sender: Arc::new(Mutex::new(None)),
+            diagnostic_receiver: Arc::new(Mutex::new(None)),
+            diagnostic_network: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -78,6 +133,123 @@ impl MgmtClient {
             .send_modify(|epoch| *epoch = epoch.wrapping_add(1));
         pending.clear();
         self.cached_role.store(0, Ordering::Relaxed);
+        self.diagnostic_sender
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        if let Some(receiver) = self
+            .diagnostic_receiver
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            receiver.wake.notify_waiters();
+        }
+    }
+
+    /// Диагностика пишет в ту же очередь RAW IP, что TUN и SOCKS.
+    pub fn install_diagnostic_sender(
+        &self,
+        sender: mpsc::Sender<Vec<u8>>,
+    ) -> DiagnosticSenderGuard {
+        *self
+            .diagnostic_sender
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(sender.clone());
+        DiagnosticSenderGuard {
+            owner: self.clone(),
+            sender,
+        }
+    }
+
+    pub(crate) fn diagnostic_sender(&self) -> Option<mpsc::Sender<Vec<u8>>> {
+        self.diagnostic_sender
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    pub(crate) fn diagnostic_id(&self) -> u32 {
+        loop {
+            let id = self.req_seq.fetch_add(1, Ordering::Relaxed);
+            if id != 0 {
+                return id;
+            }
+        }
+    }
+
+    pub(crate) fn diagnostic_epoch(&self) -> watch::Receiver<u64> {
+        self.session_epoch.subscribe()
+    }
+
+    pub(crate) fn listen_diagnostic(
+        &self,
+        receiver: Arc<crate::diagnostics::data::Receiver>,
+    ) -> DiagnosticReceiverGuard {
+        *self
+            .diagnostic_network
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(receiver.capabilities.clone());
+        *self
+            .diagnostic_receiver
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(receiver.clone());
+        DiagnosticReceiverGuard {
+            slot: self.diagnostic_receiver.clone(),
+            receiver,
+        }
+    }
+
+    /// Служебные IP-пробы, в том числе запоздалые, не попадают в приложения.
+    pub fn on_diagnostic_packet(&self, payload: &[u8]) -> bool {
+        let Some(packet) = crate::diagnostics::data::parse(payload) else {
+            return false;
+        };
+        if packet.direction != crate::diagnostics::data::Direction::Download
+            || !self
+                .diagnostic_network
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_ref()
+                .is_some_and(|caps| {
+                    packet.source == caps.server_ip && packet.destination == caps.client_ip
+                })
+        {
+            return false;
+        }
+        let receiver = self
+            .diagnostic_receiver
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if let Some(receiver) = receiver {
+            receiver.receive(&packet);
+        }
+        true
+    }
+
+    /// Не отправлять оставшиеся в очереди блоки завершенного теста.
+    pub fn diagnostic_packet_active(&self, payload: &[u8]) -> bool {
+        let Some(packet) = crate::diagnostics::data::parse(payload) else {
+            return true;
+        };
+        if packet.direction != crate::diagnostics::data::Direction::Upload
+            || !self
+                .diagnostic_network
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_ref()
+                .is_some_and(|caps| {
+                    packet.source == caps.client_ip && packet.destination == caps.server_ip
+                })
+        {
+            return true;
+        }
+        self.diagnostic_receiver
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .is_some_and(|r| r.request.id == packet.id && r.sending.load(Ordering::Acquire))
     }
 
     /// Current server-assigned role (0=User, 1=Viewer, 2=Admin), cached from
@@ -99,6 +271,17 @@ impl MgmtClient {
     /// duplicate response, or a response for a request this client never
     /// sent) is silently dropped — never panics.
     pub fn on_mgmt_response(&self, req_id: u32, status: u16, body: Vec<u8>) {
+        let receiver = self
+            .diagnostic_receiver
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if let Some(receiver) = receiver.filter(|r| r.request.response_id == req_id) {
+            if status == 200 {
+                receiver.acknowledge(&body);
+            }
+            return;
+        }
         let sender = self
             .pending
             .lock()
@@ -119,8 +302,8 @@ impl MgmtClient {
     /// Таймаут включает общую очередь, отправку, ответ и повторы.
     /// GET повторяется не более двух раз и только после явного статуса 429.
     /// Остальные методы, таймауты и ошибки канала не повторяются.
-    /// Три маршрута диагностики используют отдельный бюджет сервера:
-    /// они не ждут административный интервал и не повторяются.
+    /// Маршруты диагностики используют отдельный бюджет сервера и не ждут
+    /// административный интервал. Повторы согласования v2 выполняет измеритель.
     ///
     /// Возвращает `(status, body)` либо ошибку канала, таймаута, сброса сессии
     /// или переполнения очереди. Отмена и таймаут удаляют запись из pending,
@@ -167,8 +350,7 @@ impl MgmtClient {
                 }
             }
         }
-        let timeout_error =
-            || Error::Session("mgmt_call: timed out awaiting request queue or MgmtResponse".into());
+        let timeout_error = || Error::Session(RESPONSE_TIMEOUT.into());
         let mut body = body;
         let request = async {
             for attempt in 0..=MAX_GET_RETRIES {
@@ -266,6 +448,62 @@ mod scheduling_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn diagnostic_queue_is_cancelled_and_old_guards_cannot_clear_a_new_session() {
+        use crate::diagnostics::data;
+        let mgmt = MgmtClient::new();
+        let (old_tx, _old_rx) = mpsc::channel(8);
+        let old_guard = mgmt.install_diagnostic_sender(old_tx);
+        mgmt.reset();
+        let (tx, _rx) = mpsc::channel(8);
+        let _sender = mgmt.install_diagnostic_sender(tx.clone());
+        drop(old_guard);
+        assert!(mgmt.diagnostic_sender().unwrap().same_channel(&tx));
+        let request = data::Start {
+            id: [1; 16],
+            seed: [2; 32],
+            direction: data::Direction::Upload,
+            response_id: 42,
+            duration_ms: 1000,
+        };
+        let caps = data::Capabilities {
+            version: 2,
+            client_ip: "10.0.0.2".parse().unwrap(),
+            server_ip: "10.0.0.1".parse().unwrap(),
+            download_limit_kbps: None,
+        };
+        let receiver = Arc::new(data::Receiver::new(request.clone(), caps.clone()));
+        let _listen = mgmt.listen_diagnostic(receiver.clone());
+        let packet = data::packet(
+            caps.client_ip,
+            caps.server_ip,
+            request.id,
+            &request.seed,
+            data::Direction::Upload,
+            0,
+        );
+        assert!(mgmt.diagnostic_packet_active(&packet));
+        receiver.sending.store(false, Ordering::Release);
+        assert!(!mgmt.diagnostic_packet_active(&packet));
+        assert!(mgmt.diagnostic_packet_active(&[0x45; 100]));
+        let other = data::packet(
+            caps.client_ip,
+            "192.0.2.10".parse().unwrap(),
+            request.id,
+            &request.seed,
+            data::Direction::Upload,
+            0,
+        );
+        assert!(
+            mgmt.diagnostic_packet_active(&other),
+            "Похожий UDP-пакет вне адресов диагностики остается обычным трафиком"
+        );
+        assert!(!mgmt.on_diagnostic_packet(&other));
+        mgmt.reset();
+        assert!(mgmt.diagnostic_sender().is_none());
+        assert!(!mgmt.diagnostic_packet_active(&packet));
+    }
 
     #[tokio::test(start_paused = true)]
     async fn mgmt_call_timeout_includes_waiting_for_channel_capacity() {

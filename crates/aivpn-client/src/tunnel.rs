@@ -11,6 +11,13 @@ use crate::kill_switch::KillSwitch;
 use aivpn_common::error::{Error, Result};
 use aivpn_common::network_config::{ClientNetworkConfig, VpnNetworkConfig, LEGACY_SERVER_VPN_IP};
 
+#[cfg(all(test, target_os = "windows"))]
+#[path = "tunnel/windows_split_tests.rs"]
+mod windows_split_tests;
+
+#[cfg(target_os = "windows")]
+mod windows_routes;
+
 // Real worst-case outer overhead per packet:
 //   TAG(8) + MDH(varies, default 20) + pad_len(2) + inner_hdr(4) + random_padding(≤24) + Poly1305(16) ≈ 74 bytes.
 // Вмещает DATA и FEC во все встроенные носители при переключении масок.
@@ -125,6 +132,21 @@ impl TunnelConfig {
         }
     }
 
+    pub(crate) fn apply_network_assignment(&mut self, network: &ClientNetworkConfig) -> Result<()> {
+        network.validate()?;
+        let ipv6 = network.client_ipv6()?;
+        self.tun_addr = network.client_ip.to_string();
+        self.server_vpn_ip = network.server_vpn_ip.to_string();
+        self.tun_netmask = network.netmask_string();
+        self.prefix_len = network.prefix_len;
+        self.mtu = network
+            .mtu
+            .min(aivpn_common::network_config::MAX_MASK_TUN_MTU);
+        self.mdh_len = network.mdh_len;
+        self.ipv6 = ipv6;
+        Ok(())
+    }
+
     pub fn client_network_config(&self) -> Result<ClientNetworkConfig> {
         let client_ip = self.configured_client_ip()?;
         let server_vpn_ip = self.configured_server_vpn_ip()?;
@@ -193,8 +215,14 @@ pub struct Tunnel {
     #[allow(dead_code)]
     wintun_if_index: Option<String>,
     /// CIDRs added by apply_split_routes — removed on Drop.
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     split_routes_applied: Vec<String>,
+    #[cfg(target_os = "windows")]
+    owned_windows_split_routes: windows_routes::OwnedSplitRoutes,
+    #[cfg(target_os = "windows")]
+    owned_windows_tunnel_routes: windows_routes::OwnedSplitRoutes,
+    #[cfg(target_os = "windows")]
+    owned_windows_ipv4_addresses: windows_routes::OwnedIpv4Addresses,
     #[cfg(target_os = "linux")]
     owned_split_routes: Vec<Vec<String>>,
     #[cfg(not(target_os = "linux"))]
@@ -212,10 +240,12 @@ pub struct Tunnel {
     ipv6_address_applied: Option<(std::net::Ipv6Addr, u8)>,
     /// Active kill-switch instance; deactivated on graceful Drop.
     kill_switch_state: Option<KillSwitch>,
+    #[cfg(target_os = "linux")]
+    helper_tun: Option<crate::network_session::TunLease>,
 }
 
 /// PID of a currently in-flight `pkexec` child spawned by
-/// `Tunnel::run_via_pkexec_stdin`, if any (0 = none). Tracked so the client
+/// операции авторизации сети, if any (0 = none). Tracked so the client
 /// can attempt to kill it from its own shutdown/Drop path —
 /// `Tunnel::drop()` calls `kill_orphaned_pkexec_child()` — instead of
 /// leaving it reparented to init (and the polkit auth dialog still showing)
@@ -269,8 +299,14 @@ impl Tunnel {
             full_tunnel_routes_active: false,
             server_ip: None,
             wintun_if_index: None,
-            #[cfg(not(target_os = "linux"))]
+            #[cfg(not(any(target_os = "linux", target_os = "windows")))]
             split_routes_applied: Vec::new(),
+            #[cfg(target_os = "windows")]
+            owned_windows_split_routes: windows_routes::OwnedSplitRoutes::default(),
+            #[cfg(target_os = "windows")]
+            owned_windows_tunnel_routes: windows_routes::OwnedSplitRoutes::default(),
+            #[cfg(target_os = "windows")]
+            owned_windows_ipv4_addresses: windows_routes::OwnedIpv4Addresses::default(),
             #[cfg(target_os = "linux")]
             owned_split_routes: Vec::new(),
             #[cfg(not(target_os = "linux"))]
@@ -287,6 +323,8 @@ impl Tunnel {
             transport_routes: None,
             ipv6_address_applied: None,
             kill_switch_state: None,
+            #[cfg(target_os = "linux")]
+            helper_tun: None,
         }
     }
 
@@ -421,6 +459,23 @@ impl Tunnel {
             )));
         }
 
+        #[cfg(target_os = "linux")]
+        let helper_tun = if crate::network_session::needed() {
+            use std::os::fd::IntoRawFd;
+            let (descriptor, lease) = crate::network_session::create_tun(
+                &self.config.tun_name,
+                self.config.client_network_config()?,
+            )?;
+            config_builder = tun::Configuration::default();
+            config_builder
+                .raw_fd(descriptor.into_raw_fd())
+                .tun_name(&self.config.tun_name)
+                .mtu(self.config.mtu);
+            Some(lease)
+        } else {
+            None
+        };
+
         let dev = tun::create_as_async(&config_builder).map_err(|e| {
             let msg = e.to_string();
             #[cfg(target_os = "windows")]
@@ -472,9 +527,8 @@ impl Tunnel {
         // so the listener falls back to reporting every event — the pre-filter
         // behavior — rather than going silent.
         //
-        // Linux-only: `if_nametoindex` is not part of the Windows libc surface,
-        // and Linux is the only platform whose listener consumes the index (see
-        // `net_change::set_own_tun_ifindex`).
+        // Linux получает индекс через if_nametoindex. Windows регистрирует
+        // индекс ниже, после настройки Wintun.
         #[cfg(target_os = "linux")]
         {
             let ifindex = std::ffi::CString::new(self.config.tun_name.as_str())
@@ -488,6 +542,12 @@ impl Tunnel {
                 );
             }
             crate::net_change::set_own_tun_ifindex(ifindex);
+        }
+
+        #[cfg(target_os = "linux")]
+        if let Some(lease) = helper_tun {
+            lease.configure()?;
+            self.helper_tun = Some(lease);
         }
 
         // Platform-specific post-creation configuration
@@ -529,6 +589,16 @@ impl Tunnel {
                      Ensure Wintun is installed and the adapter name matches the config.",
                 )));
             }
+            let index = self
+                .windows_interface_index()?
+                .parse::<u32>()
+                .map_err(io::Error::other)?;
+            let network = self.config.vpn_network_config()?;
+            self.owned_windows_ipv4_addresses.adopt_initial(
+                index,
+                self.config.tun_addr.parse().map_err(io::Error::other)?,
+                network.prefix_len,
+            )?;
             self.configure_windows()?;
         }
 
@@ -557,12 +627,7 @@ impl Tunnel {
             .client_network_config()
             .ok()
             .map(|c| c.cidr_string());
-        self.config.tun_addr = network_config.client_ip.to_string();
-        self.config.server_vpn_ip = network_config.server_vpn_ip.to_string();
-        self.config.tun_netmask = network_config.netmask_string();
-        self.config.prefix_len = network_config.prefix_len;
-        self.config.mtu = network_config.mtu;
-        self.config.ipv6 = network_config.client_ipv6()?;
+        self.config.apply_network_assignment(&network_config)?;
 
         if self.reader.is_none() && self.writer.is_none() {
             return Ok(());
@@ -594,9 +659,18 @@ impl Tunnel {
         }
 
         #[cfg(target_os = "windows")]
-        self.configure_windows()?;
+        {
+            self.configure_windows()?;
+            if self.full_tunnel_routes_active {
+                self.configure_windows_full_routes()?;
+            }
+        }
 
         self.configure_ipv6()?;
+        #[cfg(target_os = "windows")]
+        if self.owned_windows_split_routes.is_applied() {
+            self.apply_split_routes()?;
+        }
         Ok(())
     }
 
@@ -818,39 +892,7 @@ impl Tunnel {
         format!("'{}'", s.replace('\'', r"'\''"))
     }
 
-    /// Fixed, system-wide path of the privileged network helper installed
-    /// by aivpn-linux's one-time setup (see `ensure_capable_binary` in
-    /// `crates/aivpn-linux/src/app.rs`), together with a polkit `.policy`
-    /// action binding `pkexec <this-exact-path>` to `auth_admin_keep`.
-    ///
-    /// This is a FIXED system path — `/usr/local/libexec/aivpn/`, root-owned
-    /// — rather than anything under the invoking user's home directory.
-    /// That matters for two reasons: (1) it lets the polkit action's
-    /// `org.freedesktop.policykit.exec.path` annotation be a hardcoded
-    /// string shared by every user on the machine, with no per-user
-    /// template substitution; and (2) unlike a per-user path, whose parent
-    /// directory is necessarily writable by that same user (making the
-    /// installed file swappable even though the file itself is root-owned
-    /// — directory write permission governs unlink/replace, not file
-    /// ownership), this path's entire directory chain is root-owned and
-    /// not group/other-writable, so no unprivileged process can plant a
-    /// substitute file here.
-    ///
-    /// Also works correctly when aivpn-client runs standalone (no GUI setup
-    /// ever ran): the path just won't exist, and the caller falls back to
-    /// `pkexec sh -c "..."` (see `run_ip_batch_privileged`).
-    #[cfg(target_os = "linux")]
-    fn ip_helper_path() -> std::path::PathBuf {
-        std::path::PathBuf::from("/usr/local/libexec/aivpn/aivpn-ip-helper")
-    }
-
-    /// Refuse to treat a file at the helper path as trustworthy unless it's
-    /// root-owned and not group/other-writable. Belt-and-suspenders: pkexec
-    /// itself doesn't care who owns the program it's asked to run (that's
-    /// not what makes root grant privilege — the polkit authorization is),
-    /// but if this ever finds something other than the aivpn-linux-installed
-    /// helper, we'd rather fall back to the known-safe `pkexec sh -c "..."`
-    /// path than hand root a script via an unverified binary.
+    /// Проверяет владельца и права всей цепочки системного файла.
     #[cfg(target_os = "linux")]
     fn is_trusted_root_binary(path: &std::path::Path) -> bool {
         use std::os::unix::fs::MetadataExt;
@@ -872,24 +914,12 @@ impl Tunnel {
             })
     }
 
-    /// Translate one `(name, ip-args)` pair — exactly the shapes already
-    /// constructed by `configure_linux` / `enable_full_tunnel` /
-    /// `apply_split_routes` below — into a single line of the
-    /// `aivpn-ip-helper` wire protocol:
-    ///
-    /// ```text
-    /// <name>\t<verb>\t<field>\t<field>...
-    /// ```
-    ///
-    /// Returns `None` for any args shape that isn't one of the helper's
-    /// whitelisted verbs (see `crates/aivpn-client/src/bin/aivpn-ip-helper.rs`)
-    /// — callers treat that as "can't use the helper for this batch, fall
-    /// back to `pkexec sh -c \"...\"`" rather than silently dropping a
-    /// command. Also rejects (returns `None` for) any field containing a
-    /// tab or newline, since those are the wire protocol's own field/line
-    /// separators — defense in depth on top of the `ip route show
-    /// default`-sourced values already being whitespace-split tokens that
-    /// can't contain either.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn system_ip() -> io::Result<std::process::Command> {
+        aivpn_desktop_agent::linux::system_network_command("ip")
+    }
+
+    /// Преобразует допустимую операцию в строку закрытого протокола помощника.
     #[cfg(target_os = "linux")]
     fn helper_line_for(name: &str, args: &[&str]) -> Option<String> {
         if name.is_empty()
@@ -1005,10 +1035,7 @@ impl Tunnel {
         }
     }
 
-    /// Build the full `aivpn-ip-helper` wire-protocol payload for a whole
-    /// batch, or `None` if any command in it doesn't map to one of the
-    /// helper's whitelisted verbs (in which case the caller falls back to
-    /// `pkexec sh -c "..."` for the entire batch — no partial helper use).
+    /// Проверяет весь набор до отправки, без частичного исполнения.
     #[cfg(target_os = "linux")]
     fn build_helper_wire(commands: &[(&str, &[&str])]) -> Option<String> {
         let mut lines = Vec::with_capacity(commands.len());
@@ -1018,75 +1045,6 @@ impl Tunnel {
         Some(lines.join("\n"))
     }
 
-    /// Parse `aivpn-ip-helper`'s `<name>:<exit_code>` output lines — the
-    /// shell-free equivalent of `parse_marker_statuses`'s
-    /// `__AIVPN_STATUS:<name>:<code>` markers used by the `pkexec sh -c
-    /// "..."` fallback path.
-    ///
-    /// The code is the command's plain shell exit code (0-255), NOT a raw
-    /// wait status: `ExitStatus::from_raw(code)` would misclassify e.g. 128
-    /// as success (`from_raw` expects `code << 8`). Keep it an `i32` and
-    /// compare `== 0` at call sites.
-    #[cfg(target_os = "linux")]
-    fn parse_helper_statuses(stdout: &[u8]) -> Vec<(String, i32)> {
-        String::from_utf8_lossy(stdout)
-            .lines()
-            .filter_map(|line| {
-                let (name, code) = line.rsplit_once(':')?;
-                let code: i32 = code.trim().parse().ok()?;
-                Some((name.to_string(), code))
-            })
-            .collect()
-    }
-
-    /// Run `pkexec <program>`, feeding `input` to the program's stdin and
-    /// closing it, then collecting output the same way `Command::output()`
-    /// would. Used for the `aivpn-ip-helper` path: the helper reads its
-    /// whole command batch from stdin (rather than argv) so the batch text
-    /// — which can embed VPN gateway/interface names sourced from `ip
-    /// route show default` — never shows up in `ps` output.
-    #[cfg(target_os = "linux")]
-    fn run_via_pkexec_stdin(
-        program: &std::path::Path,
-        input: &str,
-    ) -> io::Result<std::process::Output> {
-        use std::io::Write;
-        use std::process::{Command, Stdio};
-
-        let mut child = Command::new("pkexec")
-            .arg(program)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?;
-
-        ACTIVE_PKEXEC_PID.store(child.id(), std::sync::atomic::Ordering::SeqCst);
-        // Guard clears the tracked PID on every exit path (normal return,
-        // `?`-early-return doesn't apply here, but future edits might add
-        // one) so a completed/reaped child is never mistakenly signaled by
-        // `kill_orphaned_pkexec_child()` later.
-        struct ClearPidOnDrop;
-        impl Drop for ClearPidOnDrop {
-            fn drop(&mut self) {
-                ACTIVE_PKEXEC_PID.store(0, std::sync::atomic::Ordering::SeqCst);
-            }
-        }
-        let _clear_guard = ClearPidOnDrop;
-
-        if let Some(mut stdin) = child.stdin.take() {
-            // Best-effort: if the helper (or pkexec itself) exits early —
-            // e.g. the user cancels the auth dialog — the write can fail
-            // with EPIPE. That's not a new failure mode of ours; the
-            // eventual wait_with_output() below still reports the real
-            // process outcome either way.
-            let _ = stdin.write_all(input.as_bytes());
-        }
-
-        child.wait_with_output()
-    }
-
-    /// Даже пустой capability xattr сбрасывает ambient-права при exec.
-    /// Чужие права системного файла не меняем: используем помощник polkit.
     #[cfg(target_os = "linux")]
     fn can_inherit_net_admin(path: &std::path::Path) -> bool {
         use std::os::unix::ffi::OsStrExt;
@@ -1206,6 +1164,17 @@ impl Tunnel {
     /// from_raw(code)` would misclassify e.g. 128 as success.
     #[cfg(target_os = "linux")]
     fn run_ip_batch_privileged(commands: &[(&str, &[&str])]) -> io::Result<Vec<(String, i32)>> {
+        if let Some(session) = crate::network_session::current() {
+            let batch = Self::build_helper_wire(commands).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "Команда не входит в ограниченный протокол сетевого помощника",
+                )
+            })?;
+            return session
+                .request(crate::network_session::Request::Ip { batch })
+                .map(|(reply, _)| reply.statuses);
+        }
         use std::process::Command;
 
         let script: String = commands
@@ -1293,29 +1262,6 @@ impl Tunnel {
                 .join(", ")
         );
 
-        // Prefer `pkexec <aivpn-ip-helper>` over `pkexec sh -c "..."` when
-        // aivpn-linux's one-time setup has installed the helper at its
-        // fixed system path (see `ip_helper_path`) AND it passes the trust
-        // check: pkexec resolves the program's exact path and, since a
-        // polkit action annotates that exact path via
-        // org.freedesktop.policykit.exec.path (see
-        // platforms/linux/polkit/com.aivpn.client.policy), uses that
-        // action's auth level instead of the generic
-        // org.freedesktop.policykit.exec one. That action grants
-        // auth_admin_keep, so a disconnect→reconnect within the polkit
-        // session's cache window (~5 min by default) needs no further
-        // prompt. This is a single up-front decision (helper installed +
-        // trusted + every command maps to a whitelisted verb), not a
-        // try-then-retry — so a cancelled/failed helper auth never costs a
-        // second prompt via the sh -c fallback below.
-        let helper_path = Self::ip_helper_path();
-        if Self::is_trusted_root_binary(&helper_path) {
-            if let Some(wire) = Self::build_helper_wire(commands) {
-                let output = Self::run_via_pkexec_stdin(&helper_path, &wire)?;
-                return Ok(Self::parse_helper_statuses(&output.stdout));
-            }
-        }
-
         let output = Command::new("pkexec")
             .arg("sh")
             .arg("-c")
@@ -1379,114 +1325,114 @@ impl Tunnel {
 
     // ──────────────────── Windows ────────────────────
 
-    /// Discover the wintun adapter's interface index via `netsh`.
-    /// Used to pass `IF <index>` to `route add` so Windows binds the route
-    /// to wintun rather than the physical NIC with the best next-hop metric.
+    /// Найти индекс по точному alias созданного Wintun.
     #[cfg(target_os = "windows")]
     fn find_wintun_interface_index(&self) -> Option<String> {
-        let output = std::process::Command::new("netsh")
-            .args(["interface", "ipv4", "show", "interfaces"])
-            .output()
-            .ok()?;
-
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let tun_lower = self.config.tun_name.to_lowercase();
-        for line in stdout.lines() {
-            let trimmed = line.trim();
-            if trimmed.to_lowercase().ends_with(&tun_lower) {
-                if let Some(idx) = trimmed.split_whitespace().next() {
-                    if idx.parse::<u32>().is_ok() {
-                        return Some(idx.to_string());
-                    }
-                }
-            }
-        }
-        None
+        windows_routes::interface_index(&self.config.tun_name)
+            .ok()
+            .map(|index| index.to_string())
     }
 
-    /// Configure TUN device on Windows (netsh / route add)
     #[cfg(target_os = "windows")]
-    fn configure_windows(&self) -> Result<()> {
-        let peer_addr = &self.config.server_vpn_ip;
-        let vpn_network = self.config.vpn_network_config()?;
-        let network_addr = vpn_network.network_addr().to_string();
-        let tun_netmask = self.config.tun_netmask.clone();
-
-        // Explicitly bind the VPN subnet route to the wintun interface.
-        // Without IF, Windows may attach it to the physical NIC.
-        let (add_args, delete_args): (Vec<&str>, Vec<&str>) =
-            if let Some(ref idx) = self.wintun_if_index {
-                (
-                    vec![
-                        "add",
-                        network_addr.as_str(),
-                        "mask",
-                        tun_netmask.as_str(),
-                        peer_addr,
-                        "IF",
-                        idx.as_str(),
-                    ],
-                    vec![
-                        "delete",
-                        network_addr.as_str(),
-                        "mask",
-                        tun_netmask.as_str(),
-                        "IF",
-                        idx.as_str(),
-                    ],
-                )
-            } else {
-                (
-                    vec![
-                        "add",
-                        network_addr.as_str(),
-                        "mask",
-                        tun_netmask.as_str(),
-                        peer_addr,
-                    ],
-                    vec![
-                        "delete",
-                        network_addr.as_str(),
-                        "mask",
-                        tun_netmask.as_str(),
-                    ],
-                )
-            };
-
-        self.add_windows_route_with_retry(
-            &add_args,
-            &delete_args,
-            &format!(
-                "Added route {}/{} via {} IF {} (Windows)",
-                network_addr,
-                self.config.prefix_len,
-                peer_addr,
-                self.wintun_if_index.as_deref().unwrap_or("auto")
-            ),
-            &format!(
-                "VPN subnet route {}/{}",
-                network_addr, self.config.prefix_len
-            ),
-        )?;
-
-        // Set MTU via netsh (SetIpInterfaceEntry is skipped in config_builder for Windows
-        // due to a race with the IP stack; this runs after the session is established).
-        if let Some(ref idx) = self.wintun_if_index {
-            let mtu_str = self.config.mtu.to_string();
-            let _ = std::process::Command::new("netsh")
-                .args([
-                    "interface",
-                    "ipv4",
-                    "set",
-                    "subinterface",
-                    idx.as_str(),
-                    &format!("mtu={}", mtu_str),
-                    "store=persistent",
-                ])
-                .status();
+    fn windows_interface_index(&self) -> Result<&str> {
+        let index = self
+            .wintun_if_index
+            .as_deref()
+            .ok_or_else(|| Error::Io(io::Error::other("Не найден индекс интерфейса Wintun")))?;
+        let actual = windows_routes::interface_index(&self.config.tun_name)?;
+        if index.parse::<u32>().ok() != Some(actual) {
+            return Err(Error::Io(io::Error::other(
+                "Индекс не принадлежит интерфейсу Wintun",
+            )));
         }
+        Ok(index)
+    }
 
+    #[cfg(target_os = "windows")]
+    fn run_windows_netsh(args: &[&str]) -> Result<()> {
+        let output = std::process::Command::new("netsh").args(args).output()?;
+        if !output.status.success() {
+            return Err(Error::Io(io::Error::other(format!(
+                "Не удалось настроить Wintun: {}",
+                Self::windows_command_output(&output)
+            ))));
+        }
         Ok(())
+    }
+
+    #[cfg(target_os = "windows")]
+    fn configure_windows_full_routes(&mut self) -> Result<()> {
+        let index = self
+            .windows_interface_index()?
+            .parse::<u32>()
+            .map_err(io::Error::other)?;
+        self.configure_windows_tunnel_routes(index)
+    }
+
+    #[cfg(target_os = "windows")]
+    fn configure_windows_tunnel_routes(&mut self, index: u32) -> Result<()> {
+        let network = self.config.vpn_network_config()?;
+        let mut prefixes = vec![format!("{}/{}", network.network_addr(), network.prefix_len)];
+        if self.full_tunnel_routes_active {
+            prefixes.extend(["0.0.0.0/1".into(), "128.0.0.0/1".into()]);
+        }
+        self.owned_windows_tunnel_routes.apply_ipv4(
+            index,
+            self.config.configured_server_vpn_ip()?,
+            &prefixes,
+        )?;
+        Ok(())
+    }
+
+    #[cfg(target_os = "windows")]
+    fn configure_windows_point_to_point(&self, family: &str) -> Result<()> {
+        // Адреса этого Wintun назначает сервер. DAD на виртуальном канале
+        // оставляет их tentative и дает 10065 уже после подтверждения VPN.
+        Self::run_windows_netsh(&[
+            "interface",
+            family,
+            "set",
+            "interface",
+            self.windows_interface_index()?,
+            "dadtransmits=0",
+            "store=active",
+        ])
+    }
+
+    #[cfg(target_os = "windows")]
+    fn configure_windows(&mut self) -> Result<()> {
+        let index = self.windows_interface_index()?.to_string();
+        let idx = index.as_str();
+        self.configure_windows_point_to_point("ipv4")?;
+        let index = idx.parse::<u32>().map_err(io::Error::other)?;
+        let network = self.config.vpn_network_config()?;
+        let prepared = self.owned_windows_ipv4_addresses.prepare(
+            index,
+            self.config.tun_addr.parse().map_err(io::Error::other)?,
+            network.prefix_len,
+        )?;
+        let routes = self
+            .owned_windows_ipv4_addresses
+            .wait_ready(&prepared)
+            .map_err(Error::Io)
+            .and_then(|_| self.configure_windows_tunnel_routes(index));
+        if let Err(error) = routes {
+            if let Err(rollback) = self.owned_windows_ipv4_addresses.rollback(&prepared) {
+                warn!("Не удалось отменить новый собственный адрес Wintun: {rollback}");
+            }
+            return Err(error);
+        }
+        self.owned_windows_ipv4_addresses
+            .finish(&prepared, &self.owned_windows_tunnel_routes)?;
+        Self::run_windows_netsh(&[
+            "interface",
+            "ipv4",
+            "set",
+            "subinterface",
+            idx,
+            &format!("mtu={}", self.config.mtu),
+            "store=active",
+        ])
     }
 
     /// Настроить обход до открытия сокетов альтернативного транспорта.
@@ -1510,7 +1456,9 @@ impl Tunnel {
         #[cfg(target_os = "linux")]
         {
             self.transport_routes = None;
-            if let Some(mark) = mark {
+            if let Some(helper) = crate::network_session::current() {
+                helper.request(crate::network_session::Request::Transport { mark })?;
+            } else if let Some(mark) = mark {
                 self.transport_routes =
                     Some(crate::transport_routes::TransportRoutes::install(mark)?);
             }
@@ -1521,6 +1469,15 @@ impl Tunnel {
 
     /// Set VPN server IP (call before enable_full_tunnel)
     pub fn set_server_ip(&mut self, server_ip: String) {
+        #[cfg(target_os = "linux")]
+        if let Some(session) = crate::network_session::current() {
+            if let Ok(peer) = server_ip.parse() {
+                if let Err(error) = session.request(crate::network_session::Request::Peer { peer })
+                {
+                    warn!("Не подтвержден исходный маршрут сервера: {error}");
+                }
+            }
+        }
         self.server_ip = Some(server_ip);
     }
 
@@ -1674,86 +1631,29 @@ impl Tunnel {
         self.saved_default_gw = (!gw.is_empty()).then(|| gw.clone());
         self.full_tunnel_routes_active = true;
 
-        // 2 & 3. Bypass route for the VPN server IP + the 0/1+128/1
-        // full-tunnel trick, all issued as ONE privileged batch (at most one
-        // pkexec prompt for this whole function). All the bypass-route
-        // variants are safe to attempt unconditionally in the same batch:
-        // `ip route replace` only touches the routing table on success, so
-        // an invalid variant for this network topology (e.g. non-onlink when
-        // the gateway needs onlink) just fails without disturbing whatever
-        // the valid variant already installed — order doesn't matter, only
-        // "did at least one succeed".
+        // Сохраняем фактический путь к серверу, включая напрямую подключенную сеть.
+        let bypass = if let Some(server) = self.server_ip.as_ref().filter(|ip| !ip.contains(':')) {
+            let output = Command::new("ip")
+                .args(["-j", "-4", "route", "get", server])
+                .output()?;
+            if !output.status.success() {
+                return Err(Error::Io(io::Error::other(
+                    "Не найден исходный маршрут сервера",
+                )));
+            }
+            let rows: Vec<serde_json::Value> =
+                serde_json::from_slice(&output.stdout).map_err(io::Error::other)?;
+            Some(Self::linux_ipv4_bypass_args(
+                server,
+                rows.first()
+                    .ok_or_else(|| io::Error::other("Нет маршрута сервера"))?,
+            )?)
+        } else {
+            None
+        };
         let mut batch: Vec<(&str, Vec<&str>)> = Vec::new();
-        if let Some(server_ip) = self.server_ip.as_ref().filter(|ip| !ip.contains(':')) {
-            if default_onlink {
-                batch.push((
-                    "bypass_onlink",
-                    vec![
-                        "route",
-                        "replace",
-                        server_ip.as_str(),
-                        "via",
-                        gw.as_str(),
-                        "dev",
-                        default_dev.as_str(),
-                        "onlink",
-                    ],
-                ));
-            }
-            batch.push((
-                "bypass_plain",
-                vec![
-                    "route",
-                    "replace",
-                    server_ip.as_str(),
-                    "via",
-                    gw.as_str(),
-                    "dev",
-                    default_dev.as_str(),
-                ],
-            ));
-            if !default_onlink {
-                batch.push((
-                    "bypass_onlink",
-                    vec![
-                        "route",
-                        "replace",
-                        server_ip.as_str(),
-                        "via",
-                        gw.as_str(),
-                        "dev",
-                        default_dev.as_str(),
-                        "onlink",
-                    ],
-                ));
-            }
-            // Fallback path: a host route for the gateway itself (harmless
-            // to add even if a bypass variant above already succeeded), then
-            // one more bypass attempt that can now rely on it.
-            batch.push((
-                "gw_link",
-                vec![
-                    "route",
-                    "replace",
-                    gw.as_str(),
-                    "dev",
-                    default_dev.as_str(),
-                    "scope",
-                    "link",
-                ],
-            ));
-            batch.push((
-                "bypass_after_gw_link",
-                vec![
-                    "route",
-                    "replace",
-                    server_ip.as_str(),
-                    "via",
-                    gw.as_str(),
-                    "dev",
-                    default_dev.as_str(),
-                ],
-            ));
+        if let Some(args) = &bypass {
+            batch.push(("bypass_plain", args.iter().map(String::as_str).collect()));
         }
         batch.push((
             "ft_0",
@@ -1811,16 +1711,39 @@ impl Tunnel {
         Ok(())
     }
 
+    #[cfg(target_os = "linux")]
+    fn linux_ipv4_bypass_args(server: &str, route: &serde_json::Value) -> io::Result<Vec<String>> {
+        server
+            .parse::<std::net::Ipv4Addr>()
+            .map_err(io::Error::other)?;
+        let device = route["dev"]
+            .as_str()
+            .filter(|d| !d.is_empty())
+            .ok_or_else(|| io::Error::other("Нет интерфейса сервера"))?;
+        let mut args = vec!["route".into(), "replace".into(), server.into()];
+        if let Some(gateway) = route["gateway"].as_str() {
+            let gateway = gateway
+                .parse::<std::net::Ipv4Addr>()
+                .map_err(io::Error::other)?;
+            args.extend(["via".into(), gateway.to_string()]);
+        }
+        args.extend(["dev".into(), device.into()]);
+        if route["gateway"].is_string() {
+            args.push("onlink".into());
+        }
+        Ok(args)
+    }
+
     /// Enable full-tunnel mode on Windows
     #[cfg(target_os = "windows")]
     pub fn enable_full_tunnel(&mut self) -> Result<()> {
         use std::process::Command;
 
-        let peer_addr = self.config.server_vpn_ip.clone();
-
         // 1. Get current default gateway via powershell
         let output = Command::new("powershell")
             .args([
+                "-NoProfile",
+                "-NonInteractive",
                 "-Command",
                 "(Get-NetRoute -DestinationPrefix '0.0.0.0/0' | Select-Object -First 1).NextHop",
             ])
@@ -1864,52 +1787,7 @@ impl Tunnel {
             )?;
         }
 
-        // 3. Route all traffic through TUN via 0/1 + 128/1 trick
-        //    Explicitly bind to wintun IF to prevent Windows from attaching
-        //    these routes to the physical NIC.
-        for net in [("0.0.0.0", "128.0.0.0"), ("128.0.0.0", "128.0.0.0")] {
-            let if_suffix = self.wintun_if_index.as_deref().unwrap_or("auto");
-            let success_message = format!(
-                "Added full-tunnel route: {}/1 via {} IF {}",
-                net.0, peer_addr, if_suffix
-            );
-            let (add_args, delete_args): (Vec<&str>, Vec<&str>) =
-                if let Some(ref idx) = self.wintun_if_index {
-                    (
-                        vec![
-                            "add",
-                            net.0,
-                            "mask",
-                            net.1,
-                            peer_addr.as_str(),
-                            "metric",
-                            "5",
-                            "IF",
-                            idx.as_str(),
-                        ],
-                        vec!["delete", net.0, "mask", net.1],
-                    )
-                } else {
-                    (
-                        vec![
-                            "add",
-                            net.0,
-                            "mask",
-                            net.1,
-                            peer_addr.as_str(),
-                            "metric",
-                            "5",
-                        ],
-                        vec!["delete", net.0, "mask", net.1],
-                    )
-                };
-            self.add_windows_route_with_retry(
-                &add_args,
-                &delete_args,
-                &success_message,
-                &format!("full-tunnel route {}/{}", net.0, net.1),
-            )?;
-        }
+        self.configure_windows_full_routes()?;
 
         self.configure_ipv6()?;
         info!("Full tunnel mode enabled — all traffic routed through VPN");
@@ -1982,10 +1860,8 @@ impl Tunnel {
     fn disable_full_tunnel(&mut self) {
         use std::process::Command;
 
-        for net in [("0.0.0.0", "128.0.0.0"), ("128.0.0.0", "128.0.0.0")] {
-            let _ = Command::new("route")
-                .args(["delete", net.0, "mask", net.1])
-                .status();
+        if let Err(error) = self.owned_windows_tunnel_routes.clear_full_ipv4() {
+            warn!("Не удалось удалить собственные маршруты полного туннеля: {error}");
         }
         if let Some(server_ip) = self.server_ip.as_ref().filter(|ip| !ip.contains(':')) {
             let _ = Command::new("route").args(["delete", server_ip]).status();
@@ -2002,20 +1878,6 @@ impl Tunnel {
     fn disable_full_tunnel(&mut self) {}
 
     // ──────────────────── Split-tunnel ────────────────────
-
-    /// Parse "a.b.c.d/n" → (net_addr, netmask) for Windows route commands.
-    #[cfg(target_os = "windows")]
-    fn cidr_to_net_mask(cidr: &str) -> Option<(String, String)> {
-        let (net, prefix) = cidr.split_once('/')?;
-        let prefix: u8 = prefix.parse().ok()?;
-        let _: std::net::Ipv4Addr = net.parse().ok()?;
-        let mask = if prefix == 0 {
-            0u32
-        } else {
-            u32::MAX.wrapping_shl(32 - prefix as u32)
-        };
-        Some((net.to_string(), std::net::Ipv4Addr::from(mask).to_string()))
-    }
 
     /// Apply include/exclude routes for split-tunnel mode.
     /// Call after enable_full_tunnel (if in full-tunnel mode) and after TUN is up.
@@ -2230,80 +2092,25 @@ impl Tunnel {
 
     #[cfg(target_os = "windows")]
     pub fn apply_split_routes(&mut self) -> Result<()> {
-        use std::process::Command;
-        let peer = self.config.server_vpn_ip.clone();
-
-        for cidr in self.config.include_routes.clone() {
-            if let Some((net, mask)) = Self::cidr_to_net_mask(&cidr) {
-                let ok = if let Some(ref idx) = self.wintun_if_index.clone() {
-                    Command::new("route")
-                        .args(["add", &net, "mask", &mask, &peer, "IF", idx])
-                        .status()
-                        .map(|s| s.success())
-                        .unwrap_or(false)
-                } else {
-                    Command::new("route")
-                        .args(["add", &net, "mask", &mask, &peer])
-                        .status()
-                        .map(|s| s.success())
-                        .unwrap_or(false)
-                };
-                if ok {
-                    info!("Split-tunnel include: {} via {}", cidr, peer);
-                    self.split_routes_applied.push(cidr);
-                } else {
-                    error!("Split-tunnel: failed to add include route {}", cidr);
-                }
-            }
-        }
-
-        let gw_opt = self.saved_default_gw.clone().or_else(|| {
-            Command::new("powershell")
-                .args([
-                    "-Command",
-                    "(Get-NetRoute -DestinationPrefix '0.0.0.0/0' | Select-Object -First 1).NextHop",
-                ])
-                .output()
-                .ok()
-                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-                .filter(|s| !s.is_empty())
-        });
-
-        if let Some(gw) = gw_opt {
-            for cidr in self.config.exclude_routes.clone() {
-                if let Some((net, mask)) = Self::cidr_to_net_mask(&cidr) {
-                    let ok = Command::new("route")
-                        .args(["add", &net, "mask", &mask, &gw])
-                        .status()
-                        .map(|s| s.success())
-                        .unwrap_or(false);
-                    if ok {
-                        info!("Split-tunnel exclude: {} via {} (bypass VPN)", cidr, gw);
-                        self.split_routes_applied.push(cidr);
-                    } else {
-                        error!("Split-tunnel: failed to exclude route {}", cidr);
-                    }
-                }
-            }
-        } else if !self.config.exclude_routes.is_empty() {
-            error!("Split-tunnel: no default gateway found for exclude_routes");
-        }
-
+        let index = self
+            .windows_interface_index()?
+            .parse::<u32>()
+            .map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidInput, "Некорректный индекс Wintun")
+            })?;
+        self.owned_windows_split_routes.apply(
+            index,
+            self.config.configured_server_vpn_ip()?,
+            &self.config.include_routes,
+            &self.config.exclude_routes,
+        )?;
         Ok(())
     }
 
     #[cfg(target_os = "windows")]
     fn remove_split_routes(&mut self) {
-        use std::process::Command;
-        for cidr in self.split_routes_applied.drain(..) {
-            if let Some((net, mask)) = Self::cidr_to_net_mask(&cidr) {
-                let _ = Command::new("route")
-                    .args(["delete", &net, "mask", &mask])
-                    .status();
-            }
-        }
-        if !self.config.include_routes.is_empty() || !self.config.exclude_routes.is_empty() {
-            info!("Split-tunnel routes removed");
+        if let Err(error) = self.owned_windows_split_routes.clear() {
+            warn!("Не удалось удалить собственные маршруты split tunnel: {error}");
         }
     }
 
@@ -2475,6 +2282,9 @@ impl Tunnel {
     #[cfg(target_os = "linux")]
     fn run_owned_ipv6_command(args: &[String]) -> io::Result<i32> {
         let borrowed: Vec<_> = args.iter().map(String::as_str).collect();
+        if crate::network_session::current().is_some() {
+            return Self::run_ip_privileged(&borrowed);
+        }
         // Linux не учитывает тип маршрута при RTM_DELROUTE. Проверка до
         // удаления не дает снять чужой prohibit или unicast с тем же metric.
         if borrowed.get(2) == Some(&"del") && !Self::owned_ipv6_route_present(&borrowed)? {
@@ -2516,12 +2326,7 @@ impl Tunnel {
                 ))
             }
         };
-        let ip = ["/usr/sbin/ip", "/usr/bin/ip", "/sbin/ip", "/bin/ip"]
-            .into_iter()
-            .map(std::path::Path::new)
-            .find(|path| Self::is_trusted_root_binary(path))
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Не найден системный ip"))?;
-        let output = std::process::Command::new(ip)
+        let output = Self::system_ip()?
             .args(["-j", "-6", "route", "show", "exact", prefix, "proto", "242"])
             .output()?;
         if !output.status.success() {
@@ -2652,7 +2457,14 @@ impl Tunnel {
             // server уже разобран как IPv6, строка не может содержать код PowerShell.
             let script = format!("$r=Find-NetRoute -RemoteIPAddress '{server}' | Where-Object {{ $_.DestinationPrefix }} | Select-Object -First 1; if (!$r) {{ exit 1 }}; Write-Output ($r.InterfaceIndex.ToString()+' '+$r.NextHop)");
             let output = std::process::Command::new("powershell")
-                .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+                .args([
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    &script,
+                ])
                 .output()?;
             let text = String::from_utf8_lossy(&output.stdout);
             let fields: Vec<_> = text.split_whitespace().collect();
@@ -2705,17 +2517,22 @@ impl Tunnel {
             ],
         );
         #[cfg(target_os = "windows")]
-        return Self::checked_ipv6_command(
-            "netsh",
-            &[
-                "interface",
-                "ipv6",
-                if add { "add" } else { "delete" },
-                "address",
-                &self.config.tun_name,
-                if add { &cidr } else { &bare_address },
-            ],
-        );
+        {
+            if add {
+                self.configure_windows_point_to_point("ipv6")?;
+            }
+            return Self::checked_ipv6_command(
+                "netsh",
+                &[
+                    "interface",
+                    "ipv6",
+                    if add { "add" } else { "delete" },
+                    "address",
+                    &self.config.tun_name,
+                    if add { &cidr } else { &bare_address },
+                ],
+            );
+        }
         #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
         Err(Error::InvalidPacket(
             "IPv6 interface configuration is unsupported",
@@ -2768,14 +2585,19 @@ impl Tunnel {
 
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     fn checked_ipv6_command(program: &str, args: &[&str]) -> Result<()> {
-        let status = std::process::Command::new(program)
+        let output = std::process::Command::new(program)
             .args(args)
-            .status()
+            .output()
             .map_err(Error::Io)?;
-        if status.success() {
+        if output.status.success() {
             Ok(())
         } else {
-            Err(Error::Io(io::Error::other("IPv6 configuration failed")))
+            Err(Error::Io(io::Error::other(format!(
+                "Не удалось настроить IPv6 ({program} {}): {} {}",
+                args.join(" "),
+                String::from_utf8_lossy(&output.stdout).trim(),
+                String::from_utf8_lossy(&output.stderr).trim(),
+            ))))
         }
     }
 
@@ -2897,12 +2719,20 @@ impl Drop for Tunnel {
         kill_orphaned_pkexec_child();
 
         self.remove_split_routes();
+        #[cfg(target_os = "windows")]
+        if let Err(error) = self.owned_windows_tunnel_routes.clear() {
+            warn!("Не удалось удалить собственный маршрут подсети: {error}");
+        }
 
         if self.config.full_tunnel && self.full_tunnel_routes_active {
             self.disable_full_tunnel();
         }
 
         self.restore_ipv6();
+        #[cfg(target_os = "windows")]
+        if let Err(error) = self.owned_windows_ipv4_addresses.clear() {
+            warn!("Не удалось удалить собственные адреса Wintun: {error}");
+        }
 
         if self.writer.is_some() || self.reader.is_some() {
             info!("Closing TUN device: {}", self.config.tun_name);
@@ -2919,6 +2749,108 @@ impl Drop for Tunnel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "windows")]
+    #[tokio::test]
+    #[ignore = "Нужна отдельная Windows VM с Wintun, правами администратора и без активного AIVPN"]
+    async fn windows_tunnel_assignment_is_immediately_usable() {
+        assert_eq!(
+            std::env::var("AIVPN_NATIVE_CIDR_TEST").as_deref(),
+            Ok("1"),
+            "Нужна явная переменная стенда до создания адаптера"
+        );
+        use windows_sys::Win32::NetworkManagement::IpHelper::{
+            ConvertInterfaceAliasToLuid, GetIfEntry2, GetUnicastIpAddressEntry, MIB_IF_ROW2,
+            MIB_UNICASTIPADDRESS_ROW,
+        };
+        use windows_sys::Win32::NetworkManagement::Ndis::{IfOperStatusUp, NET_LUID_LH};
+        use windows_sys::Win32::Networking::WinSock::{
+            IpDadStatePreferred, AF_INET, AF_INET6, SOCKADDR_IN, SOCKADDR_IN6,
+        };
+
+        let alias: Vec<u16> = "AIVPN".encode_utf16().chain(Some(0)).collect();
+        let mut luid = NET_LUID_LH::default();
+        if unsafe { ConvertInterfaceAliasToLuid(alias.as_ptr(), &mut luid) } == 0 {
+            let mut existing = MIB_IF_ROW2 {
+                InterfaceLuid: luid,
+                ..Default::default()
+            };
+            assert!(
+                unsafe { GetIfEntry2(&mut existing) } != 0 || existing.OperStatus != IfOperStatusUp,
+                "Нельзя запускать тест поверх действующего адаптера AIVPN"
+            );
+        }
+        let mut tunnel = Tunnel::new(TunnelConfig {
+            tun_addr: "198.19.100.2".into(),
+            server_vpn_ip: "198.19.100.1".into(),
+            ..Default::default()
+        });
+        tunnel.create().await.unwrap();
+        let idx: u32 = tunnel.windows_interface_index().unwrap().parse().unwrap();
+        let check = |ip: std::net::IpAddr| {
+            let mut row = MIB_UNICASTIPADDRESS_ROW {
+                InterfaceIndex: idx,
+                ..Default::default()
+            };
+            match ip {
+                std::net::IpAddr::V4(ip) => {
+                    let mut address = SOCKADDR_IN {
+                        sin_family: AF_INET,
+                        ..Default::default()
+                    };
+                    address.sin_addr.S_un.S_addr = u32::from_ne_bytes(ip.octets());
+                    row.Address.Ipv4 = address;
+                }
+                std::net::IpAddr::V6(ip) => {
+                    let mut address = SOCKADDR_IN6 {
+                        sin6_family: AF_INET6,
+                        ..Default::default()
+                    };
+                    address.sin6_addr.u.Byte = ip.octets();
+                    row.Address.Ipv6 = address;
+                }
+            }
+            assert_eq!(unsafe { GetUnicastIpAddressEntry(&mut row) }, 0);
+            assert_eq!(row.DadState, IpDadStatePreferred, "Адрес {ip} еще не готов");
+        };
+        // Повторное назначение сервера не должно снова делать адрес tentative.
+        tunnel.configure_windows().unwrap();
+        check("198.19.100.2".parse().unwrap());
+        tunnel.config.tun_addr = "198.19.100.3".into();
+        tunnel.configure_windows().unwrap();
+        check("198.19.100.3".parse().unwrap());
+        let v6 = "fd42:ad:100::2".parse().unwrap();
+        tunnel.ipv6_address_command((v6, 64), true).unwrap();
+        check(v6.into());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn ipv4_server_bypass_preserves_direct_and_routed_paths() {
+        let direct =
+            Tunnel::linux_ipv4_bypass_args("192.0.2.1", &serde_json::json!({"dev":"wan0"}))
+                .unwrap();
+        assert_eq!(direct, vec!["route", "replace", "192.0.2.1", "dev", "wan0"]);
+        let routed = Tunnel::linux_ipv4_bypass_args(
+            "198.51.100.7",
+            &serde_json::json!({"dev":"eth0","gateway":"192.0.2.254"}),
+        )
+        .unwrap();
+        assert_eq!(
+            routed,
+            vec![
+                "route",
+                "replace",
+                "198.51.100.7",
+                "via",
+                "192.0.2.254",
+                "dev",
+                "eth0",
+                "onlink"
+            ]
+        );
+        assert!(Tunnel::linux_ipv4_bypass_args("192.0.2.1", &serde_json::json!({})).is_err());
+    }
 
     #[cfg(target_os = "linux")]
     #[test]
@@ -3496,26 +3428,6 @@ mod tests {
             !std::path::Path::new("/tmp/aivpn_shell_quote_pwned").exists(),
             "shell_quote failed to neutralize an embedded command substitution/terminator"
         );
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn test_parse_helper_statuses_uses_shell_exit_codes() {
-        // The helper prints `<name>:<shell exit code>`. Regression test for
-        // the from_raw bug: ExitStatus::from_raw(128) has code() == Some(0),
-        // i.e. a failed command (exit 128) looked like a success. The parser
-        // must surface the plain exit code so callers can compare `== 0`.
-        let results = Tunnel::parse_helper_statuses(b"addr:0\ndel_ft_0:128\nbadline\nroute:2\n");
-        assert_eq!(
-            results,
-            vec![
-                ("addr".to_string(), 0),
-                ("del_ft_0".to_string(), 128),
-                ("route".to_string(), 2),
-            ]
-        );
-        assert!(results.iter().any(|(_, c)| *c == 0));
-        assert!(results.iter().filter(|(_, c)| *c != 0).count() == 2);
     }
 
     #[cfg(target_os = "linux")]

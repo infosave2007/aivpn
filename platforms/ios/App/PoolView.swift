@@ -29,7 +29,7 @@ struct PoolView: View {
     @State private var errorMessage: String?
 
     var body: some View {
-        NavigationStack {
+        CompatibleNavigationView {
             Group {
                 if isLoading && nodes.isEmpty && health == nil {
                     ProgressView(loc.t("admin_loading"))
@@ -54,11 +54,11 @@ struct PoolView: View {
 
                         if let health {
                             Section(header: Text(loc.t("pool_health_section"))) {
-                                LabeledContent(loc.t("pool_transport"), value: transportLabel(health.transport))
-                                LabeledContent(loc.t("pool_total_nodes"), value: "\(health.total_nodes)")
-                                LabeledContent(loc.t("pool_connected_peers"), value: "\(health.connected_peers)")
-                                LabeledContent(loc.t("pool_converged_peers"), value: "\(health.converged_peers)")
-                                LabeledContent(loc.t("pool_diverged"), value: health.diverged ? loc.t("admin_yes") : loc.t("admin_no"))
+                                CompatibleValueRow(loc.t("pool_transport"), value: transportLabel(health.transport))
+                                CompatibleValueRow(loc.t("pool_total_nodes"), value: "\(health.total_nodes)")
+                                CompatibleValueRow(loc.t("pool_connected_peers"), value: "\(health.connected_peers)")
+                                CompatibleValueRow(loc.t("pool_converged_peers"), value: "\(health.converged_peers)")
+                                CompatibleValueRow(loc.t("pool_diverged"), value: health.diverged ? loc.t("admin_yes") : loc.t("admin_no"))
                             }
                         }
 

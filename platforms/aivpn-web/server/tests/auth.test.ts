@@ -1,10 +1,11 @@
-import { afterAll, beforeAll, expect, test } from 'bun:test'
-import { mkdtempSync, rmSync } from 'node:fs'
+import { afterAll, beforeAll, expect, spyOn, test } from 'bun:test'
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { randomBytes, randomUUID } from 'node:crypto'
 import { Hono } from 'hono'
 import http from 'node:http'
+import https from 'node:https'
 import { eq, sql } from 'drizzle-orm'
 
 // Все запросы и миграции используют отдельную временную базу.
@@ -228,6 +229,43 @@ test('отзыв сессии закрывает уже открытый SSE', a
   }
 }, 8_000)
 
+test('медленный SSE-клиент ограничивает чтение upstream и освобождает соединение', async () => {
+  let produced = 0
+  let closed = false
+  const total = 16 * 1024 * 1024
+  const chunk = Buffer.alloc(16 * 1024, 32)
+  const upstream = http.createServer((_req, res) => {
+    res.once('close', () => { closed = true })
+    res.writeHead(200, { 'Content-Type': 'text/event-stream' })
+    const pump = () => {
+      while (!res.destroyed && produced < total) {
+        produced += chunk.length
+        if (!res.write(chunk)) { res.once('drain', pump); return }
+      }
+    }
+    pump()
+  })
+  await new Promise<void>(resolve => upstream.listen(config.UNIX_SOCK, resolve))
+  let response: Response | undefined
+  try {
+    const session = await login(await newUser())
+    const minted = await post('/web/events/ticket', {}, { Authorization: `Bearer ${session.token}` })
+    const { ticket } = await minted.json() as { ticket: string }
+    response = await app.request(`/web/events?ticket=${ticket}`)
+    await Bun.sleep(300)
+    expect(produced).toBeLessThan(total)
+    const reader = response.body!.getReader()
+    for (let i = 0; i < 4; i++) expect((await reader.read()).done).toBe(false)
+    await reader.cancel()
+    for (let i = 0; i < 100 && !closed; i++) await Bun.sleep(10)
+    expect(closed).toBe(true)
+  } finally {
+    if (response && !response.body!.locked) await response.body!.cancel().catch(() => {})
+    upstream.closeAllConnections()
+    await new Promise<void>(resolve => upstream.close(() => resolve()))
+  }
+})
+
 test('proxy отдает начало ответа до завершения upstream и закрывает его при отмене', async () => {
   let closed = false
   const upstream = http.createServer((_req, res) => {
@@ -320,16 +358,34 @@ test('SSO проверяет cookie и создает одну учетную з
   const codes = new Map<string, string>()
   const subject = randomUUID()
   let issuer = ''
-  const identityProvider = Bun.serve({ hostname: '127.0.0.1', port: 0, async fetch(request) {
+  let tokenPath = '/token'
+  let lastTokenPath = ''
+  const keyFile = join(directory, 'oidc-test-key.pem')
+  const certFile = join(directory, 'oidc-test-cert.pem')
+  const certificate = Bun.spawnSync(['openssl', 'req', '-x509', '-newkey', 'rsa:2048', '-nodes',
+    '-keyout', keyFile, '-out', certFile, '-days', '1', '-subj', '/CN=127.0.0.1',
+    '-addext', 'subjectAltName=IP:127.0.0.1'])
+  expect(certificate.exitCode).toBe(0)
+  const ca = readFileSync(certFile)
+  const originalFetch = globalThis.fetch
+  const originalCa = https.globalAgent.options.ca
+  https.globalAgent.options.ca = ca
+  globalThis.fetch = Object.assign((input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
+    const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url
+    return originalFetch(input, new URL(url).origin === issuer ? { ...init, tls: { ca } } : init)
+  }, { preconnect: originalFetch.preconnect })
+  const identityProvider = Bun.serve({ hostname: '127.0.0.1', port: 0,
+    tls: { key: readFileSync(keyFile), cert: ca }, async fetch(request) {
     const url = new URL(request.url)
     if (url.pathname === '/.well-known/openid-configuration') return Response.json({
-      authorization_endpoint: `${issuer}/authorize`, token_endpoint: `${issuer}/token`, jwks_uri: `${issuer}/keys`,
+      issuer, authorization_endpoint: `${issuer}/authorize?tenant=test`, token_endpoint: `${issuer}${tokenPath}`, jwks_uri: `${issuer}/keys`,
     })
     if (url.pathname === '/keys') return Response.json(keys)
+    lastTokenPath = url.pathname
     const form = await request.formData()
     return Response.json({ id_token: codes.get(String(form.get('code'))) })
   } })
-  issuer = `http://127.0.0.1:${identityProvider.port}`
+  issuer = `https://127.0.0.1:${identityProvider.port}`
   const previous = { mode: config.OIDC_MODE, issuer: config.OIDC_ISSUER, client: config.OIDC_CLIENT_ID, origin: config.ORIGIN }
   Object.assign(config, { OIDC_MODE: 'enabled', OIDC_ISSUER: issuer, OIDC_CLIENT_ID: 'test-panel', ORIGIN: 'https://panel.example' })
   try {
@@ -343,6 +399,7 @@ test('SSO проверяет cookie и создает одну учетную з
       expect(cookie.startsWith('__Host-aivpn_oidc_pkce=')).toBe(true)
       expect(start.headers.get('set-cookie')).toContain('; Secure')
       const location = new URL(start.headers.get('location')!)
+      expect(location.searchParams.get('tenant')).toBe('test')
       const state = location.searchParams.get('state')!
       const nonce = location.searchParams.get('nonce')!
       const code = randomUUID()
@@ -362,7 +419,26 @@ test('SSO проверяет cookie и создает одну учетную з
     const created = await db.select().from(users).where(eq(users.oidc_sub, subject))
     expect(created.length).toBe(1)
     expect(created[0].role).toBe('viewer')
+    tokenPath = '/token-refreshed'
+    const clock = spyOn(Date, 'now').mockReturnValue(Date.now() + 5 * 60_000 + 1)
+    try {
+      const start = await oidc.request('/web/auth/oidc/start')
+      expect(start.status).toBe(302)
+      const cookie = start.headers.get('set-cookie')!.split(';')[0]!
+      const location = new URL(start.headers.get('location')!)
+      const code = randomUUID()
+      codes.set(code, await new SignJWT({ nonce: location.searchParams.get('nonce') })
+        .setProtectedHeader({ alg: 'ES256', kid: 'test-key' }).setSubject(subject).setIssuer(issuer)
+        .setAudience('test-panel').setIssuedAt().setExpirationTime('5m').sign(privateKey))
+      const response = await oidc.request(`/web/auth/oidc/callback?${new URLSearchParams({
+        code, state: location.searchParams.get('state')!,
+      })}`, { headers: { Cookie: cookie } })
+      expect(response.status).toBe(200)
+      expect(lastTokenPath).toBe('/token-refreshed')
+    } finally { clock.mockRestore() }
   } finally {
+    globalThis.fetch = originalFetch
+    https.globalAgent.options.ca = originalCa
     Object.assign(config, { OIDC_MODE: previous.mode, OIDC_ISSUER: previous.issuer, OIDC_CLIENT_ID: previous.client, ORIGIN: previous.origin })
     await identityProvider.stop(true)
   }
@@ -396,4 +472,22 @@ test('поздний ответ passkey не откатывает счетчик
   await db.insert(passkeys).values({ id: zeroId, user_id: user.id, credential_id: randomUUID(), public_key: 'test', counter: 0 })
   expect(await claimPasskeyCounter(db, passkeys, zeroId, 0)).toBe(true)
   expect(await claimPasskeyCounter(db, passkeys, zeroId, 0)).toBe(true)
+})
+
+
+test('число неиспользованных SSE tickets ограничено для каждого пользователя', async () => {
+  const first = await login(await newUser())
+  const headers = { Authorization: `Bearer ${first.token}` }
+  let oldest = ''
+  for (let i = 0; i < 16; i++) {
+    const minted = await post('/web/events/ticket', {}, headers)
+    expect(minted.status).toBe(200)
+    if (i === 0) oldest = (await minted.json() as { ticket: string }).ticket
+  }
+  expect((await post('/web/events/ticket', {}, headers)).status).toBe(429)
+  const second = await login(await newUser())
+  expect((await post('/web/events/ticket', {}, { Authorization: `Bearer ${second.token}` })).status).toBe(200)
+  // Неуспех upstream тоже потребляет билет и освобождает место.
+  await app.request(`/web/events?ticket=${oldest}`)
+  expect((await post('/web/events/ticket', {}, headers)).status).toBe(200)
 })

@@ -32,7 +32,7 @@ subtle.workspace = true
 zeroize.workspace = true
 
 # Async
-tokio.workspace = true
+tokio = { workspace = true, features = ["signal"] }
 
 # Networking
 tun = { version = "0.7", features = ["async"] }

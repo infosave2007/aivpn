@@ -1,19 +1,25 @@
 //! Правила WFP принадлежат приложению и не меняют политики других брандмауэров.
 
 use std::io;
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::ptr::{null, null_mut};
 use windows_sys::core::GUID;
 use windows_sys::Win32::Foundation::{
-    FWP_E_ALREADY_EXISTS, FWP_E_FILTER_NOT_FOUND, FWP_E_SUBLAYER_NOT_FOUND, HANDLE,
+    ERROR_BUFFER_OVERFLOW, ERROR_NO_DATA, FWP_E_ALREADY_EXISTS, FWP_E_FILTER_NOT_FOUND,
+    FWP_E_SUBLAYER_NOT_FOUND, HANDLE,
 };
-use windows_sys::Win32::NetworkManagement::IpHelper::ConvertInterfaceAliasToLuid;
+use windows_sys::Win32::NetworkManagement::IpHelper::{
+    ConvertInterfaceAliasToLuid, GetAdaptersAddresses, IP_ADAPTER_ADDRESSES_LH,
+};
 use windows_sys::Win32::NetworkManagement::Ndis::NET_LUID_LH;
 use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::*;
+use windows_sys::Win32::Networking::WinSock::{
+    AF_INET, AF_INET6, AF_UNSPEC, SOCKADDR_IN, SOCKADDR_IN6, SOCKET_ADDRESS,
+};
 
 const SUBLAYER: GUID = GUID::from_u128(0x9e3f1a70_27d1_453c_9183_84061e7b0170);
 const FILTER_BASE: u128 = 0x9e3f1a70_27d1_453c_9183_84061e7b0200;
-const FILTERS_PER_LAYER: u8 = 8;
+const FILTERS_PER_LAYER: u128 = 1 << 32;
 const LAYERS: [GUID; 2] = [
     FWPM_LAYER_OUTBOUND_TRANSPORT_V4,
     FWPM_LAYER_OUTBOUND_TRANSPORT_V6,
@@ -156,6 +162,7 @@ pub(super) fn activate(interface: &str, server: &str) -> io::Result<()> {
     let mut luid = NET_LUID_LH::default();
     check(unsafe { ConvertInterfaceAliasToLuid(alias.as_ptr(), &mut luid) })?;
     let mut luid_value = unsafe { luid.Value };
+    let leases = dhcp_lease_peers(luid_value)?;
     let engine = Engine::open()?;
     engine.transaction(|| {
         let mut name: Vec<u16> = "AIVPN kill-switch".encode_utf16().chain(Some(0)).collect();
@@ -170,7 +177,7 @@ pub(super) fn activate(interface: &str, server: &str) -> io::Result<()> {
         }
         delete_filters(&engine)?;
         for (layer_index, layer) in LAYERS.iter().enumerate() {
-            let mut add = |slot: u8,
+            let mut add = |slot: u32,
                            weight: u64,
                            action,
                            conditions: &mut [FWPM_FILTER_CONDITION0]|
@@ -178,9 +185,7 @@ pub(super) fn activate(interface: &str, server: &str) -> io::Result<()> {
                 let mut weight = weight;
                 let mut filter = FWPM_FILTER0::default();
                 filter.filterKey = GUID::from_u128(
-                    FILTER_BASE
-                        + layer_index as u128 * u128::from(FILTERS_PER_LAYER)
-                        + u128::from(slot),
+                    FILTER_BASE + layer_index as u128 * FILTERS_PER_LAYER + u128::from(slot),
                 );
                 filter.displayData.name = name.as_mut_ptr();
                 filter.flags = FWPM_FILTER_FLAG_PERSISTENT;
@@ -242,12 +247,61 @@ pub(super) fn activate(interface: &str, server: &str) -> io::Result<()> {
             let mut remote_port = local_port;
             remote_port.fieldKey = FWPM_CONDITION_IP_REMOTE_PORT;
             remote_port.conditionValue.Anonymous.uint16 = if layer_index == 0 { 67 } else { 547 };
+            // Первичное получение адреса остается доступным в локальной сети.
+            let mut physical = vpn;
+            physical.matchType = FWP_MATCH_NOT_EQUAL;
+            if layer_index == 0 {
+                remote.conditionValue.r#type = FWP_UINT32;
+                remote.conditionValue.Anonymous.uint32 = u32::from(Ipv4Addr::BROADCAST);
+            } else {
+                address6.byteArray16 = "ff02::1:2".parse::<Ipv6Addr>().unwrap().octets();
+                remote.conditionValue.r#type = FWP_BYTE_ARRAY16_TYPE;
+                remote.conditionValue.Anonymous.byteArray16 = &mut address6;
+            }
             add(
                 4,
                 15,
                 FWP_ACTION_PERMIT,
-                &mut [protocol, local_port, remote_port],
+                &mut [protocol, local_port, remote_port, remote, physical],
             )?;
+            if layer_index == 1 {
+                let mut range = FWP_V6_ADDR_AND_MASK {
+                    addr: "fe80::".parse::<Ipv6Addr>().unwrap().octets(),
+                    prefixLength: 10,
+                };
+                remote.conditionValue.r#type = FWP_V6_ADDR_MASK;
+                remote.conditionValue.Anonymous.v6AddrMask = &mut range;
+                add(
+                    7,
+                    15,
+                    FWP_ACTION_PERMIT,
+                    &mut [protocol, local_port, remote_port, remote, physical],
+                )?;
+            }
+            // Продление аренды разрешено только ее DHCP-серверу на ее интерфейсе.
+            for (index, &(lease_luid, address)) in leases.iter().enumerate() {
+                let mut lease_luid = lease_luid;
+                match address {
+                    IpAddr::V4(address) if layer_index == 0 => {
+                        remote.conditionValue.r#type = FWP_UINT32;
+                        remote.conditionValue.Anonymous.uint32 = u32::from(address);
+                    }
+                    IpAddr::V6(address) if layer_index == 1 => {
+                        address6.byteArray16 = address.octets();
+                        remote.conditionValue.r#type = FWP_BYTE_ARRAY16_TYPE;
+                        remote.conditionValue.Anonymous.byteArray16 = &mut address6;
+                    }
+                    _ => continue,
+                }
+                physical.matchType = FWP_MATCH_EQUAL;
+                physical.conditionValue.Anonymous.uint64 = &mut lease_luid;
+                add(
+                    8 + index as u32,
+                    15,
+                    FWP_ACTION_PERMIT,
+                    &mut [protocol, local_port, remote_port, remote, physical],
+                )?;
+            }
             if layer_index == 1 {
                 // NDP нужен для доступности физического IPv6-шлюза.
                 protocol.conditionValue.Anonymous.uint8 = 58;
@@ -269,6 +323,122 @@ pub(super) fn activate(interface: &str, server: &str) -> io::Result<()> {
         }
         Ok(())
     })
+}
+
+fn dhcp_lease_peers(vpn_luid: u64) -> io::Result<Vec<(u64, IpAddr)>> {
+    let mut size = 15_000u32;
+    for _ in 0..3 {
+        if size > 1024 * 1024 {
+            return Err(io::Error::other("Adapter address list is too large"));
+        }
+        // Тип массива обеспечивает выравнивание и время жизни всех указателей API.
+        let count = (size as usize).div_ceil(std::mem::size_of::<IP_ADAPTER_ADDRESSES_LH>());
+        let mut buffer = vec![IP_ADAPTER_ADDRESSES_LH::default(); count];
+        let code = unsafe {
+            GetAdaptersAddresses(
+                u32::from(AF_UNSPEC),
+                0,
+                null(),
+                buffer.as_mut_ptr(),
+                &mut size,
+            )
+        };
+        if code == ERROR_BUFFER_OVERFLOW {
+            continue;
+        }
+        if code == ERROR_NO_DATA {
+            return Ok(Vec::new());
+        }
+        check(code)?;
+        let mut peers = Vec::new();
+        let mut current = buffer.as_ptr();
+        while !current.is_null() {
+            let adapter = unsafe { &*current };
+            let luid = unsafe { adapter.Luid.Value };
+            if luid != vpn_luid {
+                for address in [adapter.Dhcpv4Server, adapter.Dhcpv6Server] {
+                    // SOCKET_ADDRESS принадлежит этому же буферу GetAdaptersAddresses.
+                    if let Some(ip) = unsafe { socket_ip(address) } {
+                        if !ip.is_unspecified() && !ip.is_multicast() && !ip.is_loopback() {
+                            peers.push((luid, ip));
+                        }
+                    }
+                }
+            }
+            current = adapter.Next;
+        }
+        peers.sort_unstable();
+        peers.dedup();
+        return Ok(peers);
+    }
+    Err(io::Error::other("Adapter address list kept changing"))
+}
+
+// Вызывающий владеет буфером Windows API, содержащим адрес указанной длины.
+unsafe fn socket_ip(address: SOCKET_ADDRESS) -> Option<IpAddr> {
+    if address.lpSockaddr.is_null() || address.iSockaddrLength < 2 {
+        return None;
+    }
+    match (*address.lpSockaddr).sa_family {
+        AF_INET if address.iSockaddrLength as usize >= std::mem::size_of::<SOCKADDR_IN>() => {
+            let address = &*address.lpSockaddr.cast::<SOCKADDR_IN>();
+            Some(Ipv4Addr::from(address.sin_addr.S_un.S_addr.to_ne_bytes()).into())
+        }
+        AF_INET6 if address.iSockaddrLength as usize >= std::mem::size_of::<SOCKADDR_IN6>() => {
+            let address = &*address.lpSockaddr.cast::<SOCKADDR_IN6>();
+            Some(Ipv6Addr::from(address.sin6_addr.u.Byte).into())
+        }
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dhcp_addresses_preserve_network_bytes_and_reject_short_buffers() {
+        let mut v4 = SOCKADDR_IN::default();
+        v4.sin_family = AF_INET;
+        v4.sin_addr.S_un.S_addr = u32::from_ne_bytes([192, 0, 2, 19]);
+        let mut address = SOCKET_ADDRESS {
+            lpSockaddr: (&mut v4 as *mut SOCKADDR_IN).cast(),
+            iSockaddrLength: std::mem::size_of_val(&v4) as i32,
+        };
+        assert_eq!(
+            unsafe { socket_ip(address) },
+            Some("192.0.2.19".parse().unwrap())
+        );
+        address.iSockaddrLength -= 1;
+        assert_eq!(unsafe { socket_ip(address) }, None);
+        let mut v6 = SOCKADDR_IN6::default();
+        v6.sin6_family = AF_INET6;
+        v6.sin6_addr.u.Byte = "2001:db8::19".parse::<Ipv6Addr>().unwrap().octets();
+        address.lpSockaddr = (&mut v6 as *mut SOCKADDR_IN6).cast();
+        address.iSockaddrLength = std::mem::size_of_val(&v6) as i32;
+        assert_eq!(
+            unsafe { socket_ip(address) },
+            Some("2001:db8::19".parse().unwrap())
+        );
+        address.iSockaddrLength = 2;
+        assert_eq!(unsafe { socket_ip(address) }, None);
+        assert_eq!(unsafe { socket_ip(SOCKET_ADDRESS::default()) }, None);
+    }
+
+    #[test]
+    fn windows_reports_scoped_dhcp_lease_peers() {
+        let peers = dhcp_lease_peers(u64::MAX).unwrap();
+        for (luid, ip) in &peers {
+            assert_ne!(*luid, u64::MAX);
+            assert!(!ip.is_unspecified() && !ip.is_multicast() && !ip.is_loopback());
+        }
+        for (luid, _) in peers {
+            assert!(dhcp_lease_peers(luid)
+                .unwrap()
+                .iter()
+                .all(|(owner, _)| *owner != luid));
+        }
+    }
 }
 
 pub(super) fn clear() -> io::Result<()> {

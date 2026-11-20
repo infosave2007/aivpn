@@ -62,7 +62,7 @@ const PasskeyNameSchema = z.object({
 })
 
 const PasskeyRegisterSchema = z.object({
-  response: z.record(z.unknown()),
+  response: z.record(z.string(), z.unknown()),
   name: z.string().max(64).optional(),
 })
 

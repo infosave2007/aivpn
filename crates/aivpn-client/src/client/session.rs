@@ -293,6 +293,7 @@ mod initial_upload_tests {
             Arc::new(AtomicU64::new(8000)),
             Arc::new(AtomicU64::new(0)),
             Some([42; 32]),
+            aivpn_common::mgmt::MgmtClient::new(),
         ));
         let mut nonces = Vec::new();
         for _ in 0..3 {
@@ -351,6 +352,7 @@ mod initial_upload_tests {
             Arc::new(AtomicU64::new(60000)),
             Arc::new(AtomicU64::new(0)),
             None,
+            aivpn_common::mgmt::MgmtClient::new(),
         ));
         // До Hello идут только управляющие сообщения, DATA остается в очереди.
         for _ in 0..2 {
@@ -470,7 +472,7 @@ impl super::AivpnClient {
     /// Run the client main loop
     pub async fn run(&mut self, shutdown: Arc<AtomicBool>) -> Result<()> {
         let _dns_session = self.dns_proxy_gate.as_ref().map(|gate| gate.session());
-        let admin_binding = if self.config.control_only {
+        let admin_binding = if self.config.control_only || self.tunnel.is_managed() {
             None
         } else {
             let binding = crate::record_cmd::bind_admin(self.admin_listen).await.map_err(|e| {
@@ -494,8 +496,13 @@ impl super::AivpnClient {
 
         // Create channels for TUN -> upload pipeline and UDP -> main loop
         let (tun_to_udp_tx, tun_to_udp_rx) = mpsc::channel::<Vec<u8>>(512);
+        let _diagnostic_sender = self.mgmt.install_diagnostic_sender(tun_to_udp_tx.clone());
         let (udp_to_tun_tx, mut udp_to_tun_rx) = mpsc::channel::<Bytes>(512);
-        let (admin_tx, mut admin_rx) = mpsc::channel::<String>(16);
+        let (admin_tx, mut admin_rx) = self
+            .preset_administration
+            .take()
+            .unwrap_or_else(|| mpsc::channel(16));
+        let session_since_ms = epoch_ms();
         // If `control_handle()` was called before `run()`, its receiver is
         // preset here and reused verbatim (and `self.control_tx` is already
         // set to a clone of the same sender) — otherwise, preserve the
@@ -655,12 +662,13 @@ impl super::AivpnClient {
         // plain captured bool is enough — no need for an Arc<AtomicBool>
         // like the live-updated `ip:` field above.
         let stats_bootstrap_fallback = self.config.is_bootstrap_fallback;
-        let stats_paths = crate::record_cmd::local_status_paths(self.admin_listen, "traffic.stats");
-        let stats_task = if self.config.control_only {
+        let stats_task = if self.config.control_only || self.tunnel.is_managed() {
             // Headless control-only mode: no stats file — there is no GUI or
             // CLI observing this in-process pool-peer dialer.
             tokio::spawn(std::future::pending::<()>())
         } else {
+            let stats_paths =
+                crate::record_cmd::local_status_paths(self.admin_listen, "traffic.stats");
             tokio::spawn(async move {
                 // Session epoch (unix ms), captured ONCE when this session's stats
                 // task starts. GUIs key on a CHANGE in `since` to detect a silent
@@ -774,6 +782,7 @@ impl super::AivpnClient {
                 &self.keypair,
                 &self.config.server_public_key,
             )),
+            self.mgmt.clone(),
         ));
 
         // Main loop: download + shutdown + upload health
@@ -837,6 +846,9 @@ impl super::AivpnClient {
                         info!("Shutdown requested");
                         stats_task.abort();
                         break Ok(());
+                    }
+                    if let Some(receipt) = self.mask_receiver.pending() {
+                        if let Err(error) = self.send_control(&receipt.control()).await { break Err(error); }
                     }
                     if let Err(error) = self.send_mask_state_offer().await { break Err(error); }
                 }
@@ -1116,7 +1128,22 @@ impl super::AivpnClient {
                     };
                 }
 
-                Some(cmd) = admin_rx.recv() => {
+                Some(request) = admin_rx.recv() => {
+                    let cmd = match request {
+                        crate::session_admin::ClientRequest::Statistics(reply) => {
+                    let _ = reply.send(crate::session_admin::SessionStatistics {
+                        sent: self.bytes_sent(), received: self.bytes_received(),
+                        since: session_since_ms,
+                        ip: self.current_vpn_ip.lock().unwrap_or_else(|error| error.into_inner()).clone(),
+                        fallback: self.config.is_bootstrap_fallback,
+                        quality: self.quality_tracker.score(), adaptive: self.adaptive_level as u8,
+                        fec_group: self.fec_group.load(Ordering::Relaxed), role: self.cached_role(),
+                        recording: self.recording_status.read_local_status(),
+                    });
+                            continue;
+                        }
+                        crate::session_admin::ClientRequest::Recording(command) => command,
+                    };
                     if let Some(service) = cmd.strip_prefix("record_start:") {
                         self.recording_status.handle_recording_status(true, Some(service));
                         let payload = ControlPayload::RecordingStart { service: service.to_string() };
@@ -1223,6 +1250,7 @@ impl super::AivpnClient {
         keepalive_interval_ms: Arc<AtomicU64>,
         last_tx_ms: Arc<AtomicU64>,
         initial_eph_pub: Option<[u8; 32]>,
+        mgmt: aivpn_common::mgmt::MgmtClient,
     ) -> Result<()> {
         /// Wraps MimicryEngine to implement the shared PacketEncryptor trait.
         struct MimicryEncryptor {
@@ -1237,6 +1265,7 @@ impl super::AivpnClient {
             fec: aivpn_common::fec::FecSender,
             fec_group: Arc<AtomicU8>,
             initial_eph_pub: Option<[u8; 32]>,
+            mgmt: aivpn_common::mgmt::MgmtClient,
         }
 
         impl MimicryEncryptor {
@@ -1269,6 +1298,9 @@ impl super::AivpnClient {
         }
 
         impl PacketEncryptor for MimicryEncryptor {
+            fn data_active(&self, payload: &[u8]) -> bool {
+                self.mgmt.diagnostic_packet_active(payload)
+            }
             fn fec_metadata(&self, len: usize) -> Option<aivpn_common::fec::FecMetadata> {
                 self.fec.metadata_for(len)
             }
@@ -1423,6 +1455,7 @@ impl super::AivpnClient {
             },
             fec_group,
             initial_eph_pub,
+            mgmt,
         };
         let config = UploadConfig {
             pacing,
@@ -1599,7 +1632,9 @@ impl super::AivpnClient {
                 if ip_payload.is_empty() || (ip_payload[0] >> 4 != 4 && ip_payload[0] >> 4 != 6) {
                     return Err(Error::InvalidPacket("Invalid IP version in payload"));
                 }
-                if self.config.control_only {
+                if self.mgmt.on_diagnostic_packet(&ip_payload) {
+                    // Проба уже учтена измерителем и не является пакетом приложения.
+                } else if self.config.control_only {
                     // Headless control-only mode: no TUN, no SOCKS proxy — a
                     // pool-peer dialer has nowhere to deliver DATA packets.
                     // Drop silently rather than erroring on the (never

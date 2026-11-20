@@ -587,11 +587,13 @@ impl super::AivpnApp {
         self.admin_pool_nodes_loading = true;
         self.admin_pool_nodes_error = None;
         admin::spawn(
+            self.vpn.administration_target(),
             self.vpn.client_binary.clone(),
             AdminRequest::PoolNodes,
             self.admin_tx.clone(),
         );
         admin::spawn(
+            self.vpn.administration_target(),
             self.vpn.client_binary.clone(),
             AdminRequest::PoolHealth,
             self.admin_tx.clone(),
@@ -602,6 +604,7 @@ impl super::AivpnApp {
         self.admin_clients_loading = true;
         self.admin_clients_error = None;
         admin::spawn(
+            self.vpn.administration_target(),
             self.vpn.client_binary.clone(),
             AdminRequest::ListClients,
             self.admin_tx.clone(),
@@ -614,6 +617,7 @@ impl super::AivpnApp {
         self.admin_audit_loading = true;
         self.admin_audit_error = None;
         admin::spawn(
+            self.vpn.administration_target(),
             self.vpn.client_binary.clone(),
             AdminRequest::AuditLog,
             self.admin_tx.clone(),

@@ -22,6 +22,8 @@ import type { UserRole } from '../db/schema'
  */
 
 const TICKET_TTL_MS = 60_000
+const MAX_TICKETS_PER_USER = 16
+const MAX_TICKETS_TOTAL = 4096
 
 interface TicketEntry { user: AuthUser; userId: number; role: UserRole; expiresAt: number }
 const tickets = new Map<string, TicketEntry>()
@@ -74,6 +76,12 @@ events.post('/ticket', requireAuth(), (c) => {
   const now = Date.now()
   pruneTickets(now)
   const user = c.get('user')
+  let userTickets = 0
+  for (const entry of tickets.values()) if (entry.userId === user.id) userTickets++
+  if (tickets.size >= MAX_TICKETS_TOTAL || userTickets >= MAX_TICKETS_PER_USER) {
+    c.header('Retry-After', String(Math.ceil(TICKET_TTL_MS / 1000)))
+    return c.json({ error: 'Too many unused event tickets' }, 429)
+  }
   const ticket = randomBytes(32).toString('base64url')
   tickets.set(ticket, { user: { ...user }, userId: user.id, role: user.role, expiresAt: now + TICKET_TTL_MS })
   return c.json({ ticket, expires_in: Math.floor(TICKET_TTL_MS / 1000) })
@@ -161,7 +169,10 @@ events.get('/', async (c) => {
           start(controller) {
             ctrl = controller
             res.on('data', (chunk: Buffer) => {
-              try { controller.enqueue(chunk) } catch { /* stream closed */ }
+              try {
+                controller.enqueue(chunk)
+                if ((controller.desiredSize ?? 0) <= 0) res.pause()
+              } catch { res.destroy() }
             })
             res.on('end', () => {
               clearTimeout(lifetime)
@@ -173,6 +184,9 @@ events.get('/', async (c) => {
               release()
               try { controller.error(err) } catch { /* already closed */ }
             })
+          },
+          pull() {
+            res.resume()
           },
           cancel() {
             clearTimeout(lifetime)

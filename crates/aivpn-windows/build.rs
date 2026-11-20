@@ -36,6 +36,10 @@ fn main() {
         return;
     }
 
+    if env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
+        println!("cargo:rustc-link-arg=/DEPENDENTLOADFLAG:0x800");
+    }
+
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR not set"));
     // Map Rust target arch to manifest processorArchitecture values
     let arch = match env::var("CARGO_CFG_TARGET_ARCH").as_deref() {

@@ -159,6 +159,8 @@ object AivpnJni {
     /** Total bytes written to the TUN interface in the current session. */
     external fun getDownloadBytes(): Long
 
+    external fun getMaskAssessment(): String
+
     /** Connection quality score 0–100 from last KeepaliveAck RTT. 0 = no data yet. */
     external fun getQualityScore(): Int
 

@@ -6,7 +6,8 @@
  *   nonce[0..8]  = counter (little-endian u64)
  *   nonce[8..12] = session->nonce_suffix[0..4]
  *
- * AAD = 8-byte resonance tag.  Auth tag = 16 bytes (Poly1305).
+ * AAD отсутствует, как и в encrypt_payload пользовательского процесса.
+ * Тег аутентификации Poly1305 занимает 16 байт.
  *
  * CRITICAL: the counter used for the nonce comes from the tag-window lookup
  * (aivpn_tag_lookup), NOT from the wire.  Extracting the counter from the

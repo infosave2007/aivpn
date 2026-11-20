@@ -251,6 +251,7 @@ class LocalizationManager: ObservableObject {
             "en": "Running benchmark…",
             "ru": "Тест запущен…"
         ],
+        "bench_limited": ["en": "Speed is limited by the test method; link capacity may be higher.", "ru": "Скорость ограничена методом теста; пропускная способность канала может быть выше."],
         "bench_idle": [
             "en": "Run a benchmark to check connection quality.",
             "ru": "Запустите тест для оценки качества соединения."
@@ -271,7 +272,9 @@ class LocalizationManager: ObservableObject {
             "en": "Local address for DNS leak prevention proxy. Leave empty to disable. Point your resolver here after connecting.",
             "ru": "Локальный адрес DNS-прокси для предотвращения утечек. Оставьте пустым для отключения. После подключения укажите этот адрес в настройках резолвера."
         ],
-        "exclude_routes_label": [
+        "split_enabled": ["en": "Enable split tunneling", "ru": "Включить split"],
+            "split_switch_note": ["en": "Off - all traffic uses VPN. Lists are retained.", "ru": "Выключено - весь трафик через VPN. Списки сохраняются."],
+            "exclude_routes_label": [
             "en": "Exclude routes (split tunnel)",
             "ru": "Исключить маршруты (split tunnel)"
         ],

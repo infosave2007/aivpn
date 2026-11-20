@@ -173,6 +173,12 @@ pub struct ConnectionKey {
     /// CIDRs to route exclusively through the VPN tunnel (split-tunnel allowlist).
     #[serde(default)]
     pub include_routes: Vec<String>,
+    #[serde(default = "legacy_split_enabled")]
+    pub split_enabled: bool,
+}
+
+fn legacy_split_enabled() -> bool {
+    true
 }
 
 impl ConnectionKey {
@@ -201,6 +207,7 @@ impl ConnectionKey {
             mtls_cert_path: None,
             exclude_routes: Vec::new(),
             include_routes: Vec::new(),
+            split_enabled: true,
         })
     }
 }
@@ -365,6 +372,7 @@ impl KeyStorage {
         name: &str,
         key: &str,
         full_tunnel: bool,
+        split_enabled: bool,
         proxy_listen: Option<String>,
         mtls_cert_path: Option<String>,
         exclude_routes: Vec<String>,
@@ -376,6 +384,7 @@ impl KeyStorage {
         let mut ck = ConnectionKey::from_key_string(name, key)
             .ok_or_else(|| "Invalid connection key format".to_string())?;
         ck.full_tunnel = full_tunnel;
+        ck.split_enabled = split_enabled;
         ck.proxy_listen = proxy_listen;
         ck.mtls_cert_path = mtls_cert_path;
         ck.exclude_routes = exclude_routes;

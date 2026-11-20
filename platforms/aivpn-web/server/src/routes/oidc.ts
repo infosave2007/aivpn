@@ -4,6 +4,7 @@ import { createHash, randomBytes, randomUUID } from 'node:crypto'
 import { eq, and } from 'drizzle-orm'
 import { createRemoteJWKSet } from 'jose'
 import { verifyIdToken } from '../auth/oidc-token'
+import { parseDiscovery, type Discovery } from '../auth/oidc-discovery'
 import { config } from '../config'
 import { getDb, IS_SQLITE } from '../db'
 import { sqliteUsers, sqliteSessions, pgUsers, pgSessions } from '../db/schema'
@@ -19,23 +20,26 @@ const pkceCookieName = () => config.ORIGIN.startsWith('https:') ? '__Host-aivpn_
 
 // ─── OIDC discovery + JWKS cache ─────────────────────────────────────────────
 
-interface Discovery { authorization_endpoint: string; token_endpoint: string; jwks_uri: string }
-let discoveryCache: { endpoint: string; data: Discovery } | null = null
+const DISCOVERY_TTL_MS = 5 * 60_000
+let discoveryCache: { endpoint: string; data: Discovery; expiresAt: number } | null = null
 
 async function getDiscovery(): Promise<Discovery> {
   const issuer = config.OIDC_ISSUER!
-  if (discoveryCache?.endpoint === issuer) return discoveryCache.data
-  const r = await fetch(issuer.replace(/\/$/, '') + '/.well-known/openid-configuration', { signal: AbortSignal.timeout(10_000) })
+  if (discoveryCache?.endpoint === issuer && Date.now() < discoveryCache.expiresAt) return discoveryCache.data
+  const r = await fetch(issuer.replace(/\/$/, '') + '/.well-known/openid-configuration', { signal: AbortSignal.timeout(10_000), redirect: 'error' })
   if (!r.ok) throw new Error(`OIDC discovery failed: ${r.status}`)
-  const data = await r.json() as Discovery
-  discoveryCache = { endpoint: issuer, data }
+  const data = parseDiscovery(issuer, await r.json())
+  discoveryCache = { endpoint: issuer, data, expiresAt: Date.now() + DISCOVERY_TTL_MS }
   return data
 }
 
 // JWKS key set cached per jwks_uri
 const jwksCache = new Map<string, ReturnType<typeof createRemoteJWKSet>>()
 function getJwks(uri: string) {
-  if (!jwksCache.has(uri)) jwksCache.set(uri, createRemoteJWKSet(new URL(uri)))
+  if (!jwksCache.has(uri)) {
+    jwksCache.clear()
+    jwksCache.set(uri, createRemoteJWKSet(new URL(uri)))
+  }
   return jwksCache.get(uri)!
 }
 
@@ -100,7 +104,9 @@ app.get('/start', async (c) => {
   const cookieValue = Buffer.from(JSON.stringify({ codeVerifier, state, nonce, expiresAt: Date.now() + 600_000 })).toString('base64')
   const secure = config.ORIGIN.startsWith('https') ? '; Secure' : ''
   c.header('Set-Cookie', `${pkceCookieName()}=${cookieValue}; HttpOnly; SameSite=Lax; Path=/; Max-Age=600${secure}`)
-  return c.redirect(`${discovery.authorization_endpoint}?${params}`)
+  const authorizationUrl = new URL(discovery.authorization_endpoint)
+  for (const [key, value] of params) authorizationUrl.searchParams.set(key, value)
+  return c.redirect(authorizationUrl.toString())
 })
 
 // ─── GET /web/auth/oidc/callback — verify token, find/create user, issue session
@@ -149,14 +155,14 @@ app.get('/callback', async (c) => {
 
   const tokenRes = await fetch(discovery.token_endpoint, {
     method: 'POST',
+    redirect: 'error',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body: body.toString(),
     signal: AbortSignal.timeout(10_000),
   })
   if (!tokenRes.ok) {
-    // Avoid leaking full IdP error body (may contain sensitive info); log it server-side only
-    const errBody = await tokenRes.text()
-    console.error('[oidc] token exchange failed:', tokenRes.status, errBody.slice(0, 500))
+    // Ответ IdP может содержать code и секреты, журналируем только статус.
+    console.error('[oidc] token exchange failed:', tokenRes.status)
     return oidcFailure(c, `Token exchange failed (HTTP ${tokenRes.status})`)
   }
   const tokens = await tokenRes.json() as { id_token?: string }

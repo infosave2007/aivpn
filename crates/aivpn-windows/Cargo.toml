@@ -11,6 +11,9 @@ build = "build.rs"
 name = "aivpn"
 path = "src/main.rs"
 
+[features]
+app-routing = ["aivpn-client/app-routing"]
+
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }
 # Neutral descriptor for extra settings sections. The GUI reads an optional
@@ -21,6 +24,8 @@ base64 = "0.22"
 dirs = "6"
 
 [target.'cfg(windows)'.dependencies]
+aivpn-client = { path = "../aivpn-client", features = ["ssh-install"] }
+aivpn-desktop-agent = { path = "../aivpn-desktop-agent", features = ["local-profile"] }
 eframe = { version = "0.31", default-features = false, features = ["default_fonts", "glow"] }
 egui = "0.31"
 tray-icon = "0.26"

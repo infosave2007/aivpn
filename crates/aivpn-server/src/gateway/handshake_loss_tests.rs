@@ -105,8 +105,35 @@ async fn exercise_with_switch(
     tamper_first: bool,
     reconnect: bool,
 ) {
+    exercise_with_switch_faults(
+        mask,
+        drop_init,
+        drop_hello,
+        rtt_ms,
+        duplicate,
+        switch,
+        tamper_first,
+        reconnect,
+        (0, 0),
+    )
+    .await;
+}
+
+async fn exercise_with_switch_faults(
+    mask: MaskProfile,
+    drop_init: usize,
+    drop_hello: usize,
+    rtt_ms: u64,
+    duplicate: bool,
+    switch: Option<MaskProfile>,
+    tamper_first: bool,
+    reconnect: bool,
+    switch_loss: (usize, usize),
+) {
     let mut tasks = Tasks::default();
     let switching = switch.is_some();
+    let switch_drop_up = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let switch_drop_down = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let directory = tempfile::tempdir().unwrap();
     let mask_dir = directory.path().join("masks");
     std::fs::create_dir(&mask_dir).unwrap();
@@ -145,6 +172,8 @@ async fn exercise_with_switch(
     let server_address = server.local_addr().unwrap();
     gateway.udp_socket = Some(super::MaskSocket::new(server.clone()));
     let gateway = Arc::new(gateway);
+    let retries = tokio::spawn(gateway.clone().retry_mask_updates());
+    tasks.track(&retries);
     let relay = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
     let relay_address = relay.local_addr().unwrap();
     let capture = Arc::new(parking_lot::Mutex::new(Capture {
@@ -152,6 +181,8 @@ async fn exercise_with_switch(
         packets: Vec::new(),
     }));
     let wire_capture = capture.clone();
+    let drop_up = switch_drop_up.clone();
+    let drop_down = switch_drop_down.clone();
     let relay_task = tokio::spawn(async move {
         let mut client = None;
         let mut buffer = [0; 65536];
@@ -187,6 +218,15 @@ async fn exercise_with_switch(
                 }
                 client.unwrap()
             };
+            let drop_count = if uplink { &drop_up } else { &drop_down };
+            if drop_count
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |left| {
+                    left.checked_sub(1)
+                })
+                .is_ok()
+            {
+                continue;
+            }
             assert!(
                 deliveries.len() < 128,
                 "Очередь тестового relay переполнена"
@@ -284,8 +324,9 @@ async fn exercise_with_switch(
         "{}-init{drop_init}-hello{drop_hello}-rtt{rtt_ms}-dup{duplicate}",
         mask.mask_id
     );
-    if switching {
-        label.push_str("-switch");
+    if let Some(next) = switch.as_ref() {
+        label.push_str("-switch-to-");
+        label.push_str(&next.mask_id);
     }
     if tamper_first {
         label.push_str("-tamper");
@@ -478,6 +519,16 @@ async fn exercise_with_switch(
         .expect("Downlink не восстановился после reconnect за тем же NAT");
     }
     if let Some(mut next_mask) = switch {
+        // Настройка транспортных возможностей тоже должна дойти до смены.
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !session.lock().reliable_mask_updates() {
+                time_delay(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("Клиент не объявил подтверждение поколений маски");
+        switch_drop_up.store(switch_loss.0, Ordering::Relaxed);
+        switch_drop_down.store(switch_loss.1, Ordering::Relaxed);
         crate::test_masks::sign(
             &mut next_mask,
             &ed25519_dalek::SigningKey::from_bytes(&[71; 32]),
@@ -499,7 +550,7 @@ async fn exercise_with_switch(
             .session_manager
             .update_session_mask(&id, next_mask.clone());
         let switched_digest = [94; 32];
-        let result = tokio::time::timeout(Duration::from_secs(8), async {
+        let result = tokio::time::timeout(Duration::from_secs(20), async {
             loop {
                 time_delay(Duration::from_millis(100)).await;
                 let _ = gateway
@@ -514,6 +565,7 @@ async fn exercise_with_switch(
                     tokio::time::timeout(Duration::from_millis(200), tap_rx.recv()).await
                 {
                     if digest == switched_digest
+                        && session.lock().mask_receipt.is_some()
                         && session
                             .lock()
                             .mask
@@ -633,6 +685,82 @@ async fn live_mask_switches_between_stun_and_quic_without_reconnect() {
 }
 
 #[tokio::test]
+async fn reliable_mask_switch_recovers_lost_update_and_receipt() {
+    for (from, to) in [
+        (
+            preset_masks::webrtc_zoom_v3(),
+            preset_masks::quic_https_v2(),
+        ),
+        (
+            preset_masks::quic_https_v2(),
+            preset_masks::webrtc_zoom_v3(),
+        ),
+        (
+            preset_masks::webrtc_sberjazz_v1(),
+            preset_masks::webrtc_zoom_v3(),
+        ),
+        (
+            preset_masks::webrtc_zoom_v3(),
+            preset_masks::webrtc_sberjazz_v1(),
+        ),
+    ] {
+        for loss in [(0, 5), (5, 0), (5, 5)] {
+            exercise_with_switch_faults(
+                from.clone(),
+                0,
+                0,
+                50,
+                true,
+                Some(to.clone()),
+                false,
+                false,
+                loss,
+            )
+            .await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn every_preset_pair_switches_without_reconnecting() {
+    let masks = preset_masks::all();
+    for from in &masks {
+        for to in &masks {
+            if from.mask_id != to.mask_id {
+                exercise_with_switch(
+                    from.clone(),
+                    0,
+                    0,
+                    20,
+                    false,
+                    Some(to.clone()),
+                    false,
+                    false,
+                )
+                .await;
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn ice_srtp_switches_to_stun_without_reconnecting() {
+    for _ in 0..5 {
+        exercise_with_switch(
+            preset_masks::by_id("whatsapp_voip_v1").unwrap(),
+            0,
+            0,
+            20,
+            false,
+            Some(preset_masks::by_id("webrtc_vk_teams_v1").unwrap()),
+            false,
+            false,
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
 async fn live_damaged_quic_initial_does_not_consume_bootstrap() {
     exercise_with_switch(
         preset_masks::quic_https_v2(),
@@ -664,13 +792,10 @@ async fn live_quic_reconnect_replaces_stale_state_at_same_nat_address() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn diagnostics_use_the_authenticated_session_for_both_directions() {
-    for carrier in [false, true] {
-        exercise_diagnostics_session(carrier).await;
+    for mask in preset_masks::all() {
+        exercise_diagnostics_profile(false, mask, None).await;
     }
-}
-
-async fn exercise_diagnostics_session(carrier: bool) {
-    exercise_diagnostics_profile(carrier, preset_masks::webrtc_zoom_v3(), None).await;
+    exercise_diagnostics_profile(true, preset_masks::webrtc_zoom_v3(), None).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -716,6 +841,12 @@ async fn exercise_diagnostics_with_bootstrap(
     let mask_dir = directory.path().join("masks");
     std::fs::create_dir(&mask_dir).unwrap();
     let mask_id = mask.mask_id.clone();
+    // DATA-замер объявляется только маскам с управлением потоком.
+    let expected_method = if aivpn_common::mask_io::needs_state(&mask) {
+        diagnostics::MeasurementMethod::Data
+    } else {
+        diagnostics::MeasurementMethod::RpcWindowLimited
+    };
     mask.sign(&ed25519_dalek::SigningKey::from_bytes(&[71; 32]))
         .unwrap();
     std::fs::write(
@@ -797,6 +928,23 @@ async fn exercise_diagnostics_with_bootstrap(
         packets: vec![],
     }));
     let incoming_capture = raw_capture.clone();
+    if !training && !catalog_upgrade {
+        let downlink = tokio::spawn(Gateway::downlink_worker(
+            gateway.chain_reverse_rx.take().unwrap(),
+            0,
+            gateway.session_manager.clone(),
+            gateway.udp_socket.as_ref().unwrap().clone(),
+            gateway.chain_reverse_routes.clone(),
+            mask.clone(),
+            gateway.recording_manager.clone(),
+            gateway.client_db.clone(),
+            gateway.qos_enforcer.clone(),
+            gateway.config.downlink_shaping,
+            gateway.config.network_config.clone(),
+            gateway.kernel_accel.clone(),
+        ));
+        tasks.track(&downlink);
+    }
     let gateway = Arc::new(gateway);
     let receive_gateway = gateway.clone();
     let server_task = tokio::spawn(async move {
@@ -883,7 +1031,7 @@ async fn exercise_diagnostics_with_bootstrap(
         );
     }
     let (mgmt, tx) = client.management_handle();
-    let client_task =
+    let mut client_task =
         tokio::spawn(async move { client.run(Arc::new(AtomicBool::new(false))).await });
     tasks.track(&client_task);
     tokio::time::timeout(Duration::from_secs(5), async {
@@ -984,14 +1132,30 @@ async fn exercise_diagnostics_with_bootstrap(
         );
         return;
     }
-    let result = diagnostics::run(mgmt.clone(), tx.clone(), Duration::from_secs(3))
-        .await
-        .unwrap();
-    assert!(result.samples > 0);
+    // Здесь измеряется выбранная маска, без смены по необязательному self-gate.
+    // Сам переход под нагрузкой проверяется live_mask_switches отдельно.
+    for entry in gateway.session_manager.iter_sessions() {
+        gateway.mask_preference_throttle.insert(
+            entry.value().lock().session_id,
+            Instant::now() + Duration::from_secs(60),
+        );
+    }
+    let result = diagnostics::run(mgmt.clone(), tx.clone(), Duration::from_secs(3)).await;
+    let result = match result {
+        Ok(result) => result,
+        Err(error) => {
+            let client_result =
+                tokio::time::timeout(Duration::from_secs(1), &mut client_task).await;
+            panic!("{mask_id}: {error}; client result: {client_result:?}");
+        }
+    };
+    assert!(result.samples > 0, "{mask_id}: {result:?}");
+    assert_eq!(result.throughput_method, expected_method, "{mask_id}");
     assert!(
         result.throughput_up_kbps > 0.0 && result.throughput_down_kbps > 0.0,
-        "{result:?}"
+        "{mask_id}: {result:?}"
     );
+    eprintln!("DATA {mask_id} carrier={carrier}: {result:?}");
     let (status, _) = mgmt
         .mgmt_call(
             &tx,
@@ -1010,6 +1174,70 @@ async fn exercise_diagnostics_with_bootstrap(
         .unwrap()
         .value()
         .clone();
+    let phase = diagnostics::data::Start {
+        id: [37; 16],
+        seed: [19; 32],
+        direction: diagnostics::data::Direction::Upload,
+        response_id: 0x7fff_fffe,
+        duration_ms: 1000,
+    };
+    let start = serde_json::to_vec(&phase).unwrap();
+    for _ in 0..2 {
+        assert_eq!(
+            mgmt.mgmt_call(
+                &tx,
+                1,
+                diagnostics::START,
+                start.clone(),
+                Duration::from_secs(2)
+            )
+            .await
+            .unwrap()
+            .0,
+            200
+        );
+    }
+    let mut snapshots = Vec::new();
+    for _ in 0..2 {
+        let reply = mgmt
+            .mgmt_call(
+                &tx,
+                1,
+                diagnostics::RECEIPT,
+                phase.id.to_vec(),
+                Duration::from_secs(2),
+            )
+            .await
+            .unwrap();
+        assert_eq!(reply.0, 200);
+        snapshots.push(reply.1);
+    }
+    assert_eq!(
+        snapshots[0], snapshots[1],
+        "Повтор потерянного ответа не должен менять счетчики"
+    );
+    assert!(!session
+        .lock()
+        .diagnostic_state
+        .as_ref()
+        .unwrap()
+        .active(&phase.id, Instant::now()));
+    for _ in 0..2 {
+        assert_eq!(
+            mgmt.mgmt_call(
+                &tx,
+                1,
+                diagnostics::STOP,
+                phase.id.to_vec(),
+                Duration::from_secs(2)
+            )
+            .await
+            .unwrap()
+            .0,
+            200
+        );
+    }
+    assert!(session.lock().diagnostic_state.is_none());
     session.lock().client_admitted = false;
     // Проверяем сам обработчик: packet loop может повторно допустить корректного клиента.
     let id = session.lock().session_id;

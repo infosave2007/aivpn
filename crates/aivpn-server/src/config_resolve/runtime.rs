@@ -597,6 +597,8 @@ mod tests {
             "/../../deploy/config/server.json.example"
         )))
         .unwrap();
+        // Пример одиночного сервера отключает пул; здесь проверяется и непустой env-объект.
+        example["pool"] = json!({"node_id":"test-node","peers":["peer.example:443"]});
         if cfg!(feature = "production-secure") {
             example["mask_signing_key"] = json!("/test/signing.key");
             example["mask_verify_mode"] = json!("enforce");

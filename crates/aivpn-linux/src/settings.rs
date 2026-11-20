@@ -48,6 +48,8 @@ pub struct AppSettings {
     /// Comma-separated CIDRs to exclude from the VPN tunnel (split tunnel).
     #[serde(default)]
     pub exclude_routes: String,
+    #[serde(default = "legacy_split_enabled")]
+    pub split_enabled: bool,
     /// Comma-separated CIDRs to route exclusively through the VPN tunnel (split tunnel allowlist).
     #[serde(default)]
     pub include_routes: String,
@@ -92,6 +94,10 @@ pub struct AppSettings {
     pub country_code: String,
 }
 
+fn legacy_split_enabled() -> bool {
+    true
+}
+
 fn default_lang() -> String {
     "en".to_string()
 }
@@ -121,6 +127,7 @@ impl Default for AppSettings {
             preferred_mask: "auto".to_string(),
             exclude_routes: String::new(),
             include_routes: String::new(),
+            split_enabled: true,
             socks5_enabled: false,
             socks5_addr: "127.0.0.1:1080".to_string(),
             lang: "en".to_string(),
@@ -265,6 +272,21 @@ pub fn remove_autostart_entry() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn split_switch_roundtrip_keeps_both_route_lists() {
+        let mut value = serde_json::to_value(AppSettings::default()).unwrap();
+        value["include_routes"] = "203.0.113.0/24".into();
+        value["exclude_routes"] = "192.0.2.0/24".into();
+        value.as_object_mut().unwrap().remove("split_enabled");
+        let mut saved: AppSettings = serde_json::from_value(value).unwrap();
+        assert!(saved.split_enabled);
+        saved.split_enabled = false;
+        let restored: AppSettings =
+            serde_json::from_slice(&serde_json::to_vec(&saved).unwrap()).unwrap();
+        assert!(!restored.split_enabled);
+        assert_eq!(restored.include_routes, "203.0.113.0/24");
+        assert_eq!(restored.exclude_routes, "192.0.2.0/24");
+    }
 
     #[test]
     fn autostart_escapes_paths_and_field_codes() {

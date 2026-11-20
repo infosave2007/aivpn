@@ -2,40 +2,42 @@ name: Aivpn
 options:
   bundleIdPrefix: com.aivpn
   deploymentTarget:
-    iOS: "16.0"
+    iOS: "15.0"
   xcodeVersion: "15.0"
   generateEmptyDirectories: true
 
 settings:
   base:
     SWIFT_VERSION: "5.9"
-    IPHONEOS_DEPLOYMENT_TARGET: "16.0"
+    IPHONEOS_DEPLOYMENT_TARGET: "15.0"
     ENABLE_BITCODE: NO
     DEBUG_INFORMATION_FORMAT: dwarf-with-dsym
-    MARKETING_VERSION: "1.2.0"
-    CURRENT_PROJECT_VERSION: "9"
+    MARKETING_VERSION: "1.3.0"
+    CURRENT_PROJECT_VERSION: "11"
 
 targets:
   Aivpn:
     type: application
     platform: iOS
-    deploymentTarget: "16.0"
+    deploymentTarget: "15.0"
     sources:
       - path: App
         excludes:
           - "*.entitlements"
       - path: Identity/NetworkAssignment.swift
       - path: Identity/DomainExclusions.swift
+      - path: Identity/SplitTunnelConfiguration.swift
+      - path: Identity/BootstrapResponse.swift
       # App icon lives in the shared brand folder (single source of truth across
       # all clients). ASSETCATALOG_COMPILER_APPICON_NAME=AppIcon resolves it from
       # this externally-referenced catalog — no copy under App/.
       - path: ../../assets/brand/ios/Assets.xcassets
-    info:
-      path: App/Info.plist
-    entitlements:
-      path: App/Aivpn.entitlements
     settings:
       base:
+        # Reference the checked-in files; XcodeGen's info/entitlements blocks
+        # generate new files and would erase their existing contents.
+        INFOPLIST_FILE: App/Info.plist
+        CODE_SIGN_ENTITLEMENTS: App/Aivpn.entitlements
         PRODUCT_BUNDLE_IDENTIFIER: com.aivpn.client
         PRODUCT_NAME: Aivpn
         CODE_SIGN_STYLE: Automatic
@@ -62,22 +64,16 @@ targets:
   AivpnTunnel:
     type: app-extension
     platform: iOS
-    deploymentTarget: "16.0"
+    deploymentTarget: "15.0"
     sources:
       - path: Identity
       - path: Tunnel
         excludes:
           - "*.entitlements"
-    info:
-      path: Tunnel/Info.plist
-      properties:
-        NSExtension:
-          NSExtensionPointIdentifier: com.apple.networkextension.packet-tunnel
-          NSExtensionPrincipalClass: $(PRODUCT_MODULE_NAME).PacketTunnelProvider
-    entitlements:
-      path: Tunnel/AivpnTunnel.entitlements
     settings:
       base:
+        INFOPLIST_FILE: Tunnel/Info.plist
+        CODE_SIGN_ENTITLEMENTS: Tunnel/AivpnTunnel.entitlements
         PRODUCT_BUNDLE_IDENTIFIER: com.aivpn.client.tunnel
         PRODUCT_NAME: AivpnTunnel
         CODE_SIGN_STYLE: Automatic

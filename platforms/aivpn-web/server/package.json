@@ -10,8 +10,8 @@
     "check": "tsc --noEmit"
   },
   "dependencies": {
-    "@hono/node-server": "^1.19.17",
-    "@hono/zod-validator": "^0.4.3",
+    "@hono/node-server": "^2.1.6",
+    "@hono/zod-validator": "^0.9.1",
     "@node-rs/argon2": "^2.2.1",
     "@simplewebauthn/server": "^13.3.3",
     "drizzle-orm": "^0.45.3",
@@ -20,8 +20,8 @@
     "postgres": "^3.4.9",
     "qrcode": "^1.5.4",
     "speakeasy": "^2.0.0",
-    "systeminformation": "^5.33.15",
-    "zod": "^3.25.76"
+    "systeminformation": "^5.33.19",
+    "zod": "^4.6.7"
   },
   "devDependencies": {
     "@types/qrcode": "^1.5.6",

@@ -237,7 +237,7 @@ struct InstallServerView: View {
     @State private var importFailureMessage: String?
 
     var body: some View {
-        NavigationStack {
+        CompatibleNavigationView {
             Group {
                 switch step {
                 case .target: targetForm
@@ -344,7 +344,7 @@ struct InstallServerView: View {
         Form {
             Section(header: Text(loc.t("install_target_section"))) {
                 TextField(loc.t("install_host"), text: $host)
-                    .autocorrectionDisabled()
+                    .disableAutocorrection(true)
                     .textInputAutocapitalization(.never)
                     .keyboardType(.URL)
                 HStack {
@@ -356,7 +356,7 @@ struct InstallServerView: View {
                         .frame(width: 80)
                 }
                 TextField(loc.t("install_user"), text: $user)
-                    .autocorrectionDisabled()
+                    .disableAutocorrection(true)
                     .textInputAutocapitalization(.never)
             }
 
@@ -371,10 +371,9 @@ struct InstallServerView: View {
                 if authKind == .password {
                     SecureField(loc.t("install_password"), text: $password)
                 } else {
-                    TextField(loc.t("install_pem"), text: $pem, axis: .vertical)
-                        .autocorrectionDisabled()
+                    CompatibleMultilineTextField(loc.t("install_pem"), text: $pem, lines: 4...10)
+                        .disableAutocorrection(true)
                         .textInputAutocapitalization(.never)
-                        .lineLimit(4...10)
                         .font(.system(size: 11, design: .monospaced))
                     SecureField(loc.t("install_pem_passphrase"), text: $pemPassphrase)
                 }
@@ -400,7 +399,7 @@ struct InstallServerView: View {
 
                 if binaryKind == .url {
                     TextField(loc.t("install_binary_url_field"), text: $binaryUrl)
-                        .autocorrectionDisabled()
+                        .disableAutocorrection(true)
                         .textInputAutocapitalization(.never)
                         .keyboardType(.URL)
                 } else if binaryKind == .file {
@@ -421,7 +420,7 @@ struct InstallServerView: View {
                 Toggle(loc.t("install_server_ip_toggle"), isOn: $hasServerIp.animation())
                 if hasServerIp {
                     TextField(loc.t("install_server_ip"), text: $serverIp)
-                        .autocorrectionDisabled()
+                        .disableAutocorrection(true)
                         .textInputAutocapitalization(.never)
                         .keyboardType(.URL)
                 }
@@ -612,7 +611,7 @@ struct InstallServerView: View {
     }
 
     private var scriptSheet: some View {
-        NavigationStack {
+        CompatibleNavigationView {
             Group {
                 if isLoadingScript {
                     ProgressView(loc.t("admin_loading"))
@@ -846,7 +845,7 @@ private struct InstallImportKeySheet: View {
     }
 
     var body: some View {
-        NavigationStack {
+        CompatibleNavigationView {
             Form {
                 Section {
                     if keyId != nil {
@@ -864,7 +863,7 @@ private struct InstallImportKeySheet: View {
                 }
                 Section {
                     TextField(loc.t("key_name"), text: $name)
-                        .autocorrectionDisabled()
+                        .disableAutocorrection(true)
                         .disabled(keyId == nil)
                 }
                 Section {

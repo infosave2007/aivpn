@@ -119,10 +119,29 @@ pub async fn mgmt_call(
     path: &str,
     body: Option<Vec<u8>>,
 ) -> Result<(u16, Vec<u8>), String> {
+    if let Some(target) = managed_target() {
+        let target = target?;
+        let method = method.as_clap_arg();
+        let path = path.to_owned();
+        let (status, body) = tokio::task::spawn_blocking(move || {
+            target.management(method, &path, &body.unwrap_or_default())
+        })
+        .await
+        .map_err(|error| error.to_string())?
+        .map_err(|error| error.to_string())?;
+        if !(200..300).contains(&status) {
+            return Err(format!(
+                "HTTP {status}: {}",
+                String::from_utf8_lossy(&body).trim()
+            ));
+        }
+        return Ok((status, body));
+    }
     let bin = find_client_binary()?;
 
     let token = pinned_token().ok_or_else(|| "No active admin session".to_string())?;
     let mut cmd = tokio::process::Command::new(&bin);
+    cmd.arg("cli");
     cmd.env_remove("AIVPN_ADMIN_LISTEN");
     cmd.env("AIVPN_ADMIN_TOKEN", token);
     cmd.kill_on_drop(true);
@@ -286,9 +305,17 @@ pub async fn audit_log() -> Result<AuditLogView, String> {
 }
 
 pub async fn get_role() -> Result<u8, String> {
+    if managed_target().is_some() {
+        return command("role".into(), Duration::from_secs(12))
+            .await?
+            .trim()
+            .parse()
+            .map_err(|_| "Неверный ответ о роли сеанса".into());
+    }
     let bin = find_client_binary()?;
     let token = pinned_token().ok_or_else(|| "No active admin session".to_string())?;
     let out = tokio::process::Command::new(&bin)
+        .arg("cli")
         .env("AIVPN_ADMIN_TOKEN", token)
         .kill_on_drop(true)
         .env_remove("AIVPN_ADMIN_LISTEN")
@@ -537,6 +564,19 @@ fn read_admin_token() -> Option<String> {
 /// Запрашивает QR-код у работающего клиента с токеном исходной сессии.
 /// Блокирующий TCP IPC выполняется в spawn_blocking.
 pub async fn qr_png(text: String) -> Result<Vec<u8>, String> {
+    if managed_target().is_some() {
+        let response = command(
+            format!(
+                "qr:{}",
+                base64::engine::general_purpose::STANDARD.encode(text.as_bytes())
+            ),
+            Duration::from_secs(12),
+        )
+        .await?;
+        return base64::engine::general_purpose::STANDARD
+            .decode(response.trim())
+            .map_err(|error| error.to_string());
+    }
     let token =
         pinned_token().ok_or_else(|| "No admin token found (is the VPN connected?)".to_string())?;
     tokio::task::spawn_blocking(move || -> Result<Vec<u8>, String> {
@@ -591,6 +631,48 @@ mod tests {
 }
 
 tokio::task_local! { static SESSION_TOKEN: Option<String>; }
+tokio::task_local! { static SESSION_TARGET: Option<Result<aivpn_desktop_agent::client::SessionTarget, String>>; }
+
+fn managed_target() -> Option<Result<aivpn_desktop_agent::client::SessionTarget, String>> {
+    SESSION_TARGET.try_with(Clone::clone).unwrap_or_default()
+}
+
+pub fn pin_target<F: std::future::Future>(
+    target: Option<Result<aivpn_desktop_agent::client::SessionTarget, String>>,
+    future: F,
+) -> impl std::future::Future<Output = F::Output> {
+    let token = if target.is_none() {
+        pinned_token()
+    } else {
+        None
+    };
+    SESSION_TARGET.scope(target, SESSION_TOKEN.scope(token, future))
+}
+
+pub(crate) async fn command(command: String, timeout: Duration) -> Result<String, String> {
+    let target = managed_target();
+    let token = if target.is_none() {
+        pinned_token()
+    } else {
+        None
+    };
+    tokio::task::spawn_blocking(move || {
+        if let Some(target) = target {
+            return target?.execute(command).map_err(|error| error.to_string());
+        }
+        let token = token.ok_or("Нет действующего сеанса управления")?;
+        aivpn_common::local_admin::request(
+            ADMIN_SOCKET_ADDR
+                .parse()
+                .map_err(|error: std::net::AddrParseError| error.to_string())?,
+            &format!("{token}:{command}"),
+            timeout,
+        )
+        .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
 
 pub(crate) fn pinned_token() -> Option<String> {
     SESSION_TOKEN
@@ -609,6 +691,15 @@ pub fn pin_session<F: std::future::Future>(
 #[cfg(test)]
 mod session_scope_tests {
     use super::*;
+    #[tokio::test]
+    async fn queued_managed_operation_keeps_its_original_target_even_when_unavailable() {
+        let old = pin_target(Some(Err("old-assignment".into())), async {
+            tokio::task::yield_now().await;
+            managed_target().unwrap().unwrap_err()
+        });
+        let result = pin_target(Some(Err("new-assignment".into())), old).await;
+        assert_eq!(result, "old-assignment");
+    }
     #[tokio::test]
     async fn queued_operation_keeps_the_token_captured_before_a_reconnect() {
         let result = SESSION_TOKEN

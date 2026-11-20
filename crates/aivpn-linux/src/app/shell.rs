@@ -101,6 +101,7 @@ impl App {
         match self.page {
             UiPage::Overview => self.view_overview(),
             UiPage::Profiles => self.view_profiles(),
+            UiPage::Applications => self.view_app_routing(),
             page => self.view_sections(page),
         }
     }
@@ -126,6 +127,7 @@ impl App {
                 self.nav_button(UiPage::Overview, "VPN"),
                 self.nav_button(UiPage::Profiles, self.tr("Профили", "Profiles")),
                 self.nav_button(UiPage::Routes, self.tr("Маршруты", "Routes")),
+                self.nav_button(UiPage::Applications, self.tr("Приложения", "Applications")),
                 self.nav_button(UiPage::Masks, self.tr("Маски", "Masks")),
                 self.nav_button(UiPage::Settings, self.tr("Настройки", "Settings")),
                 self.nav_button(UiPage::Service, self.tr("Сервис", "Service")),
@@ -173,6 +175,7 @@ impl App {
             let tabs = row![
                 self.nav_button(UiPage::Overview, self.tr("Обзор", "Overview")),
                 self.nav_button(UiPage::Routes, self.tr("Маршруты", "Routes")),
+                self.nav_button(UiPage::Applications, self.tr("Приложения", "Applications")),
                 self.nav_button(UiPage::Masks, self.tr("Маски", "Masks")),
             ]
             .spacing(4);
@@ -227,6 +230,10 @@ impl App {
 
     fn connect_button(&self) -> Element<'_, Message> {
         let (label, message) = match self.status {
+            VpnStatus::Error(_) if self.has_desktop_session() => (
+                self.tr("Отключить", "Disconnect"),
+                Some(Message::Disconnect),
+            ),
             VpnStatus::Connecting => (self.tr("Отменить", "Cancel"), Some(Message::Disconnect)),
             VpnStatus::Connected { .. } => (
                 self.tr("Отключить", "Disconnect"),
@@ -344,6 +351,28 @@ impl App {
     }
 
     pub(super) fn route_summary(&self) -> String {
+        if self.uses_application_routing() {
+            return if self
+                .app_routing
+                .snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.policy.as_ref())
+                .is_some_and(|policy| !policy.split_enabled)
+            {
+                self.tr(
+                    "Весь трафик через VPN (split выключен)",
+                    "All traffic through VPN (split off)",
+                )
+                .into()
+            } else {
+                self.tr("Правила приложений", "Application rules").into()
+            };
+        }
+        if !self.settings.split_enabled {
+            return self
+                .tr("Весь трафик через VPN", "All traffic through VPN")
+                .into();
+        }
         let full = self.storage.selected_key().is_some_and(|k| k.full_tunnel);
         let includes = !self.settings.include_routes.trim().is_empty();
         let excludes = !self.settings.exclude_routes.trim().is_empty();
@@ -462,8 +491,11 @@ impl App {
             );
         }
         if let Some(key) = self.storage.selected_key() {
+            let applications = self.uses_application_routing();
             let kill_switch = self.kill_switch_value();
-            let kill_label = if connected {
+            let kill_label = if applications {
+                self.tr("Защита приложений", "Application protection")
+            } else if connected {
                 self.tr("Блокировка без VPN в сеансе", "Session kill switch")
             } else {
                 self.tr(
@@ -477,17 +509,27 @@ impl App {
                 self.detail(self.tr("Маршруты", "Routes"), &self.route_summary()),
                 self.detail(
                     kill_label,
-                    match kill_switch {
-                        Some(true) => self.tr("Включена", "Enabled"),
-                        Some(false) => self.tr("Выключена", "Disabled"),
-                        None => self.tr(
-                            "Неизвестно для восстановленного сеанса",
-                            "Unknown for recovered session"
-                        ),
+                    if applications {
+                        self.tr(
+                            "Приложения с VPN не выходят напрямую",
+                            "Applications assigned to VPN cannot fall back to a direct connection",
+                        )
+                    } else {
+                        match kill_switch {
+                            Some(true) => self.tr("Включена", "Enabled"),
+                            Some(false) => self.tr("Выключена", "Disabled"),
+                            None => self.tr(
+                                "Неизвестно для восстановленного сеанса",
+                                "Unknown for recovered session",
+                            ),
+                        }
                     }
                 ),
             ]
             .spacing(16);
+            if applications {
+                details = details.push(text(self.tr("DNS общий для системы и работает через VPN. При отключении разрешение имен может перестать работать во всех приложениях.", "System DNS uses VPN for all applications. Disconnecting may interrupt name resolution system-wide.")).size(13));
+            }
             if let VpnStatus::Connected { vpn_ip } = &self.status {
                 details = details.push(self.detail(self.tr("Адрес VPN", "VPN address"), vpn_ip));
             }

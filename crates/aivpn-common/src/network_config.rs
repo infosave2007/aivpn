@@ -6,11 +6,17 @@ use crate::error::{Error, Result};
 
 /// Крупные IP-пакеты делятся на фрагменты перед шифрованием и FEC.
 pub const MAX_MASK_TUN_MTU: u16 = 1500;
+pub const MIN_VPN_MTU: u16 = 576;
 /// Минимум IPv6 и безопасное начальное значение для мобильных сетей.
 pub const DEFAULT_VPN_MTU: u16 = 1280;
 pub const DEFAULT_KEEPALIVE_SECS: u8 = 8;
 pub const LEGACY_VPN_PREFIX_LEN: u8 = 24;
 pub const LEGACY_SERVER_VPN_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 1);
+
+fn is_tunnel_unicast(ip: Ipv4Addr) -> bool {
+    let first = ip.octets()[0];
+    first != 0 && first != 127 && first < 224 && !ip.is_link_local()
+}
 
 fn default_server_vpn_ip() -> Ipv4Addr {
     LEGACY_SERVER_VPN_IP
@@ -27,6 +33,74 @@ fn default_mtu() -> u16 {
 #[cfg(test)]
 mod carrier_mtu_tests {
     use super::*;
+
+    #[test]
+    fn non_unicast_addresses_are_rejected_in_server_and_client_assignments() {
+        for address in [
+            "0.1.2.3",
+            "127.0.0.2",
+            "169.254.1.2",
+            "224.0.0.2",
+            "240.0.0.2",
+        ] {
+            let network = VpnNetworkConfig {
+                server_vpn_ip: address.parse().unwrap(),
+                ..Default::default()
+            };
+            assert!(network.validate().is_err(), "server {address}");
+        }
+        let network = VpnNetworkConfig {
+            server_vpn_ip: "128.0.0.1".parse().unwrap(),
+            prefix_len: 1,
+            ..Default::default()
+        };
+        assert!(network.validate().is_err(), "подсеть включает multicast");
+        for address in [
+            "10.0.0.1",
+            "100.64.0.1",
+            "172.16.0.1",
+            "192.168.0.1",
+            "198.18.0.1",
+        ] {
+            assert!(VpnNetworkConfig {
+                server_vpn_ip: address.parse().unwrap(),
+                prefix_len: 16,
+                ..Default::default()
+            }
+            .validate()
+            .is_ok());
+        }
+        for address in ["169.254.1.2", "224.0.0.2", "240.0.0.2"] {
+            assert!(
+                network.client_config(address.parse().unwrap()).is_err(),
+                "client {address}"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_ipv4_mtu_is_rejected_before_server_assignment_or_client_setup() {
+        for mtu in [0, 1, 575] {
+            let network = VpnNetworkConfig {
+                mtu,
+                ..Default::default()
+            };
+            assert!(network.validate().is_err(), "MTU {mtu}");
+        }
+        let valid = VpnNetworkConfig::default()
+            .client_config("10.0.0.2".parse().unwrap())
+            .unwrap();
+        for mtu in [0, 575, 1501, u16::MAX] {
+            let mut assigned = valid.clone();
+            assigned.mtu = mtu;
+            assert!(assigned.validate().is_err(), "MTU {mtu}");
+        }
+        for mtu in [576, 1280, 1500] {
+            let mut assigned = valid.clone();
+            assigned.mtu = mtu;
+            assert!(assigned.validate().is_ok(), "MTU {mtu}");
+        }
+    }
 
     #[test]
     fn server_assignment_caps_explicit_mtu_and_preserves_smaller_ipv4_mtu() {
@@ -80,6 +154,9 @@ impl Default for VpnNetworkConfig {
 
 impl VpnNetworkConfig {
     pub fn validate(&self) -> Result<()> {
+        if self.mtu < MIN_VPN_MTU {
+            return Err(Error::InvalidPacket("VPN MTU must be at least 576"));
+        }
         if self.ipv6_enabled {
             self.ipv6_gateway()?;
             if self.mtu < 1280 {
@@ -91,7 +168,35 @@ impl VpnNetworkConfig {
                 "VPN prefix length must be in range 1..=30",
             ));
         }
-        if self.server_vpn_ip == self.network_addr() || self.server_vpn_ip == self.broadcast_addr()
+        // Подсеть не должна выдавать loopback, link-local или multicast клиентам.
+        let first = u32::from(self.network_addr());
+        let last = u32::from(self.broadcast_addr());
+        let forbidden = [
+            (
+                u32::from_be_bytes([0, 0, 0, 0]),
+                u32::from_be_bytes([0, 255, 255, 255]),
+            ),
+            (
+                u32::from_be_bytes([127, 0, 0, 0]),
+                u32::from_be_bytes([127, 255, 255, 255]),
+            ),
+            (
+                u32::from_be_bytes([169, 254, 0, 0]),
+                u32::from_be_bytes([169, 254, 255, 255]),
+            ),
+            (u32::from_be_bytes([224, 0, 0, 0]), u32::MAX),
+        ];
+        if forbidden
+            .iter()
+            .any(|&(start, end)| first <= end && last >= start)
+        {
+            return Err(Error::InvalidPacket(
+                "VPN subnet includes non-unicast addresses",
+            ));
+        }
+        if !is_tunnel_unicast(self.server_vpn_ip)
+            || self.server_vpn_ip == self.network_addr()
+            || self.server_vpn_ip == self.broadcast_addr()
         {
             return Err(Error::InvalidPacket(
                 "Server VPN IP must be a usable host address",
@@ -184,14 +289,18 @@ impl VpnNetworkConfig {
     }
 
     pub fn is_usable_host(&self, ip: Ipv4Addr) -> bool {
-        self.contains(ip) && ip != self.network_addr() && ip != self.broadcast_addr()
+        is_tunnel_unicast(ip)
+            && self.contains(ip)
+            && ip != self.network_addr()
+            && ip != self.broadcast_addr()
     }
 
     pub fn ip_for_host_offset(&self, host_offset: u32) -> Option<Ipv4Addr> {
         if host_offset == 0 || host_offset > self.max_host_offset() {
             return None;
         }
-        Some(Ipv4Addr::from(self.network_u32() | host_offset))
+        let ip = Ipv4Addr::from(self.network_u32() | host_offset);
+        is_tunnel_unicast(ip).then_some(ip)
     }
 
     pub fn client_config(&self, client_ip: Ipv4Addr) -> Result<ClientNetworkConfig> {
@@ -262,6 +371,20 @@ fn default_mdh_len() -> u16 {
 }
 
 impl ClientNetworkConfig {
+    /// Параметры старого ключа, в котором указан только IPv4 клиента.
+    pub fn from_legacy_address(client_ip: Ipv4Addr) -> Self {
+        Self {
+            client_ip,
+            server_vpn_ip: LEGACY_SERVER_VPN_IP,
+            prefix_len: LEGACY_VPN_PREFIX_LEN,
+            mtu: DEFAULT_VPN_MTU,
+            mdh_len: default_mdh_len(),
+            keepalive_secs: None,
+            ipv6_address: None,
+            ipv6_prefix_len: None,
+        }
+    }
+
     pub const WIRE_SIZE: usize = 30;
     /// Wire-format / protocol-capability version.
     ///
@@ -275,6 +398,11 @@ impl ClientNetworkConfig {
     const WIRE_VERSION: u8 = 2;
 
     pub fn validate(&self) -> Result<()> {
+        if self.mtu > MAX_MASK_TUN_MTU {
+            return Err(Error::InvalidPacket(
+                "VPN MTU exceeds the supported packet budget",
+            ));
+        }
         self.client_ipv6()?;
         VpnNetworkConfig {
             server_vpn_ip: self.server_vpn_ip,

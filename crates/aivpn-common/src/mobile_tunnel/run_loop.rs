@@ -132,6 +132,33 @@ fn resolve_direct_destination<P: PlatformIo>(
 #[derive(Default)]
 struct TunnelTasks(Vec<tokio::task::AbortHandle>);
 
+/// Считаем также ранний отказ внешней несущей, до внутреннего ServerHello.
+struct HandshakeAttempt<'a> {
+    session: &'a SessionRuntime,
+    completed: bool,
+}
+
+impl HandshakeAttempt<'_> {
+    fn complete(&mut self) {
+        self.completed = true;
+        // ServerHello уже подтвердил доступность маски, независимо от настройки TUN.
+        HANDSHAKE_FAIL_STREAK.store(0, Ordering::Relaxed);
+    }
+}
+
+impl Drop for HandshakeAttempt<'_> {
+    fn drop(&mut self) {
+        if !self.completed
+            && !self.session.stop_requested.load(Ordering::SeqCst)
+            && !HANDSHAKE_REJECTED.load(Ordering::Relaxed)
+        {
+            let _ = HANDSHAKE_FAIL_STREAK.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                Some(n.saturating_add(1))
+            });
+        }
+    }
+}
+
 impl TunnelTasks {
     fn track<T>(&mut self, task: &tokio::task::JoinHandle<T>) {
         self.0.push(task.abort_handle());
@@ -368,6 +395,18 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
     //    during a slow/hung cellular DNS is handled instantly, not after a 5 s wait.
     let stop_signal = create_stop_signal(&session)?;
 
+    // Остановка прерывает и ожидание отправки: сеть может исчезнуть до того,
+    // как выполнение дойдет до основного select с обработчиком stop.
+    macro_rules! until_stopped {
+        ($operation:expr) => {
+            tokio::select! {
+                biased;
+                _ = wait_for_stop(&stop_signal) => return Ok(()),
+                result = $operation => result,
+            }
+        };
+    }
+
     // Прямой адрес нужен только UDP; альтернативный транспорт выбирает маршрут сам.
     let dest_host = server_host.trim_start_matches('[').trim_end_matches(']');
     let dns_endpoint = format!("{dest_host}:{server_port}");
@@ -514,6 +553,10 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
         mask_id: handshake_mask.mask_id.clone(),
     }
     .encode()?;
+    let mut handshake_attempt = HandshakeAttempt {
+        session: &session,
+        completed: false,
+    };
     {
         let obf_pub = obfuscate_client_eph_pub(&keypair, &server_key);
         let inner = build_inner_packet(InnerType::Control, send_seq, &client_hello);
@@ -526,7 +569,7 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
             &handshake_mask,
         )?;
         send_seq = send_seq.wrapping_add(1);
-        transport.send(&pkt).await?;
+        until_stopped!(transport.send(&pkt))?;
     }
 
     // ── 5. Wait for ServerHello with timeout ──
@@ -541,7 +584,6 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
         if now >= handshake_deadline {
             // Feed the resilience net: a timeout here is the signature of an
             // unmatchable handshake mask (tag mismatch server-side is silent).
-            HANDSHAKE_FAIL_STREAK.fetch_add(1, Ordering::Relaxed);
             return Err(Error::Session("Handshake timeout (10 s)".into()));
         }
 
@@ -667,7 +709,6 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
                     return Ok(());
                 }
                 if handshake_retry.expired(handshake_start.elapsed()) {
-                    HANDSHAKE_FAIL_STREAK.fetch_add(1, Ordering::Relaxed);
                     return Err(Error::Session("Handshake timeout (10 s)".into()));
                 }
                 // Повтор не меняет соединение и не сбрасывает счетчик.
@@ -675,11 +716,12 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
                 let inner = build_inner_packet(InnerType::Control, send_seq, &client_hello);
                 let pkt = build_shaped_mdh_packet(&keys, &mut send_counter, &inner, Some(&obf_pub), hs_mdh_len, &handshake_mask)?;
                 send_seq = send_seq.wrapping_add(1);
-                transport.send(&pkt).await?;
+                until_stopped!(transport.send(&pkt))?;
                 handshake_retry.sent(handshake_start.elapsed());
             }
         }
     };
+    handshake_attempt.complete();
     if direct_udp {
         crate::dns_candidates::confirm(&dns_endpoint, dest);
     }
@@ -776,7 +818,7 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
             &handshake_mask,
         )?;
         send_seq = send_seq.wrapping_add(1);
-        transport.send(&pkt).await?;
+        until_stopped!(transport.send(&pkt))?;
         log::debug!("mTLS: ClientCert sent ({} bytes)", cert_len_debug);
     }
     // Immediately send a keepalive to prevent CGNAT outbound mapping expiry.
@@ -799,7 +841,7 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
             &handshake_mask,
         ) {
             send_seq = send_seq.wrapping_add(1);
-            let _ = transport.send(&pkt).await;
+            let _ = until_stopped!(transport.send(&pkt));
         }
     }
     // §2 L2 failure attribution — the handshake + PFS ratchet above completed
@@ -823,7 +865,6 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
     // Session start (post-handshake) — used to tell a working sticky mask (long
     // healthy session) from a throttled one (repeated short data stalls).
     let session_established = Instant::now();
-    HANDSHAKE_FAIL_STREAK.store(0, Ordering::Relaxed);
     // H1: a disconnect that raced in while the handshake was completing must
     // not announce "ready" — the platform's stopVpn() has already rendered
     // DISCONNECTED and removed the foreground notification, so a late
@@ -859,7 +900,7 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
                     let inner = build_inner_packet(InnerType::Control, send_seq, &ka);
                     if let Ok(pkt) = build_shaped_mdh_packet(&keys, &mut send_counter, &inner, None, hs_mdh_len, &handshake_mask) {
                         send_seq = send_seq.wrapping_add(1);
-                        let _ = transport.send(&pkt).await;
+                        let _ = until_stopped!(transport.send(&pkt));
                     }
                 }
             }
@@ -891,7 +932,7 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
                     &handshake_mask,
                 ) {
                     send_seq = send_seq.wrapping_add(1);
-                    let _ = transport.send(&pkt).await;
+                    let _ = until_stopped!(transport.send(&pkt));
                 }
             }
         }
@@ -921,6 +962,7 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
     // Split upload into a dedicated pipeline:
     // TUN reader task -> channel -> UDP sender/encrypt task.
     let (tun_tx, mut tun_rx) = mpsc::channel::<Vec<u8>>(CHANNEL_SIZE);
+    let _diagnostic_sender = active_mgmt().install_diagnostic_sender(tun_tx.clone());
     let (err_tx, mut err_rx) = mpsc::channel::<String>(16);
     let tun_err_tx = err_tx.clone();
     let sender_err_tx = err_tx.clone();
@@ -968,6 +1010,7 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
     tunnel_tasks.track(&tun_reader_task);
     let keepalive_sent_ms = Arc::new(AtomicU64::new(0));
     let mut quality_tracker = QualityTracker::new();
+    let mut mask_receiver = crate::mask_transition::MaskReceiver::default();
     let mut peer_receiver_feedback = crate::quality::PeerReceiverFeedback::default();
 
     // Reset the per-session adaptive hint so the platform getter reports
@@ -1027,7 +1070,7 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
     // `session_offset=20`.
     let initial_mask = handshake_mask.clone();
     let mut rtc_mask_profile = initial_mask.clone();
-    if let Some(state) = transport.mask_state_offer(&rtc_mask_profile).await? {
+    if let Some(state) = until_stopped!(transport.mask_state_offer(&rtc_mask_profile))? {
         let _ = ctrl_tx_recv_loop.try_send(ControlPayload::MaskState(state));
     }
 
@@ -1160,6 +1203,8 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
     let packet_features = ControlPayload::Capabilities {
         role: 0,
         features: crate::protocol::CLIENT_PACKET_FEATURES
+            | crate::mask_transition::FEATURE
+            | crate::mask_assessment::FEATURE
             | if level.fec_n() > 0 {
                 crate::protocol::CLIENT_FEC_ACTIVE
             } else {
@@ -1177,7 +1222,7 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
         &handshake_mask,
     )?;
     send_seq = send_seq.wrapping_add(1);
-    transport.send(&packet).await?;
+    until_stopped!(transport.send(&packet))?;
 
     let mask_update_slot: Arc<Mutex<Option<MaskProfile>>> = Arc::new(Mutex::new(None));
     let mask_update_for_enc = Arc::clone(&mask_update_slot);
@@ -1272,8 +1317,8 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
             biased;
 
             _ = wait_for_stop(&stop_signal) => {
-                // Сокет уже закрывается stop_active_tunnel: отправка Shutdown
-                // через него невозможна. Прерываем задачи без ожидания отправки.
+                // Прерываем ожидающие отправки и прием до закрытия сокета.
+                // Завершение не должно ждать сетевого ответа или свободной очереди.
                 stop_data_plane(&tun, &mut tun_reader_task, &mut upload_sender_task).await;
                 return Ok(());
             }
@@ -1391,12 +1436,14 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
                         // tasks before propagating, or a TUN write failure
                         // (EIO/ENOBUFS from a torn-down VpnService /
                         // NEPacketTunnelProvider) leaks them across reconnects.
-                        if let Err(e) = tun_async_write(&tun, &decoded.payload).await {
-                            stop_data_plane(&tun, &mut tun_reader_task, &mut upload_sender_task).await;
-                            if session.stop_requested.load(Ordering::SeqCst) {
-                                return Ok(());
+                        if !active_mgmt().on_diagnostic_packet(&decoded.payload) {
+                            if let Err(e) = tun_async_write(&tun, &decoded.payload).await {
+                                stop_data_plane(&tun, &mut tun_reader_task, &mut upload_sender_task).await;
+                                if session.stop_requested.load(Ordering::SeqCst) {
+                                    return Ok(());
+                                }
+                                return Err(e.into());
                             }
-                            return Err(e.into());
                         }
                         session
                             .download_bytes
@@ -1424,9 +1471,34 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
                     // Handle server-initiated inline rekey (PFS without reconnect).
                     if decoded.header.inner_type == InnerType::Control {
                         if let Ok(ctrl) = ControlPayload::decode(&decoded.payload) {
+                            let (ctrl, mask_receipt) = match ctrl {
+                                ControlPayload::MaskApplied { generation, digest } => {
+                                    mask_receiver.confirm(crate::mask_transition::MaskReceipt { generation, digest });
+                                    continue;
+                                }
+                                ControlPayload::MaskUpdateV2 { generation, mask_data, signature } => {
+                                    let receipt = crate::mask_transition::MaskReceipt::for_payload(generation, &mask_data);
+                                    if mask_receiver.duplicate(receipt) {
+                                        let _ = ctrl_tx_recv_loop.try_send(receipt.control());
+                                        continue;
+                                    }
+                                    if !mask_receiver.accepts(receipt) { continue; }
+                                    (ControlPayload::MaskUpdate { mask_data, signature }, Some(receipt))
+                                }
+                                ControlPayload::MaskUpdate { .. } if mask_receiver.current().is_some() => continue,
+                                other => (other, None),
+                            };
                             match ctrl {
+                                ControlPayload::MaskApplied { .. } | ControlPayload::MaskUpdateV2 { .. } => unreachable!(),
+                                ControlPayload::MaskAssessment(value) => {
+                                    let generation = mask_receiver.current().map_or(0, |receipt| receipt.generation);
+                                    if quality_tracker.mask_assessment.record(value,
+                                        crate::mask_assessment::identity(&rtc_mask_profile), generation, Instant::now()) {
+                                        *session.mask_assessment.lock().unwrap_or_else(|e| e.into_inner()) = quality_tracker.mask_assessment.clone();
+                                    }
+                                }
                                 ControlPayload::MaskState(state) => {
-                                    if let Err(error) = transport.accept_mask_state(&state).await {
+                                    if let Err(error) = until_stopped!(transport.accept_mask_state(&state)) {
                                         log::warn!("Ответ RTC не принят: {error}");
                                     }
                                 }
@@ -1481,7 +1553,7 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
                                         let response = ControlPayload::KeyRotate {
                                             new_eph_pub: response_eph,
                                         };
-                                        if ctrl_tx_recv_loop.send(response).await.is_err() {
+                                        if until_stopped!(ctrl_tx_recv_loop.send(response)).is_err() {
                                             // Nothing was enqueued — drop the unused
                                             // rendezvous and override so they cannot
                                             // mis-fire on a future KeyRotate.
@@ -1496,7 +1568,7 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
                                                 "aivpn: rekey response re-send aborted — upload channel closed"
                                             );
                                         } else if !matches!(
-                                            time::timeout(REKEY_ACK_TIMEOUT, ack_rx).await,
+                                            until_stopped!(time::timeout(REKEY_ACK_TIMEOUT, ack_rx)),
                                             Ok(Ok(()))
                                         ) {
                                             // Upload task gone — either it dropped the
@@ -1561,7 +1633,7 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
                                         let response = ControlPayload::KeyRotate {
                                             new_eph_pub: rekey_kp.public_key_bytes(),
                                         };
-                                        if ctrl_tx_recv_loop.send(response).await.is_err() {
+                                        if until_stopped!(ctrl_tx_recv_loop.send(response)).is_err() {
                                             // Upload task gone — drop the ack we just registered.
                                             rekey_ack_slot
                                                 .lock()
@@ -1571,7 +1643,7 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
                                                 "aivpn: inline rekey aborted — upload channel closed"
                                             );
                                         } else if !matches!(
-                                            time::timeout(REKEY_ACK_TIMEOUT, ack_rx).await,
+                                            until_stopped!(time::timeout(REKEY_ACK_TIMEOUT, ack_rx)),
                                             Ok(Ok(()))
                                         ) {
                                             // Upload task gone — either it dropped the
@@ -1919,6 +1991,12 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
                                             if !recv_mdh_candidates.contains(&new_mdh) {
                                                 recv_mdh_candidates.insert(0, new_mdh);
                                             }
+                                            quality_tracker.mask_assessment.reset();
+                                            session.mask_assessment.lock().unwrap_or_else(|e| e.into_inner()).reset();
+                                            if let Some(receipt) = mask_receipt {
+                                                mask_receiver.applied(receipt);
+                                                let _ = ctrl_tx_recv_loop.try_send(receipt.control());
+                                            }
                                             rtc_mask_profile = mask.clone();
                                             transport.set_mask_profile(&mask);
                                             *mask_update_slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(mask);
@@ -1938,7 +2016,14 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
                                     stop_data_plane(&tun, &mut tun_reader_task, &mut upload_sender_task).await;
                                     return Err(Error::Session(format!("server shutdown: {reason}")));
                                 }
-                                ControlPayload::HandshakeReject { reason } => {
+                                rejection @ (ControlPayload::HandshakeReject { .. } | ControlPayload::CertRejected {}) => {
+                                    let reason = match rejection {
+                                        ControlPayload::HandshakeReject { reason } => reason,
+                                        _ => {
+                                            CERT_REJECTED.store(true, Ordering::Relaxed);
+                                            crate::protocol::CERTIFICATE_REJECT_REASON
+                                        }
+                                    };
                                     // 3f — authenticated, TERMINAL refusal. The server only ever
                                     // sends this to a peer that already proved PSK knowledge
                                     // during the handshake (see the doc comment on
@@ -2097,21 +2182,6 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
                                         send_ts: crate::crypto::current_timestamp_ms(),
                                     });
                                 }
-                                ControlPayload::CertRejected {} => {
-                                    // MEDIUM: server rejected our mTLS client certificate.
-                                    // Previously this fell through the wildcard arm below and
-                                    // was silently dropped — the tunnel kept "connecting" under
-                                    // a certificate the server will never accept, retrying
-                                    // forever with no signal to the user. Surface it via a
-                                    // polled flag (see CERT_REJECTED doc comment) so the platform
-                                    // layer can prompt re-provisioning instead of looping
-                                    // silently (mirrors desktop client.rs's warning, plus the
-                                    // mobile-specific UI callback surface desktop doesn't need).
-                                    log::warn!(
-                                        "aivpn: mTLS: server rejected the certificate — re-provision required"
-                                    );
-                                    CERT_REJECTED.store(true, Ordering::Relaxed);
-                                }
                                 ControlPayload::Capabilities { role, features } => {
                                     // P2.3: server-assigned role, sent once per
                                     // session after ratchet. `features` is reserved
@@ -2121,6 +2191,14 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
                                         "aivpn: Capabilities from server: role={} features={}",
                                         role, features
                                     );
+                                    if features & crate::mask_transition::FEATURE != 0
+                                        && features & crate::protocol::CLIENT_PACKET_FEATURES == 0 {
+                                        let _ = ctrl_tx_recv_loop.try_send(ControlPayload::Capabilities { role: 0,
+                                            features: crate::protocol::CLIENT_PACKET_FEATURES
+                                                | crate::mask_transition::FEATURE | crate::mask_assessment::FEATURE
+                                                | if level.fec_n() > 0 { crate::protocol::CLIENT_FEC_ACTIVE } else { 0 },
+                                        });
+                                    }
                                     active_mgmt().on_capabilities(role);
                                 }
                                 ControlPayload::MgmtResponse {
@@ -2191,8 +2269,11 @@ pub async fn run_tunnel_generic<P: PlatformIo>(
 
             // ── RX silence detector (proper interval, not recreated each iteration) ──
             _ = rx_check.tick() => {
+                if let Some(receipt) = mask_receiver.pending() {
+                    let _ = ctrl_tx_recv_loop.try_send(receipt.control());
+                }
                 refresh_mobile_tx_fec(&fec_group, &mut peer_receiver_feedback, None, active_keepalive_level, Instant::now());
-                if let Some(state) = transport.mask_state_offer(&rtc_mask_profile).await? {
+                if let Some(state) = until_stopped!(transport.mask_state_offer(&rtc_mask_profile))? {
                     let _ = ctrl_tx_recv_loop.try_send(ControlPayload::MaskState(state));
                 }
                 // The receive branch performs this same transition cleanup
@@ -2612,6 +2693,21 @@ mod protocol_audit_tests {
 #[cfg(test)]
 mod keepalive_tests {
     use super::*;
+
+    #[test]
+    fn confirmed_handshake_clears_failures_before_tunnel_configuration() {
+        let session = SessionRuntime::new();
+        HANDSHAKE_FAIL_STREAK.store(2, Ordering::Relaxed);
+        let mut attempt = HandshakeAttempt {
+            session: &session,
+            completed: false,
+        };
+        attempt.complete();
+        // Последующая ошибка TUN или остановка не относится к доступности маски.
+        session.stop_requested.store(true, Ordering::SeqCst);
+        drop(attempt);
+        assert_eq!(HANDSHAKE_FAIL_STREAK.load(Ordering::Relaxed), 0);
+    }
 
     #[test]
     fn server_keepalive_and_adaptive_hints_stay_below_quic_idle() {

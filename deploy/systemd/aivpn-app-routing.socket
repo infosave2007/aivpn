@@ -1,0 +1,15 @@
+[Unit]
+Description=AIVPN application routing control
+
+[Socket]
+ListenStream=/run/aivpn-app-routing/control.sock
+SocketUser=root
+SocketGroup=root
+SocketMode=0666
+DirectoryMode=0755
+Backlog=32
+RemoveOnStop=yes
+Service=aivpn-app-routing.service
+
+[Install]
+WantedBy=sockets.target

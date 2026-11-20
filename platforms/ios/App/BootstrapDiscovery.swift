@@ -232,12 +232,16 @@ enum BootstrapDiscoveryService {
         }
     }
 
-    private static let session: URLSession = {
+    private static func boundedData(for request: URLRequest) async throws -> (Data, URLResponse) {
         let config = URLSessionConfiguration.ephemeral
         config.timeoutIntervalForRequest = 15
         config.timeoutIntervalForResource = 30
-        return URLSession(configuration: config, delegate: RedirectGuard(), delegateQueue: nil)
-    }()
+        let session = URLSession(configuration: config, delegate: RedirectGuard(), delegateQueue: nil)
+        defer { session.invalidateAndCancel() }
+        let (bytes, response) = try await session.bytes(for: request)
+        let data = try await BootstrapResponse.read(bytes, expectedLength: response.expectedContentLength)
+        return (data, response)
+    }
 
     /// Rejects everything except HTTPS with a host that resolves exclusively
     /// to public addresses — mirrors (in spirit, not byte-for-byte) the SSRF
@@ -383,7 +387,7 @@ enum BootstrapDiscoveryService {
                                                 error: "URL rejected — must be https:// and not a private host"))
         }
         do {
-            let (data, response) = try await session.data(from: requestURL)
+            let (data, response) = try await boundedData(for: URLRequest(url: requestURL))
             guard let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode) else {
                 return ([], BootstrapChannelResult(channel: .cdn, success: false, descriptorsFound: 0,
                                                     error: "unexpected HTTP status"))
@@ -414,7 +418,7 @@ enum BootstrapDiscoveryService {
         var request = URLRequest(url: releaseURL)
         request.setValue("aivpn-ios", forHTTPHeaderField: "User-Agent")
         do {
-            let (data, response) = try await session.data(for: request)
+            let (data, response) = try await boundedData(for: request)
             guard let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode) else {
                 return ([], BootstrapChannelResult(channel: .github, success: false, descriptorsFound: 0,
                                                     error: "unexpected HTTP status"))
@@ -429,7 +433,7 @@ enum BootstrapDiscoveryService {
                       let downloadURLString = asset["browser_download_url"] as? String,
                       isURLAllowed(downloadURLString),
                       let downloadURL = URL(string: downloadURLString) else { continue }
-                let (assetData, assetResponse) = try await session.data(from: downloadURL)
+                let (assetData, assetResponse) = try await boundedData(for: URLRequest(url: downloadURL))
                 guard let assetHttp = assetResponse as? HTTPURLResponse,
                       (200...299).contains(assetHttp.statusCode) else { continue }
                 let valid = verifyAll(assetData, signingKey: signingKey)
@@ -468,7 +472,7 @@ enum BootstrapDiscoveryService {
                                                 error: "invalid bot token"))
         }
         do {
-            let (data, response) = try await session.data(from: updatesURL)
+            let (data, response) = try await boundedData(for: URLRequest(url: updatesURL))
             guard let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode) else {
                 return ([], BootstrapChannelResult(channel: .telegram, success: false, descriptorsFound: 0,
                                                     error: "unexpected HTTP status"))
@@ -493,14 +497,14 @@ enum BootstrapDiscoveryService {
                 guard let getFileURL = URL(string: "https://api.telegram.org/bot\(token)/getFile?file_id=\(fileId)") else {
                     continue
                 }
-                let (fileMetaData, _) = try await session.data(from: getFileURL)
+                let (fileMetaData, _) = try await boundedData(for: URLRequest(url: getFileURL))
                 guard let fileMetaJSON = try? JSONSerialization.jsonObject(with: fileMetaData) as? [String: Any],
                       let fileResult = fileMetaJSON["result"] as? [String: Any],
                       let filePath = fileResult["file_path"] as? String,
                       let downloadURL = URL(string: "https://api.telegram.org/file/bot\(token)/\(filePath)") else {
                     continue
                 }
-                let (docData, docResponse) = try await session.data(from: downloadURL)
+                let (docData, docResponse) = try await boundedData(for: URLRequest(url: downloadURL))
                 guard let docHttp = docResponse as? HTTPURLResponse,
                       (200...299).contains(docHttp.statusCode) else { continue }
                 let valid = verifyAll(docData, signingKey: signingKey)
@@ -579,43 +583,43 @@ struct BootstrapDiscoveryView: View {
     @State private var channelResults: [BootstrapChannelResult] = []
 
     var body: some View {
-        NavigationStack {
+        CompatibleNavigationView {
             Form {
                 Section(header: Text(loc.t("bootstrap_server_section")),
                         footer: Text(loc.t("advanced_hint")).font(.caption2).foregroundColor(.secondary)) {
                     TextField(loc.t("bootstrap_server_address"), text: $serverAddress)
-                        .autocorrectionDisabled()
+                        .disableAutocorrection(true)
                         .textInputAutocapitalization(.never)
                         .keyboardType(.URL)
                     TextField(loc.t("bootstrap_server_pubkey"), text: $serverPublicKeyHex)
-                        .autocorrectionDisabled()
+                        .disableAutocorrection(true)
                         .textInputAutocapitalization(.never)
                         .font(.system(size: 12, design: .monospaced))
                     TextField(loc.t("bootstrap_server_psk"), text: $pskHex)
-                        .autocorrectionDisabled()
+                        .disableAutocorrection(true)
                         .textInputAutocapitalization(.never)
                         .font(.system(size: 12, design: .monospaced))
                     TextField(loc.t("bootstrap_key_name"), text: $keyName)
-                        .autocorrectionDisabled()
+                        .disableAutocorrection(true)
                 }
 
                 Section(header: Text(loc.t("bootstrap_channels_section"))) {
                     TextField(loc.t("bootstrap_signing_pubkey"), text: $store.settings.signingPublicKeyHex)
-                        .autocorrectionDisabled()
+                        .disableAutocorrection(true)
                         .textInputAutocapitalization(.never)
                         .font(.system(size: 12, design: .monospaced))
                     TextField(loc.t("bootstrap_cdn_url"), text: $store.settings.cdnURL)
-                        .autocorrectionDisabled()
+                        .disableAutocorrection(true)
                         .textInputAutocapitalization(.never)
                         .keyboardType(.URL)
                     TextField(loc.t("bootstrap_github_repo"), text: $store.settings.githubRepo)
-                        .autocorrectionDisabled()
+                        .disableAutocorrection(true)
                         .textInputAutocapitalization(.never)
                     TextField(loc.t("bootstrap_telegram_bot_token"), text: $store.settings.telegramBotToken)
-                        .autocorrectionDisabled()
+                        .disableAutocorrection(true)
                         .textInputAutocapitalization(.never)
                     TextField(loc.t("bootstrap_telegram_chat"), text: $store.settings.telegramChatId)
-                        .autocorrectionDisabled()
+                        .disableAutocorrection(true)
                         .textInputAutocapitalization(.never)
                 }
 

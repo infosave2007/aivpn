@@ -1,5 +1,6 @@
 [package]
 name = "aivpn-client"
+autobins = false
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -9,14 +10,31 @@ repository.workspace = true
 [[bin]]
 name = "aivpn-client"
 path = "src/main.rs"
+required-features = ["cli-runtime"]
 
-[[bin]]
-name = "aivpn-ip-helper"
-path = "src/bin/aivpn-ip-helper.rs"
+[[example]]
+name = "linux_vertical_service"
+path = "examples/linux_vertical_service.rs"
+required-features = ["desktop-worker"]
+
+[[example]]
+name = "linux_dns_vertical_service"
+path = "examples/linux_dns_vertical_service.rs"
+required-features = ["desktop-service"]
+
+[[example]]
+name = "windows_vertical_service"
+path = "examples/windows_vertical_service.rs"
+required-features = ["desktop-worker"]
 
 
 [features]
-default = []
+default = ["cli-runtime"]
+app-routing = ["desktop-service", "aivpn-desktop-agent/cli"]
+cli-runtime = ["tokio/signal"]
+desktop-worker-lab = ["desktop-worker", "aivpn-desktop-agent/windows-lab"]
+desktop-worker = ["aivpn-desktop-agent/local-profile", "aivpn-desktop-agent/windows-kernel"]
+desktop-service = ["desktop-worker", "aivpn-desktop-agent/linux-kernel", "aivpn-desktop-agent/windows-kernel", "aivpn-desktop-agent/cli"]
 # Production secure mode: disables built-in bootstrap fallback
 # When enabled, client will fail to start if no valid descriptors are available
 production-secure = ["aivpn-common/production-secure"]
@@ -67,8 +85,12 @@ smoltcp = { version = "0.11", default-features = false, features = ["socket-dns"
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+[target.'cfg(target_os = "linux")'.dependencies]
+aivpn-desktop-agent = { path = "../aivpn-desktop-agent" }
+
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_Rpc", "Win32_NetworkManagement_WindowsFilteringPlatform", "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis", "Win32_Networking_WinSock"] }
+aivpn-desktop-agent = { path = "../aivpn-desktop-agent" }
+windows-sys = { version = "0.61", features = ["Wdk_Foundation", "Wdk_Storage_FileSystem", "Win32_System_IO", "Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_Rpc", "Win32_System_Services", "Win32_System_EventLog", "Win32_System_Console", "Win32_System_Com", "Win32_System_SystemInformation", "Win32_System_Pipes", "Win32_System_Threading", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging", "Win32_NetworkManagement_WindowsFilteringPlatform", "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis", "Win32_Networking_WinSock"] }
 winapi = { version = "0.3", features = [
     "processthreadsapi",
     "securitybaseapi",
@@ -76,12 +98,13 @@ winapi = { version = "0.3", features = [
     "winnt",
 ] }
 
-[build-dependencies]
-winres = "0.1"
-
 [dev-dependencies]
+aivpn-desktop-policy = { path = "../aivpn-desktop-policy" }
 async-trait.workspace = true
 # `test-util` is not part of the workspace `tokio` "full" feature set — needed
 # by client.rs tests that pause/advance virtual time (e.g. to deterministically
 # exercise the randomized MaskFeedback send-jitter without a real 0-3s sleep).
 tokio = { workspace = true, features = ["test-util"] }
+
+[build-dependencies]
+cc = "1"

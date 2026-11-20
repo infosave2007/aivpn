@@ -5,17 +5,38 @@ use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use std::time::Instant;
 
+#[cfg(feature = "client-upload")]
+mod client;
+pub mod data;
+
 pub const PING: &str = "/diagnostics/v1/ping";
 pub const UP: &str = "/diagnostics/v1/up";
 pub const DOWN: &str = "/diagnostics/v1/down";
+pub const START: &str = "/diagnostics/v2/start";
+pub const CAPABILITIES: &str = "/diagnostics/v2/capabilities";
+pub const PULL: &str = "/diagnostics/v2/pull";
+pub const RECEIPT: &str = "/diagnostics/v2/receipt";
+pub const STOP: &str = "/diagnostics/v2/stop";
 pub const BLOCK_BYTES: usize = 768;
 #[cfg(feature = "client-upload")]
 const WINDOW: usize = 64;
 #[cfg(feature = "client-upload")]
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(1);
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MeasurementMethod {
+    Data,
+    #[default]
+    RpcWindowLimited,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct BenchResult {
+    #[serde(default)]
+    pub throughput_method: MeasurementMethod,
+    #[serde(default)]
+    pub throughput_limited: bool,
     pub latency_p50_ms: f64,
     pub latency_p95_ms: f64,
     pub latency_p99_ms: f64,
@@ -28,7 +49,10 @@ pub struct BenchResult {
 }
 
 pub fn is_diagnostic(path: &str) -> bool {
-    matches!(path, PING | UP | DOWN)
+    matches!(
+        path,
+        PING | UP | DOWN | CAPABILITIES | START | PULL | RECEIPT | STOP
+    )
 }
 
 /// Ответ ограничен одним блоком и отправляется только допущенному клиенту.
@@ -50,25 +74,40 @@ fn download_block(seed: &[u8]) -> Vec<u8> {
     body
 }
 
-/// Бюджет одной сессии: до 8 МиБ в секунду с небольшим начальным запасом.
+pub const PACKETS_PER_SECOND: u64 = 8192;
+const BURST_PACKETS: f64 = 256.0;
+
+/// Бюджет одной сессии с начальным запасом. Для DATA один токен
+/// соответствует одному блоку 1024 байта, для RPC одному запросу.
 #[derive(Debug)]
 pub struct DiagnosticBudget {
     updated: Instant,
     tokens: f64,
+    burst: f64,
 }
 impl Default for DiagnosticBudget {
     fn default() -> Self {
         Self {
             updated: Instant::now(),
-            tokens: 256.0,
+            tokens: BURST_PACKETS,
+            burst: BURST_PACKETS,
         }
     }
 }
 impl DiagnosticBudget {
+    pub fn for_data() -> Self {
+        Self {
+            tokens: data::WINDOW as f64,
+            burst: data::WINDOW as f64,
+            ..Self::default()
+        }
+    }
+
     pub fn take(&mut self, now: Instant) -> bool {
         self.tokens = (self.tokens
-            + now.saturating_duration_since(self.updated).as_secs_f64() * 8192.0)
-            .min(256.0);
+            + now.saturating_duration_since(self.updated).as_secs_f64()
+                * PACKETS_PER_SECOND as f64)
+            .min(self.burst);
         self.updated = now;
         if self.tokens < 1.0 {
             return false;
@@ -101,15 +140,26 @@ pub async fn run(
         }
     }
     let _guard = Guard;
-    run_with(
-        move |path, body| {
-            let mgmt = mgmt.clone();
-            let tx = tx.clone();
-            async move { mgmt.mgmt_call(&tx, 1, path, body, REQUEST_TIMEOUT).await }
-        },
-        duration,
-    )
-    .await
+    let mut epoch = mgmt.diagnostic_epoch();
+    let benchmark = async {
+        if let Some(result) = client::run(mgmt.clone(), tx.clone(), duration).await? {
+            return Ok(result);
+        }
+        run_with(
+            move |path, body| {
+                let mgmt = mgmt.clone();
+                let tx = tx.clone();
+                async move { mgmt.mgmt_call(&tx, 1, path, body, REQUEST_TIMEOUT).await }
+            },
+            duration,
+        )
+        .await
+    };
+    tokio::select! {
+        biased;
+        _ = epoch.changed() => Err(crate::Error::Session("VPN session changed during benchmark".into())),
+        result = benchmark => result,
+    }
 }
 
 #[cfg(feature = "client-upload")]
@@ -122,29 +172,7 @@ where
     use tokio::time::Instant;
     let duration = duration.clamp(Duration::from_secs(3), Duration::from_secs(30));
     let phase = duration / 3;
-    let mut rtts = Vec::new();
-    let mut sent = 0;
-    let end = Instant::now() + phase;
-    while Instant::now() < end {
-        let seed = rand::random::<[u8; 8]>().to_vec();
-        let start = Instant::now();
-        sent += 1;
-        match call(PING, seed.clone()).await {
-            Ok((200, body)) if body == seed => rtts.push(start.elapsed().as_secs_f64() * 1000.0),
-            Ok((status, _)) if status != 200 => {
-                return Err(crate::Error::Session(format!(
-                    "In-session diagnostics unavailable (status {status}); update the server"
-                )))
-            }
-            _ => {}
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    if rtts.is_empty() {
-        return Err(crate::Error::Session(
-            "No diagnostic replies from the active VPN session".into(),
-        ));
-    }
+    let mut result = measure_latency(call.clone(), phase).await?;
     let mut speeds = [0.0; 2];
     for (index, path) in [UP, DOWN].into_iter().enumerate() {
         let start = Instant::now();
@@ -194,6 +222,43 @@ where
         // Время включает доставку последнего подтверждения, а не только постановку в очередь.
         speeds[index] = bytes as f64 * 8.0 / start.elapsed().as_secs_f64().max(0.001) / 1000.0;
     }
+    result.throughput_up_kbps = speeds[0];
+    result.throughput_down_kbps = speeds[1];
+    Ok(result)
+}
+
+#[cfg(feature = "client-upload")]
+async fn measure_latency<F, Fut>(call: F, phase: Duration) -> crate::Result<BenchResult>
+where
+    F: Fn(&'static str, Vec<u8>) -> Fut + Clone + Send + 'static,
+    Fut: std::future::Future<Output = crate::Result<(u16, Vec<u8>)>> + Send + 'static,
+{
+    use tokio::time::Instant;
+    let mut rtts = Vec::new();
+    let mut sent = 0;
+    let end = Instant::now() + phase;
+    // Один потерянный пакет не должен исчерпывать всю короткую фазу.
+    // Это отдельные пробы: потери остаются в итоговом проценте.
+    while sent < 3 || Instant::now() < end {
+        let seed = rand::random::<[u8; 8]>().to_vec();
+        let start = Instant::now();
+        sent += 1;
+        match call(PING, seed.clone()).await {
+            Ok((200, body)) if body == seed => rtts.push(start.elapsed().as_secs_f64() * 1000.0),
+            Ok((status, _)) if status != 200 => {
+                return Err(crate::Error::Session(format!(
+                    "In-session diagnostics unavailable (status {status}); update the server"
+                )))
+            }
+            _ => {}
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    if rtts.is_empty() {
+        return Err(crate::Error::Session(
+            "No diagnostic replies from the active VPN session".into(),
+        ));
+    }
     rtts.sort_by(f64::total_cmp);
     let percentile = |p: f64| {
         rtts[((rtts.len() as f64 * p).ceil() as usize)
@@ -218,8 +283,10 @@ where
         latency_p50_ms: p50,
         latency_p95_ms: percentile(0.95),
         latency_p99_ms: percentile(0.99),
-        throughput_up_kbps: speeds[0],
-        throughput_down_kbps: speeds[1],
+        throughput_method: MeasurementMethod::RpcWindowLimited,
+        throughput_limited: true,
+        throughput_up_kbps: 0.0,
+        throughput_down_kbps: 0.0,
         packet_loss_pct: loss,
         quality_score: score,
         quality_label: match score {
@@ -236,6 +303,51 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "client-upload")]
+    #[tokio::test(start_paused = true)]
+    async fn a_lost_first_probe_does_not_cancel_the_short_measurement() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        let sequence = Arc::new(AtomicUsize::new(0));
+        let result = measure_latency(
+            move |_, body| {
+                let lost = sequence.fetch_add(1, Ordering::Relaxed) == 0;
+                async move {
+                    tokio::time::sleep(Duration::from_millis(if lost { 2000 } else { 100 })).await;
+                    if lost {
+                        Err(crate::Error::Session("lost".into()))
+                    } else {
+                        Ok((200, body))
+                    }
+                }
+            },
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.samples, 3);
+        assert!((result.packet_loss_pct - 100.0 / 3.0).abs() < 0.01);
+        assert!(result.latency_p50_ms >= 100.0);
+    }
+    #[test]
+    fn data_path_benchmark_has_its_own_negotiation_namespace() {
+        for path in [
+            "/diagnostics/v2/start",
+            "/diagnostics/v2/pull",
+            "/diagnostics/v2/receipt",
+            "/diagnostics/v2/stop",
+        ] {
+            assert!(
+                is_diagnostic(path),
+                "Путь теста не должен попадать в API администратора: {path}"
+            );
+        }
+        assert!(!is_diagnostic("/diagnostics/v2/unknown"));
+    }
+
     #[test]
     fn bounded_responses_and_budget() {
         assert_eq!(response(1, PING, &[3; 8]), (200, vec![3; 8]));

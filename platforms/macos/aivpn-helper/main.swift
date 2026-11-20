@@ -1,6 +1,6 @@
 #!/usr/bin/env swift
 // ═══════════════════════════════════════════════════════════════
-// AIVPN Privileged Helper Daemon v1.2.0
+// AIVPN Privileged Helper Daemon v1.3.0
 //
 // Manages aivpn-client process on behalf of the AIVPN GUI app.
 // Communicates via JSON over Unix domain socket.
@@ -21,7 +21,7 @@ let LOG_PATH = "/var/run/aivpn/client.log"
 let PID_PATH = "/var/run/aivpn/client.pid"
 let RECORDING_STATUS_PATH = "/var/run/aivpn/recording.status"
 let RECORDING_STATUS_FALLBACK_PATH = "/tmp/aivpn-recording.status"
-let HELPER_VERSION = "1.2.0"
+let HELPER_VERSION = "1.3.0"
 
 // Открываем каждый компонент относительно дескриптора родителя. Подмена
 // каталога или файла ссылкой не меняет уже открытый путь.
@@ -54,6 +54,7 @@ func openCertificate(_ path: String) -> Int32 {
 struct HelperRequest: Codable {
     let action: String       // connect, disconnect, status, ping, log
     let key: String?         // connection key (for connect)
+    let splitEnabled: Bool?
     let fullTunnel: Bool?    // full tunnel mode (for connect)
     let binaryPath: String?  // custom binary path (for connect/dev)
     let service: String?     // service name (for record_start)
@@ -252,7 +253,7 @@ func consoleUserHomeDirectory() -> String? {
 }
 
 /// Start aivpn-client with the given configuration using posix_spawn
-func startClient(key: String, fullTunnel: Bool, binaryPath: String?, mtlsCertPath: String? = nil, excludeRoutes: String? = nil, adaptiveLevel: Int = 0, dnsProxy: String? = nil, killSwitch: Bool = false, preferredMask: String? = nil, polymorphicBase: String? = nil, shareMaskFeedback: Bool = false, receiveMaskHints: Bool = false, countryCode: String? = nil, bootstrapCdnUrl: String? = nil, bootstrapTelegramToken: String? = nil, bootstrapTelegramChat: String? = nil, bootstrapGithub: String? = nil, serverSigningKey: String? = nil) -> HelperResponse {
+func startClient(key: String, fullTunnel: Bool, binaryPath: String?, mtlsCertPath: String? = nil, excludeRoutes: String? = nil, adaptiveLevel: Int = 0, dnsProxy: String? = nil, killSwitch: Bool = false, preferredMask: String? = nil, polymorphicBase: String? = nil, shareMaskFeedback: Bool = false, receiveMaskHints: Bool = false, countryCode: String? = nil, bootstrapCdnUrl: String? = nil, bootstrapTelegramToken: String? = nil, bootstrapTelegramChat: String? = nil, bootstrapGithub: String? = nil, serverSigningKey: String? = nil, splitEnabled: Bool = true) -> HelperResponse {
     killExistingClient()
 
     // Resolve the requested path; fall back to default
@@ -301,6 +302,7 @@ func startClient(key: String, fullTunnel: Bool, binaryPath: String?, mtlsCertPat
     var certificateFd: Int32 = -1
     defer { if certificateFd >= 0 { close(certificateFd) } }
 
+    args.append("--split-enabled=\(splitEnabled)")
     if fullTunnel {
         args.append("--full-tunnel")
     }
@@ -374,7 +376,7 @@ func startClient(key: String, fullTunnel: Bool, binaryPath: String?, mtlsCertPat
         args.append("--dns-proxy")
         args.append(proxy)
     }
-    if let routes = excludeRoutes {
+    if splitEnabled, let routes = excludeRoutes {
         // Validate: each token must look like a CIDR (digits, dots, colons, slash).
         // Reject anything containing shell-special characters or path traversal.
         let tokens = routes.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }
@@ -1325,7 +1327,8 @@ func handleConnection(_ clientFD: Int32) {
                                bootstrapTelegramToken: request.bootstrapTelegramToken,
                                bootstrapTelegramChat: request.bootstrapTelegramChat,
                                bootstrapGithub: request.bootstrapGithub,
-                               serverSigningKey: request.serverSigningKey)
+                               serverSigningKey: request.serverSigningKey,
+                               splitEnabled: request.splitEnabled ?? true)
 
     case "admin":
         guard request.key == managedAdminSession, clientProcessAlive(),

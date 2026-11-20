@@ -22,10 +22,12 @@
     { key: 'idle_timeout_secs', label: 'Idle Timeout (s)', type: 'number', hint: 'Disconnect idle sessions after N seconds. 0 = disabled.' },
     { key: 'tun_mtu', label: 'TUN MTU', type: 'number', hint: 'TUN interface MTU. Default 1420. Reduce if downstream links fragment packets.' },
     { key: 'allow_peer_routing', label: 'Allow Peer Routing', type: 'checkbox', hint: 'Route traffic between VPN peers (site-to-site mesh). Disable to isolate peers.' },
-    { key: 'downlink_shaping', label: 'Downlink Shaping', type: 'select', hint: 'Balance level for downlink traffic-shape padding. Off = no shaping, Light = reduced overhead, Full = maximum shaping (default). Older servers store this as a bool (true=full/false=off) — it is normalized to a level here and sent back as a level.', options: [
-      { value: 'off', label: 'Off' },
+    { key: 'downlink_shaping', label: 'Downlink Shaping', type: 'select', hint: 'Adaptive (default) adjusts pacing to queue delay. Full preserves profile padding without extra IP-packet pauses. Strict keeps profile intervals at any load. Light caps pauses and padding; Off disables both. Legacy true/false map to Full/Off.', options: [
+      { value: 'adaptive', label: 'Adaptive (default)' },
+      { value: 'full', label: 'Full (padding)' },
+      { value: 'strict', label: 'Strict (profile intervals)' },
       { value: 'light', label: 'Light' },
-      { value: 'full', label: 'Full (default)' },
+      { value: 'off', label: 'Off' },
     ] },
   ];
 
@@ -90,8 +92,8 @@
       // upgraded yet still returns a bool (true=full/false=off) here. Fold it
       // into the level string so the select above always has a level value,
       // and so the next Apply sends the level form back (forward migration).
-      // If the field is absent entirely, leave fv unset — buildConfig() then
-      // omits it from the PUT, and the server's own default (Full) applies.
+      // При отсутствующем поле buildConfig() не добавляет его в PUT.
+      // Сервер использует свой режим по умолчанию, adaptive.
       if (typeof fv['downlink_shaping'] === 'boolean') {
         fv['downlink_shaping'] = fv['downlink_shaping'] ? 'full' : 'off';
       }

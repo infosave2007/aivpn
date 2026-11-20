@@ -49,6 +49,23 @@ fn read_key(path: &Path) -> io::Result<[u8; 32]> {
     Ok(*bytes)
 }
 
+/// Единый каталог идентичности обычного клиента и desktop-интерфейсов.
+pub fn load_or_create_device_secret(dir: &Path) -> io::Result<[u8; 32]> {
+    fs::create_dir_all(dir)?;
+    if fs::symlink_metadata(dir)?.file_type().is_symlink() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Каталог ключа устройства не может быть ссылкой",
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
+    }
+    load_or_create_secret(&dir.join("device.key"))
+}
+
 pub fn load_or_create_secret(path: &Path) -> io::Result<[u8; 32]> {
     let dir = path
         .parent()
