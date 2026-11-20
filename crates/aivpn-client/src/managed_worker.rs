@@ -133,6 +133,11 @@ pub fn run() -> Result<()> {
         .with_writer(std::io::stderr)
         .init();
     // Descriptor 3 имеет только один владелец. Exec/env/FD allowlist задает служба.
+    // Без переданного канала владеть нечем: закрытие неоткрытого номера
+    // нарушает IO safety и аварийно завершает отладочную сборку.
+    if unsafe { libc::fcntl(3, libc::F_GETFD) } == -1 {
+        return Err(Error::InvalidPacket("Работник запускается службой"));
+    }
     let control = unsafe { OwnedFd::from_raw_fd(3) };
     if unsafe { libc::geteuid() } == 0
         && (unsafe { libc::setgroups(0, std::ptr::null()) } != 0
