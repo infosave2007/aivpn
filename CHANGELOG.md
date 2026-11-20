@@ -71,6 +71,7 @@
 - **Mobile session shutdown** - stopping a tunnel no longer shuts down a UDP socket still registered with the mask driver. This prevents a receive loop from surviving disconnects, blocking reconnection and consuming a CPU core. Pending handshake and control operations also stop without waiting for the transport; Android lifecycle tests check that native sessions actually finish.
 - **Android network handover** - DNS and protected sockets use the same physical network for each connection attempt. Network changes also interrupt an unfinished handshake; capability callbacks and registration checks prevent missed switches and stale events. The VPN reports its actual underlying network to Android.
 - **iOS interface** - VPN configuration and key storage errors tell the user what to do instead of naming provisioning profiles and entitlements. The key form explains the mTLS certificate and the server signing key under the fields; the long placeholders were cut off. The mask note in the connected view is aligned with the card. On iPad the content keeps a readable width and every orientation is supported.
+- **iOS app icon** - the icons are opaque squares. They had transparent corners, and App Store Connect rejects a build whose icon has an alpha channel. The packaging gate now checks this.
 
 ### Security
 

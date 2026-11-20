@@ -156,6 +156,22 @@ class PackagingTest(unittest.TestCase):
             self.assertIn('github.event.release.tag_name', options)
             self.assertIn('github.event.inputs.tag', options)
 
+    def test_ios_app_icons_are_opaque(self):
+        # App Store Connect отклоняет сборку, если у иконки есть альфа-канал.
+        icons = sorted((REPO / 'assets/brand/ios/Assets.xcassets/AppIcon.appiconset').glob('*.png'))
+        self.assertTrue(icons)
+        for icon in icons:
+            data = icon.read_bytes()
+            self.assertEqual(data[:8], b'\x89PNG\r\n\x1a\n', icon.name)
+            chunks, offset = [], 8
+            while offset < len(data):
+                length = int.from_bytes(data[offset:offset + 4], 'big')
+                chunks.append(data[offset + 4:offset + 8])
+                offset += 12 + length
+            self.assertEqual(chunks[0], b'IHDR', icon.name)
+            self.assertIn(data[25], (0, 2, 3), icon.name)
+            self.assertNotIn(b'tRNS', chunks, icon.name)
+
     def test_wintun_rejects_unverified_download_without_changing_target(self):
         curl = self.bin / 'curl'
         curl.write_text('#!/bin/sh\nwhile [ "$1" != "-o" ]; do shift; done\nprintf invalid > "$2"\n')
