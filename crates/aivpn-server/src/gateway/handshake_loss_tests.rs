@@ -841,6 +841,12 @@ async fn exercise_diagnostics_with_bootstrap(
     let mask_dir = directory.path().join("masks");
     std::fs::create_dir(&mask_dir).unwrap();
     let mask_id = mask.mask_id.clone();
+    // DATA-замер объявляется только маскам с управлением потоком.
+    let expected_method = if aivpn_common::mask_io::needs_state(&mask) {
+        diagnostics::MeasurementMethod::Data
+    } else {
+        diagnostics::MeasurementMethod::RpcWindowLimited
+    };
     mask.sign(&ed25519_dalek::SigningKey::from_bytes(&[71; 32]))
         .unwrap();
     std::fs::write(
@@ -1144,10 +1150,7 @@ async fn exercise_diagnostics_with_bootstrap(
         }
     };
     assert!(result.samples > 0, "{mask_id}: {result:?}");
-    assert_eq!(
-        result.throughput_method,
-        diagnostics::MeasurementMethod::Data
-    );
+    assert_eq!(result.throughput_method, expected_method, "{mask_id}");
     assert!(
         result.throughput_up_kbps > 0.0 && result.throughput_down_kbps > 0.0,
         "{mask_id}: {result:?}"

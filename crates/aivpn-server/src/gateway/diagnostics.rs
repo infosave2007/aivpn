@@ -37,9 +37,22 @@ impl Gateway {
         if !body.is_empty() {
             return (400, Vec::new());
         }
-        let Some(client_ip) = session.lock().vpn_ip else {
+        let current = session.lock();
+        // DATA-пробы рассчитаны на транспорт с собственным управлением потоком.
+        // Остальные маски отправляют окно сразу, и потеря длинной серии выводит
+        // счетчики сессии за окно восстановления. По ответу 501 клиент выбирает
+        // ограниченный RPC-замер.
+        if !current
+            .mask
+            .as_ref()
+            .is_some_and(aivpn_common::mask_io::needs_state)
+        {
+            return (501, Vec::new());
+        }
+        let Some(client_ip) = current.vpn_ip else {
             return (503, Vec::new());
         };
+        drop(current);
         let capabilities = data::Capabilities {
             version: 2,
             client_ip,
