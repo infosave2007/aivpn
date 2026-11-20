@@ -16,7 +16,17 @@ if ($commands.Count -ne 1) { throw 'Не найдена единственная
 
 $scratch = Join-Path ([IO.Path]::GetTempPath()) ('aivpn-setup-' + [Guid]::NewGuid().ToString('N'))
 $originalDirectory = [Environment]::CurrentDirectory
-New-Item -ItemType Directory -Path $scratch | Out-Null
+# Установщик работает в каталоге, куда пишут только SYSTEM и администраторы.
+# Временный каталог пользователя наследует права записи самого пользователя.
+$protected = New-Object Security.AccessControl.DirectorySecurity
+$protected.SetOwner((New-Object Security.Principal.SecurityIdentifier('S-1-5-32-544')))
+$protected.SetAccessRuleProtection($true,$false)
+foreach ($sid in @('S-1-5-18','S-1-5-32-544')) {
+    $protected.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule(
+        (New-Object Security.Principal.SecurityIdentifier($sid)), 'FullControl',
+        [Security.AccessControl.InheritanceFlags]'ContainerInherit,ObjectInherit', 'None', 'Allow')))
+}
+[IO.Directory]::CreateDirectory($scratch,$protected) | Out-Null
 Push-Location -LiteralPath $scratch
 try {
     # NSIS кладет свой 32-разрядный System.dll в рабочий каталог. Такая DLL
