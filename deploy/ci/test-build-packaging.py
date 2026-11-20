@@ -90,6 +90,7 @@ class PackagingTest(unittest.TestCase):
         contexts = [
             (self.root / 'Dockerfile.generated', ['deploy/install-client-image.sh', 'deploy/install-app-routing.sh', 'deploy/systemd/aivpn-app-routing.service', 'platforms/linux/polkit/com.aivpn.client.policy']),
             (REPO / 'deploy/docker/Dockerfile.client', ['deploy/install-client-image.sh', 'deploy/install-app-routing.sh', 'deploy/systemd/aivpn-app-routing.service', 'platforms/linux/polkit/com.aivpn.client.policy']),
+            (REPO / 'Dockerfile', ['deploy/install-client-image.sh', 'deploy/install-app-routing.sh', 'deploy/systemd/aivpn-app-routing.service', 'platforms/linux/polkit/com.aivpn.client.policy']),
             (REPO / 'platforms/mikrotik/Dockerfile', ['deploy/install-client-image.sh', 'deploy/install-app-routing.sh', 'deploy/systemd/aivpn-app-routing.service', 'platforms/linux/polkit/com.aivpn.client.policy']),
             (REPO / 'deploy/docker/Dockerfile.windows-client', ['deploy/install-client-image.ps1', 'deploy/install-app-routing.ps1', 'deploy/windows-setup-common.ps1']),
         ]

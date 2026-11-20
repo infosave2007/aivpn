@@ -23,6 +23,13 @@ RUN apt-get update && apt-get install -y \
 COPY Cargo.toml Cargo.lock ./
 COPY crates crates/
 COPY vendor vendor/
+# aivpn-server links the aivpn-client library, which embeds its Linux
+# installation files at compile time.
+COPY deploy/install-client-image.sh deploy/install-client-image.sh
+COPY deploy/install-app-routing.sh deploy/install-app-routing.sh
+COPY deploy/systemd/aivpn-app-routing.service deploy/systemd/aivpn-app-routing.service
+COPY deploy/systemd/aivpn-app-routing.socket deploy/systemd/aivpn-app-routing.socket
+COPY platforms/linux/polkit/com.aivpn.client.policy platforms/linux/polkit/com.aivpn.client.policy
 COPY assets assets/
 
 # Build in release mode with the committed Cargo.lock (--locked → reproducible).
