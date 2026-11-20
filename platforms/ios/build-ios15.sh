@@ -47,6 +47,12 @@ for relative, bundle, output in (
     entitlements = plistlib.loads((source / relative).read_bytes())
     entitlements['application-identifier'] = 'TROLLTROLL.' + bundle
     entitlements['com.apple.developer.team-identifier'] = 'TROLLTROLL'
+    # A provisioning profile grants the App Group as a Keychain access group.
+    # An ad-hoc build has no profile, so it names the group itself. The
+    # checked-in entitlements must not: Xcode signing rejects a Keychain
+    # group that lacks the team prefix.
+    entitlements['keychain-access-groups'] = list(
+        entitlements['com.apple.security.application-groups'])
     (destination / output).write_bytes(plistlib.dumps(entitlements))
 PY
 codesign --force --sign - --entitlements "$build_root/tunnel.entitlements" "$extension"
