@@ -8,6 +8,7 @@
 
 - **Explicit split controls** - Linux CLI/GUI, Windows, Android, iOS and macOS can disable split tunneling without deleting saved applications, networks or domain exceptions. Disabled application policies use their selected DNS VPN profile for all traffic and remain fail-closed. Older saved configurations retain their behavior. OpenWrt and MikroTik launchers pass the explicit client setting.
 - **iOS 15 compatibility** - compatible navigation, form and share controls, preserved plist/entitlement files, shared Keychain access and a numeric NetworkExtension remote address. Build 11 fixes are integrated with the current tunnel resource cleanup.
+- **iOS data use notice and privacy manifest** - on first launch the app explains what it sends and stores before it asks for the VPN configuration or notifications. The notice stays available from the main screen and links to the privacy policy in `PRIVACY.md`. The app and the tunnel extension ship privacy manifests.
 
 ### Fixed
 
@@ -69,6 +70,7 @@
 - **Rapid reconnect admission** - a canceled attempt that completed PFS but did not finish device authentication no longer blocks the next authenticated handshake. The server preserves the admitted session while replacing an unfinished attempt; replay protection and connection limits remain enforced.
 - **Mobile session shutdown** - stopping a tunnel no longer shuts down a UDP socket still registered with the mask driver. This prevents a receive loop from surviving disconnects, blocking reconnection and consuming a CPU core. Pending handshake and control operations also stop without waiting for the transport; Android lifecycle tests check that native sessions actually finish.
 - **Android network handover** - DNS and protected sockets use the same physical network for each connection attempt. Network changes also interrupt an unfinished handshake; capability callbacks and registration checks prevent missed switches and stale events. The VPN reports its actual underlying network to Android.
+- **iOS interface** - VPN configuration and key storage errors tell the user what to do instead of naming provisioning profiles and entitlements. The key form explains the mTLS certificate and the server signing key under the fields; the long placeholders were cut off. The mask note in the connected view is aligned with the card. On iPad the content keeps a readable width and every orientation is supported.
 
 ### Security
 

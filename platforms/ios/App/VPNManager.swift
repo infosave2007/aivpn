@@ -157,7 +157,23 @@ class VPNManager: ObservableObject {
     private var coreConnectedSince: Date?
     private let bundleId = "com.aivpn.client.tunnel"
 
+    private static let dataUseNoticeKey = "dataUseNoticeAccepted"
+
+    /// False until the user has read the data use notice. Nothing asks for
+    /// the VPN configuration or for notifications before that.
+    @Published private(set) var dataUseNoticeAccepted: Bool =
+        UserDefaults.standard.bool(forKey: VPNManager.dataUseNoticeKey)
+
     init() {
+        guard dataUseNoticeAccepted else { return }
+        loadManager()
+        requestNotificationPermission()
+    }
+
+    func acceptDataUseNotice() {
+        guard !dataUseNoticeAccepted else { return }
+        UserDefaults.standard.set(true, forKey: Self.dataUseNoticeKey)
+        dataUseNoticeAccepted = true
         loadManager()
         requestNotificationPermission()
     }
@@ -529,6 +545,7 @@ class VPNManager: ObservableObject {
     func retryManagerSetup() {
         // Do NOT clear lastError here — the user must explicitly dismiss errors.
         // Clearing it here races with connect()'s error path and can hide failures.
+        guard dataUseNoticeAccepted else { return }
         loadManager()
     }
 

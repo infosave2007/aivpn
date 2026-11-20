@@ -35,7 +35,7 @@ class LocalizationManager: ObservableObject {
         "duplicate_key":       ["en": "This key already exists", "ru": "Этот ключ уже существует"],
         "delete_key_confirm":  ["en": "Delete Key?",    "ru": "Удалить ключ?"],
         "delete_key_message":  ["en": "Are you sure you want to delete this key?",
-                                "ru": "Вы уверены что хотите удалить этот ключ?"],
+                                "ru": "Вы уверены, что хотите удалить этот ключ?"],
         "split_tunnel":        ["en": "Excluded Domains (Split DNS)", "ru": "Исключённые домены (Split DNS)"],
         "split_tunnel_routes": ["en": "Excluded Routes (CIDR)",      "ru": "Исключённые маршруты (CIDR)"],
         "split_tunnel_none":   ["en": "None",                         "ru": "Нет"],
@@ -92,8 +92,10 @@ class LocalizationManager: ObservableObject {
         "bench_limited": ["en": "Speed is limited by the test method; link capacity may be higher.", "ru": "Скорость ограничена методом теста; пропускная способность канала может быть выше."],
         "bench_idle":          ["en": "Tap to measure latency and connection quality.",
                                 "ru": "Нажмите для измерения задержки и качества соединения."],
-        "mtls_cert_hint":      ["en": "mTLS cert (base64, leave empty to disable)",
-                                "ru": "mTLS сертификат (base64, оставьте пустым для отключения)"],
+        "mtls_cert_hint":      ["en": "Client certificate in base64. Leave empty to connect without mTLS.",
+                                "ru": "Клиентский сертификат в base64. Оставьте пустым, чтобы подключаться без mTLS."],
+        "mtls_cert_placeholder": ["en": "Certificate (base64)", "ru": "Сертификат (base64)"],
+        "server_signing_key_placeholder": ["en": "Public key (base64)", "ru": "Публичный ключ (base64)"],
         "server_signing_key":  ["en": "Server signing key",
                                 "ru": "Ключ подписи сервера"],
         "server_signing_key_hint": [
@@ -103,11 +105,11 @@ class LocalizationManager: ObservableObject {
         "kill_switch":         ["en": "Kill Switch (block traffic if VPN drops)",
                                 "ru": "Kill Switch (блокировать при разрыве)"],
         "done":                ["en": "Done",           "ru": "Готово"],
-        "split_domains": ["en": "Excluded domains", "ru": "Исключенные домены"],
+        "split_domains": ["en": "Excluded Domains", "ru": "Исключённые домены"],
         "split_domain_invalid": ["en": "Invalid or duplicate domain, or the 64-domain limit was reached", "ru": "Неверный или повторный домен либо достигнут предел в 64 домена"],
         "split_domain_note": ["en": "Addresses are resolved when connecting. CDN addresses may change; reconnect to refresh them.", "ru": "Адреса определяются при подключении. Адреса CDN могут меняться; для обновления переподключитесь."],
-        "split_enabled": ["en": "Enable split tunneling", "ru": "Включить split"],
-            "split_switch_note": ["en": "Off - all traffic uses VPN. Lists are retained; change while disconnected.", "ru": "Выключено - весь трафик через VPN. Списки сохраняются; изменение при отключенном VPN."],
+        "split_enabled": ["en": "Enable Split Tunnel", "ru": "Включить Split Tunnel"],
+            "split_switch_note": ["en": "When off, all traffic uses the VPN. The lists are kept. Disconnect to change this setting.", "ru": "Когда выключено, весь трафик идёт через VPN. Списки сохраняются. Чтобы изменить настройку, отключите VPN."],
             "split_tunnel_title":  ["en": "Split Tunnel",   "ru": "Split Tunnel"],
         "open_settings":       ["en": "Open Settings",  "ru": "Открыть Настройки"],
         "error_permission_denied": [
@@ -115,8 +117,8 @@ class LocalizationManager: ObservableObject {
             "ru": "Доступ к VPN запрещён. Нажмите «Повторить» или откройте Настройки → VPN.",
         ],
         "error_vpn_write_failed": [
-            "en": "Cannot save VPN config. Check Network Extension capability in your provisioning profile.",
-            "ru": "Не удалось сохранить VPN конфигурацию. Проверьте Network Extension в provisioning profile.",
+            "en": "Could not save the VPN configuration. Restart the app and try again.",
+            "ru": "Не удалось сохранить конфигурацию VPN. Перезапустите приложение и повторите попытку.",
         ],
         "error_keychain_write_failed": [
             "en": "Could not securely store the connection secret in Keychain. Connection cancelled.",
@@ -137,8 +139,8 @@ class LocalizationManager: ObservableObject {
             "ru": "Списки доменов и маршрутов хранятся в App Group без криптографической верификации.",
         ],
         "quality":             ["en": "Quality",        "ru": "Качество"],
-        "key_save_failed":     ["en": "Failed to save key — check VPN and Keychain permissions in Settings.",
-                                "ru": "Не удалось сохранить ключ — проверьте разрешения VPN и Keychain в Настройках."],
+        "key_save_failed":     ["en": "Could not save the key. Unlock the device and try again.",
+                                "ru": "Не удалось сохранить ключ. Разблокируйте устройство и повторите попытку."],
         "recording_server_rejected": [
             "en": "Server rejected the recording request",
             "ru": "Сервер отклонил запрос на запись",
@@ -158,6 +160,38 @@ class LocalizationManager: ObservableObject {
                                  "ru": "Получать рекомендации масок"],
         "country_code":        ["en": "Country Code",   "ru": "Код страны"],
         "country_code_placeholder": ["en": "US",         "ru": "US"],
+
+        // MARK: Data use notice (DataUseNoticeView.swift)
+        "notice_title":        ["en": "Privacy", "ru": "Конфиденциальность"],
+        "notice_heading":      ["en": "How AIVPN handles your data",
+                                "ru": "Как AIVPN обращается с вашими данными"],
+        "notice_server_title": ["en": "Your server", "ru": "Ваш сервер"],
+        "notice_server_body":  [
+            "en": "AIVPN connects to the VPN server from your connection key and to services you set up yourself: server discovery through a CDN, GitHub or Telegram, and installation over SSH. The app has no built-in servers and no accounts.",
+            "ru": "AIVPN подключается к VPN-серверу из вашего ключа подключения и к сервисам, которые вы настроили сами: поиск сервера через CDN, GitHub или Telegram и установка по SSH. В приложении нет встроенных серверов и учётных записей.",
+        ],
+        "notice_collect_title": ["en": "No data collection", "ru": "Данные не собираются"],
+        "notice_collect_body": [
+            "en": "The app does not send your personal data, browsing activity or usage statistics to its developers. It has no ads, analytics or trackers.",
+            "ru": "Приложение не передаёт разработчикам ваши персональные данные, историю посещений и статистику использования. В нём нет рекламы, аналитики и трекеров.",
+        ],
+        "notice_operator_title": ["en": "What the server operator sees", "ru": "Что видит оператор сервера"],
+        "notice_operator_body": [
+            "en": "While the VPN is on, your traffic passes through that server. Its operator can see your IP address, connection times and traffic volume, and a key the app creates so the server can recognise this device.",
+            "ru": "Пока VPN включён, ваш трафик идёт через этот сервер. Его оператор видит ваш IP-адрес, время подключений и объём трафика, а также ключ, который приложение создаёт, чтобы сервер узнавал это устройство.",
+        ],
+        "notice_storage_title": ["en": "Stored on this device", "ru": "Хранится на устройстве"],
+        "notice_storage_body": [
+            "en": "Connection keys are kept in the device Keychain. Settings and Split Tunnel lists stay on this device.",
+            "ru": "Ключи подключения хранятся в связке ключей устройства. Настройки и списки Split Tunnel остаются на устройстве.",
+        ],
+        "notice_optional_title": ["en": "Optional, off by default", "ru": "По желанию, по умолчанию выключено"],
+        "notice_optional_body": [
+            "en": "If you turn on “Share blocked-mask feedback”, the app tells your VPN server which traffic masks worked or were blocked, together with the two-letter country code you entered.",
+            "ru": "Если включить «Делиться данными о заблокированных масках», приложение сообщает вашему VPN-серверу, какие маски трафика сработали или были заблокированы, и двухбуквенный код страны, который вы указали.",
+        ],
+        "notice_policy_link":  ["en": "Privacy Policy", "ru": "Политика конфиденциальности"],
+        "notice_continue":     ["en": "Continue", "ru": "Продолжить"],
 
         // MARK: Bootstrap descriptor discovery ("Advanced" / discover server)
         "advanced_section":    ["en": "Advanced",       "ru": "Дополнительно"],
@@ -394,8 +428,8 @@ class LocalizationManager: ObservableObject {
         "install_close":              ["en": "Close", "ru": "Закрыть"],
         "install_bad_params":         ["en": "Invalid install parameters", "ru": "Некорректные параметры установки"],
         "install_wizard_hint": [
-            "en": "Provision a brand-new aivpn server on a fresh VPS over SSH — no existing connection needed.",
-            "ru": "Разверните новый сервер aivpn на чистом VPS по SSH — существующее подключение не требуется.",
+            "en": "Provision a brand-new AIVPN server on a fresh VPS over SSH — no existing connection needed.",
+            "ru": "Разверните новый сервер AIVPN на чистом VPS по SSH — существующее подключение не требуется.",
         ],
 
         // MARK: Binary source picker (G3)
@@ -412,8 +446,8 @@ class LocalizationManager: ObservableObject {
 
         // MARK: Device binding (G4)
         "install_device_binding_unavailable_hint": [
-            "en": "This device has no key yet — connect to any aivpn server at least once (with any connection key) so the app can create one, then reopen this wizard.",
-            "ru": "У этого устройства ещё нет ключа — подключитесь хотя бы раз к любому серверу aivpn (с любым ключом подключения), чтобы приложение создало ключ устройства, затем откройте мастер заново.",
+            "en": "This device has no key yet — connect to any AIVPN server at least once (with any connection key) so the app can create one, then reopen this wizard.",
+            "ru": "У этого устройства ещё нет ключа — подключитесь хотя бы раз к любому серверу AIVPN (с любым ключом подключения), чтобы приложение создало ключ устройства, затем откройте мастер заново.",
         ],
 
         // Marker codes from deploy/install-server.sh's `emit_marker` calls

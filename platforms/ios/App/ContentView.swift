@@ -114,14 +114,17 @@ private struct KeyEditSheet: View {
                         .disableAutocorrection(true)
                         .textInputAutocapitalization(.never)
                 }
-                Section(header: Text("mTLS")) {
-                    CompatibleMultilineTextField(loc.t("mtls_cert_hint"), text: $mtlsCert, lines: 1...4)
+                // The explanation is a footer: a placeholder is a single line
+                // and truncated the long hints.
+                Section(header: Text("mTLS"), footer: Text(loc.t("mtls_cert_hint"))) {
+                    CompatibleMultilineTextField(loc.t("mtls_cert_placeholder"), text: $mtlsCert, lines: 1...4)
                         .disableAutocorrection(true)
                         .textInputAutocapitalization(.never)
                         .font(.system(size: 12, design: .monospaced))
                 }
-                Section(header: Text(loc.t("server_signing_key"))) {
-                    CompatibleMultilineTextField(loc.t("server_signing_key_hint"), text: $serverSigningKey, lines: 1...3)
+                Section(header: Text(loc.t("server_signing_key")),
+                        footer: Text(loc.t("server_signing_key_hint"))) {
+                    CompatibleMultilineTextField(loc.t("server_signing_key_placeholder"), text: $serverSigningKey, lines: 1...3)
                         .disableAutocorrection(true)
                         .textInputAutocapitalization(.never)
                         .font(.system(size: 12, design: .monospaced))
@@ -322,12 +325,22 @@ struct ContentView: View {
     // yet at that point (see the "Advanced" DisclosureGroup in keysCard,
     // where the ungated button lives). See InstallServerView.swift.
     @State private var showInstallWizard: Bool = false
+    @State private var showDataUseNotice: Bool = false
+
+    /// Keeps the cards readable on iPad; an iPhone is narrower than this.
+    private let contentMaxWidth: CGFloat = 700
+
+    /// Presents the data use notice until it has been accepted once.
+    private var firstLaunchNotice: Binding<Bool> {
+        Binding(get: { !vpn.dataUseNoticeAccepted }, set: { _ in })
+    }
 
     var body: some View {
         CompatibleNavigationView {
             VStack(spacing: 0) {
                 // Fixed header — status ring stays visible even when user scrolls
                 statusCard
+                    .frame(maxWidth: contentMaxWidth)
                     .padding(.horizontal, 16)
                     .padding(.top, 8)
                     .padding(.bottom, 4)
@@ -343,7 +356,8 @@ struct ContentView: View {
                             CardView {
                                 maskPicker
                                 Text(loc.t("mask_next_connection"))
-                                    .font(.caption2).foregroundColor(.secondary).padding(.bottom, 12)
+                                    .font(.caption2).foregroundColor(.secondary)
+                                    .padding(.horizontal, 16).padding(.bottom, 12)
                             }
                         }
                         if vpn.isConnected && vpn.recordingCapabilityKnown && vpn.canRecordMasks {
@@ -353,16 +367,20 @@ struct ContentView: View {
                         }
                         footerView
                     }
+                    .frame(maxWidth: contentMaxWidth)
                     .padding(.horizontal, 16)
                     .padding(.top, 8)
                     .padding(.bottom, 16)
+                    .frame(maxWidth: .infinity)
                 }
             }
             .safeAreaInset(edge: .bottom, spacing: 0) {
                 connectCard
+                    .frame(maxWidth: contentMaxWidth)
                     .padding(.horizontal, 16)
                     .padding(.top, 12)
                     .padding(.bottom, 8)
+                    .frame(maxWidth: .infinity)
                     .background(.ultraThinMaterial, ignoresSafeAreaEdges: .bottom)
             }
             .navigationTitle("AIVPN")
@@ -481,6 +499,14 @@ struct ContentView: View {
         .sheet(isPresented: $showInstallWizard) {
             InstallServerView()
                 .environmentObject(vpn)
+                .environmentObject(loc)
+        }
+        .sheet(isPresented: $showDataUseNotice) {
+            DataUseNoticeView(isFirstLaunch: false) { showDataUseNotice = false }
+                .environmentObject(loc)
+        }
+        .fullScreenCover(isPresented: firstLaunchNotice) {
+            DataUseNoticeView(isFirstLaunch: true) { vpn.acceptDataUseNotice() }
                 .environmentObject(loc)
         }
         .sheet(isPresented: $showDiagnostics) {
@@ -684,7 +710,7 @@ struct ContentView: View {
             // server without an existing aivpn:// key, via signed rotating
             // bootstrap descriptors (CDN/GitHub/Telegram). See
             // BootstrapDiscovery.swift for the fetch/verify implementation.
-            DisclosureGroup(loc.t("advanced_section")) {
+            DisclosureGroup {
                 VStack(alignment: .leading, spacing: 8) {
                     Text(loc.t("advanced_hint"))
                         .font(.caption2)
@@ -716,6 +742,10 @@ struct ContentView: View {
                     .buttonStyle(.bordered)
                 }
                 .padding(.top, 4)
+            } label: {
+                Text(loc.t("advanced_section"))
+                    .font(.subheadline)
+                    .fontWeight(.semibold)
             }
             .padding(.horizontal, 16)
             .padding(.bottom, 12)
@@ -886,11 +916,15 @@ struct ContentView: View {
     // MARK: - Footer
 
     private var footerView: some View {
-        Text(loc.t("version_footer"))
-            .font(.caption2)
-            .foregroundColor(.secondary)
-            .frame(maxWidth: .infinity, alignment: .center)
-            .padding(.top, 8)
+        VStack(spacing: 6) {
+            Text(loc.t("version_footer"))
+                .font(.caption2)
+                .foregroundColor(.secondary)
+            Button(loc.t("notice_title")) { showDataUseNotice = true }
+                .font(.caption2)
+        }
+        .frame(maxWidth: .infinity, alignment: .center)
+        .padding(.top, 8)
     }
 
     // MARK: - Computed helpers
