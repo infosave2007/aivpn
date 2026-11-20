@@ -181,8 +181,22 @@ impl ControlServer {
                 return Err(error);
             }
         };
-        let written = write_state(handler, &receiver, &self.stop, &acceptor, &workers);
+        let written = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            write_state(handler, &receiver, &self.stop, &acceptor, &workers)
+        }));
         self.stop.stop();
+        let written = match written {
+            Ok(written) => written,
+            Err(panic) => {
+                // Поток приемки владеет копией listener. Раскрутка продолжается
+                // только после его завершения, иначе служба с упавшим
+                // обработчиком еще принимает подключения.
+                drop(receiver);
+                let _ = acceptor.join();
+                let _ = join_workers(workers);
+                std::panic::resume_unwind(panic);
+            }
+        };
         let stopped = handler.stopping();
         drop(receiver);
         let accepted = acceptor
