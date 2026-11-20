@@ -1,21 +1,59 @@
 #![cfg(target_os = "linux")]
 
 use aivpn_desktop_agent::linux::{ExecutableFile, MountSnapshot};
+use std::fs::File;
+use std::io;
+use std::os::fd::AsRawFd;
+use std::path::Path;
 
+/// Любое монтирование в пространстве имен делает снимок непригодным, и
+/// вызывающий берет новый. Отладочный тестовый файл сверяется десятки секунд,
+/// а на общем стенде CI за это время монтируют посторонние процессы. Попытка
+/// повторяется только после такого события; иная ошибка завершает тест сразу.
 #[test]
 fn actual_executable_is_located_in_the_same_mount_namespace() {
     let path = std::env::current_exe().unwrap();
-    let snapshot = MountSnapshot::read_current().unwrap();
-    let located = snapshot
-        .locate(ExecutableFile::resolve_selected(&path).unwrap())
-        .unwrap();
-    assert_eq!(located.canonical_path(), path.canonicalize().unwrap());
+    for attempt in 1.. {
+        let mounts = MountEvents::watch();
+        match locate_and_verify(&path) {
+            Ok(()) => return,
+            Err(error) if attempt < 5 && mounts.changed() => {
+                eprintln!("Попытка {attempt}: таблица монтирования изменилась ({error})");
+            }
+            Err(error) => panic!("{error}"),
+        }
+    }
+}
+
+fn locate_and_verify(path: &Path) -> io::Result<()> {
+    let snapshot = MountSnapshot::read_current()?;
+    let located = snapshot.locate(ExecutableFile::resolve_selected(path)?)?;
+    assert_eq!(located.canonical_path(), path.canonicalize()?);
     assert!(located.filesystem_path().starts_with(b"/"));
     assert!(located.filesystem_path().len() < 4096);
     assert!(located.filesystem_device() <= u64::from(u32::MAX));
-    located.verify().unwrap();
+    located.verify()?;
     drop(snapshot);
-    located.verify().unwrap();
+    located.verify()
+}
+
+/// Замечает изменение таблицы монтирования тем же способом, что и снимок.
+struct MountEvents(File);
+
+impl MountEvents {
+    fn watch() -> Self {
+        Self(File::open("/proc/thread-self/mountinfo").unwrap())
+    }
+
+    fn changed(&self) -> bool {
+        let mut event = libc::pollfd {
+            fd: self.0.as_raw_fd(),
+            events: libc::POLLPRI,
+            revents: 0,
+        };
+        assert!(unsafe { libc::poll(&mut event, 1, 0) } >= 0);
+        event.revents != 0
+    }
 }
 
 #[test]
