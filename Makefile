@@ -387,6 +387,10 @@ ios:
 	TARGET_DIR="$$REPO_ROOT/target"; \
 	LIB_DIR="$$CORE_DIR/lib"; \
 	CONFIGURATION="$${CONFIGURATION:-Release}"; \
+	IPHONEOS_DEPLOYMENT_TARGET="$$(awk -F'"' '/IPHONEOS_DEPLOYMENT_TARGET:/{print $$2; exit}' "$$IOS_DIR/project.yml")"; \
+	[ -n "$$IPHONEOS_DEPLOYMENT_TARGET" ] || { echo "ERROR: iOS deployment target not found in project.yml" >&2; exit 1; }; \
+	export IPHONEOS_DEPLOYMENT_TARGET; \
+	echo "==> iOS deployment target: $$IPHONEOS_DEPLOYMENT_TARGET"; \
 	echo "==> Building Rust core for aarch64-apple-ios (device) ..."; \
 	"$$CARGO" build --release -p aivpn-ios-core --target aarch64-apple-ios; \
 	echo "==> Building Rust core for aarch64-apple-ios-sim ..."; \

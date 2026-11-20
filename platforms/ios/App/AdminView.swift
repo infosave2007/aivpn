@@ -224,8 +224,10 @@ struct AdminView: View {
             .navigationTitle(loc.t("admin_title"))
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                if canMutate {
-                    ToolbarItem(placement: .navigationBarLeading) {
+                // Conditions live inside each item: conditional toolbar
+                // items themselves need iOS 16.
+                ToolbarItem(placement: .navigationBarLeading) {
+                    if canMutate {
                         Button {
                             showAddClient = true
                         } label: {
@@ -253,8 +255,8 @@ struct AdminView: View {
                 // same gate as the "add client" button above, since every
                 // control on that screen mutates (see
                 // ServerSettingsView.swift's header comment).
-                if canMutate {
-                    ToolbarItem(placement: .navigationBarTrailing) {
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    if canMutate {
                         Button {
                             showServerSettings = true
                         } label: {

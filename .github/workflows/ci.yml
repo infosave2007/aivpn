@@ -216,6 +216,11 @@ jobs:
 
     - name: Build iOS Rust core
       run: |
+        # Same minimum iOS version as the app, so the C objects in the core
+        # link without a version mismatch.
+        IPHONEOS_DEPLOYMENT_TARGET="$(awk -F'"' '/IPHONEOS_DEPLOYMENT_TARGET:/{print $2; exit}' platforms/ios/project.yml)"
+        test -n "$IPHONEOS_DEPLOYMENT_TARGET"
+        export IPHONEOS_DEPLOYMENT_TARGET
         cargo build --release --target aarch64-apple-ios -p aivpn-ios-core
         mkdir -p crates/aivpn-ios-core/lib
         cp target/aarch64-apple-ios/release/libaivpn_core.a \

@@ -393,8 +393,10 @@ struct ContentView: View {
                 // AdminApi.swift's header) and is @Published, so this
                 // toolbar re-evaluates the moment the post-handshake
                 // Capabilities role lands, with no extra polling here.
-                if vpn.isConnected && vpn.adminRole >= 1 {
-                    ToolbarItem(placement: .navigationBarTrailing) {
+                // The condition lives inside the item: a conditional
+                // toolbar item itself needs iOS 16.
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    if vpn.isConnected && vpn.adminRole >= 1 {
                         Button { showAdmin = true } label: {
                             Image(systemName: "person.badge.key.fill")
                         }
