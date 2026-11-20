@@ -5,6 +5,13 @@
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_tracing.h>
 #include <bpf/bpf_core_read.h>
+/* libbpf до 1.4 не объявляет аннотации аргументов глобальных подпрограмм. */
+#ifndef __arg_ctx
+#define __arg_ctx __attribute__((btf_decl_tag("arg:ctx")))
+#endif
+#ifndef __arg_nonnull
+#define __arg_nonnull __attribute__((btf_decl_tag("arg:nonnull")))
+#endif
 #define AIVPN_BPF
 #define AP_FOR(index, limit)                                                                       \
     for (int index = 0, _once = 1; _once; _once = 0)                                               \

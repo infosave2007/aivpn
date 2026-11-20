@@ -37,6 +37,9 @@ fn build_variant(name: &str, snapshot: bool) {
     command.args([
         "-target",
         "bpf",
+        // Программы используют 32-битные атомарные операции, для которых нужен
+        // набор инструкций v3. clang до версии 20 по умолчанию выбирает v1.
+        "-mcpu=v3",
         target_architecture(),
         "-O2",
         "-g",
