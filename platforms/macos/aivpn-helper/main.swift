@@ -1,6 +1,6 @@
 #!/usr/bin/env swift
 // ═══════════════════════════════════════════════════════════════
-// AIVPN Privileged Helper Daemon v1.3.0
+// AIVPN Privileged Helper Daemon v1.3.1
 //
 // Manages aivpn-client process on behalf of the AIVPN GUI app.
 // Communicates via JSON over Unix domain socket.
@@ -21,7 +21,7 @@ let LOG_PATH = "/var/run/aivpn/client.log"
 let PID_PATH = "/var/run/aivpn/client.pid"
 let RECORDING_STATUS_PATH = "/var/run/aivpn/recording.status"
 let RECORDING_STATUS_FALLBACK_PATH = "/tmp/aivpn-recording.status"
-let HELPER_VERSION = "1.3.0"
+let HELPER_VERSION = "1.3.1"
 
 // Открываем каждый компонент относительно дескриптора родителя. Подмена
 // каталога или файла ссылкой не меняет уже открытый путь.

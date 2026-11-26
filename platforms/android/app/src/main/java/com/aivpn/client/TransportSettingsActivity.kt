@@ -147,6 +147,7 @@ class TransportSettingsActivity : AppCompatActivity() {
             )
         })
         setContentView(root)
+        applySystemBarInsets(root)
     }
 
     // ──────────── Rendering ────────────

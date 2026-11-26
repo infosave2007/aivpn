@@ -59,6 +59,9 @@ CRATE_DIR="${REPO_ROOT}/crates/aivpn-android-core"
 JNI_LIBS_DIR="${SCRIPT_DIR}/app/src/main/jniLibs"
 RELEASES_DIR="${REPO_ROOT}/releases"
 APK_DST="${RELEASES_DIR}/aivpn-client.apk"
+# Google Play accepts only app bundles; the bundle is built next to the APK
+# when release signing is configured.
+AAB_DST="${RELEASES_DIR}/aivpn-android.aab"
 
 BUILD_TYPE="${1:-debug}"
 
@@ -171,13 +174,16 @@ find "${JNI_LIBS_DIR}" -name "libaivpn_core.so" -exec ls -lh {} \;
 echo ""
 echo "==> Building Android APK and publishing to releases/..."
 mkdir -p "${RELEASES_DIR}"
-rm -f "${APK_DST}"
+rm -f "${APK_DST}" "${AAB_DST}"
+RELEASE_SIGNED=0
 
 if [[ "${BUILD_TYPE}" == "release" ]]; then
     if [[ -f "${SCRIPT_DIR}/keystore.properties" ]]; then
         echo "     Release signing: using ${SCRIPT_DIR}/keystore.properties"
+        RELEASE_SIGNED=1
     elif [[ -n "${AIVPN_UPLOAD_STORE_FILE:-}" && -n "${AIVPN_UPLOAD_STORE_PASSWORD:-}" && -n "${AIVPN_UPLOAD_KEY_ALIAS:-}" && -n "${AIVPN_UPLOAD_KEY_PASSWORD:-}" ]]; then
         echo "     Release signing: custom keystore (${AIVPN_UPLOAD_KEY_ALIAS})"
+        RELEASE_SIGNED=1
     else
         echo "     Release signing: no custom keystore configured, Gradle will emit unsigned APK"
         if [[ "${AIVPN_ALLOW_DEBUG_APK:-0}" != "1" ]]; then
@@ -217,8 +223,22 @@ GRADLE_ARGS=(--no-daemon -Dkotlin.compiler.execution.strategy=in-process)
 if [[ "${BUILD_TYPE}" == "release" ]]; then
     (
         cd "${SCRIPT_DIR}"
-        ./gradlew "${GRADLE_ARGS[@]}" app:assembleRelease
+        if [[ "${RELEASE_SIGNED}" == "1" ]]; then
+            ./gradlew "${GRADLE_ARGS[@]}" app:assembleRelease app:bundleRelease
+        else
+            ./gradlew "${GRADLE_ARGS[@]}" app:assembleRelease
+        fi
     )
+
+    RELEASE_AAB="${SCRIPT_DIR}/app/build/outputs/bundle/release/app-release.aab"
+    if [[ "${RELEASE_SIGNED}" == "1" ]]; then
+        if [[ ! -f "${RELEASE_AAB}" ]]; then
+            echo "ERROR: signed release bundle not found at ${RELEASE_AAB}" >&2
+            exit 1
+        fi
+        cp -f "${RELEASE_AAB}" "${AAB_DST}"
+        echo "  Copied signed release bundle -> ${AAB_DST}"
+    fi
 
     RELEASE_APK_SIGNED="${SCRIPT_DIR}/app/build/outputs/apk/release/app-universal-release.apk"
     RELEASE_APK_UNSIGNED="${SCRIPT_DIR}/app/build/outputs/apk/release/app-universal-release-unsigned.apk"

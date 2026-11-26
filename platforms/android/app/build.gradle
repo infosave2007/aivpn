@@ -34,12 +34,12 @@ def hasReleaseSigning = [
 
 android {
     namespace = 'com.aivpn.client'
-    compileSdk = 34
+    compileSdk = 36
 
     defaultConfig {
         applicationId = "com.aivpn.client"
         minSdk = 26
-        targetSdk = 34
+        targetSdk = 36
         versionCode = workspaceVersionCode
         versionName = workspaceVersion
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"

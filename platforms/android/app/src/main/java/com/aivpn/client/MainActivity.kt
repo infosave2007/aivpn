@@ -130,6 +130,7 @@ class MainActivity : AppCompatActivity() {
         pendingVpnPermissionGranted = savedInstanceState?.getBoolean("pending_vpn_granted") ?: false
         binding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(binding.root)
+        applySystemBarInsets(binding.root)
         initializeNavigation(savedInstanceState)
 
         viewModel = ViewModelProvider(this).get(MainViewModel::class.java)

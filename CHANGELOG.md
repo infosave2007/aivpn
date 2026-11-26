@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.3.1] - 2026-11-26
+
+### Changed
+
+- **Android targets API level 36** - the app compiles against and targets Android 16, as Google Play requires for new apps. Every screen is drawn edge to edge and keeps its content clear of the status bar, navigation bar, display cutout and on-screen keyboard, so no controls are hidden behind the system bars on Android 15 and later.
+- **Android app bundle** - signed release builds also produce `aivpn-android.aab` for Google Play. The release publishes it with a signature next to the APK.
+- **Android package registration** - the app carries the `adi-registration.properties` asset that proves ownership of the `com.aivpn.client` package name for Android developer verification.
+
+### Security
+
+- **`url` 2.5.9** - updates the URL parser to the release that fixes a stack overflow in `Url::origin()` on nested `blob:` URLs (RUSTSEC-2026-0592).
+
 ## [1.3.0] - 2026-11-20
 
 ### Added

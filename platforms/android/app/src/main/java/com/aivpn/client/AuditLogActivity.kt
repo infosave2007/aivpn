@@ -34,6 +34,7 @@ class AuditLogActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         binding = ActivityAuditLogBinding.inflate(layoutInflater)
         setContentView(binding.root)
+        applySystemBarInsets(binding.root)
 
         binding.btnBack.setOnClickListener { finish() }
         binding.btnRefresh.setOnClickListener { load() }

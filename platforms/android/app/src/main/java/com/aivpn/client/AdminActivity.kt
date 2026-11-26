@@ -63,6 +63,7 @@ class AdminActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         binding = ActivityAdminBinding.inflate(layoutInflater)
         setContentView(binding.root)
+        applySystemBarInsets(binding.root)
 
         val role = try {
             if (AivpnJni.isAvailable) AivpnJni.getRole() else -1

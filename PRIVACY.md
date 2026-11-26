@@ -1,8 +1,8 @@
-# AIVPN for iOS: Privacy Policy
+# AIVPN for iOS and Android: Privacy Policy
 
-Effective date: 20 November 2026
+Effective date: 26 November 2026
 
-AIVPN is open-source software published at <https://github.com/infosave2007/aivpn>. This policy describes how the AIVPN app for iPhone and iPad handles your data. It does not cover VPN servers: a server is run by you or by a provider you choose, and that operator is responsible for the data on it.
+AIVPN is open-source software published at <https://github.com/infosave2007/aivpn>. This policy describes how the AIVPN apps for iPhone, iPad and Android handle your data. It does not cover VPN servers: a server is run by you or by a provider you choose, and that operator is responsible for the data on it.
 
 ## Summary
 
@@ -20,7 +20,8 @@ While the VPN is on, your traffic passes through your VPN server. As with any VP
 
 ## What is stored on your device
 
-- Connection keys, certificates, the device key and the Telegram bot token for server discovery are kept in the device Keychain.
+- On iPhone and iPad, connection keys, certificates, the device key and the Telegram bot token for server discovery are kept in the device Keychain.
+- On Android, connection keys and the device key are kept in the app's private storage, encrypted with a key held in the Android Keystore.
 - Settings, Split Tunnel lists and server discovery settings are stored in the app's storage on the device.
 
 Deleting the app removes its settings. Connection keys can be deleted in the app at any time.
@@ -33,7 +34,10 @@ Deleting the app removes its settings. Connection keys can be deleted in the app
 
 - **VPN configuration.** Required to create the tunnel.
 - **Notifications.** Used to tell you when the VPN connects or disconnects. Optional.
-- **Local network.** Used only when your VPN server is on your local network.
+- **Local network (iPhone and iPad).** Used only when your VPN server is on your local network.
+- **List of installed apps (Android).** Used only on the device to show the apps you can send around or through the VPN with Split Tunneling. The list is not sent anywhere.
+- **Start at boot (Android).** Reconnects the VPN after a restart, only if you turn on automatic connection.
+- **Ignore battery optimisation (Android).** Requested only when you choose it on the Background Health screen, so that the system does not stop the VPN in the background.
 
 ## Children
 
