@@ -85,6 +85,7 @@ class ServerSettingsActivity : AppCompatActivity() {
 
         binding = ActivityServerSettingsBinding.inflate(layoutInflater)
         setContentView(binding.root)
+        applySystemBarInsets(binding.root)
 
         maskSection = PendingSection(
             bannerRow = binding.rowMaskPending,

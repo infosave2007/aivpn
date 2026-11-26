@@ -53,6 +53,7 @@ class SplitTunnelActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         binding = ActivitySplitTunnelBinding.inflate(layoutInflater)
         setContentView(binding.root)
+        applySystemBarInsets(binding.root)
 
         binding.btnBack.setOnClickListener { finish() }
 

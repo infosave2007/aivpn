@@ -94,6 +94,7 @@ class BackgroundHealthActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         binding = ActivityBackgroundHealthBinding.inflate(layoutInflater)
         setContentView(binding.root)
+        applySystemBarInsets(binding.root)
         binding.btnBack.setOnClickListener { finish() }
     }
 

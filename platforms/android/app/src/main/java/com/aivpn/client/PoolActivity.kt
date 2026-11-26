@@ -42,6 +42,7 @@ class PoolActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         binding = ActivityPoolBinding.inflate(layoutInflater)
         setContentView(binding.root)
+        applySystemBarInsets(binding.root)
 
         binding.btnBack.setOnClickListener { finish() }
         binding.btnRefresh.setOnClickListener { load() }

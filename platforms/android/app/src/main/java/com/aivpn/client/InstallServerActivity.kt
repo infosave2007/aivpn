@@ -128,6 +128,7 @@ class InstallServerActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         binding = ActivityInstallServerBinding.inflate(layoutInflater)
         setContentView(binding.root)
+        applySystemBarInsets(binding.root)
 
         binding.btnBack.setOnClickListener { onBackStep() }
         renderStep()
