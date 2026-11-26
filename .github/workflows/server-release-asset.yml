@@ -268,14 +268,16 @@ jobs:
           echo "$ANDROID_KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/release.jks"
           echo "AIVPN_UPLOAD_STORE_FILE=$RUNNER_TEMP/release.jks" >> "$GITHUB_ENV"
 
-      - name: Build Android release APK
+      - name: Build Android release APK and app bundle
         run: make android ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT ANDROID_NDK_ROOT=$ANDROID_NDK_HOME
 
       - name: Upload Android workflow artifact
         uses: actions/upload-artifact@v4
         with:
           name: aivpn-client-android-apk
-          path: releases/aivpn-android.apk
+          path: |
+            releases/aivpn-android.apk
+            releases/aivpn-android.aab
           if-no-files-found: error
 
       - name: Install signing OpenSSL on macOS
@@ -294,7 +296,7 @@ jobs:
           while IFS= read -r -d '' asset; do assets+=("$asset"); done < <(find releases -maxdepth 1 -type f ! -name "*.sig" -print0)
           deploy/ci/sign-release-assets.sh "${assets[@]}"
 
-      - name: Publish Android APK to GitHub Release
+      - name: Publish Android APK and app bundle to GitHub Release
         if: github.event_name == 'release' || github.event.inputs.tag != ''
         uses: softprops/action-gh-release@v2
         with:
@@ -302,6 +304,8 @@ jobs:
           files: |
             releases/aivpn-android.apk
             releases/aivpn-android.apk.sig
+            releases/aivpn-android.aab
+            releases/aivpn-android.aab.sig
           fail_on_unmatched_files: true
 
   build-musl-release-assets:
