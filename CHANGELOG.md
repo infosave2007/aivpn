@@ -8,6 +8,10 @@
 - **Android app bundle** - signed release builds also produce `aivpn-android.aab` for Google Play. The release publishes it with a signature next to the APK.
 - **Android package registration** - the app carries the `adi-registration.properties` asset that proves ownership of the `com.aivpn.client` package name for Android developer verification.
 
+### Security
+
+- **`url` 2.5.9** - updates the URL parser to the release that fixes a stack overflow in `Url::origin()` on nested `blob:` URLs (RUSTSEC-2026-0592).
+
 ## [1.3.0] - 2026-11-20
 
 ### Added
